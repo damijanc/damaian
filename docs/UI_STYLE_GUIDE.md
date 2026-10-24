@@ -353,13 +353,53 @@ the UI, because the user is granting consent rather than navigating.
   in its entirety — never horizontally scrolled, elided, or capped behind a
   scroll container. The user must be able to read everything they are
   approving without interacting first.
-- **Rationale is progressive.** Explanatory prose sits behind a collapsed
-  disclosure. It renders collapsed every time; disclosure state is not
-  remembered between proposals.
+- **The deciding reason is not progressive.** The policy's first cause and the
+  agent's own stated reason sit on the card outside any disclosure (spec 62):
+  they are what tells the user whether a prompt is routine, and hiding them is
+  what made forty prompts read alike. The full prompt, with every cause, stays
+  behind a collapsed **Why this command** disclosure. Explanatory prose beyond
+  those two lines is progressive; it renders collapsed every time, and
+  disclosure state is not remembered between proposals.
 - **Escalations live in the overflow.** "Always allow", session-wide grants,
   and anything else that outlives the turn.
 - **Nothing is pre-selected toward approval.** Focus does not land on the
   primary action.
+
+### Hook review
+
+Spec 32 lets a repository ship a hook. It does not run until the user approves
+the exact definition, so this is a consent surface rather than a setting:
+
+- **The command line is shown in full**, wrapped, never scrolled or elided.
+- **Its events and fail direction sit outside any disclosure** — "Events:
+  before_patch_apply, before_tool · If it fails: blocks".
+- **Decline is the default action.** It takes focus; Approve is never
+  `.btn-primary` and is never pre-selected.
+- **Dismissing records no decision**, and the notice returns next time.
+- The id, command and arguments are repository-authored, so they enter the DOM
+  through `textContent`, never as markup.
+- An approval is taken at the definition's hash: if the definition changes, the
+  hook stops until it is reviewed again, and the prompt says so.
+
+### Question surface
+
+Spec 50 lets the model ask one bounded question mid-turn. That surface is
+deliberately **not** an approval surface: answering a question authorises
+nothing, and a user who learns to click through questions must not have learned
+to click through approvals. It lives in `.question-card`.
+
+- **It borrows nothing from `.command-approval`** — no header, no risk badge,
+  no footer, no disclosure. The dashed border marks a prompt, not consent.
+- **Every option is a secondary `.btn-sm`, and there is no `.btn-primary`.**
+  No answer is the safe one, so no answer is emphasised. That is §4's "a surface
+  with no safe action has no primary" applied to content as well as outcome.
+- **Nothing is focused or pre-selected.** The card is answerable, not answered
+  by default; the free-text field takes focus only when the user acts on it.
+- **Answered, it shows the answer and disables itself.** The answer is also a
+  user-side transcript message, so a reloaded session reads the exchange as
+  what it was: a question the assistant asked and an answer the user gave.
+- **The question and options are model-authored text**, so they are set with
+  `textContent`: no markdown, no links, no HTML.
 
 ---
 

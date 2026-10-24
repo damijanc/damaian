@@ -882,13 +882,15 @@ button:disabled {
   width: min(880px, 100%);
 }
 
-.message.user {
+.message.user,
+.message.answer {
   align-self: flex-end;
   max-width: min(760px, 88%);
 }
 
 .message.assistant,
-.message.system {
+.message.system,
+.message.question {
   align-self: flex-start;
 }
 
@@ -900,6 +902,11 @@ button:disabled {
 }
 
 .message.user .message-body {
+  border-color: #cbd8d3;
+  background: var(--accent-soft);
+}
+
+.message.answer .message-body {
   border-color: #cbd8d3;
   background: var(--accent-soft);
 }
@@ -2335,6 +2342,29 @@ button:disabled {
   color: #909294;
 }
 
+.hook-icon::before {
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  top: 3px;
+  bottom: 5px;
+  border: 2px solid currentColor;
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  content: "";
+}
+
+.hook-icon::after {
+  position: absolute;
+  left: 50%;
+  bottom: 1px;
+  width: 2px;
+  height: 6px;
+  margin-left: -1px;
+  background: currentColor;
+  content: "";
+}
+
 .sliders-icon::before,
 .sliders-icon::after {
   position: absolute;
@@ -2605,6 +2635,121 @@ button:disabled {
   border-radius: 8px;
   font-size: 13px;
   padding: 7px 12px;
+}
+
+/* Hooks in Settings (spec 32 Task 9). */
+.hook-entry {
+  border-bottom: 1px solid var(--line);
+}
+
+.hook-entry:last-child {
+  border-bottom: 0;
+}
+
+.hook-entry .settings-row {
+  align-items: flex-start;
+  border-bottom: 0;
+}
+
+.hook-row-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.hook-command {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
+.hook-row-actions {
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.hook-toggle {
+  white-space: nowrap;
+}
+
+.hook-event-select {
+  max-width: 180px;
+}
+
+.hook-test-result {
+  margin: 0;
+  border-top: 1px dashed var(--line);
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 10px 16px 12px;
+}
+
+.hook-test-result[data-state="ok"] {
+  color: var(--ok);
+}
+
+.hook-test-result[data-state="warn"] {
+  color: var(--warn);
+}
+
+.hook-test-result[data-state="error"] {
+  color: var(--danger);
+}
+
+.hook-test-result[hidden] {
+  display: none;
+}
+
+.hook-review-label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.hook-review-command {
+  margin: 4px 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 8px 10px;
+}
+
+.hook-review-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.patch-hook-warnings {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  padding: 10px 12px;
+}
+
+.patch-hook-warnings strong {
+  font-size: 13px;
+}
+
+.patch-hook-warnings p {
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .settings-provider-editor {
@@ -2945,6 +3090,25 @@ button:disabled {
   color: var(--danger);
 }
 
+/* The policy's deciding cause and the agent's own reason (spec 62 §5.2). They
+   sit outside "Why this command" on purpose: with every prompt hiding its
+   reason, forty prompts in a row looked alike. The cause is body ink because
+   it is the line that decides whether the user reads on; the agent's reason is
+   secondary to it. */
+.command-approval-cause {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.command-approval-reason {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 /* Wrapped and uncapped, deliberately. This is a consent surface: the user has
    to be able to read the whole command before approving it, so it is never
    horizontally scrolled, elided, or capped behind a scroll container. A
@@ -3036,6 +3200,79 @@ code.command-approval-command {
   flex-wrap: wrap;
   gap: 6px;
   justify-content: flex-start;
+}
+
+/* Spec 50 §5.5: a question is not an approval. This card shares no selector
+   with `.command-approval` on purpose — no header, no risk badge, no footer —
+   and every option carries the same secondary weight, because no answer is the
+   safe one and a primary would tell the user there is. The dashed border is a
+   prompt, not a consent surface. */
+.question-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 12px 14px;
+}
+
+.question-card-eyebrow {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.question-card-question {
+  margin: 0;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.question-card-options {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.question-card-free-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Sized like a `.btn-sm`, so the field and its Send sit on one control row. */
+.question-card-free-text input {
+  flex: 1 1 auto;
+  font-size: 12px;
+  padding: 5px 10px;
+}
+
+.question-card-answer {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.question-card-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* A settled card is a record, not a control: it stays readable and stops
+   looking clickable without borrowing the approval card's muted outcome. */
+.question-card[data-answered="true"] {
+  background: var(--surface);
 }
 
 /* The crash recovery prompt (docs/specs/45_crash_recovery_prompt.md). It sits

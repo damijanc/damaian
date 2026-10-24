@@ -3,8 +3,8 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md)
-**Started:** 2026-10-18
-**Status:** In progress. Tasks 1–2 done 2026-10-18; tasks 3–7 remain.
+**Started:** 2026-10-18 — **Done:** 2026-10-23
+**Status:** Done. Tasks 1–7 landed (1–2 on 2026-10-18; 3–7 on 2026-10-23).
 
 ## Progress
 
@@ -12,11 +12,11 @@
 |---|---|---|
 | 1 · `ApprovalCause` and structured causes | Done 2026-10-18 | **Landed:** `ApprovalCause` (all 11 §5.1 variants), `CommandClassification.causes`, `reasons` rendered from `causes` via `plain_words()` (one source, no drift), the `Network`/`HighRisk`/`Unknown` split (C2), the `Blocklisted`/`Destructive` split, and `ShellControl`/`Docker`/`RestrictedPath`/`OutsideRepository` causes for each escalation. Helpers: `network_keyword`, `high_risk_keyword`, `destructive_pattern`, `configured_prefix_match` (returns the matched rule), `shell_control_constructs`, `first_word`, and `escaping_path_outside_root` (returns the escaping token so the cause can name it). `read_only_classification` no longer sets a `READ_ONLY_REASON` marker; `classify_text` returns an `admitted_read_only` bool instead, so `classify_pattern` no longer sniffs a reason string. **Tests:** 12 new in `tests/permission_profiles.rs` (one per cause + `reasons_are_derived_from_causes` + the regression guard over a 18-command table). `cargo nextest run -p workspace-engine --locked`: 1314 passed, 24 skipped. Scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean. **Falsified:** `reasons` written directly (empty) → `reasons_are_derived_from_causes` fails; `network_keyword` returning `None` → `a_curl_command_names_the_network_keyword` fails (curl falls to `Unknown`); shell-control branch pushing no cause → `a_shell_control_command_names_its_constructs` fails. All reverted. **Deviations:** (1) The shell-control branch's secondary read-only refusal is dropped — `ShellControl` is the deciding cause — so spec 64's two-reason shell-control output collapses to one cause. (2) `cd <dir>`-not-a-directory maps to `Unknown { program: "cd" }` and `ls -R` of the root maps to `RestrictedPath { path }`, because the closed enum has no dedicated variant for either; neither is in Task 1's test list. (3) The spec-64 refusal that named `read_git_diff`/`read_git_log` now maps to `Unknown { program: "git" }` per C1, so that tool pointer survives only in the model-facing description (Task 3); `git_diff_show_and_log_patch_ask_and_name_the_replacement_tool` was repurposed to assert the `Unknown` mapping. (4) Necessary ripple beyond the two named files: `causes: Vec::new()` added to `CommandClassification` literals in `mode.rs` (3) and `chat.rs` (1); `ApprovalCause` re-exported in `lib.rs`; classifier reason-string assertions in `foundation.rs` and `repository_map.rs` moved from `reasons` to `causes`. **Discoveries for later tasks:** Task 2 wires `Setting`/`ProfileBlocked` (declared, unconstructed) and must convert the `command_access` block, which still pushes its literal `Blocked by permission profile: command_access=…` string, and the `require_approval_for_*` settings, which currently leave allowlisted/admitted/validation commands with empty `causes`; `reasons_are_derived_from_causes` is scoped to the default `command_access=all` config so it does not trip on that block today. |
 | 2 · Setting and profile-block causes | Done 2026-10-18 | **Landed:** `CommandPolicy` gains `sources: Option<BTreeMap<String, ConfigScope>>` derived from `RepositoryConfigReport.applied` (last scope per key, the same attribution `EffectivePolicy::from_load` derives) and a `new_with_report` constructor; `WorkspaceEngine::new_with_report` threads it (C4), and `new` delegates with `sources: None`. The `Setting { key, source: Option<String> }` cause is added in the three branches where a setting alone raises approval — the allowlist and read-only branches (`require_approval_for_all_commands`) and the validation branch (`require_approval_for_all_commands`, else `require_approval_for_risky_commands`) — naming the `rule_label` and the source (`Some("user")`/`Some("repository")`/`Some("admin")`/`Some("profile")`, or `Some("default")` when a report is present and no scope set the key). `source` is `None` when no report was threaded (a bare `Config`), and the plain words then omit " (set by …)" rather than falsely blaming "default". The `command_access` block now pushes `ProfileBlocked { access }` instead of the free-text "Blocked by permission profile" reason. **Tests:** 6 new in `tests/permission_profiles.rs` (`require_approval_for_all_commands_names_the_setting_and_its_source`, `require_approval_for_risky_commands_names_the_setting`, `a_command_access_block_is_a_profile_blocked_cause`, `a_low_risk_command_that_needs_approval_only_from_a_setting_names_that_setting_first`, `a_setting_cause_without_a_report_does_not_name_a_source`, `a_setting_cause_with_a_report_and_no_override_names_the_default`) plus `each_command_access_level_blocks_exactly_its_row` extended to assert the cause. `cargo nextest run -p workspace-engine --locked`: 1320 passed, 24 skipped. Scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo fmt --all` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean; `npm run specs:check` clean. **Falsified (all reverted, all caught):** `setting_source` returning empty → `require_approval_for_all_commands_names_the_setting_and_its_source` fails; the `command_access` block pushing the free-text string → `a_command_access_block_is_a_profile_blocked_cause` fails; `new_with_report` dropping the report → `a_setting_cause_without_a_report_does_not_name_a_source` fails. **Deviations/discoveries:** (1) `require_approval_for_risky_commands` defaults to `true`, so a validation command (`cargo test`/`npm test`) carries `Setting { require_approval_for_risky_commands, … }` even under `Config::default()` — with a report its source is `Some("default")`; `risk`/`requires_approval`/`blocked` are unchanged. (2) `validation.rs` needed no change; its `CommandProposal.causes`/serialize/audit work belongs to Task 5. (3) **Review fix (2026-10-18):** reporting "default" for a bare `Config` was a false statement — a user-set key would have been blamed on the default in the card's Why-this-command; the source is now `None` there and the plain words omit " (set by …)". **Hand-off to Task 3 Step 1:** production still builds with `WorkspaceEngine::new`, so in the app the source stays `None` until Task 3 threads `Config::load_for_repository_reporting` + `WorkspaceEngine::new_with_report` into `desktop-shell/src/lib.rs` `config_for_repo` (used by `engine_for_repo`, `config_for_repo_with_model_options`, `config_for_repo_with_provider`) and `damaian-cli/src/main.rs` `default_engine`/`engine_for_repo`. |
-| 3 · Prompt and model-facing wording | Not started | |
-| 4 · The card names the cause and the model's reason | Not started | |
-| 5 · Recording causes in the proposal and audit record | Not started | |
-| 6 · Eval harness groups prompts by first cause | Not started | |
-| 7 · Docs, live re-run and close-out | Not started | |
+| 3 · Prompt and model-facing wording | Done 2026-10-23 | **Landed:** `command_proposal_response` now leads with `reasons.first()` — the deciding cause's plain words, rendered from `causes` — then the command in backticks; a blocked command keeps its "Blocked: …" line, says "Damaian will not run it. Nothing has run.", and offers no approval. The `run_command` description and both envelope paragraphs replace "sandbox-safe" with "Damaian runs a short list of read-only commands without asking": the unrestricted paragraph says everything else needs approval, the read-only paragraph says everything else is refused outright in this mode, both naming shell control. C3's three strings are renamed (`approved_by` `"sandbox"` → `"policy"`; `--- sandbox_command_result ---` → `--- command_result ---`; `complete_with_sandbox_command` → `complete_with_command`). C5's pinned `TODAYS_CODE_SYSTEM_PROMPT`, `CODE_PARAGRAPH_BEFORE_SPEC_50`, `READ_ONLY_PARAGRAPH_BEFORE_SPEC_50` and the `ask_mode_system_prompt_has_no_command_envelope` assertion are updated together. Step 1 threads `Config::load_for_repository_reporting`/`WorkspaceEngine::new_with_report` through the CLI's `default_engine`/`engine_for_repo` and the shell's `default_engine`/`engine_for_repo`/`config_for_repo*`/`chat_engine`; the config helpers carry the `RepositoryConfigReport`, and the worker's `load_worker_config` returns it too. **Tests:** new `chat::approval_prompt_wording_tests` (4 unit tests over the builders, every mode prompt and both proposal cases) and 3 new `tests/foundation.rs` end-to-end tests (cause-first prompt; a chat turn and audit with no "sandbox"; auto-run wording in the offered tool and system prompt). `cargo nextest run -p workspace-engine --test foundation --locked`: 164 passed. `cargo nextest run -p workspace-engine --lib -E 'test(chat::)' --locked`: 65 passed. The `desktop-shell` worker config test passed. Scoped clippy clean for `workspace-engine`, `desktop-shell` and `damaian-cli`; `scripts/quality-gate.sh fmt node lint typos deny` clean. **Falsified (all reverted, all caught):** the unrestricted envelope sentence reverted to "The app will run sandbox-safe commands automatically" → both `no_local…` tests and both auto-run-description tests fail; `command_proposal_response` reverted to a fixed "I need your approval…" sentence → the unit and foundation cause-first tests fail; the audit status reverted to `complete_with_sandbox_command` → the foundation no-sandbox test fails on the audit log. **Deviations/discoveries:** (1) Task 3's file list omits `crates/desktop-shell/src/worker.rs`, but `chat_engine` now takes `(Config, RepositoryConfigReport)`, so the worker's `load_worker_config` returns the report and its four call sites destructure; worker turns get the same source attribution. (2) `config_for_repo_with_model_options`/`config_for_repo_with_provider` now return `(Config, RepositoryConfigReport)`; `config_for_repo` stays a Config-only convenience for non-engine consumers (`reveal_web_diagnostic_artifact`, `model_key_status_json`). (3) `docs/TROUBLESHOOTING.md`'s audit-status list is updated to `complete_with_command`; the remaining "not sandboxed" prose in `USER_GUIDE.md`/`SECURITY.md`/`app.js` is accurate and belongs to Task 7. (4) The `approved_by` `"sandbox"` literal is unobservable: auto-run has `requires_approval == false`, so the runner records no approver (`approvedBy: ""`); the rename is still made per C3. (5) Two existing foundation assertions that the approval message `contains("approval")` now assert `starts_with("Asks first:")`, since the message names the cause and no longer uses that word. (6) The MCP approval prompt still says "runs outside the local sandbox"; it is not a local-command string, is outside C3's list and the acceptance test, and is left for a later pass. (7) Task 3's line references had drifted with #59–#64 (e.g. `command_proposal_response` is at 6249, not 5310); every named item still exists, and the proposal's §2/§5.3 references are refreshed. (8) Step 1 adds no test of its own: Task 2's report-aware test covers the behaviour, and the production call sites are compile-checked; observing the source from `desktop-shell` would require mutating the test binary's shared data dir or a repository config. |
+| 4 · The card names the cause and the model's reason | Done 2026-10-23 | **Landed:** `AgentCommandProposal` gains `cause` (the first rendered `reasons` entry, i.e. the deciding cause's plain words) and `reason` (the model's own stated reason); `agent_command_proposal` fills both from the stored `CommandProposal`. The shell's three hand-written card payloads now carry them: `command_proposal_json` for chat results and worker cards (`crates/desktop-shell/src/lib.rs`), `handle_propose_command`'s response, and `recovery.rs`'s reattached-proposal JSON. `createCommandApprovalPreview` renders the cause as its own line outside the disclosure, next to the risk badge, and the reason as "The agent says: …" after the command; **Why this command** keeps the full prompt with every cause. MCP and browser-diagnostic proposals leave both fields empty and the card hides the lines. **Tests:** new `chat::approval_prompt_wording_tests::the_card_payload_carries_the_first_cause_and_the_models_reason` (two causes; the first wins) and `a_blocked_command_still_names_its_cause_on_the_card`; new `tests/agent_tools.rs::a_network_command_reaches_the_card_with_its_cause_and_the_models_reason` (a `MockModelAdapter` turn proposing `curl https://example.com` with a reason). `cargo nextest run -p workspace-engine --test agent_tools --locked`: 30 passed. `cargo nextest run -p workspace-engine --lib -E 'test(approval_prompt_wording_tests)' --locked`: 6 passed. `cargo nextest run -p desktop-shell --lib --locked`: 160 passed, 5 skipped. Scoped clippy clean for `workspace-engine` and `desktop-shell`; `node --check` and `npm run lint:web` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean. **Falsified (all reverted, all caught):** `cause`/`reason` set empty in `agent_command_proposal` → both named card tests fail; the cause moved inside the `details` disclosure panel → the DOM harness fails ("card renders a cause line"); the agent reason omitted → the harness fails on `The agent says: …`. The card harness is a throwaway DOM script (there is no JS test suite; style guide §9), not committed. **Deviations/discoveries:** (1) Task 4's file list omits the shell's JSON bridges — `crates/desktop-shell/src/lib.rs` (`command_proposal_json`, `handle_propose_command`) and `crates/desktop-shell/src/recovery.rs` build the card payload with format strings, so the new fields never reach `app.js` without editing them; all three now carry `cause`/`reason`, and worker cards use the same lib.rs builder. (2) `CommandProposal` has no `causes` yet (Task 5), so the first cause is `reasons.first()` — the first rendered cause, keeping the one-source rule; Task 5 can switch to `causes.first().plain_words()` without changing the wire format. (3) MCP and browser-diagnostic proposals have no policy cause, so they carry empty strings and the card hides both lines rather than inventing a cause outside the closed enum. (4) `docs/UI_STYLE_GUIDE.md` §5 said rationale is progressive. This spec owns the surface and requires the first cause and the agent's reason outside the disclosure, so the rule and the `docs/ui-style-guide.html` specimens were updated in the same change. (5) The pre-existing `command_approval_prompt` already lists every cause under **Why this command**; no prompt builder changed. (6) No classification decision moved. |
+| 5 · Recording causes in the proposal and audit record | Done 2026-10-23 | **Landed:** `CommandProposal` gains `causes: Vec<ApprovalCause>` filled from `classification.causes` in `proposal_from_classification`, so the values travel with the proposal. `serialize_proposal` writes a last, optional `CAUSES` field as JSON (every field of every cause survives, not only its name) and `deserialize_proposal` reads it when present, falling back to an empty list on older files; `serialize_proposal` now returns `Result`. `ApprovalCause` derives `Serialize`/`Deserialize` (`snake_case`) and gains `as_str()` for the audit's variant names; `store_proposal` records `causes` on `command_proposal_stored` as the comma-joined names in classifier order, through `AuditLog::record` and therefore the same secret scanner as every field beside it. **Tests:** 5 new, non-ignored tests in `tests/command_lifecycle.rs`: `a_stored_proposal_round_trips_its_causes_in_order` (two causes, order preserved, whole proposal equal after reload), `a_stored_proposal_round_trips_a_profile_block` (`CommandAccess` round-trips inside `ProfileBlocked`), `a_proposal_stored_before_causes_loads_with_no_causes` (hand-written pre-change file loads with an empty list), `the_stored_proposal_audit_names_its_causes_in_order` (`unknown,outside_repository`), and `the_audit_causes_name_causes_without_command_text` (a credential in the command is redacted in the audit beside a names-only `causes`). `cargo nextest run -p workspace-engine --test command_lifecycle --locked`: 5 passed, 5 skipped. `cargo nextest run -p workspace-engine --test foundation --locked`: 164 passed. Scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo fmt --all` clean; `node --check` and `npm run lint:web` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean. **Falsified (all reverted, all caught):** storing only the first cause → `a_stored_proposal_round_trips_its_causes_in_order` fails on the reloaded list; making `CAUSES` mandatory on read → the legacy test fails with "Expected field CAUSES, found END_COMMAND_PROPOSAL"; omitting the audit tuple → `the_stored_proposal_audit_names_its_causes_in_order` fails. **Deviations/discoveries:** (1) The plan named `tests/command_lifecycle.rs`, but that file was the all-`#[ignore]` shell-lifecycle suite with no proposal or audit tests; the five storage/audit tests are non-ignored additions there and the module doc now says only the shell-spawning tests are ignored. (2) The plan's sample audit value `shell_control,unknown` is unreachable: the shell-control branch returns a single cause. Order is asserted with `python3 ../script.py` → `unknown,outside_repository`, and the profile-block round-trip covers `shell_control,profile_blocked` separately. (3) Necessary ripple beyond the three named files: `config.rs`'s `CommandAccess` gains the same serde derives (it is `ProfileBlocked`'s field), and `chat.rs`'s test-only `CommandProposal` helper gains `causes`. (4) `agent_command_proposal` deliberately keeps `reasons.first()` rather than `causes.first()`: a proposal written before this change has `REASONS` but no `CAUSES`, and reading `causes` there would blank its card cause on reattach. (5) No classification decision moved: `risk`, `requires_approval` and `blocked` are untouched; the new data is recording only. |
+| 6 · Eval harness groups prompts by first cause | Done 2026-10-23 | **Landed:** `RecordedApproval` gains `cause: Option<String>`, the first name in `command_proposal_stored`'s `causes` field (read by `first_cause` in `runner.rs`), `None` for a decision event and for a proposal that ran without asking. `RunRecord` gains `approvals_by_cause`, a `BTreeMap<String, u64>` derived by `group_approvals_by_cause` from `approvals`, so the grouping and the list cannot drift; the `BTreeMap` keeps the text report and a baseline diff in a stable cause order. `MetricValue::Groups { counts }` is new, and `approval_prompts_by_cause` ("Approval prompts by first cause") is the 23rd `KEYS` entry, summing the per-run maps and reporting `NotApplicable { phase: "no-approval-prompts" }` when nothing asked. `report::to_text` gains a per-run "Approval prompts by first cause" section printing `cause count`. New scenario `approval_causes.toml`: `approval_decision = true`; `cd src && git diff | head -20` → `shell_control`, then `python3 ../script.py` → `unknown,outside_repository`, so a last-cause reader would group it as `outside_repository`. The two pinned scenario counts in `tests/harness.rs` moved 21 → 22. **Tests:** 4 new in `tests/harness.rs`: `a_run_records_each_approval_prompt_by_its_first_cause`, `a_proposal_that_needed_no_approval_is_not_counted_as_a_prompt` (`planned_task`'s `ls src` stores a proposal with empty `causes`), `the_report_groups_approval_prompts_by_their_first_cause` (per-run line and metric), and `the_approval_cause_metric_sums_across_runs`. `cargo nextest run -p eval-harness --locked`: 83 passed, 1 skipped. `cargo run -p eval-harness -- run --tier deterministic`: all 22 scenarios pass; the report reads `approval_causes shell_control 1 unknown 1`, `denied_approval unknown 1`, `resume_interrupted_session setting 1`, and the metric `setting 1 shell_control 1 unknown 2`. Scoped `cargo clippy -p eval-harness --all-targets --locked -- -D warnings` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean; `node --check` and `npm run lint:web` included there. **Falsified (both reverted, both caught):** `first_cause` returning a constant `"prompt"` → all three grouping tests fail (the record test on `shell_control` vs `prompt`, the auto-run test on a cause it must not have, the report test on the line); the metric returning `Count { value: 1 }` → both metric tests fail. **Deviations:** (1) `approvals` still lists every stored proposal, auto-run ones included, as it did before; grouping filters them out by their empty `causes`, so the counts describe prompts rather than proposals. (2) A new scenario was added rather than extending an existing one, because no committed scenario produced two distinct prompts in one run. (3) `evals/baseline.json` was not regenerated: it predates `findingsByPurpose` too, and this repository treats regenerating it as a human-reviewed step. (4) Task 6 said the approvals were built "around line 390"; they are at 490 in `runner.rs` — the line reference was stale, the described code was not. |
+| 7 · Docs, live re-run and close-out | Done 2026-10-23 | **Landed (docs):** `USER_GUIDE.md`'s Command Approval section now says the card's first line names the deciding cause beside the risk badge, that **Why this command** holds the full prompt, and that "The agent says: …" is the model's own reason; the auto-run descriptions in the section's introduction and the Safety Model no longer use the word "sandbox". `TROUBLESHOOTING.md` gains **Reading an approval's cause** (the cause shapes, **Why this command**, and the audit field), records `command_proposal_stored.causes` in the audit reads, and calls an auto-run command "one Damaian ran without asking" instead of "a sandbox command". `SECURITY.md`'s Command Execution section says the first line of an approval names the deciding cause and drops "they are not sandboxed" from the runs-without-asking bullet. **Cross-references:** #63's "also corrects what the model is told about the shell" still matches the shipped behaviour, so it needed no edit. #64's parenthetical said "the causes this spec adds", where "this spec" read as #64 rather than #62; it now says "the causes it added". **Live re-run:** the motivating approval, against `deepseek-v4-flash` with native tools on, under an isolated `DAMAIAN_DATA_DIR` in this worktree. Four turns asked for one command each; no command was approved, so nothing ran and the tree stayed clean. The prompts named, in their first line: `;` shell control for `ls crates; ls docs` (**the spec 59 case**: a `;`-chained read-only `ls` sequence), `curl` network for `curl -sS https://example.com`, `python3` unknown for `python3 -c 'print(1)'`, and Docker for `docker ps`. Each card payload carried the same first cause and the model's stated reason. First lines and verdicts are in proposal §6; the run used a temporary in-process `#[ignore]` driver because the CLI cannot observe a pending approval without a UI, and the driver and data directory were deleted afterwards. **Close-out:** proposal `Status:` is Done; this header and the progress table say Done; README's row, Current state, history prose and "What to build next" are updated (nothing is promoted — no `Depends on:` line names #62); the CHANGELOG `Unreleased` item is removed. **Checks:** `scripts/quality-gate.sh fmt node lint typos deny` passed; `npm run specs:check -- --strict` reports no disagreement; scoped `cargo clippy -p eval-harness --all-targets --locked -- -D warnings` clean and `cargo nextest run -p eval-harness --locked` 83 passed, 1 skipped. The diff is documentation only. The workspace clippy and test suite are left to CI; the CI result is to be recorded here once the branch is pushed. |
 
 ## Global Constraints
 
@@ -226,8 +226,9 @@ Tasks 3 and 4 both edit `chat.rs`. No task may run beside #59, #60 or #63
 **Proposal:** §5.2 (message), §5.3 (wording). **Corrections:** C3, C5.
 **Files:** `chat.rs`, `tests/foundation.rs`, `crates/desktop-shell/src/lib.rs`,
 `crates/damaian-cli/src/main.rs`.
+**Started:** 2026-10-23 — **Done:** 2026-10-23.
 
-- [ ] **Step 1: Thread the report into production (C4 hand-off).** Without
+- [x] **Step 1: Thread the report into production (C4 hand-off).** Without
       this the app and CLI build their engine with `WorkspaceEngine::new`,
       which leaves `Setting.source` `None`, so a setting's prompt never names
       who set it. Load with `Config::load_for_repository_reporting` and build
@@ -237,7 +238,7 @@ Tasks 3 and 4 both edit `chat.rs`. No task may run beside #59, #60 or #63
       `config_for_repo_with_provider`), and `damaian-cli/src/main.rs`
       `default_engine` and `engine_for_repo` — all of which today call
       `Config::load_for_repository` then `WorkspaceEngine::new`.
-- [ ] **Step 2: Write the failing tests.**
+- [x] **Step 2: Write the failing tests.**
   - `command_proposal_response_leads_with_the_deciding_cause` (a shell-control
     proposal's first line names `&&` and `|`; a blocklisted one names its rule
     and offers no approval);
@@ -247,22 +248,22 @@ Tasks 3 and 4 both edit `chat.rs`. No task may run beside #59, #60 or #63
     mode, and the `approved_by`/separator/status strings in Correction C3);
   - `the_auto_run_description_says_the_policy_runs_it_without_asking` (the new
     wording replaces "sandbox-safe").
-- [ ] **Step 3: Run them and confirm they fail.**
-- [ ] **Step 4: Rewrite `command_proposal_response`** to lead with the first
+- [x] **Step 3: Run them and confirm they fail.**
+- [x] **Step 4: Rewrite `command_proposal_response`** to lead with the first
       cause's plain words, then the command; a blocked command says what blocked
       it and that nothing runs.
-- [ ] **Step 5: Remove "sandbox" (C3).** The tool description and envelope
+- [x] **Step 5: Remove "sandbox" (C3).** The tool description and envelope
       paragraphs describe auto-run as "a short list of read-only commands the
       policy runs without asking"; rename `approved_by` `"sandbox"`, the
       `--- sandbox_command_result ---` separator and the `complete_with_sandbox_command`
       status.
-- [ ] **Step 6: Update the pinned wording (C5).** Change `TODAYS_CODE_SYSTEM_PROMPT`
+- [x] **Step 6: Update the pinned wording (C5).** Change `TODAYS_CODE_SYSTEM_PROMPT`
       and the `CODE_PARAGRAPH_BEFORE_SPEC_50`/`READ_ONLY_PARAGRAPH_BEFORE_SPEC_50`
       fixtures in the same change, and update
       `ask_mode_system_prompt_has_no_command_envelope`'s assertion string.
-- [ ] **Step 7: Falsify** (a string that keeps "sandbox", a first line that does
+- [x] **Step 7: Falsify** (a string that keeps "sandbox", a first line that does
       not name the cause) and revert.
-- [ ] **Step 8: Scoped checks.** `cargo nextest run -p workspace-engine --test
+- [x] **Step 8: Scoped checks.** `cargo nextest run -p workspace-engine --test
       foundation`, the `chat.rs` unit tests, scoped clippy for `workspace-engine`
       and the two touched binaries, and the fast checks (which include
       `node --check` and web lint).
@@ -272,23 +273,24 @@ Tasks 3 and 4 both edit `chat.rs`. No task may run beside #59, #60 or #63
 **Requirements:** 5. **Proposal:** §5.2. **Corrections:** none (the
 `AgentCommandProposal` gap is described in §2).
 **Files:** `chat.rs`, `crates/desktop-shell/static/app.js`.
+**Started:** 2026-10-23 — **Done:** 2026-10-23.
 
-- [ ] **Step 1: Write the failing tests.** `AgentCommandProposal` carries the
+- [x] **Step 1: Write the failing tests.** `AgentCommandProposal` carries the
       model's `reason` and the first cause's plain words; a unit test over
       `agent_command_proposal` asserts both, and a `MockModelAdapter` turn that
       proposes `curl …` with a reason yields a proposal whose card payload
       carries them.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: `AgentCommandProposal`** gains `reason` and a first-cause string
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: `AgentCommandProposal`** gains `reason` and a first-cause string
       (or the `causes` list); `agent_command_proposal` fills both from the
       stored proposal.
-- [ ] **Step 4: The card.** In `createCommandApprovalPreview`, render the first
+- [x] **Step 4: The card.** In `createCommandApprovalPreview`, render the first
       cause beside the risk badge outside any disclosure, and the model's
       `reason` as "The agent says: …". **Why this command** keeps the full
       prompt including every cause.
-- [ ] **Step 5: Falsify** (the cause hidden behind the disclosure, the reason
+- [x] **Step 5: Falsify** (the cause hidden behind the disclosure, the reason
       omitted) and revert.
-- [ ] **Step 6: Scoped checks.** `cargo nextest run -p workspace-engine --test
+- [x] **Step 6: Scoped checks.** `cargo nextest run -p workspace-engine --test
       agent_tools`, scoped clippy for `workspace-engine`, `node --check
       crates/desktop-shell/static/app.js` and `npm run lint:web`.
 
@@ -297,60 +299,65 @@ Tasks 3 and 4 both edit `chat.rs`. No task may run beside #59, #60 or #63
 **Requirements:** 6. **Proposal:** §5.4. **Corrections:** C6.
 **Files:** `validation.rs`, `command_policy.rs`,
 `tests/command_lifecycle.rs`.
+**Started:** 2026-10-23 — **Done:** 2026-10-23.
 
-- [ ] **Step 1: Write the failing tests.** A stored proposal round-trips its
+- [x] **Step 1: Write the failing tests.** A stored proposal round-trips its
       `causes` in order (`save_proposal` → `load_proposal`); a proposal stored
       before this change reads back with empty causes rather than failing; the
       `command_proposal_stored` audit event carries a `causes` field
       (`shell_control,unknown`) in order.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: `CommandProposal.causes`.** Add the field in
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: `CommandProposal.causes`.** Add the field in
       `proposal_from_classification`, and a `CAUSES` field to
       `serialize_proposal`/`deserialize_proposal` that is optional on read
       (older proposals lack it, matching how `PURPOSE` was added in spec 63).
-- [ ] **Step 4: Audit.** Record `causes` on `command_proposal_stored`.
-- [ ] **Step 5: Falsify** (a cause dropped on round-trip, a missing field that
+- [x] **Step 4: Audit.** Record `causes` on `command_proposal_stored`.
+- [x] **Step 5: Falsify** (a cause dropped on round-trip, a missing field that
       fails the read, the audit value omitted) and revert.
-- [ ] **Step 6: Scoped checks.** `cargo nextest run -p workspace-engine --test
+- [x] **Step 6: Scoped checks.** `cargo nextest run -p workspace-engine --test
       command_lifecycle` and `--test foundation`, scoped clippy for
       `workspace-engine`, fast checks.
 
 ## Task 6: Eval harness groups prompts by first cause
 
 **Requirements:** §5.5. **Proposal:** §5.5. **Files:**
-`crates/eval-harness/src/record.rs`, `runner.rs`, `metrics.rs`, `report.rs`.
+`crates/eval-harness/src/record.rs`, `runner.rs`, `metrics.rs`, `report.rs`,
+`crates/eval-harness/scenarios/approval_causes.toml`.
+**Started:** 2026-10-23 — **Done:** 2026-10-23.
 
-- [ ] **Step 1: Read the causes.** `runner.rs` builds `approvals` from
+- [x] **Step 1: Read the causes.** `runner.rs` builds `approvals` from
       `command_proposal_stored` events (around line 390); extend `RecordedApproval`
       with the first cause read from the event's new `causes` field.
-- [ ] **Step 2: Group and report.** Add a per-run metric and report line
+- [x] **Step 2: Group and report.** Add a per-run metric and report line
       grouping prompts by first cause (count and cause name), so the motivating
       session would read as nearly all `shell_control`.
-- [ ] **Step 3: A scenario** (or an assertion on an existing approval scenario)
+- [x] **Step 3: A scenario** (or an assertion on an existing approval scenario)
       that produces at least two distinct first causes and asserts the grouping
       distinguishes them.
-- [ ] **Step 4: Falsify** (grouping that ignores the cause, a metric that
+- [x] **Step 4: Falsify** (grouping that ignores the cause, a metric that
       reports a constant) and revert.
-- [ ] **Step 5: Scoped checks.** `cargo nextest run -p eval-harness`, scoped
+- [x] **Step 5: Scoped checks.** `cargo nextest run -p eval-harness`, scoped
       clippy for `eval-harness`, fast checks.
 
 ## Task 7: Docs, live re-run and close-out
 
-- [ ] **Step 1: Live re-run** of the motivating approval against
+- [x] **Step 1: Live re-run** of the motivating approval against
       `deepseek-v4-flash` on this repository. Record the first line each prompt
       showed and confirm it names the real cause, in proposal §6.
-- [ ] **Step 2: Docs** (§5.6): `USER_GUIDE.md` (the approval card, and what runs
+- [x] **Step 2: Docs** (§5.6): `USER_GUIDE.md` (the approval card, and what runs
       without asking — without the word "sandbox"), `TROUBLESHOOTING.md` (reading
       an approval's cause), `SECURITY.md` if it describes auto-run commands as
       sandboxed.
-- [ ] **Step 3: Cross-references.** #63 and #64's "Related" sections already
+- [x] **Step 3: Cross-references.** #63 and #64's "Related" sections already
       point at the folder; confirm their wording still matches the shipped
       wording. Update `docs/specs/README.md`'s "What to build next" once the
       spec is Done.
-- [ ] **Step 4: Close the spec** per AGENTS.md "When a spec becomes Done":
+- [x] **Step 4: Close the spec** per AGENTS.md "When a spec becomes Done":
       status in the proposal, README row and this file; `Depends on:` search;
       What to build next; remove the item from `CHANGELOG.md` Unreleased
       ("Say why each command needs your approval, instead of one sentence about
       a sandbox that does not exist").
-- [ ] **Step 5: Checks.** Fast checks and scoped clippy/tests locally; the full
-      gate on CI. Record the CI result here when it is green.
+- [x] **Step 5: Checks.** Fast checks and scoped clippy/tests locally; the full
+      gate on CI. Record the CI result here when it is green. (Local checks are
+      recorded in row 7 above; the CI result is pending the branch being pushed,
+      which the user does.)

@@ -616,6 +616,89 @@ async function reviewRepositoryConfig(repoPath) {
       toast(error.message);
     }
   }
+  // Spec 32: a repository-defined hook stays inactive until the user approves
+  // the exact definition shown here. Declining is the default action, and a
+  // dismissal asks again next time rather than recording either decision.
+  const hooks = Array.isArray(review.hooks) ? review.hooks : [];
+  for (const hook of hooks) {
+    const decision = await showHookReviewDialog(path, hook);
+    if (decision === null) {
+      reviewedRepositoryConfigs.delete(path);
+      break;
+    }
+    try {
+      await api(
+        "/api/hook-review",
+        form({ repo: path, hook: hook.id, decision, hash: hook.hash || "" }),
+      );
+      toast(decision === "approve" ? `Approved hook ${hook.id}` : `Declined hook ${hook.id}`);
+    } catch (error) {
+      reviewedRepositoryConfigs.delete(path);
+      toast(error.message);
+      break;
+    }
+  }
+}
+
+// One pending repository hook, with its full command line in the consent
+// surface (UI style guide §1: consent content is never truncated). Every
+// hook-supplied string is text, never markup.
+function showHookReviewDialog(repoPath, hook) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement("div");
+    backdrop.className = "app-dialog-backdrop";
+    backdrop.innerHTML = `
+      <div class="app-dialog app-dialog-wide app-dialog-hook-review" role="dialog" aria-modal="true">
+        <p class="app-dialog-title"></p>
+        <p class="app-dialog-message"></p>
+        <p class="hook-review-label">Command</p>
+        <pre class="hook-review-command"></pre>
+        <p class="hook-review-meta"></p>
+        <div class="app-dialog-actions">
+          <button type="button" class="app-dialog-btn app-dialog-decline">Decline</button>
+          <button type="button" class="app-dialog-btn app-dialog-approve">Approve</button>
+        </div>
+      </div>
+    `;
+    const changed = hook.activation === "changed_since_review";
+    backdrop.querySelector(".app-dialog-title").textContent = changed
+      ? "A hook this repository defines has changed"
+      : "This repository defines a hook";
+    backdrop.querySelector(".app-dialog-message").textContent = changed
+      ? `${projectName(repoPath)} ships a different definition of the hook "${hook.id}" from the one you approved. It is not running until you review the new definition. If it changes again, it stops again.`
+      : `${projectName(repoPath)} ships a hook named "${hook.id}". Damaian will run it only after you approve this exact definition. If it changes later, it stops running until you review it again.`;
+    const command = hook.command + ((hook.args || []).length ? ` ${hook.args.join(" ")}` : "");
+    backdrop.querySelector(".hook-review-command").textContent = command;
+    const failure = hook.mode === "mandatory" ? "blocks" : "warns";
+    backdrop.querySelector(".hook-review-meta").textContent = `Events: ${(hook.events || []).join(
+      ", ",
+    )} · If it fails: ${failure}`;
+
+    document.body.append(backdrop);
+
+    const cleanup = (result) => {
+      document.removeEventListener("keydown", onKeydown, true);
+      backdrop.remove();
+      resolve(result);
+    };
+    const onKeydown = (event) => {
+      if (event.key === "Escape") cleanup(null);
+    };
+    document.addEventListener("keydown", onKeydown, true);
+    backdrop.querySelector(".app-dialog-approve").addEventListener("click", () => {
+      if (!hook.hash) {
+        toast("This hook's definition could not be read, so it cannot be approved");
+        return;
+      }
+      cleanup("approve");
+    });
+    backdrop
+      .querySelector(".app-dialog-decline")
+      .addEventListener("click", () => cleanup("decline"));
+    // Decline is the default: it takes focus, and Approve is never the filled
+    // or pre-selected choice (UI style guide §4, §5).
+    backdrop.querySelector(".app-dialog-decline").focus();
+  });
 }
 
 // Resolves to the commands to keep (possibly empty), or `null` if the user
@@ -1925,13 +2008,20 @@ async function installAppUpdate() {
 }
 
 function setSettingsPage(page) {
-  const target = ["general", "shortcuts", "checkpoints", "mcp", "providers", "models"].includes(
-    page,
-  )
+  const target = [
+    "general",
+    "shortcuts",
+    "checkpoints",
+    "mcp",
+    "hooks",
+    "providers",
+    "models",
+  ].includes(page)
     ? page
     : "providers";
   if (target === "mcp") renderMcpConfigSelect();
   if (target === "checkpoints") void renderCheckpointList();
+  if (target === "hooks") void renderSettingsHooks();
   document.querySelectorAll(".settings-nav-item").forEach((button) => {
     button.classList.toggle("active", button.dataset.settingsPage === target);
   });
@@ -3664,6 +3754,188 @@ function renderMcpServerList() {
   });
 }
 
+const HOOK_ACTIVATION_LABELS = {
+  active: "active",
+  pending_review: "pending review",
+  declined: "declined",
+  changed_since_review: "changed since review",
+  disabled: "disabled",
+};
+
+// Spec 32 Task 9: every configured hook, whether it can run, what it runs, and
+// its fail direction. A repository hook is switched by review, never by the
+// toggle: the repository owns its definition and the user owns the decision.
+async function renderSettingsHooks() {
+  const container = $("hook-list");
+  if (!container) return;
+  const repoPath = repo();
+  const empty = (text) => {
+    container.replaceChildren();
+    const row = document.createElement("div");
+    row.className = "provider-empty-row";
+    row.textContent = text;
+    container.append(row);
+  };
+  if (!repoPath) {
+    empty("Open a folder to see the hooks that apply to it.");
+    return;
+  }
+  let payload;
+  try {
+    payload = await api(`/api/hooks?repo=${encodeURIComponent(repoPath)}`);
+  } catch (error) {
+    empty(`Hooks could not be loaded: ${error.message}`);
+    return;
+  }
+  if (repo() !== repoPath) return;
+  const hooks = Array.isArray(payload.hooks) ? payload.hooks : [];
+  if (!hooks.length) {
+    empty(
+      "No hooks are configured. Add hook.<id>.command and hook.<id>.events to your user configuration, or to this repository's .damaian/config.conf.",
+    );
+    return;
+  }
+  container.replaceChildren(...hooks.map((hook) => hookSettingEntry(repoPath, hook)));
+}
+
+function hookSettingEntry(repoPath, hook) {
+  const entry = document.createElement("div");
+  entry.className = "hook-entry";
+
+  const row = document.createElement("div");
+  row.className = "settings-row";
+  const copy = document.createElement("div");
+  copy.className = "hook-row-copy";
+
+  const title = document.createElement("strong");
+  title.textContent = hook.id;
+  const meta = document.createElement("p");
+  const failure = hook.mode === "mandatory" ? "If it fails: blocks" : "If it fails: warns";
+  const activation = HOOK_ACTIVATION_LABELS[hook.activation] || hook.activation;
+  meta.textContent = `${hook.source} · ${(hook.events || []).join(", ")} · ${failure} · ${activation}`;
+  const command = document.createElement("p");
+  command.className = "hook-command";
+  command.textContent = hook.command + ((hook.args || []).length ? ` ${hook.args.join(" ")}` : "");
+  copy.append(title, meta, command);
+
+  const actions = document.createElement("div");
+  actions.className = "provider-row-actions hook-row-actions";
+
+  if (hook.source === "user") {
+    const toggle = document.createElement("label");
+    toggle.className = "field-checkbox hook-toggle";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = hook.enabled === true;
+    box.setAttribute("aria-label", `Enable hook ${hook.id}`);
+    box.addEventListener("change", async () => {
+      box.disabled = true;
+      try {
+        await api(
+          "/api/hook-enabled",
+          form({ repo: repoPath, hook: hook.id, enabled: box.checked ? "true" : "false" }),
+        );
+        toast(`${box.checked ? "Enabled" : "Disabled"} hook ${hook.id}`);
+        await renderSettingsHooks();
+      } catch (error) {
+        box.checked = !box.checked;
+        box.disabled = false;
+        toast(error.message);
+      }
+    });
+    const label = document.createElement("span");
+    label.textContent = "Enabled";
+    toggle.append(box, label);
+    actions.append(toggle);
+  }
+
+  if (
+    hook.source === "repository" &&
+    ["pending_review", "changed_since_review", "declined"].includes(hook.activation)
+  ) {
+    const approve = document.createElement("button");
+    approve.type = "button";
+    approve.className = "btn-sm";
+    approve.textContent = "Approve";
+    approve.disabled = !hook.hash;
+    approve.addEventListener("click", () => decideHook(repoPath, hook, "approve"));
+    actions.append(approve);
+    // A declined hook is already declined; offering Decline again would be a
+    // second, meaningless decision. Approve lets the user reconsider.
+    if (hook.activation !== "declined") {
+      const decline = document.createElement("button");
+      decline.type = "button";
+      decline.className = "btn-sm btn-quiet";
+      decline.textContent = "Decline";
+      decline.addEventListener("click", () => decideHook(repoPath, hook, "decline"));
+      actions.append(decline);
+    }
+  }
+
+  let testResult = null;
+  if ((hook.events || []).length) {
+    const eventSelect = document.createElement("select");
+    eventSelect.className = "mode-select hook-event-select";
+    eventSelect.setAttribute("aria-label", `Event to test for hook ${hook.id}`);
+    hook.events.forEach((event) => {
+      const option = document.createElement("option");
+      option.value = event;
+      option.textContent = event;
+      eventSelect.append(option);
+    });
+    const test = document.createElement("button");
+    test.type = "button";
+    test.className = "btn-sm btn-quiet";
+    test.textContent = "Test";
+    actions.append(eventSelect, test);
+
+    testResult = document.createElement("pre");
+    testResult.className = "hook-test-result";
+    testResult.hidden = true;
+    test.addEventListener("click", () =>
+      testHook(repoPath, hook, eventSelect.value, test, testResult),
+    );
+  }
+
+  row.append(copy, actions);
+  entry.append(row);
+  if (testResult) entry.append(testResult);
+  return entry;
+}
+
+async function decideHook(repoPath, hook, decision) {
+  try {
+    await api(
+      "/api/hook-review",
+      form({ repo: repoPath, hook: hook.id, decision, hash: hook.hash || "" }),
+    );
+    toast(`${decision === "approve" ? "Approved" : "Declined"} hook ${hook.id}`);
+    await renderSettingsHooks();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function testHook(repoPath, hook, event, button, result) {
+  button.disabled = true;
+  result.hidden = false;
+  result.dataset.state = "";
+  result.textContent = "Running…";
+  try {
+    const run = await api("/api/hook-test", form({ repo: repoPath, hook: hook.id, event }));
+    const lines = [`${event}: ${run.verdict}`];
+    if (run.failure) lines.push(`failed: ${run.failure}`);
+    if (run.stderr) lines.push(run.stderr.trimEnd());
+    result.textContent = lines.join("\n");
+    result.dataset.state = run.failure ? "error" : run.verdict === "allow" ? "ok" : "warn";
+  } catch (error) {
+    result.textContent = `${event}: ${error.message}`;
+    result.dataset.state = "error";
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function upsertMcpConfig(content, server) {
   let next = removeMcpConfig(content, server.id);
   const set = (field, value) =>
@@ -4096,7 +4368,14 @@ function appendChatMessage(role, content) {
   // the role visually, and a printed label cost 22px on every message.
   const label = document.createElement("div");
   label.className = "visually-hidden";
-  label.textContent = role === "assistant" ? "Assistant" : role === "user" ? "You" : "System";
+  label.textContent =
+    role === "assistant"
+      ? "Assistant"
+      : role === "user" || role === "answer"
+        ? "You"
+        : role === "question"
+          ? "Assistant question"
+          : "System";
 
   const body = document.createElement("div");
   body.className = "message-body";
@@ -4409,7 +4688,35 @@ function renderMessages(messages, tasks = []) {
   const usageByTask = new Map(
     tasks.filter((task) => typeof task.inputTokens === "number").map((task) => [task.id, task]),
   );
-  return messages.map((message) => {
+  return messages.map((message, index) => {
+    if (message.role === "question") {
+      // The answer event immediately follows its question in the log, so the
+      // next message is what settles this card. Options ride on the question
+      // message from `/api/session`; without them a reload could show the text
+      // but could not answer it.
+      const next = messages[index + 1];
+      const answered =
+        next && next.role === "answer" && next.taskId === message.taskId ? next.content : null;
+      const article = document.createElement("article");
+      article.className = "message question";
+      if (message.seq) article.dataset.seq = message.seq;
+      const label = document.createElement("div");
+      label.className = "visually-hidden";
+      label.textContent = "Assistant question";
+      const card = createQuestionCard(
+        {
+          questionId: message.id,
+          question: message.content,
+          options: message.options || [],
+          allowFreeText: message.allowFreeText === true,
+        },
+        repo(),
+        { answered },
+      );
+      article.append(label, card);
+      $("chat-log").append(article);
+      return { message, bubble: { message: article, body: card } };
+    }
     const bubble = appendChatMessage(message.role, message.content);
     if (message.seq) bubble.message.dataset.seq = message.seq;
     if (message.role === "user") {
@@ -4781,6 +5088,30 @@ function createReattachedApprovalCard(approval) {
       "closed rather than rebuilt from partial data — approving a command Damaian is " +
       "guessing at would be worse than losing the turn.";
     wrapper.append(eyebrow, headline, note);
+    return wrapper;
+  }
+
+  // A question reattached after a crash is answered by the same card a live or
+  // reloaded question uses. It carries no proposal id, so nothing here can
+  // reach a command or patch endpoint; answering resumes the paused turn
+  // through `/api/answer-question-stream`.
+  if (approval.kind === "question") {
+    const payload = approval.payload || {};
+    headline.textContent = payload.headline || "A question was waiting for your answer";
+    note.textContent = "Answering continues the turn that asked it. It authorises nothing.";
+    wrapper.append(eyebrow, headline, note);
+    wrapper.append(
+      createQuestionCard(
+        {
+          questionId: payload.questionId,
+          question: payload.question,
+          options: payload.options,
+          allowFreeText: payload.allowFreeText,
+        },
+        repo(),
+        { answered: payload.answered ? (payload.answer?.answer ?? "") : null },
+      ),
+    );
     return wrapper;
   }
 
@@ -7582,6 +7913,7 @@ const FINDING_SOURCE_LABELS = {
   browser_scenario: "Browser scenario",
   code_review: "Code review",
   language_server: "Language server",
+  hook: "Hook",
   command: "Unparsed checks",
 };
 
@@ -8166,7 +8498,7 @@ async function renameSessionForProject(projectPath, session) {
 
 async function deleteSessionForProject(projectPath, session) {
   if (!(await confirmDialog("Delete this session?", ""))) return;
-  await api("/api/session-delete", form({ session_id: session.id }));
+  await api("/api/session-delete", form({ session_id: session.id, repo: projectPath }));
   const normalized = normalizeProjectPath(projectPath);
   if (normalized === repo() && currentSessionId === session.id) {
     localStorage.removeItem(lastSessionStorageKey(normalized));
@@ -8419,6 +8751,187 @@ async function appendGitStatusAfterChange(repoPath) {
   appendChatMessage("system", renderGitStatusText(payload));
 }
 
+// Spec 50's question card. It deliberately shares no class with
+// `.command-approval`: no header, no risk badge, no footer and no primary
+// action. Every option is `.btn-sm` at the same weight because no answer is
+// the safe one, and nothing is focused or pre-selected.
+//
+// `answered` is the recorded answer when the card is rebuilt from the
+// transcript or a recovered turn; `null` means it is still open.
+function createQuestionCard(question, questionRepo, { answered = null } = {}) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "question-card";
+  wrapper.dataset.questionId = question.questionId || "";
+  wrapper.dataset.answered = answered === null ? "false" : "true";
+
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "question-card-eyebrow";
+  eyebrow.textContent = "Question";
+
+  const text = document.createElement("p");
+  text.className = "question-card-question";
+  text.textContent = question.question || "";
+
+  const options = document.createElement("div");
+  options.className = "question-card-options";
+
+  const answer = document.createElement("p");
+  answer.className = "question-card-answer";
+  answer.hidden = answered === null;
+  answer.textContent = answered === null ? "" : `You answered: ${answered}`;
+
+  const status = document.createElement("p");
+  status.className = "question-card-status";
+  status.hidden = true;
+
+  const controls = [];
+  const setDisabled = (disabled) => {
+    controls.forEach((control) => {
+      control.disabled = disabled;
+    });
+  };
+  const settle = (value) => {
+    wrapper.dataset.answered = "true";
+    answer.hidden = false;
+    answer.textContent = `You answered: ${value}`;
+    status.hidden = true;
+    status.textContent = "";
+    setDisabled(true);
+  };
+
+  wrapper.append(eyebrow, text);
+
+  if (Array.isArray(question.options)) {
+    question.options.forEach((label, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "btn-sm";
+      button.textContent = label;
+      button.addEventListener("click", () => void submit(label, index));
+      controls.push(button);
+      options.append(button);
+    });
+  }
+  wrapper.append(options);
+
+  if (question.allowFreeText) {
+    const row = document.createElement("div");
+    row.className = "question-card-free-text";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "Type an answer…";
+    input.setAttribute("aria-label", "Your answer");
+    const send = document.createElement("button");
+    send.type = "button";
+    send.className = "btn-sm";
+    send.textContent = "Send";
+    send.addEventListener("click", () => {
+      const value = input.value.trim();
+      if (!value) {
+        input.focus();
+        return;
+      }
+      void submit(value, null);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        send.click();
+      }
+    });
+    controls.push(input, send);
+    row.append(input, send);
+    wrapper.append(row);
+  }
+
+  wrapper.append(answer, status);
+  if (answered !== null) setDisabled(true);
+
+  async function submit(value, selectedOption) {
+    if (chatSubmitting) {
+      toast("A turn is already running");
+      return;
+    }
+    setDisabled(true);
+    status.hidden = false;
+    status.textContent = "Answering…";
+    // The engine records the answer before it resumes, so show it the way a
+    // reload will: as a user-side reply after the question.
+    appendChatMessage("answer", value);
+    const assistantMessage = appendChatMessage("assistant", "");
+    const indicator = startTurnIndicator(assistantMessage);
+    let assistantText = "";
+    let streamError = null;
+    chatSubmitting = true;
+    setComposerBusy(true);
+    try {
+      await streamResumeAnswerRequest(
+        {
+          repo: questionRepo,
+          question_id: question.questionId,
+          answer: value,
+          selected_option: selectedOption === null ? "" : String(selectedOption),
+        },
+        {
+          phase(payload) {
+            indicator.phase(payload);
+          },
+          plan(planPayload) {
+            renderPlanPanel(assistantMessage, planPayload);
+          },
+          webDiagnostic(record) {
+            sessionHasRecordedDiagnostics = true;
+            renderWebDiagnosticCard(assistantMessage, record);
+          },
+          token(token) {
+            assistantText += token;
+            updateChatMessage(assistantMessage, assistantText);
+            indicator.streaming();
+          },
+          done(payload) {
+            if (payload.response && payload.response !== assistantText) {
+              assistantText = payload.response;
+              updateChatMessage(assistantMessage, assistantText);
+            }
+            appendProposals(assistantMessage, payload, questionRepo);
+            if (payload.sessionId) {
+              currentSessionId = payload.sessionId;
+              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+            }
+            appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            markMessageUsage(assistantMessage, payload.usage);
+            indicator.finish(chatCompletionState(payload));
+            markMessageTurnStop(assistantMessage, payload);
+          },
+          error(payload) {
+            streamError = new Error(payload.error || "Answer failed");
+          },
+        },
+      );
+    } catch (error) {
+      streamError = error;
+    } finally {
+      indicator.finish("failed");
+      chatSubmitting = false;
+      setComposerBusy(false);
+    }
+    if (streamError) {
+      // The card stays open: the engine puts the pause back on a refusal, so a
+      // second attempt is still the same question rather than a new one.
+      renderChatMessageError(assistantMessage, streamError);
+      status.textContent = streamError.message;
+      setDisabled(false);
+      return;
+    }
+    settle(value);
+    await loadSessions(currentSessionId, false);
+    await refreshFindings();
+    void refreshRepoBar();
+  }
+
+  return wrapper;
+}
+
 // Appends whatever proposals a finished chat turn carries. Shared by every
 // `done` handler: a turn can end with a command awaiting approval, a patch
 // awaiting review, or neither, and each handler must treat all of them the
@@ -8441,6 +8954,9 @@ function appendProposals(message, payload, repo) {
   }
   if (payload.roundBudgetProposal) {
     message.body.append(createRoundBudgetOffer(payload.roundBudgetProposal, repo));
+  }
+  if (payload.questionProposal) {
+    message.body.append(createQuestionCard(payload.questionProposal, repo));
   }
 }
 
@@ -8997,6 +9513,9 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
   const state = {
     patchId: payload.patchId,
     initialFileCount: (payload.files || []).length,
+    // Warnings a hook returned on an apply (spec 32 Task 9). They are not a
+    // reason to roll back, so they stay beside the applied files.
+    hookWarnings: [],
     files: (payload.files || []).map((file) => {
       const stats = diffStats(file.diff);
       return {
@@ -9251,6 +9770,22 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
     });
 
     const hasPending = state.files.some((file) => file.state === "pending");
+    if (state.hookWarnings.length) {
+      const notice = document.createElement("div");
+      notice.className = "patch-hook-warnings";
+      const heading = document.createElement("strong");
+      heading.textContent =
+        state.hookWarnings.length === 1
+          ? "A hook reported on this apply"
+          : "Hooks reported on this apply";
+      notice.append(heading);
+      state.hookWarnings.forEach((warning) => {
+        const line = document.createElement("p");
+        line.textContent = warning;
+        notice.append(line);
+      });
+      list.append(notice);
+    }
     applyButton.disabled = !hasPending;
     rejectButton.disabled = !hasPending;
     $("chat-log").scrollTop = $("chat-log").scrollHeight;
@@ -9284,6 +9819,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
         return;
       }
 
+      state.hookWarnings = Array.isArray(result.hookWarnings) ? result.hookWarnings : [];
       const applied = result.appliedFiles || [];
       markFiles(applied, "applied");
       await reportResolvedIfSettled();
@@ -9363,9 +9899,28 @@ function createCommandApprovalPreview(
   meta.dataset.blocked = proposal.blocked ? "true" : "false";
   header.append(title, meta);
 
+  // The policy's deciding cause and the agent's own reason sit outside the
+  // rationale disclosure (spec 62 §5.2). They are what tells the user whether
+  // a prompt is routine before they spend attention opening "Why this
+  // command"; that disclosure still carries the full prompt, every cause.
+  // MCP and browser-diagnostic proposals have neither field set, so both lines
+  // stay hidden rather than showing an empty label.
+  const cause = document.createElement("p");
+  cause.className = "command-approval-cause";
+  cause.textContent = proposal.cause || "";
+  cause.hidden = !proposal.cause;
+
   const command = document.createElement("code");
   command.className = "command-approval-command";
   command.textContent = proposal.command || "";
+
+  const agentReason = document.createElement("p");
+  agentReason.className = "command-approval-reason";
+  if (proposal.reason) {
+    agentReason.textContent = `The agent says: ${proposal.reason}`;
+  } else {
+    agentReason.hidden = true;
+  }
 
   // The card payload comes from `chat.rs`'s `AgentCommandProposal`, which
   // carries no working directory (spec 24 Task 8), so the shell reads it from
@@ -9643,7 +10198,7 @@ function createCommandApprovalPreview(
   });
 
   footer.append(disclosure, actions);
-  wrapper.append(header, command, location, details, footer, output);
+  wrapper.append(header, cause, command, agentReason, location, details, footer, output);
   return wrapper;
 }
 
@@ -9726,6 +10281,12 @@ async function streamResumeCommandRequest(data, handlers) {
 // rather than posting the decision somewhere that would not carry it.
 async function streamResumePlanRequest(data, handlers) {
   return streamRequest("/api/resume-plan-stream", null, data, handlers);
+}
+
+// Like a plan decision, answering a question *is* a turn, so there is no
+// one-shot endpoint to fall back to.
+async function streamResumeAnswerRequest(data, handlers) {
+  return streamRequest("/api/answer-question-stream", null, data, handlers);
 }
 
 // Like a plan decision, answering a fallback offer *is* a turn, so there is no

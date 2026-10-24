@@ -3878,7 +3878,11 @@ fn chat_returns_command_approval_when_command_exits_sandbox() {
     assert!(proposal.requires_approval);
     // The UI needs this to decide whether to offer "allow always".
     assert!(proposal.allow_always);
-    assert!(result.response.contains("approval"));
+    assert!(
+        result.response.starts_with("Asks first:"),
+        "{}",
+        result.response
+    );
     // The task is paused awaiting a human decision, not finished — a prior
     // bug marked it Complete even though the model never got to answer.
     assert_eq!(result.task.status.as_str(), "waiting_for_approval");
@@ -3887,6 +3891,233 @@ fn chat_returns_command_approval_when_command_exits_sandbox() {
             .chat_orchestrator
             .has_pending_chat_command(&proposal.id)
     );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Spec 62 Task 3: the first line of an approval prompt is the policy's own
+/// reason, not one sentence about a sandbox; a blocked command says what
+/// blocked it and offers no approval at all.
+#[test]
+fn command_proposal_response_leads_with_the_deciding_cause() {
+    let repo = temp_dir("chat-approval-cause");
+    write_fixture(&repo, "README.md", "# Approval cause\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut on_token = |_token: &str| {};
+
+    let mut shell_control = MockModelAdapter::new(
+        "DAMAIAN_COMMAND_V1\nCOMMAND: git status && git diff | head\nREASON: Compare state.\nEND_COMMAND\n",
+    );
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Compare the working tree with the index.",
+            &[],
+            &mut shell_control,
+            &mut on_token,
+        )
+        .unwrap();
+    let first_line = result
+        .response
+        .lines()
+        .next()
+        .expect("an approval prompt has a first line");
+    assert!(first_line.starts_with("Asks first:"), "{}", result.response);
+    assert!(first_line.contains("`&&`"), "{}", result.response);
+    assert!(first_line.contains("`|`"), "{}", result.response);
+    assert!(
+        result.response.contains("git status && git diff | head"),
+        "{}",
+        result.response
+    );
+    assert!(
+        !first_line.to_lowercase().contains("sandbox"),
+        "{}",
+        result.response
+    );
+
+    let mut config = test_config(&repo);
+    config.command_blocklist.push("echo forbidden".to_string());
+    let engine = WorkspaceEngine::new(config);
+    let mut blocked = MockModelAdapter::new(
+        "DAMAIAN_COMMAND_V1\nCOMMAND: echo forbidden\nREASON: Try it anyway.\nEND_COMMAND\n",
+    );
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Try the blocked command.",
+            &[],
+            &mut blocked,
+            &mut on_token,
+        )
+        .unwrap();
+    assert!(
+        result.response.starts_with("Blocked: matches"),
+        "{}",
+        result.response
+    );
+    assert!(
+        result.response.contains("`echo forbidden`"),
+        "{}",
+        result.response
+    );
+    assert!(
+        result.response.contains("will not run"),
+        "{}",
+        result.response
+    );
+    assert!(!result.response.contains("approval"), "{}", result.response);
+    let proposal = result
+        .command_proposal
+        .expect("a blocked command still yields proposal metadata");
+    assert!(proposal.blocked);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Spec 62 requirement 4: nothing shown to the user or sent to the model about
+/// local commands claims a sandbox exists. The turn covers the system prompt,
+/// the native tool descriptions, the approval prompt and its prompt text, an
+/// auto-run command's result, and the audit status this task renames.
+#[test]
+fn no_local_command_string_shown_or_sent_contains_sandbox() {
+    let repo = temp_dir("chat-local-command-wording");
+    write_fixture(&repo, "README.md", "# Local command wording\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut on_token = |_token: &str| {};
+
+    let mut approval = MockModelAdapter::new(
+        "DAMAIAN_COMMAND_V1\nCOMMAND: git status && git diff\nREASON: Compare state.\nEND_COMMAND\n",
+    );
+    let result = engine
+        .chat_orchestrator
+        .ask(&repo, "Compare state.", &[], &mut approval, &mut on_token)
+        .unwrap();
+    let proposal = result
+        .command_proposal
+        .expect("shell control needs approval");
+    assert!(!result.response.to_lowercase().contains("sandbox"));
+    assert!(
+        !proposal.prompt.to_lowercase().contains("sandbox"),
+        "{}",
+        proposal.prompt
+    );
+    for message in engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap()
+    {
+        assert!(
+            !message.content.to_lowercase().contains("sandbox"),
+            "{message:?}"
+        );
+    }
+    let request = &approval.requests[0];
+    assert!(
+        !request.messages[0]
+            .content
+            .to_lowercase()
+            .contains("sandbox")
+    );
+    let tools = request.tools.as_ref().expect("native tools are offered");
+    assert!(tools.iter().any(|tool| tool.name == "run_command"));
+    for tool in tools {
+        assert!(
+            !tool.description.to_lowercase().contains("sandbox"),
+            "{}: {}",
+            tool.name,
+            tool.description
+        );
+    }
+
+    let mut auto_run = MockModelAdapter::new_sequence(vec![
+        "DAMAIAN_COMMAND_V1\nCOMMAND: pwd\nREASON: Inspect the working directory.\nEND_COMMAND\n"
+            .to_string(),
+        "The working directory was inspected.".to_string(),
+    ]);
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Print the working directory.",
+            &[],
+            &mut auto_run,
+            &mut on_token,
+        )
+        .unwrap();
+    assert!(result.command_proposal.is_none());
+    for message in engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap()
+    {
+        assert!(
+            !message.content.to_lowercase().contains("sandbox"),
+            "{message:?}"
+        );
+    }
+    for request in &auto_run.requests {
+        for message in &request.messages {
+            assert!(
+                !message.content.to_lowercase().contains("sandbox"),
+                "a command turn sent sandbox to the model: {message:?}"
+            );
+        }
+    }
+    let audit =
+        fs::read_to_string(repo.join(".damaian").join("audit").join("events.jsonl")).unwrap();
+    assert!(!audit.to_lowercase().contains("sandbox"), "{audit}");
+    assert!(audit.contains("complete_with_command"), "{audit}");
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Spec 62 §5.3: the model is told what actually happens to a command it
+/// requests — a short list of read-only commands runs without asking, and
+/// everything else waits for the user's approval.
+#[test]
+fn the_auto_run_description_says_the_policy_runs_it_without_asking() {
+    let repo = temp_dir("chat-auto-run-description");
+    write_fixture(&repo, "README.md", "# Auto-run description\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new(
+        "DAMAIAN_COMMAND_V1\nCOMMAND: git status && git diff\nREASON: Compare state.\nEND_COMMAND\n",
+    );
+    let mut on_token = |_token: &str| {};
+
+    engine
+        .chat_orchestrator
+        .ask(&repo, "Compare state.", &[], &mut adapter, &mut on_token)
+        .unwrap();
+
+    let request = &adapter.requests[0];
+    let system_prompt = &request.messages[0].content;
+    assert!(
+        system_prompt.contains("runs a short list of read-only commands without asking"),
+        "{system_prompt}"
+    );
+    assert!(!system_prompt.contains("sandbox-safe"), "{system_prompt}");
+    let run_command = request
+        .tools
+        .as_ref()
+        .expect("native tools are offered")
+        .iter()
+        .find(|tool| tool.name == "run_command")
+        .expect("run_command is offered");
+    assert!(
+        run_command
+            .description
+            .contains("runs a short list of read-only commands without asking"),
+        "{}",
+        run_command.description
+    );
+    assert!(!run_command.description.contains("sandbox-safe"));
 
     fs::remove_dir_all(repo).unwrap();
 }
@@ -3996,7 +4227,11 @@ fn chat_resumes_after_command_approval_and_answers_using_the_result() {
     // summary, tool result, final assistant answer (from the resumed turn).
     assert_eq!(messages.len(), 5);
     assert_eq!(messages[0].role, "user");
-    assert!(messages[1].content.contains("approval"));
+    assert!(
+        messages[1].content.starts_with("Asks first:"),
+        "{}",
+        messages[1].content
+    );
     assert_eq!(messages[3].role, "tool");
     assert!(messages[3].content.contains("hello-from-sandbox"));
     assert_eq!(messages[4].content, resumed.response);

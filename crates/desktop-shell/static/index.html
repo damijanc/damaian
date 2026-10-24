@@ -377,6 +377,11 @@
               <span class="settings-nav-icon server-icon" aria-hidden="true"></span>
               <span>MCP Servers</span>
             </button>
+            <p class="settings-nav-group">Hooks</p>
+            <button class="settings-nav-item" type="button" data-settings-page="hooks">
+              <span class="settings-nav-icon hook-icon" aria-hidden="true"></span>
+              <span>Hooks</span>
+            </button>
             <button class="settings-nav-item active" type="button" data-settings-page="providers">
               <span class="settings-nav-icon provider-icon" aria-hidden="true"></span>
               <span>Providers</span>
@@ -672,6 +677,23 @@
                 <button id="mcp-remove-btn" class="btn-danger" type="button">Remove</button>
               </div>
               <p id="mcp-test-result" class="key-status" data-state=""></p>
+            </div>
+          </section>
+        </section>
+
+        <section id="settings-page-hooks" class="settings-page" data-page="hooks">
+          <h2 class="settings-page-title">Hooks</h2>
+          <p class="settings-page-hint">
+            A hook is a program you configure to check a lifecycle step — a tool call, a patch
+            apply, a check, or the start or end of a session. It answers with a verdict: allow,
+            warn, ask for approval, or deny. It can never grant more than your mode and permission
+            profile already allow. A hook this repository defines does not run until you review it,
+            and stops running if it changes.
+          </p>
+          <section class="settings-section">
+            <h3>Configured hooks</h3>
+            <div id="hook-list" class="settings-list-card">
+              <div class="provider-empty-row">Loading hooks…</div>
             </div>
           </section>
         </section>

@@ -47,6 +47,7 @@ This build is a developer preview. Release builds are Developer ID signed and no
 
 - [Worker Sessions](#worker-sessions)
 - [MCP Servers](#mcp-servers)
+- [Hooks](#hooks)
 - [Browser Diagnostics](#browser-diagnostics)
 - [Findings](#findings)
 - [Provider Limits and Retries](#provider-limits-and-retries)
@@ -68,7 +69,7 @@ The first installed version must already include the updater. If you installed a
 
 ## Settings
 
-Open Settings with `⌘,` or **Damaian › Settings...**; Escape or **×** closes it. It opens on **Providers**, and its other pages are **General**, **Shortcuts**, **Checkpoints**, **MCP Servers** and **Models**. Your user configuration is under **General › User configuration**: edit it and select **Save**, or select **Load** to re-read the file from disk.
+Open Settings with `⌘,` or **Damaian › Settings...**; Escape or **×** closes it. It opens on **Providers**, and its other pages are **General**, **Shortcuts**, **Checkpoints**, **MCP Servers**, **Hooks** and **Models**. Your user configuration is under **General › User configuration**: edit it and select **Save**, or select **Load** to re-read the file from disk.
 
 These are your user-scope settings, and they are kept in one file:
 
@@ -338,6 +339,11 @@ the same terms as a whole-file `propose_patch`. A large file read is reported as
 a range with the file's real line count ("lines 1–400 of 4420"), so a truncated
 result says so rather than reading as the whole file.
 
+`ask_user` is offered alongside them. It lets the assistant ask you one short
+question in the middle of a turn and carry on with your answer; it changes
+nothing by itself, and it is available only where a user can answer (see
+[When the assistant asks you a question](#when-the-assistant-asks-you-a-question)).
+
 The agent can also read the repository's git worktrees without asking.
 `list_worktrees` lists every worktree git has registered for the repository —
 each one's path, branch (or `detached`), short `HEAD`, count of changed files,
@@ -361,6 +367,37 @@ way.
 
 When one model message asks for several read-only tools, they run together and
 their results are reported in the order the model asked for them.
+
+### When the assistant asks you a question
+
+If the request is ambiguous and guessing would spend the turn on the wrong
+reading, the assistant can pause and ask you one short question — "Did you mean
+the CLI or the shell?" — instead of ending the turn. The question appears as a
+card in the assistant's message with two to four suggested answers, plus a
+free-text field when the question allows one. Answer by clicking an option or
+typing a reply and selecting **Send**; the turn then continues with your answer,
+carrying everything it had already read.
+
+- **Answering a question authorises nothing.** It is not an approval. A command,
+  a patch or a configuration change that follows still asks for its own approval
+  on the usual terms, even when your answer was "yes, go ahead".
+- **You can leave it unanswered.** Nothing times out and Damaian never picks an
+  answer for you. The task stays waiting — including after a reload or a crash —
+  until you answer it.
+- **The question and its options are redacted** before they are stored or shown,
+  on the same terms as other model output, so a question quoting a config file
+  cannot carry a key into the transcript. What you type in reply is redacted
+  before it is recorded and sent back to the model. Your own prompt to Damaian
+  is still stored and sent as you typed it, as before.
+- **A question appears only in an interactive desktop conversation.** The
+  command-line tool, the evaluation harness, worker sessions and any unattended
+  run have no one to answer, so `ask_user` is not offered there at all and the
+  assistant proceeds under a stated assumption instead.
+- **Asking is bounded.** Two questions per turn by default
+  (`agent_max_questions_per_turn`, ceiling 4), and each one uses a tool round. A
+  third question in the same turn is refused, and the assistant is told so and
+  carries on. An unanswered question simply waits; an answered one is never
+  asked again.
 
 ## File Changes
 
@@ -654,10 +691,10 @@ Read-only still lets Code mode make and advance a plan (`propose_plan`,
 ### What `local` and Offline private cannot promise
 
 **`local` means no command Damaian recognises as networked.** That is a name
-heuristic, not a sandbox. Damaian recognises `curl`, `wget`, `npm`, `pnpm`,
-`yarn`, `pip`, `docker`, and `git pull`/`push`/`fetch`/`clone`. A command it
-does not recognise, such as `python -c` with `urllib`, can still reach the
-network. Because the check reads the command name, `local` also blocks every
+heuristic, not a security boundary. Damaian recognises `curl`, `wget`, `npm`,
+`pnpm`, `yarn`, `pip`, `docker`, and `git pull`/`push`/`fetch`/`clone`. A
+command it does not recognise, such as `python -c` with `urllib`, can still
+reach the network. Because the check reads the command name, `local` also blocks every
 `npm`, `pnpm` and `yarn` command, `npm test` and `npm run …` included, while
 `cargo test` is allowed.
 
@@ -785,7 +822,7 @@ characters.
 
 ## Command Approval
 
-When the assistant needs a local command result, it asks Damaian to run the command. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, and `git log`, run without asking, in the selected working folder. They are not sandboxed: they run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Simple pipelines made only of such commands, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
+When the assistant needs a local command result, it asks Damaian to run the command. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, and `git log`, run without asking, in the selected working folder. They run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Simple pipelines made only of such commands, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
 
 ### What runs without asking
 
@@ -835,7 +872,7 @@ So `git log --oneline | grep -i fix | wc -l` and
 rm x`, `git log > out.txt` and `ls | xargs cat` do not: `;`, `>` and a filter
 with a file argument are outside the admitted shape.
 
-Every other command appears as an approval card in the conversation. Review the command, risk, and working directory (the reason is under **Why this command**), then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
+Every other command appears as an approval card in the conversation. Its first line names why Damaian is asking — which shell-control characters, network keyword, restricted path, setting, or [hook](#hooks) — and the same reason appears on the card beside the risk badge. **Why this command** holds the full prompt with every reason, and, when the agent gave one, **The agent says: …** is the agent's own stated purpose for the command. Review the command, risk, working directory and both reasons, then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
 
 Docker commands, including `docker ps`, `docker compose ...`, and `docker-compose ...`, always ask for approval. They can inspect or change a privileged local daemon, use the network, start background services, mount host paths, expose ports, and mutate images or volumes, so Damaian never treats them as read-only.
 
@@ -966,6 +1003,266 @@ Two checkboxes follow. **Enabled — offer this server's tools to the assistant*
 
 Which MCP tools a session may call also depends on its [working mode](#working-modes) and the repository's [permission profile](#permission-profiles): a tool its server does not mark read-only is offered only in Code mode. A repository can turn MCP or a server off, never on.
 
+## Hooks
+
+A **hook** is a program that runs at one of nine points in a session and
+answers with a verdict. It is how you enforce a local rule Damaian does not
+know about: "never touch `migrations/`", "run `cargo fmt --check` before a task
+is called complete", "ask me before a patch adds a dependency". `AGENTS.md` can
+*ask* the model to follow a rule; a hook can refuse the action when it does
+not.
+
+**A hook can only narrow.** It may allow, warn, ask you to approve, or deny an
+action. There is deliberately no verdict that grants anything, so a hook cannot
+undo a working mode or a permission profile. A broken **mandatory** hook
+blocks the action; it is never skipped. Hooks run in every mode and under every
+profile, because a rule like "never touch `migrations/`" must keep working in
+Ask mode too.
+
+A hook is an external program, not a model instruction and not an in-process
+plugin. It receives paths, ids and metadata, never file content, patch content
+or your prompt. The model never sees a hook's stderr.
+
+### The nine events
+
+| Event | When it runs | What a hook sees |
+|---|---|---|
+| `session_start` | Before a new session is created. A denial refuses the turn and creates nothing | `{}` |
+| `before_context` | Before context is assembled, in a chat turn and in a one-shot edit | `{ flow, explicitPaths }` |
+| `before_tool` | Before one tool call is dispatched. A denial refuses that call and the turn continues | `{ tool, paths }`, plus the command, MCP server/tool or diagnostic URL where they apply |
+| `after_tool` | After one tool call or approval resume finishes. It observes; nothing is undone | The same fields, plus `outcome`, and for a command `exitCode` and `termination` |
+| `before_patch_apply` | When you apply a previewed patch, before anything is written | `{ patchId, files }` |
+| `after_patch_apply` | After a patch is applied and recorded. It observes; nothing is rolled back | `{ patchId, files, appliedFiles }` |
+| `after_check` | After a validation command's findings are recorded (not for the standalone Run Command endpoint, which records none) | `{ command, exitCode, termination, findingIds }` |
+| `before_task_complete` | When the model has answered and the task is about to complete, not at a pause | `{ rounds, filesChanged }` |
+| `session_end` | When you delete a session. It only observes; a denial is a warning and does not stop the delete | `{}` |
+
+`before_task_complete` is not dispatched when you answer **Answer now** at the
+round budget, because that is your own decision to end the turn and needs no
+extra round. `before_tool` is the one event a question (`ask_user`) sees, and
+`request_approval` there refuses the question: an answer is not an approval.
+
+Some events have nothing to approve or nothing left to undo. What each verdict
+means at each event is in [What a verdict means](#what-a-verdict-means) below.
+
+### Configuring a hook
+
+Hooks use the same flat key format as the rest of Damaian's config. Put them in
+your user config (`<data_dir>/config/user.conf`) or in a repository's
+`.damaian/config.conf`:
+
+```text
+hook.no_migrations.command=/bin/sh
+hook.no_migrations.args=/Users/me/bin/no-migrations.sh
+hook.no_migrations.events=before_patch_apply|before_tool
+hook.no_migrations.mode=mandatory
+hook.no_migrations.order=10
+hook.no_migrations.timeout_ms=2000
+hook.no_migrations.enabled=true
+```
+
+| Key | Meaning |
+|---|---|
+| `hook.<id>.command` | The executable. Required. A user hook is an absolute path or a name found on `PATH`; a repository hook's command must resolve inside the repository or be an absolute system path |
+| `hook.<id>.args` | Arguments, separated by `\|`. An argument may contain a space |
+| `hook.<id>.events` | One or more of the nine events, separated by `\|`. Required |
+| `hook.<id>.mode` | `mandatory` (default) or `optional` |
+| `hook.<id>.order` | An integer, default `0`. Hooks run by `order`, then by id |
+| `hook.<id>.timeout_ms` | A deadline in milliseconds, `1`–`60000`. Defaults: 2,000 for `session_start`, `before_context` and `before_tool`; 5,000 for `session_end`; 10,000 for the other five |
+| `hook.<id>.enabled` | `true` (default) or `false`. A repository may switch off a hook it defined; it cannot switch off yours |
+
+The id is `[a-z0-9_]{1,40}`. Every configured hook appears in **Settings ›
+Hooks**, which shows its source, events, command line, whether it is active,
+and whether a failure blocks or warns. A user hook has an **Enabled** toggle
+there; a repository hook is switched by review instead.
+
+### Writing a hook
+
+The hook is run directly, not through your login shell. It gets the event as
+one JSON object on standard input:
+
+```json
+{
+  "event": "before_patch_apply",
+  "hookApiVersion": 1,
+  "sessionId": "session_...",
+  "taskId": "task_...",
+  "mode": "code",
+  "profile": "full",
+  "repositoryRoot": "/Users/me/work/app",
+  "hookDepth": 0,
+  "payload": {
+    "patchId": "patch_...",
+    "files": [{ "path": "migrations/003_add_index.sql", "status": "modified" }]
+  }
+}
+```
+
+It answers on standard output with exit status 0:
+
+```json
+{
+  "hookApiVersion": 1,
+  "verdict": "deny",
+  "reason": "migrations/ is applied by the release process, not by hand",
+  "findings": [],
+  "context": []
+}
+```
+
+- Empty output (whitespace only) is `allow`. Any other output must be one JSON
+  object with `hookApiVersion: 1`.
+- `verdict` is `allow`, `warn`, `request_approval` or `deny`; absent means
+  `allow`. `reason` is required for `deny` and `request_approval`.
+- `findings` are ordinary Damaian findings with source **Hook**. `context` is
+  accepted only at `session_start` and `before_context`, where it enters the
+  turn as a bounded `hook_context` item. `commands` asks Damaian to run a local
+  command (see below).
+- The response is a closed schema. An unknown field, an unrecognised verdict,
+  an unknown `hookApiVersion`, malformed JSON, output over 64 KiB, a non-zero
+  exit or a timeout is a failure, not a quiet `allow`. A hook that tries to
+  widen is recorded as a widening attempt and then treated as malformed.
+- Output is bounded and redacted before Damaian shows or stores it: 64 KiB of
+  stdout, a 1,000-character `reason`, 20 findings, 4 context entries of 4,000
+  characters each, and 3 commands. stderr is kept to its last 8 KiB, redacted, and shown only to you.
+
+The process gets a **cleared environment**: `PATH`, `HOME`, `USER`, `LANG` and
+`TMPDIR` if set, plus `DAMAIAN_HOOK_ID`, `DAMAIAN_HOOK_EVENT` and
+`DAMAIAN_REPOSITORY_ROOT`. It does not get your model API key or any MCP
+token. It runs in the repository root, whatever the session's working mode or
+profile is.
+
+### What a verdict means
+
+Each event maps the four verdicts onto what it can actually do:
+
+| Event | `deny` | `request_approval` | `warn` |
+|---|---|---|---|
+| `session_start` | The turn is refused before a session exists, and the reason is shown | Treated as `deny` | Proceed, warning finding |
+| `before_context` | The turn fails with the reason as the assistant message | Treated as `deny` | Proceed, warning finding |
+| `before_tool`, command | No proposal is stored; the tool result names the hook and reason | The command is forced to an approval card, with the hook's reason on it; a blocked command stays blocked | Proceed, warning finding |
+| `before_tool`, MCP call or diagnostic | The call is refused and the turn continues | The call takes an approval card even if it would have run unasked | Proceed, warning finding |
+| `before_tool`, patch or edit | The call is refused; no patch is stored | Satisfied by the existing review step; recorded as a warning | Proceed, warning finding |
+| `before_tool`, any other tool | The call is refused | Treated as `deny`: there is no approval step to move it to. A question (`ask_user`) is refused | Proceed, warning finding |
+| `before_patch_apply` | The apply is refused; nothing is written | Satisfied, because applying is your own action; recorded as a warning | Warning on the result; the apply proceeds |
+| `before_task_complete` | The task does not complete; the reason goes to the model, which gets another round within the existing budget | Treated as `deny` | Complete, warning finding |
+| `after_tool`, `after_patch_apply`, `after_check` | Nothing is undone. An error finding; at `after_tool` the reason is also appended to the tool result | Treated as `warn` | Warning finding |
+| `session_end` | Treated as `warn`. Audit only | Treated as `warn` | Audit only |
+
+A failure follows the same direction: a **mandatory** hook's failure (non-zero
+exit, timeout, malformed output, version mismatch, output too large, a spawn
+failure, or `changed_since_review`) becomes `deny`; an **optional** hook's
+failure becomes a warning and the action proceeds.
+
+`deny` short-circuits the remaining hooks for that event. The others run, and
+the strongest verdict wins: `deny` > `request_approval` > `warn` > `allow`,
+regardless of order. So a later hook can still deny an action an earlier one
+merely asked about.
+
+### Mandatory is the default
+
+A user who writes a hook to enforce a rule wants the rule enforced when the
+hook itself is broken, not silently skipped. So `mode` defaults to
+`mandatory`, and a timeout, a typo in the script, a crash or malformed output
+blocks the action. Use `mode=optional` for advice: a linter, a notifier, or
+anything that should never stop your work.
+
+The choice is per hook and shown as **If it fails: blocks** or **If it fails:
+warns** in Settings, so "what happens if this breaks?" is answerable without
+reading the config.
+
+### A worked example: `cargo fmt` before completion
+
+The useful way to require a check is for the hook to run it and deny when it
+fails. The denial sends the reason back to the model, which gets another round
+and can fix the problem:
+
+```sh
+#!/bin/sh
+# ~/bin/no-unformatted.sh
+if cargo fmt --all -- --check >/dev/null 2>&1; then
+  printf '%s\n' '{"hookApiVersion":1,"verdict":"allow"}'
+else
+  printf '%s\n' '{"hookApiVersion":1,"verdict":"deny","reason":"cargo fmt --check failed; run cargo fmt --all"}'
+fi
+```
+
+```text
+hook.fmt.command=/bin/sh
+hook.fmt.args=/Users/me/bin/no-unformatted.sh
+hook.fmt.events=before_task_complete
+```
+
+No executable bit is needed because `/bin/sh` reads the script. The check runs
+as your own trusted program, outside the mode and profile; the hook's verdict
+is all that comes back. Do not ask Damaian to run `cargo fmt` through the
+`commands` field instead: a command with side effects needs approval, a hook
+never raises an approval card, and the command's result would not change the
+hook's verdict anyway.
+
+### Repository hooks and review
+
+A repository may ship a hook definition in its `.damaian/config.conf`, but it
+arrives **pending**, not running. Damaian shows the full command line, events
+and fail direction in a consent dialog; **Decline** is focused by default, and
+dismissing the dialog records no decision and asks again next time. Approving
+records a hash of the exact definition, including the contents of any script
+inside the repository, in your user config as
+`hook_review.<repository_id>.<hook_id>`.
+
+- If the repository later changes the definition or the script, the hook
+  becomes **changed since review** and stops running until you approve the new
+  definition. A mandatory hook fails closed while it is in that state.
+- A **declined** hook never runs. It is not listed in the consent notice
+  again, but **Settings › Hooks** still shows it with **Approve**, so a
+  mistaken decline is reversible.
+- A repository can never change, disable, retime or make optional a hook that
+  your config or an administrator's config defines. Those keys are refused
+  and shown in the audit log by key and class.
+- A profile cannot carry a hook, so importing a permission profile cannot add
+  one.
+
+### Reviewing, enabling and testing from the CLI
+
+The command-line tool reads the same config and data directory as the app:
+
+```bash
+damaian hooks /path/to/repo
+damaian hook-review /path/to/repo no_migrations approve
+damaian hook-review /path/to/repo no_migrations decline
+damaian hook-run /path/to/repo no_migrations before_tool
+```
+
+`hooks` lists every hook with its source, events, fail direction, activation,
+command line and, for a repository hook, its review hash. `hook-review` writes
+only your user config and
+audits the decision as `hook_reviewed`; an approval at a hash that is no longer
+current is refused. `hook-run` runs one hook against a representative event
+payload and prints its verdict, failure kind, duration and redacted stderr —
+the fastest way to debug a script.
+
+A test run does not count as an invocation in the audit log. The shell's
+**Test** button and `damaian hook-run` both refuse a repository hook that is
+pending, changed since review, declined or disabled; make it active first. A
+user's own disabled hook can still be tested.
+
+### What a hook may ask Damaian to run
+
+A hook's `commands` field asks Damaian to run up to three local commands and
+turn their output into findings. It is deliberately narrow:
+
+- Only a command policy would run **unasked** in this session's mode and
+  profile is run. Ask mode refuses them; a command that needs approval, or
+  that the profile blocks, is refused. A hook never raises an approval card.
+- Each run is bracketed by an action marker, so [crash
+  recovery](#after-a-crash) sees it, and its findings belong to the session.
+- A requested command's result does not change the hook's verdict. A rule that
+  depends on a check runs the check itself, as the `cargo fmt` example does.
+- A hook never sees its own requested command's `before_tool`/`after_tool`
+  event. Requested commands can nest hooks, but only to a depth of two; past
+  that the nested dispatch is skipped, the command still runs, and a warning
+  finding and `hook_depth_exceeded` audit record say so.
+
 ## Browser Diagnostics
 
 When a browser MCP server is configured, such as a Playwright server under
@@ -1029,10 +1326,11 @@ result (see
 ## Findings
 
 A **finding** is one problem a check reported: a compiler error at a file and
-line, a failing test, a lint rule, a browser console error or failed request,
-or a whole check that failed in a way Damaian could not take apart. Findings
-come from the checks the assistant runs during a conversation and from its
-browser diagnostics. They belong to the session.
+line, a failing test, a lint rule, a browser console error or failed request, a
+hook's own finding or warning, or a whole check that failed in a way Damaian
+could not take apart. Findings come from the checks the assistant runs during a
+conversation, from its browser diagnostics, and from [hooks](#hooks). They
+belong to the session.
 
 Every command the assistant runs has a **purpose**, and the purpose decides
 whether a failure becomes a finding.
@@ -1077,8 +1375,9 @@ from the app until a check reports something new. The findings are still in
 the session; [TROUBLESHOOTING.md](TROUBLESHOOTING.md#findings) shows how to
 read them from the session log.
 
-The list groups findings by source (Compiler, Tests, Lint, Browser console,
-Network, Browser scenario, Unparsed checks), then by file. Two filters choose
+The list groups findings by source (Compiler, Tests, Lint, Security, Hook,
+Browser console, Network, Browser scenario, Code review, Language server,
+Unparsed checks), then by file. Two filters choose
 what is shown:
 
 - **Severity:** Errors (the default), Errors and warnings, or All severities.
@@ -1354,7 +1653,7 @@ Damaian keeps the local app in control of important effects:
 - The model does not read files directly.
 - The model does not write files directly.
 - File edits are previewed before application.
-- Assistant commands run without approval only when Damaian classifies them as read-only. They are not sandboxed.
+- Assistant commands run without approval only when Damaian classifies them as read-only; they run directly on your machine.
 - Every other command requires your approval before it runs, unless you [allowed that exact command always](#allow-always) for that repository.
 - Restricted files and detected secrets are redacted or blocked by policy.
 - A [permission profile](#permission-profiles) per repository can narrow all of this further, and never widen it.

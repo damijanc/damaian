@@ -103,6 +103,35 @@ impl ContextManager {
         explicit_paths: &[String],
         token_budget: usize,
     ) -> ContextPlan {
+        self.build_context_with_hooks(
+            repository_root,
+            repository_id,
+            task_id,
+            prompt,
+            index,
+            explicit_paths,
+            token_budget,
+            &[],
+        )
+    }
+
+    /// [`Self::build_context`] with the context a `session_start` or
+    /// `before_context` hook returned (spec 32 `context.md` §10). Each entry
+    /// becomes an ordinary `hook_context` item through the same `add_text`
+    /// path as every other item, so it is redacted and charged to the turn's
+    /// budget rather than being a privileged channel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_context_with_hooks(
+        &self,
+        repository_root: impl AsRef<Path>,
+        repository_id: &str,
+        task_id: &str,
+        prompt: &str,
+        index: Option<&RepositoryIndex>,
+        explicit_paths: &[String],
+        token_budget: usize,
+        hook_context: &[(String, String)],
+    ) -> ContextPlan {
         let mut items = Vec::new();
         let mut files = Vec::new();
         let mut token_estimate = 0;
@@ -236,6 +265,23 @@ impl ContextManager {
                 "symbols",
                 None,
                 &text,
+            );
+        }
+
+        // A hook's additions are ordinary items: redacted by `add_text` and
+        // charged to the same budget, so an over-long one is dropped rather
+        // than displacing the prompt or the instructions (spec 32 §5.2,
+        // `context.md` §10). Before the retrieved files, like the map and the
+        // symbols, because the hook's rule is about the turn, not the search.
+        for (hook_id, text) in hook_context {
+            add_text(
+                &self.scanner,
+                &mut items,
+                &mut token_estimate,
+                token_budget,
+                "hook_context",
+                Some(format!("hook:{hook_id}")),
+                text,
             );
         }
 

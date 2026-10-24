@@ -26,7 +26,8 @@ use serde_json::{Map, Value, json};
 use workspace_engine::worker_progress::{ProgressKind, ProgressWriter};
 use workspace_engine::{
     CancelToken, ChatTurnOptions, ChatTurnResult, Config, ModelAdapter, PhaseKind, ProcessRegistry,
-    RoundBudgetDecision, SecretScanner, TaskStatus, TurnProgress, TurnSink, TurnSteering,
+    RepositoryConfigReport, RoundBudgetDecision, SecretScanner, TaskStatus, TurnProgress, TurnSink,
+    TurnSteering,
 };
 
 /// The first argument that selects worker mode, in both `main`s.
@@ -72,7 +73,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     } = parse_worker_args(args)?;
     refuse_terminal_stdin(std::io::stdin().is_terminal())?;
     let Handover { api_key, token } = read_handover(&mut std::io::stdin().lock())?;
-    let config = load_worker_config(&data_dir, None)?;
+    let (config, _) = load_worker_config(&data_dir, None)?;
     let (registry, audit) =
         ProcessRegistry::open_with_audit(&config).map_err(|error| error.to_string())?;
 
@@ -324,7 +325,10 @@ fn bind_control_socket(
 /// With `repository`, its `.damaian/config.conf` is applied at repository
 /// scope, exactly as `Config::load_for_repository` applies it for the shell's
 /// turns: it may tighten, and cannot loosen (#34).
-fn load_worker_config(data_dir: &Path, repository: Option<&Path>) -> Result<Config, String> {
+fn load_worker_config(
+    data_dir: &Path,
+    repository: Option<&Path>,
+) -> Result<(Config, RepositoryConfigReport), String> {
     let base = Config {
         data_dir: data_dir.to_path_buf(),
         ..Config::default()
@@ -332,7 +336,7 @@ fn load_worker_config(data_dir: &Path, repository: Option<&Path>) -> Result<Conf
     let user_path = base.user_config_path();
     let admin_path = base.admin_config_path();
     let repo_path = repository.map(Config::repository_config_path);
-    let (mut config, _) = Config::load_scoped(
+    let (mut config, report) = Config::load_scoped(
         base,
         Some(&user_path),
         repo_path.as_deref(),
@@ -344,7 +348,7 @@ fn load_worker_config(data_dir: &Path, repository: Option<&Path>) -> Result<Conf
     // `data_dir` its own config named. Following that key again from here
     // would move the worker away from the shell it serves.
     config.data_dir = data_dir.to_path_buf();
-    Ok(config)
+    Ok((config, report))
 }
 
 /// A control request, validated against proposal §5.2's table.
@@ -772,7 +776,7 @@ impl TurnDriver {
         data_dir: &Path,
         adapter_for: Box<WorkerAdapterFor>,
     ) -> Result<Self, String> {
-        let config = load_worker_config(data_dir, None)?;
+        let (config, _) = load_worker_config(data_dir, None)?;
         let progress = ProgressWriter::create(
             data_dir,
             session_id,
@@ -1291,7 +1295,7 @@ mod tests {
             "audit_enabled=false\n",
         )
         .unwrap();
-        let config = load_worker_config(&data_dir, None).unwrap();
+        let (config, _) = load_worker_config(&data_dir, None).unwrap();
         assert_eq!(config.data_dir, data_dir);
         assert!(
             !config.audit_enabled,

@@ -8,18 +8,22 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::finding::{FindingStatus, RepairRequest};
+use workspace_engine::hooks::{
+    HookReviewDecision, list_hooks, review_hook, set_hook_enabled, test_run,
+};
 use workspace_engine::{
-    AgentFallbackProposal, AgentPlanProposal, AgentRoundBudgetProposal,
+    AgentFallbackProposal, AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal,
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config,
     CostEstimate, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExportFormat,
-    GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
-    ModelAdapter, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
-    ProcessRegistry, ProfileId, ProposedFilePatch, ResumeDecisionOptions, RoundBudgetDecision,
-    SearchOptions, Session, SessionMode, StepStatus, TaskPlan, TaskUsage, TokenUsage, TurnPhase,
-    TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
-    allow_always_eligible, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
-    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
+    GeneratedSecretWarning, HookActivation, HookEvent, McpClient, McpServerConfig,
+    McpTokenResolver, McpTransport, ModelAdapter, ModelRequest, ModelRun, OpenAICompatibleAdapter,
+    PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState,
+    RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session,
+    SessionMode, StepStatus, TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink,
+    WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
+    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
+    import_profile, normalize_mcp_server_id, normalize_model_provider,
     normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
     profile_import_base, review_profile_import, review_profile_rejections, select_profile,
 };
@@ -343,6 +347,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/ask-stream") => handle_ask_stream(stream, &request),
         ("POST", "/api/resume-command-stream") => handle_resume_command_stream(stream, &request),
         ("POST", "/api/resume-plan-stream") => handle_resume_plan_stream(stream, &request),
+        ("POST", "/api/answer-question-stream") => handle_answer_question_stream(stream, &request),
         ("POST", "/api/resume-fallback-stream") => handle_resume_fallback_stream(stream, &request),
         ("POST", "/api/resume-round-budget-stream") => {
             handle_resume_round_budget_stream(stream, &request)
@@ -365,6 +370,13 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/repository-config-allowlist") => {
             handle_repository_config_allowlist(stream, &request)
         }
+        // Spec 32 Task 9: the hooks the user can see, review, switch and test.
+        // None of these takes a config path: user config is the only file they
+        // can write, and its location comes from the data directory.
+        ("GET", "/api/hooks") => handle_hooks(stream, &request),
+        ("POST", "/api/hook-review") => handle_hook_review(stream, &request),
+        ("POST", "/api/hook-enabled") => handle_hook_enabled(stream, &request),
+        ("POST", "/api/hook-test") => handle_hook_test(stream, &request),
         ("POST", "/api/config-set") => handle_config_set(stream, &request),
         ("POST", "/api/config-file") => handle_post_config_file(stream, &request),
         ("POST", "/api/model-key") => handle_model_key(stream, &request),
@@ -534,6 +546,22 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         .session_store
         .read_messages_with_seq(&session_id)
         .map_err(|error| error.to_string())?;
+    // A question's options are in its `question_asked` event, not on the
+    // transcript message, and a reopened card is answerable only with them.
+    // Read once per question so `messages_json` stays a formatter.
+    let mut question_states = HashMap::new();
+    for (_, message) in &messages {
+        if message.role != "question" {
+            continue;
+        }
+        if let Some(state) = engine
+            .session_store
+            .question_state(&session_id, &message.id)
+            .map_err(|error| error.to_string())?
+        {
+            question_states.insert(message.id.clone(), state);
+        }
+    }
     // Message roles alone cannot say whether a turn was stopped, so the
     // task statuses ride along and the UI joins them by `taskId`.
     let task_statuses = engine
@@ -576,7 +604,7 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         &format!(
             "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}]}}",
             session_json(&session, engine.session_store.session_mode(&session.id)),
-            messages_json(&messages),
+            messages_json(&messages, &question_states),
             task_states_json(
                 &task_statuses,
                 &task_usage,
@@ -682,14 +710,20 @@ fn handle_worker_route(stream: &mut TcpStream, request: &Request) -> Result<(), 
 fn handle_session_delete(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let session_id = required_form(&form, "session_id")?;
-    let engine = default_engine()?;
+    // A `session_end` hook runs in the repository, and a session stores only
+    // its repository id, so the caller says which checkout this session
+    // belongs to (spec 32 Task 6).
+    let repo = required_form(&form, "repo")?;
+    // Loaded for the repository, not with `default_engine`: a repository hook
+    // the user has reviewed should see `session_end` as a user hook does, and
+    // only a repository-scoped load carries it.
+    let engine = engine_for_repo(&repo)?;
     // Before the delete: the children are recorded in the log it removes.
     for worker in workers::workers_to_stop_for_deleted_session(&engine.session_store, &session_id) {
         workers::global().shutdown(&worker);
     }
     engine
-        .session_store
-        .delete_session(&session_id)
+        .delete_session(&session_id, &repo)
         .map_err(|error| error.to_string())?;
     write_response(
         stream,
@@ -843,6 +877,122 @@ fn handle_repository_config_allowlist(
         200,
         "application/json",
         &resolve_repository_allowlist_migration(&repo, &keep)?,
+    )
+}
+
+/// Every configured hook for `repo`, with its activation, so Settings can list
+/// and act on them. `repo` is the only input: there is no path parameter that
+/// could name a config file.
+fn hooks_json(repo: &str) -> Result<String, String> {
+    if repo.trim().is_empty() {
+        return Ok("{\"repositoryPath\":\"\",\"hooks\":[]}".to_string());
+    }
+    let config = config_for_repo(repo)?;
+    let hooks = list_hooks(&config, Path::new(repo));
+    serde_json::to_string(&serde_json::json!({
+        "repositoryPath": repo,
+        "hooks": hooks,
+    }))
+    .map_err(|error| error.to_string())
+}
+
+fn handle_hooks(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = request.param("repo").unwrap_or_default();
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &hooks_json(&repo)?,
+    )
+}
+
+fn handle_hook_review(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let hook = required_form(&form, "hook")?;
+    let decision = match required_form(&form, "decision")?.as_str() {
+        "approve" => HookReviewDecision::Approve {
+            hash: required_form(&form, "hash")?,
+        },
+        "decline" => HookReviewDecision::Decline,
+        other => {
+            return Err(format!(
+                "A hook review decision is approve or decline, not {other}"
+            ));
+        }
+    };
+    let config = config_for_repo(&repo)?;
+    let path = review_hook(&config, Path::new(&repo), &hook, decision)
+        .map_err(|error| error.to_string())?;
+    // Re-read so the response carries the review that was just written.
+    let config = config_for_repo(&repo)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::to_string(&serde_json::json!({
+            "path": path.to_string_lossy(),
+            "hooks": list_hooks(&config, Path::new(&repo)),
+        }))
+        .map_err(|error| error.to_string())?,
+    )
+}
+
+fn handle_hook_enabled(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let hook = required_form(&form, "hook")?;
+    let enabled = match required_form(&form, "enabled")?.as_str() {
+        "true" | "1" => true,
+        "false" | "0" => false,
+        other => return Err(format!("A hook toggle is true or false, not {other}")),
+    };
+    let config = config_for_repo(&repo)?;
+    let path = set_hook_enabled(&config, &hook, enabled).map_err(|error| error.to_string())?;
+    let config = config_for_repo(&repo)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::to_string(&serde_json::json!({
+            "path": path.to_string_lossy(),
+            "hooks": list_hooks(&config, Path::new(&repo)),
+        }))
+        .map_err(|error| error.to_string())?,
+    )
+}
+
+fn handle_hook_test(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let hook_id = required_form(&form, "hook")?;
+    let event_name = required_form(&form, "event")?;
+    let event =
+        HookEvent::parse(&event_name).ok_or_else(|| format!("Unknown hook event: {event_name}"))?;
+    let config = config_for_repo(&repo)?;
+    let hook = config
+        .hook(&hook_id)
+        .cloned()
+        .ok_or_else(|| format!("Hook `{hook_id}` is not configured"))?;
+    let run =
+        test_run(&config, &hook, event, Path::new(&repo)).map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::to_string(&serde_json::json!({
+            "id": hook_id,
+            "event": event.as_str(),
+            "verdict": run.verdict.as_str(),
+            "failure": run.failure.map(|kind| kind.as_str()),
+            "stderr": run.stderr,
+            "durationMs": run.duration_ms,
+        }))
+        .map_err(|error| error.to_string())?,
     )
 }
 
@@ -1216,7 +1366,8 @@ fn handle_propose_edit(stream: &mut TcpStream, request: &Request) -> Result<(), 
         .get("session_id")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let engine = WorkspaceEngine::new(config_for_repo_with_model_options(&repo, &form)?);
+    let (config, report) = config_for_repo_with_model_options(&repo, &form)?;
+    let engine = WorkspaceEngine::new_with_report(config, &report);
     let context_files = form
         .get("context_files")
         .map(|value| validate_context_files(&engine, &repo, value))
@@ -1323,10 +1474,11 @@ fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> Result<(), S
         200,
         "application/json",
         &format!(
-            "{{\"patchId\":\"{}\",\"appliedFiles\":[{}],\"warningCount\":{}}}",
+            "{{\"patchId\":\"{}\",\"appliedFiles\":[{}],\"warningCount\":{},\"hookWarnings\":[{}]}}",
             escape_json(&result.patch_id),
             json_string_array(&result.applied_files),
-            result.warnings.len()
+            result.warnings.len(),
+            json_string_array(&result.hook_warnings)
         ),
     )
 }
@@ -1419,12 +1571,14 @@ fn handle_propose_command(stream: &mut TcpStream, request: &Request) -> Result<(
         200,
         "application/json",
         &format!(
-            "{{\"proposalId\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":false}}",
+            "{{\"proposalId\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"cause\":\"{}\",\"reason\":\"{}\",\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":false}}",
             escape_json(&proposal.id),
             escape_json(&command_approval_prompt(&proposal)),
             proposal.risk.as_str(),
             proposal.requires_approval,
             proposal.blocked,
+            escape_json(proposal.reasons.first().map(String::as_str).unwrap_or("")),
+            escape_json(&proposal.reason),
             allow_always_eligible(&engine.config, &proposal.command, proposal.blocked)
         ),
     )
@@ -1571,6 +1725,14 @@ fn handle_resume_plan_stream(stream: &mut TcpStream, request: &Request) -> Resul
     })
 }
 
+fn handle_answer_question_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    write_event_stream_headers(stream, request)?;
+    stream_turn(stream, move |cancel, events| {
+        run_answer_question_request(&form, cancel, events)
+    })
+}
+
 fn handle_resume_fallback_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     write_event_stream_headers(stream, request)?;
@@ -1624,7 +1786,7 @@ fn run_resume_command_request(
     let repo = required_form(form, "repo")?;
     let proposal_id = required_form(form, "proposal_id")?;
     let approved = form.get("approved").map(String::as_str) == Some("true");
-    let engine = chat_engine(config_for_repo(&repo)?);
+    let engine = chat_engine(config_and_report_for_repo(&repo)?);
 
     if !engine
         .chat_orchestrator
@@ -1693,7 +1855,7 @@ fn run_resume_plan_request(
         Some(raw) => Some(parse_plan_revision(raw)?),
         None => None,
     };
-    let engine = chat_engine(config_for_repo(&repo)?);
+    let engine = chat_engine(config_and_report_for_repo(&repo)?);
 
     let mut adapter = chat_model_adapter(&engine.config, || {
         resolve_shell_model_api_key(&engine.config)
@@ -1725,6 +1887,77 @@ fn run_resume_plan_request(
         .map_err(|error| error.to_string())
 }
 
+/// Answers the question a turn paused on (spec 50 requirement 1).
+///
+/// The answer is a tool result and authorises nothing: this route only resumes
+/// the paused turn, and every side effect the model asks for afterwards still
+/// needs its own approval or review. A command, plan, fallback or round-budget
+/// pause is refused here before a model adapter (and so a key) is built — those
+/// are decisions with their own routes, and an answer must never stand in for
+/// one.
+fn run_answer_question_request(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+) -> Result<ChatTurnResult, String> {
+    let repo = required_form(form, "repo")?;
+    let question_id = required_form(form, "question_id")?;
+    let answer = required_form(form, "answer")?;
+    let selected_option = match form
+        .get("selected_option")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(raw) => Some(
+            raw.parse::<usize>()
+                .map_err(|_| "selected_option must be a number".to_string())?,
+        ),
+        None => None,
+    };
+    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+
+    // `has_pending_chat_command` is true for every non-question pause. Asking
+    // for one of those here is a client error, and checking before the adapter
+    // means a refused answer never touches the Keychain.
+    if engine
+        .chat_orchestrator
+        .has_pending_chat_command(&question_id)
+    {
+        return Err(format!(
+            "Proposal {question_id} is not a question; resume it with its own route"
+        ));
+    }
+
+    let mut adapter = chat_model_adapter(&engine.config, || {
+        resolve_model_api_key(&engine.config.model_api_key_env)
+    })?;
+    let mut on_token = |token: &str| {
+        let _ = events.send(TurnEvent::Token(token.to_string()));
+    };
+    let mut on_progress = |progress: TurnProgress| {
+        if let Some(event) = turn_progress_event(progress) {
+            let _ = events.send(event);
+        }
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_answer(
+            &question_id,
+            &answer,
+            selected_option,
+            adapter.as_mut(),
+            &mut sink,
+        )
+        .map_err(|error| error.to_string())
+}
+
 /// Answers a provider fallback offer (spec 56).
 ///
 /// The engine that takes an approval must already have the fallback active,
@@ -1744,7 +1977,8 @@ fn run_resume_fallback_request(
         cancel,
         events,
         &|provider| {
-            let mut engine = WorkspaceEngine::new(config_for_repo_with_provider(&repo, provider)?);
+            let (config, report) = config_for_repo_with_provider(&repo, provider)?;
+            let mut engine = WorkspaceEngine::new_with_report(config, &report);
             configure_chat_integrations(&mut engine);
             Ok(engine)
         },
@@ -1839,7 +2073,7 @@ fn run_resume_round_budget_request(
         cancel,
         events,
         &|| {
-            let engine = chat_engine(config_for_repo(&repo)?);
+            let engine = chat_engine(config_and_report_for_repo(&repo)?);
             Ok(engine)
         },
         &mut |config| chat_model_adapter(config, || resolve_shell_model_api_key(config)),
@@ -2012,10 +2246,10 @@ fn run_chat_request_with(
         steering: None,
     };
     let turn_options = ChatTurnOptions {
-        // Not yet: nothing can deliver an answer until spec 50's answer route
-        // exists, so offering `ask_user` here would only ever refuse it. Spec
-        // 50 Task 6 sets this to `true`.
-        user_present: false,
+        // The desktop app is the one executor with a user present: the question
+        // card and `/api/answer-question-stream` deliver the answer. Every
+        // other driver leaves this false and is never offered `ask_user`.
+        user_present: true,
         ..ChatTurnOptions::default()
     };
     engine
@@ -2035,8 +2269,9 @@ fn run_chat_request_with(
 /// The engine a chat turn runs on. The shell's turns and a worker's both build
 /// it here (spec 57 §5.2, "same turn"), so neither host can configure a turn
 /// the other would not.
-fn chat_engine(config: Config) -> WorkspaceEngine {
-    let mut engine = WorkspaceEngine::new(config);
+fn chat_engine(config_and_report: (Config, RepositoryConfigReport)) -> WorkspaceEngine {
+    let (config, report) = config_and_report;
+    let mut engine = WorkspaceEngine::new_with_report(config, &report);
     configure_chat_integrations(&mut engine);
     engine
 }
@@ -2123,8 +2358,9 @@ fn resume_decision_options(form: &HashMap<String, String>) -> ResumeDecisionOpti
 }
 
 fn default_engine() -> Result<WorkspaceEngine, String> {
-    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
-    Ok(WorkspaceEngine::new(config))
+    let (config, report) =
+        Config::load_for_repository_reporting(None).map_err(|error| error.to_string())?;
+    Ok(WorkspaceEngine::new_with_report(config, &report))
 }
 
 fn desktop_settings_config_path(scope: Option<&str>) -> Result<PathBuf, String> {
@@ -2768,7 +3004,7 @@ fn forget_model_api_key(account: &str) {
 }
 
 fn model_key_status_json(repo: &str, provider: Option<&str>) -> Result<String, String> {
-    let config = config_for_repo_with_provider(repo, provider)?;
+    let (config, _) = config_for_repo_with_provider(repo, provider)?;
     let reference = config.model_api_key_env;
     if let Some(account) = keychain::account_from_reference(&reference) {
         let status = match keychain::password_exists(account) {
@@ -3163,10 +3399,22 @@ fn update_config_overlay(
 /// repository, so an unremarkable repository answers with empty lists.
 fn repository_config_review_json(repo: &str) -> Result<String, String> {
     if repo.trim().is_empty() {
-        return Ok("{\"rejectedKeys\":[],\"allowlistEntries\":[]}".to_string());
+        return Ok("{\"rejectedKeys\":[],\"allowlistEntries\":[],\"hooks\":[]}".to_string());
     }
     let (config, report) = Config::load_for_repository_reporting(Some(Path::new(repo)))
         .map_err(|error| error.to_string())?;
+    // A repository hook that is waiting on the user, or whose definition has
+    // changed since they approved it, is an itemised review entry: the notice
+    // shows the full command line, its events and its fail direction.
+    let hooks: Vec<_> = list_hooks(&config, Path::new(repo))
+        .into_iter()
+        .filter(|hook| {
+            matches!(
+                hook.activation,
+                HookActivation::PendingReview | HookActivation::ChangedSinceReview
+            )
+        })
+        .collect();
     let engine = WorkspaceEngine::new(config);
     let notice = engine
         .repository_trust
@@ -3188,31 +3436,25 @@ fn repository_config_review_json(repo: &str) -> Result<String, String> {
                 .rejected
                 .iter()
                 .map(|rejected| {
-                    format!(
-                        "{{\"key\":\"{}\",\"class\":\"{}\"}}",
-                        escape_json(&rejected.key),
-                        rejected.class.as_str()
-                    )
+                    serde_json::json!({
+                        "key": rejected.key,
+                        "class": rejected.class.as_str(),
+                    })
                 })
                 .collect::<Vec<_>>()
-                .join(",")
         })
         .unwrap_or_default();
     let entries = migration
         .as_ref()
-        .map(|migration| {
-            migration
-                .entries
-                .iter()
-                .map(|entry| format!("\"{}\"", escape_json(entry)))
-                .collect::<Vec<_>>()
-                .join(",")
-        })
+        .map(|migration| migration.entries.clone())
         .unwrap_or_default();
-    Ok(format!(
-        "{{\"repositoryPath\":\"{}\",\"rejectedKeys\":[{rejected}],\"allowlistEntries\":[{entries}]}}",
-        escape_json(repo)
-    ))
+    serde_json::to_string(&serde_json::json!({
+        "repositoryPath": repo,
+        "rejectedKeys": rejected,
+        "allowlistEntries": entries,
+        "hooks": hooks,
+    }))
+    .map_err(|error| error.to_string())
 }
 
 fn resolve_repository_allowlist_migration(repo: &str, keep: &[String]) -> Result<String, String> {
@@ -3231,34 +3473,44 @@ fn resolve_repository_allowlist_migration(repo: &str, keep: &[String]) -> Result
 }
 
 fn engine_for_repo(repo: &str) -> Result<WorkspaceEngine, String> {
-    let config = config_for_repo(repo)?;
-    Ok(WorkspaceEngine::new(config))
+    let (config, report) = config_and_report_for_repo(repo)?;
+    Ok(WorkspaceEngine::new_with_report(config, &report))
 }
 
 fn config_for_repo_with_model_options(
     repo: &str,
     form: &HashMap<String, String>,
-) -> Result<Config, String> {
-    let mut config = config_for_repo(repo)?;
+) -> Result<(Config, RepositoryConfigReport), String> {
+    let (mut config, report) = config_and_report_for_repo(repo)?;
     apply_model_form_options(&mut config, form)?;
-    Ok(config)
+    Ok((config, report))
 }
 
 fn config_for_repo(repo: &str) -> Result<Config, String> {
+    config_and_report_for_repo(repo).map(|(config, _)| config)
+}
+
+/// The loaded config and the report that says which scope set each key. Chat
+/// and command-approval paths build their engine with the report so an
+/// approval raised by a setting can name who set it (spec 62 Task 3).
+fn config_and_report_for_repo(repo: &str) -> Result<(Config, RepositoryConfigReport), String> {
     let repo_path = if repo.is_empty() {
         None
     } else {
         Some(Path::new(repo))
     };
-    Config::load_for_repository(repo_path).map_err(|error| error.to_string())
+    Config::load_for_repository_reporting(repo_path).map_err(|error| error.to_string())
 }
 
-fn config_for_repo_with_provider(repo: &str, provider: Option<&str>) -> Result<Config, String> {
-    let mut config = config_for_repo(repo)?;
+fn config_for_repo_with_provider(
+    repo: &str,
+    provider: Option<&str>,
+) -> Result<(Config, RepositoryConfigReport), String> {
+    let (mut config, report) = config_and_report_for_repo(repo)?;
     if let Some(provider) = provider.map(str::trim).filter(|value| !value.is_empty()) {
         switch_model_provider(&mut config, provider)?;
     }
-    Ok(config)
+    Ok((config, report))
 }
 
 /// Makes `provider` the active one, in memory only.
@@ -3743,6 +3995,23 @@ fn fallback_proposal_json(proposal: Option<&AgentFallbackProposal>) -> String {
     )
 }
 
+/// Spec 50's question, shaped for the card. It carries no `proposalId`,
+/// `command`, `patchId` or `requiresApproval`: a question has nothing to
+/// approve, and a field the command or patch route recognises is how one would
+/// become an approval in the client.
+fn question_proposal_json(proposal: Option<&AgentQuestionProposal>) -> String {
+    let Some(proposal) = proposal else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"questionId\":\"{}\",\"question\":\"{}\",\"options\":[{}],\"allowFreeText\":{}}}",
+        escape_json(&proposal.question_id),
+        escape_json(&proposal.question),
+        json_string_array(&proposal.options),
+        proposal.allow_free_text
+    )
+}
+
 /// Spec 61's round-budget pause: the rounds used and granted, and whether the
 /// turn is at the hard cap (so the shell can offer only *Answer now*).
 fn round_budget_proposal_json(proposal: Option<&AgentRoundBudgetProposal>) -> String {
@@ -3863,7 +4132,7 @@ where
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"usage\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"usage\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -3877,6 +4146,7 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         plan_proposal_json(result.plan_proposal.as_ref()),
         fallback_proposal_json(result.fallback_proposal.as_ref()),
         round_budget_proposal_json(result.round_budget_proposal.as_ref()),
+        question_proposal_json(result.question_proposal.as_ref()),
         task_usage_json(result.usage.as_ref(), result.estimated_cost)
     )
 }
@@ -3948,13 +4218,15 @@ fn command_proposal_json(result: &ChatTurnResult) -> String {
         return "null".to_string();
     };
     format!(
-        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":{}}}",
+        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"cause\":\"{}\",\"reason\":\"{}\",\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":{}}}",
         escape_json(&proposal.id),
         escape_json(&proposal.command),
         escape_json(&proposal.prompt),
         escape_json(&proposal.risk),
         proposal.requires_approval,
         proposal.blocked,
+        escape_json(&proposal.cause),
+        escape_json(&proposal.reason),
         proposal.allow_always,
         proposal.allow_browser_diagnostics_for_session
     )
@@ -4371,17 +4643,31 @@ fn task_states_json(
         .join(",")
 }
 
-fn messages_json(messages: &[(u64, ChatMessage)]) -> String {
+fn messages_json(
+    messages: &[(u64, ChatMessage)],
+    questions: &HashMap<String, QuestionState>,
+) -> String {
     messages
         .iter()
-        .map(|(seq, message)| message_json(*seq, message))
+        .map(|(seq, message)| message_json(*seq, message, questions.get(&message.id)))
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn message_json(seq: u64, message: &ChatMessage) -> String {
+fn message_json(seq: u64, message: &ChatMessage, question: Option<&QuestionState>) -> String {
+    // A question card needs what the question was asked with; no other role
+    // has anything to add, so the fields appear only on `question`.
+    let question_fields = question
+        .map(|state| {
+            format!(
+                ",\"options\":[{}],\"allowFreeText\":{}",
+                json_string_array(&state.options),
+                state.allow_free_text
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "{{\"id\":\"{}\",\"sessionId\":\"{}\",\"taskId\":{},\"role\":\"{}\",\"content\":\"{}\",\"createdAtMs\":{},\"seq\":{}}}",
+        "{{\"id\":\"{}\",\"sessionId\":\"{}\",\"taskId\":{},\"role\":\"{}\",\"content\":\"{}\",\"createdAtMs\":{},\"seq\":{}{}}}",
         escape_json(&message.id),
         escape_json(&message.session_id),
         message
@@ -4392,7 +4678,8 @@ fn message_json(seq: u64, message: &ChatMessage) -> String {
         escape_json(&message.role),
         escape_json(&message.content),
         message.created_at_ms,
-        seq
+        seq,
+        question_fields
     )
 }
 
@@ -4554,19 +4841,19 @@ fn escape_json(value: &str) -> String {
 mod tests {
     use super::{
         Request, ShellOptions, TurnEvent, allowed_cors_origin, api_request_requires_token,
-        browser_report_from_tool_result, cached_model_api_key, checkpoint_list_json,
-        checkpoint_restore_json, default_engine, desktop_settings_config_path,
-        effective_policy_for_repo, engine_for_repo, forget_model_api_key,
-        generated_secret_warnings_json, handle_connection, index_html, json_error,
-        json_optional_string, keychain, mcp_browser_arguments, parse_form, parse_path_list,
-        percent_decode, plan_json, plan_proposal_json, relay_turn_events, remember_model_api_key,
-        render_markdown_with_optional_file_links, repository_config_review_json,
-        repository_config_write_target, require_api_token, resolve_shell_model_api_key, run_server,
-        run_terminal_command, save_config_file, spawn_with_shell_stack, sweep_orphaned_processes,
-        task_states_json, task_usage_json, terminal_cwd_for_repo, turn_progress_event,
-        validate_context_files, validate_working_folder, validate_workspace_path,
-        verify_data_dir_schema_at, web_diagnostic_json, web_diagnostic_reveal_target,
-        write_basic_response, write_sse_event,
+        browser_report_from_tool_result, cached_model_api_key, chat_engine, checkpoint_list_json,
+        checkpoint_restore_json, config_and_report_for_repo, default_engine,
+        desktop_settings_config_path, effective_policy_for_repo, engine_for_repo,
+        forget_model_api_key, generated_secret_warnings_json, handle_connection, index_html,
+        json_error, json_optional_string, keychain, mcp_browser_arguments, parse_form,
+        parse_path_list, percent_decode, plan_json, plan_proposal_json, question_proposal_json,
+        relay_turn_events, remember_model_api_key, render_markdown_with_optional_file_links,
+        repository_config_review_json, repository_config_write_target, require_api_token,
+        resolve_shell_model_api_key, run_answer_question_request, run_server, run_terminal_command,
+        save_config_file, spawn_with_shell_stack, sweep_orphaned_processes, task_states_json,
+        task_usage_json, terminal_cwd_for_repo, turn_progress_event, validate_context_files,
+        validate_working_folder, validate_workspace_path, verify_data_dir_schema_at,
+        web_diagnostic_json, web_diagnostic_reveal_target, write_basic_response, write_sse_event,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -4577,9 +4864,10 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use workspace_engine::CheckpointRestoreResult;
     use workspace_engine::{
-        AgentPlanProposal, CancelToken, Config, Evidence, GeneratedSecretWarning,
-        LanguageServerHub, LanguageServerLaunch, MockModelAdapter, PlanStep, SecretScanner,
-        SessionMode, StepStatus, TaskPlan, TaskUsage, ToolCall, TurnProgress, TurnSink,
+        AgentPlanProposal, AgentQuestionProposal, AskUserInput, CancelToken, ChatTurnOptions,
+        ChatTurnResult, Config, Evidence, GeneratedSecretWarning, LanguageServerHub,
+        LanguageServerLaunch, MockModelAdapter, PendingQuestionRef, PlanStep, SecretScanner,
+        SessionMode, StepStatus, TaskPlan, TaskStatus, TaskUsage, ToolCall, TurnProgress, TurnSink,
         UsageSource, WebDiagnosticRecord, WebDiagnosticReport, WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
     };
@@ -4753,6 +5041,310 @@ mod tests {
             "got {json}"
         );
         assert!(json.contains("\"outcome\":\"blocked\""));
+    }
+
+    #[test]
+    fn the_chat_result_carries_a_question_put_up_for_an_answer() {
+        // Spec 50 requirement 3, Task 6: the live card needs the question and
+        // its options, and the payload must give no approval route anything to
+        // act on. A `proposalId` here is how a question would become an
+        // approval in the client.
+        let json = question_proposal_json(Some(&AgentQuestionProposal {
+            question_id: "question_7f".to_string(),
+            question: "Did you mean the CLI or the shell?".to_string(),
+            options: vec!["The CLI".to_string(), "The shell".to_string()],
+            allow_free_text: true,
+        }));
+        let value: serde_json::Value = serde_json::from_str(&json).expect("question JSON");
+        assert_eq!(value["questionId"], "question_7f");
+        assert_eq!(value["question"], "Did you mean the CLI or the shell?");
+        assert_eq!(value["options"][1], "The shell");
+        assert_eq!(value["allowFreeText"], true);
+        assert!(
+            value.get("proposalId").is_none(),
+            "a question has no proposal id to approve: {value}"
+        );
+        assert!(
+            value.get("requiresApproval").is_none(),
+            "a question is not an approval: {value}"
+        );
+        assert_eq!(question_proposal_json(None), "null");
+    }
+
+    fn form_fields(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// A repository whose engine loads the isolated test data directory, which
+    /// is the same directory a shell route reads when it builds its own engine.
+    fn question_repo(name: &str) -> PathBuf {
+        isolated_data_dir();
+        let repo = temp_path(name);
+        fs::create_dir_all(&repo).expect("repository");
+        fs::write(repo.join("README.md"), "# Questions\n").expect("readme");
+        repo
+    }
+
+    fn engine_for_question_test(repo: &std::path::Path) -> WorkspaceEngine {
+        let (mut config, report) =
+            config_and_report_for_repo(repo.to_str().expect("repository path")).expect("config");
+        // Fixtures are indexed once and discarded; the macOS watcher buys them
+        // nothing and costs startup time.
+        config.enable_index_watcher = false;
+        // The test must not inherit a cap of 0 from the developer's own config.
+        config.agent_max_questions_per_turn = 2;
+        // `ask_user` is offered only through native tools. The developer's own
+        // config may name a provider that does not support them, so the fixture
+        // pins one that does rather than depending on the machine.
+        let provider_id = config.model_provider.clone();
+        let model = config.model_name.clone();
+        config
+            .model_providers
+            .retain(|provider| provider.id != provider_id);
+        config
+            .model_providers
+            .push(workspace_engine::ModelProviderConfig {
+                id: provider_id.clone(),
+                label: provider_id.clone(),
+                base_url: "https://example.test".to_string(),
+                api_key_env: "DAMAIAN_TEST_KEY".to_string(),
+                models: vec![model],
+                supports_native_tools: true,
+                max_output_tokens: None,
+                context_token_budget: None,
+                provider_reports_usage: true,
+                price_per_million_input_tokens: None,
+                price_per_million_output_tokens: None,
+                price_per_million_cached_input_tokens: None,
+                supports_explicit_cache_breakpoints: false,
+            });
+        assert!(config.supports_native_tools());
+        chat_engine((config, report))
+    }
+
+    fn turn_sink<'a>(
+        cancel: &'a CancelToken,
+        on_token: &'a mut dyn FnMut(&str),
+        on_progress: &'a mut dyn FnMut(TurnProgress),
+    ) -> TurnSink<'a> {
+        TurnSink {
+            on_token,
+            on_progress,
+            cancel,
+            steering: None,
+        }
+    }
+
+    /// A turn paused on a command that needs approval. The command is the
+    /// marker file every refusal test looks for.
+    fn paused_on_command(repo: &std::path::Path) -> ChatTurnResult {
+        let engine = engine_for_question_test(repo);
+        let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new()],
+            vec![vec![ToolCall {
+                id: "call_marker".to_string(),
+                name: "run_command".to_string(),
+                arguments_json:
+                    r#"{"command":"touch should-not-run.txt","reason":"Write a marker file."}"#
+                        .to_string(),
+            }]],
+        );
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = turn_sink(&cancel, &mut on_token, &mut on_progress);
+        let result = engine
+            .chat_orchestrator
+            .ask_with_session_with_options(
+                repo,
+                "Write the marker",
+                &[],
+                None,
+                &mut adapter,
+                &mut sink,
+                ChatTurnOptions {
+                    user_present: true,
+                    ..ChatTurnOptions::default()
+                },
+            )
+            .expect("the command pauses for approval");
+        assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+        result
+    }
+
+    /// A turn paused on the model's question.
+    fn paused_on_question(repo: &std::path::Path) -> ChatTurnResult {
+        let engine = engine_for_question_test(repo);
+        let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new()],
+            vec![vec![ToolCall {
+                id: "call_question".to_string(),
+                name: "ask_user".to_string(),
+                arguments_json:
+                    r#"{"question":"Did you mean the CLI or the shell?","options":["The CLI","The shell"],"allowFreeText":true}"#
+                        .to_string(),
+            }]],
+        );
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = turn_sink(&cancel, &mut on_token, &mut on_progress);
+        let result = engine
+            .chat_orchestrator
+            .ask_with_session_with_options(
+                repo,
+                "Which one?",
+                &[],
+                None,
+                &mut adapter,
+                &mut sink,
+                ChatTurnOptions {
+                    user_present: true,
+                    ..ChatTurnOptions::default()
+                },
+            )
+            .expect("the turn pauses on a question");
+        assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+        assert!(result.question_proposal.is_some());
+        result
+    }
+
+    #[test]
+    fn a_reopened_session_carries_the_question_and_answer_messages_in_order() {
+        // Requirement 3's reload half. `read_messages` already yields the two
+        // roles; the card also needs the options it was asked with, which the
+        // role alone cannot carry.
+        isolated_data_dir();
+        let engine = default_engine().expect("default engine");
+        let session = engine
+            .session_store
+            .create_session("repo_question_transcript", "question transcript")
+            .expect("session");
+        let question = PendingQuestionRef::new();
+        engine
+            .session_store
+            .record_question_asked(
+                &session.id,
+                "task_question",
+                &question,
+                &AskUserInput {
+                    question: "Did you mean the CLI or the shell?".to_string(),
+                    options: vec!["The CLI".to_string(), "The shell".to_string()],
+                    allow_free_text: true,
+                },
+            )
+            .expect("question recorded");
+        engine
+            .session_store
+            .record_question_answered(&session.id, question.question_id(), "The CLI", Some(0))
+            .expect("answer recorded");
+
+        let (port, token) = serve_for_test();
+        let response = get_session_for_test(port, &token, &session.id);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let payload = json_of(&response);
+        let messages = payload["messages"].as_array().expect("messages");
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|message| message["role"].as_str().expect("role"))
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["question", "answer"],
+            "a reload must show the exchange in the order it happened: {payload}"
+        );
+        assert_eq!(messages[0]["id"], question.question_id());
+        assert_eq!(messages[0]["content"], "Did you mean the CLI or the shell?");
+        assert_eq!(messages[0]["options"][0], "The CLI");
+        assert_eq!(messages[0]["options"][1], "The shell");
+        assert_eq!(messages[0]["allowFreeText"], true);
+        assert_eq!(messages[1]["content"], "The CLI");
+    }
+
+    #[test]
+    fn the_answer_route_refuses_a_command_proposal_id() {
+        // Requirement 2 at the shell's answer route: a command proposal id can
+        // never be answered as though an answer were consent. Nothing runs and
+        // the command is still waiting for its own decision.
+        let repo = question_repo("answer-route-command-id");
+        let paused = paused_on_command(&repo);
+        let proposal_id = paused
+            .command_proposal
+            .as_ref()
+            .expect("a command proposal")
+            .id
+            .clone();
+        let (events, _receiver) = std::sync::mpsc::channel::<TurnEvent>();
+        let error = run_answer_question_request(
+            &form_fields(&[
+                ("repo", repo.to_str().expect("repository path")),
+                ("question_id", &proposal_id),
+                ("answer", "Yes"),
+                ("selected_option", ""),
+            ]),
+            &CancelToken::new(),
+            &events,
+        )
+        .expect_err("a command proposal id is not answerable");
+        assert!(
+            error.contains("not a question"),
+            "the route must say what is wrong: {error}"
+        );
+        assert!(
+            !repo.join("should-not-run.txt").exists(),
+            "answering a command id must run nothing"
+        );
+        let engine = engine_for_repo(repo.to_str().expect("repository path")).expect("engine");
+        assert!(
+            engine
+                .chat_orchestrator
+                .has_pending_chat_command(&proposal_id),
+            "the command is still waiting for its own decision"
+        );
+        fs::remove_dir_all(repo).ok();
+    }
+
+    #[test]
+    fn run_command_with_a_question_id_runs_nothing() {
+        // Requirement 2's other direction: a question id reaching the command
+        // route is not an approval, and there is no proposal behind it to run.
+        let repo = question_repo("run-command-question-id");
+        let paused = paused_on_question(&repo);
+        let question_id = paused
+            .question_proposal
+            .as_ref()
+            .expect("a question")
+            .question_id
+            .clone();
+        let (port, token) = serve_for_test();
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/run-command",
+            &[
+                ("repo", repo.to_str().expect("repository path")),
+                ("proposal_id", &question_id),
+            ],
+        );
+        assert!(
+            !response.starts_with("HTTP/1.1 200"),
+            "a question id is not a command proposal: {response}"
+        );
+        assert!(
+            !repo.join("should-not-run.txt").exists(),
+            "nothing may run for a question id"
+        );
+        let engine = engine_for_repo(repo.to_str().expect("repository path")).expect("engine");
+        assert!(
+            !engine
+                .chat_orchestrator
+                .has_pending_chat_command(&question_id),
+            "a question is never a pending command"
+        );
+        fs::remove_dir_all(repo).ok();
     }
 
     #[test]
@@ -5249,6 +5841,77 @@ mod tests {
             fs::read_to_string(repo.join("config.js")).unwrap(),
             "export const api_key = \"sk_live_9f8a7b6c5d4e3f2a1b0c\";\n"
         );
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Spec 32 Task 6: a `before_patch_apply` hook's denial is the error text
+    /// the UI already shows, so its reason reaches the user, and a warning is
+    /// returned beside the applied files.
+    #[test]
+    fn apply_patch_endpoint_reports_hook_denials_and_warnings() {
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-apply-hook-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join(".damaian")).unwrap();
+        fs::write(repo.join("notes.txt"), "one\n").unwrap();
+
+        let data_dir = isolated_data_dir().to_path_buf();
+        let script = data_dir.join("patch-hook.sh");
+        let deny = "cat <<'JSON'\n{\"hookApiVersion\":1,\"verdict\":\"deny\",\"reason\":\"migrations/ is applied by the release process\"}\nJSON\n";
+        fs::write(&script, deny).unwrap();
+        let user_config = data_dir.join("config").join("user.conf");
+        fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        let hook_line = format!(
+            "hook.no_migrations.command=/bin/sh\nhook.no_migrations.args={}\nhook.no_migrations.events=before_patch_apply\n",
+            script.to_string_lossy()
+        );
+        fs::write(&user_config, &hook_line).unwrap();
+
+        let repo_arg = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
+        let patch = engine
+            .patch_engine
+            .create_patch(
+                &repo,
+                &[workspace_engine::ProposedChange {
+                    path: "notes.txt".to_string(),
+                    new_content: "two\n".to_string(),
+                    status: None,
+                    allow_restricted: false,
+                }],
+                None,
+                "hook apply",
+            )
+            .expect("create patch");
+        engine.patch_store.save(&patch).expect("store patch");
+
+        let (port, token) = serve_for_test();
+        let fields = [("repo", repo_arg.as_str()), ("patch_id", patch.id.as_str())];
+        let denied = post_fields_for_test(port, &token, "/api/apply-patch", &fields);
+        assert!(denied.starts_with("HTTP/1.1 500"), "{denied}");
+        assert!(denied.contains("no_migrations"), "{denied}");
+        assert!(denied.contains("release process"), "{denied}");
+        assert_eq!(
+            fs::read_to_string(repo.join("notes.txt")).unwrap(),
+            "one\n",
+            "a denied apply wrote the file"
+        );
+
+        let warn = "cat <<'JSON'\n{\"hookApiVersion\":1,\"verdict\":\"warn\",\"reason\":\"the patch was checked by the hook\"}\nJSON\n";
+        fs::write(&script, warn).unwrap();
+        let applied = post_fields_for_test(port, &token, "/api/apply-patch", &fields);
+        let _ = fs::remove_file(&user_config);
+        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
+        assert!(
+            applied.contains("\"hookWarnings\":[\"the patch was checked by the hook\"]"),
+            "{applied}"
+        );
+        assert_eq!(fs::read_to_string(repo.join("notes.txt")).unwrap(), "two\n");
 
         fs::remove_dir_all(&repo).ok();
     }
@@ -7535,7 +8198,7 @@ mod tests {
     fn repository_config_review_is_empty_without_a_repository() {
         assert_eq!(
             repository_config_review_json("  ").unwrap(),
-            "{\"rejectedKeys\":[],\"allowlistEntries\":[]}"
+            "{\"rejectedKeys\":[],\"allowlistEntries\":[],\"hooks\":[]}"
         );
     }
 
@@ -10636,6 +11299,235 @@ exec /bin/cat > /dev/null
                 StopOutcome::Terminated
             );
         }
+    }
+    /// Spec 32 Task 9 over real HTTP: list, review, toggle and test a hook.
+    ///
+    /// The review writes user config only — the endpoint has no path parameter,
+    /// and a `path` field naming the repository's own `.damaian/config.conf` is
+    /// ignored. A pending repository hook cannot be tested before it is
+    /// reviewed, and a stale approval hash is refused rather than adopting a
+    /// definition the user never saw. The test run reports redacted stderr.
+    #[test]
+    fn hook_routes_list_review_toggle_and_test_over_http() {
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-hook-routes-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join(".damaian")).unwrap();
+        fs::create_dir_all(repo.join("scripts")).unwrap();
+        let lint_script = repo.join("scripts").join("lint-hook.sh");
+        let lint_marker = repo.join("lint-ran");
+        fs::write(
+            &lint_script,
+            format!(
+                "#!/bin/sh\ntouch {}\necho '{{\"hookApiVersion\":1,\"verdict\":\"allow\"}}'\n",
+                lint_marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let repository_config = Config::repository_config_path(&repo);
+        fs::write(
+            &repository_config,
+            "hook.lint.command=/bin/sh\n\
+             hook.lint.args=./scripts/lint-hook.sh\n\
+             hook.lint.events=before_tool\n\
+             hook.lint.mode=optional\n",
+        )
+        .unwrap();
+        let repository_before = fs::read_to_string(&repository_config).unwrap();
+
+        let data_dir = isolated_data_dir();
+        let user_config = data_dir.join("config").join("user.conf");
+        fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        let noter_script = data_dir.join("noter.sh");
+        fs::write(
+            &noter_script,
+            "cat > /dev/null\n\
+             echo '{\"hookApiVersion\":1,\"verdict\":\"warn\",\"reason\":\"heads up\"}'\n\
+             echo 'aws key AKIAIOSFODNN7EXAMPLE' >&2\n",
+        )
+        .unwrap();
+        fs::write(
+            &user_config,
+            format!(
+                "hook.noter.command=/bin/sh\nhook.noter.args={}\nhook.noter.events=before_tool\n",
+                noter_script.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let repo_arg = repo.to_string_lossy().to_string();
+        let (port, token) = serve_for_test();
+        let hooks_path = format!("/api/hooks?repo={}", percent_encode_for_test(&repo_arg));
+
+        // Both are listed; the repository hook is pending until reviewed.
+        let listed = get_for_test(port, &token, &hooks_path);
+        assert!(listed.starts_with("HTTP/1.1 200"), "{listed}");
+        let listed = json_of(&listed);
+        let rows = listed["hooks"].as_array().expect("a hooks list");
+        assert_eq!(rows.len(), 2, "{listed}");
+        let lint = rows.iter().find(|row| row["id"] == "lint").unwrap();
+        assert_eq!(lint["activation"], "pending_review");
+        assert_eq!(lint["source"], "repository");
+        assert_eq!(lint["mode"], "optional");
+        assert_eq!(lint["command"], "/bin/sh");
+        assert_eq!(lint["events"][0], "before_tool");
+        let hash = lint["hash"]
+            .as_str()
+            .expect("a definition hash")
+            .to_string();
+        let noter = rows.iter().find(|row| row["id"] == "noter").unwrap();
+        assert_eq!(noter["activation"], "active");
+        assert_eq!(noter["source"], "user");
+
+        // A pending repository hook is not executed by a test run.
+        let refused = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-test",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "lint"),
+                ("event", "before_tool"),
+            ],
+        );
+        assert!(refused.starts_with("HTTP/1.1 500"), "{refused}");
+        assert!(refused.contains("review"), "{refused}");
+        assert!(!lint_marker.exists(), "an unreviewed hook ran");
+
+        // A stale hash is refused, and nothing is written.
+        let stale = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-review",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "lint"),
+                ("decision", "approve"),
+                ("hash", "sha256:deadbeef"),
+            ],
+        );
+        assert!(stale.starts_with("HTTP/1.1 500"), "{stale}");
+        assert!(
+            !fs::read_to_string(&user_config)
+                .unwrap()
+                .contains("hook_review."),
+            "a refused review wrote user config"
+        );
+
+        // The real review: a `path` field naming the repository's own config is
+        // ignored, because the endpoint has no such parameter.
+        let reviewed = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-review",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "lint"),
+                ("decision", "approve"),
+                ("hash", hash.as_str()),
+                ("path", repository_config.to_str().unwrap()),
+            ],
+        );
+        assert!(reviewed.starts_with("HTTP/1.1 200"), "{reviewed}");
+        let reviewed = json_of(&reviewed);
+        let lint = reviewed["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "lint")
+            .unwrap();
+        assert_eq!(lint["activation"], "active", "{reviewed}");
+        assert_eq!(
+            fs::read_to_string(&repository_config).unwrap(),
+            repository_before,
+            "the endpoint wrote the repository's own config"
+        );
+        let user = fs::read_to_string(&user_config).unwrap();
+        assert!(user.contains("hook_review."), "{user}");
+        assert!(user.contains(&hash), "{user}");
+
+        // A user hook can be switched off, and the definition survives.
+        let disabled = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-enabled",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "noter"),
+                ("enabled", "false"),
+            ],
+        );
+        assert!(disabled.starts_with("HTTP/1.1 200"), "{disabled}");
+        let disabled = json_of(&disabled);
+        let noter = disabled["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "noter")
+            .unwrap();
+        assert_eq!(noter["activation"], "disabled", "{disabled}");
+        assert_eq!(noter["enabled"], false);
+
+        // A repository's hook is not the user's to switch off.
+        let refused_toggle = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-enabled",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "lint"),
+                ("enabled", "false"),
+            ],
+        );
+        assert!(
+            refused_toggle.starts_with("HTTP/1.1 500"),
+            "{refused_toggle}"
+        );
+        assert_eq!(
+            fs::read_to_string(&repository_config).unwrap(),
+            repository_before
+        );
+
+        // A test run reports the verdict and redacted stderr.
+        let tested = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-test",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "noter"),
+                ("event", "before_tool"),
+            ],
+        );
+        assert!(tested.starts_with("HTTP/1.1 200"), "{tested}");
+        let tested = json_of(&tested);
+        assert_eq!(tested["verdict"], "warn", "{tested}");
+        assert!(tested["failure"].is_null(), "{tested}");
+        let stderr = tested["stderr"].as_str().expect("stderr");
+        assert!(stderr.contains("[REDACTED_AWS_ACCESS_KEY"), "{stderr}");
+        assert!(!stderr.contains("AKIAIOSFODNN7EXAMPLE"), "{stderr}");
+
+        // The reviewed repository hook now runs, and the settings listing shows
+        // it active.
+        let ran = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-test",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "lint"),
+                ("event", "before_tool"),
+            ],
+        );
+        assert!(ran.starts_with("HTTP/1.1 200"), "{ran}");
+        assert_eq!(json_of(&ran)["verdict"], "allow");
+        assert!(lint_marker.exists(), "the reviewed hook did not run");
+
+        let _ = fs::remove_dir_all(&repo);
     }
 }
 

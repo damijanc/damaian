@@ -3,6 +3,7 @@ use crate::error::{ClientError, Result};
 use crate::hash::repository_id_for_root;
 use crate::model::TokenUsage;
 use crate::profile::{ProfileCapabilities, ProfileId};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -2726,7 +2727,8 @@ pub struct ConfigOverlay {
 /// Which commands a permission profile lets run at all, narrowest first, so
 /// `Ord` is the restriction order (spec 31, `context.md` §3). `CommandPolicy`
 /// enforces it as a block, so a stored proposal run by id is refused too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CommandAccess {
     None,
     /// What Plan mode already allows: low risk, no approval, read-only.

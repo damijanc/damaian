@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use eval_harness::assertions;
 use eval_harness::metrics::{MetricSet, MetricValue};
 use eval_harness::record::{
-    AssertionOutcome, CacheUsage, FindingsByPurpose, PurposeTally, RecordedPlan, RecordedRecovery,
-    RecordedToolCall, RunRecord, Tokens,
+    AssertionOutcome, CacheUsage, FindingsByPurpose, PurposeTally, RecordedApproval, RecordedPlan,
+    RecordedRecovery, RecordedToolCall, RunRecord, Tokens,
 };
 use eval_harness::report;
 use eval_harness::scenario::{self, Tier};
@@ -1166,8 +1167,9 @@ fn a_blocked_scenario_is_still_skipped_and_says_why() {
 }
 
 /// Guards the count in spec 18 §6, now that spec 17 has landed: every scenario
-/// runs and none is blocked. Twenty-one since spec 59 added `long_discovery` and
-/// `read_loop`.
+/// runs and none is blocked. Twenty-three: spec 59 added `long_discovery` and
+/// `read_loop`, spec 62 added `approval_causes`, and spec 50 added
+/// `answered_question`.
 #[test]
 fn every_scenario_runs_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
@@ -1182,7 +1184,7 @@ fn every_scenario_runs_and_none_is_blocked() {
         Vec::<&str>::new(),
         "no scenario is deferred any more"
     );
-    assert_eq!(all.len(), 21, "twenty-one scenarios should run");
+    assert_eq!(all.len(), 23, "twenty-three scenarios should run");
 }
 
 #[test]
@@ -1469,8 +1471,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        21,
-        "all twenty-one scenario files should be accounted for"
+        23,
+        "all twenty-three scenario files should be accounted for"
     );
     assert_eq!(
         built
@@ -2374,4 +2376,450 @@ fn the_exploration_findings_assertion_fails_when_nothing_explored() {
     let results = assertions::evaluate(&run, &asserts, Tier::Deterministic, &[]);
     let result = outcome(&results, "exploration_findings");
     assert!(!result.passed, "{} / {}", result.expected, result.actual);
+}
+
+// ---------------------------------------------------------------------------
+// Approval prompts by first cause. Spec 62 §5.5.
+// ---------------------------------------------------------------------------
+
+/// The evidence §5.5 asks for: each stored proposal carries the cause the
+/// classifier decided on, and the run groups its prompts by the *first* one.
+///
+/// `approval_causes` produces two prompts with different causes. The second
+/// proposal has two causes (`unknown,outside_repository`), so taking the last
+/// one instead of the first would make it disagree with the prompt the user
+/// actually saw.
+#[test]
+fn a_run_records_each_approval_prompt_by_its_first_cause() {
+    let (run, results) = run_and_evaluate("approval_causes");
+    assert_all_passed("approval_causes", &results);
+
+    let requested: Vec<&RecordedApproval> = run
+        .record
+        .approvals
+        .iter()
+        .filter(|approval| approval.decision == "requested")
+        .collect();
+    assert_eq!(
+        requested.len(),
+        2,
+        "the scenario produces two prompts, got {:?}",
+        run.record.approvals
+    );
+    assert_eq!(
+        requested[0].cause.as_deref(),
+        Some("shell_control"),
+        "a compound command names shell control first"
+    );
+    assert_eq!(
+        requested[1].cause.as_deref(),
+        Some("unknown"),
+        "the first of `unknown,outside_repository`, which is what the prompt led with"
+    );
+
+    assert_eq!(
+        run.record.approvals_by_cause,
+        BTreeMap::from([("shell_control".to_string(), 1), ("unknown".to_string(), 1),]),
+        "the run groups its prompts by the deciding cause"
+    );
+}
+
+/// A proposal that ran without asking is not an approval prompt and must not
+/// be counted as one. `planned_task`'s `ls src` is admitted read-only, so its
+/// `command_proposal_stored` event carries no causes at all; grouping it under
+/// a "none" bucket would make the report measure proposals rather than prompts.
+#[test]
+fn a_proposal_that_needed_no_approval_is_not_counted_as_a_prompt() {
+    let (run, results) = run_and_evaluate("planned_task");
+    assert_all_passed("planned_task", &results);
+
+    let requested: Vec<&RecordedApproval> = run
+        .record
+        .approvals
+        .iter()
+        .filter(|approval| approval.decision == "requested")
+        .collect();
+    assert!(
+        !requested.is_empty(),
+        "the run stored a proposal for the command it ran"
+    );
+    assert!(
+        requested.iter().all(|approval| approval.cause.is_none()),
+        "an auto-run proposal has no cause, got {requested:?}"
+    );
+    assert!(
+        run.record.approvals_by_cause.is_empty(),
+        "nothing was asked, so nothing is grouped: {:?}",
+        run.record.approvals_by_cause
+    );
+
+    let grouped = run.record.approvals_by_cause.clone();
+    let built = report::build(vec![run.record]);
+    assert!(
+        !report::to_text(&built).contains("\nApproval prompts by first cause\n"),
+        "a run that never prompted has no grouping section, got {grouped:?}"
+    );
+    match &built
+        .metrics
+        .get("approval_prompts_by_cause")
+        .expect("metric")
+        .value
+    {
+        MetricValue::NotApplicable { phase } => assert_eq!(phase, "no-approval-prompts"),
+        other => panic!("a run with no prompts must report no data, got {other:?}"),
+    }
+}
+
+/// The per-run line the text report prints, and the metric built from the same
+/// grouping. Both carry the cause *name* and the count, because one total would
+/// lose exactly the fact §5.5 exists to show: which cause dominates.
+#[test]
+fn the_report_groups_approval_prompts_by_their_first_cause() {
+    let (run, results) = run_and_evaluate("approval_causes");
+    assert_all_passed("approval_causes", &results);
+
+    let built = report::build(vec![run.record]);
+    let text = report::to_text(&built);
+
+    assert!(
+        text.contains("\nApproval prompts by first cause\n"),
+        "the report has a grouping section:\n{text}"
+    );
+    let section = text
+        .split_once("\nApproval prompts by first cause\n")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("no grouping section:\n{text}"));
+    let line = section
+        .lines()
+        .find(|line| line.trim_start().starts_with("approval_causes"))
+        .unwrap_or_else(|| panic!("no per-run grouping line:\n{text}"));
+    assert!(
+        line.contains("shell_control 1") && line.contains("unknown 1"),
+        "the line must name each cause and its count: {line}"
+    );
+
+    match &built
+        .metrics
+        .get("approval_prompts_by_cause")
+        .expect("metric")
+        .value
+    {
+        MetricValue::Groups { counts } => {
+            assert_eq!(counts.get("shell_control"), Some(&1));
+            assert_eq!(counts.get("unknown"), Some(&1));
+        }
+        other => panic!("expected the grouped metric, got {other:?}"),
+    }
+}
+
+/// The metric must sum across runs rather than let one run overwrite another —
+/// a constant, or a last-run-wins figure, would satisfy a single-run test while
+/// measuring nothing about a suite.
+#[test]
+fn the_approval_cause_metric_sums_across_runs() {
+    let mut first = RunRecord::new("a", "4", "deterministic", "mock", "mock");
+    first.final_status = "awaiting_approval".to_string();
+    first.approvals_by_cause =
+        BTreeMap::from([("shell_control".to_string(), 2), ("unknown".to_string(), 1)]);
+    let mut second = RunRecord::new("b", "4", "deterministic", "mock", "mock");
+    second.final_status = "awaiting_approval".to_string();
+    second.approvals_by_cause = BTreeMap::from([("shell_control".to_string(), 1)]);
+
+    let set = MetricSet::compute(&[first, second]);
+
+    match &set.get("approval_prompts_by_cause").expect("metric").value {
+        MetricValue::Groups { counts } => {
+            assert_eq!(counts.get("shell_control"), Some(&3));
+            assert_eq!(counts.get("unknown"), Some(&1));
+        }
+        other => panic!("expected the grouped metric, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scripted answers. Spec 50 §9.
+// ---------------------------------------------------------------------------
+
+/// The committed scenario above is the end-to-end case. These are written to a
+/// temporary directory instead, because they measure the harness's own script
+/// handling rather than a capability of the assistant, and a committed copy
+/// would run in both tiers for no measurement.
+fn temp_scenario(name: &str, body: &str) -> scenario::Scenario {
+    let dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+    let path = dir.join(format!("{name}.toml"));
+    std::fs::write(&path, body).expect("write scenario");
+    scenario::load(&path).unwrap_or_else(|error| panic!("{name} should load: {error:?}"))
+}
+
+#[test]
+fn a_scenario_may_script_the_users_answers() {
+    let loaded = temp_scenario(
+        "scripted_answers",
+        r#"
+name = "scripted_answers"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "p"
+answers = ["The CLI", "The shell"]
+"#,
+    );
+    assert_eq!(
+        loaded.answers,
+        vec!["The CLI".to_string(), "The shell".to_string()],
+        "an answer list survives loading in order"
+    );
+
+    let path = scenario::scenarios_dir().join("one_file_patch.toml");
+    let without = scenario::load(&path).expect("scenario");
+    assert!(
+        without.answers.is_empty(),
+        "answers default to empty, so every existing scenario stays headless"
+    );
+}
+
+/// The deterministic tier's one end-to-end answer: the scripted model asks, the
+/// runner answers the way a user would, and the next request carries the
+/// engine's fixed tool result. Asserted against that request rather than the
+/// script, because the script cannot show what the model was given.
+#[test]
+fn a_scripted_answer_reaches_the_model_and_the_turn_completes() {
+    let (run, results) = run_and_evaluate("answered_question");
+    assert_all_passed("answered_question", &results);
+
+    let request = run
+        .answer_request
+        .as_deref()
+        .expect("a turn that asked a question must record the request that answered it");
+    assert!(
+        request.contains(
+            r#"The user answered: "src/http_client.rs" (option 1: "src/http_client.rs")"#
+        ),
+        "the resumed request must carry the answer as the engine's tool result, got: {request}"
+    );
+    assert_eq!(run.record.final_task_status, "complete");
+    assert_eq!(
+        run.record.model_calls, 2,
+        "the question round and the answer round"
+    );
+    assert_eq!(
+        run.record.tool_rounds, 1,
+        "the question is the turn's one tool round"
+    );
+}
+
+/// Without a scripted answer the run is headless, exactly as every existing
+/// scenario is: `ask_user` is not offered, so a model that emits it anyway gets
+/// a tool error and the turn continues rather than waiting for nobody.
+#[test]
+fn a_scenario_without_scripted_answers_runs_headless() {
+    let loaded = temp_scenario(
+        "headless_question",
+        r#"
+name = "headless_question"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Which crate should the helper go in?"
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "ask_user", arguments = { question = "Which crate?", options = ["core", "cli"] } },
+]
+
+[[turn]]
+content = "I will put it in core, assuming that is the shared one."
+"#,
+    );
+
+    let run = eval_harness::runner::run(&loaded).expect("a headless run must not fail");
+
+    assert_eq!(run.record.final_task_status, "complete");
+    assert!(
+        run.answer_request.is_none(),
+        "nothing paused, so nothing was answered"
+    );
+    assert!(
+        run.trace
+            .of_type("model_response_completed")
+            .iter()
+            .all(|event| event.field("status") != Some("question_pending")),
+        "the tool is not offered without a user, so the turn must not pause"
+    );
+    let asked = run
+        .record
+        .tool_calls
+        .iter()
+        .find(|call| call.name == "ask_user")
+        .expect("the call was dispatched");
+    assert_eq!(
+        asked.outcome, "failed",
+        "an unoffered question is refused as a tool result, not paused"
+    );
+}
+
+/// Asking more questions than the scenario scripts is a script bug, and saying
+/// so is the only way a reader can tell it from an engine that stopped
+/// answering.
+#[test]
+fn asking_more_questions_than_are_scripted_fails_the_run() {
+    let loaded = temp_scenario(
+        "over_asking",
+        r#"
+name = "over_asking"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Ask twice"
+answers = ["Yes"]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "ask_user", arguments = { question = "First?", options = ["Yes", "No"] } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "ask_user", arguments = { question = "Second?", options = ["Yes", "No"] } },
+]
+
+[[turn]]
+content = "Done."
+"#,
+    );
+
+    let error = eval_harness::runner::run(&loaded)
+        .expect_err("an unscripted second question must fail the run");
+    assert!(
+        format!("{error:?}").contains("more questions than the scenario scripts"),
+        "the failure must name its reason, got: {error:?}"
+    );
+}
+
+/// The other half of "by option label when one matches": an answer that names
+/// no option is free text, and the engine refuses it when the question does not
+/// accept free text. The runner must not quietly pick an option instead.
+#[test]
+fn an_answer_that_matches_no_option_is_refused_when_free_text_is_off() {
+    let loaded = temp_scenario(
+        "unmatched_answer",
+        r#"
+name = "unmatched_answer"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Where?"
+answers = ["The shell"]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "ask_user", arguments = { question = "Which crate?", options = ["core", "cli"], allowFreeText = false } },
+]
+
+[[turn]]
+content = "Done."
+"#,
+    );
+
+    let run = eval_harness::runner::run(&loaded).expect("the run itself should complete");
+    assert_eq!(
+        run.record.final_status, "failed",
+        "an unanswerable question is a failed run, not a completed one"
+    );
+    assert!(
+        run.response.contains("only one of its options"),
+        "the engine's refusal should say why, got: {}",
+        run.response
+    );
+}
+
+/// A question paused for a human is a clean stop, like a command waiting for
+/// approval — not a tool error. Left unclassified, the fail-closed default in
+/// `is_tool_error` would report every question as a failure.
+#[test]
+fn a_question_pause_is_not_counted_as_a_tool_error() {
+    let mut record = RunRecord::new("q", "4", "deterministic", "mock", "mock");
+    record.final_status = "completed".to_string();
+    record.tool_calls = vec![
+        RecordedToolCall {
+            name: "ask_user".to_string(),
+            arguments: serde_json::json!({ "ref": "" }),
+            outcome: "awaiting_answer".to_string(),
+        },
+        RecordedToolCall {
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({ "ref": "src/upload.rs" }),
+            outcome: "ok".to_string(),
+        },
+    ];
+
+    match &MetricSet::compute(&[record])
+        .get("tool_and_model_error_rate")
+        .expect("metric")
+        .value
+    {
+        MetricValue::Number { value } => {
+            assert_eq!(*value, 0.0, "a pause for a human decision is not an error")
+        }
+        other => panic!("expected a rate, got {other:?}"),
+    }
+}
+
+/// The measurement proposal §7 asks for — how often a real model asks when the
+/// tool is available — cannot come from the deterministic tier, whose model
+/// asks only because a script tells it to. It needs a provider, spends money,
+/// and is therefore ignored by default. Run it explicitly:
+///
+/// ```text
+/// DAMAIAN_EVAL_PROVIDER=deepseek DAMAIAN_EVAL_MODEL=deepseek-v4-flash \
+///   cargo test -p eval-harness --locked -- --ignored --nocapture \
+///   live_tier_measures_ask_user_use
+/// ```
+///
+/// The committed scenarios script no answers, so a live run of them is headless
+/// and `ask_user` is never offered (`context.md` §9) — the count would be zero
+/// by construction. Every scenario is therefore given a scripted answer list in
+/// memory, which makes its run interactive, and what it asked is printed. The
+/// cap is two questions per turn, so two answers is all one run can consume.
+///
+/// This asserts no rate. A model that never asks and one that always asks are
+/// both outcomes a reader judges against §7's question, not a pass or a fail.
+/// A question that offers no free text cannot be answered from a generic
+/// script, so that run prints the refusal and contributes no figure.
+#[test]
+#[ignore = "calls a real provider; run manually with the command in the doc comment"]
+fn live_tier_measures_ask_user_use() {
+    let mut answered_runs = 0;
+    let mut total_questions = 0;
+
+    let scenarios = scenario::load_all().expect("scenarios should load");
+    let total_scenarios = scenarios.len();
+
+    for mut scenario in scenarios {
+        scenario.answers = vec![
+            "Yes, proceed with the most reasonable interpretation.".to_string(),
+            "Use the simplest reasonable option and say what you assumed.".to_string(),
+        ];
+        match eval_harness::runner::run_live(&scenario) {
+            Ok(run) => {
+                let asked = run
+                    .record
+                    .tool_calls
+                    .iter()
+                    .filter(|call| call.name == "ask_user" && call.outcome == "awaiting_answer")
+                    .count();
+                answered_runs += 1;
+                total_questions += asked;
+                println!(
+                    "{:<32} {asked} question(s), ended {}",
+                    scenario.name, run.record.final_task_status
+                );
+            }
+            Err(error) => println!("{:<32} no figure: {error:?}", scenario.name),
+        }
+    }
+
+    println!(
+        "{total_questions} question(s) across {answered_runs} completed run(s) of {total_scenarios}"
+    );
 }

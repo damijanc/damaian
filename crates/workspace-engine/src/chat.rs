@@ -4,9 +4,12 @@ use crate::checkpoint::{
     CheckpointConversation, CheckpointRequest, CheckpointStore, CommandCensus, PendingApproval,
 };
 use crate::clarification::{
-    AskUserInput, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, QUESTION_MAX_CHARS,
+    AskUserInput, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, PendingQuestionRef,
+    QUESTION_MAX_CHARS, validate_answer,
 };
-use crate::command_policy::{CommandClassification, CommandRisk, allow_always_eligible};
+use crate::command_policy::{
+    ApprovalCause, CommandClassification, CommandRisk, allow_always_eligible, is_validation_command,
+};
 use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::config::{Config, CostEstimate, McpTransport};
@@ -15,11 +18,12 @@ use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes
 use crate::error::{ClientError, ProviderRefusal, Result};
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
 use crate::finding::{
-    Finding, Severity, default_parsers, findings_from_execution, findings_from_web_record,
-    resolve_finding_path,
+    Finding, FindingDraft, FindingSource, Severity, default_parsers, findings_from_execution,
+    findings_from_web_record, resolve_finding_path,
 };
 use crate::git_service::{DiffOptions, GitService, GitStatus, WorktreeListing};
 use crate::hash::{create_id, now_millis};
+use crate::hooks::{HookContext, HookDispatcher, HookEvent, HookOutcome, Verdict};
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
 use crate::mode::{Permission, SessionMode, permits, refusal_message};
@@ -318,6 +322,15 @@ pub struct AgentCommandProposal {
     pub risk: String,
     pub requires_approval: bool,
     pub blocked: bool,
+    /// The policy's deciding cause in plain words (spec 62 §5.2): the first
+    /// rendered `reasons` entry, which is derived from the classification's
+    /// causes. Shown beside the risk badge, outside the rationale disclosure,
+    /// because it is what tells the user whether this prompt is routine.
+    pub cause: String,
+    /// The model's own stated reason for wanting the command (spec 62 §5.2).
+    /// Stored on the proposal all along; the card shows it as "The agent says:
+    /// …" so the user sees both what the agent wants and why Damaian asks.
+    pub reason: String,
     /// Whether the approval UI may offer "allow always" for this proposal.
     /// Always false for MCP tool calls, which aren't shell commands and so
     /// have no `command_allowlist` entry to write.
@@ -358,6 +371,22 @@ pub struct AgentPlanProposal {
     /// progress line uses — so the card can say what the approval unblocks
     /// rather than asking the user to approve in the abstract.
     pub deferred_action: String,
+}
+
+/// A question the model asked mid-turn, waiting for the user's answer
+/// (spec 50). Resumed through [`ChatOrchestrator::resume_after_answer`].
+///
+/// Carries no proposal id, because a question is not a proposal: the id
+/// addresses the paused turn, and answering it authorises nothing. The text is
+/// already redacted — the chat loop runs the secret scanner before it is stored
+/// (`context.md` §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentQuestionProposal {
+    /// The id to hand back to [`ChatOrchestrator::resume_after_answer`].
+    pub question_id: String,
+    pub question: String,
+    pub options: Vec<String>,
+    pub allow_free_text: bool,
 }
 
 /// A one-shot offer to answer a refused turn with a different configured
@@ -442,6 +471,10 @@ pub struct ChatTurnResult {
     /// mutating step. Resumed through
     /// [`ChatOrchestrator::resume_after_plan_decision`].
     pub plan_proposal: Option<AgentPlanProposal>,
+    /// The model asked a question mid-turn and the turn is waiting for the
+    /// user's answer. Resumed through
+    /// [`ChatOrchestrator::resume_after_answer`] (spec 50).
+    pub question_proposal: Option<AgentQuestionProposal>,
     /// The provider refused and a different configured provider could answer.
     /// The turn is paused, not failed, until
     /// [`ChatOrchestrator::resume_after_fallback_decision`] decides.
@@ -480,6 +513,7 @@ struct TurnProposals {
     command: Option<AgentCommandProposal>,
     patch: Option<AgentPatchProposal>,
     plan: Option<AgentPlanProposal>,
+    question: Option<AgentQuestionProposal>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -538,6 +572,7 @@ pub struct ChatOrchestrator {
     patch_engine: PatchEngine,
     patch_store: PatchStore,
     checkpoint_store: CheckpointStore,
+    hooks: HookDispatcher,
     mcp_token_resolver: Option<McpTokenResolver>,
     web_diagnostics_runner: Option<WebDiagnosticsRunnerHandle>,
 }
@@ -563,6 +598,7 @@ impl ChatOrchestrator {
         patch_engine: PatchEngine,
         patch_store: PatchStore,
         checkpoint_store: CheckpointStore,
+        hooks: HookDispatcher,
     ) -> Self {
         let pending_commands = PendingCommandStore::new(&config.data_dir);
         Self {
@@ -582,6 +618,7 @@ impl ChatOrchestrator {
             patch_engine,
             patch_store,
             checkpoint_store,
+            hooks,
             mcp_token_resolver: None,
             web_diagnostics_runner: None,
         }
@@ -834,6 +871,11 @@ impl ChatOrchestrator {
     ) -> Result<ChatTurnResult> {
         let repository_root = repository_root.as_ref();
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
+        // Context a `session_start` or `before_context` hook returned, in the
+        // order the events ran (spec 32 `context.md` §10). It is ordinary
+        // context: `build_context_with_hooks` redacts it and charges it to the
+        // turn's budget like every other item.
+        let mut hook_context: Vec<(String, String)> = Vec::new();
         let (session, prior_messages) = if let Some(session_id) = session_id {
             let Some(session) = self.session_store.read_session(session_id)? else {
                 return Err(ClientError::InvalidInput(format!(
@@ -848,11 +890,31 @@ impl ChatOrchestrator {
             let messages = self.session_store.read_messages(&session.id)?;
             (session, messages)
         } else {
-            (
-                self.session_store
-                    .create_session(&index.repository_id, &session_title(prompt))?,
-                Vec::new(),
-            )
+            // Spec 32 `context.md` §3: the event runs before the session
+            // exists, so the envelope carries no session id and there is no
+            // task. `RequestApproval` has no approval step here, so it denies
+            // like `deny` does (§4). A denial creates nothing: no session, no
+            // task, and no model call.
+            let ctx = HookContext::root();
+            let parts = self.hooks.envelope_parts(None, None, serde_json::json!({}));
+            let outcome =
+                self.hooks
+                    .dispatch(HookEvent::SessionStart, parts, repository_root, &ctx);
+            if matches!(outcome.verdict, Verdict::Deny | Verdict::RequestApproval) {
+                return Err(ClientError::PolicyBlocked(hook_refusal(&outcome)));
+            }
+            let session_start_findings = outcome.findings;
+            hook_context.extend(outcome.context);
+            let session = self
+                .session_store
+                .create_session(&index.repository_id, &session_title(prompt))?;
+            // Warnings are findings too, and now there is a log to keep them
+            // in. Requested commands are not run: `session_start` has no task,
+            // and §9 refuses a command at an event with no task.
+            for finding in &session_start_findings {
+                let _ = self.session_store.record_finding(&session.id, finding);
+            }
+            (session, Vec::new())
         };
         // Captured before the turn's own events, so rewinding this checkpoint
         // takes the user's prompt with it rather than leaving a question the
@@ -909,7 +971,63 @@ impl ChatOrchestrator {
             self.default_exploration_round_limit(),
         );
 
-        let context = self.context_manager.build_context(
+        // Spec 32 `context.md` §3, §4: context is assembled once per turn, so
+        // this is the one place a hook's additions can become ordinary
+        // `hook_context` items. `RequestApproval` has no approval step here, so
+        // it denies like `deny` does. A refused turn never reaches the model.
+        let before_context = {
+            let ctx = HookContext::root();
+            let parts = self.hooks.envelope_parts(
+                Some(&session),
+                Some(&task.id),
+                serde_json::json!({"flow": "chat", "explicitPaths": explicit_paths}),
+            );
+            let mut outcome =
+                self.hooks
+                    .dispatch(HookEvent::BeforeContext, parts, repository_root, &ctx);
+            // Warnings are findings too, so this records both (`context.md`
+            // §10). A finding that could not be journalled does not decide the
+            // turn either way.
+            for finding in &outcome.findings {
+                let _ = self.session_store.record_finding(&session.id, finding);
+            }
+            if matches!(outcome.verdict, Verdict::Deny | Verdict::RequestApproval) {
+                let message = hook_refusal(&outcome);
+                self.session_store.append_message(
+                    &session.id,
+                    Some(&task.id),
+                    "assistant",
+                    &message,
+                )?;
+                let _ = self.session_store.update_task_status_with_kind(
+                    &task,
+                    TaskStatus::Failed,
+                    Some(&message),
+                    Some("hook_denied"),
+                );
+                return Err(ClientError::PolicyBlocked(message));
+            }
+            // A `before_context` hook's requested commands run under the
+            // session's mode and profile, like any other (`context.md` §9).
+            if !outcome.commands.is_empty() {
+                let mode = self.session_store.session_mode(&session.id);
+                let requested = self.hooks.run_requested_commands(
+                    &mut outcome,
+                    &session,
+                    Some(&task),
+                    mode,
+                    repository_root,
+                    &ctx,
+                );
+                for finding in &requested {
+                    let _ = self.session_store.record_finding(&session.id, finding);
+                }
+            }
+            outcome.context
+        };
+        hook_context.extend(before_context);
+
+        let context = self.context_manager.build_context_with_hooks(
             repository_root,
             &index.repository_id,
             &task.id,
@@ -917,6 +1035,7 @@ impl ChatOrchestrator {
             Some(&index),
             explicit_paths,
             self.config.context_token_budget(),
+            &hook_context,
         );
         let model_prompt = build_model_prompt(prompt, &context.items, &prior_messages, None);
         let mode = self.session_store.session_mode(&session.id);
@@ -980,33 +1099,14 @@ impl ChatOrchestrator {
         decision_options: ResumeDecisionOptions,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
-        // A plan review shares the pending-turn file but not this path: there
-        // is no dispatched call to execute or decline, and falling through to
-        // the shell-command branch below would run `last_content` as a
-        // command. Refused loudly rather than guessed at — and the pending
-        // turn is put back, so the right resume can still find it.
-        if pending.plan_review.is_some() {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is a plan review; resume it with resume_after_plan_decision"
-            )));
-        }
-        // Same reasoning for a fallback offer: nothing was dispatched, and
-        // `last_content` is empty rather than a command.
-        if pending.provider_fallback.is_some() {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is a provider fallback offer; resume it with resume_after_fallback_decision"
-            )));
-        }
-        // Same reasoning for a round-budget pause (spec 61): nothing was
-        // dispatched, and `last_content` is empty rather than a command.
-        if pending.round_budget.is_some() {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is a round-budget pause; resume it with resume_round_budget"
-            )));
-        }
+        // Every pause shares the pending-turn file, and each resume loads
+        // whatever file its id names. A plan review, a provider fallback, a
+        // round-budget pause and a question each have their own resume;
+        // falling through to the shell-command branch here would run
+        // `last_content` as a command or fail with a misleading error after
+        // deleting the pause. Refused loudly instead, with the file put back
+        // so the right resume can still find it (spec 50 `context.md` §2).
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::Action)?;
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
         // Layer 3's resume-path points (`context.md` §8): approving a paused
@@ -1021,7 +1121,12 @@ impl ChatOrchestrator {
 
         // Three kinds of paused action resume through here: a browser
         // diagnostic, an MCP tool call, or the original shell-command path.
-        let (assistant_summary, tool_result_content) = if let Some(web_call) =
+        // A resumed call that actually dispatches is followed by `after_tool`;
+        // a decline or a refusal dispatches nothing, so there is no event.
+        let mut after_tool_action: Option<ToolAction> = None;
+        let mut after_tool_outcome: Option<ActionOutcome> = None;
+        let mut after_tool_termination: Option<CommandTermination> = None;
+        let (assistant_summary, mut tool_result_content) = if let Some(web_call) =
             &pending.web_diagnostic_call
         {
             let call = web_call.call.clone();
@@ -1071,8 +1176,15 @@ impl ChatOrchestrator {
             let content = if refused {
                 refusal_message(permission)
             } else if approved {
-                self.run_and_record_web_diagnostic(&repository_root, &call, sink)?
-                    .0
+                let (content, failed) =
+                    self.run_and_record_web_diagnostic(&repository_root, &call, sink)?;
+                after_tool_action = Some(ToolAction::WebDiagnostic(call.clone()));
+                after_tool_outcome = Some(if failed {
+                    ActionOutcome::Failed
+                } else {
+                    ActionOutcome::Ok
+                });
+                content
             } else {
                 format!(
                     "The user declined to run `{}` against `{}`. Do not request the same browser diagnostic again; answer using what you already know, noting the limitation if it matters.",
@@ -1102,7 +1214,7 @@ impl ChatOrchestrator {
                 if !permission.is_allowed() {
                     refusal_message(permission)
                 } else {
-                    match mcp.call_tool(
+                    let (content, outcome) = match mcp.call_tool(
                         &mcp_call.server_id,
                         &mcp_call.tool_name,
                         &mcp_call.arguments_json,
@@ -1110,13 +1222,26 @@ impl ChatOrchestrator {
                         Ok(result) => {
                             let text = self.scanner.redact(&result.text).text;
                             if result.is_error {
-                                format!("MCP tool reported an error:\n{text}")
+                                (
+                                    format!("MCP tool reported an error:\n{text}"),
+                                    ActionOutcome::Failed,
+                                )
                             } else {
-                                text
+                                (text, ActionOutcome::Ok)
                             }
                         }
-                        Err(error) => format!("MCP tool call failed: {error}"),
-                    }
+                        Err(error) => (
+                            format!("MCP tool call failed: {error}"),
+                            ActionOutcome::Failed,
+                        ),
+                    };
+                    after_tool_action = Some(ToolAction::McpCall {
+                        server_id: mcp_call.server_id.clone(),
+                        tool_name: mcp_call.tool_name.clone(),
+                        arguments_json: mcp_call.arguments_json.clone(),
+                    });
+                    after_tool_outcome = Some(outcome);
+                    content
                 }
             } else {
                 format!(
@@ -1195,8 +1320,8 @@ impl ChatOrchestrator {
                 // `CommandExit` either (spec 22 `context.md` §14).
                 self.record_command_findings(
                     &repository_root,
-                    &pending.session.id,
-                    &pending.task.id,
+                    &pending.session,
+                    &pending.task,
                     &record.execution,
                 )?;
                 self.record_command_effects(
@@ -1205,6 +1330,12 @@ impl ChatOrchestrator {
                     &pending.task,
                     &census,
                 );
+                after_tool_action = Some(ToolAction::Command(command_request.clone()));
+                after_tool_outcome = Some(ActionOutcome::CommandExit(
+                    record.execution.exit_code,
+                    record.execution.purpose,
+                ));
+                after_tool_termination = Some(record.execution.termination);
                 sandbox_command_context(&record.execution)
             } else {
                 self.validation_orchestrator
@@ -1216,6 +1347,30 @@ impl ChatOrchestrator {
             };
             (tool_call_summary(&command_request), content)
         };
+
+        if let (Some(action), Some(outcome)) =
+            (after_tool_action.as_ref(), after_tool_outcome.as_ref())
+        {
+            let payload =
+                tool_event_payload(&self.scanner, action, Some(outcome), after_tool_termination);
+            let after = self.dispatch_tool_event(
+                HookEvent::AfterTool,
+                &pending.session,
+                &pending.task,
+                &repository_root,
+                payload,
+            );
+            if let Some(note) = hook_after_note(&after) {
+                tool_result_content.push_str("\n\n");
+                tool_result_content.push_str(&note);
+            }
+            self.record_after_refusal(
+                &pending.session.id,
+                &pending.task.id,
+                HookEvent::AfterTool,
+                &after,
+            );
+        }
 
         self.session_store.append_message(
             &pending.session.id,
@@ -1314,11 +1469,10 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::PlanReview)?;
         let Some(review) = pending.plan_review.clone() else {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is not a plan review"
-            )));
+            // `refuse_unless_paused_for` just proved the pause is a plan review.
+            unreachable!("a plan review pause must carry its review");
         };
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
@@ -1412,6 +1566,158 @@ impl ChatOrchestrator {
         )
     }
 
+    /// Answers the question a turn paused on (spec 50 `context.md` §7).
+    ///
+    /// The answer goes back as a **tool result**, not a user message: the
+    /// paused call is replayed and its result is the user's answer, so the
+    /// model sees the exchange as a tool round and the question consumes one
+    /// action round, exactly as an uninterrupted `ask_user` would.
+    ///
+    /// An answer authorises nothing. This method only ever appends a tool
+    /// result; every side-effecting tool the model asks for next still passes
+    /// through its own approval or review.
+    pub fn resume_after_answer(
+        &self,
+        question_id: &str,
+        answer: &str,
+        selected_option: Option<usize>,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let pending = self.pending_commands.take(question_id)?;
+        self.refuse_unless_paused_for(question_id, &pending, PausedFor::Question)?;
+        let Some(question) = pending.question.clone() else {
+            // `refuse_unless_paused_for` just proved the pause is a question.
+            unreachable!("a question pause must carry its question id");
+        };
+        let Some(state) = self
+            .session_store
+            .question_state(&pending.session.id, &question.question_id)?
+        else {
+            // The question was rewound out of the active conversation, so
+            // there is nothing left to answer. Put the pause back rather than
+            // consume it.
+            self.pending_commands.save(&pending)?;
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown question: {}",
+                question.question_id
+            )));
+        };
+
+        // The answer is user text, but it becomes a tool result that leaves
+        // the protected boundary, so it is redacted on the way in. The turn's
+        // own prompt is stored and sent as written; this path is stricter
+        // because the result is engine-authored text like any other tool
+        // result (spec 50 `context.md` §7).
+        let answer = self.scanner.redact(answer).text;
+
+        // An already-answered question is never asked again (requirement 4):
+        // the recorded answer wins and a new one is ignored, even if it would
+        // not have been valid. That is the state a crash between recording the
+        // answer and resuming the turn leaves behind.
+        let (answer, selected_option) = match state.answer.clone() {
+            Some(recorded) => recorded,
+            None => {
+                if let Err(error) = validate_answer(&state.input(), &answer, selected_option) {
+                    self.pending_commands.save(&pending)?;
+                    return Err(ClientError::InvalidInput(error));
+                }
+                match self.session_store.record_question_answered(
+                    &pending.session.id,
+                    &question.question_id,
+                    &answer,
+                    selected_option,
+                ) {
+                    Ok(updated) => updated.answer.unwrap_or((answer, selected_option)),
+                    Err(error) => {
+                        // Another route may have answered it between the read
+                        // and the write. Use what is recorded; otherwise the
+                        // pause is put back so the answer can be tried again.
+                        match self
+                            .session_store
+                            .question_state(&pending.session.id, &question.question_id)?
+                            .and_then(|state| state.answer)
+                        {
+                            Some(recorded) => recorded,
+                            None => {
+                                self.pending_commands.save(&pending)?;
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let tool_result = answered_question_result(&answer, selected_option, &state.options);
+        self.session_store.append_message(
+            &pending.session.id,
+            Some(&pending.task.id),
+            "assistant",
+            &format!("Asked: \"{}\"", state.question),
+        )?;
+        self.session_store.append_message(
+            &pending.session.id,
+            Some(&pending.task.id),
+            "tool",
+            &tool_result,
+        )?;
+
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let mut messages = pending.messages;
+        if let Some(call) = &pending.matched_tool_call {
+            // Same round shape as the command resume: the paused call joins
+            // the round's one assistant message when earlier calls ran, and
+            // its answer is the tool result that follows it.
+            let round_message = pending
+                .round_calls_fed_back
+                .then(|| {
+                    messages
+                        .iter()
+                        .rposition(|message| !message.tool_calls.is_empty())
+                })
+                .flatten();
+            match round_message {
+                Some(index) => messages[index].tool_calls.push(call.clone()),
+                None => messages.push(ModelMessage::assistant_with_tool_calls(
+                    pending.last_content.clone(),
+                    vec![call.clone()],
+                    pending.reasoning_content.clone(),
+                )),
+            }
+            messages.push(ModelMessage::tool(call.id.clone(), tool_result));
+        } else {
+            // `ask_user` exists only as a native call, so this is unreachable.
+            // It mirrors the command resume's text fallback rather than
+            // inventing a second rule.
+            messages.push(
+                ModelMessage::assistant(pending.last_content.clone())
+                    .with_reasoning_content(pending.reasoning_content.clone()),
+            );
+            messages.push(ModelMessage::user(tool_result));
+        }
+
+        self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+        let task = self.session_store.update_task_status(
+            &pending.task,
+            TaskStatus::PreparingContext,
+            None,
+        )?;
+
+        self.run_agentic_turn(
+            &repository_root,
+            pending.session,
+            task,
+            pending.context_files,
+            messages,
+            pending.round + 1,
+            pending.exploration_rounds,
+            model_adapter,
+            sink,
+            pending.turn_options,
+        )
+    }
+
     /// Decides a provider-fallback offer (spec 56).
     ///
     /// Declining — the default — fails the task exactly as an unoffered
@@ -1428,11 +1734,10 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::ProviderFallback)?;
         let Some(offer) = pending.provider_fallback.clone() else {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is not a provider fallback offer"
-            )));
+            // `refuse_unless_paused_for` just proved the pause is a fallback.
+            unreachable!("a provider fallback pause must carry its offer");
         };
 
         if approved {
@@ -1574,11 +1879,10 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::RoundBudget)?;
         let Some(pause) = pending.round_budget.clone() else {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is not a round-budget pause"
-            )));
+            // `refuse_unless_paused_for` just proved the pause is a budget stop.
+            unreachable!("a round-budget pause must carry its rounds");
         };
         let repository_root = PathBuf::from(&pending.repository_root);
 
@@ -1795,19 +2099,141 @@ impl ChatOrchestrator {
     fn record_command_findings(
         &self,
         repository_root: &Path,
-        session_id: &str,
-        task_id: &str,
+        session: &Session,
+        task: &Task,
         execution: &CommandExecution,
     ) -> Result<Option<crate::plan::Evidence>> {
         let findings = findings_from_execution(execution, &default_parsers(), &self.scanner);
-        self.record_findings(
+        let evidence = self.record_findings(
             repository_root,
             Path::new(&execution.working_directory),
-            session_id,
-            task_id,
+            &session.id,
+            &task.id,
             &execution.id,
             findings,
-        )
+        )?;
+        // `after_check` runs only for validation commands, and only after the
+        // findings it describes are already in the log (`context.md` §3). The
+        // ids are evidence of what this check reported, not a path or content.
+        if is_validation_command(&execution.command) {
+            let finding_ids = match &evidence {
+                Some(crate::plan::Evidence::Findings { refs, .. }) => refs.clone(),
+                _ => Vec::new(),
+            };
+            let payload = serde_json::json!({
+                "command": execution.command,
+                "exitCode": execution.exit_code,
+                "termination": execution.termination.as_str(),
+                "findingIds": finding_ids,
+            });
+            let outcome = self.dispatch_tool_event(
+                HookEvent::AfterCheck,
+                session,
+                task,
+                repository_root,
+                payload,
+            );
+            self.record_after_refusal(&session.id, &task.id, HookEvent::AfterCheck, &outcome);
+        }
+        Ok(evidence)
+    }
+
+    /// Dispatches one per-action event, records its findings, and runs any
+    /// commands it requested (`context.md` §9). Every action dispatch goes
+    /// through here so a hook's findings cannot be recorded at one call site
+    /// and forgotten at another.
+    fn dispatch_tool_event(
+        &self,
+        event: HookEvent,
+        session: &Session,
+        task: &Task,
+        repository_root: &Path,
+        payload: serde_json::Value,
+    ) -> HookOutcome {
+        let parts = self
+            .hooks
+            .envelope_parts(Some(session), Some(&task.id), payload);
+        let mut outcome = self
+            .hooks
+            .dispatch(event, parts, repository_root, &HookContext::root());
+        for finding in &outcome.findings {
+            let _ = self.session_store.record_finding(&session.id, finding);
+        }
+        if !outcome.commands.is_empty() {
+            let mode = self.session_store.session_mode(&session.id);
+            let requested = self.hooks.run_requested_commands(
+                &mut outcome,
+                session,
+                Some(task),
+                mode,
+                repository_root,
+                &HookContext::root(),
+            );
+            for finding in &requested {
+                let _ = self.session_store.record_finding(&session.id, finding);
+            }
+        }
+        outcome
+    }
+
+    /// Records what an `after_*` verdict means (`context.md` §4): a `deny` is
+    /// an error finding and undoes nothing; `request_approval` has no approval
+    /// step left and is recorded as a warning.
+    fn record_after_refusal(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        event: HookEvent,
+        outcome: &HookOutcome,
+    ) {
+        let (severity, label) = match outcome.verdict {
+            Verdict::Deny => (Severity::Error, "refused"),
+            Verdict::RequestApproval => (Severity::Warning, "asked for approval"),
+            Verdict::Allow | Verdict::Warn => return,
+        };
+        for (hook_id, reason) in &outcome.reasons {
+            let draft = FindingDraft {
+                source: FindingSource::Hook,
+                severity,
+                summary: format!(
+                    "Hook `{hook_id}` {label} after {}: {reason}",
+                    event.as_str()
+                ),
+                details: None,
+                range: None,
+                code: None,
+            };
+            let finding = Finding::new(draft, &self.scanner)
+                .with_task_id(task_id.to_string())
+                .with_origin_ref(format!("hook:{hook_id}"));
+            let _ = self.session_store.record_finding(session_id, &finding);
+        }
+    }
+
+    /// A `request_approval` at a tool with its own review step is already
+    /// satisfied (`context.md` §4): the patch is reviewed before it applies.
+    /// It still leaves a warning, so the hook's request is visible.
+    fn record_satisfied_approval(&self, session_id: &str, task_id: &str, outcome: &HookOutcome) {
+        if outcome.verdict != Verdict::RequestApproval {
+            return;
+        }
+        for (hook_id, reason) in &outcome.reasons {
+            let draft = FindingDraft {
+                source: FindingSource::Hook,
+                severity: Severity::Warning,
+                summary: format!(
+                    "Hook `{hook_id}` asked for approval before this tool, and the patch review \
+                     already provides it: {reason}"
+                ),
+                details: None,
+                range: None,
+                code: None,
+            };
+            let finding = Finding::new(draft, &self.scanner)
+                .with_task_id(task_id.to_string())
+                .with_origin_ref(format!("hook:{hook_id}"));
+            let _ = self.session_store.record_finding(session_id, &finding);
+        }
     }
 
     /// A recorded browser diagnostic's findings. The repository is walked
@@ -1911,8 +2337,43 @@ impl ChatOrchestrator {
     /// Whether `proposal_id` was raised by a chat turn (and so should be
     /// resumed via [`Self::resume_after_command_decision`]) as opposed to a
     /// standalone command proposal from outside the chat flow.
+    ///
+    /// A question shares the pending-turn file but not this path: a question
+    /// id reaching `/api/run-command` must not be treated as an approval. It
+    /// falls through to the standalone proposal path, where no command
+    /// proposal has that id and nothing runs (spec 50 `context.md` §2).
     pub fn has_pending_chat_command(&self, proposal_id: &str) -> bool {
-        self.pending_commands.has(proposal_id)
+        self.pending_commands.has(proposal_id) && !self.pending_commands.is_question(proposal_id)
+    }
+
+    /// Refuses a pause of the wrong kind and puts its file back, so the resume
+    /// that owns it can still find it.
+    ///
+    /// `expected` is named by each resume, so every entry point has to say
+    /// what it accepts; a new [`PausedFor`] variant fails to compile in
+    /// `paused_for` and in the descriptions below until it is classified
+    /// (spec 50 `context.md` §2).
+    fn refuse_unless_paused_for(
+        &self,
+        proposal_id: &str,
+        pending: &PendingChatTurn,
+        expected: PausedFor,
+    ) -> Result<()> {
+        let actual = paused_for(pending);
+        if actual == expected {
+            return Ok(());
+        }
+        self.pending_commands.save(pending)?;
+        if actual == PausedFor::Conflicting {
+            return Err(ClientError::InvalidInput(format!(
+                "Proposal {proposal_id} records more than one kind of pause and cannot be resumed"
+            )));
+        }
+        Err(ClientError::InvalidInput(format!(
+            "Proposal {proposal_id} is {}; resume it with {}",
+            actual.description(),
+            actual.resume_method()
+        )))
     }
 
     /// Runs the model in a loop, letting it request tools across multiple
@@ -1977,6 +2438,67 @@ impl ChatOrchestrator {
             return Ok(());
         }
         self.session_store.resume_plan(task, &previous.id)
+    }
+
+    /// Runs `before_task_complete` for a model answer that would end the turn
+    /// (spec 32 `context.md` §3, §4).
+    ///
+    /// `Some(note)` means a hook denied: the caller feeds the note back to the
+    /// model and continues the loop. `None` means the turn may complete. Only
+    /// a completion calls this — a pause, a budget stop and a cancel are not
+    /// completions, and a hook never sees them.
+    ///
+    /// `filesChanged` comes from the turn's checkpoint manifest: it is the
+    /// durable per-task record of the paths this turn accepted a patch or
+    /// changed through a command for. The session log carries findings and
+    /// messages, not a path list.
+    fn before_task_complete(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        action_rounds: u32,
+    ) -> Result<Option<String>> {
+        // With nothing listening, this is today's completion path: no
+        // checkpoint read, no dispatch and no audit.
+        if crate::hooks::ordered(&self.config.hooks, HookEvent::BeforeTaskComplete).is_empty() {
+            return Ok(None);
+        }
+        let ctx = HookContext::root();
+        let files_changed = self
+            .checkpoint_store
+            .read_checkpoint_for_task(&session.repository_id, &task.id)
+            .ok()
+            .flatten()
+            .map(|manifest| {
+                manifest
+                    .files
+                    .into_iter()
+                    .map(|file| file.path)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let parts = self.hooks.envelope_parts(
+            Some(session),
+            Some(&task.id),
+            serde_json::json!({"rounds": action_rounds, "filesChanged": files_changed}),
+        );
+        let outcome =
+            self.hooks
+                .dispatch(HookEvent::BeforeTaskComplete, parts, repository_root, &ctx);
+        for finding in &outcome.findings {
+            let _ = self.session_store.record_finding(&session.id, finding);
+        }
+        if matches!(outcome.verdict, Verdict::Deny | Verdict::RequestApproval) {
+            let note = format!(
+                "A hook did not let this task complete: {}",
+                hook_refusal(&outcome)
+            );
+            self.session_store
+                .append_message(&session.id, Some(&task.id), "user", &note)?;
+            return Ok(Some(note));
+        }
+        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2710,6 +3232,30 @@ impl ChatOrchestrator {
                         StopReason::ToolBudget,
                     );
                 }
+                // Spec 32 `context.md` §4: a hook that denies a completion
+                // does not fail the turn — the reason goes back as a user-role
+                // note and the model gets another round. The action budget
+                // bounds the re-entries: a call that dispatched nothing is an
+                // action round, exactly as the forced-final call is (§5.2).
+                //
+                // *Answer now* is the user's own decision to end the turn at
+                // the round budget (spec 61 §5.2). The hook does not run
+                // there: §4's correction needs another round, and this path
+                // deliberately has none left — re-entering it would loop
+                // without a bound, because the pause that would stop it is
+                // skipped for exactly this turn.
+                if !turn_options.round_budget_answer_now
+                    && let Some(note) =
+                        self.before_task_complete(repository_root, &session, &task, action_rounds)?
+                {
+                    messages.push(
+                        ModelMessage::assistant(redacted.clone())
+                            .with_reasoning_content(model_run.reasoning_content.clone()),
+                    );
+                    messages.push(ModelMessage::user(note));
+                    action_rounds += 1;
+                    continue;
+                }
                 break (
                     model_run,
                     redacted,
@@ -2739,6 +3285,19 @@ impl ChatOrchestrator {
                 // instead so the model can retry within the remaining rounds —
                 // the same recovery the restricted-path patch arm uses.
                 let Some((undecodable, note)) = undecodable_calls.first() else {
+                    // The model answered with no tool call: a completion, so
+                    // `before_task_complete` sees it (spec 32 `context.md` §4).
+                    if let Some(note) =
+                        self.before_task_complete(repository_root, &session, &task, action_rounds)?
+                    {
+                        messages.push(
+                            ModelMessage::assistant(redacted.clone())
+                                .with_reasoning_content(model_run.reasoning_content.clone()),
+                        );
+                        messages.push(ModelMessage::user(note));
+                        action_rounds += 1;
+                        continue;
+                    }
                     break (
                         model_run,
                         redacted,
@@ -2819,19 +3378,62 @@ impl ChatOrchestrator {
             // call is never batched: there is nothing to overlap.
             // A stop that arrived before the round starts must not begin a
             // batch of reads; the top-of-loop check finishes the turn.
+            //
+            // `before_tool` runs per call before the batch, not inside it: a
+            // hook is a process, and spawning several in parallel would make
+            // their order — and therefore a deny's short-circuit — depend on
+            // scheduling. A call the mode, profile or a hook refuses is taken
+            // out of the batch; its refusal is recorded by the sequential
+            // loop below, which keeps one result per model call.
+            let mut precomputed_permissions: Vec<Option<Permission>> =
+                vec![None; calls_this_round.len()];
+            let mut precomputed_before: Vec<Option<HookOutcome>> =
+                vec![None; calls_this_round.len()];
             let precomputed = if !sink.cancel.is_cancelled()
                 && calls_this_round.len() > 1
                 && calls_this_round
                     .iter()
                     .all(|(_, action)| action_is_batchable_read_only(action))
             {
-                Some(self.run_read_only_batch(
-                    repository_root,
-                    &session,
-                    &task,
-                    &calls_this_round,
-                    sink.cancel,
-                ))
+                let mut batch_actions: Vec<DecodedCall> = Vec::new();
+                let mut batch_indices: Vec<usize> = Vec::new();
+                for (index, (_, action)) in calls_this_round.iter().enumerate() {
+                    let permission = self.action_permission(mode, repository_root, action, &mcp);
+                    precomputed_permissions[index] = Some(permission);
+                    if !permission.is_allowed() {
+                        continue;
+                    }
+                    let payload = tool_event_payload(&self.scanner, action, None, None);
+                    let outcome = self.dispatch_tool_event(
+                        HookEvent::BeforeTool,
+                        &session,
+                        &task,
+                        repository_root,
+                        payload,
+                    );
+                    let allowed =
+                        before_tool_effect(action, outcome.verdict) == BeforeToolEffect::Proceed;
+                    precomputed_before[index] = Some(outcome);
+                    if allowed {
+                        batch_indices.push(index);
+                        batch_actions.push(calls_this_round[index].clone());
+                    }
+                }
+                let mut results: Vec<Option<(String, String, ActionOutcome)>> =
+                    vec![None; calls_this_round.len()];
+                if !batch_actions.is_empty() {
+                    let computed = self.run_read_only_batch(
+                        repository_root,
+                        &session,
+                        &task,
+                        &batch_actions,
+                        sink.cancel,
+                    );
+                    for (index, result) in batch_indices.into_iter().zip(computed) {
+                        results[index] = Some(result);
+                    }
+                }
+                Some(results)
             } else {
                 None
             };
@@ -2864,7 +3466,9 @@ impl ChatOrchestrator {
                 // refused command leaves no stored proposal and no approval card
                 // behind. One site for every class rather than one per arm, so a
                 // new `ToolAction` variant cannot reach its arm unchecked.
-                let permission = self.action_permission(mode, repository_root, &tool_action, &mcp);
+                let permission = precomputed_permissions[index].unwrap_or_else(|| {
+                    self.action_permission(mode, repository_root, &tool_action, &mcp)
+                });
 
                 // The review gate (§5.5). Checked before the action is bracketed,
                 // let alone dispatched: there is no marker to finish and nothing
@@ -2914,6 +3518,7 @@ impl ChatOrchestrator {
                         }),
                         provider_fallback: None,
                         round_budget: None,
+                        question: None,
                     })?;
                     self.note_pending_approvals(
                         &session,
@@ -2940,6 +3545,70 @@ impl ChatOrchestrator {
                     ));
                     break;
                 }
+
+                // Spec 32 `context.md` §3: after the mode/profile check and
+                // the plan-review gate, before the action marker. A refusal
+                // here is a tool result like a mode refusal, but nothing was
+                // dispatched, so it leaves no marker, proposal or card.
+                let before_tool = precomputed_before[index].take().unwrap_or_else(|| {
+                    let payload = tool_event_payload(&self.scanner, &tool_action, None, None);
+                    self.dispatch_tool_event(
+                        HookEvent::BeforeTool,
+                        &session,
+                        &task,
+                        repository_root,
+                        payload,
+                    )
+                });
+                let before_effect = before_tool_effect(&tool_action, before_tool.verdict);
+                if before_effect == BeforeToolEffect::Refuse {
+                    let summary = format!(
+                        "Attempted to call `{}`.",
+                        tool_action_marker(&tool_action).0
+                    );
+                    let tool_result = hook_refusal(&before_tool);
+                    self.session_store.append_message(
+                        &session.id,
+                        Some(&task.id),
+                        "assistant",
+                        &summary,
+                    )?;
+                    self.session_store.append_message(
+                        &session.id,
+                        Some(&task.id),
+                        "tool",
+                        &tool_result,
+                    )?;
+                    if let Some(call) = &matched_tool_call {
+                        match round_message {
+                            Some(index) => messages[index].tool_calls.push(call.clone()),
+                            None => {
+                                round_message = Some(messages.len());
+                                messages.push(ModelMessage::assistant_with_tool_calls(
+                                    redacted.clone(),
+                                    vec![call.clone()],
+                                    round_reasoning.clone(),
+                                ));
+                            }
+                        }
+                        messages.push(ModelMessage::tool(call.id.clone(), tool_result));
+                    } else {
+                        messages.push(
+                            ModelMessage::assistant(redacted.clone())
+                                .with_reasoning_content(model_run.reasoning_content.clone()),
+                        );
+                        messages.push(ModelMessage::user(format!(
+                            "Command result:\n{tool_result}"
+                        )));
+                    }
+                    continue;
+                }
+                if before_effect == BeforeToolEffect::SatisfiedApproval {
+                    self.record_satisfied_approval(&session.id, &task.id, &before_tool);
+                }
+                let force_approval = before_effect == BeforeToolEffect::ForceApproval;
+                let force_approval_cause =
+                    force_approval.then(|| hook_cause(&before_tool)).flatten();
 
                 if matches!(tool_action, ToolAction::WebDiagnostic(_)) {
                     web_debug_mode = true;
@@ -2989,6 +3658,10 @@ impl ChatOrchestrator {
                 // A sandbox command's findings leave its arm through this local
                 // rather than through `ActionOutcome` (spec 22 `context.md` §14).
                 let mut command_findings: Option<crate::plan::Evidence> = None;
+                let mut command_termination: Option<CommandTermination> = None;
+                // Kept for `after_tool`; the dispatch match below consumes the
+                // action's fields.
+                let after_tool_action = tool_action.clone();
                 // A working directory the policy refuses fails the tool result
                 // before anything is proposed or run (spec 24 Task 7). It is
                 // resolved once here so the dispatch arm proposes in the same
@@ -3014,7 +3687,7 @@ impl ChatOrchestrator {
                     };
                 let writes_this_call = permission.is_allowed()
                     && matches!(action_effect(&tool_action), ActionEffect::WritesRepository);
-                let (assistant_summary, tool_result_text, action_outcome) = if !permission
+                let (assistant_summary, mut tool_result_text, action_outcome) = if !permission
                     .is_allowed()
                 {
                     // A failed tool result rather than an error, so the
@@ -3047,7 +3720,15 @@ impl ChatOrchestrator {
                     match precomputed.as_ref() {
                         // Precomputed by the concurrent batch, indexed by the
                         // model's call order.
-                        Some(results) => results[index].clone(),
+                        Some(results) => match results[index].clone() {
+                            Some(result) => result,
+                            None => self.dispatch_read_only_action(
+                                repository_root,
+                                &session,
+                                &task,
+                                &tool_action,
+                            ),
+                        },
                         None => self.dispatch_read_only_action(
                             repository_root,
                             &session,
@@ -3060,12 +3741,24 @@ impl ChatOrchestrator {
                         ToolAction::Command(command_request) => {
                             let working_directory =
                                 self.command_working_directory(repository_root, &command_request);
-                            let proposal = self.validation_orchestrator.propose_command_at(
-                                repository_root,
-                                &working_directory,
-                                &command_request.command,
-                                &command_request.reason,
-                            )?;
+                            let extra_causes = force_approval_cause
+                                .as_ref()
+                                .map(|(hook, reason)| {
+                                    vec![ApprovalCause::HookRequested {
+                                        hook: hook.clone(),
+                                        reason: reason.clone(),
+                                    }]
+                                })
+                                .unwrap_or_default();
+                            let proposal = self
+                                .validation_orchestrator
+                                .propose_command_at_with_causes(
+                                    repository_root,
+                                    &working_directory,
+                                    &command_request.command,
+                                    &command_request.reason,
+                                    extra_causes,
+                                )?;
 
                             if proposal.requires_approval || proposal.blocked {
                                 let response = command_proposal_response(&proposal);
@@ -3088,6 +3781,7 @@ impl ChatOrchestrator {
                                     plan_review: None,
                                     provider_fallback: None,
                                     round_budget: None,
+                                    question: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -3137,15 +3831,15 @@ impl ChatOrchestrator {
                             let record = self.validation_orchestrator.run_proposal(
                                 &proposal.id,
                                 false,
-                                "sandbox",
+                                "policy",
                                 Some(&task.id),
                                 cancel,
                                 &mut on_output,
                             )?;
                             command_findings = self.record_command_findings(
                                 repository_root,
-                                &session.id,
-                                &task.id,
+                                &session,
+                                &task,
                                 &record.execution,
                             )?;
                             let command_context = sandbox_command_context(&record.execution);
@@ -3154,6 +3848,7 @@ impl ChatOrchestrator {
                             // — `CommandExecution` is never persisted to the session log
                             // — so it is carried out of the arm rather than looked up.
                             let exit_code = record.execution.exit_code;
+                            command_termination = Some(record.execution.termination);
                             (
                                 tool_call_summary(&command_request),
                                 command_context,
@@ -3178,6 +3873,24 @@ impl ChatOrchestrator {
                                     // a crash — finish the marker before breaking.
                                     self.session_store
                                         .finish_action(action_marker, "awaiting_review")?;
+                                    let after = self.dispatch_tool_event(
+                                        HookEvent::AfterTool,
+                                        &session,
+                                        &task,
+                                        repository_root,
+                                        tool_event_payload(
+                                            &self.scanner,
+                                            &after_tool_action,
+                                            Some(&ActionOutcome::Ok),
+                                            None,
+                                        ),
+                                    );
+                                    self.record_after_refusal(
+                                        &session.id,
+                                        &task.id,
+                                        HookEvent::AfterTool,
+                                        &after,
+                                    );
                                     let proposal = agent_patch_proposal(&patch);
                                     let mut proposal_run = model_run;
                                     proposal_run.content = response.clone();
@@ -3363,6 +4076,24 @@ impl ChatOrchestrator {
                                     // a crash — finish the marker before breaking.
                                     self.session_store
                                         .finish_action(action_marker, "awaiting_review")?;
+                                    let after = self.dispatch_tool_event(
+                                        HookEvent::AfterTool,
+                                        &session,
+                                        &task,
+                                        repository_root,
+                                        tool_event_payload(
+                                            &self.scanner,
+                                            &after_tool_action,
+                                            Some(&ActionOutcome::Ok),
+                                            None,
+                                        ),
+                                    );
+                                    self.record_after_refusal(
+                                        &session.id,
+                                        &task.id,
+                                        HookEvent::AfterTool,
+                                        &after,
+                                    );
                                     let proposal = agent_patch_proposal(&patch);
                                     let mut proposal_run = model_run;
                                     proposal_run.content = response.clone();
@@ -3399,10 +4130,13 @@ impl ChatOrchestrator {
                                 self.session_store
                                     .browser_diagnostics_allowed_for_session(&session.id)?
                             };
-                            if !call.is_low_risk() && !session_approved {
+                            if force_approval || (!call.is_low_risk() && !session_approved) {
                                 let proposal_id = create_id("webdiag");
-                                let proposal =
-                                    web_diagnostic_approval_proposal(&proposal_id, &call);
+                                let proposal = web_diagnostic_approval_proposal(
+                                    &proposal_id,
+                                    &call,
+                                    force_approval_cause.as_ref(),
+                                );
                                 let response = proposal.prompt.clone();
                                 self.pending_commands.save(&PendingChatTurn {
                                     proposal_id,
@@ -3423,6 +4157,7 @@ impl ChatOrchestrator {
                                     plan_review: None,
                                     provider_fallback: None,
                                     round_budget: None,
+                                    question: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -3505,13 +4240,14 @@ impl ChatOrchestrator {
                             // pause the turn exactly like a command needing approval:
                             // persist state keyed by a fresh proposal id and hand the
                             // user a proposal to accept or decline.
-                            if mcp.requires_approval(&server_id) {
+                            if force_approval || mcp.requires_approval(&server_id) {
                                 let proposal_id = create_id("mcp");
                                 let proposal = mcp_approval_proposal(
                                     &proposal_id,
                                     &server_id,
                                     &tool_name,
                                     &arguments_json,
+                                    force_approval_cause.as_ref(),
                                 );
                                 let response = proposal.prompt.clone();
                                 self.pending_commands.save(&PendingChatTurn {
@@ -3537,6 +4273,7 @@ impl ChatOrchestrator {
                                     plan_review: None,
                                     provider_fallback: None,
                                     round_budget: None,
+                                    question: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -3586,14 +4323,106 @@ impl ChatOrchestrator {
                                 };
                             (summary, content, outcome)
                         }
-                        // Nothing can deliver an answer until spec 50 Task 4 builds
-                        // the pause, so even an offered call is refused the same
-                        // way rather than waiting.
-                        ToolAction::AskUser(_) => (
-                            "Attempted to ask the user a question.".to_string(),
-                            NO_USER_CAN_ANSWER.to_string(),
-                            ActionOutcome::Failed,
-                        ),
+                        ToolAction::AskUser(input) => {
+                            // Requirement 5: the cap is read from the log, so a
+                            // resumed turn counts what it already asked and an
+                            // in-memory counter cannot reset it.
+                            let asked = self
+                                .session_store
+                                .questions_asked_in_task(&session.id, &task.id)?;
+                            let cap = self.config.agent_max_questions_per_turn as usize;
+                            if asked >= cap {
+                                (
+                                    "Attempted to ask the user a question.".to_string(),
+                                    format!(
+                                        "A question was not asked: this turn has already asked \
+                                         {asked} of {cap} questions. Proceed without asking more, \
+                                         and say in your answer what you assumed and why."
+                                    ),
+                                    ActionOutcome::Failed,
+                                )
+                            } else {
+                                // Requirement 7: the question is model-authored
+                                // and may be quoting repository content, so it
+                                // is redacted before it is stored, shown or
+                                // sent anywhere.
+                                let redacted_input = AskUserInput {
+                                    question: self.scanner.redact(&input.question).text,
+                                    options: input
+                                        .options
+                                        .iter()
+                                        .map(|option| self.scanner.redact(option).text)
+                                        .collect(),
+                                    allow_free_text: input.allow_free_text,
+                                };
+                                if let Err(error) = redacted_input.validate() {
+                                    // Redaction can lengthen a question enough
+                                    // to break a bound. That is still the
+                                    // model's to fix, not a reason to fail the
+                                    // turn.
+                                    (
+                                        "Attempted to ask the user a question.".to_string(),
+                                        format!("The question was not asked: {error}"),
+                                        ActionOutcome::Failed,
+                                    )
+                                } else {
+                                    let question = PendingQuestionRef::new();
+                                    self.session_store.record_question_asked(
+                                        &session.id,
+                                        &task.id,
+                                        &question,
+                                        &redacted_input,
+                                    )?;
+                                    self.pending_commands.save(&PendingChatTurn {
+                                        proposal_id: question.question_id().to_string(),
+                                        session: session.clone(),
+                                        task: task.clone(),
+                                        repository_root: repository_root
+                                            .to_string_lossy()
+                                            .to_string(),
+                                        context_files: context_files.clone(),
+                                        round: action_rounds,
+                                        exploration_rounds,
+                                        messages: messages.clone(),
+                                        matched_tool_call: matched_tool_call.clone(),
+                                        last_content: redacted.clone(),
+                                        turn_options,
+                                        reasoning_content: model_run.reasoning_content.clone(),
+                                        round_calls_fed_back: round_message.is_some(),
+                                        mcp_call: None,
+                                        web_diagnostic_call: None,
+                                        plan_review: None,
+                                        provider_fallback: None,
+                                        round_budget: None,
+                                        question: Some(PendingQuestion {
+                                            question_id: question.question_id().to_string(),
+                                        }),
+                                    })?;
+                                    // A clean stop for a human decision, not a
+                                    // crash: the marker says what it waits on.
+                                    self.session_store
+                                        .finish_action(action_marker, "awaiting_answer")?;
+                                    let response = QUESTION_PAUSED_RESPONSE.to_string();
+                                    let mut proposal_run = model_run;
+                                    proposal_run.content = response.clone();
+                                    terminal = Some((
+                                        proposal_run,
+                                        response,
+                                        TurnProposals {
+                                            question: Some(AgentQuestionProposal {
+                                                question_id: question.question_id().to_string(),
+                                                question: redacted_input.question,
+                                                options: redacted_input.options,
+                                                allow_free_text: redacted_input.allow_free_text,
+                                            }),
+                                            ..Default::default()
+                                        },
+                                        StopReason::Answered,
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
                         other => {
                             unreachable!("read-only action reached the sequential match: {other:?}")
                         }
@@ -3656,6 +4485,30 @@ impl ChatOrchestrator {
                     ActionOutcome::Cancelled => self
                         .session_store
                         .finish_action(action_marker, "cancelled")?,
+                }
+
+                // Spec 32 `context.md` §3: after the action's marker is
+                // finished. A mode/profile refusal dispatched nothing and has
+                // no event; a hook refusal returned before the marker.
+                if permission.is_allowed() {
+                    let payload = tool_event_payload(
+                        &self.scanner,
+                        &after_tool_action,
+                        Some(&action_outcome),
+                        command_termination,
+                    );
+                    let after = self.dispatch_tool_event(
+                        HookEvent::AfterTool,
+                        &session,
+                        &task,
+                        repository_root,
+                        payload,
+                    );
+                    if let Some(note) = hook_after_note(&after) {
+                        tool_result_text.push_str("\n\n");
+                        tool_result_text.push_str(&note);
+                    }
+                    self.record_after_refusal(&session.id, &task.id, HookEvent::AfterTool, &after);
                 }
 
                 // Persist the tool call and its result so later turns in this
@@ -3789,9 +4642,16 @@ impl ChatOrchestrator {
                         proposal_id: proposal.id.clone(),
                     })
             });
-        task = match &pending {
-            Some(pending) => self.session_store.await_approval(&task, pending)?,
-            None => {
+        let pending_question = proposals
+            .question
+            .as_ref()
+            .map(|proposal| PendingQuestionRef::recorded(proposal.question_id.clone()));
+        task = match (&pending, &pending_question) {
+            (Some(pending), None) => self.session_store.await_approval(&task, pending)?,
+            // A question link goes under its own status key through
+            // `await_answer`; never through `await_approval` (spec 50 §5.2).
+            (None, Some(question)) => self.session_store.await_answer(&task, question)?,
+            (None, None) => {
                 let final_status = match stop_reason {
                     StopReason::ToolBudget => TaskStatus::ToolBudgetExhausted,
                     StopReason::TokenBudget => TaskStatus::TokenBudgetExhausted,
@@ -3799,6 +4659,9 @@ impl ChatOrchestrator {
                 };
                 self.session_store
                     .update_task_status(&task, final_status, None)?
+            }
+            (Some(_), Some(_)) => {
+                unreachable!("a turn cannot pause for an approval and a question at once")
             }
         };
         self.audit_log.record(
@@ -3817,12 +4680,14 @@ impl ChatOrchestrator {
                         "patch_proposal_ready".to_string()
                     } else if proposals.plan.is_some() {
                         "plan_review_required".to_string()
+                    } else if proposals.question.is_some() {
+                        "question_pending".to_string()
                     } else if stop_reason == StopReason::ToolBudget {
                         "tool_budget_exhausted".to_string()
                     } else if stop_reason == StopReason::TokenBudget {
                         "token_budget_exhausted".to_string()
                     } else if action_rounds > 0 {
-                        "complete_with_sandbox_command".to_string()
+                        "complete_with_command".to_string()
                     } else {
                         "complete".to_string()
                     },
@@ -3830,11 +4695,12 @@ impl ChatOrchestrator {
             ],
         )?;
         // A turn waiting on a command decision is not over: it resumes through
-        // `resume_after_command_decision` and seals then. A plan review is the
-        // same shape — nothing has happened yet and the turn continues through
-        // `resume_after_plan_decision`. Anything else has left the repository
-        // in the state a rewind must compare against.
-        if proposals.command.is_none() && proposals.plan.is_none() {
+        // `resume_after_command_decision` and seals then. A plan review and a
+        // question are the same shape — nothing has happened yet and the turn
+        // continues through `resume_after_plan_decision` or
+        // `resume_after_answer`. Anything else has left the repository in the
+        // state a rewind must compare against.
+        if proposals.command.is_none() && proposals.plan.is_none() && proposals.question.is_none() {
             self.seal_turn_checkpoint(repository_root, &session, &task);
         }
         // From the log, not from a running total: the number the client shows
@@ -3861,6 +4727,7 @@ impl ChatOrchestrator {
             command_proposal: proposals.command,
             patch_proposal: proposals.patch,
             plan_proposal: proposals.plan,
+            question_proposal: proposals.question,
             fallback_proposal: None,
             round_budget_proposal: None,
             cancelled: false,
@@ -3911,6 +4778,7 @@ impl ChatOrchestrator {
             plan_review: None,
             provider_fallback: Some(offer.clone()),
             round_budget: None,
+            question: None,
         })?;
         self.note_pending_approvals(
             &session,
@@ -3964,6 +4832,7 @@ impl ChatOrchestrator {
             command_proposal: None,
             patch_proposal: None,
             plan_proposal: None,
+            question_proposal: None,
             fallback_proposal: Some(AgentFallbackProposal {
                 id: proposal_id,
                 refused_provider: offer.refused_provider,
@@ -4030,6 +4899,7 @@ impl ChatOrchestrator {
             plan_review: None,
             provider_fallback: None,
             round_budget: Some(pause),
+            question: None,
         })?;
         self.note_pending_approvals(
             &session,
@@ -4090,6 +4960,7 @@ impl ChatOrchestrator {
             command_proposal: None,
             patch_proposal: None,
             plan_proposal: None,
+            question_proposal: None,
             fallback_proposal: None,
             round_budget_proposal: Some(AgentRoundBudgetProposal {
                 id: proposal_id,
@@ -4171,6 +5042,7 @@ impl ChatOrchestrator {
             command_proposal: None,
             patch_proposal: None,
             plan_proposal: None,
+            question_proposal: None,
             fallback_proposal: None,
             round_budget_proposal: None,
             cancelled: true,
@@ -4748,6 +5620,75 @@ impl ChatOrchestrator {
     }
 }
 
+/// What a paused turn is waiting for. Every resume matches on this
+/// exhaustively and refuses the kinds it does not own (spec 50 `context.md`
+/// §2), because the pending-turn file is keyed only by an id and each resume
+/// loads whatever file its id names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PausedFor {
+    /// A command, patch or browser diagnostic that needs approval.
+    Action,
+    PlanReview,
+    ProviderFallback,
+    RoundBudget,
+    Question,
+    /// A file carrying more than one marker. No writer produces this, and
+    /// guessing which pause it means is exactly the mistake this type exists
+    /// to prevent, so every resume refuses it.
+    Conflicting,
+}
+
+impl PausedFor {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Action => "a command or patch approval",
+            Self::PlanReview => "a plan review",
+            Self::ProviderFallback => "a provider fallback offer",
+            Self::RoundBudget => "a round-budget pause",
+            Self::Question => "a question",
+            Self::Conflicting => "more than one kind of pause",
+        }
+    }
+
+    fn resume_method(self) -> &'static str {
+        match self {
+            Self::Action => "resume_after_command_decision",
+            Self::PlanReview => "resume_after_plan_decision",
+            Self::ProviderFallback => "resume_after_fallback_decision",
+            Self::RoundBudget => "resume_round_budget",
+            Self::Question => "resume_after_answer",
+            Self::Conflicting => "",
+        }
+    }
+}
+
+/// What a question pause is waiting for. The question's text and options live
+/// in the session log; this carries only the id that addresses them, so the
+/// pause cannot drift from what was asked (spec 50 `context.md` §2, §6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingQuestion {
+    question_id: String,
+}
+
+/// The kind of pause a saved turn represents. Every writer sets at most one
+/// marker; the tuple match makes a new field on [`PendingChatTurn`] a compile
+/// error here, which is where each resume's decision starts.
+fn paused_for(pending: &PendingChatTurn) -> PausedFor {
+    match (
+        pending.plan_review.is_some(),
+        pending.provider_fallback.is_some(),
+        pending.round_budget.is_some(),
+        pending.question.is_some(),
+    ) {
+        (false, false, false, false) => PausedFor::Action,
+        (true, false, false, false) => PausedFor::PlanReview,
+        (false, true, false, false) => PausedFor::ProviderFallback,
+        (false, false, true, false) => PausedFor::RoundBudget,
+        (false, false, false, true) => PausedFor::Question,
+        _ => PausedFor::Conflicting,
+    }
+}
+
 /// Conversation state saved when a chat turn pauses on a command that needs
 /// human approval, so [`ChatOrchestrator::resume_after_command_decision`]
 /// can pick the turn back up once the user decides.
@@ -4816,6 +5757,13 @@ struct PendingChatTurn {
     /// pending turns written before the pause existed loadable.
     #[serde(default)]
     round_budget: Option<RoundBudgetPause>,
+    /// Present when the pause is a question the model asked (spec 50). As with
+    /// a plan review nothing was dispatched: the turn stopped to let a human
+    /// answer, and `round` is the round the question was asked in, because
+    /// that round has not been charged yet. `#[serde(default)]` keeps pending
+    /// turns written before the pause existed loadable.
+    #[serde(default)]
+    question: Option<PendingQuestion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4960,6 +5908,21 @@ impl PendingCommandStore {
         self.path_for(proposal_id).exists()
     }
 
+    /// Whether the pending turn is a question pause. Parsed as loose JSON so a
+    /// file written by a version without the field still answers "no", and an
+    /// unreadable file is not mistaken for a question.
+    fn is_question(&self, proposal_id: &str) -> bool {
+        let Ok(content) = fs::read_to_string(self.path_for(proposal_id)) else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return false;
+        };
+        value
+            .get("question")
+            .is_some_and(|question| !question.is_null())
+    }
+
     fn save(&self, pending: &PendingChatTurn) -> Result<()> {
         let path = self.path_for(&pending.proposal_id);
         if let Some(parent) = path.parent() {
@@ -5031,6 +5994,27 @@ fn system_prompt_for_session(
 /// The tool result for an `ask_user` call nobody can answer.
 const NO_USER_CAN_ANSWER: &str = "No user can answer a question in this context, so the question was not asked. Proceed under an explicitly stated assumption, and say in your answer what you assumed and why.";
 
+/// The assistant text a question pause leaves in the transcript. The question
+/// itself is its own `question_asked` event (`context.md` §6), so repeating it
+/// here would show the same text twice.
+const QUESTION_PAUSED_RESPONSE: &str = "I need an answer from you before continuing.";
+
+/// The answer as the model receives it, in `context.md` §7's fixed format. The
+/// option is named only when the user picked one; a free-text answer carries
+/// its text alone. The answer is already redacted by the caller.
+fn answered_question_result(
+    answer: &str,
+    selected_option: Option<usize>,
+    options: &[String],
+) -> String {
+    match selected_option.and_then(|index| options.get(index).map(|label| (index, label))) {
+        Some((index, label)) => {
+            format!("The user answered: \"{answer}\" (option {index}: \"{label}\")")
+        }
+        None => format!("The user answered: \"{answer}\""),
+    }
+}
+
 /// What a turn with nobody to ask is told instead of being offered `ask_user`
 /// (spec 50 `context.md` §4). Where a user is present the prompt carries no
 /// word about asking: the tool's own description does that, and the prompt
@@ -5098,7 +6082,7 @@ fn shell_guidance(shell: &str) -> String {
 /// only mode that should teach it.
 fn command_envelope_paragraph_unrestricted(shell: &str) -> String {
     format!(
-        "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. The app will run sandbox-safe commands automatically. {} When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.",
+        "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. Damaian runs a short list of read-only commands without asking and needs your approval before running anything else, including any command that uses shell control. {} When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.",
         shell_guidance(shell),
     )
 }
@@ -5109,7 +6093,7 @@ fn command_envelope_paragraph_unrestricted(shell: &str) -> String {
 /// actually happen: it is refused, not queued for approval.
 fn command_envelope_paragraph_read_only(shell: &str) -> String {
     format!(
-        "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. The app will run sandbox-safe commands automatically. {} In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.",
+        "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. Damaian runs a short list of read-only commands without asking and refuses every other command outright in this mode, including any command that uses shell control. {} In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.",
         shell_guidance(shell),
     )
 }
@@ -5156,7 +6140,7 @@ fn build_model_prompt(
         }
     }
     if let Some(command_context) = command_context {
-        output.push_str("\n--- sandbox_command_result ---\n");
+        output.push_str("\n--- command_result ---\n");
         output.push_str(command_context);
         if !command_context.ends_with('\n') {
             output.push('\n');
@@ -5363,6 +6347,150 @@ fn action_effect(action: &ToolAction) -> ActionEffect {
 /// no second list to drift.
 fn action_is_batchable_read_only(action: &ToolAction) -> bool {
     matches!(action_effect(action), ActionEffect::ReadOnly)
+}
+
+/// What a `before_tool` verdict does to the call about to be dispatched
+/// (`context.md` §4).
+///
+/// `RequestApproval` is not one thing for every tool: a command, MCP call or
+/// web diagnostic has an approval card to move to, while `propose_patch` and
+/// `edit_file` are already reviewed before they apply. Everything else has no
+/// approval step, including `ask_user` — an answer is not an approval, so a
+/// question is refused rather than turned into one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeforeToolEffect {
+    Proceed,
+    ForceApproval,
+    /// Proceed, and record the request as a warning because the existing
+    /// review step already satisfies it.
+    SatisfiedApproval,
+    Refuse,
+}
+
+fn before_tool_effect(action: &ToolAction, verdict: Verdict) -> BeforeToolEffect {
+    match verdict {
+        Verdict::Allow | Verdict::Warn => BeforeToolEffect::Proceed,
+        Verdict::Deny => BeforeToolEffect::Refuse,
+        Verdict::RequestApproval => match action {
+            ToolAction::Command(_) | ToolAction::McpCall { .. } | ToolAction::WebDiagnostic(_) => {
+                BeforeToolEffect::ForceApproval
+            }
+            ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
+                BeforeToolEffect::SatisfiedApproval
+            }
+            _ => BeforeToolEffect::Refuse,
+        },
+    }
+}
+
+/// The `(hook id, reason)` a denial or approval request is shown with.
+fn hook_cause(outcome: &HookOutcome) -> Option<(String, String)> {
+    let hook_id = outcome.deciding_hook.as_deref()?;
+    let reason = outcome
+        .reasons
+        .iter()
+        .find(|(id, _)| id == hook_id)
+        .map(|(_, reason)| reason.clone())
+        .unwrap_or_default();
+    Some((hook_id.to_string(), reason))
+}
+
+/// What an `after_tool` denial appends to the result the model sees
+/// (`context.md` §4).
+fn hook_after_note(outcome: &HookOutcome) -> Option<String> {
+    if outcome.verdict != Verdict::Deny {
+        return None;
+    }
+    let (hook_id, reason) = hook_cause(outcome)?;
+    Some(if reason.is_empty() {
+        format!("Hook `{hook_id}` refused after the action.")
+    } else {
+        format!("Hook `{hook_id}`: {reason}")
+    })
+}
+
+/// The payload for `before_tool` and `after_tool` (`context.md` §6): names and
+/// paths, never file content. A command's text and a URL are redacted here
+/// because the dispatcher redacts the response, not the envelope it sends.
+fn tool_event_payload(
+    scanner: &SecretScanner,
+    action: &ToolAction,
+    outcome: Option<&ActionOutcome>,
+    termination: Option<CommandTermination>,
+) -> serde_json::Value {
+    let (tool, mut paths) = match action {
+        ToolAction::ReadFile { path, .. } => ("read_file", vec![path.clone()]),
+        ToolAction::ListDirectory { dir, .. } => (
+            "list_directory",
+            vec![dir.clone().unwrap_or_else(|| ".".to_string())],
+        ),
+        ToolAction::SearchContent { path_glob, .. } => {
+            ("search_content", path_glob.clone().into_iter().collect())
+        }
+        ToolAction::SearchCodebase { .. } => ("search_codebase", Vec::new()),
+        ToolAction::ReadGitStatus { .. } => ("read_git_status", Vec::new()),
+        ToolAction::ReadGitDiff { paths, .. } => ("read_git_diff", paths.clone()),
+        ToolAction::ListWorktrees { .. } => ("list_worktrees", Vec::new()),
+        ToolAction::ReadGitLog { .. } => ("read_git_log", Vec::new()),
+        ToolAction::ProposePatch(edit) => (
+            "propose_patch",
+            edit.changes
+                .iter()
+                .map(|change| change.path.clone())
+                .collect(),
+        ),
+        ToolAction::EditFile { edits, .. } => (
+            "edit_file",
+            edits.iter().map(|edit| edit.path.clone()).collect(),
+        ),
+        ToolAction::ProposePlan(_) => ("propose_plan", Vec::new()),
+        ToolAction::CompleteStep => ("complete_step", Vec::new()),
+        ToolAction::AskUser(_) => ("ask_user", Vec::new()),
+        ToolAction::Command(_) => ("run_command", Vec::new()),
+        ToolAction::WebDiagnostic(_) => ("web_diagnostic", Vec::new()),
+        ToolAction::McpCall { .. } => ("mcp_call", Vec::new()),
+    };
+    paths = paths
+        .into_iter()
+        .map(|path| scanner.redact(&path).text)
+        .collect();
+    let mut payload = serde_json::json!({"tool": tool, "paths": paths});
+    match action {
+        ToolAction::Command(request) => {
+            payload["command"] = serde_json::json!(scanner.redact(&request.command).text);
+        }
+        ToolAction::McpCall {
+            server_id,
+            tool_name,
+            ..
+        } => {
+            payload["server"] = serde_json::json!(scanner.redact(server_id).text);
+            payload["toolName"] = serde_json::json!(scanner.redact(tool_name).text);
+        }
+        ToolAction::WebDiagnostic(call) => {
+            payload["url"] = serde_json::json!(scanner.redact(&call.url).text);
+        }
+        _ => {}
+    }
+    if let Some(outcome) = outcome {
+        let outcome_name = match outcome {
+            ActionOutcome::Ok | ActionOutcome::FileRead { .. } => "ok",
+            ActionOutcome::CommandExit(Some(0), _) => "ok",
+            ActionOutcome::CommandExit(_, _) => "failed",
+            ActionOutcome::Failed => "failed",
+            ActionOutcome::Cancelled => "refused",
+        };
+        payload["outcome"] = serde_json::json!(outcome_name);
+        if let ActionOutcome::CommandExit(exit_code, _) = outcome {
+            if let Some(code) = exit_code {
+                payload["exitCode"] = serde_json::json!(code);
+            }
+            if let Some(termination) = termination {
+                payload["termination"] = serde_json::json!(termination.as_str());
+            }
+        }
+    }
+    payload
 }
 
 /// The action marker parameters for a dispatched tool: a stable name, a
@@ -5642,7 +6770,7 @@ fn run_command_tool_definition(shell: &str) -> ToolDefinition {
     ToolDefinition {
         name: "run_command".to_string(),
         description: format!(
-            "Request a local shell command in the selected repository. {} Damaian runs sandbox-safe read-only commands automatically and pauses for user approval before running commands with side effects, network access, Docker access, shell control, or unknown risk. For git diffs and commit content, use the read_git_diff and read_git_log tools instead; git diff, git show and git log -p need approval in the shell.",
+            "Request a local shell command in the selected repository. {} Damaian runs a short list of read-only commands without asking and pauses for user approval before running anything else, including commands with side effects, network access, Docker access, shell control, or unknown risk. For git diffs and commit content, use the read_git_diff and read_git_log tools instead; git diff, git show and git log -p need approval in the shell.",
             shell_guidance(shell),
         ),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell command to run\"},\"reason\":{\"type\":\"string\",\"description\":\"Why this command is needed\"},\"working_directory\":{\"type\":\"string\",\"description\":\"Repository-relative directory to run in; defaults to the repository root\"}},\"required\":[\"command\"]}".to_string(),
@@ -6243,17 +7371,24 @@ fn parse_command_request(value: &str) -> Option<CommandRequest> {
     })
 }
 
+/// The user-facing first line is the policy's own deciding reason (spec 62
+/// §5.2). `reasons` is rendered from the classification's causes, so this
+/// leads with the same words the card's **Why this command** shows.
 fn command_proposal_response(proposal: &CommandProposal) -> String {
+    let cause = proposal.reasons.first().map(String::as_str);
     if proposal.blocked {
         format!(
-            "I cannot run `{}` in sandbox mode, and local policy blocks this command. Review or reject the command request below.",
+            "{}\n`{}`\nDamaian will not run it. Nothing has run.",
+            cause.unwrap_or("Blocked by local policy"),
             proposal.command
         )
     } else {
-        format!(
-            "I need your approval before running `{}` because it cannot run in sandbox mode.",
-            proposal.command
-        )
+        match cause {
+            Some(cause) => format!("{cause}\n`{}`", proposal.command),
+            // A proposal always carries a cause, but never print an empty first
+            // line if one is ever missing.
+            None => format!("Damaian asks before running this.\n`{}`", proposal.command),
+        }
     }
 }
 
@@ -6265,6 +7400,12 @@ fn agent_command_proposal(config: &Config, proposal: &CommandProposal) -> AgentC
         risk: proposal.risk.as_str().to_string(),
         requires_approval: proposal.requires_approval,
         blocked: proposal.blocked,
+        // `reasons` is rendered from the classification's causes, so the first
+        // entry is the deciding cause's plain words. Kept as the rendered string
+        // rather than read from `causes` so a proposal stored before spec 62
+        // (which has reasons but no causes) still shows its cause on reattach.
+        cause: proposal.reasons.first().cloned().unwrap_or_default(),
+        reason: proposal.reason.clone(),
         allow_always: allow_always_eligible(config, &proposal.command, proposal.blocked),
         allow_browser_diagnostics_for_session: false,
     }
@@ -6338,6 +7479,22 @@ fn model_output_requests_tool(model_run: &ModelRun, content: &str) -> bool {
         || content.contains("DAMAIAN_COMMAND_V1")
         || content.contains("tool_calls")
         || content.contains("DSML")
+}
+
+/// The one sentence a hook denial reaches the user with, always naming the
+/// hook so it is distinguishable from a mode or profile refusal (spec 32
+/// `context.md` §10).
+fn hook_refusal(outcome: &HookOutcome) -> String {
+    let hook_id = outcome.deciding_hook.as_deref().unwrap_or("unknown");
+    match outcome
+        .reasons
+        .iter()
+        .find(|(id, _)| id == hook_id)
+        .map(|(_, reason)| reason.as_str())
+    {
+        Some(reason) => format!("Refused by hook `{hook_id}`: {reason}"),
+        None => format!("Refused by hook `{hook_id}`"),
+    }
 }
 
 /// Names the ceiling, what was actually spent, and what is left undone.
@@ -6419,6 +7576,7 @@ fn mcp_approval_proposal(
     server_id: &str,
     tool_name: &str,
     arguments_json: &str,
+    hook_cause: Option<&(String, String)>,
 ) -> AgentCommandProposal {
     let arguments = truncate_for_prompt(arguments_json.trim(), 500);
     let prompt = format!(
@@ -6431,6 +7589,19 @@ fn mcp_approval_proposal(
         risk: "mcp".to_string(),
         requires_approval: true,
         blocked: false,
+        // Not a local command: the command policy produced no cause. When a
+        // `before_tool` hook forced this card, its cause is the honest one to
+        // show; otherwise the card already says what the call is in `prompt`.
+        cause: hook_cause
+            .map(|(hook, reason)| {
+                ApprovalCause::HookRequested {
+                    hook: hook.clone(),
+                    reason: reason.clone(),
+                }
+                .plain_words()
+            })
+            .unwrap_or_default(),
+        reason: String::new(),
         // An MCP tool call is not a shell command, so `command_allowlist` has
         // nothing to say about it. Per-server `require_approval` in the MCP
         // config is the knob for making these stop prompting.
@@ -6442,6 +7613,7 @@ fn mcp_approval_proposal(
 fn web_diagnostic_approval_proposal(
     proposal_id: &str,
     call: &WebDiagnosticCall,
+    hook_cause: Option<&(String, String)>,
 ) -> AgentCommandProposal {
     let arguments = truncate_for_prompt(call.arguments_json.trim(), 500);
     // Spec 12 §5.4: anything outside loopback is high risk, whatever the tool.
@@ -6465,6 +7637,18 @@ fn web_diagnostic_approval_proposal(
         risk: risk.to_string(),
         requires_approval: true,
         blocked: false,
+        // Not a local command: its policy cause does not exist. A hook that
+        // forced this card supplies the one cause there is to name.
+        cause: hook_cause
+            .map(|(hook, reason)| {
+                ApprovalCause::HookRequested {
+                    hook: hook.clone(),
+                    reason: reason.clone(),
+                }
+                .plain_words()
+            })
+            .unwrap_or_default(),
+        reason: String::new(),
         allow_always: false,
         // The session grant covers loopback only, so a remote URL is never
         // offered it: each remote diagnostic is approved on its own.
@@ -7400,7 +8584,7 @@ mod system_prompt_tests {
     /// `code_mode_system_prompt_is_byte_identical_to_todays` pins the Code
     /// output against it; spec 49 Task 8's prefix-stability guards depend on
     /// this staying true.
-    const TODAYS_CODE_SYSTEM_PROMPT: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
+    const TODAYS_CODE_SYSTEM_PROMPT: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. Damaian runs a short list of read-only commands without asking and needs your approval before running anything else, including any command that uses shell control. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
 
     #[test]
     fn code_mode_system_prompt_is_byte_identical_to_todays() {
@@ -7418,7 +8602,7 @@ mod system_prompt_tests {
             "Ask must teach no command envelope at all: {prompt}"
         );
         assert!(
-            !prompt.contains("The app will run sandbox-safe commands automatically"),
+            !prompt.contains("runs a short list of read-only commands without asking"),
             "Ask must not leave the envelope's guidance paragraph dangling: {prompt}"
         );
     }
@@ -7765,8 +8949,8 @@ mod clarification_tests {
     // guidance, and spec 49's cache prefix depends on `messages[0]` staying
     // put.
     const PREFIX_BEFORE_SPEC_50: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.";
-    const CODE_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
-    const READ_ONLY_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.";
+    const CODE_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. Damaian runs a short list of read-only commands without asking and needs your approval before running anything else, including any command that uses shell control. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
+    const READ_ONLY_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. Damaian runs a short list of read-only commands without asking and refuses every other command outright in this mode, including any command that uses shell control. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.";
 
     fn prompt_before_spec_50(mode: SessionMode) -> String {
         match mode {
@@ -9098,5 +10282,281 @@ done
         );
 
         fs::remove_dir_all(repo).unwrap();
+    }
+}
+
+/// Spec 62 Task 3: the approval prompt leads with the policy's own reason, and
+/// nothing shown to the user or sent to the model about local commands still
+/// claims a sandbox exists. Spec 63's shell guidance is checked separately in
+/// `shell_naming_tests`; these tests cover the wording this spec changes.
+#[cfg(test)]
+mod approval_prompt_wording_tests {
+    use super::*;
+    use crate::command_policy::ApprovalCause;
+    use crate::mode::SessionMode;
+
+    fn proposal(command: &str, blocked: bool, causes: Vec<ApprovalCause>) -> CommandProposal {
+        proposal_saying(command, blocked, causes, "The model's own reason.")
+    }
+
+    fn proposal_saying(
+        command: &str,
+        blocked: bool,
+        causes: Vec<ApprovalCause>,
+        reason: &str,
+    ) -> CommandProposal {
+        CommandProposal {
+            id: "cmdprop_test".to_string(),
+            command: command.to_string(),
+            working_directory: "/repo".to_string(),
+            repository_root: "/repo".to_string(),
+            reason: reason.to_string(),
+            risk: if blocked {
+                CommandRisk::Blocked
+            } else {
+                CommandRisk::High
+            },
+            requires_approval: true,
+            blocked,
+            expected_effects: String::new(),
+            may_use_network: false,
+            reasons: causes.iter().map(ApprovalCause::plain_words).collect(),
+            causes,
+            created_at_ms: 0,
+            status: "pending".to_string(),
+            purpose: CommandPurpose::Other,
+        }
+    }
+
+    #[test]
+    fn the_card_payload_carries_the_first_cause_and_the_models_reason() {
+        let causes = vec![
+            ApprovalCause::ShellControl {
+                constructs: "`&&`, `|`".to_string(),
+            },
+            ApprovalCause::Setting {
+                key: "require_approval_for_all_commands".to_string(),
+                source: Some("user".to_string()),
+            },
+        ];
+        let proposal = proposal_saying(
+            "cd x && git diff | head",
+            false,
+            causes.clone(),
+            "Compare the worktree with the index.",
+        );
+
+        let payload = agent_command_proposal(&Config::default(), &proposal);
+
+        assert_eq!(payload.reason, "Compare the worktree with the index.");
+        assert_eq!(payload.cause, causes[0].plain_words());
+        assert_ne!(payload.cause, causes[1].plain_words());
+        assert!(payload.cause.contains("`&&`"), "{}", payload.cause);
+        assert!(payload.cause.contains("`|`"), "{}", payload.cause);
+    }
+
+    #[test]
+    fn a_blocked_command_still_names_its_cause_on_the_card() {
+        let proposal = proposal_saying(
+            "echo forbidden",
+            true,
+            vec![ApprovalCause::Blocklisted {
+                rule: "echo forbidden".to_string(),
+            }],
+            "Try it anyway.",
+        );
+
+        let payload = agent_command_proposal(&Config::default(), &proposal);
+
+        assert!(payload.blocked);
+        assert!(payload.cause.starts_with("Blocked: matches"));
+        assert_eq!(payload.reason, "Try it anyway.");
+    }
+
+    #[test]
+    fn command_proposal_response_leads_with_the_first_cause() {
+        let shell_control = ApprovalCause::ShellControl {
+            constructs: "`&&`, `|`".to_string(),
+        };
+        let proposal = proposal(
+            "cd x && git diff | head",
+            false,
+            vec![shell_control.clone()],
+        );
+        let response = command_proposal_response(&proposal);
+        let first_line = response.lines().next().expect("a prompt has a first line");
+
+        assert_eq!(first_line, shell_control.plain_words());
+        assert!(first_line.contains("`&&`"), "{first_line}");
+        assert!(first_line.contains("`|`"), "{first_line}");
+        assert!(response.contains("cd x && git diff | head"), "{response}");
+    }
+
+    #[test]
+    fn a_blocked_proposal_names_what_blocked_it_and_offers_no_approval() {
+        let proposal = proposal(
+            "echo forbidden",
+            true,
+            vec![ApprovalCause::Blocklisted {
+                rule: "echo forbidden".to_string(),
+            }],
+        );
+        let response = command_proposal_response(&proposal);
+
+        assert!(response.starts_with("Blocked: matches"), "{response}");
+        assert!(response.contains("`echo forbidden`"), "{response}");
+        assert!(response.contains("will not run"), "{response}");
+        assert!(!response.contains("approval"), "{response}");
+    }
+
+    #[test]
+    fn no_local_command_string_shown_or_sent_contains_sandbox() {
+        for mode in [
+            SessionMode::Ask,
+            SessionMode::Code,
+            SessionMode::Plan,
+            SessionMode::Review,
+        ] {
+            for user_present in [true, false] {
+                let prompt = system_prompt(mode, user_present, "/bin/zsh");
+                assert!(
+                    !prompt.to_lowercase().contains("sandbox"),
+                    "{mode:?} prompt (user present: {user_present}) still says sandbox: {prompt}"
+                );
+            }
+        }
+
+        for shell in ["/bin/zsh", "/bin/bash"] {
+            for text in [
+                command_envelope_paragraph_unrestricted(shell),
+                command_envelope_paragraph_read_only(shell),
+                run_command_tool_definition(shell).description,
+            ] {
+                assert!(
+                    !text.to_lowercase().contains("sandbox"),
+                    "model-facing local command text still says sandbox: {text}"
+                );
+            }
+        }
+
+        for proposal in [
+            proposal(
+                "git status && git diff",
+                false,
+                vec![ApprovalCause::ShellControl {
+                    constructs: "`&&`".to_string(),
+                }],
+            ),
+            proposal(
+                "echo forbidden",
+                true,
+                vec![ApprovalCause::Blocklisted {
+                    rule: "echo forbidden".to_string(),
+                }],
+            ),
+        ] {
+            assert!(
+                !command_proposal_response(&proposal)
+                    .to_lowercase()
+                    .contains("sandbox"),
+                "the approval prompt still says sandbox"
+            );
+        }
+
+        let with_result = build_model_prompt("Question", &[], &[], Some("Command: pwd\n"));
+        assert!(
+            !with_result.to_lowercase().contains("sandbox"),
+            "a command result sent to the model still says sandbox: {with_result}"
+        );
+        assert!(
+            with_result.contains("--- command_result ---"),
+            "{with_result}"
+        );
+    }
+
+    #[test]
+    fn the_auto_run_description_says_the_policy_runs_it_without_asking() {
+        for shell in ["/bin/zsh", "/bin/bash"] {
+            for text in [
+                command_envelope_paragraph_unrestricted(shell),
+                command_envelope_paragraph_read_only(shell),
+                run_command_tool_definition(shell).description,
+            ] {
+                assert!(
+                    text.contains("runs a short list of read-only commands without asking"),
+                    "auto-run is not described as the policy running it without asking: {text}"
+                );
+                assert!(!text.contains("sandbox-safe"), "{text}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod before_tool_verdict_tests {
+    use super::*;
+
+    fn command() -> ToolAction {
+        ToolAction::Command(CommandRequest {
+            command: "cargo test".to_string(),
+            reason: "test".to_string(),
+            working_directory: None,
+        })
+    }
+
+    fn ask() -> ToolAction {
+        ToolAction::AskUser(crate::clarification::AskUserInput {
+            question: "Which one?".to_string(),
+            options: vec!["The CLI".to_string(), "The shell".to_string()],
+            allow_free_text: false,
+        })
+    }
+
+    /// Criterion 5: `request_approval` is the only verdict that can add an
+    /// approval gate, and no verdict removes one (spec 32 `context.md` §4).
+    /// The exhaustive list is deliberate: a fifth verdict must decide here.
+    #[test]
+    fn only_request_approval_adds_a_gate_and_none_removes_one() {
+        let verdicts = [
+            Verdict::Allow,
+            Verdict::Warn,
+            Verdict::RequestApproval,
+            Verdict::Deny,
+        ];
+        let mut requires_approval = true;
+        for verdict in verdicts {
+            let effect = before_tool_effect(&command(), verdict);
+            requires_approval = requires_approval || effect == BeforeToolEffect::ForceApproval;
+            assert!(
+                requires_approval,
+                "{verdict:?} removed an approval that was already required"
+            );
+            if verdict == Verdict::RequestApproval {
+                assert_eq!(effect, BeforeToolEffect::ForceApproval);
+            }
+        }
+    }
+
+    /// Spec 50: `ask_user` has no approval step and its answer authorises
+    /// nothing, so a hook asking for approval refuses the question rather than
+    /// turning it into a card.
+    #[test]
+    fn request_approval_on_a_question_is_refused() {
+        assert_eq!(
+            before_tool_effect(&ask(), Verdict::RequestApproval),
+            BeforeToolEffect::Refuse
+        );
+    }
+
+    #[test]
+    fn request_approval_on_a_patch_is_already_satisfied() {
+        let patch = ToolAction::ProposePatch(GeneratedEdit {
+            summary: "Change".to_string(),
+            changes: Vec::new(),
+        });
+        assert_eq!(
+            before_tool_effect(&patch, Verdict::RequestApproval),
+            BeforeToolEffect::SatisfiedApproval
+        );
     }
 }

@@ -78,6 +78,11 @@ pub struct Asserts {
     /// itself rather than the log it was rebuilt from. Script-derived, so it is
     /// `deterministic_only`.
     pub continuation_request_contains: Option<Vec<String>>,
+    /// Strings the first model request after a scripted answer must contain.
+    /// This is the spec 50 §9 claim that the answer reached the model as a tool
+    /// result rather than being recorded and dropped. Script-derived, so it is
+    /// `deterministic_only`.
+    pub answer_request_contains: Option<Vec<String>>,
     /// That the run dispatched at least this many tool calls, which proves a
     /// batch ran every call the model made in one message. Script-derived, so a
     /// scenario using it lists it in `deterministic_only`.
@@ -141,6 +146,12 @@ pub struct Scenario {
     /// keeps driving, so a continued turn's state and a forced final call are
     /// exercised end to end (spec 61 §5.8).
     pub round_budget_decision: Option<RoundBudgetDecision>,
+    /// The answers the user gives, in order, when the turn asks a question
+    /// (spec 50 §9). Non-empty makes the run interactive — `chat_orchestrator`
+    /// is told a user is present, so `ask_user` is offered — and the runner
+    /// resumes each question through `resume_after_answer`. Empty is the
+    /// headless default every other scenario keeps.
+    pub answers: Vec<String>,
     /// Config this run needs beyond the defaults, in the same `key=value` form
     /// as `user.conf` (spec 59 §5.7's zero-allowance case is one). Parsed at the
     /// boundary so a malformed line is a load error, not a silently ignored
@@ -172,6 +183,10 @@ struct RawScenario {
     approval_decision: Option<bool>,
     #[serde(default)]
     round_budget_decision: Option<RoundBudgetDecision>,
+    /// Scripted answers, in the order the questions are answered. An empty list
+    /// leaves the run headless.
+    #[serde(default)]
+    answers: Vec<String>,
     /// The config as the same `key=value` lines `user.conf` uses. A string
     /// rather than a table because the engine's parser is the one authority on
     /// what the keys are and what values they accept.
@@ -298,6 +313,7 @@ pub fn load(path: &Path) -> Result<Scenario> {
             .map(|change| (change.path, change.content)),
         approval_decision: raw.approval_decision,
         round_budget_decision: raw.round_budget_decision,
+        answers: raw.answers,
         config_overlay: match raw.config_overlay {
             Some(text) => Some(ConfigOverlay::parse(&text).map_err(|error| {
                 ClientError::InvalidInput(format!("{}: config_overlay: {error}", path.display()))

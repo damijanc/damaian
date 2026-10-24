@@ -1,7 +1,14 @@
 # Feature Spec: Approval Prompts Name the Reason
 
-Status: In progress. Tasks 1 (`ApprovalCause` and structured causes) and 2
-(`Setting` and profile-block causes) landed 2026-10-18. Specified on 2026-10-17
+Status: Done 2026-10-23 (started 2026-10-18; Tasks 1–7, the last on
+2026-10-23). Tasks 1 (`ApprovalCause` and structured causes) and 2
+(`Setting` and profile-block causes) landed 2026-10-18; Task 3 (prompt and
+model-facing wording) landed 2026-10-23; Task 4 (the card names the cause and
+the model's reason) landed 2026-10-23; Task 5 (recording causes in the proposal
+and audit record) landed 2026-10-23; Task 6 (the eval harness groups prompts by
+first cause) landed 2026-10-23; Task 7 (docs, live re-run and close-out)
+landed 2026-10-23, and its live re-run named every prompt's cause (§6).
+Specified on 2026-10-17
 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#61](../61_continue_the_stopped_turn/proposal.md),
 in which the user answered 40 approval prompts that all gave the same reason,
@@ -48,8 +55,12 @@ believes auto-run commands are sandboxed will trust them more than they should.
 > boundary and its classifier, and its reason strings are what §5.1's
 > `ApprovalCause` replaces. The `tasks.md` Corrections table records where the
 > code now differs from this section; the bullets below are the corrected view.
+> Task 3 has since rewritten the wording and removed the strings named here;
+> Task 4 has since shown the first cause and the model's reason on the card.
+> The line references point at the current source for the pre-Task-3 state, and
+> the card bullet below describes the pre-Task-4 card.
 
-- `command_proposal_response` (`chat.rs:5310`) returns one of two fixed
+- `command_proposal_response` (`chat.rs:6249`) returns one of two fixed
   sentences, both claiming "sandbox mode", whatever the proposal says.
 - `CommandProposal` (`validation.rs:18`) carries the model's stated `reason`
   (set from the tool call in `propose_command_at`), plus `risk`,
@@ -77,10 +88,10 @@ believes auto-run commands are sandboxed will trust them more than they should.
 - `require_approval_for_all_commands` and `require_approval_for_risky_commands`
   set `requires_approval` without adding a reason. A low-risk command that needs
   approval only because of them still reads "Read-only command".
-- The approval card (`createCommandApprovalPreview`, `app.js:9170`) shows the
+- The approval card (`createCommandApprovalPreview`, `app.js:9325`) shows the
   command and a risk badge, and puts the plain-text `command_approval_prompt`,
   which includes the reasons, behind a **Why this command** disclosure. The
-  model's own stated reason is not shown; `AgentCommandProposal` (`chat.rs:287`)
+  model's own stated reason is not shown; `AgentCommandProposal` (`chat.rs:314`)
   carries no `reason` field to show.
 - `effective_policy.rs`'s `rule_label` names configuration keys in plain words
   ("Ask before every command", "Commands that are always blocked"). It does not
@@ -89,13 +100,14 @@ believes auto-run commands are sandboxed will trust them more than they should.
   `classify_at` runs: `CommandPolicy` is built from `Config` alone
   (`workspace_engine.rs:78`), so §5.1's `Setting.source` needs that attribution
   threaded in.
-- The tool description for `run_command` (`chat.rs:4747`) and the system prompt
-  and command envelope paragraphs (`chat.rs:4247`, `4255`) tell the model that
+- The tool description for `run_command` (`chat.rs:5641`) and the system prompt
+  and command envelope paragraphs (`chat.rs:5099`, `5110`) tell the model that
   Damaian "runs sandbox-safe read-only commands automatically". Three more
   "sandbox" strings are not in those paragraphs: the auto-run path passes the
-  literal `"sandbox"` as `approved_by` (`chat.rs:2756`), the model-facing
-  context separator is `--- sandbox_command_result ---` (`chat.rs:4300`), and
-  the audit turn status includes `complete_with_sandbox_command` (`chat.rs:3411`).
+  literal `"sandbox"` as `approved_by` (`chat.rs:3140`), the model-facing
+  context separator is `--- sandbox_command_result ---` (`chat.rs:5159`), and
+  the audit turn status includes `complete_with_sandbox_command` (now
+  `complete_with_command`, `chat.rs:3825`).
 
 ## 3. Requirements
 
@@ -147,6 +159,12 @@ A new enum in `command_policy.rs`:
 | `OutsideRepository { path }` | "Asks first: refers to `<path>`, outside the repository" |
 | `Setting { key, source: Option<String> }` | "Asks first: *<rule_label(key)>* is on (set by <source>)", omitting " (set by …)" when the source is unknown |
 | `ProfileBlocked { access }` | "Blocked: the permission profile allows <access> commands only" |
+| `HookRequested { hook, reason }` | "Asks first: hook `<hook>` requested it: `<reason>`" |
+
+`HookRequested` is added by spec 32 Task 8: a `before_tool` hook's
+`request_approval` verdict is a real cause even though it comes from outside
+the classifier, and the card must name the hook and its reason rather than
+show `unknown`. Its audit name is `hook_requested`.
 
 `RestrictedPath` is added for the reason spec 64 already emits
 (`RESTRICTED_PATH_REASON`, whose doc comment names this spec); the spec-64
@@ -178,8 +196,7 @@ default and may say so.
 
 `command_proposal_response` becomes, for example:
 
-> Damaian asks before running this: it uses `&&` and `|`, and shell control
-> always asks.
+> Asks first: uses `&&`, `|` — Damaian never runs shell control without asking
 > `cd .claude/worktrees/spec25-task8 && git --no-pager diff -- … | head -220`
 
 The card's header line shows the first cause's plain words next to the risk
@@ -194,29 +211,35 @@ approval, as today.
 The `run_command` description and the command envelope paragraphs replace
 "sandbox-safe" with what is true: Damaian runs a short list of read-only commands
 without asking and asks the user for everything else, including any command that
-uses shell control. Naming shell control there is deliberate: a model that knows
+uses shell control. Plan and Review carry the same sentence but say that
+everything else is refused outright in that mode, because those modes raise no
+approval card. Naming shell control there is deliberate: a model that knows
 `a && b | c` always asks may prefer two tool calls, or #60's tools, over one
 compound command.
 
 The test that asserts the read-only prompt omits the auto-run sentence is
-`ask_mode_system_prompt_has_no_command_envelope` (`chat.rs:6414`), not "around
+`ask_mode_system_prompt_has_no_command_envelope` (`chat.rs:7421`), not "around
 line 6178". It is updated with the new wording, not removed, and
-`code_mode_system_prompt_is_byte_identical_to_todays` (`chat.rs:6406`) pins the
+`code_mode_system_prompt_is_byte_identical_to_todays` (`chat.rs:7413`) pins the
 Code system prompt against a `TODAYS_CODE_SYSTEM_PROMPT` constant — that constant
 and the `CODE_PARAGRAPH_BEFORE_SPEC_50` / `READ_ONLY_PARAGRAPH_BEFORE_SPEC_50`
-fixtures (`chat.rs:6665`) change in the same commit or the byte-identical test
-breaks.
+fixtures (`chat.rs:7775`, `7776`) change in the same commit or the byte-identical
+test breaks.
 
 ### 5.4 Recording
 
 The audit record for a command proposal — the `command_proposal_stored` event
 written in `validation.rs`'s `store_proposal`, which today carries
 `risk`/`requiresApproval`/`blocked` only — gains `causes`, the enum variant
-names in order (`shell_control,unknown`). Because the stored proposal
-(`serialize_proposal`) round-trips to disk and is reloaded for reattach and
-*Allow Always*, `CommandProposal` gains a `causes` field written and read with
-it, so the audit value and the reloaded proposal cannot drift. The session log's
-assistant message carries the plain words already, so no new event is needed.
+names in order (`unknown,outside_repository` for a command the policy does not
+recognise that also names a path outside the repository). Because the stored
+proposal (`serialize_proposal`) round-trips to disk and is reloaded for reattach
+and *Allow Always*, `CommandProposal` gains a `causes` field written and read
+with it, so the audit value and the reloaded proposal cannot drift. The field
+stores the causes themselves, not only their names: the audit names a cause,
+and the proposal keeps enough to render it. An older proposal without the field
+reads with no causes. The session log's assistant message carries the plain
+words already, so no new event is needed.
 
 ### 5.5 Measuring
 
@@ -249,6 +272,30 @@ cause), and `SECURITY.md` if it describes auto-run commands as sandboxed.
 - Classification results — risk, `requires_approval`, `blocked` — are unchanged
   for every command in the existing policy tests.
 
+### Live re-run (2026-10-23)
+
+The motivating approval was re-run against `deepseek-v4-flash` with native tools
+on, in-process against this worktree, under a `DAMAIAN_DATA_DIR` inside the
+worktree. Four turns each asked for one command. No command was approved, so
+nothing ran and the working tree stayed clean. The first line of each prompt:
+
+| Command proposed | First line shown | Names the real cause? |
+|---|---|---|
+| `ls crates; ls docs` | Asks first: uses `;` — Damaian never runs shell control without asking | Yes. This is the spec 59 case: a `;`-chained read-only `ls` sequence, named as `;` shell control. |
+| `curl -sS https://example.com` | Asks first: may use the network (`curl`) | Yes: the network keyword, not the generic high-risk sentence. |
+| `python3 -c 'print(1)'` | Asks first: Damaian does not know what `python3` does | Yes: the program is named. |
+| `docker ps` | Asks first: Docker commands always ask | Yes: the Docker cause. |
+
+Each card payload carried the same first cause and the model's own stated
+reason (`checking the layout`, `checking the page`, `checking Python`,
+`checking containers`), so the card's two lines match §5.2. The run used a
+temporary in-process `#[ignore]` driver because the CLI cannot observe a pending
+approval without a UI; the driver and its data directory were deleted
+afterwards. Criteria 3, 4, 5, 6, 7 and 8 are covered by the tests recorded in
+[`tasks.md`](tasks.md); this live run exercises criteria 1 and 2.
+
 ## 7. Implementation Notes
 
-None yet.
+The per-task record — including each deliberate deviation, the falsification
+behind every load-bearing test, and the scoped check results — is in
+[`tasks.md`](tasks.md). The live re-run is in §6 above.

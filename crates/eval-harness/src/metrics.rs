@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use crate::record::{CacheUsage, RecordedPlan, RunRecord};
@@ -10,6 +12,13 @@ pub enum MetricValue {
     },
     Count {
         value: u64,
+    },
+    /// Counts grouped by the value being measured — spec 62 §5.5's prompts by
+    /// first cause. A single total would lose the grouping, which is the
+    /// measurement: a session where nearly every prompt is `shell_control`
+    /// reads very differently from one spread across causes.
+    Groups {
+        counts: BTreeMap<String, u64>,
     },
     /// §5.6: manual repair rate and patch acceptance rate need a human decision
     /// as their input. A machine-generated value for either would be a fiction
@@ -52,11 +61,11 @@ impl MetricSet {
     /// requirement 5 guards against.
     ///
     /// The next four are spec 21's plan rows, then spec 49's
-    /// `cache_hit_rate`, and the last is spec 63's `exploration_findings`.
-    /// They live here rather than in a metric set of their
-    /// own because requirement 5 is about *the* report — a measure kept
-    /// somewhere else is a measure a baseline diff does not cover.
-    pub const KEYS: [&'static str; 22] = [
+    /// `cache_hit_rate`, spec 63's `exploration_findings`, and spec 62's
+    /// `approval_prompts_by_cause`. They live here rather than in a metric set
+    /// of their own because requirement 5 is about *the* report — a measure
+    /// kept somewhere else is a measure a baseline diff does not cover.
+    pub const KEYS: [&'static str; 23] = [
         "task_completion_rate",
         "check_pass_rate",
         "approval_policy_violations",
@@ -79,6 +88,7 @@ impl MetricSet {
         "plan_steps_blocked",
         "cache_hit_rate",
         "exploration_findings",
+        "approval_prompts_by_cause",
     ];
 
     pub fn get(&self, key: &str) -> Option<&Metric> {
@@ -448,6 +458,32 @@ impl MetricSet {
             ),
         );
 
+        // Spec 62 §5.5: prompts grouped by the cause that made them ask. Summed
+        // across runs by cause rather than per run, so the report answers "what
+        // asks most often" over the whole tier. A run that never prompted
+        // contributes nothing; with no prompts anywhere the honest answer is no
+        // data, because zero over nothing says nothing about which causes
+        // dominate.
+        let mut prompts_by_cause: BTreeMap<String, u64> = BTreeMap::new();
+        for record in &runnable {
+            for (cause, count) in &record.approvals_by_cause {
+                *prompts_by_cause.entry(cause.clone()).or_default() += count;
+            }
+        }
+        push(
+            "approval_prompts_by_cause",
+            "Approval prompts by first cause",
+            if prompts_by_cause.is_empty() {
+                MetricValue::NotApplicable {
+                    phase: "no-approval-prompts".to_string(),
+                }
+            } else {
+                MetricValue::Groups {
+                    counts: prompts_by_cause,
+                }
+            },
+        );
+
         MetricSet { metrics }
     }
 }
@@ -455,20 +491,23 @@ impl MetricSet {
 /// Whether one recorded tool call counts against §5.6's error rate.
 ///
 /// The engine's marker vocabulary — `ok`, `awaiting_approval`,
-/// `awaiting_review`, `conflict` — contains no error value: a tool failure is
-/// fed back to the model as a tool result and the marker still finishes
-/// normally. So an error here is a call that reached *none* of those states,
-/// which in practice means a marker that never finished at all.
+/// `awaiting_review`, `awaiting_answer`, `conflict` — contains no error value:
+/// a tool failure is fed back to the model as a tool result and the marker
+/// still finishes normally. So an error here is a call that reached *none* of
+/// those states, which in practice means a marker that never finished at all.
 ///
-/// Reading this as `outcome != "ok"` counted a patch waiting for review and a
-/// command waiting for approval as errors, which are the outcomes most
-/// scenarios exist to produce. That went unnoticed while the tool-call list
-/// came from the scenario script, which stamped every entry `ok` — so the
-/// metric reported 0.000 by construction rather than by measurement, and
-/// nothing would have moved it.
+/// Reading this as `outcome != "ok"` counted a patch waiting for review, a
+/// command waiting for approval and a question waiting for an answer as errors,
+/// which are the outcomes the scenarios exist to produce. That went unnoticed
+/// while the tool-call list came from the scenario script, which stamped every
+/// entry `ok` — so the metric reported 0.000 by construction rather than by
+/// measurement, and nothing would have moved it.
 fn is_tool_error(outcome: &str, record_injected_a_crash: bool) -> bool {
     match outcome {
-        "ok" | "awaiting_approval" | "awaiting_review" | "conflict" => false,
+        // A pause for a human decision stops the turn cleanly. `awaiting_answer`
+        // is spec 50's question: without it here, every scripted answer would
+        // be reported as the assistant erring.
+        "ok" | "awaiting_approval" | "awaiting_review" | "awaiting_answer" | "conflict" => false,
         // An unfinished action is the crash signature spec 17 preserves. A
         // scenario that injected a crash is *expected* to leave one, and
         // counting it would report the harness's own interruption as the

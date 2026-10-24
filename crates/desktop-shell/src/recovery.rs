@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use workspace_engine::{
-    CommandProposal, PausedTurns, ProposedPatch, ReattachedApproval, RecoveredTask, TaskStatus,
-    WorkspaceEngine, allow_always_eligible, classify_all, classify_session,
-    command_approval_prompt, headline, reattach_pending_approvals, resume_allowed,
-    resume_blocked_reason,
+    CommandProposal, PausedTurns, ProposedPatch, QUESTION_WAITING_HEADLINE, ReattachedApproval,
+    RecoveredTask, TaskStatus, WorkspaceEngine, allow_always_eligible, classify_all,
+    classify_session, command_approval_prompt, headline, reattach_pending_approvals,
+    resume_allowed, resume_blocked_reason,
 };
 
 use crate::{escape_json, patch_files_json, plan_json};
@@ -590,6 +590,48 @@ fn describe_approval(
             ),
             unavailable_reason: None,
         },
+        // Spec 50. A question is not an approval: this payload is for display
+        // only. It carries no proposal id, command or patch, so nothing can
+        // route it to a command or patch endpoint; answering it uses the
+        // question route. The text was redacted before it was stored in the
+        // session log; `answered` and `answer` are what a reattached card shows
+        // instead of asking again.
+        ReattachedApproval::Question {
+            task_id,
+            question_id,
+            question,
+            options,
+            allow_free_text,
+            answered,
+        } => Approval {
+            session_id: session_id.to_string(),
+            task_id,
+            kind: "question",
+            payload: format!(
+                "{{\"headline\":\"{}\",\"questionId\":\"{}\",\"question\":\"{}\",\"options\":[{}],\"allowFreeText\":{},\"answered\":{},\"answer\":{}}}",
+                QUESTION_WAITING_HEADLINE,
+                escape_json(&question_id),
+                escape_json(&question),
+                options
+                    .iter()
+                    .map(|option| format!("\"{}\"", escape_json(option)))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                allow_free_text,
+                answered.is_some(),
+                match &answered {
+                    None => "null".to_string(),
+                    Some((answer, selected)) => format!(
+                        "{{\"answer\":\"{}\",\"selectedOption\":{}}}",
+                        escape_json(answer),
+                        selected
+                            .map(|index| index.to_string())
+                            .unwrap_or_else(|| "null".to_string())
+                    ),
+                }
+            ),
+            unavailable_reason: None,
+        },
         ReattachedApproval::Unavailable { task_id, reason } => Approval {
             session_id: session_id.to_string(),
             task_id,
@@ -604,13 +646,15 @@ fn describe_approval(
 /// card is the same component rather than a second one.
 fn command_proposal_json(engine: &WorkspaceEngine, proposal: &CommandProposal) -> String {
     format!(
-        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":false}}",
+        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"cause\":\"{}\",\"reason\":\"{}\",\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":false}}",
         escape_json(&proposal.id),
         escape_json(&proposal.command),
         escape_json(&command_approval_prompt(proposal)),
         proposal.risk.as_str(),
         proposal.requires_approval,
         proposal.blocked,
+        escape_json(proposal.reasons.first().map(String::as_str).unwrap_or("")),
+        escape_json(&proposal.reason),
         allow_always_eligible(&engine.config, &proposal.command, proposal.blocked)
     )
 }
@@ -691,8 +735,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use workspace_engine::{
-        Config, PendingApprovalRef, PlanStep, StepStatus, Task, TaskPlan, TaskStatus,
-        WorkspaceEngine,
+        AskUserInput, Config, PendingApprovalRef, PendingQuestionRef, PlanStep, StepStatus, Task,
+        TaskPlan, TaskStatus, WorkspaceEngine,
     };
 
     static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -980,6 +1024,89 @@ mod tests {
         assert!(
             payload.contains("\"deferredAction\":\"apply a patch\""),
             "got {payload}"
+        );
+        assert_eq!(
+            engine
+                .session_store
+                .read_task_statuses(&session.id)
+                .unwrap()
+                .get(&task.id)
+                .map(String::as_str),
+            Some("waiting_for_approval")
+        );
+    }
+
+    /// Spec 50 Task 5: a question waiting when the process stopped comes back
+    /// as a question, not as an approval, with what was asked and whether it
+    /// has been answered. The payload carries no proposal id, command or
+    /// patch, so no command or patch endpoint has anything to act on.
+    #[test]
+    fn a_reattached_question_is_offered_for_an_answer_not_an_approval() {
+        let (engine, _dir) = engine("question");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Recovery")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "ask before choosing", "mock", "m")
+            .unwrap();
+        let question = PendingQuestionRef::new();
+        engine
+            .session_store
+            .record_question_asked(
+                &session.id,
+                &task.id,
+                &question,
+                &AskUserInput {
+                    question: "Did you mean the CLI or the shell?".to_string(),
+                    options: vec!["The CLI".to_string(), "The shell".to_string()],
+                    allow_free_text: true,
+                },
+            )
+            .unwrap();
+        engine.session_store.await_answer(&task, &question).unwrap();
+
+        let (_, payload) = sweep(&engine);
+
+        assert!(payload.contains("\"kind\":\"question\""), "got {payload}");
+        assert!(
+            payload.contains(&format!("\"questionId\":\"{}\"", question.question_id())),
+            "got {payload}"
+        );
+        assert!(
+            payload.contains("Did you mean the CLI or the shell?"),
+            "got {payload}"
+        );
+        assert!(
+            payload.contains("\"headline\":\"A question was waiting for your answer\""),
+            "the card must name it a question, not an approval: got {payload}"
+        );
+        assert!(
+            payload.contains("\"options\":[\"The CLI\",\"The shell\"]"),
+            "got {payload}"
+        );
+        assert!(payload.contains("\"allowFreeText\":true"), "got {payload}");
+        assert!(payload.contains("\"answered\":false"), "got {payload}");
+        assert!(payload.contains("\"answer\":null"), "got {payload}");
+        // Not an approval. Each of these is what a command or patch card needs
+        // before it can run anything.
+        assert!(!payload.contains("\"proposalId\""), "got {payload}");
+        assert!(!payload.contains("\"command\""), "got {payload}");
+        assert!(!payload.contains("\"patchId\""), "got {payload}");
+        assert!(!payload.contains("\"requiresApproval\""), "got {payload}");
+
+        // The state a crash between recording the answer and resuming leaves:
+        // the reattached card names the answer instead of asking again.
+        engine
+            .session_store
+            .record_question_answered(&session.id, question.question_id(), "The CLI", Some(0))
+            .unwrap();
+        let (_, answered) = sweep(&engine);
+        assert!(answered.contains("\"answered\":true"), "got {answered}");
+        assert!(
+            answered.contains("\"answer\":{\"answer\":\"The CLI\",\"selectedOption\":0}"),
+            "got {answered}"
         );
         assert_eq!(
             engine

@@ -31,22 +31,74 @@ impl CommandRisk {
 /// display string (spec 62 §5.1). The set is closed: a new variant is a design
 /// decision. `Setting` and `ProfileBlocked` are wired by Task 2; Task 1 lands
 /// the classifier-branch and path-escalation causes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` exist so a stored proposal round-trips the values
+/// themselves, not only [`Self::as_str`]'s names (spec 62 Task 5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalCause {
-    Blocklisted { rule: String },
-    Destructive { pattern: String },
-    ShellControl { constructs: String },
+    Blocklisted {
+        rule: String,
+    },
+    Destructive {
+        pattern: String,
+    },
+    ShellControl {
+        constructs: String,
+    },
     Docker,
-    HighRisk { keyword: String },
-    Network { keyword: String },
-    Unknown { program: String },
-    RestrictedPath { path: String },
-    OutsideRepository { path: String },
-    Setting { key: String, source: Option<String> },
-    ProfileBlocked { access: CommandAccess },
+    HighRisk {
+        keyword: String,
+    },
+    Network {
+        keyword: String,
+    },
+    Unknown {
+        program: String,
+    },
+    RestrictedPath {
+        path: String,
+    },
+    OutsideRepository {
+        path: String,
+    },
+    Setting {
+        key: String,
+        source: Option<String>,
+    },
+    ProfileBlocked {
+        access: CommandAccess,
+    },
+    /// A `before_tool` hook asked for a human before an otherwise automatic
+    /// command (spec 32 `context.md` §4). The hook's own redacted reason is
+    /// carried so the card names why, not merely that a hook was involved.
+    HookRequested {
+        hook: String,
+        reason: String,
+    },
 }
 
 impl ApprovalCause {
+    /// The variant name, as it appears in the audit record (`shell_control`,
+    /// `outside_repository`, …). The audit carries names only, so no command
+    /// text or path from a cause reaches it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Blocklisted { .. } => "blocklisted",
+            Self::Destructive { .. } => "destructive",
+            Self::ShellControl { .. } => "shell_control",
+            Self::Docker => "docker",
+            Self::HighRisk { .. } => "high_risk",
+            Self::Network { .. } => "network",
+            Self::Unknown { .. } => "unknown",
+            Self::RestrictedPath { .. } => "restricted_path",
+            Self::OutsideRepository { .. } => "outside_repository",
+            Self::Setting { .. } => "setting",
+            Self::ProfileBlocked { .. } => "profile_blocked",
+            Self::HookRequested { .. } => "hook_requested",
+        }
+    }
+
     /// The first line of an approval prompt, in plain words (spec 62 §5.1).
     pub fn plain_words(&self) -> String {
         match self {
@@ -84,6 +136,9 @@ impl ApprovalCause {
                 "Blocked: the permission profile allows {} commands only",
                 access.as_str()
             ),
+            Self::HookRequested { hook, reason } => {
+                format!("Asks first: hook `{hook}` requested it: {reason}")
+            }
         }
     }
 }

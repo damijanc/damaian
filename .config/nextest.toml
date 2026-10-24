@@ -1,0 +1,7 @@
+# Spec 32 Task 7: the always-deny `before_task_complete` test proves the
+# existing round budget bounds the re-entries. If that bound regresses, the
+# turn loops and the test would hang until the job timeout; terminate it after
+# 30 s instead.
+[[profile.default.overrides]]
+filter = 'test(=a_before_task_complete_hook_that_always_denies_stops_at_the_round_budget)'
+slow-timeout = { period = "30s", terminate-after = 1 }

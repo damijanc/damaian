@@ -8,7 +8,9 @@ use crate::checkpoint::{
 use crate::config::Config;
 use crate::context_manager::{ContextItem, ContextManager};
 use crate::error::{ClientError, Result};
+use crate::finding::{Finding, FindingDraft, FindingSource, Severity};
 use crate::hash::{create_id, repository_id_for_root};
+use crate::hooks::{HookContext, HookDispatcher, HookEvent, HookOutcome, Verdict};
 use crate::indexer::ProjectIndexer;
 use crate::mode::{permits, profile_permits, refusal_message};
 use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsage};
@@ -234,6 +236,7 @@ pub struct EditOrchestrator {
     patch_engine: PatchEngine,
     patch_store: PatchStore,
     checkpoint_store: CheckpointStore,
+    hooks: HookDispatcher,
 }
 
 impl EditOrchestrator {
@@ -250,6 +253,7 @@ impl EditOrchestrator {
         patch_engine: PatchEngine,
         patch_store: PatchStore,
         checkpoint_store: CheckpointStore,
+        hooks: HookDispatcher,
     ) -> Self {
         Self {
             config,
@@ -261,6 +265,7 @@ impl EditOrchestrator {
             patch_engine,
             patch_store,
             checkpoint_store,
+            hooks,
         }
     }
 
@@ -322,6 +327,78 @@ impl EditOrchestrator {
             // boundary the user chose, not a policy verdict.
             Err(ClientError::AccessDenied(refusal_message(permission)))
         }
+    }
+
+    /// Runs one patch event's hooks, then the commands they asked for, and
+    /// answers the warnings a caller must show beside the result (spec 32
+    /// `context.md` §4, §9, §10). Findings are recorded in the patch's
+    /// session when it has one. A legacy patch has no log to record them in,
+    /// and §9 refuses requested commands where there is no task, so those are
+    /// reported as warnings instead of run.
+    fn run_patch_hooks(
+        &self,
+        event: HookEvent,
+        payload: serde_json::Value,
+        session: Option<&Session>,
+        task_id: Option<&str>,
+        repository_root: &Path,
+    ) -> (HookOutcome, Vec<String>) {
+        let ctx = HookContext::root();
+        let parts = self.hooks.envelope_parts(session, task_id, payload);
+        let mut outcome = self.hooks.dispatch(event, parts, repository_root, &ctx);
+        let mut warnings = outcome.warnings.clone();
+        if outcome.verdict == Verdict::RequestApproval {
+            warnings.extend(
+                outcome
+                    .reasons
+                    .iter()
+                    .map(|(hook_id, reason)| format!("hook `{hook_id}`: {reason}")),
+            );
+        }
+        let mut findings = std::mem::take(&mut outcome.findings);
+        match session {
+            Some(session) => {
+                if !outcome.commands.is_empty() {
+                    let task = task_id.and_then(|id| {
+                        self.session_store
+                            .read_tasks(&session.id)
+                            .ok()?
+                            .into_iter()
+                            .find(|task| task.id == id)
+                    });
+                    let mode = self.session_store.session_mode(&session.id);
+                    let requested = self.hooks.run_requested_commands(
+                        &mut outcome,
+                        session,
+                        task.as_ref(),
+                        mode,
+                        repository_root,
+                        &ctx,
+                    );
+                    warnings.extend(
+                        requested
+                            .iter()
+                            .map(|finding| finding.summary().to_string()),
+                    );
+                    findings.extend(requested);
+                }
+                for finding in &findings {
+                    // A patch that applies is not undone by a finding that
+                    // could not be journalled.
+                    let _ = self.session_store.record_finding(&session.id, finding);
+                }
+            }
+            None => {
+                if !outcome.commands.is_empty() {
+                    warnings.push(format!(
+                        "{} requested command(s) were not run: the patch has no session",
+                        outcome.commands.len()
+                    ));
+                    outcome.commands.clear();
+                }
+            }
+        }
+        (outcome, warnings)
     }
 
     /// Proposes a patch from one prompt, in a session of its own.
@@ -401,7 +478,35 @@ impl EditOrchestrator {
             );
         }
 
-        let context = self.context_manager.build_context(
+        // Spec 32 `context.md` §3: the edit flow is a context assembly too, so
+        // a rule like "never put secrets/ into a prompt" holds here. No
+        // approval step exists, so `request_approval` denies (§4).
+        let hook_context = {
+            let ctx = HookContext::root();
+            let parts = self.hooks.envelope_parts(
+                Some(&session),
+                Some(&task.id),
+                serde_json::json!({"flow": "edit", "explicitPaths": explicit_paths}),
+            );
+            let outcome = self.hooks.dispatch(
+                HookEvent::BeforeContext,
+                parts,
+                repository_root.as_ref(),
+                &ctx,
+            );
+            if matches!(outcome.verdict, Verdict::Deny | Verdict::RequestApproval) {
+                return Err(self.record_edit_failure(
+                    &session.id,
+                    &task,
+                    ClientError::PolicyBlocked(hook_refusal(&outcome)),
+                ));
+            }
+            for finding in &outcome.findings {
+                let _ = self.session_store.record_finding(&session.id, finding);
+            }
+            outcome.context
+        };
+        let context = self.context_manager.build_context_with_hooks(
             repository_root.as_ref(),
             &index.repository_id,
             &task.id,
@@ -409,6 +514,7 @@ impl EditOrchestrator {
             Some(&index),
             explicit_paths,
             self.config.context_token_budget(),
+            &hook_context,
         );
         let request = ModelRequest {
             provider: self.config.model_provider.clone(),
@@ -578,6 +684,31 @@ impl EditOrchestrator {
         // proposed from, whose mode can change after the preview appears.
         self.refuse_unless_mode_and_profile_permit_patches(&patch.session_id)?;
         self.refuse_unless_mode_and_profile_permit_patches(&patch.origin_session_id)?;
+        // Spec 32 `context.md` §3: the last hook before anything is written.
+        // It sits after the mode and profile refusals and before the marker
+        // and the snapshot, so a denial opens no marker, takes no checkpoint
+        // and leaves no file touched. A legacy patch with no session still
+        // runs the hooks (§8: they run in every mode and profile) but has no
+        // log to record their findings in.
+        let session = if patch.session_id.is_empty() {
+            None
+        } else {
+            self.session_store.read_session(&patch.session_id)?
+        };
+        let task_id = patch.task_id.as_deref();
+        let (before, hook_warnings) = self.run_patch_hooks(
+            HookEvent::BeforePatchApply,
+            patch_hook_payload(&patch, None),
+            session.as_ref(),
+            task_id,
+            repository_root.as_ref(),
+        );
+        if before.verdict == Verdict::Deny {
+            // A policy block, not a mode refusal: `refusal_message` stays the
+            // mode/profile message, and this one names the hook so a user can
+            // tell the two apart (`context.md` §10).
+            return Err(ClientError::PolicyBlocked(hook_refusal(&before)));
+        }
         // Writing files is the most side-effecting action in the engine, so its
         // marker brackets the write itself rather than a caller. A patch stored
         // before `session_id` existed has no log to name, so it gets no marker —
@@ -605,14 +736,15 @@ impl EditOrchestrator {
         // one is not best-effort: a rewind that silently lost the pre-apply
         // content would be worse than an apply that says it could not snapshot.
         let checkpoint = self.checkpoint_for_patch(&repository_root, &patch, approved_paths)?;
-        let result = match self.patch_engine.apply_patch(
+        let applied = self.patch_engine.apply_patch(
             &repository_root,
             &patch,
             approved_paths,
             hunk_selection,
             approved_by,
             allow_generated_secrets,
-        ) {
+        );
+        let mut result = match applied {
             Ok(result) => result,
             Err(error) => {
                 // A conflict is detected in `prepare_files`, before any file is
@@ -639,6 +771,10 @@ impl EditOrchestrator {
                 .checkpoint_store
                 .seal_checkpoint(&repository_root, &manifest);
         }
+        // The before-event's advice travels on the result, beside the patch
+        // engine's own warnings (`context.md` §10). Nothing here can change
+        // what was written: the apply has already happened.
+        result.hook_warnings = hook_warnings;
         self.audit_log.record(
             "stored_patch_applied",
             &[
@@ -675,6 +811,41 @@ impl EditOrchestrator {
                 )?;
             }
             self.session_store.finish_action(marker, "ok")?;
+        }
+        // Spec 32 `context.md` §3, §4: after the marker is finished, so a
+        // crash during it leaves a finished action. A denial cannot undo the
+        // apply: it is an error finding and a warning, and the user rolls
+        // back through the existing rollback if they agree.
+        let (after, after_warnings) = self.run_patch_hooks(
+            HookEvent::AfterPatchApply,
+            patch_hook_payload(&patch, Some(&result.applied_files)),
+            session.as_ref(),
+            task_id,
+            repository_root.as_ref(),
+        );
+        result.hook_warnings.extend(after_warnings);
+        if after.verdict == Verdict::Deny {
+            let message = hook_refusal(&after);
+            let mut finding = Finding::new(
+                FindingDraft {
+                    source: FindingSource::Hook,
+                    severity: Severity::Error,
+                    summary: message.clone(),
+                    details: Some(
+                        "the patch was already applied; nothing is rolled back".to_string(),
+                    ),
+                    range: None,
+                    code: None,
+                },
+                &self.scanner,
+            );
+            if let Some(hook_id) = &after.deciding_hook {
+                finding = finding.with_origin_ref(format!("hook:{hook_id}"));
+            }
+            if let Some(session) = &session {
+                let _ = self.session_store.record_finding(&session.id, &finding);
+            }
+            result.hook_warnings.push(message);
         }
         Ok(result)
     }
@@ -944,6 +1115,38 @@ fn edit_session_title(prompt: &str) -> String {
     } else {
         title
     }
+}
+
+/// The refusal a hook denial produces: it names the deciding hook and its
+/// reason, so a hook denial is distinguishable from a mode or profile refusal
+/// (`context.md` §10). The reason is looked up by hook id because a later
+/// `deny` outranks an earlier `request_approval`'s reason in `reasons`.
+fn hook_refusal(outcome: &HookOutcome) -> String {
+    let hook_id = outcome.deciding_hook.as_deref().unwrap_or("unknown");
+    match outcome
+        .reasons
+        .iter()
+        .find(|(id, _)| id == hook_id)
+        .map(|(_, reason)| reason.as_str())
+    {
+        Some(reason) => format!("Refused by hook `{hook_id}`: {reason}"),
+        None => format!("Refused by hook `{hook_id}`"),
+    }
+}
+
+/// What a patch event's hooks see (`context.md` §6): paths and statuses, never
+/// file content. `applied` is present only after the apply.
+fn patch_hook_payload(patch: &ProposedPatch, applied: Option<&[String]>) -> serde_json::Value {
+    let files: Vec<serde_json::Value> = patch
+        .files
+        .iter()
+        .map(|file| serde_json::json!({"path": file.path, "status": file.status}))
+        .collect();
+    let mut payload = serde_json::json!({"patchId": patch.id, "files": files});
+    if let Some(applied) = applied {
+        payload["appliedFiles"] = serde_json::json!(applied);
+    }
+    payload
 }
 
 fn serialize_patch(patch: &ProposedPatch) -> String {

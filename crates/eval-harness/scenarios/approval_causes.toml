@@ -1,0 +1,37 @@
+name = "approval_causes"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Inspect the pending changes, then run the helper script"
+
+# Spec 62 §5.5: one run must produce prompts with more than one deciding cause,
+# or a report that groups them cannot be told from one that reports a constant.
+#
+# The first command is the motivating shape (`&&`, `|`), so its cause is
+# `shell_control`. The second is `unknown` *and* refers outside the repository,
+# so its causes are `unknown,outside_repository`: a reader that took the last
+# cause would group it as `outside_repository`, which is the distinction this
+# scenario exists to catch.
+#
+# The approval decision resumes the turn after the first proposal, so both are
+# stored; the turn then stops on the second.
+approval_decision = true
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "cd src && git diff | head -20", reason = "Inspect the pending changes" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "python3 ../script.py", reason = "Run the helper script" } },
+]
+
+[[turn]]
+content = "I need approval for the second command."
+
+[assert]
+approval_required = true
+command_executed = true
+files_changed_outside_patch = 0

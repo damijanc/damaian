@@ -427,7 +427,11 @@
 
     <section class="sg-section">
       <h2>Command approval</h2>
-      <p class="sg-hint">Collapsed left, expanded with a long wrapped command right.</p>
+      <p class="sg-hint">
+        Collapsed left, expanded with a long wrapped command right. The policy's deciding cause and
+        the agent's own reason are outside the disclosure; “Why this command” keeps the full
+        prompt.
+      </p>
       <div class="sg-pair">
         <div>
           <div class="sg-card">
@@ -435,7 +439,11 @@
               <strong>Run command</strong
               ><span class="command-approval-risk" data-blocked="false">review</span>
             </div>
+            <p class="command-approval-cause">
+              Asks first: *Ask before test, build and lint commands* is on (set by default)
+            </p>
             <code class="command-approval-command">cargo test -p damaian-core</code>
+            <p class="command-approval-reason">The agent says: Run the package's tests.</p>
             <p class="command-approval-location">Runs in <code>crates/engine</code></p>
             <div class="command-approval-footer">
               <button type="button" class="disclosure" aria-expanded="false">
@@ -457,7 +465,9 @@
               <strong>Run command</strong
               ><span class="command-approval-risk" data-blocked="false">review</span>
             </div>
+            <p class="command-approval-cause">Asks first: Docker commands always ask</p>
             <code class="command-approval-command">docker run --rm -v "$PWD":/w -w /w --network host -e RUST_LOG=debug rust:1.79 cargo build --release --target x86_64-unknown-linux-musl</code>
+            <p class="command-approval-reason">The agent says: Reproduce the CI build.</p>
             <pre class="command-approval-details">Cross-compiling for musl so the release artifact runs on the CI image.</pre>
             <div class="command-approval-footer">
               <button type="button" class="disclosure" aria-expanded="true">
@@ -476,17 +486,89 @@
     </section>
 
     <section class="sg-section">
+      <h2>Hook review</h2>
+      <p class="sg-hint">
+        A repository-defined hook is a consent surface: the command line is shown in full, its
+        events and fail direction sit outside any disclosure, and <strong>Decline is the default
+        action</strong>. Approve is never filled or pre-selected. Dismissing records neither
+        decision, so the repository is asked about again next time.
+      </p>
+      <div class="app-dialog app-dialog-wide app-dialog-hook-review">
+        <p class="app-dialog-title">This repository defines a hook</p>
+        <p class="app-dialog-message">
+          app ships a hook named "no_migrations". Damaian will run it only after you approve this
+          exact definition. If it changes later, it stops running until you review it again.
+        </p>
+        <p class="hook-review-label">Command</p>
+        <pre class="hook-review-command">/bin/sh ./scripts/no-migrations.sh --strict</pre>
+        <p class="hook-review-meta">Events: before_patch_apply, before_tool · If it fails: blocks</p>
+        <div class="app-dialog-actions">
+          <button type="button" class="app-dialog-btn app-dialog-decline">Decline</button>
+          <button type="button" class="app-dialog-btn app-dialog-approve">Approve</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Question surface</h2>
+      <p class="sg-hint">
+        A question from the model, not an approval request. It shares no chrome with the command
+        card: no header, no risk badge, no footer. Every option is secondary
+        <code>.btn-sm</code> and there is no <code>.btn-primary</code>, because no answer is the
+        safe one. Nothing is focused or pre-selected, and the answer is untrusted text.
+      </p>
+      <div class="sg-pair">
+        <div>
+          <div class="sg-card">
+            <section class="question-card" data-answered="false">
+              <p class="question-card-eyebrow">Question</p>
+              <p class="question-card-question">Did you mean the CLI or the shell?</p>
+              <div class="question-card-options">
+                <button type="button" class="btn-sm">The CLI</button>
+                <button type="button" class="btn-sm">The shell</button>
+              </div>
+              <div class="question-card-free-text">
+                <input type="text" placeholder="Type an answer…" aria-label="Your answer" />
+                <button type="button" class="btn-sm">Send</button>
+              </div>
+            </section>
+          </div>
+          <p class="sg-note">Open — every option has the same weight, so none of them is "yes".</p>
+        </div>
+        <div>
+          <div class="sg-card">
+            <section class="question-card" data-answered="true">
+              <p class="question-card-eyebrow">Question</p>
+              <p class="question-card-question">Did you mean the CLI or the shell?</p>
+              <div class="question-card-options">
+                <button type="button" class="btn-sm" disabled>The CLI</button>
+                <button type="button" class="btn-sm" disabled>The shell</button>
+              </div>
+              <p class="question-card-answer">You answered: The CLI</p>
+            </section>
+          </div>
+          <p class="sg-note">Answered — the reply is shown and the card stops offering choices.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
       <h2>Blocked approval</h2>
       <p class="sg-hint">
         Disabled primary, danger-toned risk pill, and no overflow trigger at all — a blocked
-        proposal cannot be approved through a menu that does not exist.
+        proposal cannot be approved through a menu that does not exist. The cause line says what
+        blocked it.
       </p>
       <div class="sg-card">
         <div class="command-approval-header">
           <strong>Run command</strong
           ><span class="command-approval-risk" data-blocked="true">blocked</span>
         </div>
+        <p class="command-approval-cause">
+          Blocked: matches *Commands that are always blocked* (`rm -rf /`)
+        </p>
         <code class="command-approval-command">rm -rf / --no-preserve-root</code>
+        <p class="command-approval-reason">The agent says: Clean the build directory.</p>
         <div class="command-approval-footer">
           <button type="button" class="disclosure" aria-expanded="false">
             <span class="disclosure-caret" aria-hidden="true"></span> Why this command
