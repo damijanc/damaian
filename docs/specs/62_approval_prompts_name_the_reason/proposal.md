@@ -1,11 +1,14 @@
 # Feature Spec: Approval Prompts Name the Reason
 
-Status: In progress. Tasks 1 (`ApprovalCause` and structured causes) and 2
+Status: Done 2026-10-23 (started 2026-10-18; Tasks 1–7, the last on
+2026-10-23). Tasks 1 (`ApprovalCause` and structured causes) and 2
 (`Setting` and profile-block causes) landed 2026-10-18; Task 3 (prompt and
 model-facing wording) landed 2026-10-23; Task 4 (the card names the cause and
 the model's reason) landed 2026-10-23; Task 5 (recording causes in the proposal
 and audit record) landed 2026-10-23; Task 6 (the eval harness groups prompts by
-first cause) landed 2026-10-23. Specified on 2026-10-17
+first cause) landed 2026-10-23; Task 7 (docs, live re-run and close-out)
+landed 2026-10-23, and its live re-run named every prompt's cause (§6).
+Specified on 2026-10-17
 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#61](../61_continue_the_stopped_turn/proposal.md),
 in which the user answered 40 approval prompts that all gave the same reason,
@@ -263,6 +266,30 @@ cause), and `SECURITY.md` if it describes auto-run commands as sandboxed.
 - Classification results — risk, `requires_approval`, `blocked` — are unchanged
   for every command in the existing policy tests.
 
+### Live re-run (2026-10-23)
+
+The motivating approval was re-run against `deepseek-v4-flash` with native tools
+on, in-process against this worktree, under a `DAMAIAN_DATA_DIR` inside the
+worktree. Four turns each asked for one command. No command was approved, so
+nothing ran and the working tree stayed clean. The first line of each prompt:
+
+| Command proposed | First line shown | Names the real cause? |
+|---|---|---|
+| `ls crates; ls docs` | Asks first: uses `;` — Damaian never runs shell control without asking | Yes. This is the spec 59 case: a `;`-chained read-only `ls` sequence, named as `;` shell control. |
+| `curl -sS https://example.com` | Asks first: may use the network (`curl`) | Yes: the network keyword, not the generic high-risk sentence. |
+| `python3 -c 'print(1)'` | Asks first: Damaian does not know what `python3` does | Yes: the program is named. |
+| `docker ps` | Asks first: Docker commands always ask | Yes: the Docker cause. |
+
+Each card payload carried the same first cause and the model's own stated
+reason (`checking the layout`, `checking the page`, `checking Python`,
+`checking containers`), so the card's two lines match §5.2. The run used a
+temporary in-process `#[ignore]` driver because the CLI cannot observe a pending
+approval without a UI; the driver and its data directory were deleted
+afterwards. Criteria 3, 4, 5, 6, 7 and 8 are covered by the tests recorded in
+[`tasks.md`](tasks.md); this live run exercises criteria 1 and 2.
+
 ## 7. Implementation Notes
 
-None yet.
+The per-task record — including each deliberate deviation, the falsification
+behind every load-bearing test, and the scoped check results — is in
+[`tasks.md`](tasks.md). The live re-run is in §6 above.

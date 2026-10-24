@@ -674,6 +674,10 @@ Useful reads:
   when you expected `patch_proposal_ready`.
 - `command_proposed` carries `risk` and `requiresApproval` — check here before
   assuming the command policy is wrong.
+- `command_proposal_stored` carries `causes`, the approval reasons as variant
+  names in classifier order, comma-joined (`unknown,outside_repository`), with
+  the `command` they explain. This is the field to read when asking why a prompt
+  appeared; it is written when the proposal is stored, before any decision.
 - A `patch_proposed` with no following `patch_applied` means the user never
   approved, or apply failed on a hash conflict.
 - An `edit_model_request_prepared` followed by `edit_failed` is a proposal that
@@ -871,8 +875,8 @@ Known quirks:
 
 ### Findings
 
-A command the assistant runs inside a turn (a sandbox command, or one you
-approved) and every browser diagnostic turn their failures into findings,
+A command the assistant runs inside a turn (one Damaian ran without asking, or
+one you approved) and every browser diagnostic turn their failures into findings,
 which the **Findings** panel shows — except an exploration command (see below).
 A command run from outside a conversation (`/api/run-command` with no session)
 records none.
@@ -1744,9 +1748,44 @@ without asking now ask, and each is deliberate:
   because the shell would run something other than what was checked.
 
 If a command that looks harmless asks, check it against the admitted table in
-the user guide's [Command Approval](USER_GUIDE.md#command-approval); the reason
-under **Why this command** names the argument or the expansion that refused it.
-This is the boundary working, not a regression.
+the user guide's [Command Approval](USER_GUIDE.md#command-approval). The first
+line of the approval card names the deciding cause — for shell control and
+paths it names the construct or path, and for anything else it names the
+keyword, setting or program that refused it. **Why this command** repeats every
+reason the classifier recorded. This is the boundary working, not a regression.
+
+### Reading an approval's cause
+
+Every approval prompt leads with the deciding cause, in plain words, and the
+approval card shows the same line beside the risk badge. The shapes are:
+
+- **Asks first: uses …** — shell control (`&&`, `|`, `;`, `>`, a newline). The
+  prompt names each construct it found.
+- **Asks first: may use the network (…)** — a network keyword such as `curl` or
+  `wget`. This is separate from the generic high-risk reason, so a network
+  command reads as a network command.
+- **Asks first: Docker commands always ask** — every Docker command.
+- **Asks first: `chmod` changes your system or repository** — a high-risk
+  keyword, named. `git commit` reads the same way.
+- **Asks first: Damaian does not know what … does** — a command outside every
+  admitted list and every keyword rule.
+- **Asks first: reads …, which the policy restricts** or **Asks first: refers
+  to …, outside the repository** — the path is named.
+- **Asks first: *Ask before every command* is on (set by user)** — a setting,
+  with the scope that set it: `user`, `repository`, `profile`, `admin` or
+  `default`. The same shape names *Ask before test, build and lint commands*
+  when `require_approval_for_risky_commands` is on.
+- **Blocked: …** — a `command_blocklist` rule, a destructive pattern, or the
+  permission profile's `command_access`. These offer no approval.
+
+**The agent says: …**, when present, is the model's own stated purpose, not the
+policy's reason. **Why this command** keeps the full prompt, including every
+cause when more than one fired.
+
+For a session already logged, `command_proposal_stored` carries `causes`: the
+variant names in classifier order, comma-joined (for example
+`unknown,outside_repository`). That is the field to group or count when asking
+which reasons produce the most prompts.
 
 ### The assistant was refused: the session mode, the permission profile, or the command policy?
 

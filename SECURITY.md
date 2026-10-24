@@ -45,9 +45,11 @@ Patch rollback snapshots and session checkpoints store pre-edit file content unr
 
 Damaian classifies every command before it runs, and the classification, not the model, decides whether you are asked:
 
-- **Runs without asking:** commands Damaian recognises as read-only, such as `pwd`, `ls`, `git status` and `git log` with listed options, and simple pipelines of them filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut` or `grep`. They are not sandboxed; they run in your login shell in the working folder, which is why the admitted set is a closed list of programs and options rather than a heuristic.
+- **Runs without asking:** commands Damaian recognises as read-only, such as `pwd`, `ls`, `git status` and `git log` with listed options, and simple pipelines of them filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut` or `grep`. They run in your login shell in the working folder, which is why the admitted set is a closed list of programs and options rather than a heuristic.
 - **Asks first:** everything else, including anything that writes, installs, reaches the network or uses shell control syntax. `git diff` and `git show` ask too, because they print file contents a command line cannot bound or keep restricted paths out of; the agent's `read_git_diff` tool does both. Every Docker command asks, `docker ps` included, because the daemon is privileged.
 - **Blocked:** commands matching `command_blocklist` or a destructive pattern are refused and cannot be approved from the UI.
+
+An approval's first line names the deciding cause — which shell-control construct, network keyword, path, setting or profile block — rather than a generic sentence, so the prompt can be judged instead of clicked through. The card shows that cause beside the risk badge and keeps every recorded reason in **Why this command**; the model's own stated purpose appears separately as *The agent says: …*. The same causes are recorded on the stored proposal and in the audit log.
 
 The read-only boundary is a tokenizer, not a prefix match. A command runs
 without asking only when a shell tokenizer splits it into words with no
@@ -164,7 +166,7 @@ An exported profile contains only keys a profile may carry, so it never names a 
 
 Two limits are deliberate and documented rather than hidden:
 
-- `command_access=local` means no command Damaian recognises as networked. That is a name heuristic, not a sandbox: a command Damaian does not recognise, such as `python -c` with `urllib`, can still reach the network.
+- `command_access=local` means no command Damaian recognises as networked. That is a name heuristic, not a security boundary: a command Damaian does not recognise, such as `python -c` with `urllib`, can still reach the network.
 - The Offline private profile does not stop model traffic. Prompts and code in context still go to the configured model provider, and `model_base_url` is not something a profile controls. The settings view warns when that address is not loopback.
 
 The same rule covers the other untrusted repository-supplied inputs. `AGENTS.md` instructions cannot widen a working mode or grant capability, and an MCP server descriptor's tool names and descriptions are data, not instructions.

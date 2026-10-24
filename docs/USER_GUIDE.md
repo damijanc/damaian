@@ -652,10 +652,10 @@ Read-only still lets Code mode make and advance a plan (`propose_plan`,
 ### What `local` and Offline private cannot promise
 
 **`local` means no command Damaian recognises as networked.** That is a name
-heuristic, not a sandbox. Damaian recognises `curl`, `wget`, `npm`, `pnpm`,
-`yarn`, `pip`, `docker`, and `git pull`/`push`/`fetch`/`clone`. A command it
-does not recognise, such as `python -c` with `urllib`, can still reach the
-network. Because the check reads the command name, `local` also blocks every
+heuristic, not a security boundary. Damaian recognises `curl`, `wget`, `npm`,
+`pnpm`, `yarn`, `pip`, `docker`, and `git pull`/`push`/`fetch`/`clone`. A
+command it does not recognise, such as `python -c` with `urllib`, can still
+reach the network. Because the check reads the command name, `local` also blocks every
 `npm`, `pnpm` and `yarn` command, `npm test` and `npm run …` included, while
 `cargo test` is allowed.
 
@@ -783,7 +783,7 @@ characters.
 
 ## Command Approval
 
-When the assistant needs a local command result, it asks Damaian to run the command. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, and `git log`, run without asking, in the selected working folder. They are not sandboxed: they run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Simple pipelines made only of such commands, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
+When the assistant needs a local command result, it asks Damaian to run the command. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, and `git log`, run without asking, in the selected working folder. They run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Simple pipelines made only of such commands, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
 
 ### What runs without asking
 
@@ -833,7 +833,7 @@ So `git log --oneline | grep -i fix | wc -l` and
 rm x`, `git log > out.txt` and `ls | xargs cat` do not: `;`, `>` and a filter
 with a file argument are outside the admitted shape.
 
-Every other command appears as an approval card in the conversation. Review the command, risk, and working directory (the reason is under **Why this command**), then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
+Every other command appears as an approval card in the conversation. Its first line names why Damaian is asking — which shell-control characters, network keyword, restricted path, or setting — and the same reason appears on the card beside the risk badge. **Why this command** holds the full prompt with every reason, and, when the agent gave one, **The agent says: …** is the agent's own stated purpose for the command. Review the command, risk, working directory and both reasons, then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
 
 Docker commands, including `docker ps`, `docker compose ...`, and `docker-compose ...`, always ask for approval. They can inspect or change a privileged local daemon, use the network, start background services, mount host paths, expose ports, and mutate images or volumes, so Damaian never treats them as read-only.
 
@@ -1349,7 +1349,7 @@ Damaian keeps the local app in control of important effects:
 - The model does not read files directly.
 - The model does not write files directly.
 - File edits are previewed before application.
-- Assistant commands run without approval only when Damaian classifies them as read-only. They are not sandboxed.
+- Assistant commands run without approval only when Damaian classifies them as read-only; they run directly on your machine.
 - Every other command requires your approval before it runs, unless you [allowed that exact command always](#allow-always) for that repository.
 - Restricted files and detected secrets are redacted or blocked by policy.
 - A [permission profile](#permission-profiles) per repository can narrow all of this further, and never widen it.
