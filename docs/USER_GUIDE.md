@@ -451,6 +451,13 @@ patterns, the read and search caps, and secret redaction. Git reads in a
 worktree or the main checkout exclude restricted paths and are bounded the same
 way.
 
+A session whose own checkout is a linked worktree — a worker, or a development
+worktree — can reach only that worktree by default: the main checkout and its
+siblings count as outside it. `list_worktrees` then shows 0 even though
+`git worktree list` shows the repository's worktrees, because it lists only
+reachable ones. Add the main checkout to `allowed_roots`, or run the tool from
+the main checkout, to survey them.
+
 When one model message asks for several read-only tools, they run together and
 their results are reported in the order the model asked for them.
 

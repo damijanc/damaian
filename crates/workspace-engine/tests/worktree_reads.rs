@@ -1219,6 +1219,47 @@ fn list_worktrees_reports_path_branch_head_changed_count_and_ahead_behind() {
 }
 
 #[test]
+fn from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots() {
+    // Spec 60 §5.1 / C1, pinned as a limitation: the containment root is the
+    // session's own checkout, not the repository's main worktree. A session in
+    // a linked worktree therefore lists nothing, and the result does not name
+    // the refusals; `git worktree list` still shows every registration.
+    let fixture = fixture("list-from-linked");
+    let session_root = fixture.worktree("a");
+    let listing = fixture.git.list_worktrees(&session_root, None).unwrap();
+    assert_eq!(listing.base.as_deref(), Some("main"));
+    assert_eq!(listing.entries.len(), 0, "{listing:?}");
+    assert_eq!(listing.omitted, 0, "{listing:?}");
+
+    // The documented remedy: allow the main repository, and the main checkout
+    // and the sibling become reachable from the linked session. The session's
+    // own checkout stays excluded.
+    let scanner = SecretScanner::new(Vec::new());
+    let allowed_git = GitService::new(
+        AuditLog::new(fixture.root.join("data-allowed"), true, scanner.clone()),
+        scanner,
+        policy_allowing(&fixture.repo),
+        GitReadCaps::from_config(&Config::default()),
+    );
+    let listing = allowed_git.list_worktrees(&session_root, None).unwrap();
+    assert_eq!(listing.entries.len(), 2, "{listing:?}");
+    let main = fs::canonicalize(&fixture.repo).unwrap();
+    let paths: Vec<String> = listing
+        .entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    assert!(
+        paths.contains(&main.to_string_lossy().to_string()),
+        "{listing:?}"
+    );
+    assert!(
+        paths.contains(&fixture.worktree("b").to_string_lossy().to_string()),
+        "{listing:?}"
+    );
+}
+
+#[test]
 fn list_worktrees_omits_ahead_behind_when_the_main_worktree_is_detached() {
     let fixture = fixture("list-detached");
     fixture.run(&["checkout", "--quiet", "--detach"]);

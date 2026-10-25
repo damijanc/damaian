@@ -155,6 +155,25 @@ A worktree is **reachable** when all of these hold:
   canonical `allowed_roots` entry (requirement 6);
 - `PathPolicy::canonical_root` accepts it.
 
+**Consequence for a linked-worktree session.** The containment test uses the
+session's own canonical root. A session whose root is a linked worktree — a
+spec 57 worker, or a development worktree — therefore sees its own entry as the
+own checkout and every other entry, including the main checkout and its
+siblings, as outside that root. With the default empty `allowed_roots` the
+reachable set is empty, and `list_worktrees` prints
+`Worktrees (0 listed, ahead/behind vs <base>):`. It lists only reachable
+entries, so it does not name the refusals; a model reading that result alone can
+conclude no worktree is registered. `git worktree list` and the
+`git_worktrees_listed` audit record (`count: 0`, `resourcePath` = the session's
+root) show what is actually registered. To survey the repository from such a
+session, add the main checkout to `allowed_roots` or run the tool from the main
+checkout. This is deliberate (`tasks.md` C1): the location rule exists so a
+session is not silently given another checkout, and the containment root is the
+checkout the user opened, not the repository's main worktree. The pinned
+behavior is
+`from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots`
+(`tests/worktree_reads.rs`).
+
 A `worktree` argument is resolved by canonicalizing it — as given, absolute or
 relative to the repository root — and comparing it with the canonical paths of
 the reachable set. Only an exact match is accepted. Everything else is refused
@@ -308,7 +327,10 @@ and why: not registered, outside the allowed roots, or prunable), and
 
 - `list_worktrees` on this repository lists every worktree `git worktree list`
   shows inside the repository root, except the main one, with branch, `HEAD`,
-  dirty count and ahead/behind against the main worktree's branch.
+  dirty count and ahead/behind against the main worktree's branch. From a
+  session whose own checkout is a linked worktree it lists nothing unless
+  `allowed_roots` contains the main checkout; that limitation is recorded in
+  §5.1 and pinned by `from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots`.
 - Each of the five existing read tools, given `worktree`, reads that worktree;
   without it, its output is byte-identical to before on the existing
   deterministic scenarios.
@@ -382,3 +404,17 @@ and why: not registered, outside the allowed roots, or prunable), and
   turn after an approval, which is why the full run went through the desktop
   shell. That approval's text still blamed "sandbox mode", which is
   [#62](../62_approval_prompts_name_the_reason/proposal.md)'s defect.
+- **Documented limitation, 2026-10-25.** A session rooted in a linked worktree
+  (a spec 57 worker, or a development worktree) has that worktree as its
+  containment root, so with the default empty `allowed_roots` every other entry
+  — the main checkout and its siblings — is outside it and `list_worktrees`
+  returns 0. The result lists only reachable entries and does not name the
+  refusals, so a model can read it as "no worktrees are registered"; `git
+  worktree list` and the `git_worktrees_listed` audit record (`count: 0`,
+  `resourcePath` = the session's root) show the truth. The remedy is to add the
+  main checkout to `allowed_roots` or run the tool from the main checkout.
+  Observed in the spec 65 live run, whose session root was this repository's
+  spec 65 worktree. Pinned by
+  `from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots`.
+  Deliberate under `tasks.md` C1; using the main worktree as the containment
+  root would be a design change, not a bug fix.
