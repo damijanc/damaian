@@ -121,6 +121,13 @@ map, including the call sites this section only names.
   (`file_access.rs:16`, `usize` start/end, 1-based inclusive), re-exported at
   `lib.rs:103` and taken by `ReadWindow::Range`. §5.1 reuses it rather than
   defining a second range type.
+- **No collection source can name a line range yet** (checked 2026-10-25 for
+  Task 3). `indexer::SearchResult` (`indexer.rs:49-56`) carries the path and a
+  snippet but drops the chunk offsets it was derived from, and
+  `symbol_index::Symbol` (`symbol_index.rs:85-99`) carries one starting line and
+  is collected as one rendered block, not as file ranges. Every `add_file` call
+  therefore asks for the whole file. §5.4's merge is implemented ahead of its
+  first producer and is unit-tested; the note in §5.4 records the seam.
 - **`ContextManager` holds no `PathPolicy` and no `AuditLog`**
   (`context_manager.rs:43-51`). The policy is inside `FileAccessController`
   (private) and in `SymbolSource`; every read currently goes through
@@ -400,13 +407,22 @@ Requirement 2, applied after collection and before budgeting:
 A whole-file item (`range: None`) absorbs every range for that path: if the whole
 file is included, a range within it is redundant. This is the case most likely to
 be missed, because the two come from different collection paths — a prompt
-mention producing the whole file and a search hit producing a range — and today
-it is the *only* case that exists, since there are no ranges.
+mention producing the whole file and a search hit producing a range.
 
 Merging preserves the highest-priority `provenance` among the merged items
 (`Provenance::LanguageServer` sorts before `Heuristic`), so a range that came
 partly from a language-server symbol is not downgraded by being merged with a
 heuristic one.
+
+**Producers today: none** (checked 2026-10-25). No collection source yields a
+`LineRange`: `indexer::SearchResult` has a path and a snippet, and
+`symbol_index::Symbol` has one starting line and is collected as a block (§2).
+Task 3 therefore implements the rules as `merge_file_ranges` plus
+`flush_file_ranges`, with every `add_file` caller passing `range: None`; the
+whole-file absorption has no producer either. The merge is covered by unit tests
+of the function, and `no_collection_source_yields_a_line_range_yet`
+(`tests/context_assembly.rs`) fails the day a source starts producing ranges, at
+which point the merge must be covered through `build_context` as well.
 
 **The re-read is a new `ReadWindow` variant.** `ReadWindow::Range` clamps to
 `max_read_lines` (400 today) at `file_access.rs:184-189`, deliberately, so a
@@ -741,3 +757,20 @@ To be completed during implementation. Record:
   §5.6 — that is where a future bypass would appear.
 - How much of the deterministic eval tier's context each category used, so the
   defaults are read against a fixture rather than guessed.
+
+**Range gutter: `GUTTER = 2` (Task 3, 2026-10-25).** The rule is
+`next.start <= current.end + 1 + GUTTER`, so ranges 10–20 and 23–30 merge
+(two lines, 21–22, between them) and ranges 10–20 and 29–35 do not (eight
+lines between them). Two is the proposal's original value and was kept: hits in
+one function are separated by a blank line, a closing brace or a single
+statement, while an eight-line gap is a different region whose intervening lines
+are mostly unrelated to the match and would be paid for in tokens. What this
+value could not be calibrated against: no collection source produces a
+`LineRange` today (§2, §5.4), search hits are whole-file, and instruction files
+are collected whole, so there were no real search-hit clusters or instruction
+ranges to measure. The boundary is therefore pinned by
+`ranges_two_lines_apart_merge_and_ranges_eight_apart_do_not`, and the answer to
+"did one gutter cover both clusters and instruction ranges" is **not yet
+answerable**: the first real range producer has to re-check it. If ranges later
+arrive from findings (§5.3's `FileRanges` third tier) or from pinned selections,
+revisit the value with that producer's data rather than changing it silently.

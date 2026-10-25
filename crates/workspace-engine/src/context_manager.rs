@@ -159,6 +159,10 @@ pub enum CollectionSource {
 #[serde(rename_all = "snake_case")]
 pub enum ExclusionReason {
     RestrictedPath,
+    /// A range read as part of another range, or absorbed by a whole-file item
+    /// for the same path (proposal §5.4). The record names the range that did
+    /// not become its own item.
+    DeduplicatedIntoRange,
 }
 
 /// One item that did not enter the plan, with the reason. Never content.
@@ -322,6 +326,196 @@ pub struct ContextRequest<'a> {
     pub plan: Option<&'a TaskPlan>,
 }
 
+/// A gap of at most this many lines still merges two ranges (proposal §5.4).
+///
+/// Two hits in one function can be separated by a blank line or a closing
+/// brace, and reading them as one range is cheaper than two headers for the
+/// same neighbourhood. Eight lines apart is a different region; §7 records the
+/// evidence behind the value.
+const RANGE_GUTTER: usize = 2;
+
+/// One file a collection source asked for, before dedup and merge.
+///
+/// The assembler's own type rather than `SearchResult`: a source that can name
+/// a line range passes it here, and every source that cannot passes `None` for
+/// the whole file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileCandidate {
+    path: String,
+    /// `None` is the whole file. Spec 26 produces no ranges yet — every source
+    /// is whole-file — so the merge below is exercised by its unit tests until
+    /// a source supplies one.
+    range: Option<LineRange>,
+    kind: ContextKind,
+    provenance: Option<Provenance>,
+    allow_outside_root: bool,
+}
+
+/// One read the assembler will make: a merged range, or a whole file when a
+/// candidate asked for one (or a whole-file item already absorbed the ranges).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergedFile {
+    path: String,
+    range: Option<LineRange>,
+    kind: ContextKind,
+    provenance: Option<Provenance>,
+    allow_outside_root: bool,
+}
+
+/// Group by path, absorb ranges under a whole-file item, and merge overlapping
+/// or near ranges with [`RANGE_GUTTER`].
+///
+/// Paths keep their first-seen order and ranges are sorted by start, so the
+/// output does not depend on hash iteration or input order beyond the first
+/// appearance of a path. `whole_files` is every path already included whole by
+/// an earlier collection stage; those absorb their ranges, because the whole
+/// file already contains them. Every range that did not become its own item is
+/// recorded as [`ExclusionReason::DeduplicatedIntoRange`].
+fn merge_file_ranges(
+    candidates: &[FileCandidate],
+    whole_files: &[String],
+) -> (Vec<MergedFile>, Vec<ExclusionRecord>) {
+    let mut groups: Vec<(&str, Vec<&FileCandidate>)> = Vec::new();
+    for candidate in candidates {
+        if let Some((_, group)) = groups
+            .iter_mut()
+            .find(|(path, _)| *path == candidate.path.as_str())
+        {
+            group.push(candidate);
+        } else {
+            groups.push((candidate.path.as_str(), vec![candidate]));
+        }
+    }
+
+    let mut merged = Vec::new();
+    let mut excluded = Vec::new();
+
+    for (path, group) in groups {
+        let included_whole = whole_files.iter().any(|included| included == path);
+        let whole = group
+            .iter()
+            .copied()
+            .find(|candidate| candidate.range.is_none());
+
+        // Whole-file absorption: a range within an included whole file is
+        // redundant. This is the cross-source case (§5.4): a prompt mention
+        // collects the whole file and a search hit collects a range.
+        if included_whole || whole.is_some() {
+            for candidate in &group {
+                if let Some(range) = candidate.range {
+                    excluded.push(range_exclusion(
+                        path,
+                        range,
+                        candidate.kind,
+                        "absorbed into the whole-file item",
+                    ));
+                }
+            }
+            if let Some(whole) = whole {
+                merged.push(MergedFile {
+                    path: path.to_string(),
+                    range: None,
+                    kind: whole.kind,
+                    provenance: best_provenance(&group),
+                    allow_outside_root: whole.allow_outside_root,
+                });
+            }
+            continue;
+        }
+
+        let mut ranges = group;
+        // A total order, not just by start: two ranges with the same start are
+        // still deterministic, so a prompt cannot depend on candidate order.
+        ranges.sort_by_key(|candidate| {
+            candidate
+                .range
+                .map(|range| (range.start, range.end))
+                .unwrap_or((usize::MAX, usize::MAX))
+        });
+
+        let mut index = 0;
+        while index < ranges.len() {
+            let Some(first_range) = ranges[index].range else {
+                index += 1;
+                continue;
+            };
+            let start = first_range.start;
+            let mut end = first_range.end;
+            let mut members = vec![ranges[index]];
+            let mut next = index + 1;
+            while next < ranges.len() {
+                let Some(following) = ranges[next].range else {
+                    break;
+                };
+                // `next.start <= current.end + 1 + GUTTER` (proposal §5.4).
+                if following.start > end.saturating_add(1).saturating_add(RANGE_GUTTER) {
+                    break;
+                }
+                end = end.max(following.end);
+                members.push(ranges[next]);
+                next += 1;
+            }
+
+            let merged_range = LineRange { start, end };
+            let first = members[0];
+            merged.push(MergedFile {
+                path: path.to_string(),
+                range: Some(merged_range),
+                kind: first.kind,
+                provenance: best_provenance(&members),
+                allow_outside_root: first.allow_outside_root,
+            });
+
+            // One member that is exactly the merged range is the item itself;
+            // every other member was read as part of it and is recorded.
+            let mut kept = false;
+            for member in members {
+                let Some(member_range) = member.range else {
+                    continue;
+                };
+                if !kept && member_range == merged_range {
+                    kept = true;
+                    continue;
+                }
+                excluded.push(range_exclusion(
+                    path,
+                    member_range,
+                    member.kind,
+                    &format!("merged into {}-{}", merged_range.start, merged_range.end),
+                ));
+            }
+            index = next;
+        }
+    }
+
+    (merged, excluded)
+}
+
+/// The most authoritative provenance among the parts: `LanguageServer` sorts
+/// before `Heuristic`, so the best is the minimum, unlike the symbols block's
+/// "weakest shown".
+fn best_provenance(candidates: &[&FileCandidate]) -> Option<Provenance> {
+    candidates
+        .iter()
+        .filter_map(|candidate| candidate.provenance)
+        .min()
+}
+
+fn range_exclusion(
+    path: &str,
+    range: LineRange,
+    kind: ContextKind,
+    detail: &str,
+) -> ExclusionRecord {
+    ExclusionRecord {
+        reason: ExclusionReason::DeduplicatedIntoRange,
+        path: Some(path.to_string()),
+        range: Some(range),
+        category: kind.category(),
+        detail: Some(detail.to_string()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ContextManager {
     file_access: FileAccessController,
@@ -429,6 +623,11 @@ impl ContextManager {
         let mut items = Vec::new();
         let mut files = Vec::new();
         let mut excluded = Vec::new();
+        // Ranged candidates are read once, after collection, so ranges for one
+        // path can be merged and absorbed (proposal §5.4). Whole-file items are
+        // still read where they are collected, which is what keeps the prompt's
+        // item order unchanged.
+        let mut range_candidates = Vec::new();
         let mut token_estimate = 0;
 
         add_text(
@@ -437,6 +636,7 @@ impl ContextManager {
             &mut token_estimate,
             limit,
             ContextKind::UserPrompt,
+            None,
             None,
             None,
             prompt,
@@ -491,11 +691,14 @@ impl ContextManager {
                 repository_id,
                 task_id,
                 path.as_str(),
+                None,
+                None,
                 source,
                 ContextKind::ExplicitFile,
                 &mut files,
                 &mut items,
                 &mut excluded,
+                &mut range_candidates,
                 &mut token_estimate,
                 limit,
                 requested,
@@ -508,11 +711,14 @@ impl ContextManager {
                 repository_id,
                 task_id,
                 &instruction_path,
+                None,
+                None,
                 CollectionSource::Instruction,
                 ContextKind::AgentInstruction,
                 &mut files,
                 &mut items,
                 &mut excluded,
+                &mut range_candidates,
                 &mut token_estimate,
                 limit,
                 false,
@@ -525,11 +731,14 @@ impl ContextManager {
                 repository_id,
                 task_id,
                 rule_path,
+                None,
+                None,
                 CollectionSource::ProjectRule,
                 ContextKind::ProjectRule,
                 &mut files,
                 &mut items,
                 &mut excluded,
+                &mut range_candidates,
                 &mut token_estimate,
                 limit,
                 false,
@@ -548,6 +757,7 @@ impl ContextManager {
                 ContextKind::RepositoryMap,
                 None,
                 None,
+                None,
                 &text,
             );
         }
@@ -564,6 +774,7 @@ impl ContextManager {
                 &mut token_estimate,
                 limit,
                 ContextKind::Symbols,
+                None,
                 None,
                 provenance,
                 &text,
@@ -584,6 +795,7 @@ impl ContextManager {
                 ContextKind::HookContext,
                 Some(format!("hook:{hook_id}")),
                 None,
+                None,
                 text,
             );
         }
@@ -600,6 +812,7 @@ impl ContextManager {
                 ContextKind::PlanState,
                 None,
                 None,
+                None,
                 &text,
             );
         }
@@ -614,17 +827,35 @@ impl ContextManager {
                     repository_id,
                     task_id,
                     &hit.path,
+                    None,
+                    None,
                     source,
                     ContextKind::RetrievedFile,
                     &mut files,
                     &mut items,
                     &mut excluded,
+                    &mut range_candidates,
                     &mut token_estimate,
                     limit,
                     false,
                 );
             }
         }
+
+        // After collection, so ranges for one path can merge and a whole-file
+        // item from an earlier stage can absorb them. No production source asks
+        // for a range yet (see `FileCandidate`), so this is a no-op today.
+        self.flush_file_ranges(
+            repository_root,
+            repository_id,
+            task_id,
+            &range_candidates,
+            &mut files,
+            &mut items,
+            &mut excluded,
+            &mut token_estimate,
+            limit,
+        );
 
         ContextPlan {
             repository_id: repository_id.to_string(),
@@ -707,16 +938,22 @@ impl ContextManager {
         repository_id: &str,
         task_id: &str,
         path: &str,
+        range: Option<LineRange>,
+        provenance: Option<Provenance>,
         source: CollectionSource,
         kind: ContextKind,
         files: &mut Vec<String>,
         items: &mut Vec<ContextItem>,
         excluded: &mut Vec<ExclusionRecord>,
+        range_candidates: &mut Vec<FileCandidate>,
         token_estimate: &mut usize,
         token_budget: usize,
         allow_outside_root: bool,
     ) {
-        if files.iter().any(|existing| existing == path) {
+        // Whole files are deduplicated here, as they always were. A range for
+        // a path already included whole is kept as a candidate so the merge can
+        // record it as absorbed rather than silently dropped (§5.4).
+        if range.is_none() && files.iter().any(|existing| existing == path) {
             return;
         }
         // The collection-time check, before the file is opened (proposal §5.6).
@@ -729,16 +966,28 @@ impl ContextManager {
                 ExclusionRecord {
                     reason,
                     path: Some(path.to_string()),
-                    range: None,
+                    range,
                     category: kind.category(),
                     detail: None,
                 },
             );
             return;
         }
+
+        if let Some(range) = range {
+            range_candidates.push(FileCandidate {
+                path: path.to_string(),
+                range: Some(range),
+                kind,
+                provenance,
+                allow_outside_root,
+            });
+            return;
+        }
+
         // `Whole`, not the tool's bounded window: this function has its own
         // `token_budget` and `add_text` decides what fits. Capping here would
-        // silently shrink what every task sees. Spec 26 owns the ranged version.
+        // silently shrink what every task sees.
         let Ok(file) = self.file_access.read_file(
             repository_root,
             path,
@@ -758,21 +1007,92 @@ impl ContextManager {
             kind,
             Some(file.path.clone()),
             None,
+            provenance,
             &file.content,
         );
         if added {
             files.push(file.path);
         }
     }
+
+    /// Read each merged range once, as one item (proposal §5.4).
+    ///
+    /// Ranges use [`crate::file_access::ReadWindow::ContextRange`]: no line
+    /// cap, because assembly's own token budget is the bound and a merge cut at
+    /// the tool's 400 lines would be silently wrong. Path policy, the byte cap
+    /// and redaction are `read_file`'s and are not reimplemented here.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_file_ranges(
+        &self,
+        repository_root: &Path,
+        repository_id: &str,
+        task_id: &str,
+        range_candidates: &[FileCandidate],
+        files: &mut Vec<String>,
+        items: &mut Vec<ContextItem>,
+        excluded: &mut Vec<ExclusionRecord>,
+        token_estimate: &mut usize,
+        token_budget: usize,
+    ) {
+        if range_candidates.is_empty() {
+            return;
+        }
+        let whole_files = files.clone();
+        let (merged, absorbed) = merge_file_ranges(range_candidates, &whole_files);
+        for record in absorbed {
+            push_exclusion(excluded, record);
+        }
+
+        for file in merged {
+            let window = match file.range {
+                Some(range) => crate::file_access::ReadWindow::ContextRange(range),
+                None => crate::file_access::ReadWindow::Whole,
+            };
+            let Ok(read) = self.file_access.read_file(
+                repository_root,
+                &file.path,
+                Some(task_id),
+                Some(repository_id),
+                false,
+                file.allow_outside_root,
+                window,
+            ) else {
+                // The collection-time check already refused restricted paths;
+                // a read failure here is an ordinary missing or unreadable file
+                // and the turn proceeds without it, as for a whole file.
+                continue;
+            };
+            // The header names what was actually read, so a range clamped to the
+            // file's length cannot claim lines that do not exist.
+            let added = add_text(
+                &self.scanner,
+                items,
+                token_estimate,
+                token_budget,
+                file.kind,
+                Some(read.path.clone()),
+                file.range.map(|_| read.line_range),
+                file.provenance,
+                &read.content,
+            );
+            if added && !files.iter().any(|existing| existing == &file.path) {
+                files.push(read.path);
+            }
+        }
+    }
 }
 
-/// Record an exclusion once per `(reason, path)`. The same restricted path can
-/// be reached by more than one source — a prompt mention is also a keyword hit
-/// — and the manifest wants the fact, not a copy per route.
+/// Record an exclusion once per `(reason, path, range)`. The same restricted
+/// path can be reached by more than one source — a prompt mention is also a
+/// keyword hit — and the manifest wants the fact, not a copy per route. The
+/// range is part of the key because two different ranges for one path are two
+/// facts (proposal §5.4 records every absorbed range).
 fn push_exclusion(excluded: &mut Vec<ExclusionRecord>, record: ExclusionRecord) {
-    let duplicate = excluded
-        .iter()
-        .any(|existing| existing.reason == record.reason && existing.path == record.path);
+    let duplicate = excluded.iter().any(|existing| {
+        existing.reason == record.reason
+            && existing.path == record.path
+            && existing.range == record.range
+    });
     if !duplicate {
         excluded.push(record);
     }
@@ -816,6 +1136,7 @@ fn add_text(
     token_budget: usize,
     kind: ContextKind,
     path: Option<String>,
+    range: Option<LineRange>,
     provenance: Option<Provenance>,
     content: &str,
 ) -> bool {
@@ -838,7 +1159,7 @@ fn add_text(
         category: kind.category(),
         kind,
         path,
-        range: None,
+        range,
         content: redaction.text,
         tokens,
         redaction_status: if redaction.findings.is_empty() {
@@ -1015,6 +1336,177 @@ mod tests {
                 format!("\"{spelling}\"")
             );
         }
+    }
+
+    fn candidate(
+        path: &str,
+        range: Option<(usize, usize)>,
+        provenance: Option<Provenance>,
+    ) -> FileCandidate {
+        FileCandidate {
+            path: path.to_string(),
+            range: range.map(|(start, end)| LineRange { start, end }),
+            kind: ContextKind::RetrievedFile,
+            provenance,
+            allow_outside_root: false,
+        }
+    }
+
+    #[test]
+    fn two_search_hits_in_one_function_send_one_merged_range() {
+        let merged = merge_file_ranges(
+            &[
+                candidate("src/lib.rs", Some((12, 20)), Some(Provenance::Heuristic)),
+                candidate("src/lib.rs", Some((22, 30)), Some(Provenance::Heuristic)),
+            ],
+            &[],
+        );
+
+        assert_eq!(merged.0.len(), 1, "{:?}", merged.0);
+        assert_eq!(merged.0[0].range, Some(LineRange { start: 12, end: 30 }));
+        assert_eq!(
+            merged
+                .1
+                .iter()
+                .map(|record| record.range)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(LineRange { start: 12, end: 20 }),
+                Some(LineRange { start: 22, end: 30 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn ranges_two_lines_apart_merge_and_ranges_eight_apart_do_not() {
+        // Lines 21 and 22 sit between the first pair: `23 <= 20 + 1 + 2`.
+        let (near, _) = merge_file_ranges(
+            &[
+                candidate("src/lib.rs", Some((10, 20)), None),
+                candidate("src/lib.rs", Some((23, 30)), None),
+            ],
+            &[],
+        );
+        assert_eq!(near.len(), 1, "{near:?}");
+        assert_eq!(near[0].range, Some(LineRange { start: 10, end: 30 }));
+
+        // Eight lines between them: `29 > 20 + 1 + 2`, so two reads.
+        let (far, records) = merge_file_ranges(
+            &[
+                candidate("src/lib.rs", Some((10, 20)), None),
+                candidate("src/lib.rs", Some((29, 35)), None),
+            ],
+            &[],
+        );
+        assert_eq!(
+            far.iter().map(|file| file.range).collect::<Vec<_>>(),
+            vec![
+                Some(LineRange { start: 10, end: 20 }),
+                Some(LineRange { start: 29, end: 35 })
+            ]
+        );
+        // Nothing was deduplicated: both ranges are read as they were asked for.
+        assert!(records.is_empty(), "{records:?}");
+    }
+
+    #[test]
+    fn a_whole_file_item_absorbs_every_range_for_its_path() {
+        let (merged, records) = merge_file_ranges(
+            &[
+                candidate("src/lib.rs", None, None),
+                candidate("src/lib.rs", Some((10, 20)), Some(Provenance::Heuristic)),
+                candidate("src/lib.rs", Some((30, 40)), Some(Provenance::Heuristic)),
+            ],
+            &[],
+        );
+
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].range, None);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.reason, record.range))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ExclusionReason::DeduplicatedIntoRange,
+                    Some(LineRange { start: 10, end: 20 })
+                ),
+                (
+                    ExclusionReason::DeduplicatedIntoRange,
+                    Some(LineRange { start: 30, end: 40 })
+                ),
+            ]
+        );
+
+        // The production shape: the whole file was already included by an
+        // earlier collection stage, so only the range is a candidate here.
+        let (merged, records) = merge_file_ranges(
+            &[candidate("src/lib.rs", Some((10, 20)), None)],
+            &["src/lib.rs".to_string()],
+        );
+        assert!(merged.is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(records[0].range, Some(LineRange { start: 10, end: 20 }));
+    }
+
+    #[test]
+    fn merging_keeps_the_language_server_provenance() {
+        let (merged, _) = merge_file_ranges(
+            &[
+                candidate(
+                    "src/lib.rs",
+                    Some((10, 20)),
+                    Some(Provenance::LanguageServer),
+                ),
+                candidate("src/lib.rs", Some((22, 30)), Some(Provenance::Heuristic)),
+            ],
+            &[],
+        );
+
+        assert_eq!(merged.len(), 1);
+        // `LanguageServer` sorts before `Heuristic`, so the best of the parts
+        // is the minimum, not the maximum the symbols block uses.
+        assert_eq!(merged[0].provenance, Some(Provenance::LanguageServer));
+    }
+
+    #[test]
+    fn every_absorbed_or_merged_range_is_recorded() {
+        let (merged, records) = merge_file_ranges(
+            &[
+                candidate("src/lib.rs", Some((10, 20)), None),
+                candidate("src/lib.rs", Some((15, 25)), None),
+                candidate("src/lib.rs", Some((40, 50)), None),
+            ],
+            &[],
+        );
+
+        assert_eq!(
+            merged.iter().map(|file| file.range).collect::<Vec<_>>(),
+            vec![
+                Some(LineRange { start: 10, end: 25 }),
+                Some(LineRange { start: 40, end: 50 })
+            ]
+        );
+        // The two parts of the first merge each produced a different range, so
+        // both are recorded; the second was read exactly as asked and is not an
+        // exclusion.
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.range)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(LineRange { start: 10, end: 20 }),
+                Some(LineRange { start: 15, end: 25 }),
+            ]
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.reason == ExclusionReason::DeduplicatedIntoRange)
+        );
     }
 
     #[test]

@@ -248,6 +248,136 @@ fn a_few_enormous_lines_are_cut_by_bytes_and_say_so() {
 }
 
 // ---------------------------------------------------------------------------
+// Spec 26 Task 3 · the assembler's merged range (Correction C5)
+// ---------------------------------------------------------------------------
+
+/// A merged context range is not a model range: assembly applies its own token
+/// budget, so the tool's `max_read_lines` cap must not silently cut a merge at
+/// 400 lines. The same fixture through `Range` truncates, which is what makes
+/// this a guard on the new variant rather than on ranges in general.
+#[test]
+fn a_merged_range_longer_than_the_tool_read_cap_is_read_in_full() {
+    let repo = temp_dir("context-range");
+    write_fixture(&repo, "big.rs", &numbered_lines(1000));
+    let config = Config {
+        max_read_lines: 400,
+        ..test_config(&repo)
+    };
+    let access = file_access_for(&repo, &config);
+
+    let read = access
+        .read_file(
+            &repo,
+            "big.rs",
+            None,
+            None,
+            false,
+            false,
+            ReadWindow::ContextRange(LineRange {
+                start: 100,
+                end: 699,
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(
+        read.line_range,
+        LineRange {
+            start: 100,
+            end: 699
+        }
+    );
+    assert_eq!(read.total_lines, 1000);
+    assert_eq!(read.truncated_by, None);
+    assert!(read.content.starts_with("line 100\n"));
+    assert!(read.content.trim_end().ends_with("line 699"));
+    assert!(!read.content.contains("line 700"));
+
+    // The tool-facing window on the same range is what the assembler must not
+    // inherit: it still stops at the cap.
+    let tool = access
+        .read_file(
+            &repo,
+            "big.rs",
+            None,
+            None,
+            false,
+            false,
+            ReadWindow::Range(LineRange {
+                start: 100,
+                end: 699,
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        tool.line_range,
+        LineRange {
+            start: 100,
+            end: 499
+        }
+    );
+    assert_eq!(tool.truncated_by, Some("lines".to_string()));
+}
+
+/// The new variant keeps `read_file`'s path policy. A context range is a
+/// caller-side decision, not an escape from the restriction on the file.
+#[test]
+fn a_context_range_read_still_refuses_a_restricted_path() {
+    let repo = temp_dir("context-range-restricted");
+    write_fixture(&repo, ".env", "API_KEY=sk_live_0123456789abcdef\n");
+    let config = test_config(&repo);
+    let access = file_access_for(&repo, &config);
+
+    let error = access
+        .read_file(
+            &repo,
+            ".env",
+            None,
+            None,
+            false,
+            false,
+            ReadWindow::ContextRange(LineRange { start: 1, end: 1 }),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::AccessDenied(_)),
+        "got {error:?}"
+    );
+}
+
+/// Redaction happens on the selected range inside `read_file`, not by slicing
+/// text that was read some other way, so a context range cannot send a secret
+/// merely because it did not go through the tool's window.
+#[test]
+fn a_context_range_read_still_redacts() {
+    let repo = temp_dir("context-range-redacted");
+    write_fixture(&repo, "notes.txt", "before\nAKIAIOSFODNN7EXAMPLE\nafter\n");
+    let config = test_config(&repo);
+    let access = file_access_for(&repo, &config);
+
+    let read = access
+        .read_file(
+            &repo,
+            "notes.txt",
+            None,
+            None,
+            false,
+            false,
+            ReadWindow::ContextRange(LineRange { start: 1, end: 3 }),
+        )
+        .unwrap();
+
+    assert!(!read.content.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(
+        read.content.contains("[REDACTED_AWS_ACCESS_KEY_"),
+        "content was {:?}",
+        read.content
+    );
+    assert_eq!(read.redaction_status, "redacted");
+}
+
+// ---------------------------------------------------------------------------
 // Task 3 · list_directory (requirements 2 and 3)
 // ---------------------------------------------------------------------------
 
@@ -902,6 +1032,72 @@ fn every_new_tool_records_an_audit_event() {
     assert!(
         !events.contains("AKIA") && !events.contains("sk_live"),
         "an audit entry must never carry a secret from the search it recorded"
+    );
+}
+
+/// Spec 26 Task 3: the model's own `read_file` tool must not reach
+/// `ReadWindow::ContextRange`. It parses `start_line`/`end_line` into
+/// `ToolAction::ReadFile` and dispatch maps that to `ReadWindow::Range`, which
+/// is capped. A 600-line request through the tool therefore stops at 400; if
+/// dispatch were ever changed to the assembler's uncapped window, this test
+/// would return all 600 lines and fail.
+#[test]
+fn the_agent_read_tool_cannot_request_an_uncapped_context_range() {
+    let repo = temp_dir("read-tool-cap");
+    write_fixture(&repo, "big.rs", &numbered_lines(1000));
+    let mut config = Config {
+        max_read_lines: 400,
+        ..test_config(&repo)
+    };
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments_json: "{\"path\":\"big.rs\",\"start_line\":1,\"end_line\":600}"
+                    .to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Read the first 600 lines.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    let tool_content = messages
+        .iter()
+        .find(|message| message.role == "tool")
+        .map(|message| message.content.as_str())
+        .expect("the read tool result should be in the session");
+
+    assert!(
+        tool_content.contains("lines 1–400 of 1000"),
+        "the tool must stay on the capped window: {tool_content:?}"
+    );
+    assert!(
+        tool_content.contains("truncated by lines"),
+        "the tool must say it was cut: {tool_content:?}"
+    );
+    assert!(
+        !tool_content.contains("line 401"),
+        "the tool returned past max_read_lines: {tool_content:?}"
     );
 }
 

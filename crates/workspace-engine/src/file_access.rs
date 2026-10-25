@@ -38,6 +38,14 @@ pub enum ReadWindow {
     /// The model asked for this range, clamped to `max_read_lines` so a large
     /// range cannot be used to step around the cap.
     Range(LineRange),
+    /// The assembler's merged range (spec 26 §5.4): an explicit range with no
+    /// line cap, because assembly applies its own token budget and a merge cut
+    /// at 400 lines would be silently wrong. The byte cap, path policy and
+    /// redaction are exactly those of [`Self::Range`].
+    ///
+    /// Not reachable from the `read_file` tool: the tool maps an optional range
+    /// to [`Self::Range`], and `tests/agent_tools.rs` pins the cap through it.
+    ContextRange(LineRange),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +170,11 @@ impl FileAccessController {
         // An empty or inverted range is refused naming the total, so the model
         // can correct it in the same round rather than receiving an empty
         // string it might read as "the file is empty".
-        if let ReadWindow::Range(asked) = window
+        let asked_range = match window {
+            ReadWindow::Range(asked) | ReadWindow::ContextRange(asked) => Some(asked),
+            ReadWindow::Whole | ReadWindow::Default => None,
+        };
+        if let Some(asked) = asked_range
             && (asked.start == 0 || asked.start > asked.end || asked.start > total_lines)
         {
             return Err(ClientError::InvalidInput(format!(
@@ -172,20 +184,18 @@ impl FileAccessController {
         }
 
         let max_bytes = self.config.max_file_bytes as usize;
-        let start = match window {
-            ReadWindow::Range(asked) => asked.start,
-            _ => 1,
-        };
-        let requested_end = match window {
-            ReadWindow::Range(asked) => asked.end,
-            _ => usize::MAX,
+        let (start, requested_end) = match window {
+            ReadWindow::Whole | ReadWindow::Default => (1, usize::MAX),
+            ReadWindow::Range(asked) | ReadWindow::ContextRange(asked) => (asked.start, asked.end),
         };
         // The line cap applies to an explicit range too, or a model could step
         // around it by asking for a range larger than the cap. `Whole` opts out
-        // entirely: its callers bound the result themselves.
+        // entirely because its callers bound the result themselves, and
+        // `ContextRange` does the same: the assembler's token budget is its
+        // bound, and a merge must not be cut at a tool's line cap.
         let capped_end = match window {
-            ReadWindow::Whole => usize::MAX,
-            _ => start
+            ReadWindow::Whole | ReadWindow::ContextRange(_) => usize::MAX,
+            ReadWindow::Default | ReadWindow::Range(_) => start
                 .saturating_add(self.config.max_read_lines)
                 .saturating_sub(1),
         };

@@ -1012,3 +1012,66 @@ fn the_symbols_item_keeps_the_lowest_provenance_it_contains() {
 
     fs::remove_dir_all(repo).unwrap();
 }
+
+// ---- Task 3: range deduplication and the range-source finding ----
+
+/// Task 3 discovery, pinned so it cannot go stale silently: **no collection
+/// source yields a `LineRange` today.** `indexer::SearchResult` carries a path
+/// and a snippet and drops the chunk offsets; `symbol_index::Symbol` carries
+/// one starting line and is collected as a rendered block, not a file range.
+/// Every file-bearing source is therefore whole-file, and range merging has no
+/// production producer yet. The merge rules themselves are unit-tested in
+/// `context_manager.rs` (where the private merge function lives); read windows
+/// are exercised through `read_file` in `tests/agent_tools.rs`.
+///
+/// When a source starts supplying ranges this assertion fails, which is the
+/// signal to cover the merge through `build_context` and to stop calling the
+/// machinery unit-only.
+#[test]
+fn no_collection_source_yields_a_line_range_yet() {
+    let repo = temp_dir("range-source-finding");
+    write_fixture(
+        &repo,
+        "src/probe.rs",
+        "pub fn rangeprobe() -> usize { 42 }\n",
+    );
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    assert!(
+        index
+            .keyword_search("rangeprobe", 8)
+            .iter()
+            .any(|hit| hit.path == "src/probe.rs"),
+        "the fixture must reach collection as a search hit"
+    );
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "rangeprobe src/probe.rs",
+        &[],
+        Some(&index),
+        None,
+    );
+
+    assert!(
+        plan.items
+            .iter()
+            .any(|item| item.path.as_deref() == Some("src/probe.rs")),
+        "the fixture should be in the plan: {:?}",
+        plan.files
+    );
+    let ranged = plan
+        .items
+        .iter()
+        .filter(|item| item.range.is_some())
+        .map(|item| (item.path.clone(), item.range))
+        .collect::<Vec<_>>();
+    assert!(
+        ranged.is_empty(),
+        "a collection source now produces line ranges; cover merging through build_context: {ranged:?}"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
