@@ -55,6 +55,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | A file is missing from the model's context | [A file the model should see is missing from context](#a-file-the-model-should-see-is-missing-from-context) |
 | Why a file or search hit was excluded, or what a turn's context actually held | [Reading a turn's context manifest](#reading-a-turns-context-manifest) |
 | A `worktree` argument is refused | [A `worktree` argument is refused](#a-worktree-argument-is-refused) |
+| `list_worktrees` shows none from a worktree session | [`list_worktrees` shows no worktrees from a worktree session](#list_worktrees-shows-no-worktrees-from-a-worktree-session) |
 | A project root is missing or wrong, or a command ran in the wrong directory | [Repository roots and the repository map](#repository-roots-and-the-repository-map) |
 | Symbol search shows only `likely` results, or a configured language server will not start | [Symbol search shows only likely results, or a language server will not start](#symbol-search-shows-only-likely-results-or-a-language-server-will-not-start) |
 | A language-server diagnostic never appears | [Symbol search shows only likely results, or a language server will not start](#symbol-search-shows-only-likely-results-or-a-language-server-will-not-start) |
@@ -2365,6 +2366,35 @@ Worktrees inside the repository root are reachable by default; ones outside it
 need an `allowed_roots` entry. A worktree is still subject to the session's own
 policy once reached: a restricted or ignored path inside it is refused or
 omitted exactly as in the main checkout.
+
+### `list_worktrees` shows no worktrees from a worktree session
+
+`list_worktrees` lists only the worktrees that are **reachable from the session's
+own checkout**, not every registration git knows about. The containment root is
+the checkout the session opened. A session running in a linked worktree — a
+worker's `.damaian/worktrees/<slug>`, or a development worktree under
+`.claude/worktrees/` — therefore treats its own entry as the session checkout
+and the main checkout and every sibling as outside it. With the default empty
+`allowed_roots`, the reachable set is empty and the tool result is:
+
+```
+Worktrees (0 listed, ahead/behind vs `main`):
+```
+
+It does not enumerate the entries it withheld, so the assistant can read that as
+“no worktrees are registered”. They are registered; the tool cannot reach them.
+
+Check the truth with `git -C <repo> worktree list` or the audit event
+`git_worktrees_listed`: its `count` is the number listed and its `resourcePath`
+is the session root that decided reachability. A `count: 0` with a `resourcePath`
+inside a worktree is this case, not an empty repository.
+
+To survey the repository from a worktree session, either add the main checkout
+to `allowed_roots` (then the main and its siblings are reachable, while the
+session's own checkout is still addressed by omitting `worktree`), or run the
+tool from the main checkout. This is deliberate (spec 60 §5.1, correction C1),
+pinned by `from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots`;
+changing it would be a spec change, not a configuration fix.
 
 ### MCP server not working
 
