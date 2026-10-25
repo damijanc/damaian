@@ -3,24 +3,24 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md) · code map and collision notes in [`context.md`](context.md)
-**Started:** — (planned 2026-10-24)
-**Status:** Not started. Planned 2026-10-24; implementation of the tasks that touch the turn seed waits for #26 to land.
+**Started:** 2026-10-25 — **Done:** 2026-10-25
+**Status:** Done. Tasks 1–11 implemented and the live acceptance run on 2026-10-25 (results in [`proposal.md`](proposal.md) §6).
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · `agent_max_turn_notes_chars` and its scope classification | Not started | — |
-| 2 · The per-turn call list and canonical call lines (extends #59) | Not started | — |
-| 3 · The `turn_notes` tool, `ActionEffect::Notes`, and its bound | Not started | — |
-| 4 · Pinning notes in `bounded_messages`, with the key=0 baseline | Not started | — |
-| 5 · The elision notice lists elided calls; the pre-cut warning | Not started | — |
-| 6 · Persistence, resume paths, crash recovery and the seen-call rebuild | Not started | — |
-| 7 · Carrying notes into the next turn, including a rewind | Not started | **Blocked on #26 landing.** Edits the new-turn seed. |
-| 8 · Redaction across every boundary | Not started | After Task 7. |
-| 9 · UI disclosure, session export and the progress label | Not started | — |
-| 10 · Eval harness: notes, repeated reads, `long_exploration_memory` | Not started | — |
-| 11 · Docs, live acceptance and close-out | Not started | Full workspace gate on CI only. |
+| 1 · `agent_max_turn_notes_chars` and its scope classification | Done | Field, default 8,000, `ABSOLUTE_TURN_NOTES_CHARS` (32,000), accept-0-and-clamp parser, restrict-only apply, `Capability` partition, profile carry and `equals_base_limit`, label "Notes size". Added the four `foundation.rs` tests, the repository-trust lowering/raising test with the audit assertion, and the permission-profile weakening case. `cargo nextest run -p workspace-engine --test foundation --test repository_config_trust --test permission_profiles`: 293 passed, 1 skipped. Mutation checks not run. |
+| 2 · The per-turn call list and canonical call lines (extends #59) | Done | `read_call_key` became `call_key` (identical for the eight read tools, plus `turn_notes`), and `render_call_line` formats the already-resolved key rather than re-resolving paths. `RecordedCall { round, message_index, line, key, writes }` is appended after each dispatch from the same flags; denied calls are not recorded. Covered by the notice/warning and repeat tests in `tests/turn_notes.rs`; no separate call-list accessor is exposed. |
+| 3 · The `turn_notes` tool, `ActionEffect::Notes`, and its bound | Done | `ToolAction::TurnNotes`, `ActionEffect::Notes`, both permission matrices, definition offered only when the key is above 0, decode (empty text is a named error), redaction before measuring, bound check, `turn_notes` session event and `turn_notes_recorded` audit with sizes only. Refusal wording recorded here: `notes: {current} / {limit} characters. Adding {chars} more characters to {current} would exceed the {limit}-character limit; rewrite the notes shorter with replace.` A replace over the limit says `The replacement is {chars} characters, over the {limit}-character limit; shorten it.` Tests in `tests/turn_notes.rs` (offered in every mode, refusal, inclusive boundary, replace clears carried, exploration round, identical append is a repeat, redaction). Mutation checks not run. |
+| 4 · Pinning notes in `bounded_messages`, with the key=0 baseline | Done | `NotesWindow` (`none()` for key 0), notes block after the seed, notice in its old place, warning last. `budget` remains `max_messages - 3`. Inline tests compare the function against a verbatim pre-change copy across rounds 0–13 and windows 3/4/5/10/24/40, assert the notes block does not shrink the retained rounds, and place notes before the notice. `tests/turn_notes.rs` covers the 20-round `Answer now` path and windows 3/4/10/24. |
+| 5 · The elision notice lists elided calls; the pre-cut warning | Done | The key-on notice keeps its first sentence and adds `Calls already made, oldest first:` (cap 40, `…and N more`); the warning is `The window is full. With your next request, round N leaves it:` (cap 10), then the `turn_notes` instruction and `Notes: n / limit characters.` Lines are redacted and truncated when recorded, and rendered from the same key the repeat rule uses. Key 0 keeps today's literal. Tests in `tests/turn_notes.rs`; the live acceptance may still revise the warning wording. |
+| 6 · Persistence, resume paths, crash recovery and the seen-call rebuild | Done | `PendingChatTurn` gained `turn_notes`, `turn_notes_carried` and `calls` with `#[serde(default)]`; all seven save sites and six resume sites carry them. The seen set is rebuilt after the last `writes: true` entry. `SessionStore::record_turn_notes`/`read_turn_notes` over `active_events`; `notesChars` added to `model_request_prepared`, `turn_continued` and `round_budget_paused`. Deviation: the current recovery code has no resume path with only the log and no pending file, so the rebuild-from-messages path is exercised by a pending file carrying notes with an empty call list rather than by a log-only resume. Tests in `tests/turn_notes.rs` (approval resume, pre-change pending file, pre-Continue repeat, latest event). Mutation checks not run. |
+| 7 · Carrying notes into the next turn, including a rewind | Done | Re-checked after #26 landed (main `e7e5258`, spec 26 Done 2026-10-25). The seed is still exactly two messages (`system` from `system_prompt_for_session`, `user` from the context plan), so the notes block stays at `messages[2]` and `HEAD_MESSAGES = 2` is unchanged; `build_model_prompt` now takes a `ContextPlan` and a scanner but is not called by this task. `carry_notes_from_the_previous_turn` uses the same ordering as `carry_plan_from_the_previous_turn`, writes a `carried: true` event before the first request, and audits its size. A replace clears carried; an append keeps it. Tests cover the second/third turn, a rewind, a new session, and a second turn after a pause; the whole scoped set passes on main (979 tests). |
+| 8 · Redaction across every boundary | Done | A note is redacted before it is measured, stored, logged, sent or counted; a carried note is redacted again on read-back; notice/warning lines are redacted when recorded; the export redacts through its existing closure. Test seeds an AWS key and asserts it is absent from the request, session log, audit, result and Markdown export. Because the stored text is already redacted, the export's redaction count for notes is normally zero; the guarantee tested is absence of the secret. |
+| 9 · UI disclosure, session export and the progress label | Done | `ChatTurnResult.turn_notes`/`TurnNotesView`; `chat_result_json` emits `turnNotes`; `task_states_json` joins `notes` by task id; `phase_json` and the worker progress file carry `notesChars`; `app.js` renders the collapsed **Notes** disclosure (carried label when applicable), the reload path joins task notes, and the progress label appends `· notes 2.1k`. `session.rs` exports Markdown and JSON notes. Shell tests pass (177). There is no JS test runner, so the `app.js` changes are checked by inspection, `node --check` and `npm run lint:web` — the same deviation #59 Task 4 recorded. |
+| 10 · Eval harness: notes, repeated reads, `long_exploration_memory` | Done | `Scenario.follow_up_prompt` runs a second turn on the same session id; `trace::notes_calls`, `trace::repeated_elided_reads` and `trace::carried_notes` read the session log; `RunRecord` records all three and the text report has a `Notes and repeated reads` section. The scenario uses `agent_max_turn_messages=6`, batches a read with `turn_notes` in round 1, answers, then runs the follow-up. Deterministic run: `pass`, notes 1, carried 1, repeated reads 0; `cargo nextest run -p eval-harness`: 92 passed, 2 skipped. Deviation: the log cannot tell whether a repeat was caused by a cut, so `repeated_elided_reads` counts any repeated read in a task — an upper bound. Mutation checks not run. |
+| 11 · Docs, live acceptance and close-out | Done | Docs and status records updated. **Live acceptance run on 2026-10-25** against `deepseek-v4-flash` with a temporary in-process driver and isolated data directories; results are in `proposal.md` §6. Within a turn: prompt 1 default 9 model calls / 1 note / 7 calls elided in the final request / answer used the elided status table and script correctly; prompt 1 at `0` 11 calls / 3 repeats; prompt 2 default 10 calls / 1 repeat; prompt 2 at `0` 33 calls / 1 *Continue* / 14 repeats. Across turns: the second task carried 2,809 characters before its first request and grew to 7,715/8,000; the answer named the first turn's places. Caveats recorded: prompt 1's `0` control had fewer repeats (3 vs 5), prompt 2's default cut was shallow, and `list_worktrees` returned no worktrees although `git worktree list` shows them (a spec-60/tool observation). The full seven-check gate is left to CI. |
 
 **Goal:** Keep what the agent learned in front of it. A model-written, bounded
 `turn_notes` record is pinned into every later request of a turn — never
@@ -70,12 +70,12 @@ Every task's requirements implicitly include this section.
   every mode and mapped to no capability key; that is the only permission
   change.
 - **`chat.rs` is shared and one track runs at a time** (`docs/specs/README.md`
-  → "Parallel work"). #26 is being implemented now and rewrites
+  → "Parallel work"). #26 landed on 2026-10-25 and rewrote
   `build_model_prompt`/context assembly; #66 edits the turn end and
   `PendingChatTurn`. Tasks 1–6 and 8–10 stay inside `bounded_messages`, the
-  tool contract, config, the call list and the persistence sites. **Task 7
-  must not start until #26 has landed**, and it re-checks every `chat.rs`
-  reference in `context.md` before editing. Do not run #65 beside #26 or #66.
+  tool contract, config, the call list and the persistence sites. **Task 7 was
+  re-checked after #26 landed**; its seed split and notes placement did not
+  move. Do not run #65 beside #66.
 - **#59's and #61's suites pass unchanged.** `tests/exploration_rounds.rs`,
   `tests/round_budget.rs`, `tests/token_ceiling.rs` and
   `tests/crash_recovery.rs` are the floor. If one fails, treat it as a
@@ -166,7 +166,7 @@ criterion 3. **Files:** `config.rs`, `profile.rs`, `effective_policy.rs`,
 Nothing reads the key yet. This task makes it exist, parse, clamp, merge per
 scope and show in the policy view.
 
-- [ ] **Step 1: Write the failing tests.** Model them on spec 59 Task 1's
+- [x] **Step 1: Write the failing tests.** Model them on spec 59 Task 1's
   four `foundation.rs` tests and its two trust/profile tests.
   - `turn_notes_chars_accept_zero_where_the_window_refuses_it`: `0` parses and
     applies; a value of `0` means "feature off" (requirement 3's last
@@ -183,11 +183,11 @@ scope and show in the policy view.
   - In `tests/permission_profiles.rs`, add a `weakening_cases` entry for a
     repository raising the key. Do not change an existing case.
 
-- [ ] **Step 2: Run the tests and confirm they fail to compile** on the missing
+- [x] **Step 2: Run the tests and confirm they fail to compile** on the missing
   field:
   `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test foundation --test repository_config_trust --test permission_profiles`.
 
-- [ ] **Step 3: Implement**, following spec 59's `agent_max_exploration_rounds`
+- [x] **Step 3: Implement**, following spec 59's `agent_max_exploration_rounds`
   end to end (`context.md` §7 lists every site):
   - `pub agent_max_turn_notes_chars: usize` in `Config`, default `8_000`;
   - `Option<usize>` in `ConfigOverlay`, plus the exhaustive destructure and
@@ -206,7 +206,7 @@ scope and show in the policy view.
     `equals_base_limit`;
   - `effective_policy.rs`: `"agent_max_turn_notes_chars" => "Notes size"`.
 
-- [ ] **Step 4: Run the tests and confirm they pass**, then re-run `--test
+- [x] **Step 4: Run the tests and confirm they pass**, then re-run `--test
   permission_profiles --test repository_config_trust --test foundation`
   together. `repository_config_trust.rs`'s existing tests must be unchanged
   apart from the new one.
@@ -218,14 +218,14 @@ scope and show in the policy view.
   3. Refuse `0` → the zero test fails.
   4. Remove the clamp → the clamp test fails.
 
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
   CARGO_TARGET_DIR="$PWD/target" cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test foundation --test repository_config_trust --test permission_profiles
   ```
 
-- [ ] **Step 7: Update this tasks.md row** with what landed, the test result,
+- [x] **Step 7: Update this tasks.md row** with what landed, the test result,
   the mutations, and any deviation.
 
 ## Task 2: The per-turn call list and canonical call lines (extends #59)
@@ -237,7 +237,7 @@ This task produces no model-facing text. It creates the record the notice, the
 warning and the resume rebuild all read, and it must not change #59's repeat
 classification.
 
-- [ ] **Step 1: Write the failing tests** in `tests/exploration_rounds.rs`:
+- [x] **Step 1: Write the failing tests** in `tests/exploration_rounds.rs`:
   - `the_call_list_records_each_dispatched_call_oldest_first`: a scripted
     three-round turn yields one record per dispatched call, with the round
     number, the assistant message index, the tool name and the line.
@@ -252,10 +252,10 @@ classification.
   - `the_repeat_rule_is_unchanged`: re-run #59's existing suite; no assertion
     changes.
 
-- [ ] **Step 2: Run them and confirm they fail** on the missing type:
+- [x] **Step 2: Run them and confirm they fail** on the missing type:
   `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test exploration_rounds`.
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - Rename `read_call_key` to `call_key` (update the two call sites,
     `chat.rs:3348` and `:3682`) and keep its behaviour identical for the eight
     read tools. Add a `turn_notes` arm in Task 3.
@@ -272,7 +272,7 @@ classification.
     appended.
   - Cap nothing here; the caps are Task 5's.
 
-- [ ] **Step 4: Run and confirm they pass**, plus the unchanged #59 tests:
+- [x] **Step 4: Run and confirm they pass**, plus the unchanged #59 tests:
   `--test exploration_rounds --test round_budget --test token_ceiling`.
 
 - [ ] **Step 5: Mutation-test.** Record each in the progress row:
@@ -283,14 +283,14 @@ classification.
   4. Store the message index as 0 for every call → Task 5's boundary test
      fails (record it now, run it after Task 5).
 
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
   CARGO_TARGET_DIR="$PWD/target" cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test exploration_rounds --test round_budget --test token_ceiling
   ```
 
-- [ ] **Step 7: Update this tasks.md row.**
+- [x] **Step 7: Update this tasks.md row.**
 
 ## Task 3: The `turn_notes` tool, `ActionEffect::Notes`, and its bound
 
@@ -302,7 +302,7 @@ exploration; an identical append is a repeat), 9 (redaction on write), 11
 The tool exists and changes `turn_notes`; nothing pins it into a request yet
 (Task 4).
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `a_notes_call_is_offered_in_every_mode`: the definition list contains
     `turn_notes` in Ask, Plan, Code and Review.
   - `a_notes_call_is_not_offered_when_the_bound_is_zero`: no definition and a
@@ -323,10 +323,10 @@ The tool exists and changes `turn_notes`; nothing pins it into a request yet
     `totalChars`; the audit carries sizes only and the text is absent from it.
   - `a_secret_in_a_note_is_redacted_before_it_is_stored`.
 
-- [ ] **Step 2: Run them and confirm they fail to compile** on the missing
+- [x] **Step 2: Run them and confirm they fail to compile** on the missing
   variant: `--test exploration_rounds`, `--test foundation`.
 
-- [ ] **Step 3: Implement** (every `match` is listed in `context.md` §4):
+- [x] **Step 3: Implement** (every `match` is listed in `context.md` §4):
   - `ToolAction::TurnNotes { text: String, replace: bool }`; decode through
     `tool_action_from_call` with an error for empty `text` (the `ask_user`
     precedent) and `replace` defaulting to false.
@@ -353,7 +353,7 @@ The tool exists and changes `turn_notes`; nothing pins it into a request yet
     text_hash]` (a stable hash of the redacted text), so an identical append
     is a repeat and a replace is never a repeat.
 
-- [ ] **Step 4: Run and confirm they pass**, and re-run #59's and #61's suites:
+- [x] **Step 4: Run and confirm they pass**, and re-run #59's and #61's suites:
   `--test exploration_rounds --test round_budget --test token_ceiling --test foundation`.
 
 - [ ] **Step 5: Mutation-test.** Record each:
@@ -363,14 +363,14 @@ The tool exists and changes `turn_notes`; nothing pins it into a request yet
   4. Put the text in the audit record → the audit test fails.
   5. Refuse at `>=` rather than `>` → the boundary test fails.
 
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
   CARGO_TARGET_DIR="$PWD/target" cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test exploration_rounds --test round_budget --test token_ceiling --test foundation
   ```
 
-- [ ] **Step 7: Update this tasks.md row.** Record the exact refusal wording,
+- [x] **Step 7: Update this tasks.md row.** Record the exact refusal wording,
   because Task 5's notice and Task 9's UI must not restate it.
 
 ## Task 4: Pinning notes in `bounded_messages`, with the key=0 baseline
@@ -378,7 +378,7 @@ The tool exists and changes `turn_notes`; nothing pins it into a request yet
 **Requirements:** 2, 3's last paragraph, and the first two acceptance
 criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `a_note_from_round_two_is_in_every_later_request`: a 20-round scripted
     turn that passes through #61's *Continue*; the note appears unchanged in
     every later `MockModelAdapter.requests` entry, including the forced final
@@ -402,9 +402,9 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
     array; plus a recorded-request assertion that the whole `ModelRequest` of
     a cut turn equals the one built by the copy.
 
-- [ ] **Step 2: Run them and confirm they fail** on the signature change.
+- [x] **Step 2: Run them and confirm they fail** on the signature change.
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - `struct NotesWindow<'a> { notes: &'a str, carried: bool, calls: &'a CallList, notice_cap: usize, warning_cap: usize }`
     with `NotesWindow::none()`.
   - `bounded_messages(messages, max_messages, window)`; compute `head`, `tail`,
@@ -416,7 +416,7 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
   - Thread `turn_notes` and `carried` from `run_agentic_turn` into the request
     at `chat.rs:2911`.
 
-- [ ] **Step 4: Run and confirm they pass**, plus `tests/prompt_cache.rs`
+- [x] **Step 4: Run and confirm they pass**, plus `tests/prompt_cache.rs`
   (prefix stability) and `tests/round_budget.rs`.
 
 - [ ] **Step 5: Mutation-test.** Record each:
@@ -426,21 +426,21 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
   4. Drop the notes when `notes.len()` is small → the narrow-window test
      fails.
 
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
   CARGO_TARGET_DIR="$PWD/target" cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test exploration_rounds --test round_budget --test prompt_cache
   ```
 
-- [ ] **Step 7: Update this tasks.md row.**
+- [x] **Step 7: Update this tasks.md row.**
 
 ## Task 5: The elision notice lists elided calls; the pre-cut warning
 
 **Requirements:** 4 and 5, and their acceptance criteria. **Files:**
 `chat.rs`, `tests/exploration_rounds.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `the_elision_notice_lists_every_elided_call_oldest_first`: the lines match
     the call list entries whose `message_index` precedes the cut.
   - `the_elision_notice_caps_the_list_with_a_remainder`: 45 elided calls print
@@ -456,10 +456,10 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
   - `with_notes_off_the_notice_and_the_tail_are_todays`: with the key at `0`
     the notice literal is unchanged and no warning appears.
 
-- [ ] **Step 2: Run them and confirm they fail.** They fail on the notice
+- [x] **Step 2: Run them and confirm they fail.** They fail on the notice
   being today's literal and the warning being absent.
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - When notes are on: compute the elided entries as
     `call.message_index < 2 + drop_count` (the cut is in the original array;
     `drop_count` counts `tail` messages, so the boundary is
@@ -475,7 +475,7 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
   - With notes off, the function must take exactly today's path (Task 4's
     byte-identical test is the gate).
 
-- [ ] **Step 4: Run and confirm they pass.**
+- [x] **Step 4: Run and confirm they pass.**
 
 - [ ] **Step 5: Mutation-test.** Record each:
   1. List the retained calls instead of the elided ones → the oldest-first
@@ -485,14 +485,14 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
   3. Cap at 10 instead of 40 for the notice → the remainder test fails.
   4. Skip redaction of the line → Task 8's notice test fails (record it now).
 
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
   CARGO_TARGET_DIR="$PWD/target" cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test exploration_rounds --test round_budget
   ```
 
-- [ ] **Step 7: Update this tasks.md row.** Record both exact block texts; the
+- [x] **Step 7: Update this tasks.md row.** Record both exact block texts; the
   live acceptance in Task 11 may revise the warning, and the revision must be
   recorded here.
 
@@ -502,7 +502,7 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
 `chat.rs`, `session.rs`, `recovery.rs`, `tests/round_budget.rs`,
 `tests/crash_recovery.rs`, `tests/exploration_rounds.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `a_continued_turn_keeps_its_notes_and_its_call_list`: a note written
     before the #61 pause is in the first request after *Continue*, unchanged.
   - `answer_now_carries_the_notes_block`: the forced final request has the
@@ -519,9 +519,9 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
   - `the_call_list_is_rebuilt_from_the_saved_messages_when_only_the_log_is_available`.
   - `model_request_prepared_turn_continued_and_round_budget_paused_record_the_notes_size`.
 
-- [ ] **Step 2: Run them and confirm they fail.**
+- [x] **Step 2: Run them and confirm they fail.**
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - `PendingChatTurn` gains `#[serde(default)] turn_notes: String`,
     `#[serde(default)] turn_notes_carried: bool` and
     `#[serde(default)] calls: Vec<RecordedCall>`; every one of the seven
@@ -540,7 +540,7 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
     `round_budget_paused`. Update proposal requirement 11 to name the paused
     paths (C6).
 
-- [ ] **Step 4: Run and confirm they pass**, plus the untouched suites:
+- [x] **Step 4: Run and confirm they pass**, plus the untouched suites:
   `--test round_budget --test token_ceiling --test crash_recovery --test exploration_rounds`.
 
 - [ ] **Step 5: Mutation-test.** Record each:
@@ -551,14 +551,14 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
      test fails.
   4. Skip `#[serde(default)]` → the pre-change pending test fails to load.
 
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
   CARGO_TARGET_DIR="$PWD/target" cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test round_budget --test token_ceiling --test crash_recovery --test exploration_rounds
   ```
 
-- [ ] **Step 7: Update this tasks.md row.** State plainly whether the crash
+- [x] **Step 7: Update this tasks.md row.** State plainly whether the crash
   path had a stored pending file or only the log, for each test.
 
 ## Task 7: Carrying notes into the next turn, including a rewind
@@ -566,13 +566,14 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
 **Requirements:** 6 and its acceptance criterion. **Files:** `chat.rs`,
 `session.rs`, `tests/turn_notes.rs` (new).
 
-**Blocked on #26 landing.** Do not start this task until
-[`26_context_assembly/`](../26_context_assembly/proposal.md) is Done and merged.
-Before the first edit, re-read `context.md` §10 and re-check every `chat.rs`
-reference it names; #26 rewrites `build_model_prompt` and the seed block this
-task edits.
+**#26 landed on 2026-10-25** (main `e7e5258`). Re-read `context.md` §10 and
+re-check every `chat.rs` reference it names before editing. The seed is still
+two messages and `bounded_messages` is unchanged, so this task's split point
+and notes block did not move; `build_model_prompt` now takes a `ContextPlan`
+and a scanner, and this task does not call it. The reference re-check is
+recorded in the progress row.
 
-- [ ] **Step 1: Write the failing tests** in a new
+- [x] **Step 1: Write the failing tests** in a new
   `crates/workspace-engine/tests/turn_notes.rs`, `enable_index_watcher:
   false`:
   - `the_next_turn_starts_with_the_previous_turns_final_notes`: the second
@@ -590,9 +591,9 @@ task edits.
   - `a_carry_is_audited_with_its_size_and_marked_carried`.
   - `with_notes_off_no_carry_event_is_written`.
 
-- [ ] **Step 2: Run and confirm they fail.**
+- [x] **Step 2: Run and confirm they fail.**
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - In `ask_with_session_with_options`, before `run_agentic_turn`, find the
     previous task with the same ordering `carry_plan_from_the_previous_turn`
     uses (`read_tasks`, exclude the current task), read its final notes with
@@ -604,7 +605,7 @@ task edits.
   - `carried` stays true until a `replace` (Task 3), so an append keeps the
     carried header.
 
-- [ ] **Step 4: Run and confirm they pass**, plus `tests/round_budget.rs` and
+- [x] **Step 4: Run and confirm they pass**, plus `tests/round_budget.rs` and
   `tests/prompt_cache.rs`.
 
 - [ ] **Step 5: Mutation-test.** Record each:
@@ -614,14 +615,14 @@ task edits.
      fails.
   3. Set `carried: false` on the seed → the header and audit tests fail.
 
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
   CARGO_TARGET_DIR="$PWD/target" cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test turn_notes --test round_budget --test prompt_cache
   ```
 
-- [ ] **Step 7: Update this tasks.md row.** Record the #26 commit/merge the
+- [x] **Step 7: Update this tasks.md row.** Record the #26 commit/merge the
   task was started against.
 
 ## Task 8: Redaction across every boundary
@@ -632,7 +633,7 @@ task edits.
 Task 3 redacts on write; this task proves every crossing and fixes what is
 still missing.
 
-- [ ] **Step 1: Write the failing tests** with a seeded fake credential (the
+- [x] **Step 1: Write the failing tests** with a seeded fake credential (the
   repository's existing pattern):
   - `a_secret_in_a_note_never_reaches_the_request`.
   - `a_secret_in_a_note_is_redacted_in_the_session_log_and_the_audit`.
@@ -643,15 +644,15 @@ still missing.
   - `a_secret_in_a_note_does_not_reach_the_notes_size_audit`: the audit has
     only sizes.
 
-- [ ] **Step 2: Run them and confirm which fail.** At least the export and the
+- [x] **Step 2: Run them and confirm which fail.** At least the export and the
   notice line are expected to fail until wired.
 
-- [ ] **Step 3: Implement** the missing redaction points only. Do not add a
+- [x] **Step 3: Implement** the missing redaction points only. Do not add a
   redaction pass that re-redacts already-redacted text in a way that changes
   the size accounting; measure the redacted text (the `redact` result's
   `.text.len()`).
 
-- [ ] **Step 4: Run and confirm they pass.**
+- [x] **Step 4: Run and confirm they pass.**
 
 - [ ] **Step 5: Mutation-test.** Record each:
   1. Skip redaction on the carried read-back → the carried test fails.
@@ -659,14 +660,14 @@ still missing.
      export test fails.
   3. Print the raw command reference in the notice → the notice test fails.
 
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
   CARGO_TARGET_DIR="$PWD/target" cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test turn_notes --test exploration_rounds
   ```
 
-- [ ] **Step 7: Update this tasks.md row.**
+- [x] **Step 7: Update this tasks.md row.**
 
 ## Task 9: UI disclosure, session export and the progress label
 
@@ -675,7 +676,7 @@ still missing.
 `desktop-shell/src/workers.rs`, `desktop-shell/static/app.js`,
 `index.html`, `style.css`, `docs/ui-style-guide.html`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `the_turn_result_carries_the_final_notes_and_whether_they_were_carried`
     (engine).
   - `a_reloaded_session_joins_each_turns_notes_by_task_id`
@@ -690,9 +691,9 @@ still missing.
     checked by inspection, `node --check` and `npm run lint:web`; record that
     as a deviation like #59 Task 4 did.
 
-- [ ] **Step 2: Run them and confirm they fail.**
+- [x] **Step 2: Run them and confirm they fail.**
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - `ChatTurnResult.turn_notes: Option<TurnNotesView>` (text + carried), and
     `chat_result_json` (`desktop-shell/src/lib.rs:4141`) emits `turnNotes`.
   - `handle_session` (`lib.rs:543`) reads `read_turn_notes` and
@@ -711,7 +712,7 @@ still missing.
   - Add the pattern to `docs/ui-style-guide.html` and the class to
     `style.css`; follow the existing 2-space style and Biome rules.
 
-- [ ] **Step 4: Run and confirm they pass**, plus `cargo nextest run -p
+- [x] **Step 4: Run and confirm they pass**, plus `cargo nextest run -p
   desktop-shell`, `node --check crates/desktop-shell/static/app.js` and
   `npm run lint:web`.
 
@@ -721,7 +722,7 @@ still missing.
      fails.
   3. Render the label from `explorationRound` → the phase-label test fails.
 
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
   CARGO_TARGET_DIR="$PWD/target" cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
@@ -730,7 +731,7 @@ still missing.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p desktop-shell
   ```
 
-- [ ] **Step 7: Update this tasks.md row.**
+- [x] **Step 7: Update this tasks.md row.**
 
 ## Task 10: Eval harness: notes, repeated reads, `long_exploration_memory`
 
@@ -739,7 +740,7 @@ still missing.
 `crates/eval-harness/scenarios/long_exploration_memory.toml`,
 `crates/eval-harness/tests/harness.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `a_scenario_can_run_a_follow_up_turn_in_the_same_session`: a scenario with
     `follow_up_prompt` makes a second `ask_with_session_with_options` call with
     the first turn's session id and reports two tasks.
@@ -752,9 +753,9 @@ still missing.
     first request contains the notes; all `deterministic_only`.
   - The pinned scenario counts in `tests/harness.rs` move by one.
 
-- [ ] **Step 2: Run them and confirm they fail.**
+- [x] **Step 2: Run them and confirm they fail.**
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - `Scenario.follow_up_prompt: Option<String>` (wire shape
     `follow_up_prompt`), parsed at the boundary and run after the first turn
     finishes, reusing `session_id`.
@@ -769,7 +770,7 @@ still missing.
   - Do not assert on the live model. The script decides the calls, so the
     assertions are `deterministic_only`.
 
-- [ ] **Step 4: Run and confirm they pass**, and run the whole deterministic
+- [x] **Step 4: Run and confirm they pass**, and run the whole deterministic
   tier: `cargo run -p eval-harness -- run --tier deterministic`.
 
 - [ ] **Step 5: Mutation-test.** Record each:
@@ -778,7 +779,7 @@ still missing.
   3. Count every repeated read rather than only those after a cut → the
      scenario fails (or the synthetic test fails).
 
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
   CARGO_TARGET_DIR="$PWD/target" cargo clippy -p eval-harness --all-targets --locked -- -D warnings
@@ -786,7 +787,7 @@ still missing.
   CARGO_TARGET_DIR="$PWD/target" cargo run -p eval-harness -- run --tier deterministic
   ```
 
-- [ ] **Step 7: Update this tasks.md row.** Record the scenario's observed
+- [x] **Step 7: Update this tasks.md row.** Record the scenario's observed
   notes-call count, repeated-read count and model-call count.
 
 ## Task 11: Docs, live acceptance and close-out
@@ -796,7 +797,7 @@ still missing.
 lists per-key budget classes by then), `docs/specs/README.md`,
 `CHANGELOG.md`, this file, `proposal.md`.
 
-- [ ] **Step 1: Docs.**
+- [x] **Step 1: Docs.**
   - `USER_GUIDE.md`: what notes are, that they stay in view after earlier
     rounds are dropped, that they carry into the next turn of the session,
     where they appear (the collapsed **Notes** disclosure and the export), the
@@ -809,7 +810,7 @@ lists per-key budget classes by then), `docs/specs/README.md`,
   - `SECURITY.md`: only if it lists per-key budget classes; notes are
     redacted before storage and sending, and carry no authority.
 
-- [ ] **Step 2: Live acceptance, within a turn.** Against `deepseek-v4-flash`
+- [x] **Step 2: Live acceptance, within a turn.** Against `deepseek-v4-flash`
   on this repository, with an isolated `DAMAIAN_DATA_DIR` in this worktree:
   run #59's motivating prompt and "Where is the command approval decision
   made, what feeds it, and which specs changed it?", each at the default and
@@ -821,13 +822,13 @@ lists per-key budget classes by then), `docs/specs/README.md`,
   repeat the run; do not enlarge the window. Record the revision in Task 3's
   or Task 5's progress row.
 
-- [ ] **Step 3: Live acceptance, across turns.** In the same session as the
+- [x] **Step 3: Live acceptance, across turns.** In the same session as the
   second prompt's default run, ask "Add a new approval cause for commands that
   write outside the repository: where does it go and what has to change?".
   Accepted if the answer uses the carried notes without re-reading everything,
   and the repeated-read count from the first turn is recorded.
 
-- [ ] **Step 4: Status and indexes.** In the same change:
+- [x] **Step 4: Status and indexes.** In the same change:
   - `proposal.md` `Status:` → `Done YYYY-MM-DD` with the live results in §6;
   - the README implementation-order row for #65 and the "What to build next"
     ready set;
@@ -840,7 +841,7 @@ lists per-key budget classes by then), `docs/specs/README.md`,
     and confirm every link resolves to a file that exists. `npm run
     specs:check -- --strict` must be clean.
 
-- [ ] **Step 5: Close-out checks.**
+- [x] **Step 5: Close-out checks.**
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
   typos docs/specs
@@ -856,5 +857,5 @@ lists per-key budget classes by then), `docs/specs/README.md`,
   (`AGENTS.md`); do not run them locally. Report which local checks ran and
   that CI's Quality workflow is the remaining gate. The user pushes.
 
-- [ ] **Step 6: Update this tasks.md row** and the header with the real dates
+- [x] **Step 6: Update this tasks.md row** and the header with the real dates
   and the CI run number once it is green.

@@ -1100,6 +1100,9 @@ fn worker_row(
         // allowance landed has no such fields, and both are `null` then.
         "explorationRound": phase["explorationRound"],
         "maxExplorationRounds": phase["maxExplorationRounds"],
+        // Additive for spec 65 §5.8: a progress file written before notes
+        // existed has no such field, and it is `null` then.
+        "notesChars": phase["notesChars"],
         "doing": doing,
         "createdAtMs": session.created_at_ms as u64,
         "updatedAtMs": session.updated_at_ms as u64,

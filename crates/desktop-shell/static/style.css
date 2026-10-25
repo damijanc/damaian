@@ -3124,6 +3124,26 @@ button:disabled {
   margin-top: 6px;
 }
 
+/* A turn's notes (spec 65 §5.8). Plain model-written text: preformatted so the
+   paragraphs it wrote stay where it put them, and quiet enough to read as a
+   footnote to the answer rather than as part of it. */
+.turn-notes[hidden] {
+  display: none;
+}
+
+.turn-notes {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 .context-file {
   max-width: 100%;
   min-height: 24px;

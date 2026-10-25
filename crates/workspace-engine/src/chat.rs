@@ -183,6 +183,9 @@ pub struct TurnPhase {
     /// variant of it.
     pub exploration_round: u32,
     pub max_exploration_rounds: u32,
+    /// Characters of `turn_notes` this turn holds (spec 65 §5.8). A count, not
+    /// a budget: the label shows "· notes 2.1k" only when it is non-zero.
+    pub notes_chars: usize,
 }
 
 impl TurnPhase {
@@ -193,6 +196,7 @@ impl TurnPhase {
         max_rounds: u32,
         exploration_round: u32,
         max_exploration_rounds: u32,
+        notes_chars: usize,
     ) -> Self {
         Self {
             kind,
@@ -201,6 +205,7 @@ impl TurnPhase {
             max_rounds,
             exploration_round,
             max_exploration_rounds,
+            notes_chars,
         }
     }
 }
@@ -259,6 +264,10 @@ impl TurnSink<'_> {
         (self.on_progress)(TurnProgress::Session(session_id.to_string()));
     }
 
+    // The counts travel together: every caller already has all of them at the
+    // point it reports progress, and grouping them into a struct would trade a
+    // stable call shape for one that has to be rebuilt at seven sites.
+    #[allow(clippy::too_many_arguments)]
     fn phase(
         &mut self,
         kind: PhaseKind,
@@ -267,6 +276,7 @@ impl TurnSink<'_> {
         max_rounds: u32,
         exploration_round: u32,
         max_exploration_rounds: u32,
+        notes_chars: usize,
     ) {
         (self.on_progress)(TurnProgress::Phase(TurnPhase::new(
             kind,
@@ -275,6 +285,7 @@ impl TurnSink<'_> {
             max_rounds,
             exploration_round,
             max_exploration_rounds,
+            notes_chars,
         )));
     }
 
@@ -500,6 +511,16 @@ pub struct ChatTurnResult {
     /// A [`CostEstimate`] rather than a bare `f64` so the upper-bound label
     /// travels with the number: spec 49 §5.3.
     pub estimated_cost: Option<CostEstimate>,
+    /// The turn's final notes, already redacted, and whether they include text
+    /// carried from an earlier turn (spec 65 §5.8). Empty notes show nothing.
+    pub turn_notes: Option<TurnNotesView>,
+}
+
+/// What the user sees of a turn's notes (spec 65 §5.8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnNotesView {
+    pub text: String,
+    pub carried: bool,
 }
 
 /// What a turn ended holding out for a human, if anything.
@@ -947,6 +968,11 @@ impl ChatOrchestrator {
         // into an unrelated next question would put steps on the panel the user
         // never asked for, and a normally-completed task has nothing to resume.
         self.carry_plan_from_the_previous_turn(&session.id, &task)?;
+        // Spec 65 §5.5: the model's notes from the previous turn are this
+        // turn's starting record, pinned from the first request and marked as
+        // carried. Read from the active log, so a rewind carries the notes of
+        // the turn before the rewound one with no second ordering rule.
+        let turn_notes = self.carry_notes_from_the_previous_turn(&session.id, &task)?;
         let user_message =
             self.session_store
                 .append_message(&session.id, Some(&task.id), "user", prompt)?;
@@ -969,6 +995,7 @@ impl ChatOrchestrator {
             self.tool_round_limit(prompt_enters_web_debug_mode(prompt)),
             0,
             self.default_exploration_round_limit(),
+            turn_notes.text.chars().count(),
         );
 
         // Spec 32 `context.md` §3, §4: context is assembled once per turn, so
@@ -1081,6 +1108,7 @@ impl ChatOrchestrator {
             messages,
             0,
             0,
+            turn_notes,
             model_adapter,
             sink,
             options,
@@ -1120,6 +1148,7 @@ impl ChatOrchestrator {
         decision_options: ResumeDecisionOptions,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
+        let turn_notes = TurnNotesState::from_pending(&pending);
         // Every pause shares the pending-turn file, and each resume loads
         // whatever file its id names. A plan review, a provider fallback, a
         // round-budget pause and a question each have their own resume;
@@ -1327,6 +1356,7 @@ impl ChatOrchestrator {
                         max_rounds,
                         pending.exploration_rounds,
                         max_exploration_rounds,
+                        pending.turn_notes.chars().count(),
                     )));
                 };
                 let record = self.validation_orchestrator.run_proposal(
@@ -1456,6 +1486,7 @@ impl ChatOrchestrator {
             messages,
             pending.round + 1,
             pending.exploration_rounds,
+            turn_notes,
             model_adapter,
             sink,
             pending.turn_options,
@@ -1490,6 +1521,7 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
+        let turn_notes = TurnNotesState::from_pending(&pending);
         self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::PlanReview)?;
         let Some(review) = pending.plan_review.clone() else {
             // `refuse_unless_paused_for` just proved the pause is a plan review.
@@ -1581,6 +1613,7 @@ impl ChatOrchestrator {
             messages,
             pending.round + 1,
             pending.exploration_rounds,
+            turn_notes,
             model_adapter,
             sink,
             pending.turn_options,
@@ -1606,6 +1639,7 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(question_id)?;
+        let turn_notes = TurnNotesState::from_pending(&pending);
         self.refuse_unless_paused_for(question_id, &pending, PausedFor::Question)?;
         let Some(question) = pending.question.clone() else {
             // `refuse_unless_paused_for` just proved the pause is a question.
@@ -1733,6 +1767,7 @@ impl ChatOrchestrator {
             messages,
             pending.round + 1,
             pending.exploration_rounds,
+            turn_notes,
             model_adapter,
             sink,
             pending.turn_options,
@@ -1819,6 +1854,7 @@ impl ChatOrchestrator {
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
+        let turn_notes = TurnNotesState::from_pending(&pending);
         self.audit_log.record(
             "provider_fallback_decision",
             &[
@@ -1873,6 +1909,7 @@ impl ChatOrchestrator {
             pending.messages,
             pending.round,
             pending.exploration_rounds,
+            turn_notes,
             model_adapter,
             sink,
             turn_options,
@@ -1900,6 +1937,7 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
+        let turn_notes = TurnNotesState::from_pending(&pending);
         self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::RoundBudget)?;
         let Some(pause) = pending.round_budget.clone() else {
             // `refuse_unless_paused_for` just proved the pause is a budget stop.
@@ -1975,6 +2013,7 @@ impl ChatOrchestrator {
                     messages,
                     pending.round,
                     pending.exploration_rounds,
+                    turn_notes,
                     model_adapter,
                     sink,
                     turn_options,
@@ -2009,6 +2048,7 @@ impl ChatOrchestrator {
                     pending.messages,
                     pending.round,
                     pending.exploration_rounds,
+                    turn_notes,
                     model_adapter,
                     sink,
                     turn_options,
@@ -2461,6 +2501,106 @@ impl ChatOrchestrator {
         self.session_store.resume_plan(task, &previous.id)
     }
 
+    /// Seeds a new turn with the previous turn's final notes (spec 65 §5.5).
+    ///
+    /// "Previous" is the turn before this one in the conversation as the active
+    /// log stands, which is the same ordering `carry_plan_from_the_previous_turn`
+    /// uses. That makes a rewind correct without a second rule: everything
+    /// after the newest marker is already invisible to `read_tasks` and to
+    /// `read_turn_notes`.
+    ///
+    /// The carry is written as a `turn_notes` event with `carried: true`
+    /// before the turn's first request, and audited with its size only. With
+    /// the bound at `0`, nothing is read, written or carried.
+    fn carry_notes_from_the_previous_turn(
+        &self,
+        session_id: &str,
+        task: &Task,
+    ) -> Result<TurnNotesState> {
+        if self.config.agent_max_turn_notes_chars == 0 {
+            return Ok(TurnNotesState::default());
+        }
+        let tasks = self.session_store.read_tasks(session_id)?;
+        let Some(previous) = tasks.iter().rev().find(|candidate| candidate.id != task.id) else {
+            return Ok(TurnNotesState::default());
+        };
+        let notes = self.session_store.read_turn_notes(session_id)?;
+        let Some(previous_notes) = notes.get(&previous.id) else {
+            return Ok(TurnNotesState::default());
+        };
+        if previous_notes.text.is_empty() {
+            return Ok(TurnNotesState::default());
+        }
+        // Read back through the scanner as well: the log is trusted only as
+        // far as every other boundary trusts it, and a note is model-written
+        // text that may quote what was read (requirement 9).
+        let text = self.scanner.redact(&previous_notes.text).text;
+        self.session_store.record_turn_notes(
+            session_id,
+            &task.id,
+            false,
+            true,
+            &text,
+            text.chars().count(),
+        )?;
+        self.audit_log.record(
+            "turn_notes_carried",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("taskId", task.id.clone()),
+                ("sourceTaskId", previous.id.clone()),
+                ("chars", text.chars().count().to_string()),
+            ],
+        )?;
+        Ok(TurnNotesState {
+            text,
+            carried: true,
+            calls: Vec::new(),
+        })
+    }
+
+    /// Rebuilds a turn's call list from the tool calls in its saved messages
+    /// (spec 65 §5.6). The pending file is the normal source; this is the
+    /// fallback for a turn whose notes survived but whose call list did not,
+    /// and the shape a task resumed from the log alone would use.
+    fn rebuild_call_list(
+        &self,
+        repository_root: &Path,
+        messages: &[ModelMessage],
+    ) -> Vec<RecordedCall> {
+        let mut calls = Vec::new();
+        let mut round = 0u32;
+        for (message_index, message) in messages.iter().enumerate() {
+            if message.role != "assistant" || message.tool_calls.is_empty() {
+                continue;
+            }
+            round += 1;
+            for call in &message.tool_calls {
+                let Ok(Some(action)) = tool_action_from_call(call) else {
+                    continue;
+                };
+                let line = self
+                    .render_call_line(repository_root, &action)
+                    .map(|line| {
+                        truncate_for_prompt(
+                            &single_line(&self.scanner.redact(&line).text),
+                            CALL_LINE_MAX_CHARS,
+                        )
+                    })
+                    .unwrap_or_default();
+                calls.push(RecordedCall {
+                    round,
+                    message_index,
+                    line,
+                    key: self.call_key(repository_root, &action),
+                    writes: matches!(action_effect(&action), ActionEffect::WritesRepository),
+                });
+            }
+        }
+        calls
+    }
+
     /// Runs `before_task_complete` for a model answer that would end the turn
     /// (spec 32 `context.md` §3, §4).
     ///
@@ -2532,6 +2672,7 @@ impl ChatOrchestrator {
         mut messages: Vec<ModelMessage>,
         mut action_rounds: u32,
         mut exploration_rounds: u32,
+        mut turn_notes: TurnNotesState,
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
         turn_options: ChatTurnOptions,
@@ -2683,6 +2824,17 @@ impl ChatOrchestrator {
             }) {
                 tools.push(read_git_log_tool_definition());
             }
+            // Spec 65 §5.1: offered wherever the read tools are and the bound
+            // is above zero. Zero means "not offered", never "offered and
+            // always refused".
+            if self.config.agent_max_turn_notes_chars > 0
+                && offered(&ToolAction::TurnNotes {
+                    text: String::new(),
+                    replace: false,
+                })
+            {
+                tools.push(turn_notes_tool_definition());
+            }
             if self.web_diagnostics_runner.is_some()
                 && offered(&ToolAction::WebDiagnostic(WebDiagnosticCall {
                     kind: WebDiagnosticKind::Inspect,
@@ -2775,10 +2927,30 @@ impl ChatOrchestrator {
         // The per-turn read allowance (spec 59 §5.2). It is fixed for the turn
         // and never extended by a continuation, so it is computed once here.
         let max_exploration_rounds = self.default_exploration_round_limit();
-        // The turn's already-dispatched read calls (spec 59 §5.3), keyed by the
-        // canonical form below. It lives for one turn: a resumed turn starts
-        // with an empty set, and a round that writes clears it.
-        let mut seen_read_calls: HashSet<Vec<String>> = HashSet::new();
+        // A notes record that survived without its call list (a hand-written or
+        // partially written pending file) rebuilds the list from the messages
+        // it saved, so the notice and the repeat rule still work.
+        if turn_notes.calls.is_empty() && !turn_notes.text.is_empty() {
+            turn_notes.calls = self.rebuild_call_list(repository_root, &messages);
+        }
+        // The turn's already-dispatched calls (spec 59 §5.3, spec 65 §5.6),
+        // keyed by the canonical form below. A resumed turn rebuilds the set
+        // from the persisted list, taking entries since the last round that
+        // wrote — a write changes what a read reports, so reads before it are
+        // verification history rather than a loop. A turn written before spec
+        // 65 has no list and starts empty, as #59 accepted.
+        let mut seen_read_calls: HashSet<Vec<String>> = {
+            let since_write = turn_notes
+                .calls
+                .iter()
+                .rposition(|call| call.writes)
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            turn_notes.calls[since_write..]
+                .iter()
+                .filter_map(|call| call.key.clone())
+                .collect()
+        };
         let (final_run, response, proposals, stop_reason) = loop {
             // Spec 57 §5.4, in its order: a pause holds here, before the
             // cancel check, so a stop that arrives while paused ends the turn
@@ -2827,6 +2999,7 @@ impl ChatOrchestrator {
                     task,
                     context_files,
                     &partial_response,
+                    &turn_notes,
                     cancelled_run,
                 );
             }
@@ -2914,6 +3087,7 @@ impl ChatOrchestrator {
                     messages,
                     action_rounds,
                     exploration_rounds,
+                    turn_notes,
                     max_rounds,
                     round_budget_extension,
                     turn_options,
@@ -2929,7 +3103,26 @@ impl ChatOrchestrator {
                 model: self.config.model_name.clone(),
                 // Bounded, not the raw array: a long turn's tool results would
                 // otherwise grow the request without limit (requirement 6).
-                messages: bounded_messages(&messages, self.config.agent_max_turn_messages),
+                // The notes, the calls-aware notice and the pre-cut warning are
+                // inserted beside the unchanged bounded tail (spec 65 §5.2).
+                messages: bounded_messages(
+                    &messages,
+                    self.config.agent_max_turn_messages,
+                    &if self.config.agent_max_turn_notes_chars == 0 {
+                        // Requirement 3: zero restores today's request exactly.
+                        NotesWindow::none()
+                    } else {
+                        NotesWindow {
+                            notes: &turn_notes.text,
+                            carried: turn_notes.carried,
+                            calls: &turn_notes.calls,
+                            enabled: true,
+                            notes_limit: self.config.agent_max_turn_notes_chars,
+                            notice_cap: ELISION_NOTICE_LINE_CAP,
+                            warning_cap: PRE_CUT_LINE_CAP,
+                        }
+                    },
+                ),
                 temperature: Some("0".to_string()),
                 reasoning_level: Some(self.config.model_reasoning_level.clone()),
                 stream: true,
@@ -2961,6 +3154,9 @@ impl ChatOrchestrator {
                     // acted on.
                     ("explorationRounds", exploration_rounds.to_string()),
                     ("explorationLimit", max_exploration_rounds.to_string()),
+                    // Spec 65 correction C6: the request records how big the
+                    // notes are, never their text (that is in the session log).
+                    ("notesChars", turn_notes.text.chars().count().to_string()),
                 ],
             )?;
 
@@ -2971,6 +3167,7 @@ impl ChatOrchestrator {
                 max_rounds,
                 exploration_rounds,
                 max_exploration_rounds,
+                turn_notes.text.chars().count(),
             );
             // `sideEffecting: false` — §4 treats a cut stream as a lost call:
             // the task resumes by making a new one, and spec 19 reports the cost
@@ -3013,6 +3210,7 @@ impl ChatOrchestrator {
                         max_rounds,
                         exploration_rounds,
                         max_exploration_rounds,
+                        turn_notes.text.chars().count(),
                     )));
                 };
                 model_adapter.stream_response(&request, sink.cancel, &mut accumulate, &mut on_wait)
@@ -3047,6 +3245,7 @@ impl ChatOrchestrator {
                         task,
                         context_files,
                         &partial_response,
+                        &turn_notes,
                         cancelled_run,
                     );
                 }
@@ -3118,6 +3317,7 @@ impl ChatOrchestrator {
                             messages,
                             action_rounds,
                             exploration_rounds,
+                            turn_notes,
                             turn_options,
                             offer,
                         );
@@ -3196,6 +3396,7 @@ impl ChatOrchestrator {
                     task,
                     context_files,
                     &partial,
+                    &turn_notes,
                     model_run,
                 );
             }
@@ -3227,6 +3428,7 @@ impl ChatOrchestrator {
                                 // pair is named explicitly rather than shared.
                                 ("explorationRounds", exploration_rounds.to_string()),
                                 ("explorationLimit", max_exploration_rounds.to_string()),
+                                ("notesChars", turn_notes.text.chars().count().to_string()),
                             ],
                         )?;
                         messages.push(
@@ -3366,24 +3568,27 @@ impl ChatOrchestrator {
             // The canonical keys are computed once here and remembered for the
             // dispatch below, so a call is not resolved twice and a batch and a
             // sequential round agree on what counts as the same call.
-            let read_call_keys: Vec<Option<Vec<String>>> = calls_this_round
+            let call_keys: Vec<Option<Vec<String>>> = calls_this_round
                 .iter()
-                .map(|(_, action)| self.read_call_key(repository_root, action))
+                .map(|(_, action)| self.call_key(repository_root, action))
                 .collect();
             let repeats_a_seen_call = {
                 // A duplicate inside this round is a repeat too: two identical
                 // calls in one round make it an action round.
                 let mut this_round = HashSet::new();
-                read_call_keys
+                call_keys
                     .iter()
                     .flatten()
                     .any(|key| seen_read_calls.contains(key) || !this_round.insert(key))
             };
             let round_is_exploration = !calls_this_round.is_empty()
                 && undecodable_calls.is_empty()
-                && calls_this_round
-                    .iter()
-                    .all(|(_, action)| matches!(action_effect(action), ActionEffect::ReadOnly))
+                && calls_this_round.iter().all(|(_, action)| {
+                    matches!(
+                        action_effect(action),
+                        ActionEffect::ReadOnly | ActionEffect::Notes
+                    )
+                })
                 && !repeats_a_seen_call
                 && exploration_rounds < max_exploration_rounds;
 
@@ -3435,7 +3640,10 @@ impl ChatOrchestrator {
                     let allowed =
                         before_tool_effect(action, outcome.verdict) == BeforeToolEffect::Proceed;
                     precomputed_before[index] = Some(outcome);
-                    if allowed {
+                    // A notes call may share a round with reads, but its
+                    // mutation belongs on the loop thread after the batch
+                    // returns — never inside the batch worker (spec 65 §5.1).
+                    if allowed && matches!(action_effect(action), ActionEffect::ReadOnly) {
                         batch_indices.push(index);
                         batch_actions.push(calls_this_round[index].clone());
                     }
@@ -3522,6 +3730,9 @@ impl ChatOrchestrator {
                         context_files: context_files.clone(),
                         round: action_rounds,
                         exploration_rounds,
+                        turn_notes: turn_notes.text.clone(),
+                        turn_notes_carried: turn_notes.carried,
+                        calls: turn_notes.calls.clone(),
                         messages: messages.clone(),
                         // The deferred call is deliberately dropped rather than
                         // stored: it was never dispatched, and the resumed turn
@@ -3643,6 +3854,7 @@ impl ChatOrchestrator {
                     max_rounds,
                     exploration_rounds,
                     max_exploration_rounds,
+                    turn_notes.text.chars().count(),
                 );
 
                 // Bracket the dispatch, not the leaf call: `ValidationOrchestrator`
@@ -3697,15 +3909,31 @@ impl ChatOrchestrator {
                     _ => None,
                 };
                 // Captured before the dispatch match consumes `tool_action`.
-                // A denied call never dispatched, so it is not a seen call;
-                // a read that failed on its own (a missing file, a refused
-                // path) did, and still counts.
-                let dispatched_read_key =
-                    if permission.is_allowed() && action_is_batchable_read_only(&tool_action) {
-                        read_call_keys[index].clone()
-                    } else {
-                        None
-                    };
+                // A denied call never dispatched, so it is not a seen call or a
+                // recorded call; a read that failed on its own (a missing file,
+                // a refused path) did, and still counts. A refused working
+                // directory and a question nobody can answer are refused before
+                // dispatch, so neither is recorded either.
+                let dispatched = permission.is_allowed()
+                    && refused_directory.is_none()
+                    && !(matches!(tool_action, ToolAction::AskUser(_)) && !ask_user_offered);
+                let dispatched_call_key = if dispatched {
+                    call_keys[index].clone()
+                } else {
+                    None
+                };
+                // The notice and warning read this line, so it is redacted and
+                // truncated here, once, rather than on every request.
+                let call_line = dispatched
+                    .then(|| self.render_call_line(repository_root, &tool_action))
+                    .flatten()
+                    .map(|line| {
+                        truncate_for_prompt(
+                            &single_line(&self.scanner.redact(&line).text),
+                            CALL_LINE_MAX_CHARS,
+                        )
+                    });
+                let round_number = action_rounds + exploration_rounds + 1;
                 let writes_this_call = permission.is_allowed()
                     && matches!(action_effect(&tool_action), ActionEffect::WritesRepository);
                 let (assistant_summary, mut tool_result_text, action_outcome) = if !permission
@@ -3737,7 +3965,7 @@ impl ChatOrchestrator {
                         NO_USER_CAN_ANSWER.to_string(),
                         ActionOutcome::Failed,
                     )
-                } else if action_is_batchable_read_only(&tool_action) {
+                } else if matches!(action_effect(&tool_action), ActionEffect::ReadOnly) {
                     match precomputed.as_ref() {
                         // Precomputed by the concurrent batch, indexed by the
                         // model's call order.
@@ -3791,6 +4019,9 @@ impl ChatOrchestrator {
                                     context_files: context_files.clone(),
                                     round: action_rounds,
                                     exploration_rounds,
+                                    turn_notes: turn_notes.text.clone(),
+                                    turn_notes_carried: turn_notes.carried,
+                                    calls: turn_notes.calls.clone(),
                                     messages: messages.clone(),
                                     matched_tool_call: matched_tool_call.clone(),
                                     last_content: redacted.clone(),
@@ -3847,6 +4078,7 @@ impl ChatOrchestrator {
                                     max_rounds,
                                     exploration_rounds,
                                     max_exploration_rounds,
+                                    turn_notes.text.chars().count(),
                                 )));
                             };
                             let record = self.validation_orchestrator.run_proposal(
@@ -4167,6 +4399,9 @@ impl ChatOrchestrator {
                                     context_files: context_files.clone(),
                                     round: action_rounds,
                                     exploration_rounds,
+                                    turn_notes: turn_notes.text.clone(),
+                                    turn_notes_carried: turn_notes.carried,
+                                    calls: turn_notes.calls.clone(),
                                     messages: messages.clone(),
                                     matched_tool_call: matched_tool_call.clone(),
                                     last_content: redacted.clone(),
@@ -4279,6 +4514,9 @@ impl ChatOrchestrator {
                                     context_files: context_files.clone(),
                                     round: action_rounds,
                                     exploration_rounds,
+                                    turn_notes: turn_notes.text.clone(),
+                                    turn_notes_carried: turn_notes.carried,
+                                    calls: turn_notes.calls.clone(),
                                     messages: messages.clone(),
                                     matched_tool_call: matched_tool_call.clone(),
                                     last_content: redacted.clone(),
@@ -4344,6 +4582,92 @@ impl ChatOrchestrator {
                                 };
                             (summary, content, outcome)
                         }
+                        // Spec 65 §5.1: notes mutate turn state that only this
+                        // loop owns, so they are dispatched here rather than in
+                        // the concurrent batch. The text is redacted before it
+                        // is measured, stored, logged, sent or counted.
+                        ToolAction::TurnNotes { text, replace } => {
+                            let limit = self.config.agent_max_turn_notes_chars;
+                            if limit == 0 {
+                                (
+                                    "Attempted to write notes.".to_string(),
+                                    "turn_notes is not available in this session.".to_string(),
+                                    ActionOutcome::Failed,
+                                )
+                            } else {
+                                let redacted = self.scanner.redact(&text).text;
+                                let chars = redacted.chars().count();
+                                let current = turn_notes.text.chars().count();
+                                let separator = if turn_notes.text.is_empty() { 0 } else { 2 };
+                                let fits = if replace {
+                                    chars <= limit
+                                } else {
+                                    current + separator + chars <= limit
+                                };
+                                if !fits {
+                                    let detail = if replace {
+                                        format!(
+                                            "The replacement is {chars} characters, over the \
+                                             {limit}-character limit; shorten it."
+                                        )
+                                    } else {
+                                        format!(
+                                            "Adding {chars} more characters to {current} would \
+                                             exceed the {limit}-character limit; rewrite the \
+                                             notes shorter with replace."
+                                        )
+                                    };
+                                    (
+                                        "Attempted to write notes.".to_string(),
+                                        format!("notes: {current} / {limit} characters. {detail}"),
+                                        ActionOutcome::Failed,
+                                    )
+                                } else {
+                                    if replace {
+                                        turn_notes.text = redacted;
+                                        turn_notes.carried = false;
+                                    } else {
+                                        if !turn_notes.text.is_empty() {
+                                            turn_notes.text.push_str("\n\n");
+                                        }
+                                        turn_notes.text.push_str(&redacted);
+                                    }
+                                    let total = turn_notes.text.chars().count();
+                                    // The per-change log event carries the text
+                                    // (already redacted); the audit carries only
+                                    // sizes, never text (requirement 11).
+                                    self.session_store.record_turn_notes(
+                                        &session.id,
+                                        &task.id,
+                                        replace,
+                                        turn_notes.carried,
+                                        &turn_notes.text,
+                                        chars,
+                                    )?;
+                                    self.audit_log.record(
+                                        "turn_notes_recorded",
+                                        &[
+                                            ("actor", "model".to_string()),
+                                            ("sessionId", session.id.clone()),
+                                            ("taskId", task.id.clone()),
+                                            ("replace", replace.to_string()),
+                                            ("carried", turn_notes.carried.to_string()),
+                                            ("chars", chars.to_string()),
+                                            ("totalChars", total.to_string()),
+                                        ],
+                                    )?;
+                                    (
+                                        if replace {
+                                            "Updated notes.".to_string()
+                                        } else {
+                                            "Wrote notes.".to_string()
+                                        },
+                                        format!("notes: {total} / {limit} characters."),
+                                        ActionOutcome::Ok,
+                                    )
+                                }
+                            }
+                        }
                         ToolAction::AskUser(input) => {
                             // Requirement 5: the cap is read from the log, so a
                             // resumed turn counts what it already asked and an
@@ -4404,6 +4728,9 @@ impl ChatOrchestrator {
                                         context_files: context_files.clone(),
                                         round: action_rounds,
                                         exploration_rounds,
+                                        turn_notes: turn_notes.text.clone(),
+                                        turn_notes_carried: turn_notes.carried,
+                                        calls: turn_notes.calls.clone(),
                                         messages: messages.clone(),
                                         matched_tool_call: matched_tool_call.clone(),
                                         last_content: redacted.clone(),
@@ -4463,7 +4790,7 @@ impl ChatOrchestrator {
                 // identical call in a later round is a repeat. A write marks the
                 // round to clear the set once it completes: checking Git state
                 // again after changing it is verification, not a loop.
-                if let Some(key) = dispatched_read_key {
+                if let Some(key) = dispatched_call_key.clone() {
                     seen_read_calls.insert(key);
                 }
                 if writes_this_call {
@@ -4583,6 +4910,19 @@ impl ChatOrchestrator {
                     messages.push(ModelMessage::user(format!(
                         "Command result:\n{tool_result_text}"
                     )));
+                }
+                // Spec 65 §5.3: the durable per-turn record the notice, the
+                // warning and a resumed turn's seen-call set read. A call that
+                // opened no assistant message (the text-envelope command) has
+                // no stable index to record against.
+                if dispatched && let Some(message_index) = round_message {
+                    turn_notes.calls.push(RecordedCall {
+                        round: round_number,
+                        message_index,
+                        line: call_line.unwrap_or_default(),
+                        key: dispatched_call_key,
+                        writes: writes_this_call,
+                    });
                 }
             }
 
@@ -4751,6 +5091,7 @@ impl ChatOrchestrator {
             question_proposal: proposals.question,
             fallback_proposal: None,
             round_budget_proposal: None,
+            turn_notes: turn_notes.view(),
             cancelled: false,
             usage,
             estimated_cost,
@@ -4773,6 +5114,7 @@ impl ChatOrchestrator {
         messages: Vec<ModelMessage>,
         action_rounds: u32,
         exploration_rounds: u32,
+        turn_notes: TurnNotesState,
         turn_options: ChatTurnOptions,
         offer: PendingProviderFallback,
     ) -> Result<ChatTurnResult> {
@@ -4786,6 +5128,9 @@ impl ChatOrchestrator {
             context_files: context_files.clone(),
             round: action_rounds,
             exploration_rounds,
+            turn_notes: turn_notes.text.clone(),
+            turn_notes_carried: turn_notes.carried,
+            calls: turn_notes.calls.clone(),
             // The request as the provider refused it: approving re-issues this
             // round, so nothing is appended for a call that never answered.
             messages,
@@ -4864,6 +5209,7 @@ impl ChatOrchestrator {
                 message: offer.message,
             }),
             round_budget_proposal: None,
+            turn_notes: turn_notes.view(),
             cancelled: false,
             usage,
             estimated_cost,
@@ -4887,6 +5233,7 @@ impl ChatOrchestrator {
         messages: Vec<ModelMessage>,
         action_rounds: u32,
         exploration_rounds: u32,
+        turn_notes: TurnNotesState,
         max_rounds: u32,
         rounds_granted: u32,
         turn_options: ChatTurnOptions,
@@ -4907,6 +5254,9 @@ impl ChatOrchestrator {
             context_files: context_files.clone(),
             round: action_rounds,
             exploration_rounds,
+            turn_notes: turn_notes.text.clone(),
+            turn_notes_carried: turn_notes.carried,
+            calls: turn_notes.calls.clone(),
             // The conversation so far, unchanged: nothing was dispatched, so
             // resuming replays it and the model simply asks for its tool again.
             messages,
@@ -4954,6 +5304,7 @@ impl ChatOrchestrator {
                     "explorationLimit",
                     self.default_exploration_round_limit().to_string(),
                 ),
+                ("notesChars", turn_notes.text.chars().count().to_string()),
             ],
         )?;
         let usage = self
@@ -4991,6 +5342,7 @@ impl ChatOrchestrator {
                 rounds_more: self.default_tool_round_limit(),
                 at_hard_cap,
             }),
+            turn_notes: turn_notes.view(),
             cancelled: false,
             usage,
             estimated_cost,
@@ -5012,6 +5364,7 @@ impl ChatOrchestrator {
         task: Task,
         context_files: Vec<String>,
         partial: &str,
+        turn_notes: &TurnNotesState,
         model_run: ModelRun,
     ) -> Result<ChatTurnResult> {
         // Through the same scanner as a completed turn: stopping does not
@@ -5066,6 +5419,7 @@ impl ChatOrchestrator {
             question_proposal: None,
             fallback_proposal: None,
             round_budget_proposal: None,
+            turn_notes: turn_notes.view(),
             cancelled: true,
             usage,
             estimated_cost,
@@ -5129,12 +5483,13 @@ impl ChatOrchestrator {
         )
     }
 
-    /// The canonical identity of a read-only call for repeat detection
-    /// (spec 59 §5.3). `None` means the tool has no row in the proposal's table
-    /// and is therefore never a repeat — the err-toward-exploration direction
-    /// §5.3 requires, so a new read tool cannot silently start being policed
-    /// before its arguments are considered.
-    fn read_call_key(&self, repository_root: &Path, action: &ToolAction) -> Option<Vec<String>> {
+    /// The canonical identity of a dispatched call for repeat detection and
+    /// the elision notice (spec 59 §5.3, spec 65 §5.3). `None` means the tool
+    /// has no row in the proposal's table and is therefore never a repeat —
+    /// the err-toward-exploration direction §5.3 requires, so a new read tool
+    /// cannot silently start being policed before its arguments are
+    /// considered. `turn_notes` has a row so an identical append is a repeat.
+    fn call_key(&self, repository_root: &Path, action: &ToolAction) -> Option<Vec<String>> {
         match action {
             ToolAction::ReadFile {
                 path,
@@ -5268,8 +5623,40 @@ impl ChatOrchestrator {
                 }
                 Some(key)
             }
+            // An identical append is a repeat (requirement 8), so the key
+            // carries the redacted text's stable hash. A replace is never a
+            // repeat: replacing the whole record is how a full one is made to
+            // fit, and charging that as a repeated call would punish the only
+            // way out.
+            ToolAction::TurnNotes { text, replace } => (!*replace).then(|| {
+                vec![
+                    "turn_notes".to_string(),
+                    "append".to_string(),
+                    stable_text_hash(&self.scanner.redact(text).text),
+                ]
+            }),
             _ => None,
         }
+    }
+
+    /// A human-readable line for one dispatched call, over the same resolved
+    /// identity [`Self::call_key`] computes (spec 65 §5.3). Displaying a second
+    /// resolution would let the notice and the repeat rule disagree; calls
+    /// without a canonical row (a command, a patch, a plan, `turn_notes`) are
+    /// printed from [`tool_action_marker`] instead.
+    fn render_call_line(&self, repository_root: &Path, action: &ToolAction) -> Option<String> {
+        if let Some(key) = self.call_key(repository_root, action)
+            && let Some(line) = render_call_key(&key, repository_root)
+        {
+            return Some(line);
+        }
+        let (name, reference, _) = tool_action_marker(action);
+        let reference = single_line(&reference);
+        Some(if reference.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name} {reference}")
+        })
     }
 
     /// The checkout a read call names, as spec 60's resolver canonicalizes it,
@@ -5710,6 +6097,54 @@ fn paused_for(pending: &PendingChatTurn) -> PausedFor {
     }
 }
 
+/// One dispatched call in a turn, as the elision notice and the pre-cut
+/// warning describe it (spec 65 §5.3).
+///
+/// `message_index` is the index of the round's assistant message in `messages`.
+/// That array is append-only within a turn, so the index stays stable and lets
+/// `bounded_messages` decide which entries precede the cut without re-deriving
+/// round boundaries. `key` is the canonical identity from [`ChatOrchestrator::call_key`]
+/// (for repeat detection on resume) and `line` its rendered, already-redacted
+/// display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RecordedCall {
+    round: u32,
+    message_index: usize,
+    line: String,
+    #[serde(default)]
+    key: Option<Vec<String>>,
+    #[serde(default)]
+    writes: bool,
+}
+
+/// The notes and call list a turn carries across a pause (spec 65 §5.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct TurnNotesState {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    carried: bool,
+    #[serde(default)]
+    calls: Vec<RecordedCall>,
+}
+
+impl TurnNotesState {
+    fn from_pending(pending: &PendingChatTurn) -> Self {
+        TurnNotesState {
+            text: pending.turn_notes.clone(),
+            carried: pending.turn_notes_carried,
+            calls: pending.calls.clone(),
+        }
+    }
+
+    fn view(&self) -> Option<TurnNotesView> {
+        (!self.text.is_empty()).then(|| TurnNotesView {
+            text: self.text.clone(),
+            carried: self.carried,
+        })
+    }
+}
+
 /// Conversation state saved when a chat turn pauses on a command that needs
 /// human approval, so [`ChatOrchestrator::resume_after_command_decision`]
 /// can pick the turn back up once the user decides.
@@ -5730,6 +6165,21 @@ struct PendingChatTurn {
     /// existed loadable, with no exploration rounds spent.
     #[serde(default)]
     exploration_rounds: u32,
+    /// The turn's notes at the pause (spec 65 §5.6), already redacted. A
+    /// pending turn written before this field existed loads with no notes and
+    /// resumes as it always did.
+    #[serde(default)]
+    turn_notes: String,
+    /// Whether the notes still hold text carried from an earlier turn. A
+    /// replace clears it; an append keeps it.
+    #[serde(default)]
+    turn_notes_carried: bool,
+    /// Every dispatched call this turn, oldest first. Persisted so the
+    /// elision notice survives a pause and `seen_read_calls` can be rebuilt
+    /// after a resume (requirement 8). `#[serde(default)]` keeps older
+    /// pending turns loadable with an empty list.
+    #[serde(default)]
+    calls: Vec<RecordedCall>,
     messages: Vec<ModelMessage>,
     matched_tool_call: Option<ToolCall>,
     last_content: String,
@@ -6195,16 +6645,30 @@ fn build_model_prompt(
 /// so a tool result is never left without the call it answers. The session log
 /// still holds every round; only the request is bounded. Spec 47 requirement 6,
 /// the half `OBSERVATIONS.md` entry 6 names.
-fn bounded_messages(messages: &[ModelMessage], max_messages: usize) -> Vec<ModelMessage> {
-    if messages.len() <= max_messages {
-        return messages.to_vec();
-    }
+///
+/// Spec 65 adds up to three blocks *beside* the bounded tail: the turn's notes
+/// after the seed, the notes-aware elision notice, and a warning naming the
+/// oldest round still in view. The round budget stays exactly
+/// `max_messages - 3`, so the request may exceed `max_messages` by the blocks'
+/// size and the number of rounds kept is unchanged. With notes off
+/// (`NotesWindow::none()`) the result is byte-for-byte today's.
+fn bounded_messages(
+    messages: &[ModelMessage],
+    max_messages: usize,
+    window: &NotesWindow<'_>,
+) -> Vec<ModelMessage> {
+    let head_len = messages.len().min(HEAD_MESSAGES);
+    let head = messages[..head_len].to_vec();
+    let tail = &messages[head_len..];
     // The head and the notice are never dropped, so the effective floor is
     // three messages whatever a repository sets.
-    let head = messages[..2].to_vec();
-    let tail = &messages[2..];
     let budget = max_messages.saturating_sub(3);
-    let mut drop_count = tail.len().saturating_sub(budget);
+    let over = messages.len() > max_messages;
+    let mut drop_count = if over {
+        tail.len().saturating_sub(budget)
+    } else {
+        0
+    };
     // Whole rounds: every round opens with its assistant message, and a
     // batched round's one message is followed by a result per call, so the
     // cut lands on a round's start. Stopping inside a round would leave a
@@ -6213,7 +6677,7 @@ fn bounded_messages(messages: &[ModelMessage], max_messages: usize) -> Vec<Model
     // latest round would take away the results the model just asked for.
     // Then it moves back to that round's start, and the request exceeds the
     // bound by the part of one round that does not fit.
-    if drop_count < tail.len() && tail[drop_count].role != "assistant" {
+    if over && drop_count < tail.len() && tail[drop_count].role != "assistant" {
         let is_round_start = |message: &ModelMessage| message.role == "assistant";
         drop_count = match tail[drop_count..].iter().position(is_round_start) {
             Some(offset) => drop_count + offset,
@@ -6227,12 +6691,288 @@ fn bounded_messages(messages: &[ModelMessage], max_messages: usize) -> Vec<Model
         .iter()
         .filter(|message| message.role != "assistant")
         .count();
+
     let mut bounded = head;
-    bounded.push(ModelMessage::system(format!(
-        "Earlier rounds of this turn were elided to bound the request: {drop_count} messages ({results} call results) omitted. The session log still holds them; repeat a read if you need it."
-    )));
+    if window.enabled && !window.notes.is_empty() {
+        let header = if window.carried {
+            CARRIED_NOTES_HEADER
+        } else {
+            NOTES_HEADER
+        };
+        bounded.push(ModelMessage::system(format!("{header}\n{}", window.notes)));
+    }
+    if over {
+        bounded.push(ModelMessage::system(if window.enabled {
+            elision_notice(drop_count, results, window)
+        } else {
+            format!(
+                "Earlier rounds of this turn were elided to bound the request: {drop_count} messages ({results} call results) omitted. The session log still holds them; repeat a read if you need it."
+            )
+        }));
+    }
     bounded.extend_from_slice(&tail[drop_count..]);
+    if window.enabled
+        && tail.len() >= budget
+        && drop_count < tail.len()
+        && let Some(warning) = pre_cut_warning(drop_count, window)
+    {
+        bounded.push(ModelMessage::system(warning));
+    }
     bounded
+}
+
+/// How many calls the elision notice and the pre-cut warning list (spec 65
+/// §5.3, §5.4), and how long one rendered line may be. The caps keep both
+/// blocks a fixed size whatever a turn did.
+const ELISION_NOTICE_LINE_CAP: usize = 40;
+const PRE_CUT_LINE_CAP: usize = 10;
+const CALL_LINE_MAX_CHARS: usize = 120;
+/// The system prompt and the user seed, which `bounded_messages` never drops.
+const HEAD_MESSAGES: usize = 2;
+
+const NOTES_HEADER: &str = "Notes you recorded earlier in this turn:";
+const CARRIED_NOTES_HEADER: &str = "Notes carried from earlier turns in this session, and added to in this one. Files may have changed since they were written:";
+
+/// What `bounded_messages` may pin into a request (spec 65 §5.2).
+///
+/// `none()` is the key = 0 shape: no notes block, no warning, and today's
+/// notice literal, so the request is exactly what it was before this spec.
+struct NotesWindow<'a> {
+    notes: &'a str,
+    carried: bool,
+    calls: &'a [RecordedCall],
+    enabled: bool,
+    notes_limit: usize,
+    notice_cap: usize,
+    warning_cap: usize,
+}
+
+impl NotesWindow<'_> {
+    fn none() -> NotesWindow<'static> {
+        NotesWindow {
+            notes: "",
+            carried: false,
+            calls: &[],
+            enabled: false,
+            notes_limit: 0,
+            notice_cap: 0,
+            warning_cap: 0,
+        }
+    }
+}
+
+/// The calls already made, oldest first, capped with "…and N more".
+fn rendered_call_lines<'a>(
+    calls: impl IntoIterator<Item = &'a RecordedCall>,
+    cap: usize,
+) -> (Vec<String>, usize) {
+    let calls: Vec<&RecordedCall> = calls.into_iter().collect();
+    let shown = calls.len().min(cap);
+    let lines = calls[..shown]
+        .iter()
+        .map(|call| format!("  {}", call.line))
+        .collect();
+    (lines, calls.len().saturating_sub(shown))
+}
+
+/// The notice that replaces today's literal when notes are on and rounds were
+/// cut. It names the calls that left the window, not just how many messages
+/// did, so the model can tell what it has already looked at.
+fn elision_notice(drop_count: usize, results: usize, window: &NotesWindow<'_>) -> String {
+    let mut notice = format!(
+        "Earlier rounds of this turn were elided to bound the request: {drop_count} messages ({results} call results) omitted."
+    );
+    let boundary = HEAD_MESSAGES + drop_count;
+    let elided = window
+        .calls
+        .iter()
+        .filter(|call| call.message_index < boundary);
+    let (lines, more) = rendered_call_lines(elided, window.notice_cap);
+    if !lines.is_empty() {
+        notice.push_str(" Calls already made, oldest first:\n");
+        notice.push_str(&lines.join("\n"));
+        if more > 0 {
+            notice.push_str(&format!("\n  …and {more} more"));
+        }
+    }
+    notice.push_str("\nThe session log still holds every result. Your notes are above.");
+    notice
+}
+
+/// The warning that names the oldest round still in view once the tail fills
+/// the window (spec 65 §5.4). The model gets one round to record what it still
+/// needs before those results are gone.
+fn pre_cut_warning(drop_count: usize, window: &NotesWindow<'_>) -> Option<String> {
+    let boundary = HEAD_MESSAGES + drop_count;
+    let oldest = window
+        .calls
+        .iter()
+        .find(|call| call.message_index >= boundary)?;
+    let (lines, more) = rendered_call_lines(
+        window
+            .calls
+            .iter()
+            .filter(|call| call.round == oldest.round && call.message_index >= boundary),
+        window.warning_cap,
+    );
+    let mut warning = format!(
+        "The window is full. With your next request, round {} leaves it:",
+        oldest.round
+    );
+    for line in lines {
+        warning.push('\n');
+        warning.push_str(&line);
+    }
+    if more > 0 {
+        warning.push_str(&format!("\n  …and {more} more"));
+    }
+    warning.push_str("\nRecord in turn_notes anything from these results you still need.");
+    warning.push_str(&format!(
+        "\nNotes: {} / {} characters.",
+        window.notes.chars().count(),
+        window.notes_limit
+    ));
+    Some(warning)
+}
+
+/// Render one canonical call line from the segmented identity [`ChatOrchestrator::call_key`]
+/// produced. Reading the identity rather than re-resolving a path is what
+/// keeps the elision notice and the repeat rule from drifting apart.
+fn render_call_key(key: &[String], repository_root: &Path) -> Option<String> {
+    let tool = key.first()?.as_str();
+    let segment_after = |tag: &str| {
+        key.iter()
+            .position(|segment| segment == tag)
+            .and_then(|index| key.get(index + 1))
+    };
+    let mut line = match tool {
+        "read_file" => {
+            let path = key.get(2)?;
+            let mut line = format!("read_file {path}");
+            if let Some(index) = key.iter().position(|segment| segment == "range") {
+                line.push_str(&format!(" {}–{}", key.get(index + 1)?, key.get(index + 2)?));
+            }
+            line
+        }
+        "list_directory" => {
+            let path = key.get(2)?;
+            let mut line = format!("list_directory {path}");
+            if let Some(depth) = segment_after("depth") {
+                line.push_str(&format!(" depth {depth}"));
+            }
+            line
+        }
+        "search_content" => {
+            let pattern = key.get(2)?;
+            let mut line = format!("search_content \"{pattern}\"");
+            if let Some(glob) = segment_after("glob") {
+                line.push_str(&format!(" in {glob}"));
+            }
+            if let Some(max) = segment_after("max") {
+                line.push_str(&format!(" max {max}"));
+            }
+            line
+        }
+        "search_codebase" => {
+            let query = key.get(1)?;
+            let mut line = format!("search_codebase \"{query}\"");
+            if key.get(2).map(String::as_str) == Some("true") {
+                line.push_str(" semantic");
+            }
+            if let Some(limit) = key.get(3) {
+                line.push_str(&format!(" limit {limit}"));
+            }
+            line
+        }
+        "read_git_status" => "read_git_status".to_string(),
+        "read_git_diff" => {
+            let mut line = "read_git_diff".to_string();
+            if key.get(2).map(String::as_str) == Some("true") {
+                line.push_str(" staged");
+            }
+            if key.get(3).map(String::as_str) == Some("true") {
+                line.push_str(" stat");
+            }
+            if let Some(base) = segment_after("base") {
+                line.push_str(&format!(" base {base}"));
+            }
+            if let Some(index) = key.iter().position(|segment| segment == "paths") {
+                let paths = &key[index + 1..];
+                if !paths.is_empty() {
+                    line.push_str(&format!(" paths {}", paths.join(",")));
+                }
+            }
+            line
+        }
+        "list_worktrees" => {
+            let mut line = "list_worktrees".to_string();
+            if let Some(base) = segment_after("base") {
+                line.push_str(&format!(" base {base}"));
+            }
+            line
+        }
+        "read_git_log" => {
+            let mut line = "read_git_log".to_string();
+            if let Some(base) = segment_after("base") {
+                line.push_str(&format!(" base {base}"));
+            }
+            if let Some(max) = segment_after("max") {
+                line.push_str(&format!(" n {max}"));
+            }
+            line
+        }
+        // `turn_notes` and every non-read call have no canonical row; the
+        // caller falls back to `tool_action_marker`.
+        _ => return None,
+    };
+    // The checkout is segment 1 for every read tool that has one.
+    let checkout = match tool {
+        "search_codebase" | "list_worktrees" | "turn_notes" => None,
+        _ => key.get(1),
+    };
+    if let Some(tag) = checkout
+        && let Some(display) = checkout_display(tag, repository_root)
+    {
+        line.push_str(&format!(" (worktree {display})"));
+    }
+    Some(line)
+}
+
+/// How a `call_key` checkout tag is named in a rendered line: nothing for the
+/// session's own checkout, the given argument for one that could not be
+/// resolved, and the repository-relative path for a registered worktree.
+fn checkout_display(tag: &str, repository_root: &Path) -> Option<String> {
+    if tag == "checkout:session" {
+        return None;
+    }
+    if let Some(given) = tag.strip_prefix("checkout-as-given:") {
+        return Some(given.to_string());
+    }
+    let path = tag.strip_prefix("checkout:")?;
+    let path = Path::new(path);
+    Some(
+        path.strip_prefix(repository_root)
+            .map(|relative| relative.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string()),
+    )
+}
+
+/// Collapse every run of whitespace to one space, so a marker's reference can
+/// never add a line to the notice.
+fn single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A stable 64-bit FNV-1a hash, as hex. `DefaultHasher` is not guaranteed
+/// stable across Rust versions, and a notes key is persisted with a paused
+/// turn, so the repeat rule must not change when the binary is rebuilt.
+fn stable_text_hash(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6329,6 +7069,15 @@ pub(crate) enum ToolAction {
     /// One bounded question for the user (spec 50). Already validated against
     /// the bounds when it is decoded; not yet redacted.
     AskUser(AskUserInput),
+    /// A model-written note about what it has learned this turn (spec 65).
+    ///
+    /// Not a read and not a turn-shaping call: it changes only the turn's
+    /// notes, so it may run in the same round as the read that produced the
+    /// finding, and a round of reads and notes is exploration (requirement 8).
+    TurnNotes {
+        text: String,
+        replace: bool,
+    },
 }
 
 /// What dispatching a tool can change beyond its own result.
@@ -6354,6 +7103,13 @@ enum ActionEffect {
     /// planning, completing a step, proposing a patch or an edit. Safe for
     /// crash recovery, not a candidate for batching.
     ShapesTurn,
+    /// Writes the turn's own notes (spec 65). It is not `WritesRepository`
+    /// because nothing outside the session log changes, and it is not
+    /// `ShapesTurn` because recording a finding in the same round as the read
+    /// that found it is exactly what the model should do. Its budget decision
+    /// is exploration: a round of reads and notes is charged to the read
+    /// allowance (requirement 8).
+    Notes,
 }
 
 fn action_effect(action: &ToolAction) -> ActionEffect {
@@ -6376,14 +7132,20 @@ fn action_effect(action: &ToolAction) -> ActionEffect {
         | ToolAction::ReadGitDiff { .. }
         | ToolAction::ListWorktrees { .. }
         | ToolAction::ReadGitLog { .. } => ActionEffect::ReadOnly,
+        ToolAction::TurnNotes { .. } => ActionEffect::Notes,
     }
 }
 
 /// Whether a tool may be dispatched alongside another in the same round.
 /// Derived from [`action_effect`] rather than declared beside it, so there is
-/// no second list to drift.
+/// no second list to drift. `Notes` is batchable with reads but is not a read:
+/// its mutation happens on the loop thread after a batch returns, never inside
+/// the batch worker (spec 65 §5.1).
 fn action_is_batchable_read_only(action: &ToolAction) -> bool {
-    matches!(action_effect(action), ActionEffect::ReadOnly)
+    matches!(
+        action_effect(action),
+        ActionEffect::ReadOnly | ActionEffect::Notes
+    )
 }
 
 /// What a `before_tool` verdict does to the call about to be dispatched
@@ -6483,6 +7245,7 @@ fn tool_event_payload(
         ToolAction::ProposePlan(_) => ("propose_plan", Vec::new()),
         ToolAction::CompleteStep => ("complete_step", Vec::new()),
         ToolAction::AskUser(_) => ("ask_user", Vec::new()),
+        ToolAction::TurnNotes { .. } => ("turn_notes", Vec::new()),
         ToolAction::Command(_) => ("run_command", Vec::new()),
         ToolAction::WebDiagnostic(_) => ("web_diagnostic", Vec::new()),
         ToolAction::McpCall { .. } => ("mcp_call", Vec::new()),
@@ -6587,6 +7350,13 @@ fn tool_action_marker_unscoped(
         // The reference stays empty: the question is model-authored and not
         // yet redacted when the marker is written.
         ToolAction::AskUser(_) => ("ask_user", String::new(), side_effecting),
+        // Only the size: the notes themselves are in the session log, and a
+        // reference must not leak model-written text into the action log.
+        ToolAction::TurnNotes { text, .. } => (
+            "turn_notes",
+            text.chars().count().to_string(),
+            side_effecting,
+        ),
         ToolAction::ReadFile { path, .. } => ("read_file", path.clone(), side_effecting),
         ToolAction::ListDirectory { dir, .. } => (
             "list_directory",
@@ -6746,6 +7516,13 @@ fn tool_action_label(action: &ToolAction) -> String {
         ToolAction::ProposePlan(steps) => format!("Planning {} steps", steps.len()),
         ToolAction::CompleteStep => "Finishing a step".to_string(),
         ToolAction::AskUser(_) => "Asking you a question".to_string(),
+        ToolAction::TurnNotes { replace, .. } => {
+            if *replace {
+                "Updating notes".to_string()
+            } else {
+                "Writing notes".to_string()
+            }
+        }
         ToolAction::ReadFile { path, worktree, .. } => {
             format!("Reading {path}{}", in_worktree(worktree.as_deref()))
         }
@@ -6863,6 +7640,14 @@ fn read_file_tool_definition() -> ToolDefinition {
         name: "read_file".to_string(),
         description: "Read a file from the repository, or from one of its git worktrees with `worktree`, to help answer the user's question. The result states the lines returned and the file's total line count, so a truncated read says so rather than reading as the whole file.".to_string(),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Repository-relative file path\"},\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"start_line\":{\"type\":\"integer\",\"description\":\"First line to return, 1-based; default 1\"},\"end_line\":{\"type\":\"integer\",\"description\":\"Last line to return, inclusive; default is the last line or the read cap\"}},\"required\":[\"path\"]}".to_string(),
+    }
+}
+
+fn turn_notes_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "turn_notes".to_string(),
+        description: "Record short notes about what you have learned while investigating. The notes stay visible for the rest of this turn even after earlier rounds of the conversation are dropped to bound the request, and they carry into the next turn of this session. Use them for findings worth keeping: paths, what a component does, how pieces connect, and open questions. Append a paragraph, or set replace to rewrite the whole record. Keep them short.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"What to record. Appended as a new paragraph unless replace is true.\"},\"replace\":{\"type\":\"boolean\",\"description\":\"Replace the whole record instead of appending; defaults to false\"}},\"required\":[\"text\"]}".to_string(),
     }
 }
 
@@ -7006,6 +7791,33 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
                 .map_err(|error| ClientError::InvalidInput(error.to_string()))?;
             input.validate().map_err(ClientError::InvalidInput)?;
             Ok(Some(ToolAction::AskUser(input)))
+        }
+        // Empty notes are a model error worth naming, like a malformed
+        // question: an empty append records nothing, and silently accepting it
+        // would waste a round (spec 65 §5.1).
+        "turn_notes" => {
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+            else {
+                return Ok(None);
+            };
+            let Some(text) = arguments
+                .get("text")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Err(ClientError::InvalidInput(
+                    "turn_notes requires non-empty text".to_string(),
+                ));
+            };
+            let replace = arguments
+                .get("replace")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            Ok(Some(ToolAction::TurnNotes {
+                text: text.to_string(),
+                replace,
+            }))
         }
         "read_file" => {
             let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
@@ -8020,7 +8832,7 @@ mod evidence_tests {
             ));
         }
 
-        let bounded = bounded_messages(&messages, 10);
+        let bounded = bounded_messages(&messages, 10, &NotesWindow::none());
 
         assert!(
             bounded.len() <= 10,
@@ -8067,7 +8879,7 @@ mod evidence_tests {
 
         let last_round = &messages[messages.len() - 4..];
         for max in 3..messages.len() {
-            let bounded = bounded_messages(&messages, max);
+            let bounded = bounded_messages(&messages, max, &NotesWindow::none());
             let kept_only_the_latest_round = bounded[3..] == *last_round;
             assert!(
                 bounded.len() <= max || kept_only_the_latest_round,
@@ -8092,12 +8904,183 @@ mod evidence_tests {
     #[test]
     fn a_turn_inside_the_window_is_left_alone() {
         let messages = vec![ModelMessage::system("system"), ModelMessage::user("prompt")];
-        let bounded = bounded_messages(&messages, 24);
+        let bounded = bounded_messages(&messages, 24, &NotesWindow::none());
         assert_eq!(bounded.len(), 2);
         assert!(
             !bounded
                 .iter()
                 .any(|message| message.content.contains("elided"))
+        );
+    }
+
+    /// Spec 65's strongest available "byte-identical to before": the
+    /// pre-change algorithm, copied verbatim, compared against the real
+    /// function at every window and length in a representative matrix.
+    #[test]
+    fn with_notes_off_every_request_is_byte_identical_to_todays() {
+        fn bounded_messages_before_65(
+            messages: &[ModelMessage],
+            max_messages: usize,
+        ) -> Vec<ModelMessage> {
+            if messages.len() <= max_messages {
+                return messages.to_vec();
+            }
+            let head = messages[..2].to_vec();
+            let tail = &messages[2..];
+            let budget = max_messages.saturating_sub(3);
+            let mut drop_count = tail.len().saturating_sub(budget);
+            if drop_count < tail.len() && tail[drop_count].role != "assistant" {
+                let is_round_start = |message: &ModelMessage| message.role == "assistant";
+                drop_count = match tail[drop_count..].iter().position(is_round_start) {
+                    Some(offset) => drop_count + offset,
+                    None => tail[..drop_count]
+                        .iter()
+                        .rposition(is_round_start)
+                        .unwrap_or(0),
+                };
+            }
+            let results = tail[..drop_count]
+                .iter()
+                .filter(|message| message.role != "assistant")
+                .count();
+            let mut bounded = head;
+            bounded.push(ModelMessage::system(format!(
+                "Earlier rounds of this turn were elided to bound the request: {drop_count} messages ({results} call results) omitted. The session log still holds them; repeat a read if you need it."
+            )));
+            bounded.extend_from_slice(&tail[drop_count..]);
+            bounded
+        }
+
+        for rounds in 0..14 {
+            let mut messages = vec![ModelMessage::system("system"), ModelMessage::user("prompt")];
+            for round in 0..rounds {
+                messages.push(ModelMessage::assistant(format!("assistant {round}")));
+                for call in 0..(round % 3 + 1) {
+                    messages.push(ModelMessage::tool(
+                        format!("call_{round}_{call}"),
+                        format!("result {round} {call}"),
+                    ));
+                }
+            }
+            for max_messages in [3, 4, 5, 10, 24, 40] {
+                assert_eq!(
+                    bounded_messages(&messages, max_messages, &NotesWindow::none()),
+                    bounded_messages_before_65(&messages, max_messages),
+                    "rounds={rounds} max={max_messages}"
+                );
+            }
+        }
+    }
+
+    fn notes_window<'a>(
+        notes: &'a str,
+        calls: &'a [RecordedCall],
+        carried: bool,
+    ) -> NotesWindow<'a> {
+        NotesWindow {
+            notes,
+            carried,
+            calls,
+            enabled: true,
+            notes_limit: 8_000,
+            notice_cap: ELISION_NOTICE_LINE_CAP,
+            warning_cap: PRE_CUT_LINE_CAP,
+        }
+    }
+
+    fn call(index: usize, line: &str) -> RecordedCall {
+        RecordedCall {
+            round: index as u32 + 1,
+            message_index: 2 + index * 2,
+            line: line.to_string(),
+            key: None,
+            writes: false,
+        }
+    }
+
+    #[test]
+    fn the_notes_block_sits_between_the_seed_and_the_notice() {
+        let mut messages = vec![ModelMessage::system("system"), ModelMessage::user("prompt")];
+        for index in 0..10 {
+            messages.push(ModelMessage::assistant(format!("assistant {index}")));
+            messages.push(ModelMessage::tool(
+                format!("call_{index}"),
+                format!("result {index}"),
+            ));
+        }
+        let calls: Vec<RecordedCall> = (0..10)
+            .map(|index| call(index, &format!("read_file src/{index}.rs")))
+            .collect();
+        let bounded = bounded_messages(&messages, 10, &notes_window("a finding", &calls, false));
+
+        assert_eq!(bounded[0].role, "system");
+        assert_eq!(bounded[1].role, "user");
+        assert!(
+            bounded[2].content.starts_with(NOTES_HEADER),
+            "the notes are the first block after the seed: {}",
+            bounded[2].content
+        );
+        assert!(
+            bounded[3].content.contains("elided"),
+            "the notice follows the notes: {}",
+            bounded[3].content
+        );
+        assert!(
+            bounded
+                .last()
+                .unwrap()
+                .content
+                .contains("The window is full."),
+            "the warning is last: {}",
+            bounded.last().unwrap().content
+        );
+    }
+
+    #[test]
+    fn the_notes_block_does_not_shrink_the_round_budget() {
+        let mut messages = vec![ModelMessage::system("system"), ModelMessage::user("prompt")];
+        for index in 0..10 {
+            messages.push(ModelMessage::assistant(format!("assistant {index}")));
+            messages.push(ModelMessage::tool(
+                format!("call_{index}"),
+                format!("result {index}"),
+            ));
+        }
+        let calls: Vec<RecordedCall> = (0..10)
+            .map(|index| call(index, &format!("read_file src/{index}.rs")))
+            .collect();
+        for max_messages in [5, 10, 24] {
+            let without = bounded_messages(&messages, max_messages, &NotesWindow::none());
+            let with = bounded_messages(
+                &messages,
+                max_messages,
+                &notes_window("a finding", &calls, false),
+            );
+            // One notes block and one warning at most; the retained rounds
+            // are exactly the same messages.
+            let without_rounds: Vec<&ModelMessage> = without
+                .iter()
+                .filter(|message| message.role == "assistant" || message.role == "tool")
+                .collect();
+            let with_rounds: Vec<&ModelMessage> = with
+                .iter()
+                .filter(|message| message.role == "assistant" || message.role == "tool")
+                .collect();
+            assert_eq!(
+                without_rounds, with_rounds,
+                "max={max_messages}: the round budget must be unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn the_carried_header_is_used_while_carried_text_remains() {
+        let messages = vec![ModelMessage::system("system"), ModelMessage::user("prompt")];
+        let bounded = bounded_messages(&messages, 24, &notes_window("a finding", &[], true));
+        assert!(
+            bounded[2].content.starts_with(CARRIED_NOTES_HEADER),
+            "{}",
+            bounded[2].content
         );
     }
 

@@ -177,6 +177,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "agent_max_questions_per_turn" => "Questions the model may ask per turn",
         "agent_max_task_tokens" => "Token limit per turn",
         "agent_max_turn_messages" => "Messages sent per model request",
+        "agent_max_turn_notes_chars" => "Notes size",
         "project_roots_added" => "Folders you made project roots",
         "project_roots_removed" => "Folders you said are not project roots",
         "shell" => "Shell that runs commands",

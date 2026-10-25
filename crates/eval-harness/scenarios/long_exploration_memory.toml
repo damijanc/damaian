@@ -1,0 +1,60 @@
+name = "long_exploration_memory"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Read upload.rs and checkout.rs, note how they connect, then summarise the crate."
+follow_up_prompt = "Now say where a new approval cause for out-of-repository writes would go."
+
+# Spec 65 §5.9. Round 1 batches a read with a `turn_notes` call; the request
+# window is deliberately low enough to cut the early rounds, so the note has to
+# survive the elision to appear in the round that answers. The second turn runs
+# in the same session and carries the first turn's notes.
+config_overlay = """
+agent_max_turn_messages=6
+agent_max_tool_rounds=8
+agent_max_exploration_rounds=24
+agent_max_turn_notes_chars=8000
+"""
+
+# Round 1: the read and the note that must outlive the cut.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs" } },
+  { name = "turn_notes", arguments = { text = "upload.rs sends the payload through upload()." } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/checkout.rs" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "search_content", arguments = { pattern = "pub fn" } },
+]
+
+# Round 4 answers. With the window at six messages, the note from round 1 is the
+# only surviving record of upload.rs by this point.
+[[turn]]
+content = "The crate handles uploads and checkout; upload.rs sends the payload through upload()."
+
+# The second turn in the same session. Its first request must carry the notes.
+[[turn]]
+content = "An approval cause belongs beside the existing causes in command_policy.rs."
+
+[assert]
+notes_calls = 1
+carried_notes_at_least = 1
+repeated_elided_reads = 0
+exploration_rounds = 3
+task_count = 2
+files_changed_outside_patch = 0
+deterministic_only = [
+  "notes_calls",
+  "carried_notes_at_least",
+  "repeated_elided_reads",
+  "exploration_rounds",
+  "task_count",
+]

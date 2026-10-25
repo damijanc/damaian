@@ -382,6 +382,36 @@ pub fn evaluate(
                 rounds.to_string(),
             );
         }
+
+        // Spec 65 §5.9: the notes the run took, what it carried, and whether a
+        // read repeated an earlier one.
+        if let Some(expected) = asserts.notes_calls {
+            let calls = run.record.notes_calls;
+            push(
+                "notes_calls",
+                calls == expected,
+                expected.to_string(),
+                calls.to_string(),
+            );
+        }
+        if let Some(expected) = asserts.carried_notes_at_least {
+            let carried = run.record.carried_notes;
+            push(
+                "carried_notes_at_least",
+                carried >= expected,
+                format!("at least {expected}"),
+                carried.to_string(),
+            );
+        }
+        if let Some(expected) = asserts.repeated_elided_reads {
+            let repeats = run.record.repeated_elided_reads;
+            push(
+                "repeated_elided_reads",
+                repeats == expected,
+                expected.to_string(),
+                repeats.to_string(),
+            );
+        }
     }
 
     results

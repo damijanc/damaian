@@ -13,6 +13,14 @@ planning).
 near it. Everything below was checked on 2026-10-24 against
 `spec65-plan-65b021`.
 
+**Re-checked on 2026-10-25 against main `e7e5258`**, where #26 is Done. The
+seed is still exactly two messages (`system` + `user`), `bounded_messages` is
+unchanged, and `build_model_prompt` now takes a `ContextPlan` and a scanner.
+Line numbers below have moved by roughly 500–1,300; resolve by function name,
+not by the number. The notes block stays a system message, not a `Pinned`
+context item: `context_budget.pinned` exists, but notes are turn state and must
+survive `bounded_messages` without a repository read.
+
 ## 1. Spec citations that moved
 
 | Proposal cited (2026-10-18/19) | Now |
@@ -402,8 +410,8 @@ next to the seed) touch that first two regions:
 - **Task 7 (carry across turns)** edits the new-turn path — where `messages` is
   seeded and `carry_plan_from_the_previous_turn` runs (`chat.rs:949`) — and
   therefore overlaps both `build_model_prompt`'s call site and the seed
-  construction. **It must not start until #26 has landed**, and it must
-  re-check every `chat.rs` reference in this file and in `tasks.md` first.
+  construction. **It was re-checked after #26 landed on 2026-10-25** (main
+  `e7e5258`): the seed is still two messages, so the split point did not move.
 - **Task 4 (`bounded_messages` pinning)** inserts the notes block immediately
   after `messages[..2]`, so it depends on the seed being *two* messages. #26
   may change what the seed contains but should not change the count; if it
@@ -446,7 +454,7 @@ may run beside #65.
 
 ### Ordering consequence
 
-The plan orders the work so the `chat.rs`-light tasks land first. If #26 lands
-while Task 1–3 are in progress, re-read §3 and §4 of this file before Task 4.
-If #26 has not landed when Task 7 is reached, stop and wait; do not implement
-the carry against the pre-#26 seed and rebase later.
+The plan orders the work so the `chat.rs`-light tasks land first. #26 landed on
+2026-10-25 while Task 1–6 were in progress; §3 and §4 were re-read before Task
+4, and Task 7 was re-checked against the post-#26 seed. The re-check found the
+seed still two messages and `bounded_messages` unchanged.

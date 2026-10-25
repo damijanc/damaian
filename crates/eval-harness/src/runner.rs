@@ -497,6 +497,34 @@ fn drive(
         );
     }
 
+    // Spec 65 §5.9: a scenario may run a second user turn in the same session.
+    // The scripted responses continue where the first turn's script stopped, so
+    // the follow-up is a real new turn that inherits the first turn's notes
+    // rather than a replay of the same outcome.
+    if let Some(prompt) = &scenario.follow_up_prompt
+        && let Ok(first) = &outcome
+    {
+        let session_id = first.session.id.clone();
+        let cancel = CancelToken::new();
+        let mut on_follow_up_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_follow_up_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        outcome = engine.chat_orchestrator.ask_with_session_with_options(
+            &materialized.root,
+            prompt,
+            &[],
+            Some(&session_id),
+            adapter,
+            &mut sink,
+            turn_options(scenario),
+        );
+    }
+
     if let Ok(result) = &outcome
         && let Some(usage) = result.usage
     {
@@ -578,6 +606,11 @@ fn drive(
     // Spec 59 §5.6: exploration rounds are derived from the same session log,
     // not from the script, so the figure describes what the run dispatched.
     run_record.exploration_rounds = trace::exploration_rounds(&materialized.data_dir)?;
+    // Spec 65 requirement 11: the notes and repeat metrics read from the same
+    // log, so they describe what the run dispatched rather than the script.
+    run_record.notes_calls = trace::notes_calls(&materialized.data_dir)?;
+    run_record.repeated_elided_reads = trace::repeated_elided_reads(&materialized.data_dir)?;
+    run_record.carried_notes = trace::carried_notes(&materialized.data_dir)?;
 
     // filesChanged is the union of what the engine says it wrote — never a walk
     // of the working tree, which would also catch git's own bookkeeping.

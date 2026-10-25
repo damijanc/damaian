@@ -350,10 +350,10 @@ fn exploration_rounds_come_from_the_session_log() {
     let sessions = data_dir.join("sessions");
     std::fs::create_dir_all(&sessions).expect("sessions dir");
     let log = [
-        // Round one: two reads, both read tools.
+        // Round one: a read and a notes call, both exploration (spec 65).
         session_action_started("model_call"),
         session_action_started("read_file"),
-        session_action_started("read_git_log"),
+        session_action_started("turn_notes"),
         // Round two: a command beside a read — an action round.
         session_action_started("model_call"),
         session_action_started("run_command"),
@@ -372,7 +372,62 @@ fn exploration_rounds_come_from_the_session_log() {
     assert_eq!(
         trace::exploration_rounds(&data_dir).expect("exploration rounds"),
         2,
-        "two all-read rounds, and the mixed round is an action round"
+        "a read-and-notes round and the all-read round are exploration; the mixed round is not"
+    );
+}
+
+/// Spec 65 requirement 11: notes calls and repeated reads come from the same
+/// action markers, not from the script.
+#[test]
+fn notes_calls_and_repeated_reads_come_from_the_session_log() {
+    let data_dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+    let sessions = data_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions dir");
+    let log = [
+        session_action_started("model_call"),
+        session_action_started("read_file"),
+        session_action_started("turn_notes"),
+        // The same read again: a repeat by the log's reckoning.
+        session_action_started("read_file"),
+        session_action_started("turn_notes"),
+    ]
+    .join("\n");
+    std::fs::write(sessions.join("session-notes.jsonl"), log).expect("session log");
+
+    assert_eq!(trace::notes_calls(&data_dir).expect("notes calls"), 2);
+    assert_eq!(
+        trace::repeated_elided_reads(&data_dir).expect("repeated reads"),
+        1,
+        "the identical read_file marker after the first is a repeat"
+    );
+}
+
+/// Spec 65 §5.9: a scenario may run a second turn in the same session, and the
+/// second turn carries the first turn's notes.
+#[test]
+fn a_scenario_can_run_a_follow_up_turn_in_the_same_session() {
+    let path = scenario::scenarios_dir().join("long_exploration_memory.toml");
+    let loaded = scenario::load(&path).expect("the scenario should load");
+    assert!(
+        loaded.follow_up_prompt.is_some(),
+        "the scenario runs two turns"
+    );
+
+    let run = eval_harness::runner::run(&loaded).expect("the scenario should run");
+
+    assert_eq!(run.record.scenario, "long_exploration_memory");
+    assert_eq!(
+        run.record.task_count, 2,
+        "the follow-up is a second task, not a resumed first turn"
+    );
+    assert_eq!(run.record.notes_calls, 1, "round 2 took one note");
+    assert!(
+        run.record.carried_notes >= 1,
+        "the second turn carries the first turn's notes"
+    );
+    assert_eq!(
+        run.record.repeated_elided_reads, 0,
+        "the script never repeats a read"
     );
 }
 
@@ -1184,7 +1239,7 @@ fn every_scenario_runs_and_none_is_blocked() {
         Vec::<&str>::new(),
         "no scenario is deferred any more"
     );
-    assert_eq!(all.len(), 23, "twenty-three scenarios should run");
+    assert_eq!(all.len(), 24, "twenty-four scenarios should run");
 }
 
 #[test]
@@ -1471,8 +1526,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        23,
-        "all twenty-three scenario files should be accounted for"
+        24,
+        "all twenty-four scenario files should be accounted for"
     );
     assert_eq!(
         built

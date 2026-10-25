@@ -20,13 +20,13 @@ use workspace_engine::{
     OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId,
     ProposedFilePatch, QuestionState, RepositoryConfigReport, ResumeDecisionOptions,
     RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus, SymbolRef, TaskPlan,
-    TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind,
-    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
-    WorkspaceEngine, allow_always_eligible, command_approval_prompt, custom_profile_ids,
-    ensure_data_dir_schema, export_profile, import_profile, normalize_mcp_server_id,
-    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
-    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
-    review_profile_import, review_profile_rejections, select_profile,
+    TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall,
+    WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
+    WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible, command_approval_prompt,
+    custom_profile_ids, ensure_data_dir_schema, export_profile, import_profile,
+    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
+    parse_hunk_selection, parse_mcp_transport, patch_diff_text, profile_import_base,
+    repository_id_for_root, review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -604,6 +604,12 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         .session_store
         .read_session_web_diagnostics(&session_id)
         .map_err(|error| error.to_string())?;
+    // Each turn's final notes, joined by `taskId` (spec 65 §5.8). Already
+    // redacted when recorded.
+    let task_notes = engine
+        .session_store
+        .read_turn_notes(&session_id)
+        .map_err(|error| error.to_string())?;
     write_response(
         stream,
         request,
@@ -619,6 +625,7 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
                 &task_plans,
                 &task_failure_kinds,
                 &task_web_diagnostics,
+                &task_notes,
                 &engine.config
             )
         ),
@@ -3900,16 +3907,18 @@ enum TurnEvent {
 }
 
 /// Adds `explorationRound`/`maxExplorationRounds` beside the action counts;
-/// older readers ignore the new fields (spec 59 §5.5).
+/// older readers ignore the new fields (spec 59 §5.5). `notesChars` is the
+/// turn's notes size for the progress label (spec 65 §5.8).
 fn phase_json(phase: &TurnPhase) -> String {
     format!(
-        "{{\"phase\":\"{}\",\"label\":\"{}\",\"round\":{},\"maxRounds\":{},\"explorationRound\":{},\"maxExplorationRounds\":{}}}",
+        "{{\"phase\":\"{}\",\"label\":\"{}\",\"round\":{},\"maxRounds\":{},\"explorationRound\":{},\"maxExplorationRounds\":{},\"notesChars\":{}}}",
         phase.kind.as_str(),
         escape_json(&phase.label),
         phase.round,
         phase.max_rounds,
         phase.exploration_round,
-        phase.max_exploration_rounds
+        phase.max_exploration_rounds,
+        phase.notes_chars
     )
 }
 
@@ -4139,8 +4148,16 @@ where
 }
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
+    let turn_notes = match &result.turn_notes {
+        Some(notes) => format!(
+            "{{\"text\":\"{}\",\"carried\":{}}}",
+            escape_json(&notes.text),
+            notes.carried
+        ),
+        None => "null".to_string(),
+    };
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"usage\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"turnNotes\":{},\"usage\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -4155,6 +4172,7 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         fallback_proposal_json(result.fallback_proposal.as_ref()),
         round_budget_proposal_json(result.round_budget_proposal.as_ref()),
         question_proposal_json(result.question_proposal.as_ref()),
+        turn_notes,
         task_usage_json(result.usage.as_ref(), result.estimated_cost)
     )
 }
@@ -4705,6 +4723,7 @@ fn task_states_json(
     plans: &HashMap<String, TaskPlan>,
     failure_kinds: &HashMap<String, String>,
     web_diagnostics: &HashMap<String, Vec<WebDiagnosticRecord>>,
+    notes: &BTreeMap<String, TurnNotes>,
     config: &Config,
 ) -> String {
     let mut entries: Vec<&String> = statuses.keys().collect();
@@ -4756,13 +4775,25 @@ fn task_states_json(
                 ),
                 _ => String::new(),
             };
+            // The turn's final notes, joined by `taskId` (spec 65 §5.8).
+            // Absent when the turn recorded none, so a reload shows the
+            // disclosure only for turns that have one.
+            let notes_field = match notes.get(*id) {
+                Some(notes) if !notes.text.is_empty() => format!(
+                    ",\"notes\":{{\"text\":\"{}\",\"carried\":{}}}",
+                    escape_json(&notes.text),
+                    notes.carried
+                ),
+                _ => String::new(),
+            };
             format!(
-                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}{}}}",
+                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}{}{}}}",
                 escape_json(id),
                 escape_json(&statuses[*id]),
                 usage_json,
                 failure_kind_field,
                 plan_json_field,
+                notes_field,
                 web_diagnostics_field
             )
         })
@@ -4973,7 +5004,7 @@ mod tests {
         desktop_settings_config_path, effective_policy_for_repo, engine_for_repo,
         forget_model_api_key, generated_secret_warnings_json, handle_connection, index_html,
         json_error, json_optional_string, keychain, language_servers_json, mcp_browser_arguments,
-        parse_form, parse_path_list, percent_decode, plan_json, plan_proposal_json,
+        parse_form, parse_path_list, percent_decode, phase_json, plan_json, plan_proposal_json,
         question_proposal_json, relay_turn_events, remember_model_api_key,
         render_markdown_with_optional_file_links, repository_config_review_json,
         repository_config_write_target, require_api_token, resolve_shell_model_api_key,
@@ -4995,9 +5026,9 @@ mod tests {
         AgentPlanProposal, AgentQuestionProposal, AskUserInput, CancelToken, ChatTurnOptions,
         ChatTurnResult, Config, Evidence, GeneratedSecretWarning, LanguageServerHub,
         LanguageServerLaunch, LanguageServerState, LanguageServerStatus, MockModelAdapter,
-        PendingQuestionRef, PlanStep, SecretScanner, SessionMode, StepStatus, TaskPlan, TaskStatus,
-        TaskUsage, ToolCall, TurnProgress, TurnSink, UsageSource, WebDiagnosticRecord,
-        WebDiagnosticReport, WorkspaceEngine,
+        PendingQuestionRef, PhaseKind, PlanStep, SecretScanner, SessionMode, StepStatus, TaskPlan,
+        TaskStatus, TaskUsage, ToolCall, TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource,
+        WebDiagnosticRecord, WebDiagnosticReport, WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
     };
 
@@ -8714,6 +8745,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &Config::default(),
         );
 
@@ -8848,6 +8880,55 @@ mod tests {
     }
 
     #[test]
+    fn a_reopened_session_carries_each_turns_notes() {
+        let statuses = HashMap::from([("task_1".to_string(), "complete".to_string())]);
+        let notes = BTreeMap::from([(
+            "task_1".to_string(),
+            TurnNotes {
+                text: "Approvals live in command_policy.rs.".to_string(),
+                carried: true,
+                chars: 38,
+                total_chars: 38,
+            },
+        )]);
+
+        let json = task_states_json(
+            &statuses,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &notes,
+            &Config::default(),
+        );
+
+        assert!(
+            json.contains(
+                "\"notes\":{\"text\":\"Approvals live in command_policy.rs.\",\"carried\":true}"
+            ),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn phases_carry_the_notes_size() {
+        let phase = TurnPhase {
+            kind: PhaseKind::Model,
+            label: String::new(),
+            round: 1,
+            max_rounds: 8,
+            exploration_round: 2,
+            max_exploration_rounds: 24,
+            notes_chars: 2_100,
+        };
+
+        let json = phase_json(&phase);
+
+        assert!(json.contains("\"explorationRound\":2"), "{json}");
+        assert!(json.contains("\"notesChars\":2100"), "{json}");
+    }
+
+    #[test]
     fn a_task_with_no_usage_reports_none_rather_than_zero() {
         // A session written before usage existed. Absent, not zero: a zero is
         // indistinguishable from a real measurement of nothing.
@@ -8859,6 +8940,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &Config::default(),
         );
 
@@ -8880,6 +8962,7 @@ mod tests {
             &plans,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &Config::default(),
         );
 
@@ -8904,6 +8987,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &Config::default(),
         );
 
@@ -8978,6 +9062,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &web_diagnostics,
+            &BTreeMap::new(),
             &Config::default(),
         );
 

@@ -256,7 +256,7 @@ remove one
 | `mcp_enabled`, `mcp_server.<id>.enabled` | May be turned off, never on |
 | `mcp_server_allowlist` | May be narrowed, never widened |
 | `mcp_server.<id>.*` for a server the user already configured | Ignored: it would redirect a process the user trusts |
-| `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds` | May be lowered, never raised |
+| `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, `agent_max_turn_notes_chars` | May be lowered, never raised |
 | Everything else (`max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, `agent_web_debug_max_tool_rounds`, `agent_tool_retry_limit`, `agent_max_questions_per_turn`, `project_roots_added`, `project_roots_removed`) | Applied as written |
 
 Ask which keys a repository asked for and did not get — this also records them
@@ -1253,6 +1253,37 @@ charged to `agent_max_tool_rounds`.
   another `agent_max_tool_rounds` at a time, and records `turn_continued` each
   time, until the token ceiling stops it or it reaches 16 action rounds. At 16
   rounds it pauses as above.
+
+### Notes: what the assistant kept, and why a later turn knows something
+
+A turn can write short `turn_notes` during an investigation (spec 65). The
+notes are pinned into every later request of that turn, even after older rounds
+have been dropped, and they carry into the next turn of the session. That is why
+an answer may say it relied on its notes, and why a later turn can name a file
+or a function it did not read again. The notes are bounded by
+`agent_max_turn_notes_chars` (default 8,000, `0` off); an append over the bound
+is refused with the current size and a suggestion to `replace`.
+
+Two model-facing blocks explain what left the request window:
+
+- `Earlier rounds of this turn were elided … Calls already made, oldest first`
+  names the calls that were dropped. A call into a registered worktree names
+  that worktree, so the same path read in two checkouts appears twice.
+- `The window is full. With your next request, round N leaves it` names the
+  oldest round still in view and its calls. The model gets one round to record
+  anything it still needs.
+
+Both are normal, not errors: they are how the model avoids re-reading what it
+already saw. A read it repeats anyway is still charged as an action round.
+
+In the session log, `turn_notes` events carry `taskId`, `replace`, `carried`,
+`text` (already redacted), `chars` and `totalChars`; the latest event for a task
+is that task's notes. A carry into a later turn is another `turn_notes` event
+with `carried: true`, written before that turn's first request. The audit log
+has `turn_notes_recorded` (sizes only, never text) and `turn_notes_carried`
+(the source task id and size). A turn that took no notes is indistinguishable
+from one where the model chose not to; check `agent_max_turn_notes_chars=0` if
+you expected the tool and it was not offered at all.
 
 Two terminal statuses look alike in the UI and mean different things:
 

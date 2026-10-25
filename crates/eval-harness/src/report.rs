@@ -73,6 +73,27 @@ pub fn to_text(report: &Report) -> String {
         ));
     }
 
+    // Spec 65 §5.9. Only runs that took notes: a run with none has nothing to
+    // show, and printing a zero for every scenario would describe the script
+    // rather than the run.
+    let noted: Vec<&RunRecord> = report
+        .records
+        .iter()
+        .filter(|record| record.notes_calls > 0 || record.carried_notes > 0)
+        .collect();
+    if !noted.is_empty() {
+        out.push_str("\nNotes and repeated reads\n");
+        for record in noted {
+            out.push_str(&format!(
+                "  {:<32} notes {}  carried {}  repeated reads {}\n",
+                record.scenario,
+                record.notes_calls,
+                record.carried_notes,
+                record.repeated_elided_reads,
+            ));
+        }
+    }
+
     // Spec 63 §5.5. Only runs that executed a command: the rest have nothing
     // to group.
     let commanded: Vec<&RunRecord> = report

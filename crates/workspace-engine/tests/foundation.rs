@@ -5522,6 +5522,61 @@ fn exploration_round_allowance_round_trips_through_config_show_and_the_overlay_s
 }
 
 #[test]
+fn turn_notes_chars_accept_zero_where_the_window_refuses_it() {
+    // Spec 65 requirement 3: `0` means "notes off" and must be accepted,
+    // unlike `agent_max_tool_rounds`, whose parser refuses 0.
+    let overlay = ConfigOverlay::parse("agent_max_turn_notes_chars=0\n").expect("0 must parse");
+    let mut config = Config::default();
+    config.apply_overlay(overlay);
+    assert_eq!(config.agent_max_turn_notes_chars, 0);
+    assert!(ConfigOverlay::parse("agent_max_tool_rounds=0\n").is_err());
+}
+
+#[test]
+fn turn_notes_chars_clamps_values_above_its_ceiling() {
+    let at_ceiling = ConfigOverlay::parse("agent_max_turn_notes_chars=32000\n").unwrap();
+    let mut config = Config::default();
+    config.apply_overlay(at_ceiling);
+    assert_eq!(config.agent_max_turn_notes_chars, 32_000);
+
+    for too_big in ["32001", "999999"] {
+        let overlay =
+            ConfigOverlay::parse(&format!("agent_max_turn_notes_chars={too_big}\n")).unwrap();
+        let mut config = Config::default();
+        config.apply_overlay(overlay);
+        assert_eq!(
+            config.agent_max_turn_notes_chars, 32_000,
+            "a value above 32,000 must clamp to the ceiling"
+        );
+    }
+}
+
+#[test]
+fn turn_notes_chars_defaults_to_8000() {
+    assert_eq!(Config::default().agent_max_turn_notes_chars, 8_000);
+}
+
+#[test]
+fn turn_notes_chars_round_trips_through_config_show_and_the_overlay_serializer() {
+    let config = Config::default();
+    assert!(
+        config
+            .to_policy_text()
+            .contains("agent_max_turn_notes_chars=8000"),
+        "got: {}",
+        config.to_policy_text()
+    );
+
+    let overlay = ConfigOverlay::parse("agent_max_turn_notes_chars=4000\n").unwrap();
+    let text = overlay.to_policy_text();
+    assert!(
+        text.contains("agent_max_turn_notes_chars=4000"),
+        "got: {text}"
+    );
+    assert_eq!(ConfigOverlay::parse(&text).unwrap(), overlay);
+}
+
+#[test]
 fn provider_defaults_preserve_keychain_references() {
     let overlay =
         ConfigOverlay::parse("model_api_key_env=keychain:model-api-key\nmodel_provider=deepseek\n")

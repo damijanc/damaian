@@ -4495,7 +4495,17 @@ function startTurnIndicator(target, onStop = null) {
         payload.phase !== "context" && payload.explorationRound > 0
           ? ` · ${payload.explorationRound} ${payload.explorationRound === 1 ? "read" : "reads"}`
           : "";
-      label.textContent = `${text}${rounds}${reads}`;
+      // Spec 65 §5.8: the turn's notes size, beside the read count. A turn
+      // that has recorded nothing shows nothing.
+      const notes =
+        payload.phase !== "context" && payload.notesChars > 0
+          ? ` · notes ${
+              payload.notesChars >= 1000
+                ? `${(payload.notesChars / 1000).toFixed(1)}k`
+                : payload.notesChars
+            }`
+          : "";
+      label.textContent = `${text}${rounds}${reads}${notes}`;
     },
     streaming() {
       if (done || streaming) return;
@@ -4684,6 +4694,11 @@ function renderMessages(messages, tasks = []) {
   const diagnosticsByTask = new Map(
     tasks.filter((task) => task.webDiagnostics).map((task) => [task.id, task.webDiagnostics]),
   );
+  // A task with no notes carries no `notes` field, so a turn that recorded
+  // none stays disclosure-free (spec 65 §5.8).
+  const notesByTask = new Map(
+    tasks.filter((task) => task.notes).map((task) => [task.id, task.notes]),
+  );
   // Set before any message renders: each one runs the legacy thumbnail scan.
   sessionHasRecordedDiagnostics = diagnosticsByTask.size > 0;
   // Whatever a turn appends *after* its answer — a stop row, the plan panel —
@@ -4756,6 +4771,7 @@ function renderMessages(messages, tasks = []) {
         (diagnosticsByTask.get(message.taskId) || []).forEach((record) => {
           renderWebDiagnosticCard(bubble, record);
         });
+        appendTurnNotes(bubble.body, notesByTask.get(message.taskId));
       }
       if (message.taskId) markMessageUsage(bubble, usageByTask.get(message.taskId));
     }
@@ -7474,6 +7490,18 @@ function appendContextDisclosure(body, files) {
   body.append(createDisclosure(label, panel), panel);
 }
 
+// The notes a turn kept, folded into that turn (spec 65 §5.8). The text comes
+// from the shell, so it survives a reload; a turn with no notes shows nothing.
+function appendTurnNotes(body, notes) {
+  if (!notes?.text) return;
+
+  const panel = document.createElement("pre");
+  panel.className = "turn-notes";
+  panel.textContent = notes.text;
+  const label = notes.carried ? "Notes (carried from the previous turn)" : "Notes";
+  body.append(createDisclosure(label, panel), panel);
+}
+
 // The plan panel, per docs/specs/21_task_plan_progress_and_budget §5.6.
 //
 // One panel per assistant message, replaced in place as `plan` events arrive.
@@ -9209,6 +9237,7 @@ function createQuestionCard(question, questionRepo, { answered = null } = {}) {
               localStorage.setItem(lastSessionStorageKey(), currentSessionId);
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
@@ -9389,6 +9418,7 @@ function createFallbackOffer(proposal, proposalRepo) {
               localStorage.setItem(lastSessionStorageKey(), currentSessionId);
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage);
             if (indicator) indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
@@ -9524,6 +9554,7 @@ function createRoundBudgetOffer(proposal, proposalRepo) {
               localStorage.setItem(lastSessionStorageKey(), currentSessionId);
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
@@ -9767,6 +9798,7 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
               localStorage.setItem(lastSessionStorageKey(), currentSessionId);
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
@@ -10425,6 +10457,7 @@ function createCommandApprovalPreview(
               localStorage.setItem(lastSessionStorageKey(), currentSessionId);
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
@@ -11003,6 +11036,7 @@ async function proposePatchFromChat(prompt, assistantMessage) {
   );
   assistantMessage.body.append(createPatchPreview(payload, patchRepo));
   appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+  appendTurnNotes(assistantMessage.body, payload.turnNotes);
   markMessageUsage(assistantMessage, payload.usage);
 }
 
@@ -11136,6 +11170,7 @@ async function sendChatPrompt(options = {}) {
           await finalizeChatMessage(assistantMessage, assistantText);
           appendProposals(assistantMessage, payload, chatRepo);
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+          appendTurnNotes(assistantMessage.body, payload.turnNotes);
           markMessageUsage(assistantMessage, payload.usage);
           if (payload.cancelled) {
             if (indicator) indicator.finish("stopped");
@@ -11239,6 +11274,7 @@ async function askAgainFromExhausted(sessionId, taskId) {
           await finalizeChatMessage(assistantMessage, assistantText);
           appendProposals(assistantMessage, payload, chatRepo);
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+          appendTurnNotes(assistantMessage.body, payload.turnNotes);
           markMessageUsage(assistantMessage, payload.usage);
           if (payload.cancelled) {
             indicator.finish("stopped");
