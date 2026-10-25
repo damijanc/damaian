@@ -1,3 +1,12 @@
+//! The verification loop's pure rules, per
+//! `docs/specs/23_verification_loop/`.
+//!
+//! These tests build states from event vectors, never from a store. Requirement
+//! 7's rules — what "passed" means, that every selected check is accounted for,
+//! that "no checks available" is not "checks passed", and that the summary never
+//! claims completion it cannot support — are properties of the fold and the
+//! report, so they are tested without a session, a model or a filesystem.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -7,9 +16,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
-    CheckId, CheckOutcome, Config, Evidence, PlanReport, PlanStep, Selection, SkipReason, TaskPlan,
-    VerificationEvent, VerificationOutcome, VerificationReport, VerificationState, WorkspaceEngine,
-    fold_verification, is_documentation, propose_checks, select_roots,
+    CheckId, CheckOutcome, Config, Evidence, MockModelAdapter, PlanReport, PlanStep, Selection,
+    SkipReason, TaskPlan, VerificationEvent, VerificationOutcome, VerificationReport,
+    VerificationState, WorkspaceEngine, fold_verification, is_documentation, propose_checks,
+    select_roots,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -808,5 +818,457 @@ fn a_repository_with_no_detected_checks_says_so() {
     );
 
     let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+// --- Patch decisions and verification due (Task 3) ------------------------
+
+fn write(repo: &std::path::Path, relative_path: &str, content: &str) {
+    let path = repo.join(relative_path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, content).unwrap();
+}
+
+fn edit_engine(root: &std::path::Path, data_dir: &std::path::Path) -> WorkspaceEngine {
+    fs::create_dir_all(root).unwrap();
+    WorkspaceEngine::new(Config {
+        data_dir: data_dir.to_path_buf(),
+        enable_index_watcher: false,
+        shell: "/usr/bin/true".to_string(),
+        ..Config::default()
+    })
+}
+
+fn edit_response(files: &[(&str, &str)]) -> String {
+    let mut response = String::from("DAMAIAN_EDIT_V1\nSUMMARY: change\n");
+    for (path, content) in files {
+        response.push_str(&format!(
+            "FILE: {path}\nSTATUS: modified\nCONTENT:\n{content}END_FILE\n"
+        ));
+    }
+    response.push_str("END_PATCH\n");
+    response
+}
+
+fn propose(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    response: &str,
+) -> workspace_engine::EditProposalResult {
+    let mut adapter = MockModelAdapter::new(response);
+    engine
+        .edit_orchestrator
+        .propose_edit(root, "change it", &[], None, &mut adapter)
+        .expect("the edit should be proposed")
+}
+
+fn verification_events(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    task_id: &str,
+) -> Vec<VerificationEvent> {
+    engine
+        .session_store
+        .read_verification_events(session_id, &[task_id])
+        .expect("the log should read")
+}
+
+fn due_count(engine: &WorkspaceEngine, session_id: &str, task_id: &str) -> usize {
+    verification_events(engine, session_id, task_id)
+        .iter()
+        .filter(|event| matches!(event, VerificationEvent::Due { .. }))
+        .count()
+}
+
+fn decisions(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    task_id: &str,
+) -> Vec<workspace_engine::PatchFileDecision> {
+    engine
+        .session_store
+        .read_patch_file_decisions(session_id, task_id)
+        .expect("the log should read")
+}
+
+#[test]
+fn applying_every_file_of_a_code_mode_patch_records_one_due() {
+    let root = temp_dir("due-all");
+    let data_dir = temp_dir("due-all-data");
+    write(&root, "src/a.rs", "let a = 1;\n");
+    let engine = edit_engine(&root, &data_dir);
+    let proposal = propose(
+        &engine,
+        &root,
+        &edit_response(&[("src/a.rs", "let a = 2;\n")]),
+    );
+    let session = proposal.session.id.clone();
+    let task = proposal.task.id.clone();
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &proposal.patch.id, None, None, "tester", false)
+        .expect("the patch should apply");
+
+    assert_eq!(due_count(&engine, &session, &task), 1);
+    let recorded = decisions(&engine, &session, &task);
+    assert_eq!(recorded.len(), 1);
+    assert!(recorded[0].applied);
+    assert_eq!(recorded[0].paths, vec!["src/a.rs".to_string()]);
+    let state = fold_verification(verification_events(&engine, &session, &task).iter());
+    assert!(
+        state.due.is_some(),
+        "the log should say verification is due"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn two_of_three_applied_is_not_settled_and_the_last_rejection_settles_it() {
+    let root = temp_dir("due-partial");
+    let data_dir = temp_dir("due-partial-data");
+    write(&root, "src/a.rs", "let a = 1;\n");
+    write(&root, "src/b.rs", "let b = 1;\n");
+    write(&root, "src/c.rs", "let c = 1;\n");
+    let engine = edit_engine(&root, &data_dir);
+    let proposal = propose(
+        &engine,
+        &root,
+        &edit_response(&[
+            ("src/a.rs", "let a = 2;\n"),
+            ("src/b.rs", "let b = 2;\n"),
+            ("src/c.rs", "let c = 2;\n"),
+        ]),
+    );
+    let session = proposal.session.id.clone();
+    let task = proposal.task.id.clone();
+
+    let approved = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(
+            &root,
+            &proposal.patch.id,
+            Some(&approved),
+            None,
+            "tester",
+            false,
+        )
+        .expect("the selected files should apply");
+    assert_eq!(
+        due_count(&engine, &session, &task),
+        0,
+        "an undecided file leaves the patch unsettled"
+    );
+
+    engine
+        .edit_orchestrator
+        .reject_stored_patch_files(&proposal.patch.id, &["src/c.rs".to_string()], "tester")
+        .expect("the remaining file should be rejected");
+    assert_eq!(due_count(&engine, &session, &task), 1);
+
+    // The stored patch still holds the content statuses; the decision is the
+    // session event, not a rewrite of the patch.
+    let stored = engine.patch_store.load(&proposal.patch.id).unwrap();
+    assert!(stored.files.iter().all(|file| file.status == "modified"));
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn rejecting_every_file_of_a_first_patch_is_not_settled() {
+    let root = temp_dir("due-rejected-first");
+    let data_dir = temp_dir("due-rejected-first-data");
+    write(&root, "src/a.rs", "let a = 1;\n");
+    let engine = edit_engine(&root, &data_dir);
+    let proposal = propose(
+        &engine,
+        &root,
+        &edit_response(&[("src/a.rs", "let a = 2;\n")]),
+    );
+    let session = proposal.session.id.clone();
+    let task = proposal.task.id.clone();
+
+    engine
+        .edit_orchestrator
+        .reject_stored_patch_files(&proposal.patch.id, &["src/a.rs".to_string()], "tester")
+        .expect("the file should be rejected");
+
+    assert_eq!(due_count(&engine, &session, &task), 0);
+    let recorded = decisions(&engine, &session, &task);
+    assert_eq!(recorded.len(), 1);
+    assert!(!recorded[0].applied);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn rejecting_every_file_of_a_repair_patch_still_records_a_due() {
+    let root = temp_dir("due-rejected-repair");
+    let data_dir = temp_dir("due-rejected-repair-data");
+    write(&root, "src/a.rs", "let a = 1;\n");
+    let engine = edit_engine(&root, &data_dir);
+    let proposal = propose(
+        &engine,
+        &root,
+        &edit_response(&[("src/a.rs", "let a = 2;\n")]),
+    );
+    let session = proposal.session.id.clone();
+    let task = proposal.task.id.clone();
+
+    // The repair turn began an attempt before proposing this patch.
+    engine
+        .session_store
+        .append_verification_event(
+            &session,
+            &VerificationEvent::Started {
+                task_id: task.clone(),
+                attempt: 0,
+                checks: vec![CheckId::new("", "cargo test")],
+            },
+        )
+        .unwrap();
+
+    engine
+        .edit_orchestrator
+        .reject_stored_patch_files(&proposal.patch.id, &["src/a.rs".to_string()], "tester")
+        .expect("the file should be rejected");
+
+    assert_eq!(
+        due_count(&engine, &session, &task),
+        1,
+        "the attempt must be closeable with no_repair_applied"
+    );
+    let state = fold_verification(verification_events(&engine, &session, &task).iter());
+    assert!(state.due.is_some());
+    assert!(
+        state.finished.is_none(),
+        "rejecting the repair patch does not finish the attempt"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn an_ask_mode_session_never_records_a_due() {
+    let root = temp_dir("due-ask");
+    let data_dir = temp_dir("due-ask-data");
+    write(&root, "src/a.rs", "let a = 1;\n");
+    let engine = edit_engine(&root, &data_dir);
+    let proposal = propose(
+        &engine,
+        &root,
+        &edit_response(&[("src/a.rs", "let a = 2;\n")]),
+    );
+    let session = proposal.session.id.clone();
+    let task = proposal.task.id.clone();
+    engine
+        .session_store
+        .set_session_mode(&session, workspace_engine::SessionMode::Ask, "user")
+        .unwrap();
+
+    let refused = engine.edit_orchestrator.apply_stored_patch(
+        &root,
+        &proposal.patch.id,
+        None,
+        None,
+        "tester",
+        false,
+    );
+    assert!(refused.is_err(), "Ask mode must refuse the apply");
+    assert_eq!(due_count(&engine, &session, &task), 0);
+    assert!(decisions(&engine, &session, &task).is_empty());
+    assert_eq!(
+        fs::read_to_string(root.join("src/a.rs")).unwrap(),
+        "let a = 1;\n"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_patch_with_no_session_applies_and_records_nothing() {
+    let root = temp_dir("due-no-session");
+    let data_dir = temp_dir("due-no-session-data");
+    write(&root, "src/a.rs", "let a = 1;\n");
+    let engine = edit_engine(&root, &data_dir);
+    let proposal = propose(
+        &engine,
+        &root,
+        &edit_response(&[("src/a.rs", "let a = 2;\n")]),
+    );
+    let session = proposal.session.id.clone();
+    let task = proposal.task.id.clone();
+
+    let mut orphan = proposal.patch.clone();
+    orphan.session_id = String::new();
+    orphan.task_id = None;
+    engine.patch_store.save(&orphan).unwrap();
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &orphan.id, None, None, "tester", false)
+        .expect("a patch with no session still applies");
+    assert_eq!(
+        fs::read_to_string(root.join("src/a.rs")).unwrap(),
+        "let a = 2;\n"
+    );
+    assert!(decisions(&engine, &session, &task).is_empty());
+    assert!(verification_events(&engine, &session, &task).is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn an_ask_mode_session_never_records_a_due_for_a_repair_patch_either() {
+    let root = temp_dir("due-ask-repair");
+    let data_dir = temp_dir("due-ask-repair-data");
+    write(&root, "src/a.rs", "let a = 1;\n");
+    let engine = edit_engine(&root, &data_dir);
+    let proposal = propose(
+        &engine,
+        &root,
+        &edit_response(&[("src/a.rs", "let a = 2;\n")]),
+    );
+    let session = proposal.session.id.clone();
+    let task = proposal.task.id.clone();
+    engine
+        .session_store
+        .append_verification_event(
+            &session,
+            &VerificationEvent::Started {
+                task_id: task.clone(),
+                attempt: 0,
+                checks: vec![CheckId::new("", "cargo test")],
+            },
+        )
+        .unwrap();
+    engine
+        .session_store
+        .set_session_mode(&session, workspace_engine::SessionMode::Ask, "user")
+        .unwrap();
+
+    engine
+        .edit_orchestrator
+        .reject_stored_patch_files(&proposal.patch.id, &["src/a.rs".to_string()], "tester")
+        .expect("rejecting writes no repository file, so the mode does not refuse it");
+
+    assert_eq!(due_count(&engine, &session, &task), 0);
+    assert_eq!(
+        decisions(&engine, &session, &task).len(),
+        1,
+        "the decision is recorded; only the verification trigger is withheld"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_decision_survives_a_repeated_apply_and_does_not_duplicate_the_due() {
+    let root = temp_dir("due-repeat");
+    let data_dir = temp_dir("due-repeat-data");
+    write(&root, "src/a.rs", "let a = 1;\n");
+    write(&root, "src/b.rs", "let b = 1;\n");
+    let engine = edit_engine(&root, &data_dir);
+    let proposal = propose(
+        &engine,
+        &root,
+        &edit_response(&[("src/a.rs", "let a = 2;\n"), ("src/b.rs", "let b = 2;\n")]),
+    );
+    let session = proposal.session.id.clone();
+    let task = proposal.task.id.clone();
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(
+            &root,
+            &proposal.patch.id,
+            Some(&["src/a.rs".to_string()]),
+            None,
+            "tester",
+            false,
+        )
+        .expect("the first file should apply");
+    assert_eq!(due_count(&engine, &session, &task), 0);
+
+    // Applying the same file again cannot conflict-check against its old hash.
+    assert!(
+        engine
+            .edit_orchestrator
+            .apply_stored_patch(
+                &root,
+                &proposal.patch.id,
+                Some(&["src/a.rs".to_string()]),
+                None,
+                "tester",
+                false,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        decisions(&engine, &session, &task).len(),
+        1,
+        "the first decision survives the repeated call"
+    );
+
+    engine
+        .edit_orchestrator
+        .reject_stored_patch_files(&proposal.patch.id, &["src/b.rs".to_string()], "tester")
+        .expect("the second file should be rejected");
+    assert_eq!(due_count(&engine, &session, &task), 1);
+
+    // A later settle of the same patch — here by applying a file after
+    // rejecting it — records another decision but never a second `Due`.
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(
+            &root,
+            &proposal.patch.id,
+            Some(&["src/b.rs".to_string()]),
+            None,
+            "tester",
+            false,
+        )
+        .expect("the rejected file can still be applied later");
+    assert_eq!(due_count(&engine, &session, &task), 1);
+    assert_eq!(decisions(&engine, &session, &task).len(), 3);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn verification_events_round_trip_through_a_fresh_store() {
+    let data_dir = temp_dir("events-round-trip");
+    let session = {
+        let store = workspace_engine::SessionStore::new(&data_dir);
+        let session = store.create_session("repo", "title").unwrap();
+        store
+            .append_verification_event(
+                &session.id,
+                &VerificationEvent::Due {
+                    task_id: "task".to_string(),
+                    patch_id: "patch".to_string(),
+                },
+            )
+            .unwrap();
+        session
+    };
+
+    let reopened = workspace_engine::SessionStore::new(&data_dir);
+    let events = reopened
+        .read_verification_events(&session.id, &["task"])
+        .expect("the log should read");
+    assert_eq!(events.len(), 1);
+    assert!(fold_verification(events.iter()).due.is_some());
+
     let _ = fs::remove_dir_all(&data_dir);
 }

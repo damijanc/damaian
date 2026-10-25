@@ -4,15 +4,15 @@
 
 **Implements:** [`proposal.md`](proposal.md) in full · corrections and the
 decisions it left open in [`context.md`](context.md)
-**Started:** not yet (planned 2026-10-09); re-checked 2026-10-24
+**Started:** 2026-10-25 (planned 2026-10-09; re-checked 2026-10-24)
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Verification types, the event fold and the report | Not started | No `chat.rs`. Pure module, the report's rules. May run beside #26 (`context.md` §13) |
-| 2 · Check selection by root | Not started | No `chat.rs`. Record the clippy/build gap in `OBSERVATIONS.md`. May run beside #26 |
-| 3 · Patch-file decisions, verification due, session events | Not started | No `chat.rs`. `edit.rs`, `session.rs`. May run beside #26, with one rebase in `edit.rs` |
+| 1 · Verification types, the event fold and the report | Done 2026-10-25 | `verification.rs` with `CheckId`, `SkipReason`, `CheckOutcome`, `VerificationEvent`/`Outcome`/`State`, `fold_verification`, `VerificationReport`. 12 tests in `tests/verification_loop.rs` cover the pass rule (`Some(0)` only, `None` → "killed or signalled"), the four-section partition, `NoChecksAvailable` ≠ passed, latest-attempt-wins and regressions, staleness (including a deleted file), the summary's completion gate, batch-independent folding, and the wire shape of every event. All six planned mutations caught by the named test. Scoped `fmt`, `clippy -p workspace-engine --all-targets`, `typos` pass. |
+| 2 · Check selection by root | Done 2026-10-25 | `is_documentation`, `select_roots`, `RepositoryMap::restricted_to`/`enclosing_roots`, `propose_checks`/`Selection`. 7 tests (19 total): member change selects owning + enclosing roots and no sibling, web change drops `test-shortcut` within its root only, docs-only selects nothing (`Makefile`/`build.sh` are not docs), a removed root is never selected and its files resolve to the nearest live root, only selected proposals are stored, and a no-check root says `NoChecksAvailable`. All four planned mutations caught. Observation #48 recorded in `docs/PLAN/OBSERVATIONS.md` (no clippy/build detection, `lint:web` missed); not fixed here. |
+| 3 · Patch-file decisions, verification due, session events | Done 2026-10-25 | `PatchFileDecision` plus `append_patch_file_decision`/its reader and `append_verification_event`/`read_verification_events` in `session.rs`; `edit.rs` records a decision from apply and both reject paths, then appends one `verification_due` per settled Code-mode patch. 9 tests (28 total): full apply, partial apply then reject, all-rejected first patch, all-rejected repair patch (unfinished attempt), Ask-mode refusal for apply and for a repair rejection, no-session patch, repeated apply, and a fresh-store round trip. All four planned mutations caught. The repair case's "next verification turn records `NoRepairApplied`" half belongs to Task 5, which owns that outcome. |
 | 4 · The verification turn: run, one card, record | Not started | **Edits `chat.rs`.** Starts only after #26 lands. Read Global Constraints first |
 | 5 · Repair, rerun, the limit and the failed status | Not started | **Edits `chat.rs`.** Starts only after #26 lands. Run the deterministic eval tier |
 | 6 · Browser behaviour verification | Not started | **Edits `chat.rs`.** Starts only after #26 lands |
@@ -282,7 +282,7 @@ warning.
   `render(&self) -> String` (proposal §5.7's layout, paths as plain
   repository-relative text).
 
-- [ ] **Step 1: Write the failing tests** in `tests/verification_loop.rs`.
+- [x] **Step 1: Write the failing tests** in `tests/verification_loop.rs`.
   Build states from event vectors, never from a store. At least:
   1. `a_check_passes_only_on_exit_code_zero`: three checks with `Some(0)`,
      `Some(1)` and `None`. Only the first is in `passed`. `None` is in
@@ -313,11 +313,11 @@ warning.
   8. `events_serialise_in_the_shape_the_log_holds`: one `serde_json::json!`
      pin per variant, including `"reason":"declined_by_user"`.
 
-- [ ] **Step 2: Run them and confirm they fail to compile**
+- [x] **Step 2: Run them and confirm they fail to compile**
 
   Run: `cargo nextest run -p workspace-engine --test verification_loop`
 
-- [ ] **Step 3: Implement `verification.rs`** with the types above, and
+- [x] **Step 3: Implement `verification.rs`** with the types above, and
   register it in `lib.rs` (`pub mod verification;`, re-exports, then
   `cargo fmt --all`). The pass rule is one function,
   `fn passed(outcome: &CheckOutcome) -> bool { matches!(outcome, CheckOutcome::Ran { exit_code: Some(0), .. }) }`,
@@ -325,10 +325,10 @@ warning.
   before sorting a ran check into passed or failed: a stale check is in
   `stale` whatever its exit code was.
 
-- [ ] **Step 4: Run the tests and confirm they pass.** Do not weaken an
+- [x] **Step 4: Run the tests and confirm they pass.** Do not weaken an
   assertion to make one pass.
 
-- [ ] **Step 5: Mutation-test.** Do each, confirm the named test fails,
+- [x] **Step 5: Mutation-test.** Do each, confirm the named test fails,
   revert, and record all of them:
   1. `passed` as `!matches!(exit_code, Some(c) if c != 0)` (lets `None`
      through). Test 1 fails.
@@ -339,7 +339,7 @@ warning.
   5. Staleness checked after the pass sort. Test 5 fails.
   6. `summary` ignoring `due`. Test 6 fails.
 
-- [ ] **Step 6: Scoped checks**
+- [x] **Step 6: Scoped checks**
 
   ```bash
   cargo fmt --all -- --check
@@ -347,7 +347,7 @@ warning.
   typos
   ```
 
-- [ ] **Step 7: Update this file's Task 1 row, then show the change and the
+- [x] **Step 7: Update this file's Task 1 row, then show the change and the
   check results and ask before committing.** Suggested subject:
   `Add verification types and an honest completion report`.
 

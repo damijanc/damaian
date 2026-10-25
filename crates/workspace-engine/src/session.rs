@@ -44,6 +44,25 @@ pub struct WorkerRecord {
     pub git_commands: Vec<String>,
 }
 
+/// The user's decision about one or more files of a patch.
+///
+/// A session event rather than a field on the stored patch: neither the apply
+/// nor the reject path rewrites the stored patch, and
+/// `ProposedFilePatch.status` is the content's `added`/`modified`/`deleted`,
+/// never the review's. Without this record "the patch is settled" cannot be
+/// computed after a restart (spec 23 `context.md` §1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchFileDecision {
+    pub task_id: String,
+    pub patch_id: String,
+    pub paths: Vec<String>,
+    /// `true` for applied, `false` for rejected. Stored as a boolean rather
+    /// than an enum because a decision event describes exactly one action and a
+    /// third state would be a different event.
+    pub applied: bool,
+}
+
 /// What a task is doing, precisely enough that a crash in it is classifiable.
 ///
 /// The old `Running` covered context preparation, the model call, tool
@@ -1690,6 +1709,105 @@ impl SessionStore {
             }
         }
         Ok(records)
+    }
+
+    /// Appends one patch-file decision (spec 23 `context.md` §1). The apply and
+    /// reject paths call this even when the decision will not settle the patch,
+    /// so a later decision can complete the set.
+    pub fn append_patch_file_decision(
+        &self,
+        session_id: &str,
+        decision: &PatchFileDecision,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(decision).map_err(|error| {
+            crate::error::ClientError::Io(format!("patch file decision serialization: {error}"))
+        })?;
+        self.append_session_event(session_id, "patch_file_decided", &payload)
+    }
+
+    /// Every decision this task recorded, in log order. The caller filters by
+    /// patch to decide whether that patch is settled.
+    pub fn read_patch_file_decisions(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<PatchFileDecision>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        let mut decisions = Vec::new();
+        for event in active_events(&content) {
+            if event.event_type != "patch_file_decided" {
+                continue;
+            }
+            let Ok(decision) = serde_json::from_value::<PatchFileDecision>(event.payload.clone())
+            else {
+                continue;
+            };
+            if decision.task_id == task_id {
+                decisions.push(decision);
+            }
+        }
+        Ok(decisions)
+    }
+
+    /// Appends one verification event (spec 23 §5.1). One session-event kind
+    /// per variant, so a reader of the log can tell what appended it.
+    pub fn append_verification_event(
+        &self,
+        session_id: &str,
+        event: &crate::verification::VerificationEvent,
+    ) -> Result<()> {
+        use crate::verification::VerificationEvent;
+        let event_type = match event {
+            VerificationEvent::Due { .. } => "verification_due",
+            VerificationEvent::Started { .. } => "verification_started",
+            VerificationEvent::Check { .. } => "verification_check",
+            VerificationEvent::Finished { .. } => "verification_finished",
+        };
+        let payload = serde_json::to_string(event).map_err(|error| {
+            crate::error::ClientError::Io(format!("verification event serialization: {error}"))
+        })?;
+        self.append_session_event(session_id, event_type, &payload)
+    }
+
+    /// Every verification event in the session belonging to one of
+    /// `task_ids`, in log order.
+    ///
+    /// Takes a task chain because each verification turn is a new task carrying
+    /// the plan: the `Due` names the task that proposed the patch, while the
+    /// `Started`/`Check`/`Finished` name the verification turn's own task
+    /// (spec 23 `context.md` §1). Unreadable payloads are skipped rather than
+    /// failing the replay, matching the other readers here.
+    pub fn read_verification_events(
+        &self,
+        session_id: &str,
+        task_ids: &[&str],
+    ) -> Result<Vec<crate::verification::VerificationEvent>> {
+        use crate::verification::VerificationEvent;
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        let mut events = Vec::new();
+        for event in active_events(&content) {
+            if !matches!(
+                event.event_type.as_str(),
+                "verification_due"
+                    | "verification_started"
+                    | "verification_check"
+                    | "verification_finished"
+            ) {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_value::<VerificationEvent>(event.payload.clone())
+            else {
+                continue;
+            };
+            if task_ids.iter().any(|id| *id == parsed.task_id()) {
+                events.push(parsed);
+            }
+        }
+        Ok(events)
     }
 
     /// Appends one finding (spec 22 §5.7). A `Finding` is redacted by

@@ -1,6 +1,9 @@
 # Feature Spec: Verification Loop
 
-Status: Not started. Split into a folder and planned on 2026-10-09, after
+Status: In progress. Started 2026-10-25: Tasks 1–3 (the pure report, check
+selection, and the patch-decision/verification-due events) have landed. Tasks
+4–6 edit `chat.rs` and wait for [#26](../26_context_assembly/proposal.md) to
+merge. Split into a folder and planned on 2026-10-09, after
 [#24](../24_repository_map_and_monorepo_boundaries/proposal.md) made check
 discovery per root. Where the code contradicted the design, this proposal was
 corrected in place. The decisions it left open are in

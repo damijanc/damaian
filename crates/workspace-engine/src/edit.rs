@@ -12,13 +12,15 @@ use crate::finding::{Finding, FindingDraft, FindingSource, Severity};
 use crate::hash::{create_id, repository_id_for_root};
 use crate::hooks::{HookContext, HookDispatcher, HookEvent, HookOutcome, Verdict};
 use crate::indexer::ProjectIndexer;
-use crate::mode::{permits, profile_permits, refusal_message};
+use crate::mode::{SessionMode, permits, profile_permits, refusal_message};
 use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsage};
 use crate::patch_engine::{
     GeneratedSecretWarning, PatchApplyResult, PatchEngine, ProposedChange, ProposedPatch,
 };
 use crate::secret_scanner::SecretScanner;
-use crate::session::{Session, SessionStore, Task, TaskStatus};
+use crate::session::{PatchFileDecision, Session, SessionStore, Task, TaskStatus};
+use crate::verification::{VerificationEvent, fold_verification};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -867,7 +869,103 @@ impl EditOrchestrator {
             }
             result.hook_warnings.push(message);
         }
+        // Spec 23 `context.md` §1: record the user's decision per file, then
+        // mark verification due when that settles the patch. After the
+        // `PatchApplied` evidence above, whose applied hashes are what the loop
+        // later compares against.
+        self.record_patch_file_decision(&patch, &result.applied_files, true)?;
         Ok(result)
+    }
+
+    /// Records one decision and, when it settles the patch, that verification
+    /// is due.
+    ///
+    /// A patch is settled when the decisions in the log cover every file and at
+    /// least one was applied. The one exception is a repair patch: a task with
+    /// an unfinished verification attempt records a decision even when every
+    /// file was rejected, so the attempt can close with `no_repair_applied`
+    /// instead of leaving nothing to ask about (spec 23 `context.md` §1, §5).
+    fn record_patch_file_decision(
+        &self,
+        patch: &ProposedPatch,
+        paths: &[String],
+        applied: bool,
+    ) -> Result<()> {
+        let (Some(task_id), false) = (patch.task_id.as_deref(), patch.session_id.is_empty()) else {
+            return Ok(());
+        };
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.session_store.append_patch_file_decision(
+            &patch.session_id,
+            &PatchFileDecision {
+                task_id: task_id.to_string(),
+                patch_id: patch.id.clone(),
+                paths: paths.to_vec(),
+                applied,
+            },
+        )?;
+        self.record_verification_due_if_settled(patch, task_id)
+    }
+
+    fn record_verification_due_if_settled(
+        &self,
+        patch: &ProposedPatch,
+        task_id: &str,
+    ) -> Result<()> {
+        // The loop is entered only in Code mode; a patch in Ask, Plan or Review
+        // cannot be applied at all, but the mode can change between the apply
+        // and this read (spec 23 proposal §5.1).
+        if self.session_store.session_mode(&patch.session_id) != SessionMode::Code {
+            return Ok(());
+        }
+        let events = self
+            .session_store
+            .read_verification_events(&patch.session_id, &[task_id])?;
+        // Once per patch: a second settle of the same patch has no undecided
+        // file to complete, and a repeated `Due` would offer the same run twice.
+        if events.iter().any(|event| {
+            matches!(event, VerificationEvent::Due { patch_id, .. } if patch_id == &patch.id)
+        }) {
+            return Ok(());
+        }
+        let decisions = self
+            .session_store
+            .read_patch_file_decisions(&patch.session_id, task_id)?;
+        let mut decided = BTreeSet::new();
+        let mut any_applied = false;
+        for decision in decisions
+            .iter()
+            .filter(|decision| decision.patch_id == patch.id)
+        {
+            any_applied |= decision.applied;
+            for path in &decision.paths {
+                decided.insert(path.as_str());
+            }
+        }
+        if patch
+            .files
+            .iter()
+            .any(|file| !decided.contains(file.path.as_str()))
+        {
+            return Ok(());
+        }
+        // A repair turn starts an attempt before it proposes its patch, so a
+        // selected check set with no `Finished` is the unfinished attempt
+        // (spec 23 `context.md` §5).
+        let state = fold_verification(events.iter());
+        let unfinished = !state.selected.is_empty() && state.finished.is_none();
+        if !any_applied && !unfinished {
+            return Ok(());
+        }
+        self.session_store.append_verification_event(
+            &patch.session_id,
+            &VerificationEvent::Due {
+                task_id: task_id.to_string(),
+                patch_id: patch.id.clone(),
+            },
+        )
     }
 
     /// Adds the patch's selected files to the checkpoint of the turn that
@@ -934,6 +1032,7 @@ impl EditOrchestrator {
     }
 
     pub fn reject_stored_patch(&self, patch_id: &str, rejected_by: &str) -> Result<PathBuf> {
+        let patch = self.patch_store.load(patch_id)?;
         let path = self.patch_store.mark_rejected(patch_id, rejected_by)?;
         self.audit_log.record(
             "stored_patch_rejected",
@@ -944,6 +1043,8 @@ impl EditOrchestrator {
                 ("resourcePath", path.to_string_lossy().to_string()),
             ],
         )?;
+        let paths: Vec<String> = patch.files.iter().map(|file| file.path.clone()).collect();
+        self.record_patch_file_decision(&patch, &paths, false)?;
         Ok(path)
     }
 
@@ -967,6 +1068,7 @@ impl EditOrchestrator {
                 ("resourcePath", path.to_string_lossy().to_string()),
             ],
         )?;
+        self.record_patch_file_decision(&patch, rejected_paths, false)?;
         Ok(path)
     }
 }

@@ -88,19 +88,19 @@ reports the disagreement.
 #25, #32, #50, #59 and #62 are all Done and merged into `main`. #26 context
 assembly is Done (2026-10-25), so the keystone is no longer in flight.
 
-- **In progress:** #49 prompt cache — the accounting slice is done and the
-  reuse slice (requirement 4) is the only unbuilt requirement. #26's ordering
-  now exists, but the spec's own `Depends on:` line still names Phase 1 WP3
-  (provider capability validation) as unspecified, and the eight-message
-  sliding window it is most sensitive to is #55's to replace, so it is not in
-  the ready set.
-- **Ready, not started:** #23 verification loop;
-  #27 context inspector; #33 MCP management; #51 external reference retrieval;
-  #55 conversation compaction; #65 exploration memory (planned 2026-10-24 as a
-  folder spec; its requirement 8's budget interaction is settled by #59, and its
-  carry-into-the-next-turn task no longer waits for #26); #66 plan left open at
-  turn end (#65 and #66 both edit `chat.rs`, so they do not pair with each
-  other).
+- **In progress:** #23 verification loop (Tasks 1–3 landed 2026-10-25; #26 is
+  Done, so Tasks 4–6 are unblocked); #49 prompt cache — the accounting slice is
+  done and the reuse slice (requirement 4) is the only unbuilt requirement.
+  #26's ordering now exists, but the spec's own `Depends on:` line still names
+  Phase 1 WP3 (provider capability validation) as unspecified, and the
+  eight-message sliding window it is most sensitive to is #55's to replace, so
+  it is not in the ready set.
+- **Ready, not started:** #27 context inspector; #33 MCP management; #51
+  external reference retrieval; #55 conversation compaction; #65 exploration
+  memory (planned 2026-10-24 as a folder spec; its requirement 8's budget
+  interaction is settled by #59, and its carry-into-the-next-turn task no longer
+  waits for #26); #66 plan left open at turn end (#65 and #66 both edit
+  `chat.rs`, so they do not pair with each other).
 - **Blocked:** #28 on #27; #29 on #28; #30 on #28 and #29; #35 on #23; #36 on
   #35; #37 on #33, #35 and #36; #52 on #33; #39 on #38; #40 on #38 and #39; #54
   on Phase 1 WP3 (provider capability validation), which is unspecified.
@@ -453,6 +453,13 @@ Task 1 begins. Three facts about pairing it, from its
   hook. A hook may therefore fire twice on a reminded turn, both times charged
   to the same action budget.
 
+Re-checked on 2026-10-25, when [#23](23_verification_loop/proposal.md) started.
+#23 leaves the ready set for in-progress; Tasks 1–3 landed the same day and do
+not touch `chat.rs`. Its Tasks 4–6 edit `chat.rs` and waited for #26 to merge
+(its [`context.md`](23_verification_loop/context.md) §13), so #23 and #26 were
+strictly sequential. **#26 closed later the same day**, which unblocked Tasks
+4–10. The ready set is now #27, #33, #51, #55, #65 and #66.
+
 ### Parallel work
 
 Two specs may be built at once, which is a **deliberate exception to the
@@ -518,7 +525,7 @@ is ready.
 | 20 | [20_working_modes/](20_working_modes/proposal.md) | **Done.** Roadmap Phase 2 WP1. Four session modes (Ask, Plan, Code, Review) as a capability boundary rather than a prompt instruction, enforced in three layers: the tool list via `mode_permits`, the fallback prompt, and orchestrator refusals at nine call sites. Two known gaps stay open in its §7: a rejected proposal can be run by id through `/api/run-command`, and `git diff --output=<file>` passes the read-only check. |
 | 21 | [21_task_plan_progress_and_budget/](21_task_plan_progress_and_budget/proposal.md) | **Done.** Roadmap Phase 2 WP2. Ordered plan steps with observable evidence, so a step is never complete because the model said so, plus an enforced per-turn token ceiling using #19's accounting, persisted through #17's event log. `propose_plan` supplies titles only and `complete_step` takes no arguments: the model asks to move on, the engine decides from what it observed. |
 | 22 | [22_findings_model_and_panel/](22_findings_model_and_panel/proposal.md) | **Done 2026-10-04.** Roadmap Phase 2 WP6. One `Finding` type shared by compiler, test, lint, browser and (later) review sources, with parsers that degrade to one honest generic finding rather than losing a failure, persisted in #17's session log. A session panel filters, opens, dismisses, or sends a selected subset to the agent as a scoped repair. It also closed #21's deferred `Evidence::Findings`. |
-| 23 | [23_verification_loop/](23_verification_loop/proposal.md) | **Not started; split into a folder and planned 2026-10-09.** See `tasks.md` for the ten-task breakdown. [`context.md`](23_verification_loop/context.md) found that a patch is applied after the turn that proposed it has ended, so the loop is a continuation the apply path triggers rather than a step inside a turn. It also found that detection gives a Cargo root `cargo test` and nothing else, so checks are selected by the root that owns each changed file, not by a file-category table. Roadmap Phase 2 WP3. Sequences apply → discover checks → run → find → repair → rerun → report, driven by the orchestrator rather than the model, so a completion report distinguishes verified from assumed. Consumes #21, #22 and #24. |
+| 23 | [23_verification_loop/](23_verification_loop/proposal.md) | **In progress; started 2026-10-25.** Tasks 1–3 landed: the pure `verification.rs` report and fold, per-root check selection with `RepositoryMap::restricted_to`, and the `patch_file_decided`/`verification_due` session events the apply and reject paths append. Tasks 4–6 edit `chat.rs`; #26 merged on 2026-10-25, so they are now unblocked. Split into a folder and planned 2026-10-09. See `tasks.md` for the ten-task breakdown. [`context.md`](23_verification_loop/context.md) found that a patch is applied after the turn that proposed it has ended, so the loop is a continuation the apply path triggers rather than a step inside a turn. It also found that detection gives a Cargo root `cargo test` and nothing else, so checks are selected by the root that owns each changed file, not by a file-category table. Roadmap Phase 2 WP3. Sequences apply → discover checks → run → find → repair → rerun → report, driven by the orchestrator rather than the model, so a completion report distinguishes verified from assumed. Consumes #21, #22 and #24. |
 | 24 | [24_repository_map_and_monorepo_boundaries/](24_repository_map_and_monorepo_boundaries/proposal.md) | **Done 2026-10-09.** Roadmap Phase 3 WP2, built in nine tasks. A deterministic map of project roots, persisted per repository and rebuilt on an input fingerprint, rendered into model context under `repository_map_max_tokens` (default 800, lower-only from a repository). A command discovered in, or requested for, `packages/api` runs there. Allow Always in a sub-root writes a root-qualified grant, and a plain allowlist entry applies at the repository root only. Containment is always checked against the repository root. Roots are corrected through `project_roots_added`/`project_roots_removed` in repository config, from Settings or `damaian repo-root`. Reuses `detect_project_commands`' manifest list per root rather than inventing a second one. `context.md` records where the code contradicted the design. Not built: frameworks and per-root permission restrictions (`proposal.md` §7.1). |
 | 25 | [25_symbol_and_relationship_index/](25_symbol_and_relationship_index/proposal.md) | **Done 2026-10-23 (started 2026-10-13).** Split into a folder and planned 2026-10-09, re-checked against `main` 2026-10-12, built in eleven tasks. [`context.md`](25_symbol_and_relationship_index/context.md) records where the code contradicted the design: spec 46's registry is built, LSP framing is not MCP's, sessions have no close event, and restricted files are indexed. The three pieces that need `chat.rs` remain deferred (§12): an agent-facing symbol tool, task attribution for diagnostics, and symbols in `search_codebase` output. Roadmap Phase 3 WP3. A rescope, not greenfield: `FileRecord.symbols`/`imports` already existed as prefix heuristics. Adds locations, kinds, relationships, a `symbols` context item, on-demand references, and a `Provenance` label separating language-server fact from heuristic guess. Satisfies Phase 2's deferred LSP dependency. A Task 11 follow-up wired the eager definition pass to the first symbol search, so language-server definitions and diagnostics are reachable in the app; the Tauri app's exit path still relies on EOF and the next launch's sweep, as Task 5 recorded. |
 | 26 | [26_context_assembly/proposal.md](26_context_assembly/proposal.md) | **Done 2026-10-25** (planned 2026-10-24; Tasks 1–6 on 2026-10-25, Task 7 closing the same day). Roadmap Phase 3 WP4. Replaced the single first-come-first-served budget with per-category allocation whose shares a repository may lower but never raise, range deduplication with ranged reads outside the tool line cap, exclusion records naming why content was dropped or shortened, and a content-free manifest recorded once per assembly as `context_assembled`. Also fixed a security hole planning found: the user's prompt and replayed earlier turns now pass through the secret scanner, where both used to reach the provider in cleartext. The estimator is content-aware and calibrated against a live provider measurement (prose 4 B/token, code 3.6, structured 2.4). Its [`context.md`](26_context_assembly/context.md) records the pre-implementation pipeline; [`tasks.md`](26_context_assembly/tasks.md) holds the corrections and the seven tasks. Two open points in its §7 are inherited rather than fixed: no collection source yields a `LineRange` yet, so range merging is implemented and unit-tested but inert, and no Observed capability profile exists, so every limit is `Declared`. |
