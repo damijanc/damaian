@@ -576,6 +576,15 @@ pub struct ChatTurnOptions {
     /// (spec 61 §5.2). Callers leave it `false`.
     #[serde(default)]
     pub round_budget_answer_now: bool,
+    /// This turn is Damaian's verification continuation (spec 23). Its plan
+    /// steps are the checks the applied patch triggered, not a plan the model
+    /// proposed, so the plan review gate does not apply: asking the user to
+    /// approve "run `cargo test`" would be asking about Damaian's own
+    /// bookkeeping, and the repair request is what the model actually answers.
+    /// Set only by `ChatOrchestrator::run_repair_turn`; a paused turn carries
+    /// it so a resume keeps the same exemption.
+    #[serde(default)]
+    pub verification_turn: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1128,7 +1137,7 @@ impl ChatOrchestrator {
         &self,
         repository_root: impl AsRef<Path>,
         session_id: &str,
-        _model_adapter: &mut dyn ModelAdapter,
+        model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let repository_root = repository_root.as_ref();
@@ -1136,8 +1145,7 @@ impl ChatOrchestrator {
             return Err(ClientError::InvalidInput(format!(
                 "Unknown session: {session_id}"
             )));
-        };
-        // The loop is Code-only: in Ask, Plan and Review there is nothing
+        }; // The loop is Code-only: in Ask, Plan and Review there is nothing
         // applied to verify. Checked again here because the mode can change
         // between the apply and this call.
         if self.session_store.session_mode(session_id) != SessionMode::Code {
@@ -1154,15 +1162,59 @@ impl ChatOrchestrator {
                 "No verification is due in this session".to_string(),
             ));
         };
-        // Attempt 0 is the first verification. A `Due` after a finished
-        // attempt starts the next one; an interrupted attempt is rerun at the
+        // A repair patch whose every file the user rejected left the failing
+        // attempt open and nothing to verify. It closes as
+        // `no_repair_applied`, and the attempt count does not increase: no
+        // repair was attempted at all (spec 23 `context.md` §5).
+        let decisions = self
+            .session_store
+            .read_patch_file_decisions(session_id, &due.task_id)?;
+        let decisions: Vec<_> = decisions
+            .into_iter()
+            .filter(|decision| decision.patch_id == due.patch_id)
+            .collect();
+        if !decisions.is_empty() && decisions.iter().all(|decision| !decision.applied) {
+            let mut task = self.session_store.create_task(
+                session_id,
+                VERIFICATION_TURN_PROMPT,
+                &self.config.model_provider,
+                &self.config.model_name,
+            )?;
+            task = self
+                .session_store
+                .update_task_status(&task, TaskStatus::Validating, None)?;
+            self.session_store.resume_plan(&task, &due.task_id)?;
+            let changed = self.verification_changed_files(session_id, &task.id, &due)?;
+            let file_hashes = hash_existing_files(repository_root, &changed);
+            return self.finish_verification_with_outcome(
+                session,
+                task,
+                VerificationOutcome::NoRepairApplied,
+                changed,
+                file_hashes,
+            );
+        }
+        // Attempt 0 is the first verification. A repair patch proposed by the
+        // verification turn that was already running starts the next attempt;
+        // a new patch after a finished verification does too. An interrupted
+        // attempt (its due patch predates the running turn) is rerun at the
         // attempt it was already on (spec 23 `context.md` §5).
+        let due_patch_task = self
+            .patch_store
+            .load(&due.patch_id)
+            .ok()
+            .and_then(|patch| patch.task_id);
+        let latest_started = events.iter().rev().find_map(|event| match event {
+            VerificationEvent::Started { task_id, .. } => Some(task_id.as_str()),
+            _ => None,
+        });
+        let repair_patch = latest_started.is_some() && due_patch_task.as_deref() == latest_started;
         let attempt = if state.selected.is_empty() {
             0
-        } else if state.finished.is_none() {
-            state.attempt
-        } else {
+        } else if repair_patch || state.finished.is_some() {
             state.attempt.saturating_add(1)
+        } else {
+            state.attempt
         };
         let mut task = self.session_store.create_task(
             session_id,
@@ -1216,6 +1268,7 @@ impl ChatOrchestrator {
                 checks,
                 changed,
                 file_hashes,
+                model_adapter,
                 sink,
             ),
         }
@@ -1231,7 +1284,7 @@ impl ChatOrchestrator {
         batch_id: &str,
         decisions: &[(String, bool)],
         approved_by: &str,
-        _model_adapter: &mut dyn ModelAdapter,
+        model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(batch_id)?;
@@ -1314,7 +1367,16 @@ impl ChatOrchestrator {
         task = self
             .session_store
             .update_task_status(&task, TaskStatus::Validating, None)?;
-        self.finish_verification(session, task, batch.files_changed, batch.file_hashes)
+        self.finish_verification(
+            &repository_root,
+            session,
+            task,
+            batch.attempt,
+            batch.files_changed,
+            batch.file_hashes,
+            model_adapter,
+            sink,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1328,6 +1390,7 @@ impl ChatOrchestrator {
         checks: Vec<(CheckId, CommandProposal)>,
         changed: Vec<String>,
         file_hashes: BTreeMap<String, String>,
+        model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let selected: Vec<CheckId> = checks.iter().map(|(check, _)| check.clone()).collect();
@@ -1431,7 +1494,16 @@ impl ChatOrchestrator {
                 file_hashes,
             );
         }
-        self.finish_verification(session, task, changed, file_hashes)
+        self.finish_verification(
+            repository_root,
+            session,
+            task,
+            attempt,
+            changed,
+            file_hashes,
+            model_adapter,
+            sink,
+        )
     }
 
     /// Runs one check and records its effect on its plan step.
@@ -1634,40 +1706,28 @@ impl ChatOrchestrator {
                 checks: Vec::new(),
             },
         )?;
-        self.session_store.append_verification_event(
-            &session.id,
-            &VerificationEvent::Finished {
-                task_id: task.id.clone(),
-                outcome,
-            },
-        )?;
-        let events = self
-            .session_store
-            .read_verification_events(&session.id, &[])?;
-        let state = fold_verification(events.iter());
-        let plan = self
-            .session_store
-            .read_task_plan(&session.id, &task.id)?
-            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
-        let report = VerificationReport::build(&state, &plan, &changed, &file_hashes);
-        let response = format!("{}\n\n{}", report.summary(&plan.report()), report.render());
-        let task = self
-            .session_store
-            .update_task_status(&task, TaskStatus::Complete, None)?;
-        self.verification_turn_result(session, task, response, None, Some(report), changed)
+        self.finish_verification_with_outcome(session, task, outcome, changed, file_hashes)
     }
 
-    /// Appends `Finished`, then builds and returns the report.
+    /// Decides whether the verification is done, may be repaired, or has hit
+    /// the repair limit (spec 23 proposal §5.5).
     ///
-    /// Task 5 inserts repair before this: today a failing check closes the
-    /// task as `failed` with the report, which is the honest answer even
-    /// without a repair attempt.
+    /// A failing check below `agent_tool_retry_limit` starts a repair turn whose
+    /// request is the failing check's findings. A repair is a patch, so the
+    /// turn ends awaiting review as any patch does; when it settles, Task 3's
+    /// `verification_due` makes attempt *n + 1* due. At the limit the task is
+    /// `failed` and the report leads with what still fails.
+    #[allow(clippy::too_many_arguments)]
     fn finish_verification(
         &self,
+        repository_root: &Path,
         session: Session,
         task: Task,
+        attempt: u32,
         changed: Vec<String>,
         file_hashes: BTreeMap<String, String>,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let events = self
             .session_store
@@ -1678,11 +1738,174 @@ impl ChatOrchestrator {
             .read_task_plan(&session.id, &task.id)?
             .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
         let preliminary = VerificationReport::build(&state, &plan, &changed, &file_hashes);
-        let outcome = if preliminary.failed.is_empty() && preliminary.stale.is_empty() {
-            VerificationOutcome::Passed
-        } else {
-            VerificationOutcome::Failed
-        };
+        if preliminary.failed.is_empty() && preliminary.stale.is_empty() {
+            return self.finish_verification_with_outcome(
+                session,
+                task,
+                VerificationOutcome::Passed,
+                changed,
+                file_hashes,
+            );
+        }
+        if attempt >= self.config.agent_tool_retry_limit {
+            return self.finish_verification_with_outcome(
+                session,
+                task,
+                VerificationOutcome::RepairLimitExhausted,
+                changed,
+                file_hashes,
+            );
+        }
+        self.run_repair_turn(
+            repository_root,
+            session,
+            task,
+            &preliminary,
+            &plan,
+            changed,
+            file_hashes,
+            model_adapter,
+            sink,
+        )
+    }
+
+    /// Asks the model to fix the failing checks, and either returns its patch
+    /// proposal or closes the attempt as `no_repair_applied`.
+    ///
+    /// The request is the rendered [`RepairRequest`](crate::finding::RepairRequest),
+    /// findings rather than raw log output, and it enters as the turn's user
+    /// request through context assembly so `bounded_messages` can never elide
+    /// it (spec 23 `context.md` §13).
+    #[allow(clippy::too_many_arguments)]
+    fn run_repair_turn(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        report: &VerificationReport,
+        plan: &TaskPlan,
+        changed: Vec<String>,
+        file_hashes: BTreeMap<String, String>,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let mut refs = Vec::new();
+        for step in plan
+            .steps
+            .iter()
+            .filter(|step| step.id.starts_with("verify_"))
+        {
+            for evidence in &step.evidence {
+                if let Evidence::Findings { refs: ids, .. } = evidence {
+                    refs.extend(ids.clone());
+                }
+            }
+        }
+        let findings = self
+            .session_store
+            .read_findings(&session.id, repository_root)?;
+        let rendered = crate::finding::RepairRequest::select(&findings, &refs)
+            .render()
+            .unwrap_or_else(|| {
+                // A check that failed without a parsed finding still has to be
+                // stated: the labels and exit reasons, never the raw log.
+                let lines = report
+                    .failed
+                    .iter()
+                    .map(|item| format!("- {} — {}", item.check.label(), item.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("Fix the failing checks below.\n\n{lines}")
+            });
+        let prompt = format!(
+            "{VERIFICATION_TURN_PROMPT} {} verification {} failed. Fix {} and propose a patch with `propose_patch`.\n\n{rendered}",
+            report.failed.len(),
+            if report.failed.len() == 1 {
+                "check"
+            } else {
+                "checks"
+            },
+            if report.failed.len() == 1 {
+                "it"
+            } else {
+                "them"
+            },
+        );
+        let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
+        let context = self.context_manager.build_context(ContextRequest {
+            repository_root,
+            repository_id: &index.repository_id,
+            task_id: &task.id,
+            prompt: &prompt,
+            index: Some(&index),
+            explicit_paths: &changed,
+            limit: self.config.context_token_budget(),
+            hook_context: &[],
+            plan: Some(plan),
+        })?;
+        let mut fields = vec![
+            ("actor", "system".to_string()),
+            ("sessionId", session.id.clone()),
+        ];
+        fields.extend(context.manifest.audit_fields());
+        self.audit_log.record("context_assembled", &fields)?;
+        let messages = vec![
+            ModelMessage::system(system_prompt_for_session(
+                SessionMode::Code,
+                false,
+                false,
+                &self.config.shell,
+            )),
+            ModelMessage::user(build_model_prompt(&context, &[], &self.scanner, None)),
+        ];
+        let result = self.run_agentic_turn(
+            repository_root,
+            session,
+            task,
+            context.files,
+            messages,
+            0,
+            0,
+            model_adapter,
+            sink,
+            ChatTurnOptions {
+                verification_turn: true,
+                ..Default::default()
+            },
+        )?;
+        // A pause is not the end of the attempt: a command approval or a round
+        // budget resumes the same turn and still counts as this attempt.
+        let paused = result.command_proposal.is_some()
+            || result.plan_proposal.is_some()
+            || result.question_proposal.is_some()
+            || result.fallback_proposal.is_some()
+            || result.round_budget_proposal.is_some()
+            || result.check_batch.is_some();
+        if paused || result.patch_proposal.is_some() {
+            return Ok(result);
+        }
+        // The model answered without proposing a patch. Asking it the same
+        // question again would spend the remaining attempts for nothing, so the
+        // loop stops here (proposal §5.5).
+        self.finish_verification_with_outcome(
+            result.session,
+            result.task,
+            VerificationOutcome::NoRepairApplied,
+            changed,
+            file_hashes,
+        )
+    }
+
+    /// Appends `Finished`, builds the report and closes the task with the
+    /// status that outcome earns.
+    fn finish_verification_with_outcome(
+        &self,
+        session: Session,
+        task: Task,
+        outcome: VerificationOutcome,
+        changed: Vec<String>,
+        file_hashes: BTreeMap<String, String>,
+    ) -> Result<ChatTurnResult> {
         self.session_store.append_verification_event(
             &session.id,
             &VerificationEvent::Finished {
@@ -1694,15 +1917,66 @@ impl ChatOrchestrator {
             .session_store
             .read_verification_events(&session.id, &[])?;
         let state = fold_verification(events.iter());
+        let plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)?
+            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
         let report = VerificationReport::build(&state, &plan, &changed, &file_hashes);
         let response = format!("{}\n\n{}", report.summary(&plan.report()), report.render());
-        let status = if outcome == VerificationOutcome::Passed {
-            TaskStatus::Complete
-        } else {
-            TaskStatus::Failed
+        let status = match outcome {
+            VerificationOutcome::Passed
+            | VerificationOutcome::NoChecksAvailable
+            | VerificationOutcome::OnlyDocumentationChanged => TaskStatus::Complete,
+            VerificationOutcome::Failed
+            | VerificationOutcome::RepairLimitExhausted
+            | VerificationOutcome::NoRepairApplied => TaskStatus::Failed,
         };
         let task = self.session_store.update_task_status(&task, status, None)?;
         self.verification_turn_result(session, task, response, None, Some(report), changed)
+    }
+
+    /// Closes a repair turn that paused and later ended with a model answer
+    /// (spec 23 proposal §5.5).
+    ///
+    /// The pause's resume path re-enters `run_agentic_turn` outside
+    /// [`Self::run_repair_turn`], so this is where its answer is judged: a
+    /// patch ends the turn as any patch does, another pause waits, and an
+    /// answer with no patch is `no_repair_applied` rather than a success.
+    fn close_verification_resume(
+        &self,
+        repository_root: &Path,
+        result: ChatTurnResult,
+    ) -> Result<ChatTurnResult> {
+        let paused = result.patch_proposal.is_some()
+            || result.command_proposal.is_some()
+            || result.plan_proposal.is_some()
+            || result.question_proposal.is_some()
+            || result.fallback_proposal.is_some()
+            || result.round_budget_proposal.is_some()
+            || result.check_batch.is_some()
+            || result.cancelled;
+        if paused {
+            return Ok(result);
+        }
+        let events = self
+            .session_store
+            .read_verification_events(&result.session.id, &[])?;
+        let state = fold_verification(events.iter());
+        let Some(due) = state.due.clone() else {
+            return Ok(result);
+        };
+        if state.selected.is_empty() || state.finished.is_some() {
+            return Ok(result);
+        }
+        let changed = self.verification_changed_files(&result.session.id, &result.task.id, &due)?;
+        let file_hashes = hash_existing_files(repository_root, &changed);
+        self.finish_verification_with_outcome(
+            result.session,
+            result.task,
+            VerificationOutcome::NoRepairApplied,
+            changed,
+            file_hashes,
+        )
     }
 
     /// The files the task changed, from the plan's applied patches and the due
@@ -1725,11 +1999,17 @@ impl ChatOrchestrator {
                 }
             }
         }
+        // Every applied patch in the conversation, not only the one that made
+        // this attempt due: a repair changes files, and the rerun set is every
+        // check selected so far plus whatever the repair's files select
+        // (spec 23 proposal §5.5). Reading only `due.task_id` would lose the
+        // files an earlier patch applied once the plan step that carried the
+        // evidence had already closed.
         for decision in self
             .session_store
-            .read_patch_file_decisions(session_id, &due.task_id)?
+            .read_all_patch_file_decisions(session_id)?
         {
-            if decision.patch_id == due.patch_id && decision.applied {
+            if decision.applied {
                 for path in decision.paths {
                     changed.insert(path);
                 }
@@ -2159,7 +2439,7 @@ impl ChatOrchestrator {
             None,
         )?;
 
-        self.run_agentic_turn(
+        let result = self.run_agentic_turn(
             &repository_root,
             pending.session,
             task,
@@ -2170,7 +2450,11 @@ impl ChatOrchestrator {
             model_adapter,
             sink,
             pending.turn_options,
-        )
+        )?;
+        if pending.turn_options.verification_turn {
+            return self.close_verification_resume(&repository_root, result);
+        }
+        Ok(result)
     }
 
     /// Continues a chat turn that stopped to have its plan reviewed before
@@ -2576,8 +2860,9 @@ impl ChatOrchestrator {
             provider_fallback_used: true,
             ..pending.turn_options
         };
-        self.run_agentic_turn(
-            &PathBuf::from(&pending.repository_root),
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let result = self.run_agentic_turn(
+            &repository_root,
             pending.session,
             task,
             pending.context_files,
@@ -2587,7 +2872,11 @@ impl ChatOrchestrator {
             model_adapter,
             sink,
             turn_options,
-        )
+        )?;
+        if pending.turn_options.verification_turn {
+            return self.close_verification_resume(&repository_root, result);
+        }
+        Ok(result)
     }
 
     /// Decides a round-budget pause (spec 61 §5.2).
@@ -2678,7 +2967,7 @@ impl ChatOrchestrator {
                     round_budget_extension: rounds_granted,
                     ..pending.turn_options
                 };
-                self.run_agentic_turn(
+                let result = self.run_agentic_turn(
                     &repository_root,
                     pending.session,
                     task,
@@ -2689,7 +2978,11 @@ impl ChatOrchestrator {
                     model_adapter,
                     sink,
                     turn_options,
-                )
+                )?;
+                if pending.turn_options.verification_turn {
+                    return self.close_verification_resume(&repository_root, result);
+                }
+                Ok(result)
             }
             RoundBudgetDecision::AnswerNow => {
                 self.audit_log.record(
@@ -2712,7 +3005,7 @@ impl ChatOrchestrator {
                     round_budget_answer_now: true,
                     ..pending.turn_options
                 };
-                self.run_agentic_turn(
+                let result = self.run_agentic_turn(
                     &repository_root,
                     pending.session,
                     task,
@@ -2723,7 +3016,11 @@ impl ChatOrchestrator {
                     model_adapter,
                     sink,
                     turn_options,
-                )
+                )?;
+                if pending.turn_options.verification_turn {
+                    return self.close_verification_resume(&repository_root, result);
+                }
+                Ok(result)
             }
         }
     }
@@ -4216,6 +4513,7 @@ impl ChatOrchestrator {
                 // panel in front of every trivial question (§5.1).
                 if let Some(current) = plan.as_ref()
                     && !plan_approved
+                    && !turn_options.verification_turn
                     && permission.is_allowed()
                     && action_awaits_plan_review(&tool_action, |command| {
                         self.validation_orchestrator

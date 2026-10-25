@@ -1732,6 +1732,23 @@ impl SessionStore {
         session_id: &str,
         task_id: &str,
     ) -> Result<Vec<PatchFileDecision>> {
+        Ok(self
+            .read_all_patch_file_decisions(session_id)?
+            .into_iter()
+            .filter(|decision| decision.task_id == task_id)
+            .collect())
+    }
+
+    /// Every patch-file decision in the session, in log order.
+    ///
+    /// The verification loop needs this rather than one task's decisions: a
+    /// verification chain spans the task that proposed each patch, and the
+    /// files a later attempt must re-check are the union of everything the
+    /// conversation applied, not only the patch that made it due.
+    pub fn read_all_patch_file_decisions(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PatchFileDecision>> {
         let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
             return Ok(Vec::new());
         };
@@ -1744,9 +1761,7 @@ impl SessionStore {
             else {
                 continue;
             };
-            if decision.task_id == task_id {
-                decisions.push(decision);
-            }
+            decisions.push(decision);
         }
         Ok(decisions)
     }

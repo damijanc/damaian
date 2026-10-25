@@ -17,10 +17,10 @@ use serde_json::json;
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
     CancelToken, CheckId, CheckOutcome, CommandPurpose, Config, Evidence, HookConfig, HookEvent,
-    HookMode, HookSource, MockModelAdapter, PlanReport, PlanStep, Selection, SkipReason, TaskPlan,
-    TaskStatus, TurnProgress, TurnSink, VerificationEvent, VerificationOutcome, VerificationReport,
-    VerificationState, WorkspaceEngine, fold_verification, is_documentation, propose_checks,
-    select_roots,
+    HookMode, HookSource, MockModelAdapter, PlanReport, PlanStep, RoundBudgetDecision, Selection,
+    SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink, VerificationEvent,
+    VerificationOutcome, VerificationReport, VerificationState, WorkspaceEngine, fold_verification,
+    is_documentation, propose_checks, select_roots,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -1283,6 +1283,17 @@ fn verify_engine(
     allow: &[&str],
     block: &[&str],
 ) -> WorkspaceEngine {
+    verify_engine_with_retry(root, data_dir, shell, allow, block, 0)
+}
+
+fn verify_engine_with_retry(
+    root: &std::path::Path,
+    data_dir: &std::path::Path,
+    shell: &str,
+    allow: &[&str],
+    block: &[&str],
+    retry_limit: u32,
+) -> WorkspaceEngine {
     fs::create_dir_all(root).unwrap();
     WorkspaceEngine::new(Config {
         data_dir: data_dir.to_path_buf(),
@@ -1290,6 +1301,7 @@ fn verify_engine(
         shell: shell.to_string(),
         command_allowlist: allow.iter().map(|entry| (*entry).to_string()).collect(),
         command_blocklist: block.iter().map(|entry| (*entry).to_string()).collect(),
+        agent_tool_retry_limit: retry_limit,
         ..Config::default()
     })
 }
@@ -1652,7 +1664,10 @@ fn a_failing_check_blocks_its_step_and_fails_the_report() {
     let result = run_verification(&engine, &root, &session, &mut adapter);
 
     let report = result.verification_report.as_ref().unwrap();
-    assert_eq!(report.outcome, Some(VerificationOutcome::Failed));
+    assert_eq!(
+        report.outcome,
+        Some(VerificationOutcome::RepairLimitExhausted)
+    );
     assert!(report.passed.is_empty());
     assert_eq!(
         report.failed[0].reason, "exit code 1",
@@ -1874,6 +1889,7 @@ fn an_after_check_hook_sees_the_verification_run() {
         enable_index_watcher: false,
         shell: "/usr/bin/false".to_string(),
         command_allowlist: vec!["cargo test".to_string()],
+        agent_tool_retry_limit: 0,
         hooks: vec![hook],
         ..Config::default()
     });
@@ -1887,7 +1903,7 @@ fn an_after_check_hook_sees_the_verification_run() {
     let result = run_verification(&engine, &root, &session, &mut adapter);
     assert_eq!(
         result.verification_report.as_ref().unwrap().outcome,
-        Some(VerificationOutcome::Failed)
+        Some(VerificationOutcome::RepairLimitExhausted)
     );
 
     let captured: serde_json::Value =
@@ -1900,6 +1916,501 @@ fn an_after_check_hook_sees_the_verification_run() {
         captured["payload"]["findingIds"].is_array(),
         "the payload carries the finding ids field: {captured}"
     );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+// --- Repair, rerun and the limit (Task 5) ----------------------------------
+
+fn patch_call(path: &str, content: &str) -> workspace_engine::ToolCall {
+    workspace_engine::ToolCall {
+        id: "repair_patch".to_string(),
+        name: "propose_patch".to_string(),
+        arguments_json: serde_json::json!({
+            "summary": "Fix the failing check",
+            "files": [{"path": path, "content": content, "status": "modified"}],
+        })
+        .to_string(),
+    }
+}
+
+fn repaired_shell(root: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("bin").join("check-shell.sh");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$2\" in\n  *\"npm run test\"*)\n    if [ -f \"{root}/web-fail\" ]; then\n      echo 'error[E0308]: mismatched types' >&2\n      echo ' --> packages/web/src/index.ts:1:1' >&2\n      exit 1\n    fi\n    exit 0\n    ;;\n  *)\n    if [ -f \"{root}/cargo-fail\" ]; then\n      echo 'error[E0425]: cannot find value x in this scope' >&2\n      echo ' --> src/a.rs:1:1' >&2\n      exit 1\n    fi\n    exit 0\n    ;;\nesac\n",
+            root = root.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+fn started_attempts(events: &[VerificationEvent]) -> Vec<u32> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            VerificationEvent::Started { attempt, .. } => Some(*attempt),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_failed_check_is_repaired_and_the_rerun_passes() {
+    let root = temp_dir("repair-pass");
+    let data_dir = temp_dir("repair-pass-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+
+    let first = run_verification(&engine, &root, &session, &mut repair);
+    let patch = first
+        .patch_proposal
+        .as_ref()
+        .expect("a failing check asks the model for a repair patch");
+    assert!(
+        first.verification_report.is_none(),
+        "the report waits for the rerun"
+    );
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+        .expect("the repair patch applies");
+    assert_eq!(
+        fs::read_to_string(root.join("src/a.rs")).unwrap(),
+        "let a = 3;\n"
+    );
+
+    // A new orchestrator over the same data dir proves the attempt count comes
+    // from the log, not from memory, and flips the check's result.
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[], 2);
+    let mut adapter = MockModelAdapter::new("");
+    let second = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = second.verification_report.as_ref().unwrap();
+    assert_eq!(report.outcome, Some(VerificationOutcome::Passed));
+    assert_eq!(report.passed, vec![CheckId::new("", "cargo test")]);
+    assert_eq!(second.task.status, TaskStatus::Complete);
+    let events = outcome_events(&engine, &session);
+    assert_eq!(started_attempts(&events), vec![0, 1], "{events:?}");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn exhausting_the_repair_limit_reports_what_still_fails() {
+    let root = temp_dir("repair-limit");
+    let data_dir = temp_dir("repair-limit-data");
+    cargofile(&root);
+    let mut session = String::new();
+    for attempt in 0..2 {
+        let engine =
+            verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+        if attempt == 0 {
+            let (created, _task) = applied_change(
+                &engine,
+                &root,
+                &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+            );
+            session = created;
+        }
+        let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new()],
+            vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+        );
+        let turn = run_verification(&engine, &root, &session, &mut repair);
+        let patch = turn
+            .patch_proposal
+            .as_ref()
+            .expect("each attempt below the limit asks for a repair");
+        engine
+            .edit_orchestrator
+            .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+            .expect("the repair patch applies");
+    }
+
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let mut adapter = MockModelAdapter::new("");
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert_eq!(
+        report.outcome,
+        Some(VerificationOutcome::RepairLimitExhausted)
+    );
+    assert_eq!(result.task.status, TaskStatus::Failed);
+    assert!(!result.response.contains("complete"));
+    assert!(
+        result.response.contains("repair limit was exhausted"),
+        "{}",
+        result.response
+    );
+    assert_eq!(
+        started_attempts(&outcome_events(&engine, &session)),
+        vec![0, 1, 2]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_repair_turn_that_answers_without_a_patch_stops() {
+    let root = temp_dir("repair-no-patch");
+    let data_dir = temp_dir("repair-no-patch-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut repair = MockModelAdapter::new("I cannot fix this without more information.");
+
+    let result = run_verification(&engine, &root, &session, &mut repair);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert_eq!(report.outcome, Some(VerificationOutcome::NoRepairApplied));
+    assert_eq!(result.task.status, TaskStatus::Failed);
+    assert_eq!(repair.requests.len(), 1, "one repair question, not two");
+    assert!(result.response.contains("no repair patch was applied"));
+    assert_eq!(
+        started_attempts(&outcome_events(&engine, &session)),
+        vec![0]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_fully_rejected_repair_patch_closes_the_attempt_without_another_round() {
+    let root = temp_dir("repair-rejected");
+    let data_dir = temp_dir("repair-rejected-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+    let first = run_verification(&engine, &root, &session, &mut repair);
+    let patch = first.patch_proposal.as_ref().unwrap();
+    engine
+        .edit_orchestrator
+        .reject_stored_patch_files(&patch.patch_id, &["src/a.rs".to_string()], "tester")
+        .expect("the repair patch is rejected in full");
+
+    let mut adapter = MockModelAdapter::new("");
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert_eq!(report.outcome, Some(VerificationOutcome::NoRepairApplied));
+    assert_eq!(result.task.status, TaskStatus::Failed);
+    assert!(
+        adapter.requests.is_empty(),
+        "a rejected repair patch does not spend another model call"
+    );
+    assert_eq!(
+        started_attempts(&outcome_events(&engine, &session)),
+        vec![0]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_repair_that_breaks_a_previously_passing_check_is_a_regression() {
+    let root = temp_dir("repair-regression");
+    let data_dir = temp_dir("repair-regression-data");
+    cargofile(&root);
+    write(
+        &root,
+        "packages/web/package.json",
+        "{\"scripts\":{\"test\":\"node test.js\"}}\n",
+    );
+    let shell = repaired_shell(&root);
+    fs::write(root.join("cargo-fail"), "fail\n").unwrap();
+    let shell = shell.to_string_lossy().to_string();
+    let allow = ["cargo test", "cd packages/web && npm run test"];
+    let engine = verify_engine_with_retry(&root, &data_dir, &shell, &allow, &[], 1);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[
+            ("src/a.rs", "let a = 1;\n", "let a = 2;\n"),
+            (
+                "packages/web/src/index.ts",
+                "export const x = 1;\n",
+                "export const x = 2;\n",
+            ),
+        ],
+    );
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+    let first = run_verification(&engine, &root, &session, &mut repair);
+    let patch = first.patch_proposal.as_ref().expect("a repair patch");
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+        .unwrap();
+
+    // The repair fixed A and broke B.
+    fs::remove_file(root.join("cargo-fail")).unwrap();
+    fs::write(root.join("web-fail"), "fail\n").unwrap();
+
+    let engine = verify_engine_with_retry(&root, &data_dir, &shell, &allow, &[], 1);
+    let mut adapter = MockModelAdapter::new("");
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert_ne!(report.outcome, Some(VerificationOutcome::Passed));
+    assert_eq!(
+        report.passed,
+        vec![CheckId::new("", "cargo test")],
+        "{report:?}"
+    );
+    assert!(
+        report
+            .failed
+            .iter()
+            .any(|item| item.check == CheckId::new("packages/web", "npm run test"))
+    );
+    assert_eq!(
+        report.regressions,
+        vec![CheckId::new("packages/web", "npm run test")]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn the_repair_request_names_the_finding_ids_not_the_raw_log() {
+    let root = temp_dir("repair-request");
+    let data_dir = temp_dir("repair-request-data");
+    cargofile(&root);
+    let shell = repaired_shell(&root).to_string_lossy().to_string();
+    fs::write(root.join("cargo-fail"), "fail\n").unwrap();
+    let engine = verify_engine_with_retry(&root, &data_dir, &shell, &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut repair = MockModelAdapter::new("I cannot fix this.");
+
+    let result = run_verification(&engine, &root, &session, &mut repair);
+
+    assert_eq!(
+        result.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::NoRepairApplied)
+    );
+    let findings = engine.session_store.read_findings(&session, &root).unwrap();
+    let finding = findings
+        .first()
+        .expect("the failing check recorded a finding");
+    let request = repair
+        .requests
+        .first()
+        .expect("the repair turn called the model");
+    let user = request
+        .messages
+        .iter()
+        .find(|message| message.role == "user")
+        .expect("a user message carries the request");
+    assert!(
+        user.content.contains(finding.id()),
+        "the repair request names the finding id: {}",
+        user.content
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn before_task_complete_fires_for_a_repair_answer_but_not_for_a_report() {
+    use std::os::unix::fs::PermissionsExt;
+    let marker = |root: &std::path::Path| root.join("before-complete-ran");
+    let hook_for = |root: &std::path::Path| {
+        let script = root.join("hooks").join("before-complete.sh");
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(
+            &script,
+            format!(
+                "echo invoked >> {}\necho '{{\"hookApiVersion\":1,\"verdict\":\"allow\"}}'\n",
+                marker(root).display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        HookConfig {
+            id: "before_complete".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec![script.to_string_lossy().to_string()],
+            events: vec![HookEvent::BeforeTaskComplete],
+            mode: HookMode::Mandatory,
+            order: 0,
+            timeout_ms: Some(5_000),
+            enabled: true,
+            source: HookSource::User,
+        }
+    };
+
+    // A report-only verification turn never calls the model, so the hook does
+    // not fire.
+    let root = temp_dir("complete-report");
+    let data_dir = temp_dir("complete-report-data");
+    cargofile(&root);
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: data_dir.clone(),
+        enable_index_watcher: false,
+        shell: "/usr/bin/true".to_string(),
+        command_allowlist: vec!["cargo test".to_string()],
+        agent_tool_retry_limit: 0,
+        hooks: vec![hook_for(&root)],
+        ..Config::default()
+    });
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+    run_verification(&engine, &root, &session, &mut adapter);
+    assert!(!marker(&root).exists(), "a report is not a model answer");
+
+    // A repair turn that answers does call the model, so it fires.
+    let root = temp_dir("complete-repair");
+    let data_dir = temp_dir("complete-repair-data");
+    cargofile(&root);
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: data_dir.clone(),
+        enable_index_watcher: false,
+        shell: "/usr/bin/false".to_string(),
+        command_allowlist: vec!["cargo test".to_string()],
+        agent_tool_retry_limit: 1,
+        hooks: vec![hook_for(&root)],
+        ..Config::default()
+    });
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("I cannot fix this.");
+    run_verification(&engine, &root, &session, &mut adapter);
+    assert!(
+        marker(&root).exists(),
+        "the repair answer dispatches the hook"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_repair_turn_that_hits_the_round_budget_pauses_instead_of_failing() {
+    let root = temp_dir("repair-round-budget");
+    let data_dir = temp_dir("repair-round-budget-data");
+    cargofile(&root);
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: data_dir.clone(),
+        enable_index_watcher: false,
+        shell: "/usr/bin/false".to_string(),
+        command_allowlist: vec!["cargo test".to_string()],
+        agent_tool_retry_limit: 2,
+        agent_max_tool_rounds: 1,
+        ..Config::default()
+    });
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let complete_step = workspace_engine::ToolCall {
+        id: "step_done".to_string(),
+        name: "complete_step".to_string(),
+        arguments_json: "{}".to_string(),
+    };
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "I cannot fix this.".to_string()],
+        vec![vec![complete_step], Vec::new()],
+    );
+
+    let paused = run_verification(&engine, &root, &session, &mut adapter);
+    let budget = paused
+        .round_budget_proposal
+        .as_ref()
+        .expect("the repair turn pauses at its round budget");
+    assert!(
+        paused.verification_report.is_none(),
+        "the attempt is not closed"
+    );
+    assert_eq!(adapter.requests.len(), 1);
+
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let resumed = engine
+        .chat_orchestrator
+        .resume_round_budget(
+            &budget.id,
+            RoundBudgetDecision::Continue,
+            "tester",
+            &mut adapter,
+            &mut sink,
+        )
+        .expect("Continue resumes the repair turn");
+
+    assert_eq!(
+        resumed.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::NoRepairApplied)
+    );
+    assert_eq!(
+        started_attempts(&outcome_events(&engine, &session)),
+        vec![0],
+        "a continuation is not another attempt"
+    );
+    assert_eq!(adapter.requests.len(), 2, "Continue runs one more round");
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);
