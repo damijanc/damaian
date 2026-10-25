@@ -495,8 +495,14 @@ should contain nothing to redact. The caller records it because
 `ContextManager` has no audit log (`context_manager.rs:43-51`) and the two
 orchestrators already do; adding one to the manager would be a second audit path
 for one event. One `context_assembled` event per assembly, with the manifest as
-one JSON field beside `repositoryId` and `taskId`, next to the existing
-`model_request_prepared` (`chat.rs:2927-2944`).
+one JSON field beside `repositoryId`, `taskId` and `tokenEstimate`, next to the
+existing `model_request_prepared` (`chat.rs:2927-2944`).
+
+In #26 the enum carries the reasons the pipeline can actually produce:
+`RestrictedPath`, `DeduplicatedIntoRange`, `CategoryBudgetExhausted`, `Truncated`,
+`TooLarge` and `Binary`. `SecretBearing`, `TotalBudgetExhausted` and
+`UserRemoved` arrive with the stages that produce them (the total-budget path,
+spec 27's removal), so no record can claim a reason nothing generates.
 
 ### 5.6 Exclusion at every stage
 
@@ -530,6 +536,17 @@ implementation: the same `PathPolicy` instance the read path uses, passed to
 A restricted path never enters the manifest's `included` list, and appears in
 `excluded` as `RestrictedPath` — which is itself the assertion that it was
 considered and refused, rather than never noticed.
+
+**Normalisation.** The collection check compares strings, while the read path
+resolves first (`PathPolicy::resolve_existing`): it strips `./`, collapses `..`
+and turns an absolute in-repo path into a repository-relative one before
+`assert_not_restricted`. The assembler therefore normalises each candidate with
+that same resolver before the collection check, and records the path the policy
+matched. A read that still refuses for a policy reason becomes a
+`RestrictedPath` record rather than a silent omission. A read that fails for a
+reason the enum can name — a whole-file size refusal (`TooLarge`) or a binary
+file (`Binary`) — is recorded too. A missing or unreadable file has no reason in
+§5.5's list, so it stays unrecorded rather than carrying a fabricated one.
 
 ### 5.7 The effective limit
 

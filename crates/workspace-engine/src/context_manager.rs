@@ -1,6 +1,7 @@
 use crate::command_policy::CommandPolicy;
 use crate::error::{ClientError, Result};
 use crate::file_access::{FileAccessController, LineRange};
+use crate::hash::now_millis;
 use crate::indexer::RepositoryIndex;
 use crate::path_policy::PathPolicy;
 use crate::plan::TaskPlan;
@@ -337,6 +338,11 @@ pub enum ExclusionReason {
     /// The item is included, but only in part: a block re-rendered at a smaller
     /// ceiling for its category share (proposal §5.2, Correction C14).
     Truncated,
+    /// A whole-file read the read path refuses because the file exceeds
+    /// `max_file_bytes` (proposal §5.5).
+    TooLarge,
+    /// A read the read path refuses because the file looks binary.
+    Binary,
 }
 
 /// One item that did not enter the plan, with the reason. Never content.
@@ -349,6 +355,79 @@ pub struct ExclusionRecord {
     pub range: Option<LineRange>,
     pub category: ContextCategory,
     pub detail: Option<String>,
+}
+
+/// One included item, named by where it came from rather than what it says.
+///
+/// The manifest's projection of a [`ContextItem`]: category, kind, path, range,
+/// tokens and the two provenance-ish fields. Never `content` or
+/// `redaction_status` — the manifest is safe to audit and to show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncludedRef {
+    pub category: ContextCategory,
+    pub kind: ContextKind,
+    pub path: Option<String>,
+    #[serde(rename = "lineRange")]
+    pub range: Option<LineRange>,
+    pub tokens: usize,
+    pub root_path: Option<String>,
+    pub provenance: Option<Provenance>,
+}
+
+impl IncludedRef {
+    /// The only place an item is projected into the manifest.
+    pub fn from_item(item: &ContextItem) -> Self {
+        Self {
+            category: item.category,
+            kind: item.kind,
+            path: item.path.clone(),
+            range: item.range,
+            tokens: item.tokens,
+            root_path: item.root_path.clone(),
+            provenance: item.provenance,
+        }
+    }
+}
+
+/// What one assembly included and left out, by path, range, count and reason
+/// (proposal §5.5).
+///
+/// Holds no item content: that is what makes it safe to write to the audit log
+/// and to show in a diagnostics view. `assembled_at_ms` is the one
+/// time-dependent field and never reaches the prompt; the prompt's determinism
+/// guard is `tests/prompt_cache.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextManifest {
+    pub repository_id: String,
+    pub task_id: String,
+    pub assembled_at_ms: u128,
+    /// The limit categories divided and where it came from (requirement 7).
+    pub limit: EffectiveLimit,
+    pub total_tokens: usize,
+    /// Per category allocation and use, in pipeline order.
+    pub categories: Vec<CategoryUsage>,
+    /// Every included item, in inclusion order.
+    pub included: Vec<IncludedRef>,
+    /// Everything left out, or included only in part, with a reason.
+    pub excluded: Vec<ExclusionRecord>,
+}
+
+impl ContextManifest {
+    /// The `context_assembled` audit fields, one shape for both callers.
+    ///
+    /// The manifest is a single JSON field beside the identifiers and the
+    /// token estimate (proposal §5.5). Serialisation cannot fail: every field is
+    /// a plain value or an enum of plain values.
+    pub fn audit_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("repositoryId", self.repository_id.clone()),
+            ("taskId", self.task_id.clone()),
+            ("tokenEstimate", self.total_tokens.to_string()),
+            ("manifest", serde_json::to_string(self).unwrap_or_default()),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,15 +486,10 @@ pub struct ContextPlan {
     pub token_estimate: usize,
     pub items: Vec<ContextItem>,
     pub files: Vec<String>,
-    /// The limit categories divided, and whether it was observed or declared
-    /// (proposal §5.7).
-    pub limit: EffectiveLimit,
-    /// Per-category allocation and use, in pipeline order (proposal §5.5).
-    /// Task 5 folds this into the manifest.
-    pub categories: Vec<CategoryUsage>,
-    /// Everything collection left out, with the reason (proposal §5.6). Never
-    /// content.
-    pub excluded: Vec<ExclusionRecord>,
+    /// The record of this assembly: what was included and what was left out,
+    /// with the limit and per-category usage (proposal §5.5). Recorded by the
+    /// caller as one `context_assembled` audit event.
+    pub manifest: ContextManifest,
 }
 
 impl ContextPlan {
@@ -528,6 +602,9 @@ struct FileCandidate {
     range: Option<LineRange>,
     kind: ContextKind,
     provenance: Option<Provenance>,
+    /// The project root that owns `path` (spec 24), resolved once when the
+    /// candidate is collected.
+    root_path: Option<String>,
     allow_outside_root: bool,
 }
 
@@ -539,6 +616,7 @@ struct MergedFile {
     range: Option<LineRange>,
     kind: ContextKind,
     provenance: Option<Provenance>,
+    root_path: Option<String>,
     allow_outside_root: bool,
 }
 
@@ -645,6 +723,7 @@ fn merge_file_ranges(
                     range: None,
                     kind: whole.kind,
                     provenance: best_provenance(&group),
+                    root_path: whole.root_path.clone(),
                     allow_outside_root: whole.allow_outside_root,
                 });
             }
@@ -691,6 +770,7 @@ fn merge_file_ranges(
                 range: Some(merged_range),
                 kind: first.kind,
                 provenance: best_provenance(&members),
+                root_path: first.root_path.clone(),
                 allow_outside_root: first.allow_outside_root,
             });
 
@@ -717,6 +797,19 @@ fn merge_file_ranges(
     }
 
     (merged, excluded)
+}
+
+/// The project root that owns `path`, or `None` when nothing can say.
+///
+/// `RepositoryMap::root_for_path` returns `""` for the repository root — the
+/// map's own representation of it — so a root-level file carries `Some("")`
+/// rather than `None`. An explicit path outside the repository keeps an
+/// absolute spelling after normalisation and has no owning root here.
+fn owning_root(map: &RepositoryMap, path: &str) -> Option<String> {
+    if Path::new(path).is_absolute() {
+        return None;
+    }
+    Some(map.root_for_path(path).to_string())
 }
 
 /// The most authoritative provenance among the parts: `LanguageServer` sorts
@@ -843,6 +936,31 @@ impl ContextManager {
         restricted.then_some(ExclusionReason::RestrictedPath)
     }
 
+    /// The candidate path as the read path will see it (Task 5 Step 3a).
+    ///
+    /// [`Self::collection_exclusion`] compares strings, while `read_file`
+    /// resolves the request first: it strips `./`, collapses `..` and turns an
+    /// absolute in-repo path into a repository-relative one before
+    /// `assert_not_restricted`. Checking the raw spelling let a non-normalised
+    /// restricted path through collection, so it was refused at read and
+    /// dropped without a record — the manifest could not say why the file was
+    /// absent. This is the read path's own normaliser, not a second one.
+    ///
+    /// A path that does not resolve (absent, or outside the root when that is
+    /// not allowed) is returned as it came: it cannot be read either way, and
+    /// rewriting it would invent a path the caller did not name.
+    fn normalise_candidate(
+        &self,
+        repository_root: &Path,
+        path: &str,
+        allow_outside_root: bool,
+    ) -> String {
+        self.path_policy
+            .resolve_existing(repository_root, path, allow_outside_root)
+            .map(|resolved| resolved.relative_path)
+            .unwrap_or_else(|_| path.to_string())
+    }
+
     pub fn build_context(&self, request: ContextRequest<'_>) -> Result<ContextPlan> {
         let ContextRequest {
             repository_root,
@@ -867,6 +985,12 @@ impl ContextManager {
         // still read where they are collected, which is what keeps the prompt's
         // item order unchanged.
         let mut range_candidates = Vec::new();
+
+        // Requirement 6: every included file carries its owning root, so the
+        // map is loaded even when neither the map nor the symbols block is
+        // rendered. `load_or_build` reuses the stored map, so a repository with
+        // both ceilings at 0 does not pay for a second build.
+        let repository_map = index.and_then(|index| self.load_map(index));
 
         push_text(
             &mut pending,
@@ -937,6 +1061,7 @@ impl ContextManager {
                 &mut pending,
                 &mut excluded,
                 &mut range_candidates,
+                repository_map.as_ref(),
                 requested,
             );
         }
@@ -955,6 +1080,7 @@ impl ContextManager {
                 &mut pending,
                 &mut excluded,
                 &mut range_candidates,
+                repository_map.as_ref(),
                 false,
             );
         }
@@ -973,6 +1099,7 @@ impl ContextManager {
                 &mut pending,
                 &mut excluded,
                 &mut range_candidates,
+                repository_map.as_ref(),
                 false,
             );
         }
@@ -980,16 +1107,19 @@ impl ContextManager {
         // After instructions and rules, before retrieved files: under a tight
         // budget the map displaces retrieved files, never instructions. The
         // block is kept unrendered so its category share can choose the ceiling
-        // (Correction C14); `symbols_block` needs the map first.
-        let map = index.and_then(|index| self.load_map(index));
+        // (Correction C14); `symbols_block` needs the map first. The map is
+        // cloned into the item because `repository_map` stays available for the
+        // root of the files collected after this point.
         let symbols = index
-            .zip(map.as_ref())
+            .zip(repository_map.as_ref())
             .and_then(|(index, map)| self.symbols_block(index, map, prompt));
-        if let Some(map) = map.filter(|_| self.repository_map.max_tokens > 0) {
+        if self.repository_map.max_tokens > 0
+            && let Some(map) = &repository_map
+        {
             pending.push(PendingItem::Block(BlockItem {
                 kind: ContextKind::RepositoryMap,
                 max_tokens: self.repository_map.max_tokens,
-                content: BlockContent::Map(map),
+                content: BlockContent::Map(map.clone()),
             }));
         }
         if let Some((index, matches)) = symbols {
@@ -1054,6 +1184,7 @@ impl ContextManager {
                     &mut pending,
                     &mut excluded,
                     &mut range_candidates,
+                    repository_map.as_ref(),
                     false,
                 );
             }
@@ -1235,6 +1366,7 @@ impl ContextManager {
             }
         }
         let token_estimate = items.iter().map(|item| item.tokens).sum();
+        let manifest = build_manifest(repository_id, task_id, limit, &items, categories, excluded);
 
         Ok(ContextPlan {
             repository_id: repository_id.to_string(),
@@ -1242,9 +1374,7 @@ impl ContextManager {
             token_estimate,
             items,
             files,
-            limit,
-            categories,
-            excluded,
+            manifest,
         })
     }
 
@@ -1309,14 +1439,14 @@ impl ContextManager {
         }
     }
 
-    /// The map both items are built from, or `None` when both ceilings are
-    /// `0` or the map cannot be loaded or stored. The map is an aid: a
-    /// read-only or broken data directory leaves it out rather than failing
-    /// the turn.
+    /// The map both items and root resolution are built from, or `None` when it
+    /// cannot be loaded or stored. The map is an aid: a read-only or broken data
+    /// directory leaves it out rather than failing the turn.
+    ///
+    /// Not gated on the render ceilings: `build_context` uses the map to name
+    /// each file's owning root (requirement 6) even when neither the map nor the
+    /// symbols item is rendered, and `load_or_build` reuses the stored map.
     fn load_map(&self, index: &RepositoryIndex) -> Option<RepositoryMap> {
-        if self.repository_map.max_tokens == 0 && self.symbols.max_tokens == 0 {
-            return None;
-        }
         let source = &self.repository_map;
         let (map, _) = source
             .store
@@ -1368,8 +1498,18 @@ impl ContextManager {
         pending: &mut Vec<PendingItem>,
         excluded: &mut Vec<ExclusionRecord>,
         range_candidates: &mut Vec<FileCandidate>,
+        roots: Option<&RepositoryMap>,
         allow_outside_root: bool,
     ) {
+        // Normalise before the dedup, the collection check and the candidate
+        // list, so all three compare what the read path will actually open
+        // (Task 5 Step 3a).
+        let normalised = self.normalise_candidate(repository_root, path, allow_outside_root);
+        let path = normalised.as_str();
+        // Requirement 6: every included file names its owning root. Resolved
+        // here, where the assembler still knows this is a file and not a
+        // session block with a path-shaped label.
+        let root_path = roots.and_then(|map| owning_root(map, path));
         // Whole files are deduplicated here, as they always were. A range for
         // a path already included whole is kept as a candidate so the merge can
         // record it as absorbed rather than silently dropped (§5.4).
@@ -1400,6 +1540,7 @@ impl ContextManager {
                 range: Some(range),
                 kind,
                 provenance,
+                root_path,
                 allow_outside_root,
             });
             return;
@@ -1408,7 +1549,7 @@ impl ContextManager {
         // `Whole`, not the tool's bounded window: assembly's category budget
         // decides what fits. Capping here would silently shrink what every task
         // sees.
-        let Ok(file) = self.file_access.read_file(
+        let file = match self.file_access.read_file(
             repository_root,
             path,
             Some(task_id),
@@ -1416,8 +1557,16 @@ impl ContextManager {
             false,
             allow_outside_root,
             crate::file_access::ReadWindow::Whole,
-        ) else {
-            return;
+        ) {
+            Ok(file) => file,
+            Err(error) => {
+                // A path can still be refused at read time (a symlink swapped
+                // between the check and the read, or the size cap and the
+                // binary check, which only the read knows about). Record what
+                // the error says rather than dropping it silently.
+                record_read_failure(excluded, path, range, kind, &error);
+                return;
+            }
         };
         let added = push_text(
             pending,
@@ -1428,7 +1577,11 @@ impl ContextManager {
                 None,
                 provenance,
                 &file.content,
-            ),
+            )
+            .map(|mut item| {
+                item.root_path = root_path;
+                item
+            }),
         );
         if added {
             files.push(file.path);
@@ -1466,7 +1619,7 @@ impl ContextManager {
                 Some(range) => crate::file_access::ReadWindow::ContextRange(range),
                 None => crate::file_access::ReadWindow::Whole,
             };
-            let Ok(read) = self.file_access.read_file(
+            let read = match self.file_access.read_file(
                 repository_root,
                 &file.path,
                 Some(task_id),
@@ -1474,11 +1627,17 @@ impl ContextManager {
                 false,
                 file.allow_outside_root,
                 window,
-            ) else {
-                // The collection-time check already refused restricted paths;
-                // a read failure here is an ordinary missing or unreadable file
-                // and the turn proceeds without it, as for a whole file.
-                continue;
+            ) {
+                Ok(read) => read,
+                Err(error) => {
+                    // The collection-time check already refused restricted
+                    // paths; what is left is a read-time refusal the error can
+                    // name (a restriction that appeared since, the size cap, a
+                    // binary file) or an ordinary missing/unreadable file. Only
+                    // the first becomes a record, with a fixed detail.
+                    record_read_failure(excluded, &file.path, file.range, file.kind, &error);
+                    continue;
+                }
             };
             // The header names what was actually read, so a range clamped to the
             // file's length cannot claim lines that do not exist.
@@ -1491,12 +1650,41 @@ impl ContextManager {
                     file.range.map(|_| read.line_range),
                     file.provenance,
                     &read.content,
-                ),
+                )
+                .map(|mut item| {
+                    item.root_path = file.root_path;
+                    item
+                }),
             );
             if added && !files.iter().any(|existing| existing == &file.path) {
                 files.push(read.path);
             }
         }
+    }
+}
+
+/// Shape the record of one assembly.
+///
+/// Kept separate from `apply_budget` so the manifest can be tested against every
+/// [`ExclusionReason`], including ones today's collection cannot yet produce
+/// (no collection source yields a line range — Task 3's discovery).
+fn build_manifest(
+    repository_id: &str,
+    task_id: &str,
+    limit: EffectiveLimit,
+    items: &[ContextItem],
+    categories: Vec<CategoryUsage>,
+    excluded: Vec<ExclusionRecord>,
+) -> ContextManifest {
+    ContextManifest {
+        repository_id: repository_id.to_string(),
+        task_id: task_id.to_string(),
+        assembled_at_ms: now_millis(),
+        limit,
+        total_tokens: items.iter().map(|item| item.tokens).sum(),
+        categories,
+        included: items.iter().map(IncludedRef::from_item).collect(),
+        excluded,
     }
 }
 
@@ -1514,6 +1702,46 @@ fn push_exclusion(excluded: &mut Vec<ExclusionRecord>, record: ExclusionRecord) 
     if !duplicate {
         excluded.push(record);
     }
+}
+
+/// Record a read the assembler attempted and could not use, when the read
+/// path's error says why (Task 5 Step 3a).
+///
+/// `read_file` distinguishes three refusals by fixed messages: a policy
+/// restriction, the whole-file size cap, and a binary file. Nothing else it
+/// returns has a reason in proposal §5.5's list — a missing file or a path
+/// outside the root is not a dropped item — so those stay unrecorded rather
+/// than carrying a fabricated reason. The detail is never the error text: it
+/// names the path and the manifest is not the place for a second copy of it.
+fn record_read_failure(
+    excluded: &mut Vec<ExclusionRecord>,
+    path: &str,
+    range: Option<LineRange>,
+    kind: ContextKind,
+    error: &ClientError,
+) {
+    let ClientError::AccessDenied(message) = error else {
+        return;
+    };
+    let reason = if message.starts_with("Path is restricted by policy:") {
+        ExclusionReason::RestrictedPath
+    } else if message == "File exceeds configured size limit" {
+        ExclusionReason::TooLarge
+    } else if message == "Binary file reads are denied by default" {
+        ExclusionReason::Binary
+    } else {
+        return;
+    };
+    push_exclusion(
+        excluded,
+        ExclusionRecord {
+            reason,
+            path: Some(path.to_string()),
+            range,
+            category: kind.category(),
+            detail: None,
+        },
+    );
 }
 
 /// A carried plan as the `plan_state` item's text (proposal §5.11).
@@ -1776,6 +2004,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_exclusion_reason_reaches_the_manifest() {
+        // `DeduplicatedIntoRange` has no producer through `build_context` yet
+        // (no collection source yields a line range), so the manifest's
+        // carry-through is pinned here for every variant rather than through a
+        // fixture that does not exist.
+        let reasons = [
+            ExclusionReason::RestrictedPath,
+            ExclusionReason::DeduplicatedIntoRange,
+            ExclusionReason::CategoryBudgetExhausted,
+            ExclusionReason::Truncated,
+            ExclusionReason::TooLarge,
+            ExclusionReason::Binary,
+        ];
+        let excluded = reasons
+            .iter()
+            .map(|&reason| ExclusionRecord {
+                reason,
+                path: Some("src/lib.rs".to_string()),
+                range: None,
+                category: ContextCategory::FileRanges,
+                detail: None,
+            })
+            .collect::<Vec<_>>();
+
+        let manifest = build_manifest(
+            "repo",
+            "task",
+            EffectiveLimit::declared(10),
+            &[],
+            Vec::new(),
+            excluded.clone(),
+        );
+
+        assert_eq!(manifest.excluded, excluded);
+        let json = serde_json::to_string(&manifest).unwrap();
+        for name in [
+            "restricted_path",
+            "deduplicated_into_range",
+            "category_budget_exhausted",
+            "truncated",
+            "too_large",
+            "binary",
+        ] {
+            assert!(json.contains(name), "{name} is missing from {json}");
+        }
+    }
+
     fn candidate(
         path: &str,
         range: Option<(usize, usize)>,
@@ -1786,6 +2062,7 @@ mod tests {
             range: range.map(|(start, end)| LineRange { start, end }),
             kind: ContextKind::RetrievedFile,
             provenance,
+            root_path: None,
             allow_outside_root: false,
         }
     }

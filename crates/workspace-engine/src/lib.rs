@@ -86,8 +86,8 @@ pub use config::{
 };
 pub use context_manager::{
     CategoryUsage, CollectionSource, ContextBudget, ContextCategory, ContextItem, ContextKind,
-    ContextManager, ContextPlan, ContextRequest, EffectiveLimit, ExclusionRecord, LimitSource,
-    PromptSection, PromptSectionName, RepositoryMapSource, SymbolSource,
+    ContextManager, ContextManifest, ContextPlan, ContextRequest, EffectiveLimit, ExclusionRecord,
+    IncludedRef, LimitSource, PromptSection, PromptSectionName, RepositoryMapSource, SymbolSource,
 };
 pub use data_schema::{
     CURRENT_DATA_SCHEMA_VERSION, DataSchemaError, DataSchemaOutcome, ensure_data_dir_schema,

@@ -541,6 +541,17 @@ impl EditOrchestrator {
             emit_cache_breakpoints: self.config.supports_explicit_cache_breakpoints(),
         };
 
+        // One `context_assembled` event per assembly, beside
+        // `edit_model_request_prepared` below (proposal §5.5, Correction C9).
+        // Same manifest shape as the chat turn's; the manager records nothing.
+        let mut context_fields = vec![
+            ("actor", "system".to_string()),
+            ("sessionId", session.id.clone()),
+        ];
+        context_fields.extend(context.manifest.audit_fields());
+        self.audit_log
+            .record("context_assembled", &context_fields)?;
+
         self.audit_log.record(
             "edit_model_request_prepared",
             &[

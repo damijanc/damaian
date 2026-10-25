@@ -1047,6 +1047,17 @@ impl ChatOrchestrator {
             hook_context: &hook_context,
             plan: carried_plan.as_ref(),
         })?;
+        // One `context_assembled` event per assembly, recorded by the caller:
+        // the manager holds no audit log and adding one would be a second audit
+        // path for one event (proposal §5.5, Correction C9). The manifest holds
+        // no content, and `AuditLog::record` redacts every field value anyway.
+        let mut context_fields = vec![
+            ("actor", "system".to_string()),
+            ("sessionId", session.id.clone()),
+        ];
+        context_fields.extend(context.manifest.audit_fields());
+        self.audit_log
+            .record("context_assembled", &context_fields)?;
         let model_prompt = build_model_prompt(&context, &prior_messages, &self.scanner, None);
         let mode = self.session_store.session_mode(&session.id);
         // A worker is never invited to hand off further work (spec 57 §5.0).
@@ -10505,9 +10516,16 @@ mod approval_prompt_wording_tests {
                 root_path: None,
             }],
             files: Vec::new(),
-            limit: crate::context_manager::EffectiveLimit::declared(2),
-            categories: Vec::new(),
-            excluded: Vec::new(),
+            manifest: crate::context_manager::ContextManifest {
+                repository_id: "repo".to_string(),
+                task_id: "task".to_string(),
+                assembled_at_ms: 0,
+                limit: crate::context_manager::EffectiveLimit::declared(2),
+                total_tokens: 2,
+                categories: Vec::new(),
+                included: Vec::new(),
+                excluded: Vec::new(),
+            },
         };
         let with_result = build_model_prompt(
             &plan,

@@ -13,10 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::context_manager::ExclusionReason;
 use workspace_engine::{
     CancelToken, CategoryUsage, ChatTurnResult, ClientError, CollectionSource, Config,
-    ConfigOverlay, ContextCategory, ContextItem, ContextKind, ContextPlan, ContextRequest,
-    ExclusionRecord, LimitSource, LineRange, MockModelAdapter, ModelAdapter, PlanStep, Provenance,
-    RepositoryIndex, StepStatus, Symbol, SymbolIndexStore, TaskPlan, TurnProgress, TurnSink,
-    WorkspaceEngine,
+    ConfigOverlay, ContextCategory, ContextItem, ContextKind, ContextManifest, ContextPlan,
+    ContextRequest, ExclusionRecord, LimitSource, LineRange, MockModelAdapter, ModelAdapter,
+    PlanStep, Provenance, RepositoryIndex, StepStatus, Symbol, SymbolIndexStore, TaskPlan,
+    TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -105,6 +105,18 @@ fn fixture_repo(name: &str) -> PathBuf {
 
 fn user_message(adapter: &MockModelAdapter, index: usize) -> &str {
     &adapter.requests[index].messages[1].content
+}
+
+/// One audit event type, parsed. `AuditLog::record` writes every field value as
+/// a string, so the manifest is a JSON string inside a JSON object.
+fn audit_events(data_dir: &Path, event_type: &str) -> Vec<serde_json::Value> {
+    let path = data_dir.join("audit").join("events.jsonl");
+    let contents = fs::read_to_string(path).unwrap_or_default();
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["eventType"] == event_type)
+        .collect()
 }
 
 #[test]
@@ -527,14 +539,21 @@ fn assemble_with_limit(
 }
 
 fn usage(plan: &ContextPlan, category: ContextCategory) -> &CategoryUsage {
-    plan.categories
+    plan.manifest
+        .categories
         .iter()
         .find(|usage| usage.category == category)
-        .unwrap_or_else(|| panic!("{category:?} has no usage row in {:?}", plan.categories))
+        .unwrap_or_else(|| {
+            panic!(
+                "{category:?} has no usage row in {:?}",
+                plan.manifest.categories
+            )
+        })
 }
 
 fn budget_records<'a>(plan: &'a ContextPlan, path: &str) -> Vec<&'a ExclusionRecord> {
-    plan.excluded
+    plan.manifest
+        .excluded
         .iter()
         .filter(|record| {
             record.reason == ExclusionReason::CategoryBudgetExhausted
@@ -546,7 +565,8 @@ fn budget_records<'a>(plan: &'a ContextPlan, path: &str) -> Vec<&'a ExclusionRec
 /// Every restriction record for `path`, so a test can state which category it
 /// came from instead of accepting any record.
 fn restrictions_for<'a>(plan: &'a ContextPlan, path: &str) -> Vec<&'a ExclusionRecord> {
-    plan.excluded
+    plan.manifest
+        .excluded
         .iter()
         .filter(|record| {
             record.reason == ExclusionReason::RestrictedPath && record.path.as_deref() == Some(path)
@@ -593,7 +613,7 @@ fn a_restricted_explicit_path_is_excluded_at_collection() {
 
     assert_absent(&plan, "secrets/x.rs");
     let records = restrictions_for(&plan, "secrets/x.rs");
-    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records.len(), 1, "{:?}", plan.manifest.excluded);
     assert_eq!(records[0].category, ContextCategory::FileRanges);
 
     fs::remove_dir_all(repo).unwrap();
@@ -618,7 +638,7 @@ fn a_restricted_prompt_mention_is_excluded_at_collection() {
 
     assert_absent(&plan, "secrets/x.rs");
     let records = restrictions_for(&plan, "secrets/x.rs");
-    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records.len(), 1, "{:?}", plan.manifest.excluded);
     assert_eq!(records[0].category, ContextCategory::FileRanges);
 
     fs::remove_dir_all(repo).unwrap();
@@ -654,7 +674,7 @@ fn a_restricted_keyword_hit_is_excluded_at_collection() {
 
     assert_absent(&plan, "secrets/keyword_probe.rs");
     let records = restrictions_for(&plan, "secrets/keyword_probe.rs");
-    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records.len(), 1, "{:?}", plan.manifest.excluded);
     // A search hit is `SearchResults`, not `FileRanges`: the two are ordered
     // and budgeted differently (§5.3), while the header still says
     // `retrieved_file`.
@@ -712,7 +732,7 @@ fn a_restricted_semantic_hit_is_excluded_at_collection() {
 
     assert_absent(&plan, restricted);
     let records = restrictions_for(&plan, restricted);
-    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records.len(), 1, "{:?}", plan.manifest.excluded);
     assert_eq!(records[0].category, ContextCategory::SearchResults);
 
     fs::remove_dir_all(repo).unwrap();
@@ -738,7 +758,7 @@ fn a_restricted_instruction_path_is_excluded_at_collection() {
 
     assert_absent(&plan, "secrets/AGENTS.md");
     let records = restrictions_for(&plan, "secrets/AGENTS.md");
-    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records.len(), 1, "{:?}", plan.manifest.excluded);
     assert_eq!(records[0].category, ContextCategory::Instructions);
 
     fs::remove_dir_all(repo).unwrap();
@@ -764,7 +784,7 @@ fn a_restricted_project_rule_is_excluded_at_collection() {
 
     assert_absent(&plan, "README.md");
     let records = restrictions_for(&plan, "README.md");
-    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records.len(), 1, "{:?}", plan.manifest.excluded);
     assert_eq!(records[0].category, ContextCategory::Instructions);
 
     fs::remove_dir_all(repo).unwrap();
@@ -811,7 +831,7 @@ fn a_restricted_path_is_never_an_included_item() {
         assert!(
             !restrictions_for(&plan, path).is_empty(),
             "{path} was never recorded as restricted: {:?}",
-            plan.excluded
+            plan.manifest.excluded
         );
     }
 
@@ -1206,7 +1226,7 @@ fn each_category_stops_at_its_configured_share() {
         1_000,
     );
 
-    for usage in &plan.categories {
+    for usage in &plan.manifest.categories {
         assert!(
             usage.used <= usage.allocated,
             "{:?} used {} of {} allocated",
@@ -1251,7 +1271,7 @@ fn an_unused_share_moves_to_later_categories() {
         .filter(|item| item.category == ContextCategory::Required)
         .map(|item| item.tokens)
         .sum();
-    let available = plan.limit.tokens - required;
+    let available = plan.manifest.limit.tokens - required;
     let nominal = available * 2_500 / 10_000;
     let file_ranges = usage(&plan, ContextCategory::FileRanges);
     assert!(
@@ -1309,7 +1329,7 @@ fn a_category_over_its_share_drops_its_lowest_priority_members() {
         "the mentioned path should be dropped: {paths:?}"
     );
     let records = budget_records(&plan, "src/mentioned_only.rs");
-    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records.len(), 1, "{:?}", plan.manifest.excluded);
     assert_eq!(records[0].category, ContextCategory::FileRanges);
     assert!(usage(&plan, ContextCategory::FileRanges).truncated);
 
@@ -1359,7 +1379,7 @@ fn semantic_hits_are_dropped_before_exact_matches() {
     assert!(
         !included.is_empty(),
         "some exact hit must survive the tiny share: {:?}",
-        plan.excluded
+        plan.manifest.excluded
     );
     assert!(
         included.iter().all(|path| index
@@ -1369,7 +1389,7 @@ fn semantic_hits_are_dropped_before_exact_matches() {
         "every surviving hit is an exact keyword hit: {included:?}"
     );
     let records = budget_records(&plan, "zzz/semantic_only.rs");
-    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records.len(), 1, "{:?}", plan.manifest.excluded);
     assert_eq!(records[0].category, ContextCategory::SearchResults);
     assert!(usage(&plan, ContextCategory::SearchResults).truncated);
 
@@ -1422,7 +1442,7 @@ fn the_most_specific_agents_md_survives_truncation() {
         .collect();
     assert_eq!(instruction_paths, vec!["src/deep/AGENTS.md"]);
     let records = budget_records(&plan, "AGENTS.md");
-    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records.len(), 1, "{:?}", plan.manifest.excluded);
     assert_eq!(records[0].category, ContextCategory::Instructions);
     assert!(usage(&plan, ContextCategory::Instructions).truncated);
 
@@ -1491,6 +1511,7 @@ fn a_block_item_too_large_for_its_share_is_rerendered_smaller() {
         .expect("the map should survive at a smaller ceiling");
     assert!(!small_map.content.is_empty());
     let truncated = small
+        .manifest
         .excluded
         .iter()
         .filter(|record| {
@@ -1498,7 +1519,7 @@ fn a_block_item_too_large_for_its_share_is_rerendered_smaller() {
                 && record.category == ContextCategory::RepositoryMap
         })
         .count();
-    assert_eq!(truncated, 1, "{:?}", small.excluded);
+    assert_eq!(truncated, 1, "{:?}", small.manifest.excluded);
     assert!(usage(&small, ContextCategory::RepositoryMap).truncated);
 
     let roomy = assemble_with_limit(
@@ -1523,12 +1544,12 @@ fn a_block_item_too_large_for_its_share_is_rerendered_smaller() {
         roomy_map.tokens
     );
     assert!(
-        !roomy.excluded.iter().any(|record| {
+        !roomy.manifest.excluded.iter().any(|record| {
             record.reason == ExclusionReason::Truncated
                 && record.category == ContextCategory::RepositoryMap
         }),
         "a roomy share is not a truncation: {:?}",
-        roomy.excluded
+        roomy.manifest.excluded
     );
 
     fs::remove_dir_all(repo).unwrap();
@@ -1541,11 +1562,627 @@ fn with_no_observed_profile_the_limit_is_the_config_budget_labelled_declared() {
 
     let plan = assemble(&engine, &repo, "repo_declared", "Review", &[], None, None);
 
-    assert_eq!(plan.limit.tokens, engine.config.context_token_budget());
-    assert_eq!(plan.limit.tokens, 16_000);
-    assert_eq!(plan.limit.source, LimitSource::Declared);
-    assert_eq!(plan.limit.safety_margin_bps, 0);
-    assert_eq!(plan.limit.window, None);
+    assert_eq!(
+        plan.manifest.limit.tokens,
+        engine.config.context_token_budget()
+    );
+    assert_eq!(plan.manifest.limit.tokens, 16_000);
+    assert_eq!(plan.manifest.limit.source, LimitSource::Declared);
+    assert_eq!(plan.manifest.limit.safety_margin_bps, 0);
+    assert_eq!(plan.manifest.limit.window, None);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// ---- Task 5: the manifest, its audit record, and the callers ----
+
+/// Any record with this reason, and this path when one is named.
+fn has_reason(plan: &ContextPlan, reason: ExclusionReason, path: Option<&str>) -> bool {
+    plan.manifest.excluded.iter().any(|record| {
+        record.reason == reason && path.is_none_or(|path| record.path.as_deref() == Some(path))
+    })
+}
+
+#[test]
+fn the_manifest_lists_every_included_item_by_path_range_and_root() {
+    let repo = fixture_repo("manifest-included");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["src/lib.rs".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Explain src/lib.rs",
+        &explicit,
+        Some(&index),
+        None,
+    );
+
+    assert_eq!(plan.manifest.repository_id, index.repository_id);
+    assert_eq!(plan.manifest.task_id, "task-2");
+    assert!(plan.manifest.assembled_at_ms > 0);
+    assert_eq!(plan.manifest.total_tokens, plan.token_estimate);
+    assert_eq!(plan.manifest.included.len(), plan.items.len());
+    for (item, included) in plan.items.iter().zip(&plan.manifest.included) {
+        assert_eq!(included.category, item.category);
+        assert_eq!(included.kind, item.kind);
+        assert_eq!(included.path, item.path);
+        assert_eq!(included.range, item.range);
+        assert_eq!(included.tokens, item.tokens);
+        assert_eq!(included.root_path, item.root_path);
+        assert_eq!(included.provenance, item.provenance);
+    }
+
+    let file = plan
+        .items
+        .iter()
+        .position(|item| item.path.as_deref() == Some("src/lib.rs"))
+        .expect("the explicit file should be included");
+    assert_eq!(
+        plan.manifest.included[file].path.as_deref(),
+        Some("src/lib.rs")
+    );
+    assert_eq!(plan.manifest.included[file].range, None);
+    // The repository root is the map's `""`, and this item belongs to it.
+    assert_eq!(plan.manifest.included[file].root_path.as_deref(), Some(""));
+
+    let request = plan
+        .items
+        .iter()
+        .position(|item| item.category == ContextCategory::Required)
+        .expect("the prompt is a required item");
+    assert_eq!(plan.manifest.included[request].path, None);
+    assert_eq!(plan.manifest.included[request].range, None);
+    assert_eq!(plan.manifest.included[request].root_path, None);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// `DeduplicatedIntoRange` is not producible through `build_context` today:
+/// no collection source yields a line range (Task 3's discovery), so the merge
+/// runs only in its unit tests. It is covered end to end here for the other
+/// three reasons, and by `every_exclusion_reason_reaches_the_manifest` in
+/// `context_manager.rs` for the manifest's carry-through of every variant.
+#[test]
+fn the_manifest_names_the_reason_for_every_exclusion() {
+    // RestrictedPath: a non-normalised explicit path the policy refuses.
+    let repo = fixture_repo("manifest-reason-restricted");
+    write_fixture(&repo, "secrets/x.rs", "pub fn leaked() {}\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["./secrets/x.rs".to_string()];
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Review the file",
+        &explicit,
+        Some(&index),
+        None,
+    );
+    assert!(
+        has_reason(&plan, ExclusionReason::RestrictedPath, Some("secrets/x.rs")),
+        "{:?}",
+        plan.manifest.excluded
+    );
+    fs::remove_dir_all(repo).unwrap();
+
+    // CategoryBudgetExhausted: one per cent of a 1000-token limit holds the
+    // explicit file and drops the mentioned one.
+    let repo = fixture_repo("manifest-reason-budget");
+    write_fixture(
+        &repo,
+        "src/mentioned_only.rs",
+        &format!("// mentioned only\n{}\n", "pub fn filler() {}\n".repeat(20)),
+    );
+    let engine = WorkspaceEngine::new(config_with_shares(
+        &repo,
+        "context_budget.file_ranges=0.01\n",
+    ));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["src/lib.rs".to_string()];
+    let plan = assemble_with_limit(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Explain src/lib.rs and src/mentioned_only.rs",
+        &explicit,
+        Some(&index),
+        None,
+        1_000,
+    );
+    assert!(
+        has_reason(
+            &plan,
+            ExclusionReason::CategoryBudgetExhausted,
+            Some("src/mentioned_only.rs")
+        ),
+        "{:?}",
+        plan.manifest.excluded
+    );
+    fs::remove_dir_all(repo).unwrap();
+
+    // Truncated: the map is re-rendered at a smaller share.
+    let repo = map_heavy_repo("manifest-reason-truncated");
+    let engine = WorkspaceEngine::new(config_with_shares(
+        &repo,
+        "context_budget.repository_map=0.05\n",
+    ));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let plan = assemble_with_limit(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Summarize the repository",
+        &[],
+        Some(&index),
+        None,
+        2_000,
+    );
+    assert!(
+        has_reason(&plan, ExclusionReason::Truncated, None),
+        "{:?}",
+        plan.manifest.excluded
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn no_manifest_field_contains_item_content() {
+    const MARKER: &str = "content_marker_zzq";
+    let repo = fixture_repo("manifest-content");
+    write_fixture(
+        &repo,
+        "src/leaky.rs",
+        &format!("// {MARKER}\npub const KEY: &str = \"{AWS_ACCESS_KEY}\";\n"),
+    );
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let prompt = format!("Review src/leaky.rs and the marker {MARKER}");
+    ask(&engine, &repo, None, &prompt, &mut adapter);
+
+    let events = audit_events(&engine.config.data_dir, "context_assembled");
+    assert_eq!(events.len(), 1, "{events:?}");
+    let manifest_json = events[0]["manifest"]
+        .as_str()
+        .expect("the manifest is a JSON field");
+    // The file was included, or the absence of its content proves nothing.
+    assert!(
+        manifest_json.contains("src/leaky.rs"),
+        "the file is not in the manifest: {manifest_json}"
+    );
+    assert!(
+        !manifest_json.contains(AWS_ACCESS_KEY),
+        "the manifest carries the secret: {manifest_json}"
+    );
+    assert!(
+        !manifest_json.contains(MARKER),
+        "the manifest carries item content: {manifest_json}"
+    );
+    assert!(
+        !manifest_json.contains("pub const KEY"),
+        "the manifest carries item content: {manifest_json}"
+    );
+
+    // The audit file as a whole, not only this event: a content leak anywhere
+    // in the trail is the failure the manifest exists to make impossible.
+    let audit = fs::read_to_string(engine.config.data_dir.join("audit/events.jsonl")).unwrap();
+    assert!(
+        !audit.contains(AWS_ACCESS_KEY),
+        "the seeded secret reached the audit file"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn the_manifest_is_recorded_once_per_turn_as_context_assembled() {
+    let repo = fixture_repo("manifest-audit");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    ask(&engine, &repo, None, "Review src/lib.rs", &mut adapter);
+
+    let events = audit_events(&engine.config.data_dir, "context_assembled");
+    assert_eq!(events.len(), 1, "one event per turn: {events:?}");
+    let event = &events[0];
+    assert_eq!(event["repositoryId"], index.repository_id);
+    let task_id = event["taskId"].as_str().expect("a task id");
+    assert!(!task_id.is_empty());
+    let token_estimate = event["tokenEstimate"]
+        .as_str()
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("a token estimate");
+
+    let manifest: ContextManifest =
+        serde_json::from_str(event["manifest"].as_str().expect("a manifest field"))
+            .expect("the manifest must be valid JSON");
+    assert_eq!(manifest.repository_id, index.repository_id);
+    assert_eq!(manifest.task_id, task_id);
+    assert_eq!(manifest.total_tokens, token_estimate);
+    assert_eq!(
+        manifest
+            .categories
+            .iter()
+            .map(|usage| usage.items)
+            .sum::<usize>(),
+        manifest.included.len(),
+        "every included item belongs to exactly one category"
+    );
+    assert!(
+        manifest
+            .included
+            .iter()
+            .any(|item| item.path.as_deref() == Some("src/lib.rs")),
+        "the explicit file is missing: {manifest:?}"
+    );
+    assert!(
+        !serde_json::to_string(event)
+            .unwrap()
+            .contains("pub fn answer"),
+        "the audit event carries item content: {event:?}"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn the_edit_flow_records_its_manifest_too() {
+    let repo = fixture_repo("manifest-edit-audit");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let response = "DAMAIAN_EDIT_V1\nSUMMARY: Update lib\nFILE: src/lib.rs\nSTATUS: modified\nCONTENT:\npub fn answer() -> usize { 43 }\nEND_FILE\nEND_PATCH\n";
+    let mut adapter = MockModelAdapter::new(response);
+
+    engine
+        .edit_orchestrator
+        .propose_edit(&repo, "Update src/lib.rs", &[], None, &mut adapter)
+        .expect("the edit should be proposed");
+
+    let events = audit_events(&engine.config.data_dir, "context_assembled");
+    assert_eq!(events.len(), 1, "one event per edit: {events:?}");
+    let event = &events[0];
+    assert_eq!(event["repositoryId"], index.repository_id);
+    let manifest: ContextManifest =
+        serde_json::from_str(event["manifest"].as_str().expect("a manifest field"))
+            .expect("the manifest must be valid JSON");
+    assert_eq!(manifest.repository_id, index.repository_id);
+    assert!(
+        manifest
+            .included
+            .iter()
+            .any(|item| item.path.as_deref() == Some("src/lib.rs")),
+        "the edit's context is missing: {manifest:?}"
+    );
+    assert_eq!(
+        event["tokenEstimate"].as_str().unwrap(),
+        manifest.total_tokens.to_string()
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn context_files_are_the_unique_included_paths_in_inclusion_order() {
+    let repo = fixture_repo("manifest-files");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    // `src/lib.rs` is named both explicitly and in the prompt, in a
+    // non-normalised spelling; `README.md` is mentioned and is also a project
+    // rule. Each path must appear once, in first-inclusion order.
+    let explicit = vec!["./src/lib.rs".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Explain src/lib.rs and README.md",
+        &explicit,
+        Some(&index),
+        None,
+    );
+
+    let mut expected: Vec<String> = Vec::new();
+    for item in &plan.items {
+        if let Some(path) = &item.path
+            && !expected.contains(path)
+        {
+            expected.push(path.clone());
+        }
+    }
+    assert_eq!(plan.files, expected);
+    assert_eq!(plan.included_paths(), expected.as_slice());
+    assert_eq!(
+        plan.files
+            .iter()
+            .filter(|path| *path == "src/lib.rs")
+            .count(),
+        1,
+        "the same file was included twice: {:?}",
+        plan.files
+    );
+    assert!(
+        plan.files.iter().any(|path| path == "README.md"),
+        "{:?}",
+        plan.files
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_dot_prefixed_restricted_path_is_recorded() {
+    let repo = fixture_repo("restricted-dot");
+    write_fixture(&repo, "secrets/x.rs", "pub fn leaked() {}\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    // `ignore::normalize_path` already strips `./` inside the rule matcher, so
+    // this spelling reached collection before Task 5. What was not normalised
+    // was the record: it named `./secrets/x.rs`, not the path the read path
+    // refuses.
+    let explicit = vec!["./secrets/x.rs".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Review the file",
+        &explicit,
+        Some(&index),
+        None,
+    );
+
+    assert_absent(&plan, "secrets/x.rs");
+    let records = restrictions_for(&plan, "secrets/x.rs");
+    assert_eq!(records.len(), 1, "{:?}", plan.manifest.excluded);
+    assert_eq!(records[0].category, ContextCategory::FileRanges);
+    assert!(
+        !plan
+            .manifest
+            .excluded
+            .iter()
+            .any(|record| record.path.as_deref() == Some("./secrets/x.rs")),
+        "a restriction record kept a non-normalised spelling: {:?}",
+        plan.manifest.excluded
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn an_absolute_restricted_path_inside_the_repository_is_recorded() {
+    let repo = fixture_repo("restricted-absolute");
+    write_fixture(&repo, "secrets/x.rs", "pub fn leaked() {}\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec![repo.join("secrets/x.rs").to_string_lossy().to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Review the file",
+        &explicit,
+        Some(&index),
+        None,
+    );
+
+    assert_absent(&plan, "secrets/x.rs");
+    let records = restrictions_for(&plan, "secrets/x.rs");
+    assert_eq!(
+        records.len(),
+        1,
+        "the read refused it but no record says why: {:?}",
+        plan.manifest.excluded
+    );
+    assert_eq!(records[0].category, ContextCategory::FileRanges);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_binary_file_read_is_recorded_as_binary() {
+    let repo = fixture_repo("manifest-binary");
+    fs::write(repo.join("src/image.bin"), [0u8, 1, 2, 3, 0, 255]).unwrap();
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["src/image.bin".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Review the image",
+        &explicit,
+        Some(&index),
+        None,
+    );
+
+    assert_absent(&plan, "src/image.bin");
+    let records = plan
+        .manifest
+        .excluded
+        .iter()
+        .filter(|record| {
+            record.reason == ExclusionReason::Binary
+                && record.path.as_deref() == Some("src/image.bin")
+        })
+        .count();
+    assert_eq!(records, 1, "{:?}", plan.manifest.excluded);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn an_oversized_file_read_is_recorded_too_large() {
+    let repo = fixture_repo("manifest-too-large");
+    write_fixture(&repo, "src/big.rs", &"// a long line\n".repeat(64));
+    let mut config = test_config(&repo);
+    config.apply_overlay(ConfigOverlay::parse("max_file_bytes=128\n").unwrap());
+    let engine = WorkspaceEngine::new(config);
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["src/big.rs".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Review the big file",
+        &explicit,
+        Some(&index),
+        None,
+    );
+
+    assert_absent(&plan, "src/big.rs");
+    let records = plan
+        .manifest
+        .excluded
+        .iter()
+        .filter(|record| {
+            record.reason == ExclusionReason::TooLarge
+                && record.path.as_deref() == Some("src/big.rs")
+        })
+        .count();
+    assert_eq!(records, 1, "{:?}", plan.manifest.excluded);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// ---- Task 5 review fix: every included file names its owning root ----
+
+/// A repository with a nested project root (`packages/api`), so "the root that
+/// owns this path" has a non-empty answer to give.
+fn monorepo_fixture(name: &str) -> PathBuf {
+    let repo = temp_dir(name);
+    write_fixture(
+        &repo,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"packages/api\"]\n",
+    );
+    write_fixture(&repo, "README.md", "# Root\n");
+    write_fixture(&repo, "src/lib.rs", "pub fn root_level() -> usize { 1 }\n");
+    write_fixture(
+        &repo,
+        "packages/api/Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\n",
+    );
+    write_fixture(
+        &repo,
+        "packages/api/src/lib.rs",
+        "pub fn api() -> usize { 2 }\n",
+    );
+    repo
+}
+
+fn included_root(plan: &ContextPlan, path: &str) -> Option<String> {
+    plan.manifest
+        .included
+        .iter()
+        .find(|included| included.path.as_deref() == Some(path))
+        .unwrap_or_else(|| panic!("{path} is not in the manifest: {:?}", plan.files))
+        .root_path
+        .clone()
+}
+
+/// The kinds a collection source reads from a repository file. A hook's
+/// `hook:id` label and a plan's text have a `path`-shaped label too, so the
+/// assertion is by kind rather than by `path.is_some()`.
+const FILE_KINDS: [ContextKind; 4] = [
+    ContextKind::ExplicitFile,
+    ContextKind::AgentInstruction,
+    ContextKind::ProjectRule,
+    ContextKind::RetrievedFile,
+];
+
+#[test]
+fn every_included_file_carries_its_owning_root() {
+    let repo = monorepo_fixture("owning-root");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec![
+        "packages/api/src/lib.rs".to_string(),
+        "src/lib.rs".to_string(),
+    ];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Review packages/api/src/lib.rs and src/lib.rs",
+        &explicit,
+        Some(&index),
+        None,
+    );
+
+    assert_eq!(
+        included_root(&plan, "packages/api/src/lib.rs").as_deref(),
+        Some("packages/api"),
+        "the nested root must own its file: {:?}",
+        plan.manifest.included
+    );
+    assert_eq!(
+        included_root(&plan, "src/lib.rs").as_deref(),
+        Some(""),
+        "the repository root is the map's `\"\"` and owns a root-level file"
+    );
+    for (item, included) in plan.items.iter().zip(&plan.manifest.included) {
+        if !FILE_KINDS.contains(&item.kind) {
+            continue;
+        }
+        assert_eq!(
+            item.root_path, included.root_path,
+            "the manifest must mirror the item's root: {item:?}"
+        );
+        assert!(
+            item.root_path.is_some(),
+            "a file item has no owning root: {item:?}"
+        );
+    }
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn the_owning_root_is_set_even_with_the_map_item_turned_off() {
+    let repo = monorepo_fixture("owning-root-no-map");
+    let mut config = test_config(&repo);
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "repository_map_max_tokens=0\n\
+             symbol_context_max_tokens=0\n",
+        )
+        .unwrap(),
+    );
+    let engine = WorkspaceEngine::new(config);
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["packages/api/src/lib.rs".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Review packages/api/src/lib.rs",
+        &explicit,
+        Some(&index),
+        None,
+    );
+
+    for kind in [ContextKind::RepositoryMap, ContextKind::Symbols] {
+        assert!(
+            !plan.items.iter().any(|item| item.kind == kind),
+            "{kind:?} must stay out when its ceiling is 0"
+        );
+    }
+    assert_eq!(
+        included_root(&plan, "packages/api/src/lib.rs").as_deref(),
+        Some("packages/api"),
+        "the root is resolved from the map even when the map item is off: {:?}",
+        plan.manifest.included
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }
