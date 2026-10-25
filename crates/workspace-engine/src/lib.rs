@@ -44,6 +44,7 @@ pub mod symbol_index;
 pub mod tree_walk;
 pub mod validation;
 pub mod vector_index;
+pub mod verification;
 pub mod web_diagnostics;
 pub mod worker_progress;
 pub mod workspace_engine;
@@ -172,9 +173,9 @@ pub use repository_trust::{
 };
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
-    ActionMarker, ChatMessage, DanglingAction, ExportFormat, PendingApprovalRef, SearchOptions,
-    Session, SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskStatus, TaskUsage,
-    WorkerRecord,
+    ActionMarker, ChatMessage, DanglingAction, ExportFormat, PatchFileDecision, PendingApprovalRef,
+    SearchOptions, Session, SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskStatus,
+    TaskUsage, WorkerRecord,
 };
 pub use steering::TurnSteering;
 pub use symbol_index::{
@@ -187,6 +188,11 @@ pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{
     CommandProposal, CommandRunRecord, CommandStore, ValidationOrchestrator,
     command_approval_prompt, resolve_command_directory,
+};
+pub use verification::{
+    BROWSER_CHECK_PREFIX, CheckId, CheckOutcome, CheckRun, FailedCheck, SkipReason, SkippedCheck,
+    VerificationDue, VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
+    fold_verification,
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,
