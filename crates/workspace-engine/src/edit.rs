@@ -506,7 +506,7 @@ impl EditOrchestrator {
             }
             outcome.context
         };
-        let context = self.context_manager.build_context(ContextRequest {
+        let context = match self.context_manager.build_context(ContextRequest {
             repository_root: repository_root.as_ref(),
             repository_id: &index.repository_id,
             task_id: &task.id,
@@ -517,7 +517,14 @@ impl EditOrchestrator {
             hook_context: &hook_context,
             // A one-shot edit has no turn whose plan it could carry.
             plan: None,
-        });
+        }) {
+            Ok(context) => context,
+            // A required prompt that cannot fit is the user's to see, and the
+            // edit task is marked failed like any other pre-model error.
+            Err(error) => {
+                return Err(self.record_edit_failure(&session.id, &task, error));
+            }
+        };
         let request = ModelRequest {
             provider: self.config.model_provider.clone(),
             model: self.config.model_name.clone(),

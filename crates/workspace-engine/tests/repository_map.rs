@@ -1833,17 +1833,20 @@ fn build_context_places_one_map_item_before_retrieved_files() {
     let repo = IndexedMonorepo::new("context-item");
     let engine = WorkspaceEngine::new(repo.config());
     let index = repo.index();
-    let plan = engine.context_manager.build_context(ContextRequest {
-        repository_root: &repo.root,
-        repository_id: &index.repository_id,
-        task_id: "task_map",
-        prompt: "change the engine function and the api index",
-        index: Some(&index),
-        explicit_paths: &[],
-        limit: 16_000,
-        hook_context: &[],
-        plan: None,
-    });
+    let plan = engine
+        .context_manager
+        .build_context(ContextRequest {
+            repository_root: &repo.root,
+            repository_id: &index.repository_id,
+            task_id: "task_map",
+            prompt: "change the engine function and the api index",
+            index: Some(&index),
+            explicit_paths: &[],
+            limit: 16_000,
+            hook_context: &[],
+            plan: None,
+        })
+        .expect("the map assembly should run");
     let kinds: Vec<ContextKind> = plan.items.iter().map(|item| item.kind).collect();
     let maps: Vec<usize> = kinds
         .iter()
@@ -1879,17 +1882,20 @@ fn build_context_places_one_map_item_before_retrieved_files() {
         repository_map_max_tokens: 0,
         ..repo.config()
     });
-    let plan = off.context_manager.build_context(ContextRequest {
-        repository_root: &repo.root,
-        repository_id: &index.repository_id,
-        task_id: "task_map_off",
-        prompt: "change the engine function and the api index",
-        index: Some(&index),
-        explicit_paths: &[],
-        limit: 16_000,
-        hook_context: &[],
-        plan: None,
-    });
+    let plan = off
+        .context_manager
+        .build_context(ContextRequest {
+            repository_root: &repo.root,
+            repository_id: &index.repository_id,
+            task_id: "task_map_off",
+            prompt: "change the engine function and the api index",
+            index: Some(&index),
+            explicit_paths: &[],
+            limit: 16_000,
+            hook_context: &[],
+            plan: None,
+        })
+        .expect("the map assembly should run");
     assert!(
         !plan
             .items
@@ -1898,17 +1904,20 @@ fn build_context_places_one_map_item_before_retrieved_files() {
         "a ceiling of 0 turns the item off"
     );
 
-    let plan = engine.context_manager.build_context(ContextRequest {
-        repository_root: &repo.root,
-        repository_id: &index.repository_id,
-        task_id: "task_map_no_index",
-        prompt: "change the engine function",
-        index: None,
-        explicit_paths: &[],
-        limit: 16_000,
-        hook_context: &[],
-        plan: None,
-    });
+    let plan = engine
+        .context_manager
+        .build_context(ContextRequest {
+            repository_root: &repo.root,
+            repository_id: &index.repository_id,
+            task_id: "task_map_no_index",
+            prompt: "change the engine function",
+            index: None,
+            explicit_paths: &[],
+            limit: 16_000,
+            hook_context: &[],
+            plan: None,
+        })
+        .expect("the map assembly should run");
     assert!(
         !plan
             .items
@@ -1929,17 +1938,20 @@ fn a_map_that_cannot_be_stored_is_left_out_and_the_turn_goes_on() {
     );
 
     let index = repo.index();
-    let plan = engine.context_manager.build_context(ContextRequest {
-        repository_root: &repo.root,
-        repository_id: &index.repository_id,
-        task_id: "task_map_unwritable",
-        prompt: "change the engine function and the api index",
-        index: Some(&index),
-        explicit_paths: &[],
-        limit: 16_000,
-        hook_context: &[],
-        plan: None,
-    });
+    let plan = engine
+        .context_manager
+        .build_context(ContextRequest {
+            repository_root: &repo.root,
+            repository_id: &index.repository_id,
+            task_id: "task_map_unwritable",
+            prompt: "change the engine function and the api index",
+            index: Some(&index),
+            explicit_paths: &[],
+            limit: 16_000,
+            hook_context: &[],
+            plan: None,
+        })
+        .expect("the map assembly should run");
     let kinds: Vec<&str> = plan.items.iter().map(|item| item.kind.as_str()).collect();
     assert!(!kinds.contains(&"repository_map"), "{kinds:?}");
     assert!(kinds.contains(&"user_prompt"), "{kinds:?}");

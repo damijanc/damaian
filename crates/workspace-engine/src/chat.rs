@@ -1046,7 +1046,7 @@ impl ChatOrchestrator {
             limit: self.config.context_token_budget(),
             hook_context: &hook_context,
             plan: carried_plan.as_ref(),
-        });
+        })?;
         let model_prompt = build_model_prompt(&context, &prior_messages, &self.scanner, None);
         let mode = self.session_store.session_mode(&session.id);
         // A worker is never invited to hand off further work (spec 57 §5.0).
@@ -10505,6 +10505,8 @@ mod approval_prompt_wording_tests {
                 root_path: None,
             }],
             files: Vec::new(),
+            limit: crate::context_manager::EffectiveLimit::declared(2),
+            categories: Vec::new(),
             excluded: Vec::new(),
         };
         let with_result = build_model_prompt(

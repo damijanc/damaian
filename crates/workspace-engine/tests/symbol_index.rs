@@ -3190,17 +3190,20 @@ impl Repo {
 
     fn context(&self, engine: &WorkspaceEngine, prompt: &str) -> ContextPlan {
         let index = self.index();
-        engine.context_manager.build_context(ContextRequest {
-            repository_root: &self.root,
-            repository_id: &index.repository_id,
-            task_id: "task_symbols",
-            prompt,
-            index: Some(&index),
-            explicit_paths: &[],
-            limit: 16_000,
-            hook_context: &[],
-            plan: None,
-        })
+        engine
+            .context_manager
+            .build_context(ContextRequest {
+                repository_root: &self.root,
+                repository_id: &index.repository_id,
+                task_id: "task_symbols",
+                prompt,
+                index: Some(&index),
+                explicit_paths: &[],
+                limit: 16_000,
+                hook_context: &[],
+                plan: None,
+            })
+            .expect("the symbols assembly should run")
     }
 }
 

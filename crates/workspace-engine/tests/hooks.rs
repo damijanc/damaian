@@ -3005,17 +3005,20 @@ fn a_before_context_hook_adds_a_redacted_hook_context_item_to_an_edit_plan() {
 
     // Charged to the turn budget like any other item: under a tiny budget it is
     // dropped rather than made privileged.
-    let plan = engine.context_manager.build_context(ContextRequest {
-        repository_root: &root,
-        repository_id: &repository_id_for_root(&root),
-        task_id: "task",
-        prompt: "Add a",
-        index: None,
-        explicit_paths: &[],
-        limit: 4,
-        hook_context: &[("noter".to_string(), "x".repeat(400))],
-        plan: None,
-    });
+    let plan = engine
+        .context_manager
+        .build_context(ContextRequest {
+            repository_root: &root,
+            repository_id: &repository_id_for_root(&root),
+            task_id: "task",
+            prompt: "Add a",
+            index: None,
+            explicit_paths: &[],
+            limit: 4,
+            hook_context: &[("noter".to_string(), "x".repeat(400))],
+            plan: None,
+        })
+        .expect("the hook assembly should run");
     assert!(
         plan.items
             .iter()

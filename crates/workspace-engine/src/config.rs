@@ -1,4 +1,5 @@
 use crate::clarification::MAX_QUESTIONS_PER_TURN_CEILING;
+use crate::context_manager::{ContextBudget, ContextCategory};
 use crate::error::{ClientError, Result};
 use crate::hash::repository_id_for_root;
 use crate::model::TokenUsage;
@@ -238,6 +239,10 @@ pub struct Config {
     /// `repository_map_max_tokens`: it bounds how much of the repository's
     /// declarations leaves the machine per turn.
     pub symbol_context_max_tokens: usize,
+    /// Per-category shares of the context limit and the observed-window safety
+    /// margin (spec 26 §5.2, §5.7). Restrict-only: a repository may lower a
+    /// share and raise the margin, never the reverse.
+    pub context_budget: ContextBudget,
     pub max_command_output_bytes: usize,
     /// Seconds a running command may run before its process group is killed
     /// and it is reported as timed out.
@@ -1041,6 +1046,9 @@ impl Config {
         if let Some(root) = repository_root {
             report.allow_always_entries = config.apply_repository_allowlist(root);
         }
+        // Spec 26 §5.2: an oversubscribed share set is a config error, and the
+        // resolved config is where the sum is finally known.
+        config.validate_context_budget()?;
         Ok((config, report))
     }
 
@@ -1090,6 +1098,17 @@ impl Config {
             max_match_line_chars,
             repository_map_max_tokens,
             symbol_context_max_tokens,
+            context_budget_instructions,
+            context_budget_hook_context,
+            context_budget_pinned,
+            context_budget_plan_state,
+            context_budget_repository_map,
+            context_budget_symbols,
+            context_budget_search_results,
+            context_budget_file_ranges,
+            context_budget_findings,
+            context_budget_conversation_summary,
+            context_budget_safety_margin,
             max_command_output_bytes,
             command_timeout_secs,
             allowed_roots,
@@ -1649,9 +1668,82 @@ impl Config {
             }
         }
 
-        // Forbidden: lowering a checkpoint budget destroys the user's own
-        // recovery data for a repository a clone brought with it, so a
-        // repository cannot set these even though they look like budgets.
+        // Spec 26 §5.2: each category share is restrict-only and lower-wins —
+        // a share steers model traffic toward or away from a repository's own
+        // content, so a clone may lower one but never raise it. The margin is
+        // the opposite direction: reserving more of an observed window is the
+        // restriction, so a repository may raise it and never lower it. A
+        // refused value is never clipped into force; it is reported by key.
+        for (key, category, incoming) in [
+            (
+                "context_budget.instructions",
+                ContextCategory::Instructions,
+                context_budget_instructions,
+            ),
+            (
+                "context_budget.hook_context",
+                ContextCategory::HookContext,
+                context_budget_hook_context,
+            ),
+            (
+                "context_budget.pinned",
+                ContextCategory::Pinned,
+                context_budget_pinned,
+            ),
+            (
+                "context_budget.plan_state",
+                ContextCategory::PlanState,
+                context_budget_plan_state,
+            ),
+            (
+                "context_budget.repository_map",
+                ContextCategory::RepositoryMap,
+                context_budget_repository_map,
+            ),
+            (
+                "context_budget.symbols",
+                ContextCategory::Symbols,
+                context_budget_symbols,
+            ),
+            (
+                "context_budget.search_results",
+                ContextCategory::SearchResults,
+                context_budget_search_results,
+            ),
+            (
+                "context_budget.file_ranges",
+                ContextCategory::FileRanges,
+                context_budget_file_ranges,
+            ),
+            (
+                "context_budget.findings",
+                ContextCategory::Findings,
+                context_budget_findings,
+            ),
+            (
+                "context_budget.conversation_summary",
+                ContextCategory::ConversationSummary,
+                context_budget_conversation_summary,
+            ),
+        ] {
+            if let Some(value) = incoming
+                && let Some(current) = self.context_budget.share_mut(category)
+                && let Some(loosened) = restrict_only_share(current, value, key, trusted, rejected)
+            {
+                outcome.record(scope, key, None, loosened);
+            }
+        }
+        if let Some(value) = context_budget_safety_margin
+            && let Some(loosened) = restrict_only_minimum(
+                &mut self.context_budget.safety_margin_bps,
+                value,
+                "context_budget.safety_margin",
+                trusted,
+                rejected,
+            )
+        {
+            outcome.record(scope, "context_budget.safety_margin", None, loosened);
+        }
         // The user's own profile may lower the retention window, which is
         // what Offline private is for (`context.md` §3).
         if let Some(value) = checkpoint_retention_days {
@@ -1931,6 +2023,13 @@ impl Config {
                     .and_then(|provider| provider.context_token_budget)
             })
             .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET) as usize
+    }
+
+    /// The category shares must fit the window: an oversubscribed set is a
+    /// config error naming the key family, never a silent scale-down
+    /// (spec 26 §5.2).
+    pub fn validate_context_budget(&self) -> Result<()> {
+        self.context_budget.validate()
     }
 
     pub fn apply_model_provider_defaults(&mut self) {
@@ -2377,6 +2476,9 @@ impl Config {
             "symbol_context_max_tokens",
             &self.symbol_context_max_tokens.to_string(),
         );
+        for (key, value) in context_budget_policy_lines(&self.context_budget) {
+            push_line(&mut output, key, &format_basis_points(value));
+        }
         push_line(
             &mut output,
             "max_command_output_bytes",
@@ -2592,6 +2694,7 @@ impl Default for Config {
             // Spec 26's planned 10% share of the same budget (spec 25
             // `context.md` §9).
             symbol_context_max_tokens: 1_600,
+            context_budget: ContextBudget::default(),
             max_command_output_bytes: 1024 * 1024,
             command_timeout_secs: 600,
             allowed_roots: Vec::new(),
@@ -2670,6 +2773,19 @@ pub struct ConfigOverlay {
     pub max_match_line_chars: Option<usize>,
     pub repository_map_max_tokens: Option<usize>,
     pub symbol_context_max_tokens: Option<usize>,
+    /// `context_budget.*` shares, in basis points. Each is its own field so the
+    /// overlay macro classifies it and a repository raise is refused by name.
+    pub context_budget_instructions: Option<u16>,
+    pub context_budget_hook_context: Option<u16>,
+    pub context_budget_pinned: Option<u16>,
+    pub context_budget_plan_state: Option<u16>,
+    pub context_budget_repository_map: Option<u16>,
+    pub context_budget_symbols: Option<u16>,
+    pub context_budget_search_results: Option<u16>,
+    pub context_budget_file_ranges: Option<u16>,
+    pub context_budget_findings: Option<u16>,
+    pub context_budget_conversation_summary: Option<u16>,
+    pub context_budget_safety_margin: Option<u16>,
     pub max_command_output_bytes: Option<usize>,
     pub command_timeout_secs: Option<usize>,
     pub allowed_roots: Option<Vec<PathBuf>>,
@@ -2803,6 +2919,20 @@ classify_overlay_fields! {
     max_match_line_chars => Capability,
     repository_map_max_tokens => Capability,
     symbol_context_max_tokens => Capability,
+    // Spec 26 §5.2: a share steers model traffic toward or away from a
+    // repository's own content, so a clone may lower one but never raise it.
+    // The safety margin is the reverse direction (higher is restrictive).
+    context_budget_instructions => Capability,
+    context_budget_hook_context => Capability,
+    context_budget_pinned => Capability,
+    context_budget_plan_state => Capability,
+    context_budget_repository_map => Capability,
+    context_budget_symbols => Capability,
+    context_budget_search_results => Capability,
+    context_budget_file_ranges => Capability,
+    context_budget_findings => Capability,
+    context_budget_conversation_summary => Capability,
+    context_budget_safety_margin => Capability,
     max_command_output_bytes => Preference,
     command_timeout_secs => Capability,
     allowed_roots => Capability,
@@ -2995,6 +3125,40 @@ impl ConfigOverlay {
             // `0` is valid here too: it leaves the `symbols` item out.
             "symbol_context_max_tokens" => {
                 self.symbol_context_max_tokens = Some(parse_u64(key, value)? as usize)
+            }
+            // Spec 26 §5.2: decimals parsed into integer basis points.
+            "context_budget.instructions" => {
+                self.context_budget_instructions = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.hook_context" => {
+                self.context_budget_hook_context = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.pinned" => {
+                self.context_budget_pinned = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.plan_state" => {
+                self.context_budget_plan_state = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.repository_map" => {
+                self.context_budget_repository_map = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.symbols" => {
+                self.context_budget_symbols = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.search_results" => {
+                self.context_budget_search_results = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.file_ranges" => {
+                self.context_budget_file_ranges = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.findings" => {
+                self.context_budget_findings = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.conversation_summary" => {
+                self.context_budget_conversation_summary = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.safety_margin" => {
+                self.context_budget_safety_margin = Some(parse_basis_points(key, value)?)
             }
             "max_command_output_bytes" => {
                 self.max_command_output_bytes = Some(parse_u64(key, value)? as usize)
@@ -3388,6 +3552,17 @@ impl ConfigOverlay {
             max_match_line_chars,
             repository_map_max_tokens,
             symbol_context_max_tokens,
+            context_budget_instructions,
+            context_budget_hook_context,
+            context_budget_pinned,
+            context_budget_plan_state,
+            context_budget_repository_map,
+            context_budget_symbols,
+            context_budget_search_results,
+            context_budget_file_ranges,
+            context_budget_findings,
+            context_budget_conversation_summary,
+            context_budget_safety_margin,
             max_command_output_bytes,
             command_timeout_secs,
             allowed_roots,
@@ -3457,6 +3632,32 @@ impl ConfigOverlay {
         }
         if let Some(value) = symbol_context_max_tokens {
             push_line(&mut output, "symbol_context_max_tokens", &value.to_string());
+        }
+        for (key, value) in [
+            ("context_budget.instructions", context_budget_instructions),
+            ("context_budget.hook_context", context_budget_hook_context),
+            ("context_budget.pinned", context_budget_pinned),
+            ("context_budget.plan_state", context_budget_plan_state),
+            (
+                "context_budget.repository_map",
+                context_budget_repository_map,
+            ),
+            ("context_budget.symbols", context_budget_symbols),
+            (
+                "context_budget.search_results",
+                context_budget_search_results,
+            ),
+            ("context_budget.file_ranges", context_budget_file_ranges),
+            ("context_budget.findings", context_budget_findings),
+            (
+                "context_budget.conversation_summary",
+                context_budget_conversation_summary,
+            ),
+            ("context_budget.safety_margin", context_budget_safety_margin),
+        ] {
+            if let Some(value) = value {
+                push_line(&mut output, key, &format_basis_points(*value));
+            }
         }
         if let Some(value) = max_file_bytes {
             push_line(&mut output, "max_file_bytes", &value.to_string());
@@ -4426,6 +4627,104 @@ fn push_line(output: &mut String, key: &str, value: &str) {
     output.push('\n');
 }
 
+/// The resolved `context_budget.*` lines, in the order proposal §5.2 lists
+/// them. `Config::to_policy_text` and the effective-policy view read the same
+/// names.
+fn context_budget_policy_lines(budget: &ContextBudget) -> Vec<(&'static str, u16)> {
+    let mut lines = vec![
+        (
+            "context_budget.instructions",
+            budget.share(ContextCategory::Instructions),
+        ),
+        (
+            "context_budget.hook_context",
+            budget.share(ContextCategory::HookContext),
+        ),
+        (
+            "context_budget.pinned",
+            budget.share(ContextCategory::Pinned),
+        ),
+        (
+            "context_budget.plan_state",
+            budget.share(ContextCategory::PlanState),
+        ),
+        (
+            "context_budget.repository_map",
+            budget.share(ContextCategory::RepositoryMap),
+        ),
+        (
+            "context_budget.symbols",
+            budget.share(ContextCategory::Symbols),
+        ),
+        (
+            "context_budget.search_results",
+            budget.share(ContextCategory::SearchResults),
+        ),
+        (
+            "context_budget.file_ranges",
+            budget.share(ContextCategory::FileRanges),
+        ),
+        (
+            "context_budget.findings",
+            budget.share(ContextCategory::Findings),
+        ),
+        (
+            "context_budget.conversation_summary",
+            budget.share(ContextCategory::ConversationSummary),
+        ),
+    ];
+    lines.push(("context_budget.safety_margin", budget.safety_margin_bps));
+    lines
+}
+
+/// The canonical decimal form of a basis-point value. Four places is exact:
+/// one basis point is `0.0001`.
+fn format_basis_points(bps: u16) -> String {
+    format!("{}.{:04}", bps / 10_000, bps % 10_000)
+}
+
+/// Parses `0.10` or `0` into basis points without ever using a float: the last
+/// token's allocation must not depend on rounding (proposal §5.2, Correction
+/// C7). More than four decimal places is an error rather than a rounded value,
+/// and so is a value above `1.00`.
+fn parse_basis_points(key: &str, value: &str) -> Result<u16> {
+    let value = value.trim();
+    let invalid = || {
+        ClientError::InvalidInput(format!(
+            "{key} must be a decimal between 0 and 1 with at most four decimal places"
+        ))
+    };
+    let (whole, fraction) = match value.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (value, None),
+    };
+    if whole.is_empty() || !whole.chars().all(|character| character.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let whole: u32 = whole.parse().map_err(|_| invalid())?;
+    let fractional = match fraction {
+        None => 0,
+        Some(fraction) => {
+            if fraction.is_empty()
+                || fraction.len() > 4
+                || !fraction.chars().all(|character| character.is_ascii_digit())
+            {
+                return Err(invalid());
+            }
+            let digits: u32 = fraction.parse().map_err(|_| invalid())?;
+            digits * 10u32.pow(4 - fraction.len() as u32)
+        }
+    };
+    let bps = whole
+        .checked_mul(10_000)
+        .and_then(|points| points.checked_add(fractional))
+        .ok_or_else(invalid)?;
+    if bps > 10_000 {
+        return Err(invalid());
+    }
+    Ok(bps as u16)
+}
+
 fn split_list(value: &str) -> Vec<String> {
     value
         .split('|')
@@ -4595,6 +4894,51 @@ fn restrict_only_u32(
     None
 }
 
+/// [`restrict_only_limit`] for a context share in basis points (spec 26 §5.2).
+///
+/// Lowering a share is the restriction: it sends less of the repository's own
+/// content. A raise is refused and reported, never clipped to the current value.
+fn restrict_only_share(
+    current: &mut u16,
+    value: u16,
+    key: &str,
+    trusted: bool,
+    rejected: &mut Vec<RejectedConfigKey>,
+) -> Option<bool> {
+    if trusted || value < *current {
+        let loosens = value > *current;
+        *current = value;
+        return Some(loosens);
+    }
+    rejected.push(RejectedConfigKey::new(
+        key,
+        RepositoryKeyClass::RestrictOnly,
+    ));
+    None
+}
+
+/// The opposite direction of [`restrict_only_share`]: the margin reserves part
+/// of an observed window, so a *higher* margin is more restrictive and an
+/// untrusted scope may only raise it.
+fn restrict_only_minimum(
+    current: &mut u16,
+    value: u16,
+    key: &str,
+    trusted: bool,
+    rejected: &mut Vec<RejectedConfigKey>,
+) -> Option<bool> {
+    if trusted || value > *current {
+        let loosens = value < *current;
+        *current = value;
+        return Some(loosens);
+    }
+    rejected.push(RejectedConfigKey::new(
+        key,
+        RepositoryKeyClass::RestrictOnly,
+    ));
+    None
+}
+
 fn restrict_only_ceiling(
     current: &mut Option<u64>,
     value: u64,
@@ -4716,6 +5060,61 @@ mod tests {
             config
                 .to_policy_text()
                 .contains("enable_worker_sessions=true")
+        );
+    }
+
+    /// Spec 26 §5.2: decimals are stored and allocated as integer basis points,
+    /// and a set that oversubscribes is an error naming the family rather than
+    /// a silent scale-down.
+    #[test]
+    fn context_budget_shares_are_stored_in_basis_points_and_an_oversubscribed_set_is_a_config_error()
+     {
+        let mut config = Config::default();
+        let overlay = ConfigOverlay::parse(concat!(
+            "context_budget.instructions=0.10\n",
+            "context_budget.repository_map=0.0500\n",
+            "context_budget.safety_margin=0.15\n",
+        ))
+        .unwrap();
+        assert_eq!(overlay.context_budget_instructions, Some(1_000));
+        assert_eq!(
+            ConfigOverlay::parse(&overlay.to_policy_text()).unwrap(),
+            overlay,
+            "the overlay serializer must round-trip the new keys"
+        );
+        config.apply_overlay(overlay);
+        assert_eq!(
+            config.context_budget.share(ContextCategory::Instructions),
+            1_000
+        );
+        assert_eq!(
+            config.context_budget.share(ContextCategory::RepositoryMap),
+            500
+        );
+        assert_eq!(config.context_budget.safety_margin_bps, 1_500);
+        assert!(config.validate_context_budget().is_ok());
+        assert!(
+            config
+                .to_policy_text()
+                .contains("context_budget.instructions=0.1000")
+        );
+
+        // More decimal places than a basis point can express is refused rather
+        // than rounded: the last token's allocation must not depend on it.
+        assert!(ConfigOverlay::parse("context_budget.instructions=0.12345\n").is_err());
+        assert!(ConfigOverlay::parse("context_budget.instructions=1.01\n").is_err());
+
+        let mut oversubscribed = Config::default();
+        oversubscribed
+            .context_budget
+            .set_share(ContextCategory::Instructions, 10_000);
+        oversubscribed
+            .context_budget
+            .set_share(ContextCategory::FileRanges, 2_500);
+        let error = oversubscribed.validate_context_budget().unwrap_err();
+        assert!(
+            error.to_string().contains("context_budget"),
+            "the error must name the key family: {error}"
         );
     }
 }

@@ -115,6 +115,7 @@ impl WorkspaceEngine {
                 path_policy: path_policy.clone(),
                 max_tokens: config.symbol_context_max_tokens,
             },
+            config.context_budget,
         );
         let command_runner = CommandRunner::new(
             config.clone(),

@@ -12,10 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::context_manager::ExclusionReason;
 use workspace_engine::{
-    CancelToken, ChatTurnResult, CollectionSource, Config, ConfigOverlay, ContextCategory,
-    ContextItem, ContextKind, ContextPlan, ContextRequest, ExclusionRecord, LineRange,
-    MockModelAdapter, ModelAdapter, PlanStep, Provenance, RepositoryIndex, StepStatus, Symbol,
-    SymbolIndexStore, TaskPlan, TurnProgress, TurnSink, WorkspaceEngine,
+    CancelToken, CategoryUsage, ChatTurnResult, ClientError, CollectionSource, Config,
+    ConfigOverlay, ContextCategory, ContextItem, ContextKind, ContextPlan, ContextRequest,
+    ExclusionRecord, LimitSource, LineRange, MockModelAdapter, ModelAdapter, PlanStep, Provenance,
+    RepositoryIndex, StepStatus, Symbol, SymbolIndexStore, TaskPlan, TurnProgress, TurnSink,
+    WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -64,13 +65,13 @@ fn item(kind: ContextKind, path: Option<&str>, content: &str) -> ContextItem {
     }
 }
 
-fn ask(
+fn try_ask(
     engine: &WorkspaceEngine,
     repo: &Path,
     session_id: Option<&str>,
     prompt: &str,
     adapter: &mut dyn ModelAdapter,
-) -> ChatTurnResult {
+) -> workspace_engine::Result<ChatTurnResult> {
     let cancel = CancelToken::new();
     let mut on_token = |_token: &str| {};
     let mut on_progress = |_event: TurnProgress| {};
@@ -83,7 +84,16 @@ fn ask(
     engine
         .chat_orchestrator
         .ask_with_session(repo, prompt, &[], session_id, adapter, &mut sink)
-        .expect("the turn should run")
+}
+
+fn ask(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: Option<&str>,
+    prompt: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    try_ask(engine, repo, session_id, prompt, adapter).expect("the turn should run")
 }
 
 fn fixture_repo(name: &str) -> PathBuf {
@@ -232,8 +242,11 @@ fn a_secret_in_the_user_prompt_is_redacted_in_the_model_request() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// Replaces Task 1's `a_prompt_larger_than_the_budget_still_reaches_the_model_redacted`:
+/// the interim exemption that let an over-budget `Required` item through is
+/// gone, so the same fixture now asserts the visible error on both callers.
 #[test]
-fn a_prompt_larger_than_the_budget_still_reaches_the_model_redacted() {
+fn a_required_item_that_does_not_fit_is_an_error() {
     let repo = fixture_repo("oversized-prompt");
     let mut config = test_config(&repo);
     config.apply_overlay(
@@ -251,24 +264,51 @@ fn a_prompt_larger_than_the_budget_still_reaches_the_model_redacted() {
         "Please review oversized_request_marker_zzq and rotate {AWS_ACCESS_KEY}. {}",
         "Keep this detail. ".repeat(40)
     );
+    let limit = engine.config.context_token_budget();
     assert!(
-        prompt.len().div_ceil(4) > engine.config.context_token_budget(),
+        prompt.len().div_ceil(4) > limit,
         "the prompt must exceed the budget or this test proves nothing"
     );
-    ask(&engine, &repo, None, &prompt, &mut adapter);
 
-    let message = user_message(&adapter, 0);
+    // Both callers propagate the assembly error: the turn fails visibly instead
+    // of sending an empty `User request:` (Task 4 replaced Task 1's exemption).
+    let error = try_ask(&engine, &repo, None, &prompt, &mut adapter)
+        .expect_err("the oversized request must be refused");
     assert!(
-        message.contains("oversized_request_marker_zzq"),
-        "the oversized request was dropped from the prompt:\n{message}"
+        matches!(&error, ClientError::InvalidInput(message) if message.contains(&limit.to_string())),
+        "the error must name the limit {limit}: {error:?}"
+    );
+    let direct = engine.context_manager.build_context(ContextRequest {
+        repository_root: &repo,
+        repository_id: "repo_oversized",
+        task_id: "task_oversized",
+        prompt: &prompt,
+        index: None,
+        explicit_paths: &[],
+        limit,
+        hook_context: &[],
+        plan: None,
+    });
+    assert!(
+        matches!(&direct, Err(ClientError::InvalidInput(message)) if message.contains(&limit.to_string())),
+        "assembly itself must name the limit {limit}: {direct:?}"
+    );
+    let edit_error = engine
+        .edit_orchestrator
+        .propose_edit(&repo, &prompt, &[], None, &mut adapter)
+        .expect_err("the edit flow must refuse it too");
+    assert!(
+        matches!(&edit_error, ClientError::InvalidInput(message) if message.contains(&limit.to_string())),
+        "the edit error must name the limit {limit}: {edit_error:?}"
     );
     assert!(
-        message.contains("[REDACTED_AWS_ACCESS_KEY_"),
-        "the surviving request was not redacted:\n{message}"
-    );
-    assert!(
-        !message.contains(AWS_ACCESS_KEY),
-        "the raw secret reached the provider:\n{message}"
+        adapter.requests.is_empty(),
+        "no request may reach the provider: {:?}",
+        adapter
+            .requests
+            .iter()
+            .map(|request| &request.messages[1].content)
+            .collect::<Vec<_>>()
     );
 
     fs::remove_dir_all(repo).unwrap();
@@ -413,6 +453,30 @@ fn a_category_orders_before_the_categories_after_it() {
 
 // ---- Task 2: collection sources and exclusion at collection time ----
 
+/// Every context share is zero, so a test can give one category an exact share
+/// and see only that category compete for the limit.
+const ZERO_CONTEXT_SHARES: &str = concat!(
+    "context_budget.instructions=0\n",
+    "context_budget.hook_context=0\n",
+    "context_budget.pinned=0\n",
+    "context_budget.plan_state=0\n",
+    "context_budget.repository_map=0\n",
+    "context_budget.symbols=0\n",
+    "context_budget.search_results=0\n",
+    "context_budget.file_ranges=0\n",
+    "context_budget.findings=0\n",
+    "context_budget.conversation_summary=0\n",
+);
+
+fn config_with_shares(repo: &Path, extra: &str) -> Config {
+    let mut config = test_config(repo);
+    config.apply_overlay(
+        ConfigOverlay::parse(&format!("{ZERO_CONTEXT_SHARES}{extra}"))
+            .expect("the test's budget keys should parse"),
+    );
+    config
+}
+
 /// One assembly with the Task 2 request shape, at the default budget.
 fn assemble(
     engine: &WorkspaceEngine,
@@ -423,17 +487,60 @@ fn assemble(
     index: Option<&RepositoryIndex>,
     plan: Option<&TaskPlan>,
 ) -> ContextPlan {
-    engine.context_manager.build_context(ContextRequest {
-        repository_root: repo,
+    assemble_with_limit(
+        engine,
+        repo,
         repository_id,
-        task_id: "task-2",
         prompt,
-        index,
         explicit_paths,
-        limit: 16_000,
-        hook_context: &[],
+        index,
         plan,
-    })
+        16_000,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_with_limit(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    repository_id: &str,
+    prompt: &str,
+    explicit_paths: &[String],
+    index: Option<&RepositoryIndex>,
+    plan: Option<&TaskPlan>,
+    limit: usize,
+) -> ContextPlan {
+    engine
+        .context_manager
+        .build_context(ContextRequest {
+            repository_root: repo,
+            repository_id,
+            task_id: "task-2",
+            prompt,
+            index,
+            explicit_paths,
+            limit,
+            hook_context: &[],
+            plan,
+        })
+        .expect("the assembly should succeed")
+}
+
+fn usage(plan: &ContextPlan, category: ContextCategory) -> &CategoryUsage {
+    plan.categories
+        .iter()
+        .find(|usage| usage.category == category)
+        .unwrap_or_else(|| panic!("{category:?} has no usage row in {:?}", plan.categories))
+}
+
+fn budget_records<'a>(plan: &'a ContextPlan, path: &str) -> Vec<&'a ExclusionRecord> {
+    plan.excluded
+        .iter()
+        .filter(|record| {
+            record.reason == ExclusionReason::CategoryBudgetExhausted
+                && record.path.as_deref() == Some(path)
+        })
+        .collect()
 }
 
 /// Every restriction record for `path`, so a test can state which category it
@@ -1072,6 +1179,373 @@ fn no_collection_source_yields_a_line_range_yet() {
         ranged.is_empty(),
         "a collection source now produces line ranges; cover merging through build_context: {ranged:?}"
     );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// ---- Task 4: per-category budgets and the effective limit ----
+
+#[test]
+fn each_category_stops_at_its_configured_share() {
+    let repo = fixture_repo("share-cap");
+    let engine = WorkspaceEngine::new(config_with_shares(
+        &repo,
+        "context_budget.file_ranges=0.01\n",
+    ));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["src/lib.rs".to_string()];
+
+    let plan = assemble_with_limit(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Explain src/lib.rs and README.md",
+        &explicit,
+        Some(&index),
+        None,
+        1_000,
+    );
+
+    for usage in &plan.categories {
+        assert!(
+            usage.used <= usage.allocated,
+            "{:?} used {} of {} allocated",
+            usage.category,
+            usage.used,
+            usage.allocated
+        );
+        assert!(
+            usage.estimated,
+            "{:?} must be marked estimated",
+            usage.category
+        );
+    }
+    let file_ranges = usage(&plan, ContextCategory::FileRanges);
+    assert!(file_ranges.truncated, "{file_ranges:?}");
+    assert_eq!(file_ranges.allocated, 9, "1% of ~991 tokens");
+    assert_eq!(file_ranges.used, 8, "the explicit file only");
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn an_unused_share_moves_to_later_categories() {
+    let repo = fixture_repo("redistribute");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let explicit = vec!["src/lib.rs".to_string()];
+
+    let plan = assemble_with_limit(
+        &engine,
+        &repo,
+        "repo_redistribute",
+        "Review",
+        &explicit,
+        None,
+        None,
+        4_000,
+    );
+
+    let required: usize = plan
+        .items
+        .iter()
+        .filter(|item| item.category == ContextCategory::Required)
+        .map(|item| item.tokens)
+        .sum();
+    let available = plan.limit.tokens - required;
+    let nominal = available * 2_500 / 10_000;
+    let file_ranges = usage(&plan, ContextCategory::FileRanges);
+    assert!(
+        file_ranges.allocated > nominal,
+        "unused shares should reach FileRanges: allocated {}, nominal {nominal}",
+        file_ranges.allocated
+    );
+    assert!(file_ranges.used <= file_ranges.allocated);
+    assert_eq!(file_ranges.used, 8, "the explicit file fits either way");
+    assert!(
+        usage(&plan, ContextCategory::Pinned).used == 0,
+        "Pinned is reserved and releases its share"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_category_over_its_share_drops_its_lowest_priority_members() {
+    let repo = fixture_repo("file-drop");
+    write_fixture(
+        &repo,
+        "src/mentioned_only.rs",
+        &format!("// mentioned only\n{}\n", "pub fn filler() {}\n".repeat(20)),
+    );
+    let engine = WorkspaceEngine::new(config_with_shares(
+        &repo,
+        "context_budget.file_ranges=0.10\n",
+    ));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["src/lib.rs".to_string()];
+
+    let plan = assemble_with_limit(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Explain src/lib.rs and src/mentioned_only.rs",
+        &explicit,
+        Some(&index),
+        None,
+        300,
+    );
+
+    let paths: Vec<&str> = plan
+        .items
+        .iter()
+        .filter_map(|item| item.path.as_deref())
+        .collect();
+    assert!(
+        paths.contains(&"src/lib.rs"),
+        "the explicit path has priority: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"src/mentioned_only.rs"),
+        "the mentioned path should be dropped: {paths:?}"
+    );
+    let records = budget_records(&plan, "src/mentioned_only.rs");
+    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records[0].category, ContextCategory::FileRanges);
+    assert!(usage(&plan, ContextCategory::FileRanges).truncated);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn semantic_hits_are_dropped_before_exact_matches() {
+    let repo = semantic_only_fixture("search-budget", "zzz/semantic_only.rs");
+    let engine = WorkspaceEngine::new(config_with_shares(
+        &repo,
+        "context_budget.search_results=0.10\n",
+    ));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    assert!(
+        !index
+            .keyword_search("semanticprobe", 8)
+            .iter()
+            .any(|hit| hit.path == "zzz/semantic_only.rs"),
+        "the fixture is a keyword hit too, so the semantic drop is not tested"
+    );
+    assert!(
+        index
+            .semantic_search("semanticprobe", 8)
+            .iter()
+            .any(|hit| hit.path == "zzz/semantic_only.rs"),
+        "the fixture is not a semantic hit, so the test proves nothing"
+    );
+
+    let plan = assemble_with_limit(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "semanticprobe",
+        &[],
+        Some(&index),
+        None,
+        100,
+    );
+
+    let included: Vec<&str> = plan
+        .items
+        .iter()
+        .filter(|item| item.category == ContextCategory::SearchResults)
+        .filter_map(|item| item.path.as_deref())
+        .collect();
+    assert!(
+        !included.is_empty(),
+        "some exact hit must survive the tiny share: {:?}",
+        plan.excluded
+    );
+    assert!(
+        included.iter().all(|path| index
+            .keyword_search("semanticprobe", 8)
+            .iter()
+            .any(|hit| &hit.path == path)),
+        "every surviving hit is an exact keyword hit: {included:?}"
+    );
+    let records = budget_records(&plan, "zzz/semantic_only.rs");
+    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records[0].category, ContextCategory::SearchResults);
+    assert!(usage(&plan, ContextCategory::SearchResults).truncated);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn the_most_specific_agents_md_survives_truncation() {
+    let repo = temp_dir("instruction-truncation");
+    write_fixture(
+        &repo,
+        "AGENTS.md",
+        &format!(
+            "# Root rules\n{}\n",
+            "Always run the full suite.\n".repeat(30)
+        ),
+    );
+    write_fixture(
+        &repo,
+        "src/deep/AGENTS.md",
+        "# Nested rules\nUse the local helper.\n",
+    );
+    write_fixture(
+        &repo,
+        "src/deep/lib.rs",
+        "pub fn answer() -> usize { 42 }\n",
+    );
+    let engine = WorkspaceEngine::new(config_with_shares(
+        &repo,
+        "context_budget.instructions=0.01\n",
+    ));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+
+    let plan = assemble_with_limit(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Review src/deep/lib.rs",
+        &[],
+        Some(&index),
+        None,
+        2_000,
+    );
+
+    let instruction_paths: Vec<&str> = plan
+        .items
+        .iter()
+        .filter(|item| item.category == ContextCategory::Instructions)
+        .filter_map(|item| item.path.as_deref())
+        .collect();
+    assert_eq!(instruction_paths, vec!["src/deep/AGENTS.md"]);
+    let records = budget_records(&plan, "AGENTS.md");
+    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records[0].category, ContextCategory::Instructions);
+    assert!(usage(&plan, ContextCategory::Instructions).truncated);
+
+    // The prompt keeps today's order for whatever survives: root first.
+    let roomy_engine = WorkspaceEngine::new(test_config(&repo));
+    let roomy = assemble(
+        &roomy_engine,
+        &repo,
+        &index.repository_id,
+        "Review src/deep/lib.rs",
+        &[],
+        Some(&index),
+        None,
+    );
+    let roomy_paths: Vec<&str> = roomy
+        .items
+        .iter()
+        .filter(|item| item.category == ContextCategory::Instructions)
+        .filter_map(|item| item.path.as_deref())
+        .collect();
+    assert_eq!(roomy_paths, vec!["AGENTS.md", "src/deep/AGENTS.md"]);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A repository with enough structure that the map's full render is well over
+/// a small category share.
+fn map_heavy_repo(name: &str) -> PathBuf {
+    let repo = temp_dir(name);
+    write_fixture(&repo, "README.md", "# Map fixture\n");
+    for directory in 1..=24 {
+        for file in 1..=3 {
+            write_fixture(
+                &repo,
+                &format!("area{directory:02}/module{file}.rs"),
+                "pub fn helper() -> usize { 0 }\n",
+            );
+        }
+    }
+    repo
+}
+
+#[test]
+fn a_block_item_too_large_for_its_share_is_rerendered_smaller() {
+    let repo = map_heavy_repo("block-rerender");
+    let engine = WorkspaceEngine::new(config_with_shares(
+        &repo,
+        "context_budget.repository_map=0.05\n",
+    ));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+
+    let small = assemble_with_limit(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Summarize the repository",
+        &[],
+        Some(&index),
+        None,
+        2_000,
+    );
+    let small_map = small
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::RepositoryMap)
+        .expect("the map should survive at a smaller ceiling");
+    assert!(!small_map.content.is_empty());
+    let truncated = small
+        .excluded
+        .iter()
+        .filter(|record| {
+            record.reason == ExclusionReason::Truncated
+                && record.category == ContextCategory::RepositoryMap
+        })
+        .count();
+    assert_eq!(truncated, 1, "{:?}", small.excluded);
+    assert!(usage(&small, ContextCategory::RepositoryMap).truncated);
+
+    let roomy = assemble_with_limit(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Summarize the repository",
+        &[],
+        Some(&index),
+        None,
+        100_000,
+    );
+    let roomy_map = roomy
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::RepositoryMap)
+        .expect("the map should be there at a roomy limit");
+    assert!(
+        roomy_map.tokens > small_map.tokens,
+        "the small share must shorten the block: {} vs {}",
+        small_map.tokens,
+        roomy_map.tokens
+    );
+    assert!(
+        !roomy.excluded.iter().any(|record| {
+            record.reason == ExclusionReason::Truncated
+                && record.category == ContextCategory::RepositoryMap
+        }),
+        "a roomy share is not a truncation: {:?}",
+        roomy.excluded
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn with_no_observed_profile_the_limit_is_the_config_budget_labelled_declared() {
+    let repo = fixture_repo("declared-limit");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+
+    let plan = assemble(&engine, &repo, "repo_declared", "Review", &[], None, None);
+
+    assert_eq!(plan.limit.tokens, engine.config.context_token_budget());
+    assert_eq!(plan.limit.tokens, 16_000);
+    assert_eq!(plan.limit.source, LimitSource::Declared);
+    assert_eq!(plan.limit.safety_margin_bps, 0);
+    assert_eq!(plan.limit.window, None);
 
     fs::remove_dir_all(repo).unwrap();
 }

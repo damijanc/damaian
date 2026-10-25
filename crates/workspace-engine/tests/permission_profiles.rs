@@ -24,11 +24,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     AppliedKey, ApprovalCause, AuditLog, CancelToken, ChatTurnResult, ClientError, CommandAccess,
     CommandClassification, CommandPolicy, CommandRisk, Config, ConfigKeyKind, ConfigOverlay,
-    ConfigScope, EffectivePolicy, MockModelAdapter, ModelProviderConfig, ProfileCapabilities,
-    ProfileId, RefusedBy, RefusedRequest, RepositoryConfigReport, RepositoryKeyClass,
-    RepositoryTrustStore, SecretScanner, SessionMode, SourceKind, ToolCall, TurnProgress, TurnSink,
-    WorkspaceEngine, overlay_field_kinds, repository_id_for_root, review_profile_rejections,
-    select_profile,
+    ConfigScope, ContextCategory, EffectivePolicy, MockModelAdapter, ModelProviderConfig,
+    ProfileCapabilities, ProfileId, RefusedBy, RefusedRequest, RepositoryConfigReport,
+    RepositoryKeyClass, RepositoryTrustStore, SecretScanner, SessionMode, SourceKind, ToolCall,
+    TurnProgress, TurnSink, WorkspaceEngine, overlay_field_kinds, repository_id_for_root,
+    review_profile_rejections, select_profile,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -456,6 +456,77 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "language_server.rust=/bin/sh\n",
             Reported("language_server.rust"),
         ),
+        // Spec 26 Task 4: a share steers model traffic toward or away from a
+        // repository's own content, and a clone may only lower it. Each share
+        // is its own capability key so a single raise is refused by name.
+        case(
+            "context_budget_instructions",
+            "",
+            "context_budget.instructions=1.00\n",
+            Reported("context_budget.instructions"),
+        ),
+        case(
+            "context_budget_hook_context",
+            "",
+            "context_budget.hook_context=1.00\n",
+            Reported("context_budget.hook_context"),
+        ),
+        case(
+            "context_budget_pinned",
+            "",
+            "context_budget.pinned=1.00\n",
+            Reported("context_budget.pinned"),
+        ),
+        case(
+            "context_budget_plan_state",
+            "",
+            "context_budget.plan_state=1.00\n",
+            Reported("context_budget.plan_state"),
+        ),
+        case(
+            "context_budget_repository_map",
+            "",
+            "context_budget.repository_map=1.00\n",
+            Reported("context_budget.repository_map"),
+        ),
+        case(
+            "context_budget_symbols",
+            "",
+            "context_budget.symbols=1.00\n",
+            Reported("context_budget.symbols"),
+        ),
+        case(
+            "context_budget_search_results",
+            "",
+            "context_budget.search_results=1.00\n",
+            Reported("context_budget.search_results"),
+        ),
+        case(
+            "context_budget_file_ranges",
+            "",
+            "context_budget.file_ranges=1.00\n",
+            Reported("context_budget.file_ranges"),
+        ),
+        case(
+            "context_budget_findings",
+            "",
+            "context_budget.findings=1.00\n",
+            Reported("context_budget.findings"),
+        ),
+        case(
+            "context_budget_conversation_summary",
+            "",
+            "context_budget.conversation_summary=1.00\n",
+            Reported("context_budget.conversation_summary"),
+        ),
+        // The margin is the other direction: reserving more is a restriction,
+        // so a repository may raise it and never lower it.
+        case(
+            "context_budget_safety_margin",
+            "",
+            "context_budget.safety_margin=0.00\n",
+            Reported("context_budget.safety_margin"),
+        ),
     ]
 }
 
@@ -612,6 +683,82 @@ fn a_repository_can_narrow_each_profile_key_without_a_refusal() {
         "narrowing is not a refusal: {:?}",
         report.rejected_keys
     );
+}
+
+// Spec 26 Task 4: a repository may lower a share and raise the margin; the
+// helper direction is the reverse of the numeric caps because a bigger margin
+// reserves more of the window, which is the restrictive direction.
+#[test]
+fn a_repository_may_lower_a_share_and_raise_the_margin() {
+    let (config, report) = load(
+        "context-budget-narrow",
+        "",
+        concat!(
+            "context_budget.instructions=0.05\n",
+            "context_budget.file_ranges=0.10\n",
+            "context_budget.safety_margin=0.20\n",
+        ),
+    );
+
+    assert_eq!(
+        config.context_budget.share(ContextCategory::Instructions),
+        500
+    );
+    assert_eq!(
+        config.context_budget.share(ContextCategory::FileRanges),
+        1_000
+    );
+    assert_eq!(config.context_budget.safety_margin_bps, 2_000);
+    assert!(
+        report.rejected_keys.is_empty(),
+        "narrowing is not a refusal: {:?}",
+        report.rejected_keys
+    );
+}
+
+#[test]
+fn a_profile_may_only_narrow_the_context_budget() {
+    let narrowing = ConfigOverlay::parse(concat!(
+        "context_budget.file_ranges=0.10\n",
+        "context_budget.safety_margin=0.20\n",
+    ))
+    .unwrap();
+    let mut narrowed = Config::default();
+    let outcome = narrowed.apply_overlay_scoped(narrowing, ConfigScope::Profile);
+    assert!(outcome.rejected.is_empty(), "{:?}", outcome.rejected);
+    assert_eq!(
+        narrowed.context_budget.share(ContextCategory::FileRanges),
+        1_000
+    );
+    assert_eq!(narrowed.context_budget.safety_margin_bps, 2_000);
+
+    let loosening = narrowed.apply_overlay_scoped(
+        ConfigOverlay::parse(concat!(
+            "context_budget.file_ranges=0.50\n",
+            "context_budget.safety_margin=0.05\n",
+        ))
+        .unwrap(),
+        ConfigScope::Profile,
+    );
+    assert_eq!(
+        refusal_set(&loosening.rejected),
+        BTreeSet::from([
+            (
+                "context_budget.file_ranges".to_string(),
+                RepositoryKeyClass::RestrictOnly.as_str(),
+            ),
+            (
+                "context_budget.safety_margin".to_string(),
+                RepositoryKeyClass::RestrictOnly.as_str(),
+            ),
+        ])
+    );
+    assert_eq!(
+        narrowed.context_budget.share(ContextCategory::FileRanges),
+        1_000,
+        "a refused raise is never clipped into force"
+    );
+    assert_eq!(narrowed.context_budget.safety_margin_bps, 2_000);
 }
 
 #[test]

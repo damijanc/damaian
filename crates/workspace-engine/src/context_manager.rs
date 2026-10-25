@@ -1,11 +1,12 @@
 use crate::command_policy::CommandPolicy;
+use crate::error::{ClientError, Result};
 use crate::file_access::{FileAccessController, LineRange};
 use crate::indexer::RepositoryIndex;
 use crate::path_policy::PathPolicy;
 use crate::plan::TaskPlan;
 use crate::repository_map::{RepositoryMap, RepositoryMapStore};
 use crate::secret_scanner::SecretScanner;
-use crate::symbol_index::{Provenance, SymbolIndexStore};
+use crate::symbol_index::{Provenance, SymbolIndex, SymbolIndexStore, SymbolMatch};
 use crate::vector_index::VectorIndexCache;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -66,6 +67,174 @@ impl ContextCategory {
             Self::ConversationSummary => "conversation_summary",
         }
     }
+
+    /// The budgeted categories, in pipeline order after `Required`, which has no
+    /// share (proposal §5.2). Declaration order of the enum is the same order.
+    pub const BUDGETED: [ContextCategory; 10] = [
+        ContextCategory::Instructions,
+        ContextCategory::HookContext,
+        ContextCategory::Pinned,
+        ContextCategory::PlanState,
+        ContextCategory::RepositoryMap,
+        ContextCategory::Symbols,
+        ContextCategory::SearchResults,
+        ContextCategory::FileRanges,
+        ContextCategory::Findings,
+        ContextCategory::ConversationSummary,
+    ];
+
+    /// The index into [`ContextBudget::shares`]; `None` for `Required`.
+    pub fn budget_index(self) -> Option<usize> {
+        match self {
+            Self::Required => None,
+            Self::Instructions => Some(0),
+            Self::HookContext => Some(1),
+            Self::Pinned => Some(2),
+            Self::PlanState => Some(3),
+            Self::RepositoryMap => Some(4),
+            Self::Symbols => Some(5),
+            Self::SearchResults => Some(6),
+            Self::FileRanges => Some(7),
+            Self::Findings => Some(8),
+            Self::ConversationSummary => Some(9),
+        }
+    }
+}
+
+/// The per-category shares and the observed-window margin (proposal §5.2, §5.7).
+///
+/// Fractions are integer basis points (`u16`, `0..=10_000`): a float would make
+/// the last token's allocation depend on rounding and would cost
+/// [`ContextItem`]/[`ContextPlan`] their `Eq`, which tests rely on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextBudget {
+    /// One share per [`ContextCategory::BUDGETED`] category, in that order.
+    /// The sum must be at most 10,000; a set that oversubscribes is a config
+    /// error rather than a silent scale-down.
+    pub shares: [u16; 10],
+    /// The share of an observed window reserved for estimate error. It is not
+    /// applied to the declared `context_token_budget` (proposal §5.7).
+    pub safety_margin_bps: u16,
+}
+
+impl Default for ContextBudget {
+    fn default() -> Self {
+        Self {
+            shares: [
+                1_000, // instructions
+                500,   // hook_context
+                1_500, // pinned
+                500,   // plan_state
+                500,   // repository_map
+                1_000, // symbols
+                1_500, // search_results
+                2_500, // file_ranges
+                500,   // findings
+                500,   // conversation_summary
+            ],
+            safety_margin_bps: 1_000,
+        }
+    }
+}
+
+impl ContextBudget {
+    pub fn share(&self, category: ContextCategory) -> u16 {
+        category
+            .budget_index()
+            .map(|index| self.shares[index])
+            .unwrap_or(0)
+    }
+
+    pub fn share_mut(&mut self, category: ContextCategory) -> Option<&mut u16> {
+        category.budget_index().map(|index| &mut self.shares[index])
+    }
+
+    pub fn set_share(&mut self, category: ContextCategory, value: u16) {
+        if let Some(share) = self.share_mut(category) {
+            *share = value;
+        }
+    }
+
+    pub fn total_share_bps(&self) -> u32 {
+        self.shares.iter().map(|share| u32::from(*share)).sum()
+    }
+
+    /// A set that allocates more than the whole window is a config error naming
+    /// the key family, never a silent scale-down (proposal §5.2).
+    pub fn validate(&self) -> Result<()> {
+        let total = self.total_share_bps();
+        if total > 10_000 {
+            return Err(ClientError::InvalidInput(format!(
+                "context_budget.* shares total {total} basis points; they must sum to at most 10000 (1.00)"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Where the effective limit came from (proposal §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitSource {
+    /// A capability profile's provider window, with the safety margin applied.
+    Observed,
+    /// `context_token_budget`, used unchanged, with no margin.
+    Declared,
+}
+
+/// The token limit assembly actually divides (proposal §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectiveLimit {
+    pub tokens: usize,
+    pub source: LimitSource,
+    pub safety_margin_bps: u16,
+    /// The provider window the margin was applied to, when one is known.
+    pub window: Option<usize>,
+}
+
+impl EffectiveLimit {
+    /// The config budget used as-is. No margin: `context_token_budget` is a
+    /// packing budget, not the provider's window (Correction C6), so shrinking
+    /// it by 10% would make every existing user's context smaller for no safety
+    /// gain.
+    pub fn declared(tokens: usize) -> Self {
+        Self {
+            tokens,
+            source: LimitSource::Declared,
+            safety_margin_bps: 0,
+            window: None,
+        }
+    }
+
+    /// An observed provider window with the configured margin reserved.
+    pub fn observed(window: usize, safety_margin_bps: u16) -> Self {
+        let reserved = (window as u128 * u128::from(safety_margin_bps) / 10_000) as usize;
+        Self {
+            tokens: window.saturating_sub(reserved),
+            source: LimitSource::Observed,
+            safety_margin_bps,
+            window: Some(window),
+        }
+    }
+}
+
+/// What one category was allowed and what it used (proposal §5.5).
+///
+/// `estimated` is always true for assembly and exists so a figure can never be
+/// read as measured (spec 19 requirement 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryUsage {
+    pub category: ContextCategory,
+    /// After redistribution from earlier categories.
+    pub allocated: usize,
+    pub used: usize,
+    pub items: usize,
+    /// The category ran out of its share and dropped or shortened an item.
+    pub truncated: bool,
+    pub estimated: bool,
 }
 
 /// The source label the prompt header shows.
@@ -163,6 +332,11 @@ pub enum ExclusionReason {
     /// for the same path (proposal §5.4). The record names the range that did
     /// not become its own item.
     DeduplicatedIntoRange,
+    /// The item did not fit its category's share (proposal §5.2).
+    CategoryBudgetExhausted,
+    /// The item is included, but only in part: a block re-rendered at a smaller
+    /// ceiling for its category share (proposal §5.2, Correction C14).
+    Truncated,
 }
 
 /// One item that did not enter the plan, with the reason. Never content.
@@ -233,6 +407,12 @@ pub struct ContextPlan {
     pub token_estimate: usize,
     pub items: Vec<ContextItem>,
     pub files: Vec<String>,
+    /// The limit categories divided, and whether it was observed or declared
+    /// (proposal §5.7).
+    pub limit: EffectiveLimit,
+    /// Per-category allocation and use, in pipeline order (proposal §5.5).
+    /// Task 5 folds this into the manifest.
+    pub categories: Vec<CategoryUsage>,
     /// Everything collection left out, with the reason (proposal §5.6). Never
     /// content.
     pub excluded: Vec<ExclusionRecord>,
@@ -360,6 +540,54 @@ struct MergedFile {
     kind: ContextKind,
     provenance: Option<Provenance>,
     allow_outside_root: bool,
+}
+
+/// One collected thing, before the category budget decides whether it is
+/// included (proposal §5.2).
+///
+/// Text is already redacted and measured by [`add_text`]. A block is kept as
+/// data rather than text because a category share smaller than its configured
+/// ceiling must re-render it through its own renderer (Correction C14), never
+/// slice what redaction produced.
+#[derive(Debug)]
+enum PendingItem {
+    Item(ContextItem),
+    Block(BlockItem),
+}
+
+impl PendingItem {
+    fn category(&self) -> ContextCategory {
+        match self {
+            Self::Item(item) => item.category,
+            Self::Block(block) => block.kind.category(),
+        }
+    }
+
+    fn tokens(&self) -> usize {
+        match self {
+            Self::Item(item) => item.tokens,
+            // A block is rendered by the budget pass, which measures it then.
+            Self::Block(_) => 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BlockItem {
+    kind: ContextKind,
+    /// The ceiling the renderer was configured with (`repository_map_max_tokens`
+    /// or `symbol_context_max_tokens`).
+    max_tokens: usize,
+    content: BlockContent,
+}
+
+#[derive(Debug)]
+enum BlockContent {
+    Map(RepositoryMap),
+    Symbols {
+        index: SymbolIndex,
+        matches: Vec<SymbolMatch>,
+    },
 }
 
 /// Group by path, absorb ranges under a whole-file item, and merge overlapping
@@ -527,6 +755,8 @@ pub struct ContextManager {
     enable_semantic_search: bool,
     repository_map: RepositoryMapSource,
     symbols: SymbolSource,
+    /// The shares category budgeting divides the limit by (proposal §5.2).
+    budget: ContextBudget,
 }
 
 /// What the `repository_map` item is built from (spec 24 `context.md` §5).
@@ -550,6 +780,10 @@ pub struct SymbolSource {
 }
 
 impl ContextManager {
+    // The engine's one construction seam: every field is a collaborator the
+    // engine already holds, and spec 27 adds a pinned store here. A params
+    // struct would be built at this single call site only to be destructured.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         file_access: FileAccessController,
         path_policy: PathPolicy,
@@ -558,6 +792,7 @@ impl ContextManager {
         enable_semantic_search: bool,
         repository_map: RepositoryMapSource,
         symbols: SymbolSource,
+        budget: ContextBudget,
     ) -> Self {
         Self {
             file_access,
@@ -567,6 +802,7 @@ impl ContextManager {
             enable_semantic_search,
             repository_map,
             symbols,
+            budget,
         }
     }
 
@@ -607,7 +843,7 @@ impl ContextManager {
         restricted.then_some(ExclusionReason::RestrictedPath)
     }
 
-    pub fn build_context(&self, request: ContextRequest<'_>) -> ContextPlan {
+    pub fn build_context(&self, request: ContextRequest<'_>) -> Result<ContextPlan> {
         let ContextRequest {
             repository_root,
             repository_id,
@@ -620,7 +856,10 @@ impl ContextManager {
             plan,
         } = request;
 
-        let mut items = Vec::new();
+        let mut pending = Vec::new();
+        // Every whole file collected so far, for dedup and range absorption.
+        // The plan's `files` is recomputed from the budgeted items at the end,
+        // so a path dropped by its category share is not reported as included.
         let mut files = Vec::new();
         let mut excluded = Vec::new();
         // Ranged candidates are read once, after collection, so ranges for one
@@ -628,18 +867,17 @@ impl ContextManager {
         // still read where they are collected, which is what keeps the prompt's
         // item order unchanged.
         let mut range_candidates = Vec::new();
-        let mut token_estimate = 0;
 
-        add_text(
-            &self.scanner,
-            &mut items,
-            &mut token_estimate,
-            limit,
-            ContextKind::UserPrompt,
-            None,
-            None,
-            None,
-            prompt,
+        push_text(
+            &mut pending,
+            add_text(
+                &self.scanner,
+                ContextKind::UserPrompt,
+                None,
+                None,
+                None,
+                prompt,
+            ),
         );
 
         let requested_paths = explicit_paths.to_vec();
@@ -696,11 +934,9 @@ impl ContextManager {
                 source,
                 ContextKind::ExplicitFile,
                 &mut files,
-                &mut items,
+                &mut pending,
                 &mut excluded,
                 &mut range_candidates,
-                &mut token_estimate,
-                limit,
                 requested,
             );
         }
@@ -716,11 +952,9 @@ impl ContextManager {
                 CollectionSource::Instruction,
                 ContextKind::AgentInstruction,
                 &mut files,
-                &mut items,
+                &mut pending,
                 &mut excluded,
                 &mut range_candidates,
-                &mut token_estimate,
-                limit,
                 false,
             );
         }
@@ -736,49 +970,34 @@ impl ContextManager {
                 CollectionSource::ProjectRule,
                 ContextKind::ProjectRule,
                 &mut files,
-                &mut items,
+                &mut pending,
                 &mut excluded,
                 &mut range_candidates,
-                &mut token_estimate,
-                limit,
                 false,
             );
         }
 
         // After instructions and rules, before retrieved files: under a tight
-        // budget the map displaces retrieved files, never instructions.
+        // budget the map displaces retrieved files, never instructions. The
+        // block is kept unrendered so its category share can choose the ceiling
+        // (Correction C14); `symbols_block` needs the map first.
         let map = index.and_then(|index| self.load_map(index));
-        if let Some(text) = map.as_ref().and_then(|map| self.repository_map_text(map)) {
-            add_text(
-                &self.scanner,
-                &mut items,
-                &mut token_estimate,
-                limit,
-                ContextKind::RepositoryMap,
-                None,
-                None,
-                None,
-                &text,
-            );
-        }
-
-        // The symbols the prompt names, in the same place for the same
-        // reason: it displaces retrieved files, never instructions or the map.
-        if let Some((text, provenance)) = index
+        let symbols = index
             .zip(map.as_ref())
-            .and_then(|(index, map)| self.symbols_text(index, map, prompt))
-        {
-            add_text(
-                &self.scanner,
-                &mut items,
-                &mut token_estimate,
-                limit,
-                ContextKind::Symbols,
-                None,
-                None,
-                provenance,
-                &text,
-            );
+            .and_then(|(index, map)| self.symbols_block(index, map, prompt));
+        if let Some(map) = map.filter(|_| self.repository_map.max_tokens > 0) {
+            pending.push(PendingItem::Block(BlockItem {
+                kind: ContextKind::RepositoryMap,
+                max_tokens: self.repository_map.max_tokens,
+                content: BlockContent::Map(map),
+            }));
+        }
+        if let Some((index, matches)) = symbols {
+            pending.push(PendingItem::Block(BlockItem {
+                kind: ContextKind::Symbols,
+                max_tokens: self.symbols.max_tokens,
+                content: BlockContent::Symbols { index, matches },
+            }));
         }
 
         // A hook's additions are ordinary items: redacted by `add_text` and
@@ -787,16 +1006,16 @@ impl ContextManager {
         // `context.md` §10). Before the retrieved files, like the map and the
         // symbols, because the hook's rule is about the turn, not the search.
         for (hook_id, text) in hook_context {
-            add_text(
-                &self.scanner,
-                &mut items,
-                &mut token_estimate,
-                limit,
-                ContextKind::HookContext,
-                Some(format!("hook:{hook_id}")),
-                None,
-                None,
-                text,
+            push_text(
+                &mut pending,
+                add_text(
+                    &self.scanner,
+                    ContextKind::HookContext,
+                    Some(format!("hook:{hook_id}")),
+                    None,
+                    None,
+                    text,
+                ),
             );
         }
 
@@ -804,16 +1023,16 @@ impl ContextManager {
         // `carry_plan_from_the_previous_turn`) is ordinary, redacted, charged
         // context — not a privileged channel (proposal §5.11).
         if let Some(text) = plan.and_then(plan_state_text) {
-            add_text(
-                &self.scanner,
-                &mut items,
-                &mut token_estimate,
-                limit,
-                ContextKind::PlanState,
-                None,
-                None,
-                None,
-                &text,
+            push_text(
+                &mut pending,
+                add_text(
+                    &self.scanner,
+                    ContextKind::PlanState,
+                    None,
+                    None,
+                    None,
+                    &text,
+                ),
             );
         }
 
@@ -832,11 +1051,9 @@ impl ContextManager {
                     source,
                     ContextKind::RetrievedFile,
                     &mut files,
-                    &mut items,
+                    &mut pending,
                     &mut excluded,
                     &mut range_candidates,
-                    &mut token_estimate,
-                    limit,
                     false,
                 );
             }
@@ -851,19 +1068,244 @@ impl ContextManager {
             task_id,
             &range_candidates,
             &mut files,
-            &mut items,
+            &mut pending,
             &mut excluded,
-            &mut token_estimate,
-            limit,
         );
 
-        ContextPlan {
+        self.apply_budget(
+            repository_id,
+            task_id,
+            pending,
+            EffectiveLimit::declared(limit),
+            excluded,
+        )
+    }
+
+    /// Divide the limit by category share, drop or shorten over-share items, and
+    /// build the plan (proposal §5.2, §5.7).
+    ///
+    /// `Required` is subtracted before any category is allocated: a required
+    /// item that does not fit is not a budgeting problem but an error the user
+    /// must see. Unused allocation is released to later categories in pipeline
+    /// order; a category over its share truncates within itself rather than
+    /// stealing from the next.
+    fn apply_budget(
+        &self,
+        repository_id: &str,
+        task_id: &str,
+        pending: Vec<PendingItem>,
+        limit: EffectiveLimit,
+        mut excluded: Vec<ExclusionRecord>,
+    ) -> Result<ContextPlan> {
+        let required_tokens: usize = pending
+            .iter()
+            .filter(|item| item.category() == ContextCategory::Required)
+            .map(PendingItem::tokens)
+            .sum();
+        if required_tokens > limit.tokens {
+            return Err(ClientError::InvalidInput(format!(
+                "Required context needs {required_tokens} tokens but the context budget is {}",
+                limit.tokens
+            )));
+        }
+        let available = limit.tokens - required_tokens;
+
+        let mut indices: [Vec<usize>; 11] = std::array::from_fn(|_| Vec::new());
+        for (index, item) in pending.iter().enumerate() {
+            indices[item.category() as usize].push(index);
+        }
+
+        let mut placed: Vec<Option<ContextItem>> = vec![None; pending.len()];
+        let mut categories = Vec::with_capacity(11);
+
+        // Required is never budgeted and never dropped (proposal §5.1).
+        let required = &indices[ContextCategory::Required as usize];
+        for &index in required {
+            if let PendingItem::Item(item) = &pending[index] {
+                placed[index] = Some(item.clone());
+            }
+        }
+        categories.push(CategoryUsage {
+            category: ContextCategory::Required,
+            allocated: required_tokens,
+            used: required_tokens,
+            items: required.len(),
+            truncated: false,
+            estimated: true,
+        });
+
+        // Unused allocation, released to the next category in pipeline order.
+        let mut carry = 0usize;
+        for category in ContextCategory::BUDGETED {
+            let share = self.budget.share(category);
+            // Integer basis points all the way: no float decides inclusion.
+            let nominal = (available as u128 * u128::from(share) / 10_000) as usize;
+            let allocation = nominal.saturating_add(carry);
+            let mut used = 0usize;
+            let mut kept = 0usize;
+            let mut truncated = false;
+            let mut exhausted = false;
+
+            for index in self.priority_order(category, &pending, &indices[category as usize]) {
+                if exhausted {
+                    budget_exclusion(&mut excluded, &pending[index], category);
+                    truncated = true;
+                    continue;
+                }
+                match &pending[index] {
+                    PendingItem::Item(item) => {
+                        if used + item.tokens <= allocation {
+                            used += item.tokens;
+                            kept += 1;
+                            placed[index] = Some(item.clone());
+                        } else {
+                            budget_exclusion(&mut excluded, &pending[index], category);
+                            truncated = true;
+                            exhausted = true;
+                        }
+                    }
+                    PendingItem::Block(block) => {
+                        let Some((text, provenance)) = self.render_block(block, block.max_tokens)
+                        else {
+                            // Nothing to send even at its configured ceiling.
+                            continue;
+                        };
+                        let Some(full) =
+                            add_text(&self.scanner, block.kind, None, None, provenance, &text)
+                        else {
+                            continue;
+                        };
+                        if used + full.tokens <= allocation {
+                            used += full.tokens;
+                            kept += 1;
+                            placed[index] = Some(full);
+                            continue;
+                        }
+                        // Re-render at the share, through the block's own
+                        // renderer, then measure the re-rendered text through
+                        // `add_text` (C14). Never slice redacted text.
+                        let remaining = allocation - used;
+                        let shortened = self
+                            .render_block(block, remaining)
+                            .and_then(|(text, provenance)| {
+                                add_text(&self.scanner, block.kind, None, None, provenance, &text)
+                            })
+                            .filter(|item| item.tokens <= remaining);
+                        if let Some(item) = shortened {
+                            used += item.tokens;
+                            kept += 1;
+                            placed[index] = Some(item);
+                            truncated = true;
+                            excluded.push(ExclusionRecord {
+                                reason: ExclusionReason::Truncated,
+                                path: None,
+                                range: None,
+                                category,
+                                detail: Some(format!(
+                                    "re-rendered at its category share of {remaining} tokens"
+                                )),
+                            });
+                        } else {
+                            budget_exclusion(&mut excluded, &pending[index], category);
+                            truncated = true;
+                            exhausted = true;
+                        }
+                    }
+                }
+            }
+
+            carry = allocation.saturating_sub(used);
+            categories.push(CategoryUsage {
+                category,
+                allocated: allocation,
+                used,
+                items: kept,
+                truncated,
+                estimated: true,
+            });
+        }
+
+        let items: Vec<ContextItem> = placed.into_iter().flatten().collect();
+        let mut files = Vec::new();
+        for item in &items {
+            if let Some(path) = &item.path
+                && !files.iter().any(|existing| existing == path)
+            {
+                files.push(path.clone());
+            }
+        }
+        let token_estimate = items.iter().map(|item| item.tokens).sum();
+
+        Ok(ContextPlan {
             repository_id: repository_id.to_string(),
             task_id: task_id.to_string(),
             token_estimate,
             items,
             files,
+            limit,
+            categories,
             excluded,
+        })
+    }
+
+    /// A category's items in inclusion priority, highest first.
+    ///
+    /// Only `Instructions` differs from collection order: prompt order stays
+    /// root-before-nested, but truncation keeps the most specific `AGENTS.md`
+    /// (nested instructions override broader ones), then broader files, then
+    /// the root project rules (proposal §5.3).
+    fn priority_order(
+        &self,
+        category: ContextCategory,
+        pending: &[PendingItem],
+        indices: &[usize],
+    ) -> Vec<usize> {
+        let mut order = indices.to_vec();
+        if category == ContextCategory::Instructions {
+            order.sort_by_key(|&index| {
+                let (project_rule, depth) = match &pending[index] {
+                    PendingItem::Item(item) if item.kind == ContextKind::AgentInstruction => (
+                        false,
+                        item.path
+                            .as_deref()
+                            .map_or(0, |path| path.matches('/').count()),
+                    ),
+                    _ => (true, 0),
+                };
+                (project_rule, std::cmp::Reverse(depth), index)
+            });
+        }
+        order
+    }
+
+    /// Render a block at `max_tokens` through its own renderer (Correction C14).
+    fn render_block(
+        &self,
+        block: &BlockItem,
+        max_tokens: usize,
+    ) -> Option<(String, Option<Provenance>)> {
+        if max_tokens == 0 {
+            return None;
+        }
+        match &block.content {
+            BlockContent::Map(map) => {
+                let rendered = map.render_for_model(max_tokens);
+                (!rendered.text.is_empty()).then_some((rendered.text, None))
+            }
+            BlockContent::Symbols { index, matches } => {
+                let rendered = index.render_for_model(matches, max_tokens);
+                if rendered.text.is_empty() {
+                    return None;
+                }
+                // The weakest provenance among the lines actually shown, as
+                // before: one heuristic symbol makes the whole block a guess.
+                let provenance = matches
+                    .iter()
+                    .take(rendered.shown)
+                    .map(|matched| matched.symbol.provenance)
+                    .max();
+                Some((rendered.text, provenance))
+            }
         }
     }
 
@@ -883,28 +1325,19 @@ impl ContextManager {
         Some(map)
     }
 
-    /// The rendered map, or `None` when its ceiling is `0`.
-    fn repository_map_text(&self, map: &RepositoryMap) -> Option<String> {
-        let max_tokens = self.repository_map.max_tokens;
-        (max_tokens > 0).then(|| map.render_for_model(max_tokens).text)
-    }
-
-    /// The symbols the prompt's identifiers name and the provenance of the
-    /// weakest one shown, or `None` when the ceiling is `0`, nothing matches,
-    /// or the symbol index cannot be loaded or stored, which leaves the item
-    /// out rather than failing the turn. It reads the stored index as it is,
-    /// whatever an eager definition pass has merged so far, and never waits on
-    /// a language server (`context.md` §8).
-    ///
-    /// The block's provenance is the **lowest** among the lines it actually
-    /// contains (proposal §5.3): one heuristic symbol makes the whole block a
-    /// guess, however many exact ones sit beside it.
-    fn symbols_text(
+    /// The symbols the prompt's identifiers name, as data rather than rendered
+    /// text: the category share picks the ceiling, so the render happens in the
+    /// budget pass (Correction C14). `None` when the ceiling is `0`, nothing
+    /// matches, or the symbol index cannot be loaded or stored, which leaves
+    /// the item out rather than failing the turn. It reads the stored index as
+    /// it is, whatever an eager definition pass has merged so far, and never
+    /// waits on a language server (`context.md` §8).
+    fn symbols_block(
         &self,
         index: &RepositoryIndex,
         map: &RepositoryMap,
         prompt: &str,
-    ) -> Option<(String, Option<Provenance>)> {
+    ) -> Option<(SymbolIndex, Vec<SymbolMatch>)> {
         let source = &self.symbols;
         if source.max_tokens == 0 {
             return None;
@@ -917,18 +1350,7 @@ impl ContextManager {
         if matches.is_empty() {
             return None;
         }
-        let rendered = symbols.render_for_model(&matches, source.max_tokens);
-        if rendered.text.is_empty() {
-            return None;
-        }
-        // `Provenance::Heuristic` sorts after `LanguageServer`, so the maximum
-        // is the least authoritative entry present in the rendered block.
-        let provenance = matches
-            .iter()
-            .take(rendered.shown)
-            .map(|matched| matched.symbol.provenance)
-            .max();
-        Some((rendered.text, provenance))
+        Some((symbols, matches))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -943,11 +1365,9 @@ impl ContextManager {
         source: CollectionSource,
         kind: ContextKind,
         files: &mut Vec<String>,
-        items: &mut Vec<ContextItem>,
+        pending: &mut Vec<PendingItem>,
         excluded: &mut Vec<ExclusionRecord>,
         range_candidates: &mut Vec<FileCandidate>,
-        token_estimate: &mut usize,
-        token_budget: usize,
         allow_outside_root: bool,
     ) {
         // Whole files are deduplicated here, as they always were. A range for
@@ -985,9 +1405,9 @@ impl ContextManager {
             return;
         }
 
-        // `Whole`, not the tool's bounded window: this function has its own
-        // `token_budget` and `add_text` decides what fits. Capping here would
-        // silently shrink what every task sees.
+        // `Whole`, not the tool's bounded window: assembly's category budget
+        // decides what fits. Capping here would silently shrink what every task
+        // sees.
         let Ok(file) = self.file_access.read_file(
             repository_root,
             path,
@@ -999,16 +1419,16 @@ impl ContextManager {
         ) else {
             return;
         };
-        let added = add_text(
-            &self.scanner,
-            items,
-            token_estimate,
-            token_budget,
-            kind,
-            Some(file.path.clone()),
-            None,
-            provenance,
-            &file.content,
+        let added = push_text(
+            pending,
+            add_text(
+                &self.scanner,
+                kind,
+                Some(file.path.clone()),
+                None,
+                provenance,
+                &file.content,
+            ),
         );
         if added {
             files.push(file.path);
@@ -1029,10 +1449,8 @@ impl ContextManager {
         task_id: &str,
         range_candidates: &[FileCandidate],
         files: &mut Vec<String>,
-        items: &mut Vec<ContextItem>,
+        pending: &mut Vec<PendingItem>,
         excluded: &mut Vec<ExclusionRecord>,
-        token_estimate: &mut usize,
-        token_budget: usize,
     ) {
         if range_candidates.is_empty() {
             return;
@@ -1064,16 +1482,16 @@ impl ContextManager {
             };
             // The header names what was actually read, so a range clamped to the
             // file's length cannot claim lines that do not exist.
-            let added = add_text(
-                &self.scanner,
-                items,
-                token_estimate,
-                token_budget,
-                file.kind,
-                Some(read.path.clone()),
-                file.range.map(|_| read.line_range),
-                file.provenance,
-                &read.content,
+            let added = push_text(
+                pending,
+                add_text(
+                    &self.scanner,
+                    file.kind,
+                    Some(read.path.clone()),
+                    file.range.map(|_| read.line_range),
+                    file.provenance,
+                    &read.content,
+                ),
             );
             if added && !files.iter().any(|existing| existing == &file.path) {
                 files.push(read.path);
@@ -1125,37 +1543,25 @@ fn plan_state_text(plan: &TaskPlan) -> Option<String> {
     Some(text)
 }
 
-// The accumulators are borrowed plan state and the rest are the item's own
-// fields; a params struct would be built at each call site only to be
-// destructured here. Task 4 folds the budget accumulators into one type.
-#[allow(clippy::too_many_arguments)]
+/// Redact, measure and shape one item. The only place item content is created
+/// (proposal §5.6): redaction runs before the estimate, so nothing unredacted is
+/// ever measured or stored. Category budgeting happens afterwards in
+/// [`ContextManager::apply_budget`], which is why this no longer refuses an item
+/// for budget — the `Required` item's refusal is a visible error there.
 fn add_text(
     scanner: &SecretScanner,
-    items: &mut Vec<ContextItem>,
-    token_estimate: &mut usize,
-    token_budget: usize,
     kind: ContextKind,
     path: Option<String>,
     range: Option<LineRange>,
     provenance: Option<Provenance>,
     content: &str,
-) -> bool {
+) -> Option<ContextItem> {
     if content.is_empty() {
-        return false;
+        return None;
     }
     let redaction = scanner.redact(content);
     let tokens = redaction.text.len().div_ceil(4);
-    // `Required` is never dropped for budget (proposal §5.1). It is the user's
-    // own message, and the prompt is rendered only from this item (C17), so
-    // refusing it would send an empty `User request:` while the raw prompt went
-    // nowhere. It is still charged to the estimate, so the next item sees a
-    // budget that already accounts for it. Task 4 replaces this with a visible
-    // "Required item does not fit" error once categories are budgeted.
-    if kind.category() != ContextCategory::Required && *token_estimate + tokens > token_budget {
-        return false;
-    }
-    *token_estimate += tokens;
-    items.push(ContextItem {
+    Some(ContextItem {
         category: kind.category(),
         kind,
         path,
@@ -1169,8 +1575,40 @@ fn add_text(
         },
         provenance,
         root_path: None,
-    });
-    true
+    })
+}
+
+fn push_text(pending: &mut Vec<PendingItem>, item: Option<ContextItem>) -> bool {
+    match item {
+        Some(item) => {
+            pending.push(PendingItem::Item(item));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Record an item its category share could not hold (proposal §5.2). Never
+/// content: the path, the range it would have carried, and the category.
+fn budget_exclusion(
+    excluded: &mut Vec<ExclusionRecord>,
+    item: &PendingItem,
+    category: ContextCategory,
+) {
+    let (path, range) = match item {
+        PendingItem::Item(item) => (item.path.clone(), item.range),
+        PendingItem::Block(_) => (None, None),
+    };
+    push_exclusion(
+        excluded,
+        ExclusionRecord {
+            reason: ExclusionReason::CategoryBudgetExhausted,
+            path,
+            range,
+            category,
+            detail: Some("the category share is exhausted".to_string()),
+        },
+    );
 }
 
 pub(crate) fn agent_instruction_paths(context_paths: &[String]) -> Vec<String> {
