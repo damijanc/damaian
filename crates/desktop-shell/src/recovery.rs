@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use workspace_engine::{
-    CommandProposal, PausedTurns, ProposedPatch, QUESTION_WAITING_HEADLINE, ReattachedApproval,
-    RecoveredTask, TaskStatus, WorkspaceEngine, allow_always_eligible, classify_all,
-    classify_session, command_approval_prompt, headline, reattach_pending_approvals,
-    resume_allowed, resume_blocked_reason,
+    CommandProposal, PausedTurns, PendingVerification, ProposedPatch, QUESTION_WAITING_HEADLINE,
+    ReattachedApproval, RecoveredTask, TaskStatus, WorkspaceEngine, allow_always_eligible,
+    classify_all, classify_session, command_approval_prompt, headline, pending_verifications,
+    reattach_pending_approvals, resume_allowed, resume_blocked_reason,
 };
 
 use crate::{escape_json, patch_files_json, plan_json};
@@ -61,6 +61,7 @@ struct Approval {
 struct Sweep {
     recovered: Vec<Recovered>,
     approvals: Vec<Approval>,
+    verifications: Vec<(String, PendingVerification)>,
 }
 
 /// Everything the sweep needs from one session log, read once.
@@ -150,12 +151,23 @@ fn sweep_payload(engine: &WorkspaceEngine, sweep: &Sweep) -> Result<String, Stri
     }
 
     Ok(format!(
-        "{{\"tasks\":[{}],\"approvals\":[{}]}}",
+        "{{\"tasks\":[{}],\"approvals\":[{}],\"verifications\":[{}]}}",
         open.join(","),
         sweep
             .approvals
             .iter()
             .map(approval_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        sweep
+            .verifications
+            .iter()
+            .map(|(session_id, due)| format!(
+                "{{\"sessionId\":\"{}\",\"taskId\":\"{}\",\"patchId\":\"{}\"}}",
+                escape_json(session_id),
+                escape_json(&due.task_id),
+                escape_json(&due.patch_id)
+            ))
             .collect::<Vec<_>>()
             .join(",")
     ))
@@ -405,9 +417,19 @@ fn run_sweep(engine: &WorkspaceEngine) -> Result<Sweep, String> {
         }
     }
 
+    let mut verifications = Vec::new();
+    for session in &sessions {
+        for due in pending_verifications(&engine.session_store, &session.id)
+            .map_err(|error| error.to_string())?
+        {
+            verifications.push((session.id.clone(), due));
+        }
+    }
+
     Ok(Sweep {
         recovered,
         approvals,
+        verifications,
     })
 }
 
@@ -596,6 +618,29 @@ fn describe_approval(
         // question route. The text was redacted before it was stored in the
         // session log; `answered` and `answer` are what a reattached card shows
         // instead of asking again.
+        ReattachedApproval::CheckBatch {
+            task_id,
+            proposal_id,
+            checks,
+        } => {
+            let checks_json = checks
+                .iter()
+                .filter_map(|proposal_id| engine.command_store.load_proposal(proposal_id).ok())
+                .map(|proposal| command_proposal_json(engine, &proposal))
+                .collect::<Vec<_>>()
+                .join(",");
+            Approval {
+                session_id: session_id.to_string(),
+                task_id,
+                kind: "checks",
+                payload: format!(
+                    "{{\"proposalId\":\"{}\",\"checks\":[{}]}}",
+                    escape_json(&proposal_id),
+                    checks_json
+                ),
+                unavailable_reason: None,
+            }
+        }
         ReattachedApproval::Question {
             task_id,
             question_id,

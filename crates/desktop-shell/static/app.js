@@ -4794,6 +4794,7 @@ async function loadSessionCheckpoints(sessionId) {
 // server-side before it is applied.
 let recoveredTasks = [];
 let reattachedApprovals = [];
+let pendingVerifications = [];
 let recoverySweepRequest = null;
 
 function loadRecoverySweep() {
@@ -4806,6 +4807,7 @@ function loadRecoverySweep() {
       .then((payload) => {
         recoveredTasks = Array.isArray(payload.tasks) ? payload.tasks : [];
         reattachedApprovals = Array.isArray(payload.approvals) ? payload.approvals : [];
+        pendingVerifications = Array.isArray(payload.verifications) ? payload.verifications : [];
       })
       .catch(() => {
         // A sweep that cannot be read must not stop a session from opening.
@@ -4815,6 +4817,7 @@ function loadRecoverySweep() {
         // for the rest of the run.
         recoveredTasks = [];
         reattachedApprovals = [];
+        pendingVerifications = [];
         recoverySweepRequest = null;
       });
   }
@@ -4835,6 +4838,9 @@ async function renderRecoveryPrompts(sessionId) {
     ...reattachedApprovals
       .filter((approval) => approval.sessionId === sessionId)
       .map(createReattachedApprovalCard),
+    ...pendingVerifications
+      .filter((due) => due.sessionId === sessionId)
+      .map(createVerificationOfferCard),
   ];
   // Prepended in reverse so the cards end up above the conversation in the
   // order they were built.
@@ -5138,6 +5144,7 @@ function createReattachedApprovalCard(approval) {
     plan: "A plan was waiting for your review when Damaian stopped",
     provider_fallback: "An offer to switch providers was waiting when Damaian stopped",
     round_budget: "A turn was waiting for your decision when Damaian stopped",
+    checks: "Checks were waiting for your approval when Damaian stopped",
   };
   const notes = {
     command:
@@ -5160,6 +5167,9 @@ function createReattachedApprovalCard(approval) {
     round_budget:
       "This turn reached its round budget and was saved while you decided. Continue grants " +
       "it more rounds; Answer now ends it.",
+    checks:
+      "The verification of an applied patch stopped on this card. Deciding it continues the " +
+      "same attempt; the report follows when every check is answered.",
   };
   headline.textContent = headlines[approval.kind];
   note.textContent = notes[approval.kind];
@@ -5185,6 +5195,16 @@ function createReattachedApprovalCard(approval) {
   } else if (approval.kind === "round_budget") {
     // No `onResolved`, for the plan's reason: either answer ends the task.
     wrapper.append(createRoundBudgetOffer(approval.payload, repo()));
+  } else if (approval.kind === "checks") {
+    wrapper.append(
+      createCheckBatchCard(approval.payload, repo(), {
+        reattached: true,
+        onSubmitted: () => {
+          reattachedApprovals = reattachedApprovals.filter((entry) => entry !== approval);
+          wrapper.remove();
+        },
+      }),
+    );
   } else {
     wrapper.append(
       createPatchPreview(approval.payload, repo(), {
@@ -9242,6 +9262,323 @@ function createQuestionCard(question, questionRepo, { answered = null } = {}) {
   return wrapper;
 }
 
+// One verification continuation, streamed into a fresh assistant bubble. Used
+// by the patch card's settle trigger, the recovery offer, and the check card,
+// so all three render the report and any repair patch the same way.
+async function runVerificationStream(streamCall, targetRepo) {
+  const { message, body } = appendChatMessage("assistant", "");
+  const target = { message, body };
+  const indicator = startTurnIndicator(target);
+  let text = "";
+  let streamError = null;
+  try {
+    await streamCall({
+      phase(payload) {
+        indicator.phase(payload);
+      },
+      plan(planPayload) {
+        renderPlanPanel(target, planPayload);
+      },
+      token(token) {
+        text += token;
+        updateChatMessage(target, text);
+        indicator.streaming();
+      },
+      done(payload) {
+        if (payload.response && payload.response !== text) {
+          text = payload.response;
+          updateChatMessage(target, text);
+        }
+        appendProposals(target, payload, targetRepo);
+        appendContextDisclosure(target.body, payload.contextFiles || []);
+        markMessageUsage(target, payload.usage);
+        markMessageTurnStop(target, payload);
+        indicator.finish(chatCompletionState(payload));
+      },
+      error(payload) {
+        streamError = new Error(payload.error || "Verification failed");
+      },
+    });
+  } catch (error) {
+    streamError = error;
+  } finally {
+    indicator.finish("failed");
+  }
+  if (streamError) {
+    renderChatMessageError(target, streamError);
+    toast(streamError.message);
+  }
+  await loadSessions(currentSessionId, false);
+  await refreshFindings();
+}
+
+// A settled patch makes verification due in Code mode only. The engine is
+// asked rather than guessed at: nothing due is a no-op, and an Ask/Plan/Review
+// session has nothing applied to verify.
+async function startVerification(repoName) {
+  if (!currentSessionId) return;
+  if ((currentSessionMode?.mode || "code") !== "code") return;
+  await runVerificationStream(
+    (handlers) => streamVerifyRequest({ repo: repoName, session_id: currentSessionId }, handlers),
+    repoName,
+  );
+}
+
+function checkLabel(check) {
+  return `${check.command} (${check.workingDirectory || "repository root"})`;
+}
+
+// One card for every check that needs approval (spec 23 §5.3). Unchecked
+// checks are declined and reported as skipped; the batch still resolves, so
+// declining everything is a valid answer rather than a stall.
+function createCheckBatchCard(batch, batchRepo, { reattached = false, onSubmitted = null } = {}) {
+  const card = document.createElement("section");
+  card.className = "check-batch";
+
+  const header = document.createElement("div");
+  header.className = "check-batch-header";
+  const title = document.createElement("strong");
+  title.textContent = "Checks need approval";
+  const count = document.createElement("span");
+  count.className = "check-batch-count";
+  count.textContent = `${batch.checks.length} check${batch.checks.length === 1 ? "" : "s"}`;
+  header.append(title, count);
+
+  const note = document.createElement("p");
+  note.className = "check-batch-note";
+  note.textContent =
+    "Verification is waiting for these checks. Unchecked checks are skipped and reported as " +
+    "declined; the report follows once this card is submitted.";
+
+  const list = document.createElement("div");
+  list.className = "check-batch-list";
+  const rows = batch.checks.map((check) => {
+    const row = document.createElement("div");
+    row.className = "check-batch-item";
+
+    const run = document.createElement("input");
+    run.type = "checkbox";
+    run.className = "check-batch-run";
+    run.checked = reattached;
+    run.setAttribute("aria-label", `Run ${check.command}`);
+
+    const command = document.createElement("code");
+    command.className = "check-batch-command";
+    command.textContent = check.command;
+
+    const risk = document.createElement("span");
+    risk.className = "check-batch-risk";
+    risk.dataset.blocked = check.blocked ? "true" : "false";
+    risk.textContent = check.blocked ? "blocked" : check.risk || "review";
+
+    const cause = document.createElement("span");
+    cause.className = "check-batch-cause";
+    cause.textContent = check.cause || "";
+
+    row.append(run, command, risk, cause);
+
+    let always = null;
+    if (check.allowAlways) {
+      const grant = document.createElement("label");
+      grant.className = "check-batch-allow";
+      always = document.createElement("input");
+      always.type = "checkbox";
+      always.disabled = true;
+      run.addEventListener("change", () => {
+        always.disabled = !run.checked;
+      });
+      grant.append(always, document.createTextNode(" Always allow"));
+      row.append(grant);
+    }
+    list.append(row);
+    return { check, run, always };
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "check-batch-actions";
+  const submit = document.createElement("button");
+  submit.type = "button";
+  submit.className = "btn-sm btn-primary";
+  submit.textContent = "Submit checks";
+  actions.append(submit);
+
+  submit.addEventListener("click", async () => {
+    submit.disabled = true;
+    const decisions = rows.map(({ check, run }) => ({
+      proposalId: check.proposalId,
+      approved: run.checked,
+    }));
+    const always = rows
+      .filter(({ run, always }) => run.checked && always?.checked)
+      .map(({ check }) => check.proposalId)
+      .join("\n");
+    card.classList.add("submitted");
+    try {
+      if (onSubmitted) onSubmitted();
+      await runVerificationStream(
+        (handlers) =>
+          streamResumeChecksRequest(
+            {
+              repo: batchRepo,
+              proposal_id: batch.proposalId,
+              decisions: JSON.stringify(decisions),
+              always,
+            },
+            handlers,
+          ),
+        batchRepo,
+      );
+    } catch (error) {
+      submit.disabled = false;
+      card.classList.remove("submitted");
+      toast(error.message);
+    }
+  });
+
+  card.append(header, note, list, actions);
+  return card;
+}
+
+// The structured half of proposal §5.7. The text copy is the assistant
+// message; this card is what makes the sections scannable and the changed
+// paths clickable.
+function createVerificationReportCard(report, reportRepo) {
+  const card = document.createElement("section");
+  card.className = "verification-report";
+
+  const header = document.createElement("div");
+  header.className = "verification-report-header";
+  const title = document.createElement("strong");
+  title.textContent = "Verification report";
+  const outcome = document.createElement("span");
+  outcome.className = "verification-report-outcome";
+  outcome.dataset.outcome = report.due ? "due" : report.outcome || "running";
+  outcome.textContent = report.due ? "due" : (report.outcome || "").replaceAll("_", " ");
+  header.append(title, outcome);
+  card.append(header);
+
+  const section = (label, items) => {
+    const row = document.createElement("div");
+    row.className = "verification-report-row";
+    const name = document.createElement("span");
+    name.className = "verification-report-label";
+    name.textContent = label;
+    const value = document.createElement("div");
+    value.className = "verification-report-value";
+    if (!items.length) {
+      value.textContent = "none";
+    } else {
+      items.forEach((item, index) => {
+        if (index) value.append(document.createTextNode(", "));
+        value.append(item);
+      });
+    }
+    row.append(name, value);
+    card.append(row);
+    return value;
+  };
+
+  const files = (report.filesChanged || []).map((path) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "file-reference";
+    button.dataset.path = path;
+    button.textContent = path;
+    return button;
+  });
+  section("Files changed", files);
+  section(
+    "Checks passed",
+    (report.passed || []).map((check) => document.createTextNode(checkLabel(check))),
+  );
+  section(
+    "Checks failed",
+    (report.failed || []).map((item) =>
+      document.createTextNode(`${checkLabel(item.check)} — ${item.reason}`),
+    ),
+  );
+  section(
+    "Checks skipped",
+    (report.skipped || []).map((item) => {
+      const reason = item.reason || {};
+      const detail =
+        reason.reason === "declined_by_user"
+          ? "declined by you"
+          : reason.reason === "no_running_target"
+            ? "no running target"
+            : reason.policyReason || "blocked";
+      return document.createTextNode(`${checkLabel(item.check)} — ${detail}`);
+    }),
+  );
+  const stale = section(
+    "Checks stale",
+    (report.stale || []).map((check) => {
+      const badge = document.createElement("span");
+      badge.className = "verification-stale";
+      badge.textContent = `${checkLabel(check)} — stale`;
+      return badge;
+    }),
+  );
+  if (report.stale?.length) stale.classList.add("has-stale");
+  section(
+    "Behaviour verified",
+    (report.behaviourVerified || []).map((item) => document.createTextNode(item)),
+  );
+  section(
+    "Unverified steps",
+    (report.unverifiedSteps || []).map((step) => document.createTextNode(`"${step}"`)),
+  );
+  section(
+    "Regressions",
+    (report.regressions || []).map((check) => document.createTextNode(checkLabel(check))),
+  );
+  section("Outcome", [
+    document.createTextNode(
+      report.due ? "verification is due" : (report.outcome || "not finished").replaceAll("_", " "),
+    ),
+  ]);
+
+  wireFileReferences(card, reportRepo);
+  return card;
+}
+
+// A due verification from the recovery sweep. Nothing has run: the button is
+// the only thing that starts it, matching spec 17's rule for commands.
+function createVerificationOfferCard(due) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "recovery-card verification-offer";
+  wrapper.dataset.taskId = due.taskId;
+
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "recovery-card-eyebrow";
+  eyebrow.textContent = "Still waiting for you";
+  const headline = document.createElement("p");
+  headline.className = "recovery-card-headline";
+  headline.textContent = "A verification was due when Damaian stopped";
+  const note = document.createElement("p");
+  note.className = "recovery-card-note";
+  note.textContent =
+    "The patch was applied and the checks have not run. Verifying now runs the checks the " +
+    "project detects; nothing has been assumed to pass.";
+
+  const actions = document.createElement("div");
+  actions.className = "command-approval-actions";
+  const verify = document.createElement("button");
+  verify.type = "button";
+  verify.className = "btn-sm btn-primary";
+  verify.textContent = "Verify now";
+  actions.append(verify);
+  verify.addEventListener("click", async () => {
+    verify.disabled = true;
+    pendingVerifications = pendingVerifications.filter((entry) => entry !== due);
+    wrapper.remove();
+    await startVerification(repo());
+  });
+
+  wrapper.append(eyebrow, headline, note, actions);
+  return wrapper;
+}
+
 // Appends whatever proposals a finished chat turn carries. Shared by every
 // `done` handler: a turn can end with a command awaiting approval, a patch
 // awaiting review, or neither, and each handler must treat all of them the
@@ -9254,7 +9591,20 @@ function appendProposals(message, payload, repo) {
     message.body.append(createCommandApprovalPreview(payload.commandProposal, repo));
   }
   if (payload.patchProposal) {
-    message.body.append(createPatchPreview(payload.patchProposal, repo));
+    message.body.append(
+      createPatchPreview(payload.patchProposal, repo, {
+        // A patch is verified once every file of it is settled. The engine
+        // decides whether anything is due, so an unrelated or all-rejected
+        // patch is a no-op rather than a second run.
+        onResolved: () => startVerification(repo),
+      }),
+    );
+  }
+  if (payload.checkBatch) {
+    message.body.append(createCheckBatchCard(payload.checkBatch, repo));
+  }
+  if (payload.verificationReport) {
+    message.body.append(createVerificationReportCard(payload.verificationReport, repo));
   }
   if (payload.planProposal) {
     message.body.append(createPlanReview(payload.planProposal, repo));
@@ -10609,6 +10959,16 @@ async function streamResumeFallbackRequest(data, handlers) {
 // there is no one-shot endpoint to fall back to.
 async function streamResumeRoundBudgetRequest(data, handlers) {
   return streamRequest("/api/resume-round-budget-stream", null, data, handlers);
+}
+
+// Verification is a continuation turn the engine starts, not a user prompt, so
+// there is no one-shot endpoint behind it.
+async function streamVerifyRequest(data, handlers) {
+  return streamRequest("/api/verify-stream", null, data, handlers);
+}
+
+async function streamResumeChecksRequest(data, handlers) {
+  return streamRequest("/api/resume-checks-stream", null, data, handlers);
 }
 
 async function streamRequest(streamPath, fallbackPath, data, handlers, signal) {

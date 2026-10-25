@@ -12,21 +12,22 @@ use workspace_engine::hooks::{
     HookReviewDecision, list_hooks, review_hook, set_hook_enabled, test_run,
 };
 use workspace_engine::{
-    AgentFallbackProposal, AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal,
-    CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config,
-    CostEstimate, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExportFormat,
-    GeneratedSecretWarning, HookActivation, HookEvent, LanguageServerStatus, McpClient,
-    McpServerConfig, McpTokenResolver, McpTransport, ModelAdapter, ModelRequest, ModelRun,
-    OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId,
-    ProposedFilePatch, QuestionState, RepositoryConfigReport, ResumeDecisionOptions,
-    RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus, SymbolRef, TaskPlan,
-    TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind,
-    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
-    WorkspaceEngine, allow_always_eligible, command_approval_prompt, custom_profile_ids,
-    ensure_data_dir_schema, export_profile, import_profile, normalize_mcp_server_id,
-    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
-    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
-    review_profile_import, review_profile_rejections, select_profile,
+    AgentCheckBatch, AgentFallbackProposal, AgentPlanProposal, AgentQuestionProposal,
+    AgentRoundBudgetProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage,
+    ChatTurnOptions, ChatTurnResult, Config, CostEstimate, CurlModelTransport, DataSchemaOutcome,
+    EffectivePolicy, ExportFormat, GeneratedSecretWarning, HookActivation, HookEvent,
+    LanguageServerStatus, McpClient, McpServerConfig, McpTokenResolver, McpTransport, ModelAdapter,
+    ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
+    ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState, RepositoryConfigReport,
+    ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus,
+    SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink,
+    VerificationReport, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
+    allow_always_eligible, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
+    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
+    select_profile,
 };
 
 mod keychain;
@@ -347,6 +348,8 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/render-markdown") => handle_render_markdown(stream, &request),
         ("POST", "/api/ask-stream") => handle_ask_stream(stream, &request),
         ("POST", "/api/resume-command-stream") => handle_resume_command_stream(stream, &request),
+        ("POST", "/api/verify-stream") => handle_verify_stream(stream, &request),
+        ("POST", "/api/resume-checks-stream") => handle_resume_checks_stream(stream, &request),
         ("POST", "/api/resume-plan-stream") => handle_resume_plan_stream(stream, &request),
         ("POST", "/api/answer-question-stream") => handle_answer_question_stream(stream, &request),
         ("POST", "/api/resume-fallback-stream") => handle_resume_fallback_stream(stream, &request),
@@ -1725,6 +1728,22 @@ fn handle_resume_command_stream(stream: &mut TcpStream, request: &Request) -> Re
     })
 }
 
+fn handle_verify_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    write_event_stream_headers(stream, request)?;
+    stream_turn(stream, move |cancel, events| {
+        run_verify_request(&form, cancel, events)
+    })
+}
+
+fn handle_resume_checks_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    write_event_stream_headers(stream, request)?;
+    stream_turn(stream, move |cancel, events| {
+        run_resume_checks_request(&form, cancel, events)
+    })
+}
+
 fn handle_resume_plan_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     write_event_stream_headers(stream, request)?;
@@ -1843,6 +1862,121 @@ fn run_resume_command_request(
             resume_decision_options(form),
         )
         .map_err(|error| error.to_string())
+}
+
+/// Runs the verification a settled patch made due (spec 23 Task 8).
+///
+/// The engine decides whether anything is due: an all-rejected repair patch
+/// still closes its attempt through this route.
+fn run_verify_request(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+) -> Result<ChatTurnResult, String> {
+    let repo = required_form(form, "repo")?;
+    let session_id = required_form(form, "session_id")?;
+    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+    let mut adapter = chat_model_adapter(&engine.config, || {
+        resolve_shell_model_api_key(&engine.config)
+    })?;
+    let mut on_token = |token: &str| {
+        let _ = events.send(TurnEvent::Token(token.to_string()));
+    };
+    let mut on_progress = |progress: TurnProgress| {
+        if let Some(event) = turn_progress_event(progress) {
+            let _ = events.send(event);
+        }
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .verify_due(&repo, &session_id, adapter.as_mut(), &mut sink)
+        .map_err(|error| error.to_string())
+}
+
+/// Answers a check card (spec 23 Task 8).
+///
+/// `decisions` is a JSON array of `{"proposalId": "...", "approved": true}`,
+/// one per check on the card. A missing decision is refused by the engine and
+/// the pause is put back, so a stale client can retry.
+fn run_resume_checks_request(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+) -> Result<ChatTurnResult, String> {
+    let repo = required_form(form, "repo")?;
+    let proposal_id = required_form(form, "proposal_id")?;
+    let decisions = parse_check_decisions(&required_form(form, "decisions")?)?;
+    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+    // *Allow Always* is still per check and exact-command: it writes the same
+    // repository-qualified allowlist entry the single command card does, before
+    // the resumed turn runs anything (spec 23 proposal §5.3).
+    for proposal_id in form
+        .get("always")
+        .map(|raw| raw.split(['\n', ',']).filter(|id| !id.trim().is_empty()))
+        .into_iter()
+        .flatten()
+    {
+        engine
+            .validation_orchestrator
+            .allow_command_always(proposal_id.trim(), "desktop_user")
+            .map_err(|error| error.to_string())?;
+    }
+    let mut adapter = chat_model_adapter(&engine.config, || {
+        resolve_shell_model_api_key(&engine.config)
+    })?;
+    let mut on_token = |token: &str| {
+        let _ = events.send(TurnEvent::Token(token.to_string()));
+    };
+    let mut on_progress = |progress: TurnProgress| {
+        if let Some(event) = turn_progress_event(progress) {
+            let _ = events.send(event);
+        }
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_check_decision(
+            &proposal_id,
+            &decisions,
+            "desktop_user",
+            adapter.as_mut(),
+            &mut sink,
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn parse_check_decisions(raw: &str) -> Result<Vec<(String, bool)>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| format!("decisions must be JSON: {error}"))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| "decisions must be a JSON array".to_string())?;
+    items
+        .iter()
+        .map(|item| {
+            let proposal_id = item
+                .get("proposalId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| "each decision needs a proposalId".to_string())?;
+            let approved = item
+                .get("approved")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| "each decision needs an approved boolean".to_string())?;
+            Ok((proposal_id.to_string(), approved))
+        })
+        .collect()
 }
 
 /// Continues a turn paused for plan review (spec 21 §5.5).
@@ -4140,7 +4274,7 @@ where
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"usage\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"checkBatch\":{},\"verificationReport\":{},\"usage\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -4155,6 +4289,8 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         fallback_proposal_json(result.fallback_proposal.as_ref()),
         round_budget_proposal_json(result.round_budget_proposal.as_ref()),
         question_proposal_json(result.question_proposal.as_ref()),
+        check_batch_json(result.check_batch.as_ref()),
+        verification_report_json(result.verification_report.as_ref()),
         task_usage_json(result.usage.as_ref(), result.estimated_cost)
     )
 }
@@ -4222,9 +4358,17 @@ pub(crate) fn task_usage_json(
 }
 
 fn command_proposal_json(result: &ChatTurnResult) -> String {
-    let Some(proposal) = &result.command_proposal else {
-        return "null".to_string();
-    };
+    result
+        .command_proposal
+        .as_ref()
+        .map(agent_command_json)
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// One check or command proposal as the card renders it. Shared by the single
+/// command card and the check batch so a check cannot show a different risk,
+/// cause or `Allow Always` answer from the command it names.
+fn agent_command_json(proposal: &workspace_engine::AgentCommandProposal) -> String {
     format!(
         "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"cause\":\"{}\",\"reason\":\"{}\",\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":{}}}",
         escape_json(&proposal.id),
@@ -4238,6 +4382,31 @@ fn command_proposal_json(result: &ChatTurnResult) -> String {
         proposal.allow_always,
         proposal.allow_browser_diagnostics_for_session
     )
+}
+
+/// One card listing every check the verification loop wants to run.
+fn check_batch_json(batch: Option<&AgentCheckBatch>) -> String {
+    let Some(batch) = batch else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"proposalId\":\"{}\",\"checks\":[{}]}}",
+        escape_json(&batch.id),
+        batch
+            .checks
+            .iter()
+            .map(agent_command_json)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+/// The structured report the report card renders. The type is already
+/// camelCase-serialised; the text copy is in `response`.
+fn verification_report_json(report: Option<&VerificationReport>) -> String {
+    report
+        .and_then(|report| serde_json::to_string(report).ok())
+        .unwrap_or_else(|| "null".to_string())
 }
 
 /// Shaped identically to `/api/propose-edit`'s response (`patchId` +
@@ -5969,6 +6138,186 @@ mod tests {
         assert_eq!(
             fs::read_to_string(repo.join("config.js")).unwrap(),
             "export const api_key = \"sk_live_9f8a7b6c5d4e3f2a1b0c\";\n"
+        );
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The done event of an SSE turn, whichever `data:` line carries it.
+    fn sse_done(response: &str) -> serde_json::Value {
+        for line in response.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            if value.get("response").is_some() && value.get("sessionId").is_some() {
+                return value;
+            }
+        }
+        panic!("no done event in response: {response}");
+    }
+
+    /// Creates a session whose patch is applied and therefore verification is
+    /// due, and returns the session id.
+    fn due_session(repo: &std::path::Path, changes: &[(&str, &str)]) -> String {
+        let repo_arg = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
+        for (path, before) in changes {
+            let file = repo.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, before).unwrap();
+        }
+        let session = engine
+            .session_store
+            .create_session("shell-test", "verification")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "patch", "provider", "model")
+            .unwrap();
+        let proposed = changes
+            .iter()
+            .map(|(path, _)| workspace_engine::ProposedChange {
+                path: (*path).to_string(),
+                new_content: format!("// fixed {path}\n"),
+                status: None,
+                allow_restricted: false,
+            })
+            .collect::<Vec<_>>();
+        let mut patch = engine
+            .patch_engine
+            .create_patch(repo, &proposed, Some(&task.id), "test change")
+            .unwrap();
+        patch.session_id = session.id.clone();
+        engine.patch_store.save(&patch).unwrap();
+        engine
+            .edit_orchestrator
+            .apply_stored_patch(repo, &patch.id, None, None, "tester", false)
+            .unwrap();
+        session.id
+    }
+
+    fn temp_shell_repo(name: &str) -> std::path::PathBuf {
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join(".damaian")).unwrap();
+        isolated_data_dir();
+        repo
+    }
+
+    #[test]
+    fn verify_endpoint_reports_no_checks_available() {
+        // The route builds an adapter before the engine decides nothing is due.
+        unsafe { std::env::set_var("DAMAIAN_MOCK_MODEL_RESPONSE", "No repair.") };
+        let repo = temp_shell_repo("verify-endpoint");
+        let session = due_session(&repo, &[("src/a.rs", "fn a() {}\n")]);
+        let (port, token) = serve_for_test();
+        let repo_arg = repo.to_string_lossy().to_string();
+
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/verify-stream",
+            &[("repo", &repo_arg), ("session_id", &session)],
+        );
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let done = sse_done(&response);
+        let report = &done["verificationReport"];
+        assert_eq!(report["outcome"], "no_checks_available", "{done}");
+        assert!(
+            done["response"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("No checks were available"),
+            "{done}"
+        );
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn resume_checks_endpoint_records_declined_checks() {
+        unsafe { std::env::set_var("DAMAIAN_MOCK_MODEL_RESPONSE", "No repair.") };
+        let repo = temp_shell_repo("resume-checks-endpoint");
+        fs::create_dir_all(repo.join("packages/web/src")).unwrap();
+        fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        fs::write(
+            repo.join("packages/web/package.json"),
+            "{\"scripts\":{\"test\":\"node test.js\"}}\n",
+        )
+        .unwrap();
+        let session = due_session(
+            &repo,
+            &[
+                ("src/a.rs", "fn a() {}\n"),
+                ("packages/web/src/index.ts", "export {};\n"),
+            ],
+        );
+        let (port, token) = serve_for_test();
+        let repo_arg = repo.to_string_lossy().to_string();
+
+        let paused = post_fields_for_test(
+            port,
+            &token,
+            "/api/verify-stream",
+            &[("repo", &repo_arg), ("session_id", &session)],
+        );
+        let paused = sse_done(&paused);
+        let checks = paused["checkBatch"]["checks"]
+            .as_array()
+            .expect("both checks need approval");
+        assert_eq!(checks.len(), 2, "{paused}");
+        let decisions = checks
+            .iter()
+            .map(|check| {
+                serde_json::json!({
+                    "proposalId": check["proposalId"],
+                    "approved": false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let decisions = serde_json::Value::Array(decisions).to_string();
+
+        let resumed = post_fields_for_test(
+            port,
+            &token,
+            "/api/resume-checks-stream",
+            &[
+                ("repo", &repo_arg),
+                (
+                    "proposal_id",
+                    paused["checkBatch"]["proposalId"]
+                        .as_str()
+                        .expect("batch id"),
+                ),
+                ("decisions", &decisions),
+            ],
+        );
+
+        assert!(resumed.starts_with("HTTP/1.1 200"), "{resumed}");
+        let done = sse_done(&resumed);
+        let report = &done["verificationReport"];
+        assert_eq!(report["outcome"], "passed", "{done}");
+        let skipped = report["skipped"].as_array().expect("skipped checks");
+        let declined = skipped
+            .iter()
+            .filter(|item| item["reason"]["reason"] == "declined_by_user")
+            .count();
+        assert_eq!(declined, 2, "{done}");
+        assert!(
+            skipped.iter().all(|item| {
+                let reason = &item["reason"]["reason"];
+                reason == "declined_by_user" || reason == "no_running_target"
+            }),
+            "{done}"
         );
 
         fs::remove_dir_all(&repo).ok();

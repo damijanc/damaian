@@ -5,13 +5,14 @@ use workspace_engine::hooks::{HookReviewDecision, list_hooks, review_hook, test_
 use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, CommandProposal, CommandRisk, Config, ConfigOverlay,
     ConfigScope, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExclusionReason,
-    HookEvent, MapLoad, MockModelAdapter, OpenAICompatibleAdapter, ProcessRegistry, ProfileId,
-    ReadWindow, RebuildReason, RelationTarget, RepositoryMap, RootEvidence, RootOverride,
-    RootOverrideEdit, SearchResult, SymbolLoad, SymbolMatch, SymbolRef, SymbolReferences,
-    WorkspaceEngine, command_approval_prompt, edit_root_overrides, ensure_data_dir_schema,
-    export_profile, hook_definition_hash, import_profile, parse_hunk_selection, patch_diff_text,
-    patch_hunk_summary, profile_import_base, render_markdown_to_ansi, review_profile_import,
-    review_profile_rejections, select_profile, symbol_matches_json, symbol_references_json,
+    HookEvent, MapLoad, MockModelAdapter, ModelAdapter, OpenAICompatibleAdapter, ProcessRegistry,
+    ProfileId, ReadWindow, RebuildReason, RelationTarget, RepositoryMap, RootEvidence,
+    RootOverride, RootOverrideEdit, SearchResult, SymbolLoad, SymbolMatch, SymbolRef,
+    SymbolReferences, TurnProgress, TurnSink, WorkspaceEngine, command_approval_prompt,
+    edit_root_overrides, ensure_data_dir_schema, export_profile, hook_definition_hash,
+    import_profile, parse_hunk_selection, patch_diff_text, patch_hunk_summary, profile_import_base,
+    render_markdown_to_ansi, review_profile_import, review_profile_rejections, select_profile,
+    symbol_matches_json, symbol_references_json,
 };
 
 fn usage() -> &'static str {
@@ -46,6 +47,7 @@ fn usage() -> &'static str {
   damaian run-command <proposal-id> --approve [--always]
   damaian reject-command <proposal-id>
   damaian ask <repo> <prompt>
+  damaian verify <repo> <session> [--decline-checks]
   damaian propose-edit <repo> <prompt>
   damaian show-patch <repo> <patch-id>
   damaian apply-patch <repo> <patch-id> [file...] [--hunk-selection <json>]
@@ -500,6 +502,59 @@ fn run() -> workspace_engine::Result<()> {
                     .join(",")
             );
         }
+        "verify" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let session_id = require_arg(&args, 2, "<session>")?;
+            let decline_all = args[3..].iter().any(|arg| arg == "--decline-checks");
+            let engine = engine_for_repo(repo)?;
+            let mut adapter = cli_model_adapter(&engine)?;
+            let cancel = CancelToken::new();
+            let mut on_token = |_token: &str| {};
+            let mut on_progress = |_progress: TurnProgress| {};
+            let mut sink = TurnSink {
+                on_token: &mut on_token,
+                on_progress: &mut on_progress,
+                cancel: &cancel,
+                steering: None,
+            };
+            let mut result = engine.chat_orchestrator.verify_due(
+                repo,
+                session_id,
+                adapter.as_mut(),
+                &mut sink,
+            )?;
+            // One check card at a time. The engine refuses a missing decision and
+            // puts the pause back, so a mistyped answer cannot half-run a batch.
+            while let Some(batch) = result.check_batch.clone() {
+                let mut decisions = Vec::new();
+                for check in &batch.checks {
+                    let approved = if decline_all {
+                        false
+                    } else {
+                        confirm_check(check)?
+                    };
+                    decisions.push((check.id.clone(), approved));
+                }
+                result = engine.chat_orchestrator.resume_after_check_decision(
+                    &batch.id,
+                    &decisions,
+                    "local_user",
+                    adapter.as_mut(),
+                    &mut sink,
+                )?;
+            }
+            if use_color(no_color_flag) {
+                print!("{}", render_markdown_to_ansi(&result.response));
+            } else {
+                print!("{}", result.response);
+            }
+            if !result.response.ends_with('\n') {
+                println!();
+            }
+            if let Some(patch) = &result.patch_proposal {
+                eprintln!("repair_patch={}", escape(&patch.patch_id));
+            }
+        }
         "propose-edit" => {
             let repo = require_arg(&args, 1, "<repo>")?;
             let engine = engine_for_repo(repo)?;
@@ -691,6 +746,45 @@ fn engine_for_repo(repo: &str) -> workspace_engine::Result<WorkspaceEngine> {
 /// serves without credentials, so a missing reference becomes an empty key
 /// and the transport sends no `Authorization` header. A remote endpoint still
 /// fails loudly rather than sending an unauthenticated request.
+/// A model adapter for a CLI command, mocked when `DAMAIAN_MOCK_MODEL_RESPONSE`
+/// is set — the same convention every model-dependent CLI path uses.
+fn cli_model_adapter(engine: &WorkspaceEngine) -> workspace_engine::Result<Box<dyn ModelAdapter>> {
+    if let Ok(mock_response) = env::var("DAMAIAN_MOCK_MODEL_RESPONSE") {
+        return Ok(Box::new(MockModelAdapter::new(mock_response)));
+    }
+    let api_key = live_model_api_key(&engine.config)?;
+    let transport = CurlModelTransport::new(
+        &engine.config.model_base_url,
+        api_key,
+        ProcessRegistry::open(&engine.config.data_dir)?,
+        &engine.config.data_dir,
+    );
+    Ok(Box::new(OpenAICompatibleAdapter::with_provider(
+        &engine.config.model_provider,
+        &engine.config.model_name,
+        transport,
+    )))
+}
+
+/// Asks whether one check may run. Declining is the default and the safe
+/// answer: a pipe or a non-terminal stdin declines every check rather than
+/// running one nobody approved.
+fn confirm_check(check: &workspace_engine::AgentCommandProposal) -> workspace_engine::Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprint!("Run `{}` (risk: {})? [y/N] ", check.command, check.risk);
+    std::io::Write::flush(&mut std::io::stderr()).ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|error| workspace_engine::ClientError::Io(error.to_string()))?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 fn live_model_api_key(config: &Config) -> workspace_engine::Result<String> {
     match env::var(&config.model_api_key_env) {
         Ok(api_key) => Ok(api_key),

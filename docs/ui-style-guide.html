@@ -486,6 +486,87 @@
     </section>
 
     <section class="sg-section">
+      <h2>Verification check card</h2>
+      <p class="sg-hint">
+        Every check that needs approval after a patch is settled arrives on one card, never as
+        sequential prompts. Unchecked checks are declined and reported as skipped; the report
+        follows when the card is submitted. <em>Allow Always</em> stays per check and exact-command.
+      </p>
+      <div class="sg-card check-batch">
+        <div class="check-batch-header">
+          <strong>Checks need approval</strong><span class="check-batch-count">2 checks</span>
+        </div>
+        <p class="check-batch-note">
+          Verification is waiting for these checks. Unchecked checks are skipped and reported as
+          declined; the report follows once this card is submitted.
+        </p>
+        <div class="check-batch-list">
+          <div class="check-batch-item">
+            <input type="checkbox" checked aria-label="Run cargo test" />
+            <code class="check-batch-command">cargo test</code>
+            <span class="check-batch-risk" data-blocked="false">review</span>
+            <span class="check-batch-cause">Asks first: test, build and lint commands</span>
+            <label class="check-batch-allow"><input type="checkbox" /> Always allow</label>
+          </div>
+          <div class="check-batch-item">
+            <input type="checkbox" aria-label="Run npm run test" />
+            <code class="check-batch-command">npm run test</code>
+            <span class="check-batch-risk" data-blocked="false">review</span>
+            <span class="check-batch-cause">Runs in packages/web</span>
+          </div>
+        </div>
+        <div class="check-batch-actions">
+          <button type="button" class="btn-sm btn-primary">Submit checks</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Verification report</h2>
+      <p class="sg-hint">
+        What was actually checked after a patch was applied. A check appears in exactly one of
+        passed, failed, skipped or stale; an unrun check is never shown as passed, and
+        <strong>No checks were available</strong> is its own line rather than an empty pass list.
+      </p>
+      <div class="sg-card verification-report">
+        <div class="verification-report-header">
+          <strong>Verification report</strong
+          ><span class="verification-report-outcome" data-outcome="passed">passed</span>
+        </div>
+        <div class="verification-report-row">
+          <span class="verification-report-label">Files changed</span>
+          <div class="verification-report-value"><code>src/upload.rs</code></div>
+        </div>
+        <div class="verification-report-row">
+          <span class="verification-report-label">Checks passed</span>
+          <div class="verification-report-value">cargo test (crates/engine), cargo test (repository root)</div>
+        </div>
+        <div class="verification-report-row">
+          <span class="verification-report-label">Checks failed</span>
+          <div class="verification-report-value">none</div>
+        </div>
+        <div class="verification-report-row">
+          <span class="verification-report-label">Checks skipped</span>
+          <div class="verification-report-value">npm run lint (packages/web) — declined by you</div>
+        </div>
+        <div class="verification-report-row">
+          <span class="verification-report-label">Checks stale</span>
+          <div class="verification-report-value">
+            <span class="verification-stale">cargo test (crates/cli) — stale</span>
+          </div>
+        </div>
+        <div class="verification-report-row">
+          <span class="verification-report-label">Behaviour verified</span>
+          <div class="verification-report-value">browser check http://127.0.0.1:3000/</div>
+        </div>
+      </div>
+      <p class="sg-note">
+        Stale checks are marked inline, never silently rerun: the files they saw changed after
+        the run.
+      </p>
+    </section>
+
+    <section class="sg-section">
       <h2>Hook review</h2>
       <p class="sg-hint">
         A repository-defined hook is a consent surface: the command line is shown in full, its

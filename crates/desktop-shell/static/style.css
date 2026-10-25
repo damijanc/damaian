@@ -5058,3 +5058,199 @@ body.worker-view #chat-model-menu {
   font-weight: 600;
   text-overflow: clip;
 }
+
+/* Verification check card and report (spec 23). The card collects every check
+   that needs approval into one decision, so the loop cannot turn into a row of
+   sequential prompts; unchecked checks are declined, not hidden. */
+.check-batch {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px 14px;
+}
+
+.check-batch-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.check-batch-count {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.check-batch-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.check-batch-list {
+  display: grid;
+  gap: 4px;
+}
+
+.check-batch-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding: 6px 0;
+}
+
+.check-batch-item:first-child {
+  border-top: 0;
+}
+
+.check-batch-command {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.check-batch-risk {
+  border: 1px solid #e3cba8;
+  border-radius: 999px;
+  background: #fdf3e3;
+  padding: 1px 7px;
+  color: #7a4b12;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.check-batch-risk[data-blocked="true"] {
+  border-color: #e3b4b4;
+  background: #fdecec;
+  color: #8d1f1f;
+}
+
+.check-batch-cause {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.check-batch-allow {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.check-batch-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.check-batch.submitted {
+  opacity: 0.7;
+}
+
+.verification-report {
+  display: grid;
+  gap: 4px;
+  margin-top: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px 14px;
+}
+
+.verification-report-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.verification-report-outcome {
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 1px 8px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.verification-report-outcome[data-outcome="passed"] {
+  border-color: #bfe0c6;
+  background: #f0faf2;
+  color: #22643a;
+}
+
+.verification-report-outcome[data-outcome="failed"],
+.verification-report-outcome[data-outcome="repair_limit_exhausted"],
+.verification-report-outcome[data-outcome="no_repair_applied"] {
+  border-color: #e3b4b4;
+  background: #fdecec;
+  color: #8d1f1f;
+}
+
+.verification-report-outcome[data-outcome="due"] {
+  border-color: #e3cba8;
+  background: #fdf3e3;
+  color: #7a4b12;
+}
+
+.verification-report-row {
+  display: grid;
+  grid-template-columns: 130px minmax(0, 1fr);
+  gap: 10px;
+  font-size: 12px;
+}
+
+.verification-report-label {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.verification-report-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.verification-report-value.has-stale {
+  color: #7a4b12;
+}
+
+.verification-stale {
+  border: 1px dashed #d8b985;
+  border-radius: 4px;
+  padding: 0 4px;
+  color: #7a4b12;
+}
+
+.verification-offer {
+  border-color: #d8b985;
+}
+
+@media (max-width: 720px) {
+  .verification-report-row {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .check-batch-item {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .check-batch-cause {
+    grid-column: 2 / -1;
+    white-space: normal;
+  }
+}
