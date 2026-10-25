@@ -7202,6 +7202,28 @@ impl PausedTurns {
             rounds_granted: round_budget.get("rounds_granted")?.as_u64()? as u32,
         })
     }
+
+    /// The proposal ids a paused check batch holds, in card order, or `None`
+    /// when the id names no paused turn, or one that is not a check batch
+    /// (spec 23). Recovery reads it to know whether the batch can still be
+    /// re-presented; an empty list means the card would ask nothing.
+    pub fn check_batch_proposals(&self, proposal_id: &str) -> Option<Vec<String>> {
+        let path = PendingCommandStore::new(&self.data_dir).path_for(proposal_id);
+        let content = fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let checks = value.get("check_batch")?.get("checks")?.as_array()?;
+        Some(
+            checks
+                .iter()
+                .filter_map(|check| {
+                    check
+                        .get("proposal_id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                })
+                .collect(),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]

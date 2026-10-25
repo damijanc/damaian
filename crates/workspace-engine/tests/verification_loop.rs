@@ -17,12 +17,13 @@ use serde_json::json;
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
     CancelToken, CheckId, CheckOutcome, CommandPurpose, Config, Evidence, HookConfig, HookEvent,
-    HookMode, HookSource, MockModelAdapter, PlanReport, PlanStep, RoundBudgetDecision, Selection,
-    SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink, VerificationEvent,
-    VerificationOutcome, VerificationReport, VerificationState, WebDiagnosticCall,
-    WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkspaceEngine, fold_verification, is_documentation,
-    propose_checks, select_roots,
+    HookMode, HookSource, MockModelAdapter, PausedTurns, PlanReport, PlanStep, ReattachedApproval,
+    RoundBudgetDecision, Selection, SessionStore, SkipReason, TaskPlan, TaskStatus, TurnProgress,
+    TurnSink, VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
+    WebDiagnosticCall, WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, fold_verification,
+    is_documentation, pending_verifications, propose_checks, reattach_pending_approvals,
+    select_roots,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -2665,6 +2666,160 @@ fn without_the_session_approval_the_browser_check_is_skipped_by_policy() {
         .find(|item| item.check.is_browser())
         .expect("the browser check is skipped");
     assert!(matches!(skipped.reason, SkipReason::Blocked { .. }));
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+// --- Recovery (Task 7) -----------------------------------------------------
+
+#[test]
+fn a_due_verification_is_offered_after_a_reopen() {
+    let root = temp_dir("recover-due");
+    let data_dir = temp_dir("recover-due-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+
+    let reopened = SessionStore::new(&data_dir);
+    let offers = pending_verifications(&reopened, &session).expect("the log reads");
+
+    assert_eq!(offers.len(), 1, "one due verification is offered");
+    assert_eq!(
+        offers[0].patch_id,
+        engine
+            .session_store
+            .read_all_patch_file_decisions(&session)
+            .unwrap()
+            .first()
+            .unwrap()
+            .patch_id
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_check_batch_is_reattached_and_resumes_after_a_reopen() {
+    let root = temp_dir("recover-batch");
+    let data_dir = temp_dir("recover-batch-data");
+    cargofile(&root);
+    write(
+        &root,
+        "packages/web/package.json",
+        "{\"scripts\":{\"test\":\"node test.js\"}}\n",
+    );
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[
+            ("src/a.rs", "let a = 1;\n", "let a = 2;\n"),
+            (
+                "packages/web/src/index.ts",
+                "export const x = 1;\n",
+                "export const x = 2;\n",
+            ),
+        ],
+    );
+    let mut adapter = MockModelAdapter::new("");
+    let paused = run_verification(&engine, &root, &session, &mut adapter);
+    let batch = paused.check_batch.as_ref().unwrap();
+
+    // Nothing is running now: recovery re-presents the batch, not the due
+    // event behind it.
+    assert!(
+        pending_verifications(&engine.session_store, &session)
+            .unwrap()
+            .is_empty(),
+        "a waiting batch is the offer, not a second verification offer"
+    );
+
+    let reopened = SessionStore::new(&data_dir);
+    let paused_turns = PausedTurns::new(&data_dir);
+    let reattached = reattach_pending_approvals(
+        &reopened,
+        &engine.audit_log,
+        &engine.command_store,
+        &engine.patch_store,
+        &paused_turns,
+        &session,
+    )
+    .expect("recovery should run");
+    let check_batch = reattached
+        .iter()
+        .find_map(|item| match item {
+            ReattachedApproval::CheckBatch {
+                proposal_id,
+                checks,
+                ..
+            } => Some((proposal_id, checks)),
+            _ => None,
+        })
+        .expect("the batch is reattached");
+    assert_eq!(check_batch.0, &batch.id);
+    assert_eq!(check_batch.1.len(), 2);
+
+    // A fresh orchestrator over the same data dir resumes it.
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    let mut adapter = MockModelAdapter::new("");
+    let decisions = batch
+        .checks
+        .iter()
+        .map(|check| (check.id.clone(), true))
+        .collect::<Vec<_>>();
+    let resumed = resume_checks(&engine, check_batch.0, &decisions, &mut adapter);
+    assert_eq!(
+        resumed.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::Passed)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_verification_interrupted_mid_check_is_offered_and_nothing_is_passed() {
+    let root = temp_dir("recover-interrupted");
+    let data_dir = temp_dir("recover-interrupted-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let check = CheckId::new("", "cargo test");
+    engine
+        .session_store
+        .append_verification_event(
+            &session,
+            &VerificationEvent::Started {
+                task_id: "verification_turn".to_string(),
+                attempt: 0,
+                checks: vec![check.clone()],
+            },
+        )
+        .unwrap();
+
+    let reopened = SessionStore::new(&data_dir);
+    let offers = pending_verifications(&reopened, &session).unwrap();
+    assert_eq!(
+        offers.len(),
+        1,
+        "the interrupted verification is offered again"
+    );
+
+    let events = reopened.read_verification_events(&session, &[]).unwrap();
+    let state = fold_verification(events.iter());
+    let report = VerificationReport::build(&state, &empty_plan(), &[], &BTreeMap::new());
+    assert!(report.passed.is_empty());
+    assert!(report.failed.iter().any(|item| item.check == check));
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);

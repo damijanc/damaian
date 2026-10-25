@@ -26,6 +26,7 @@ use crate::patch_engine::ProposedPatch;
 use crate::plan::TaskPlan;
 use crate::session::{DanglingAction, PendingApprovalRef, SessionStore, TaskStatus};
 use crate::validation::{CommandProposal, CommandStore};
+use crate::verification::{VerificationEvent, fold_verification};
 
 /// A task that was in flight when the process stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +261,63 @@ pub fn classify_all(store: &SessionStore, audit: &AuditLog) -> Result<Vec<Recove
     Ok(recovered)
 }
 
+/// A verification that is due and not being run (spec 23 §9).
+///
+/// Recovery reports it; it runs nothing. The shell offers it, and running it
+/// after a restart without asking would be the same unrequested side effect
+/// spec 17 refuses for commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingVerification {
+    /// The task that proposed the patch, from the `Due` event.
+    pub task_id: String,
+    pub patch_id: String,
+}
+
+/// Every due verification in a session that nothing is currently running.
+///
+/// A task in an active state, or the verification turn parked on a check batch,
+/// is already the thing the user sees; the due event behind it is not a second
+/// offer.
+pub fn pending_verifications(
+    store: &SessionStore,
+    session_id: &str,
+) -> Result<Vec<PendingVerification>> {
+    let events = store.read_verification_events(session_id, &[])?;
+    let state = fold_verification(events.iter());
+    let Some(due) = state.due else {
+        return Ok(Vec::new());
+    };
+    let statuses = store.read_task_statuses(session_id)?;
+    let busy = statuses
+        .values()
+        .filter_map(|raw| TaskStatus::parse(raw))
+        .any(|status| {
+            matches!(
+                status,
+                TaskStatus::PreparingContext
+                    | TaskStatus::WaitingForModel
+                    | TaskStatus::RunningTool
+                    | TaskStatus::ApplyingPatch
+                    | TaskStatus::Validating
+            )
+        });
+    let latest_started = events.iter().rev().find_map(|event| match event {
+        VerificationEvent::Started { task_id, .. } => Some(task_id.as_str()),
+        _ => None,
+    });
+    let waiting_on_batch = latest_started
+        .and_then(|task_id| statuses.get(task_id))
+        .and_then(|raw| TaskStatus::parse(raw))
+        == Some(TaskStatus::WaitingForApproval);
+    if busy || waiting_on_batch {
+        return Ok(Vec::new());
+    }
+    Ok(vec![PendingVerification {
+        task_id: due.task_id,
+        patch_id: due.patch_id,
+    }])
+}
+
 /// A task that was awaiting a human decision when the process stopped, with the
 /// proposal it was waiting on — or the reason it could not be produced.
 #[derive(Debug, Clone)]
@@ -305,6 +363,16 @@ pub enum ReattachedApproval {
         proposal_id: String,
         rounds_used: u32,
         rounds_granted: u32,
+    },
+    /// A verification check batch waiting for one card's decisions (spec 23).
+    /// Its paused turn is on disk, so the batch is re-presented rather than
+    /// lost; a paused turn that is gone, or one with no proposals, fails the
+    /// task instead, because answering would have nothing to run.
+    CheckBatch {
+        task_id: String,
+        proposal_id: String,
+        /// The proposal ids in the batch, in card order.
+        checks: Vec<String>,
     },
     /// A question the turn paused on (spec 50). Unlike the other kinds its
     /// state is not a proposal file: the question and its answer are events in
@@ -416,6 +484,21 @@ pub fn reattach_pending_approvals(
                     })
                     .ok_or_else(|| {
                         format!("the paused turn behind round-budget pause {proposal_id} is gone")
+                    })
+            }
+            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+                if kind == "checks" =>
+            {
+                paused
+                    .check_batch_proposals(proposal_id)
+                    .filter(|checks| !checks.is_empty())
+                    .map(|checks| ReattachedApproval::CheckBatch {
+                        task_id: task_id.clone(),
+                        proposal_id: proposal_id.clone(),
+                        checks,
+                    })
+                    .ok_or_else(|| {
+                        format!("the paused turn behind check batch {proposal_id} is gone or empty")
                     })
             }
             Some(PendingDecision::Approval(PendingApprovalRef { kind, .. })) => {

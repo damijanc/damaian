@@ -155,9 +155,9 @@ pub use profile::{
     review_profile_rejections, select_profile, split_profile_keys,
 };
 pub use recovery::{
-    QUESTION_WAITING_HEADLINE, ReattachedApproval, RecoveredTask, abandon, classify_all,
-    classify_session, headline, mark_failed, reattach_pending_approvals, resume, resume_allowed,
-    resume_blocked_reason,
+    PendingVerification, QUESTION_WAITING_HEADLINE, ReattachedApproval, RecoveredTask, abandon,
+    classify_all, classify_session, headline, mark_failed, pending_verifications,
+    reattach_pending_approvals, resume, resume_allowed, resume_blocked_reason,
 };
 pub use render::{
     render_markdown_to_ansi, render_markdown_to_html, render_markdown_to_html_with_file_links,
