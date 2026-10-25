@@ -1,9 +1,8 @@
 # Feature Spec: Verification Loop
 
-Status: In progress. Started 2026-10-25: Tasks 1–3 (the pure report, check
-selection, and the patch-decision/verification-due events) have landed. Tasks
-4–6 edit `chat.rs` and wait for [#26](../26_context_assembly/proposal.md) to
-merge. Split into a folder and planned on 2026-10-09, after
+Status: Done 2026-10-25. Started and finished the same day, after
+[#26](../26_context_assembly/proposal.md) merged. Split into a folder and
+planned on 2026-10-09, after
 [#24](../24_repository_map_and_monorepo_boundaries/proposal.md) made check
 discovery per root. Where the code contradicted the design, this proposal was
 corrected in place. The decisions it left open are in
@@ -436,3 +435,55 @@ To be completed during implementation. Record:
   work than it appears and the "no changed file" stop is doing most of it.
 - Whether the regression rerun and the overlapping roots materially slowed the
   loop, and the measured cost.
+
+### What shipped
+
+**Root selection (Tasks 1–2, 2026-10-25).** `select_roots` takes
+`RepositoryMap::root_for_path` and every enclosing non-removed root, exactly as
+§5.2 proposes; documentation is the extension list `md`, `txt`, `rst`, `adoc`.
+The map is restricted before `propose_detected_validations`, so only selected
+roots' proposals are stored and audited. The one observed case where selection
+found nothing for a change that needed a check is a root with no manifest at
+all: the report says `NoChecksAvailable` rather than pretending it passed. The
+Cargo detection gap (no clippy or build command, `lint:web` missed) is
+`OBSERVATIONS.md` #48; the loop lists no such check rather than claiming one
+passed.
+
+**Repair within the limit (Task 5).** The deterministic `verified_repair`
+scenario repairs a compile error on the first attempt; that is one run, not a
+success-rate measurement. No real-use sessions were recorded for this spec, so
+the question "how often does attempt two succeed" remains open rather than
+answered with an invented number. The "no changed file" stop is what ends the
+`repair_limit_exhausted` scenario after one repair.
+
+**Cost of overlapping roots and the regression rerun (Tasks 5, 9).** The
+`rust-workspace` fixture's `cargo test` measured **1.24s cold and 0.05s warm**
+with a shared `CARGO_TARGET_DIR`, so a verification of that fixture is cheap;
+that is the only measurement taken. No live repository was run with the loop
+enabled, so the proposal §7 question about material slowdown in real projects
+is not answered here.
+
+### Acceptance criteria, and what shows each
+
+| Criterion (§6) | Evidence |
+|---|---|
+| A broken test is reported, repaired within the limit, rerun and reported | `a_failed_check_is_repaired_and_the_rerun_passes`; eval `verified_repair` |
+| Exhausting the limit reports what still fails, status `failed` | `exhausting_the_repair_limit_reports_what_still_fails`; eval `repair_limit_exhausted` |
+| A repair with no applied patch stops the loop | `a_repair_turn_that_answers_without_a_patch_stops`; `a_fully_rejected_repair_patch_closes_the_attempt_without_another_round` |
+| A repair that breaks a passing check is a regression | `a_repair_that_breaks_a_previously_passing_check_is_a_regression` |
+| Declined check is skipped `declined_by_user`, task continues | `two_checks_needing_approval_produce_one_batch_and_one_resume`; shell `resume_checks_endpoint_records_declined_checks` |
+| Blocked check is skipped with the policy reason and never retried | `a_blocked_check_is_skipped_and_never_runs` |
+| `Checks passed` only exit-zero, including `exit_code: None` | `a_check_passes_only_on_exit_code_zero` |
+| Every proposed check appears once across passed/failed/skipped/stale | `every_selected_check_is_in_exactly_one_section` |
+| No detected checks is distinct from passing | `no_checks_available_is_not_checks_passed`; `verify_due_with_no_detected_checks_says_so`; shell `verify_endpoint_reports_no_checks_available` |
+| A sub-root change runs its root's and enclosing roots' checks only | `a_member_change_selects_its_own_root_and_every_enclosing_root` |
+| A docs-only change runs no checks and says so | `only_documentation_changes_select_nothing`; `a_documentation_only_patch_verifies_nothing_and_says_so` |
+| A web check with no running target is skipped, never verified | `an_unreachable_page_is_skipped_with_no_running_target`; `a_web_change_with_no_stored_target_is_skipped_with_no_running_target` |
+| A rollback or later edit marks affected checks `stale` | `a_check_whose_files_changed_is_stale_not_passed` |
+| Multiple approvals produce one card | `two_checks_needing_approval_produce_one_batch_and_one_resume` |
+| `require_approval_for_all_commands` is honoured for read-only checks | `require_approval_for_all_commands_puts_an_allowlisted_check_on_the_card` |
+| The loop does not run in Ask, Plan or Review | `verify_due_refuses_a_session_that_is_no_longer_code`; `an_ask_mode_session_never_records_a_due` |
+| Verification survives a restart; a due run or waiting card is offered again | `a_due_verification_is_offered_after_a_reopen`; `a_check_batch_is_reattached_and_resumes_after_a_reopen`; `verification_events_round_trip_through_a_fresh_store` |
+| The summary never says "complete" when a check failed, the limit was hit, or verification is due | `the_summary_never_says_complete_when_anything_is_wrong`; eval `repair_limit_exhausted` |
+| Both eval scenarios exist and pass | `verified_repair` and `repair_limit_exhausted`, 25/25 deterministic scenarios |
+| The quality gate passes and spec 18 shows no regression | Scoped checks recorded in `tasks.md`; the workspace gate and the CI Quality run are recorded there when green |

@@ -1052,6 +1052,52 @@ Rewinding takes plans and approvals with it: `read_task_plan` and
 because what was billed was billed regardless of where the conversation now
 sits.
 
+### Verification: which checks ran, and why one was skipped
+
+After a patch is applied in Code mode, the verification loop writes these
+session events:
+
+| Event | Meaning |
+|-------|---------|
+| `verification_due` | a settled Code-mode patch needs verification; names the task and patch |
+| `verification_started` | one attempt, with its number and the selected checks |
+| `verification_check` | one check's outcome, or its skip reason, plus the hash of every changed file when it ran |
+| `verification_finished` | the attempt's outcome (`passed`, `failed`, `repair_limit_exhausted`, `no_repair_applied`, `no_checks_available`, `only_documentation_changed`) |
+
+A check is identified by its command and root, so `cargo test` at the repository
+root and in `crates/engine` are two checks. Each appears in exactly one of
+passed, failed, skipped or stale in the report; **an unrun check is never
+passed**.
+
+**Where the full output lives.** A `verification_check` event is a summary. The
+findings carry an `originRef`, and the command's complete `stdout.log`,
+`stderr.log` and summary are under `commands/` in the data directory (see
+[Command output](#command-output)). The report itself lists only findings and
+exit codes.
+
+**A check says `stale`.** The files it saw changed after it ran: a verified file
+was rolled back, a later patch touched it, or you edited it outside Damaian. The
+loop records the hash of every changed file with each check run and compares it
+when the report is built. A stale check is not rerun automatically and is not
+reported as passed; run the verification again once the files have settled.
+
+**The check card keeps asking.** The loop proposes each check through the
+normal command policy, so the fix is the same as for any command: choose
+**Allow Always** for that check (exact command, root-qualified in a sub-root) or
+add the command to `command_allowlist` for the repository. A repository with
+`require_approval_for_all_commands` keeps asking by design.
+
+**A browser check was skipped.** `no running target` means no stored diagnostic
+target existed, or the page could not be reached. Start the app and inspect the
+page once, then run verification again. Without a session grant for browser
+diagnostics the check is skipped with the policy reason instead of running
+unasked.
+
+**The task failed with the repair limit exhausted.** The report lists what still
+fails; the agent's repairs did not fix it within `agent_tool_retry_limit`
+(default 2). Raise the limit if the work genuinely needs more, or fix the
+finding and apply a patch — verification runs again when that patch settles.
+
 ### Browser diagnostics
 
 Each `inspect_web_page` or `run_web_scenario` that returned a report appends

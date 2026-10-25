@@ -4,7 +4,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) in full · corrections and the
 decisions it left open in [`context.md`](context.md)
-**Started:** 2026-10-25 (planned 2026-10-09; re-checked 2026-10-24)
+**Started:** 2026-10-25 — **Done:** 2026-10-25 (planned 2026-10-09; re-checked 2026-10-24)
 
 ## Progress
 
@@ -19,7 +19,7 @@ decisions it left open in [`context.md`](context.md)
 | 7 · Recovery of a due verification and a waiting card | Done 2026-10-25 | `recovery.rs` learns the `"checks"` kind (one arm before the unknown-kind catch-all) and reattaches the batch from its paused turn; `ReattachedApproval::CheckBatch` carries the proposal ids, and an empty or missing pause fails the task. `PausedTurns::check_batch_proposals` parses the ids without building an orchestrator. `pending_verifications` reports a due event with no `Finished` whose verification is not active and not parked on a batch; it runs nothing. 3 tests (55 total): a reopened store offers a due verification; a batch is reattached and resumes through a fresh orchestrator; a mid-check interruption is offered again and its check is absent from `passed`. Mutation caught: dropping the `"checks"` arm fails the task instead of reattaching it. **Mutations not observable through the public API:** `pending_verifications` has no orchestrator, so it cannot run anything to mutate; the batch writer always produces at least one proposal, so the empty-list filter is defensive. |
 | 8 · Shell API, the check card, the report, the CLI | Done 2026-10-25 | `POST /api/verify-stream` and `POST /api/resume-checks-stream` (decisions JSON plus an `always` list that writes the same exact-command, root-qualified allowlist entry the single card does). `chat_result_json` gains `checkBatch` and `verificationReport`. `app.js` calls the verify stream when a patch card settles in Code mode, renders one check card with every approval-requiring check (unchecked = declined, per-check Allow Always), renders the report card with clickable changed paths and stale marks, and shows a reattached batch or a due verification from the recovery sweep. CLI: `damaian verify <repo> <session> [--decline-checks]`, answering the batch interactively and declining when stdin is not a terminal. Two endpoint tests beside the apply-patch test cover a no-checks report and a two-check card whose checks are both declined (3 skipped, including the browser check, all accounted for). `index.html` needed no static markup because both cards are built in `app.js`; the two cards are added to `docs/ui-style-guide.html`. **Not done:** the by-hand UI drive the task asks for, because the standalone shell's API token is only reachable through the Tauri IPC bootstrap (OBSERVATIONS #22). The route and payloads are covered by endpoint tests; a live UI pass remains for the next desktop session. |
 | 9 · Eval scenarios | Done 2026-10-25 | Measured the `rust-workspace` fixture's `cargo test` first: **1.24s cold, 0.05s warm** with a shared `CARGO_TARGET_DIR`, so the real detected check was cheap enough and no substitute was needed. `Scenario` gains `verify_after_apply`, `check_decisions` and three report assertions (`verification_outcome`, `verification_summary_excludes`, `verification_passed_commands`); the runner applies the scripted patch, drives `verify_due`, answers the check card, applies repair patches and stops on the report. Two scenarios: `verified_repair` (a compile error is repaired and the rerun passes) and `repair_limit_exhausted` (with `agent_tool_retry_limit=1`, the report never claims completion and the task is `failed`). Both listed in spec 18 §5.4. All 25 scenarios pass in the deterministic tier; `cargo nextest -p eval-harness` 90 passed, 2 skipped. Mutation: making the limit report `Passed` fails the negative scenario's `verification_outcome` and `final_task_status` assertions. |
-| 10 · Docs, acceptance criteria, close the spec | Not started | Leaves the workspace gate to CI and records the run |
+| 10 · Docs, acceptance criteria, close the spec | Done 2026-10-25 | `USER_GUIDE.md` gains a Verification section (what runs, which roots, one card, repair, report sections, stale, no-checks ≠ passed, browser limits, CLI) and `TROUBLESHOOTING.md` a section on the verification events, where full output lives, what `stale` means, allowlisting a check, `no_running_target`, and an exhausted repair limit. Proposal §7 records what shipped, the honest gaps (no real-use repair sample; no live timing beyond the 1.24s cold / 0.05s warm fixture measurement) and a criterion-to-test table. Spec status, README row and current state, #35's `Depends on:` line, CHANGELOG `Unreleased`, and the progress records were updated together. Scoped local checks passed on 2026-10-25: `scripts/quality-gate.sh fmt node lint typos deny`, `cargo fmt --all -- --check`, `cargo clippy -p workspace-engine -p desktop-shell -p damaian-cli -p eval-harness --all-targets --locked -- -D warnings`, `cargo nextest -p workspace-engine --test verification_loop --test repository_config_trust --test permission_profiles` (177 passed, 1 skipped), `-p eval-harness` (90 passed, 2 skipped), the four shell verification/apply endpoint tests, and `-p damaian-cli` (2 passed). `npm run specs:check` passed. **The workspace clippy and test suite are left to CI** per `AGENTS.md`; the full seven-check **Quality** run is to be recorded here when green. |
 
 **Goal:** after a Code-mode patch is applied, Damaian discovers the checks of
 every root the change touched, runs the approved ones, turns failures into
@@ -748,11 +748,11 @@ scenario fails); count a `None` exit as passed.
 **Files:** `docs/USER_GUIDE.md`, `docs/TROUBLESHOOTING.md`, this spec's three
 files, `docs/specs/README.md`, `CHANGELOG.md`.
 
-- [ ] `USER_GUIDE.md` and `TROUBLESHOOTING.md` per proposal §5.9.
-- [ ] Walk every acceptance criterion in proposal §6 and record, per
+- [x] `USER_GUIDE.md` and `TROUBLESHOOTING.md` per proposal §5.9.
+- [x] Walk every acceptance criterion in proposal §6 and record, per
   criterion, the test or measurement that shows it, in proposal §7 or the
   progress row. Fill in proposal §7's implementation notes.
-- [ ] Run the fast checks locally —
+- [x] Run the fast checks locally —
   `scripts/quality-gate.sh fmt node lint typos deny` — plus
   `npm run specs:check`, and scoped clippy and scoped tests for every crate the
   feature touched, each with `CARGO_TARGET_DIR="$PWD/target"` where it runs
@@ -761,8 +761,8 @@ files, `docs/specs/README.md`, `CHANGELOG.md`.
   The spec is not done until CI's **Quality** workflow is green, and the
   progress row records that run: "The full seven-check gate passed in CI on
   YYYY-MM-DD; scoped checks passed locally: …".
-- [ ] Close per `AGENTS.md` "When a spec becomes Done": the `Status:` line,
+- [x] Close per `AGENTS.md` "When a spec becomes Done": the `Status:` line,
   the README row, this file's header and progress table, every `Depends on:`
   naming #23 (#35 waits on #23 and #31; #31 is Done, so #35 is promoted),
   "What to build next", and the `CHANGELOG.md` `Unreleased` entry.
-- [ ] Show the change and the check results and ask before committing.
+- [x] Show the change and the check results and ask before committing.

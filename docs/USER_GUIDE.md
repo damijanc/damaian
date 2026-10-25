@@ -31,6 +31,7 @@ This build is a developer preview. Release builds are Developer ID signed and no
 - [Terminal](#terminal)
 - [Chat](#chat)
 - [File Changes](#file-changes)
+- [Verification](#verification)
 - [Rewind](#rewind)
 - [The Plan Panel](#the-plan-panel)
 - [Search and Export](#search-and-export)
@@ -494,6 +495,64 @@ Detection is not perfect. Setup instructions and placeholder values can resemble
 From the CLI, `damaian apply-patch` prints the same findings and re-runs with `--allow-generated-secrets` to accept them.
 
 After files are applied, Damaian prints a concise Git status summary in the conversation.
+
+## Verification
+
+After you apply a patch in **Code** mode, Damaian checks the change instead of
+leaving that to you. It discovers the project's own checks, runs the ones you
+approve, turns failures into findings, lets the agent repair within a limited
+number of attempts, reruns, and reports what was actually verified.
+
+**Which checks run.** Detection is per project root. A change selects the root
+that owns each changed file plus every root that encloses it, because a member
+change is a workspace change. On this repository, changing `crates/engine`
+selects `cargo test` in `crates/engine` and at the repository root. A
+documentation-only change (`.md`, `.txt`, `.rst`, `.adoc`) selects nothing and
+says so. A Cargo root currently detects one check, `cargo test`; detection finds
+no separate clippy or build command, so the report cannot claim one ran.
+
+**Approval.** Checks that would need approval arrive on **one card**, not one
+prompt each. Unchecked checks are declined and reported as skipped; a blocked
+check never reaches the card and is reported with the policy's reason.
+**Allow Always** stays per check, exact-command, and is qualified with the root
+when the check runs in a sub-root. A session with
+`require_approval_for_all_commands` gets a card even for a check that would
+otherwise run without asking.
+
+**Repair.** A failing check becomes findings, and the agent may propose a repair
+patch within `agent_tool_retry_limit` (default 2). The patch still goes through
+the normal preview and approval path, and the check reruns once it is applied.
+A repair that breaks a previously passing check is reported as a regression. If
+a repair turn produces no patch, the loop stops rather than spending the
+remaining attempts; at the limit the task is marked failed.
+
+**The report** lists:
+
+- **Files changed** — the paths this task applied.
+- **Checks passed** — only checks that ran and exited zero. A killed or
+  signalled command is never here.
+- **Checks failed** — with the exit code or the browser diagnostic's verdict.
+- **Checks skipped** — declined by you, blocked by policy, or no running target.
+- **Checks stale** — the files a check saw changed after it ran (a rollback, a
+  later patch, or an edit outside Damaian). A stale check is not rerun silently
+  and is not reported as passed.
+- **Behaviour verified** — browser checks that ran and recorded no error.
+- **Unverified steps**, **Regressions**, **Remaining**, and **User action
+  needed**.
+
+**"No checks were available" is not "checks passed".** A project with no
+detected checks, or a documentation-only change, says so in its own words.
+
+**Browser checks.** When a changed path is a web asset and the session already
+has a diagnostic target, the loop reruns an inspection at that page under the
+same session allowance. With no target, or a page that is not reachable, the
+check is skipped with `no running target`; it is never inferred as verified.
+
+Verification runs only in Code mode. Ask, Plan and Review have nothing applied
+to verify. From the command line, `damaian verify <repo> <session>` runs it and
+prints the report; `--decline-checks` answers an approval card with every check
+declined. This checks that the project's own tests pass — it does not prove the
+change is correct, and the report is written to avoid implying that.
 
 ## Rewind
 
