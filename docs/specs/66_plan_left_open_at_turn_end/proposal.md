@@ -1,7 +1,7 @@
 # Feature Spec: A Plan Left Open When the Turn Ends
 
-Status: Done 2026-10-25 (implementation and live acceptance; CI is still
-outstanding — see §7.1). Started 2026-10-24 and implemented in ten tasks
+Status: Done 2026-10-25 (implementation, live acceptance, and the full
+seven-check gate green in CI). Started 2026-10-24 and implemented in ten tasks
 ([`tasks.md`](tasks.md)); Tasks 1–8 edited `chat.rs`. The one reminder per turn,
 the evidence carried across pauses and attached at a true end, the declined
 plan's `Skipped` steps, the `plan_left_open` audit record and the panel's
@@ -459,7 +459,7 @@ not stuck; how to read `plan_left_open` and `plan_reminder_sent`).
 | A turn that ends open keeps it open with its evidence, for any reason | `a_turn_that_answers_with_a_step_open_keeps_it_open_with_its_evidence`, `a_stopped_turn_keeps_its_step_open_with_its_evidence`, `a_provider_failure_keeps_its_step_open`; the engine never calls `status_from_evidence` on attach. A token-budget stop uses the same `truly_completed` branch and was not exercised end to end | Automated except the token-budget variant |
 | An ended panel never says "running" | `an_ended_plan_summary_says_not_marked_done`, `an_ended_plan_with_a_blocked_step_still_names_it`, `an_ended_turn_s_plan_is_not_active`, `the_plan_event_carries_whether_the_turn_is_active`; the JS label reads `plan.active !== false`. **Checked in the real UI on 2026-10-25**: the panel read "Turn ended with 1 step not marked done, 1 finished.", labelled the open step "not finished" with no "running" label, and showed each step's evidence | Automated and manual, passed |
 | While the turn runs the panel is unchanged | `the_states_whose_turn_is_still_running_are_exactly_the_non_terminal_work_states`; `plan.active: true` from `TurnProgress::Plan` and `task_states_json` for a `RunningTool` task | Automated |
-| Deterministic scenarios pass in CI | `cargo nextest -p eval-harness` (92 tests) and `cargo run -p eval-harness -- run --tier deterministic` passed locally; CI has not run | Automated locally |
+| Deterministic scenarios pass in CI | The full seven-check gate passed in CI on 2026-10-25 (Quality run `40206976184`, merge commit `dd720d1`); the deterministic tier passed locally and in CI | Automated in CI |
 | **Live:** §1's prompt against `deepseek-v4-flash` | **Passed 2026-10-25.** The §1 prompt verbatim, default budgets and Code mode, against a disposable clone of this branch (`1d263bf`) with an isolated data directory. The model planned four steps, ran the work, answered, received the one reminder (`openSteps: 4`), used *Continue* after the round-budget pause the reminder's charge exposed, and then closed all four steps. `TurnProgress::PlanFinished` arrived once; no `plan_left_open` was written. Step 1 carried 20 evidence items; steps 2–4 closed unverified. 27 model calls, 2,218,346 input (1,934,208 cached) and 17,662 output tokens. The reminder round itself cost **80,774 input (66,432 cached) and 249 output**. The final response was the report. | Manual, passed |
 
 ### 7.2 Implementation discoveries
