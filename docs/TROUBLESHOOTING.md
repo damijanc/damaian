@@ -928,6 +928,31 @@ Rewinding takes plans and approvals with it: `read_task_plan` and
 because what was billed was billed regardless of where the conversation now
 sits.
 
+### The plan says a step is still open after the turn ended
+
+That is the recorded truth, not a stuck turn. When a turn ends while a step is
+still open, Damaian attaches the evidence the step accrued and leaves its status
+alone: a step is never closed because the model stopped talking. The panel calls
+it **not finished** and summarises the plan as "Turn ended with N steps not
+marked done." The answer the turn produced is unaffected.
+
+Two audit records explain what happened:
+
+| Event | Meaning |
+|-------|---------|
+| `plan_reminder_sent` | the engine sent its one reminder at a completion that would otherwise have ended with open steps; `openSteps` is the count it named |
+| `plan_left_open` | the turn truly ended with open steps; `openSteps`, `reminderSent` and `stopReason` (`answered`, `tool_budget`, `token_budget`, `cancelled` or `failed`) say why |
+
+The reminder is also an ordinary message in the session log with
+`"kind":"plan_reminder"` on its `message_appended` payload. It is a user-role
+message in the request so the model reads it at the end, but it is not something
+the user typed: the conversation view renders it as a system line, and the next
+turn's prompt seed skips it.
+
+A plan you declined at the review gate has its remaining steps marked `skipped`,
+which is why a declined plan produces neither record and never gets a reminder:
+the user's decision, not the model's claim, settled it.
+
 ### Browser diagnostics
 
 Each `inspect_web_page` or `run_web_scenario` that returned a report appends

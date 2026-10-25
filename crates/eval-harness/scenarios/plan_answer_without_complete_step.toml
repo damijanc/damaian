@@ -1,0 +1,60 @@
+name = "plan_answer_without_complete_step"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Work out what the upload client does, then write the report."
+
+# Spec 66 §5.5's first scenario: the model answers while its plan still has
+# open steps, receives exactly one reminder, closes all three, and answers
+# again. The answer that triggered the reminder stays the turn's response and
+# the short reply after it is a second message — which is why the response and
+# the last assistant message are asserted separately.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_plan", arguments = { steps = [
+    { title = "Collect the evidence" },
+    { title = "Verify the behaviour" },
+    { title = "Write the report" },
+  ] } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "Collect the evidence" } },
+]
+
+[[turn]]
+content = "The report is written."
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "complete_step", arguments = {} },
+  { name = "complete_step", arguments = {} },
+  { name = "complete_step", arguments = {} },
+]
+
+[[turn]]
+content = "Done."
+
+[assert]
+approval_required = false
+response_contains = ["The report is written."]
+plan_reminders = 1
+# Step 1 ran `ls src`, so the read's exit confirms it; the other two were
+# closed with nothing observable behind them and say so.
+plan_verified = 1
+plan_unverified = 2
+plan_outstanding = 0
+plan_left_open = false
+last_assistant_message_contains = ["Done."]
+final_task_status = "complete"
+deterministic_only = [
+  "plan_reminders",
+  "plan_verified",
+  "plan_unverified",
+  "plan_outstanding",
+  "plan_left_open",
+  "last_assistant_message_contains",
+]

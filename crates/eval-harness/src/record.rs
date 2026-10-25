@@ -95,6 +95,18 @@ pub struct RecordedPlan {
     /// stopped turn, or a plan left waiting on review. Not an outcome, and
     /// counted apart from the four that are.
     pub steps_outstanding: u64,
+    /// How many plan reminders the run sent (spec 66 §5.5). A count rather than
+    /// a bool so "exactly one" can fail on two; a planless run has no
+    /// `RecordedPlan` at all, so a zero here always means a plan was measured.
+    pub reminders_sent: u64,
+    /// Whether the engine recorded `plan_left_open` for this run: it truly
+    /// ended with open steps. Read from the engine's own audit record rather
+    /// than derived from a second terminal-status mapping.
+    pub left_open_at_end: bool,
+    /// Evidence items attached to steps that were still open in the final plan.
+    /// This is how a scenario can see that the work a turn ran reached the step
+    /// it never closed.
+    pub open_step_evidence: u64,
 }
 
 /// A task's prompt-cache accounting, read back from `TaskUsage`

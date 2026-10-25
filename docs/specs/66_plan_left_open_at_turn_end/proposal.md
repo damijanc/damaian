@@ -1,12 +1,17 @@
 # Feature Spec: A Plan Left Open When the Turn Ends
 
-Status: Not started. Planned as a folder spec on 2026-10-24; specified the same
-day from a reporting-only session that answered in full, ended `complete`, and
-left its plan panel showing the first of four steps as **running** and "4 steps
-outstanding." Corrections where this spec no longer matches the code, the
-decisions it left open, and its interactions with specs 32, 50, 61 and 65 are in
-[`context.md`](context.md), not inlined here. The work is in ten tasks
-([`tasks.md`](tasks.md)); Tasks 1–8 edit `chat.rs`.
+Status: Done 2026-10-25 (implementation; §6's live acceptance run and CI are
+still outstanding — see §7.1). Started 2026-10-24 and implemented in ten tasks
+([`tasks.md`](tasks.md)); Tasks 1–8 edited `chat.rs`. The one reminder per turn,
+the evidence carried across pauses and attached at a true end, the declined
+plan's `Skipped` steps, the `plan_left_open` audit record and the panel's
+`active`/`not finished` wording are all in the tree; §7 below records the
+acceptance walk and what was not exercised. Planned as a folder spec on
+2026-10-24; specified the same day from a reporting-only session that answered
+in full, ended `complete`, and left its plan panel showing the first of four
+steps as **running** and "4 steps outstanding." Corrections where this spec no
+longer matches the code, the decisions it left open, and its interactions with
+specs 32, 50, 61 and 65 are in [`context.md`](context.md), not inlined here.
 Order: 66 of 66
 Plan: none. Evidence-driven, like [#47](../47_agent_working_capability/proposal.md)
 — an exception to the rule in [`README.md`](../README.md).
@@ -439,4 +444,46 @@ not stuck; how to read `plan_left_open` and `plan_reminder_sent`).
 
 ## 7. Implementation Notes
 
-None yet.
+### 7.1 Acceptance walk (2026-10-25)
+
+| Criterion (§6) | Evidence | Kind |
+|---|---|---|
+| One reminder with open steps; none for closed, absent or only-blocked | `an_answer_with_open_steps_gets_one_reminder_and_closes_after_it`, `a_closed_plan_gets_no_reminder`, `a_planless_turn_gets_no_reminder`, `a_plan_with_only_a_blocked_step_gets_no_reminder`; eval `plan_answer_without_complete_step` (`planReminders = 1`), `planned_task` (`0`); `plan.rs`'s `a_blocked_step_is_not_open` | Automated |
+| A declined plan is skipped and gets no reminder | `a_declined_plan_is_marked_skipped_and_never_reminded` | Automated |
+| Hook first: no reminder when it denies; one when it allows | `a_plan_reminder_waits_for_before_task_complete`, `a_hook_that_always_denies_never_gets_a_reminder` | Automated |
+| Not twice across an approval, plan review, restart, or a hook that keeps denying | `the_reminder_is_not_sent_twice_across_a_command_approval` (second engine = restart), `the_reminder_is_not_sent_twice_across_a_plan_review`, `a_hook_that_always_denies_never_gets_a_reminder`; the flag is saved and seeded by every pause literal, which the exhaustive `PendingChatTurn` literals enforce | Automated (the *Continue* and question paths share the same save/seed code, pinned by compilation and the pause tests rather than a dedicated end-to-end scenario) |
+| No reminder with no round or token room | `the_reminder_gate_needs_two_rounds_of_room`, `the_reminder_gate_needs_room_under_the_token_ceiling`, `a_hook_that_always_denies_never_gets_a_reminder` | Automated (pure gate) |
+| `complete_step` still closes steps from evidence after the reminder | `an_answer_with_open_steps_gets_one_reminder_and_closes_after_it` (two closed steps, read on step 1) | Automated |
+| Two-answers rule | Same test (`response` is the report, "Done." is the last message) and `a_second_answer_ends_the_turn_with_the_steps_still_open` (response is the first answer, second is last) | Automated |
+| Evidence before an approval is on the step after the resume, including the command's exit | `a_plan_review_pause_carries_the_evidence_and_the_reminder_flag`, `an_approved_command_reaches_the_open_step_as_evidence` | Automated |
+| A turn that ends open keeps it open with its evidence, for any reason | `a_turn_that_answers_with_a_step_open_keeps_it_open_with_its_evidence`, `a_stopped_turn_keeps_its_step_open_with_its_evidence`, `a_provider_failure_keeps_its_step_open`; the engine never calls `status_from_evidence` on attach. A token-budget stop uses the same `truly_completed` branch and was not exercised end to end | Automated except the token-budget variant |
+| An ended panel never says "running" | `an_ended_plan_summary_says_not_marked_done`, `an_ended_plan_with_a_blocked_step_still_names_it`, `an_ended_turn_s_plan_is_not_active`, `the_plan_event_carries_whether_the_turn_is_active`; the JS label reads `plan.active !== false`. Rendering it in a browser is a manual check that was **not** run (see `tasks.md`, Task 7 Step 6) | Automated contract; manual UI unverified |
+| While the turn runs the panel is unchanged | `the_states_whose_turn_is_still_running_are_exactly_the_non_terminal_work_states`; `plan.active: true` from `TurnProgress::Plan` and `task_states_json` for a `RunningTool` task | Automated |
+| Deterministic scenarios pass in CI | `cargo nextest -p eval-harness` (92 tests) and `cargo run -p eval-harness -- run --tier deterministic` passed locally; CI has not run | Automated locally |
+| **Live:** §1's prompt against `deepseek-v4-flash` | **Not run.** It needs a real provider key and a network call, and this task did not make one. No token figure or panel observation is claimed. | Manual, outstanding |
+
+### 7.2 Implementation discoveries
+
+- **A one-step plan is not decodable.** `tool_action_from_call` returns `None`
+  for a `propose_plan` with fewer than two steps (`chat.rs`, `§5.1`), so every
+  turn-level test needs two steps even when it only cares about step 1.
+- **A mutating command cannot test the plan review and the command approval at
+  once.** The review gate fires first on any mutating action while the plan is
+  unapproved, so a "reminder then command pause" test must approve the plan
+  first; the reminder then fires in the resumed turn.
+- **The reminder at the forced-final completion is unreachable, by design.** A
+  forced-final call has `action_rounds >= max_rounds`, so the two-round gate is
+  always false. The call is still made at both completion points so the rule has
+  one definition.
+- **`TaskStatus::is_active` is not `!is_terminal()`.** `Interrupted` and
+  `UnknownExternalOutcome` stay recoverable but are inactive; a test pins the
+  partition.
+- **A turn ended by a declined provider fallback settles outside the loop.** The
+  plan is read from the log and the evidence from the pending turn; this is the
+  only true end that runs no loop code.
+- **Attaching is many events, not one.** A turn that ends with twelve command
+  results writes twelve `plan_step_updated` records; the log is append-only and
+  the plan is small (also recorded in `context.md` §7).
+- **The JS label has no automated check.** There is no JavaScript test harness;
+  the contract (`active`) is tested and the label was reviewed by reading the
+  code, but the rendered panel was not checked in a browser in this session.

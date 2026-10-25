@@ -4693,6 +4693,14 @@ function renderMessages(messages, tasks = []) {
     tasks.filter((task) => typeof task.inputTokens === "number").map((task) => [task.id, task]),
   );
   return messages.map((message, index) => {
+    // The engine's one plan reminder is a user-role message in the request but
+    // not something the user typed. Render it as a system line, and not as an
+    // answer, a rewind anchor, or a question (spec 66 `context.md` D10).
+    if (message.kind === "plan_reminder") {
+      const bubble = appendChatMessage("system", message.content);
+      if (message.seq) bubble.message.dataset.seq = message.seq;
+      return { message, bubble };
+    }
     if (message.role === "question") {
       // The answer event immediately follows its question in the log, so the
       // next message is what settles this card. Options ride on the question
@@ -7529,10 +7537,14 @@ function renderPlanPanel(message, plan) {
       item.append(note);
     }
     if (step.status === "in_progress") {
-      const running = document.createElement("span");
-      running.className = "plan-step-outcome";
-      running.textContent = "running";
-      item.append(running);
+      // "running" only while a turn is going. Once it has ended, an open step
+      // is still open — say what Damaian knows rather than implying work is in
+      // flight (spec 66 §5.4). An older payload without `active` reads as live.
+      const live = plan.active !== false;
+      const state = document.createElement("span");
+      state.className = "plan-step-outcome";
+      state.textContent = live ? "running" : "not finished";
+      item.append(state);
     }
 
     const evidence = Array.isArray(step.evidence) ? step.evidence : [];

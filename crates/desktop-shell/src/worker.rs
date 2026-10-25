@@ -1013,7 +1013,14 @@ impl ProgressSink<'_> {
                 append_progress(
                     self.writer,
                     ProgressKind::Plan,
-                    parsed(&crate::plan_json(&plan)),
+                    parsed(&crate::plan_json(&plan, true)),
+                );
+            }
+            TurnProgress::PlanFinished(plan) => {
+                append_progress(
+                    self.writer,
+                    ProgressKind::Plan,
+                    parsed(&crate::plan_json(&plan, false)),
                 );
             }
             TurnProgress::Paused => {

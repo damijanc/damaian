@@ -52,3 +52,7 @@ content = "The upload client sends a payload and reports an error when it is emp
 # a read-only plan mutated something.
 approval_required = false
 files_changed_outside_patch = 0
+# A closed plan gets no reminder (spec 66 §5.5), so this is the negative half
+# of the reminder measurement rather than an incidental zero.
+plan_reminders = 0
+deterministic_only = ["plan_reminders"]

@@ -509,6 +509,23 @@ and its exit code, or the files a patch wrote. This is what Damaian observed,
 never what the model said about its own work. A step whose command exited 3 is
 blocked no matter how confidently the reply describes it as done.
 
+### When the turn ends with steps still open
+
+The model does not get to mark a step done by saying so. If it answers while its
+plan still has steps open, Damaian sends it **one** reminder to call
+`complete_step` for the ones it finished. If it answers again without closing
+them, the turn ends and they stay open.
+
+That is not a stuck turn. An open step in an ended turn is shown as **not
+finished**, and the summary reads **"Turn ended with N steps not marked done."**
+Damaian knows what it observed; it does not know that the work was left undone,
+which is why the wording is not "failed". The answer is still the answer, and
+everything the step ran is still listed under **What confirms this**.
+
+A plan you declined at the review gate is different: its steps are shown as
+**skipped**, because your decision settled them. Damaian will not ask the model
+to complete work you refused.
+
 The panel survives a reload, so you can reopen an old session and still see
 what a turn came to.
 
