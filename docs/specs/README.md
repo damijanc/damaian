@@ -85,8 +85,9 @@ A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
 reports the disagreement.
 
-#25, #32, #50, #59 and #62 are all Done and merged into `main`. #26 context
-assembly is Done (2026-10-25), so the keystone is no longer in flight.
+#23, #25, #26, #32, #50, #59 and #62 are all Done and merged into `main`.
+#23 and #26 both finished on 2026-10-25, so the two keystones are no longer in
+flight.
 
 - **In progress:** #49 prompt cache — the accounting slice is done and the
   reuse slice (requirement 4) is the only unbuilt requirement. #26's ordering
