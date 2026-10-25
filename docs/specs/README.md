@@ -352,7 +352,8 @@ blockers and are inherited by #27 and by whoever builds the first range
 producer: no collection source yields a `LineRange` yet, so range deduplication
 is implemented and unit-tested but inert in production, and no Observed
 capability profile exists, so every limit is `Declared`. The ready set is #23,
-#27, #33, #51, #55, #65 and #66.
+#27, #33, #51, #55, #65 and #66. The full seven-check gate passed in CI on
+2026-10-25 (Quality run 40204226481).
 
 **#26 is Done (2026-10-25), so the tail it was blocking is open.** Nothing else
 in front of it is unbuilt. The specs it unblocked are #27, #33, #51 and #55;

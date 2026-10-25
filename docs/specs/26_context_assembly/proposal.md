@@ -9,9 +9,9 @@ recovery 1.000. Compared by hand against `evals/baseline.json` (§7), the moved
 aggregates are explained by the tier growing from 16 to 23 scenarios rather than
 by a behaviour change; against the pre-implementation tree the same tier leaves
 every count and rate identical and the whole-request estimate falls from 399391
-to 397245 tokens, lower in every scenario. Scoped tests and clippy
-passed locally; the full seven-check gate is left to CI (§7 records that, and
-does not claim CI passed). The estimate is calibrated against
+to 397245 tokens, lower in every scenario. Scoped tests and clippy passed
+locally, and the full seven-check gate passed in CI on 2026-10-25 (Quality run
+40204226481, on `main` at `8758f62`). The estimate is calibrated against
 provider-reported measured usage from one live run against
 `deepseek`/`deepseek-v4-flash` (§7); the offline half over recorded traffic was
 not run. Known open points — no collection source yields line ranges, so range
@@ -1010,9 +1010,10 @@ rediscover it:
   source could bypass the check by comparing raw strings, which is why every
   source goes through `add_file`/`normalise_candidate` and the exhaustive
   `CollectionSource` walk exists.
-- **The full seven-check quality gate is left to CI.** Locally, the named
-  test files, scoped `workspace-engine` clippy, `scripts/quality-gate.sh fmt
-  node lint typos deny` and `npm run specs:check -- --strict` passed. The
-  workspace clippy and test suite were not run locally by policy; their result
-  is to be recorded here once the branch is pushed and CI is green — this
-  document does not claim it passed.
+- **CI passed.** The full seven-check gate passed in CI on 2026-10-25 (Quality
+  run 40204226481, on `main` at `8758f62`). Scoped checks passed locally:
+  `scripts/quality-gate.sh fmt node lint typos deny`, `npm run specs:check --
+  --strict`, `cargo clippy -p workspace-engine --all-targets --locked -- -D
+  warnings`, the named test files (232 passed, 2 skipped) and the deterministic
+  eval tier (23/23). Workspace clippy and the workspace test suite were not run
+  locally, by `AGENTS.md`'s policy; the CI run is their record.
