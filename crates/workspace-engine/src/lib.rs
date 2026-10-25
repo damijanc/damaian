@@ -54,9 +54,9 @@ pub mod worktree_access;
 pub use audit::AuditLog;
 pub use cancel::CancelToken;
 pub use chat::{
-    AgentCommandProposal, AgentFallbackProposal, AgentPatchProposal, AgentPlanProposal,
-    AgentQuestionProposal, AgentRoundBudgetProposal, ChatOrchestrator, ChatTurnOptions,
-    ChatTurnResult, McpTokenResolver, PausedTurns, PhaseKind, PlanRevisionStep,
+    AgentCheckBatch, AgentCommandProposal, AgentFallbackProposal, AgentPatchProposal,
+    AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal, ChatOrchestrator,
+    ChatTurnOptions, ChatTurnResult, McpTokenResolver, PausedTurns, PhaseKind, PlanRevisionStep,
     ResumeDecisionOptions, RoundBudgetDecision, RoundBudgetPause, TurnPhase, TurnProgress,
     TurnSink,
 };

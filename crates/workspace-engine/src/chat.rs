@@ -22,7 +22,7 @@ use crate::finding::{
     findings_from_web_record, resolve_finding_path,
 };
 use crate::git_service::{DiffOptions, GitService, GitStatus, WorktreeListing};
-use crate::hash::{create_id, now_millis};
+use crate::hash::{create_id, file_hash, now_millis};
 use crate::hooks::{HookContext, HookDispatcher, HookEvent, HookOutcome, Verdict};
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
@@ -34,22 +34,29 @@ use crate::model::{
 use crate::navigation::NavigationController;
 use crate::patch_engine::{PatchEngine, ProposedChange, ProposedFilePatch, ProposedPatch};
 use crate::path_policy::PathPolicy;
-use crate::plan::TaskPlan;
+use crate::plan::{Evidence, PlanStep, StepStatus, TaskPlan, status_from_evidence};
+use crate::repository_map::RepositoryMapStore;
 use crate::secret_scanner::SecretScanner;
-use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus, TaskUsage};
+use crate::session::{
+    ChatMessage, PendingApprovalRef, Session, SessionStore, Task, TaskStatus, TaskUsage,
+};
 use crate::steering::TurnSteering;
 use crate::validation::{
     CommandProposal, CommandStore, ValidationOrchestrator, command_approval_prompt,
     resolve_command_directory,
 };
 use crate::vector_index::VectorIndexCache;
+use crate::verification::{
+    CheckId, CheckOutcome, Selection, SkipReason, VerificationEvent, VerificationOutcome,
+    VerificationReport, fold_verification, propose_checks,
+};
 use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
     WebDiagnosticReport, WebDiagnosticsRunnerHandle,
 };
 use crate::worktree_access::resolve_worktree;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -341,6 +348,20 @@ pub struct AgentCommandProposal {
     pub allow_browser_diagnostics_for_session: bool,
 }
 
+/// Every check the verification loop wants to run that needs approval, as one
+/// card (spec 23 proposal §5.3).
+///
+/// One card for many checks because a loop that produces five sequential
+/// prompts is a loop users click through blindly. Each entry keeps its own
+/// proposal, so *Allow Always* remains per check and exact-command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCheckBatch {
+    /// The id to hand back to
+    /// [`ChatOrchestrator::resume_after_check_decision`].
+    pub id: String,
+    pub checks: Vec<AgentCommandProposal>,
+}
+
 /// A patch the model proposed mid-conversation via the `propose_patch` tool
 /// call (as opposed to `EditOrchestrator::propose_edit`'s dedicated one-shot
 /// flow). Carries the same `ProposedFilePatch` data the text-envelope path
@@ -482,6 +503,13 @@ pub struct ChatTurnResult {
     /// The turn reached its round budget and paused before the forced final
     /// call. Resumed through `resume_round_budget` (spec 61).
     pub round_budget_proposal: Option<AgentRoundBudgetProposal>,
+    /// The verification loop is holding on a card listing the checks that need
+    /// approval. Resumed through [`ChatOrchestrator::resume_after_check_decision`]
+    /// (spec 23).
+    pub check_batch: Option<AgentCheckBatch>,
+    /// The report a verification turn produced, as data for the report card.
+    /// The same content is in `response`; this is the structured copy.
+    pub verification_report: Option<crate::verification::VerificationReport>,
     /// The user stopped this turn. Distinct from a failure: `response` holds
     /// whatever had been generated, and it is persisted.
     pub cancelled: bool,
@@ -514,6 +542,7 @@ struct TurnProposals {
     patch: Option<AgentPatchProposal>,
     plan: Option<AgentPlanProposal>,
     question: Option<AgentQuestionProposal>,
+    checks: Option<AgentCheckBatch>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1085,6 +1114,688 @@ impl ChatOrchestrator {
             sink,
             options,
         )
+    }
+
+    /// Runs the verification that a settled Code-mode patch made due (spec 23).
+    ///
+    /// A continuation turn Damaian starts, not one the user typed. The apply
+    /// path records `verification_due`; this runs in a new task carrying the
+    /// plan, so the model never decides whether to verify. With every check
+    /// auto-runnable it runs them and finishes with the report; with any
+    /// requiring approval it pauses once on a check card and
+    /// [`Self::resume_after_check_decision`] continues.
+    pub fn verify_due(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+        _model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let repository_root = repository_root.as_ref();
+        let Some(session) = self.session_store.read_session(session_id)? else {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown session: {session_id}"
+            )));
+        };
+        // The loop is Code-only: in Ask, Plan and Review there is nothing
+        // applied to verify. Checked again here because the mode can change
+        // between the apply and this call.
+        if self.session_store.session_mode(session_id) != SessionMode::Code {
+            return Err(ClientError::AccessDenied(
+                "Verification runs only in Code mode".to_string(),
+            ));
+        }
+        let events = self
+            .session_store
+            .read_verification_events(session_id, &[])?;
+        let state = fold_verification(events.iter());
+        let Some(due) = state.due.clone() else {
+            return Err(ClientError::InvalidInput(
+                "No verification is due in this session".to_string(),
+            ));
+        };
+        // Attempt 0 is the first verification. A `Due` after a finished
+        // attempt starts the next one; an interrupted attempt is rerun at the
+        // attempt it was already on (spec 23 `context.md` §5).
+        let attempt = if state.selected.is_empty() {
+            0
+        } else if state.finished.is_none() {
+            state.attempt
+        } else {
+            state.attempt.saturating_add(1)
+        };
+        let mut task = self.session_store.create_task(
+            session_id,
+            VERIFICATION_TURN_PROMPT,
+            &self.config.model_provider,
+            &self.config.model_name,
+        )?;
+        task = self
+            .session_store
+            .update_task_status(&task, TaskStatus::PreparingContext, None)?;
+        self.session_store.resume_plan(&task, &due.task_id)?;
+        task = self
+            .session_store
+            .update_task_status(&task, TaskStatus::Validating, None)?;
+        sink.session(&session.id);
+
+        let changed = self.verification_changed_files(session_id, &task.id, &due)?;
+        let file_hashes = hash_existing_files(repository_root, &changed);
+        let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
+        let (map, _) = RepositoryMapStore::new(&self.config.data_dir, self.audit_log.clone())
+            .load_or_build(&index, self.validation_orchestrator.command_policy())?;
+        let selection = propose_checks(
+            &self.validation_orchestrator,
+            repository_root,
+            &map,
+            &changed,
+        )?;
+        match selection {
+            Selection::OnlyDocumentation => self.finish_verification_without_checks(
+                session,
+                task,
+                attempt,
+                VerificationOutcome::OnlyDocumentationChanged,
+                changed,
+                file_hashes,
+            ),
+            Selection::NoChecksAvailable { .. } => self.finish_verification_without_checks(
+                session,
+                task,
+                attempt,
+                VerificationOutcome::NoChecksAvailable,
+                changed,
+                file_hashes,
+            ),
+            Selection::Proposed(checks) => self.run_verification_checks(
+                repository_root,
+                session,
+                task,
+                due,
+                attempt,
+                checks,
+                changed,
+                file_hashes,
+                sink,
+            ),
+        }
+    }
+
+    /// Continues the verification turn parked on a check card (spec 23 §3).
+    ///
+    /// `decisions` must answer every proposal in the batch; a missing one is
+    /// refused rather than read as a decline, and the pause is put back so the
+    /// client can retry.
+    pub fn resume_after_check_decision(
+        &self,
+        batch_id: &str,
+        decisions: &[(String, bool)],
+        approved_by: &str,
+        _model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let pending = self.pending_commands.take(batch_id)?;
+        self.refuse_unless_paused_for(batch_id, &pending, PausedFor::CheckBatch)?;
+        if self.session_store.session_mode(&pending.session.id) != SessionMode::Code {
+            self.pending_commands.save(&pending)?;
+            return Err(ClientError::AccessDenied(
+                "Verification runs only in Code mode".to_string(),
+            ));
+        }
+        let Some(batch) = pending.check_batch.clone() else {
+            self.pending_commands.save(&pending)?;
+            return Err(ClientError::InvalidInput(format!(
+                "Proposal {batch_id} is not a check batch"
+            )));
+        };
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let session = pending.session.clone();
+        let mut task =
+            self.session_store
+                .update_task_status(&pending.task, TaskStatus::Validating, None)?;
+        let mut plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)?
+            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+
+        for pending_check in &batch.checks {
+            let Some((_, approved)) = decisions
+                .iter()
+                .find(|(proposal_id, _)| proposal_id == &pending_check.proposal_id)
+            else {
+                self.pending_commands.save(&pending)?;
+                return Err(ClientError::InvalidInput(format!(
+                    "No decision was given for check {}",
+                    pending_check.proposal_id
+                )));
+            };
+            let check = pending_check.check();
+            let proposal = self
+                .command_store
+                .load_proposal(&pending_check.proposal_id)?;
+            let outcome = if *approved {
+                self.run_verification_check(
+                    &repository_root,
+                    &session,
+                    &task,
+                    &check,
+                    &proposal,
+                    &pending_check.step_id,
+                    &mut plan,
+                    true,
+                    approved_by,
+                    &batch.file_hashes,
+                    sink,
+                )?
+            } else {
+                // Through the store as well as the log, so the command store
+                // and the audit trail agree with the report (proposal §5.3).
+                self.validation_orchestrator
+                    .reject_proposal(&pending_check.proposal_id, approved_by)?;
+                self.close_verification_step(
+                    &task,
+                    &mut plan,
+                    &pending_check.step_id,
+                    StepStatus::Skipped,
+                )?;
+                sink.progress(TurnProgress::Plan(plan.clone()));
+                CheckOutcome::Skipped(SkipReason::DeclinedByUser)
+            };
+            self.session_store.append_verification_event(
+                &session.id,
+                &VerificationEvent::Check {
+                    task_id: task.id.clone(),
+                    check,
+                    outcome,
+                    file_hashes: batch.file_hashes.clone(),
+                },
+            )?;
+        }
+        task = self
+            .session_store
+            .update_task_status(&task, TaskStatus::Validating, None)?;
+        self.finish_verification(session, task, batch.files_changed, batch.file_hashes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_verification_checks(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        due: crate::verification::VerificationDue,
+        attempt: u32,
+        checks: Vec<(CheckId, CommandProposal)>,
+        changed: Vec<String>,
+        file_hashes: BTreeMap<String, String>,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let selected: Vec<CheckId> = checks.iter().map(|(check, _)| check.clone()).collect();
+        self.session_store.append_verification_event(
+            &session.id,
+            &VerificationEvent::Started {
+                task_id: task.id.clone(),
+                attempt,
+                checks: selected,
+            },
+        )?;
+        let mut plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)?
+            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        let mut step_ids = Vec::new();
+        for (index, (check, _)) in checks.iter().enumerate() {
+            let step_id = format!("verify_{}", index + 1);
+            plan.steps.push(PlanStep {
+                id: step_id.clone(),
+                title: format!(
+                    "Run `{}` in `{}`",
+                    check.command,
+                    root_label(&check.working_directory)
+                ),
+                detail: Some(format!("Verification check: {}", check.label())),
+                status: StepStatus::Pending,
+                depends_on: Vec::new(),
+                started_at_ms: None,
+                completed_at_ms: None,
+                evidence: Vec::new(),
+            });
+            step_ids.push(step_id);
+        }
+        self.session_store.revise_plan(&task, &plan)?;
+        sink.progress(TurnProgress::Plan(plan.clone()));
+
+        let mut awaiting = Vec::new();
+        for ((check, proposal), step_id) in checks.iter().zip(step_ids.iter()) {
+            if proposal.blocked {
+                let reason = if proposal.reasons.is_empty() {
+                    "blocked by command policy".to_string()
+                } else {
+                    proposal.reasons.join("; ")
+                };
+                self.close_verification_step(&task, &mut plan, step_id, StepStatus::Skipped)?;
+                self.session_store.append_verification_event(
+                    &session.id,
+                    &VerificationEvent::Check {
+                        task_id: task.id.clone(),
+                        check: check.clone(),
+                        outcome: CheckOutcome::Skipped(SkipReason::Blocked { reason }),
+                        file_hashes: file_hashes.clone(),
+                    },
+                )?;
+                sink.progress(TurnProgress::Plan(plan.clone()));
+                continue;
+            }
+            if proposal.requires_approval {
+                awaiting.push(PendingCheckDecision {
+                    proposal_id: proposal.id.clone(),
+                    step_id: step_id.clone(),
+                    working_directory: check.working_directory.clone(),
+                    command: check.command.clone(),
+                });
+                continue;
+            }
+            let outcome = self.run_verification_check(
+                repository_root,
+                &session,
+                &task,
+                check,
+                proposal,
+                step_id,
+                &mut plan,
+                false,
+                "policy",
+                &file_hashes,
+                sink,
+            )?;
+            self.session_store.append_verification_event(
+                &session.id,
+                &VerificationEvent::Check {
+                    task_id: task.id.clone(),
+                    check: check.clone(),
+                    outcome,
+                    file_hashes: file_hashes.clone(),
+                },
+            )?;
+        }
+
+        if !awaiting.is_empty() {
+            return self.pause_for_check_batch(
+                repository_root,
+                session,
+                task,
+                due,
+                attempt,
+                awaiting,
+                changed,
+                file_hashes,
+            );
+        }
+        self.finish_verification(session, task, changed, file_hashes)
+    }
+
+    /// Runs one check and records its effect on its plan step.
+    ///
+    /// The exit is recorded as [`Evidence::CommandExit`] with the purpose the
+    /// classification gave it (a detected check is always
+    /// [`CommandPurpose::Check`]). Recording it as `Exploration` would leave the
+    /// step completed and produce no findings, which is exactly the
+    /// laundering spec 63 §5.3 exists to stop.
+    #[allow(clippy::too_many_arguments)]
+    fn run_verification_check(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        _check: &CheckId,
+        proposal: &CommandProposal,
+        step_id: &str,
+        plan: &mut TaskPlan,
+        approved: bool,
+        approved_by: &str,
+        _file_hashes: &BTreeMap<String, String>,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<CheckOutcome> {
+        let started = now_millis();
+        if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
+            step.status = StepStatus::InProgress;
+            step.started_at_ms = Some(started);
+            self.session_store.update_plan_step(task, step)?;
+            sink.progress(TurnProgress::Plan(plan.clone()));
+        }
+        let cancel = sink.cancel;
+        let on_progress = &mut *sink.on_progress;
+        let mut on_output = |line: &str| {
+            on_progress(TurnProgress::Phase(TurnPhase::new(
+                PhaseKind::Output,
+                line,
+                0,
+                0,
+                0,
+                0,
+            )));
+        };
+        let record = self.validation_orchestrator.run_proposal(
+            &proposal.id,
+            approved,
+            approved_by,
+            Some(&task.id),
+            cancel,
+            &mut on_output,
+        )?;
+        // Findings and `after_check` both come from here, exactly as they do
+        // for a check the model ran. Writing findings through another path
+        // would make this the one check no hook sees (proposal §5.3).
+        let findings =
+            self.record_command_findings(repository_root, session, task, &record.execution)?;
+        let exit_code = record.execution.exit_code;
+        let marker_id = record.execution.id.clone();
+        let mut evidence = vec![Evidence::CommandExit {
+            marker_id: marker_id.clone(),
+            exit_code,
+            purpose: record.execution.purpose,
+        }];
+        if let Some(findings) = findings {
+            evidence.push(findings);
+        }
+        if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
+            step.evidence = evidence;
+            step.status = status_from_evidence(&step.evidence);
+            step.completed_at_ms = Some(now_millis());
+            self.session_store.update_plan_step(task, step)?;
+        }
+        sink.progress(TurnProgress::Plan(plan.clone()));
+        Ok(CheckOutcome::Ran {
+            exit_code,
+            marker_id,
+        })
+    }
+
+    fn close_verification_step(
+        &self,
+        task: &Task,
+        plan: &mut TaskPlan,
+        step_id: &str,
+        status: StepStatus,
+    ) -> Result<()> {
+        if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
+            step.status = status;
+            if step.started_at_ms.is_none() {
+                step.started_at_ms = Some(now_millis());
+            }
+            step.completed_at_ms = Some(now_millis());
+            self.session_store.update_plan_step(task, step)?;
+        }
+        Ok(())
+    }
+
+    /// Parks the verification turn on one card for every check that needs
+    /// approval (proposal §5.3).
+    #[allow(clippy::too_many_arguments)]
+    fn pause_for_check_batch(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        due: crate::verification::VerificationDue,
+        attempt: u32,
+        awaiting: Vec<PendingCheckDecision>,
+        changed: Vec<String>,
+        file_hashes: BTreeMap<String, String>,
+    ) -> Result<ChatTurnResult> {
+        let batch_id = create_id("checkbatch");
+        let mut entries = Vec::new();
+        for pending in &awaiting {
+            let proposal = self.command_store.load_proposal(&pending.proposal_id)?;
+            entries.push(agent_command_proposal(&self.config, &proposal));
+        }
+        let batch = AgentCheckBatch {
+            id: batch_id.clone(),
+            checks: entries,
+        };
+        self.pending_commands.save(&PendingChatTurn {
+            proposal_id: batch_id.clone(),
+            session: session.clone(),
+            task: task.clone(),
+            repository_root: repository_root.to_string_lossy().to_string(),
+            context_files: changed.clone(),
+            round: 0,
+            exploration_rounds: 0,
+            messages: Vec::new(),
+            matched_tool_call: None,
+            last_content: String::new(),
+            turn_options: ChatTurnOptions::default(),
+            reasoning_content: None,
+            round_calls_fed_back: false,
+            mcp_call: None,
+            web_diagnostic_call: None,
+            plan_review: None,
+            provider_fallback: None,
+            round_budget: None,
+            question: None,
+            check_batch: Some(PendingCheckBatch {
+                checks: awaiting,
+                due_task_id: due.task_id,
+                patch_id: due.patch_id,
+                attempt,
+                files_changed: changed.clone(),
+                file_hashes,
+            }),
+        })?;
+        self.note_pending_approvals(
+            &session,
+            &task,
+            vec![PendingApproval {
+                kind: "checks".to_string(),
+                proposal_id: batch_id.clone(),
+            }],
+        );
+        let task = self.session_store.await_approval(
+            &task,
+            &PendingApprovalRef {
+                kind: "checks".to_string(),
+                proposal_id: batch_id.clone(),
+            },
+        )?;
+        self.audit_log.record(
+            "verification_check_batch_paused",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
+                ("proposalId", batch_id.clone()),
+                ("checks", batch.checks.len().to_string()),
+            ],
+        )?;
+        self.verification_turn_result(
+            session,
+            task,
+            CHECK_BATCH_PAUSED_RESPONSE.to_string(),
+            Some(batch),
+            None,
+            changed,
+        )
+    }
+
+    fn finish_verification_without_checks(
+        &self,
+        session: Session,
+        task: Task,
+        attempt: u32,
+        outcome: VerificationOutcome,
+        changed: Vec<String>,
+        file_hashes: BTreeMap<String, String>,
+    ) -> Result<ChatTurnResult> {
+        self.session_store.append_verification_event(
+            &session.id,
+            &VerificationEvent::Started {
+                task_id: task.id.clone(),
+                attempt,
+                checks: Vec::new(),
+            },
+        )?;
+        self.session_store.append_verification_event(
+            &session.id,
+            &VerificationEvent::Finished {
+                task_id: task.id.clone(),
+                outcome,
+            },
+        )?;
+        let events = self
+            .session_store
+            .read_verification_events(&session.id, &[])?;
+        let state = fold_verification(events.iter());
+        let plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)?
+            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        let report = VerificationReport::build(&state, &plan, &changed, &file_hashes);
+        let response = format!("{}\n\n{}", report.summary(&plan.report()), report.render());
+        let task = self
+            .session_store
+            .update_task_status(&task, TaskStatus::Complete, None)?;
+        self.verification_turn_result(session, task, response, None, Some(report), changed)
+    }
+
+    /// Appends `Finished`, then builds and returns the report.
+    ///
+    /// Task 5 inserts repair before this: today a failing check closes the
+    /// task as `failed` with the report, which is the honest answer even
+    /// without a repair attempt.
+    fn finish_verification(
+        &self,
+        session: Session,
+        task: Task,
+        changed: Vec<String>,
+        file_hashes: BTreeMap<String, String>,
+    ) -> Result<ChatTurnResult> {
+        let events = self
+            .session_store
+            .read_verification_events(&session.id, &[])?;
+        let state = fold_verification(events.iter());
+        let plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)?
+            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        let preliminary = VerificationReport::build(&state, &plan, &changed, &file_hashes);
+        let outcome = if preliminary.failed.is_empty() && preliminary.stale.is_empty() {
+            VerificationOutcome::Passed
+        } else {
+            VerificationOutcome::Failed
+        };
+        self.session_store.append_verification_event(
+            &session.id,
+            &VerificationEvent::Finished {
+                task_id: task.id.clone(),
+                outcome,
+            },
+        )?;
+        let events = self
+            .session_store
+            .read_verification_events(&session.id, &[])?;
+        let state = fold_verification(events.iter());
+        let report = VerificationReport::build(&state, &plan, &changed, &file_hashes);
+        let response = format!("{}\n\n{}", report.summary(&plan.report()), report.render());
+        let status = if outcome == VerificationOutcome::Passed {
+            TaskStatus::Complete
+        } else {
+            TaskStatus::Failed
+        };
+        let task = self.session_store.update_task_status(&task, status, None)?;
+        self.verification_turn_result(session, task, response, None, Some(report), changed)
+    }
+
+    /// The files the task changed, from the plan's applied patches and the due
+    /// patch's applied decisions, falling back to the stored patch's files.
+    fn verification_changed_files(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        due: &crate::verification::VerificationDue,
+    ) -> Result<Vec<String>> {
+        let mut changed = BTreeSet::new();
+        if let Some(plan) = self.session_store.read_task_plan(session_id, task_id)? {
+            for step in &plan.steps {
+                for evidence in &step.evidence {
+                    if let Evidence::PatchApplied { files, .. } = evidence {
+                        for file in files {
+                            changed.insert(file.path.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for decision in self
+            .session_store
+            .read_patch_file_decisions(session_id, &due.task_id)?
+        {
+            if decision.patch_id == due.patch_id && decision.applied {
+                for path in decision.paths {
+                    changed.insert(path);
+                }
+            }
+        }
+        if changed.is_empty()
+            && let Ok(patch) = self.patch_store.load(&due.patch_id)
+        {
+            for file in patch.files {
+                changed.insert(file.path);
+            }
+        }
+        Ok(changed.into_iter().collect())
+    }
+
+    fn verification_turn_result(
+        &self,
+        session: Session,
+        task: Task,
+        response: String,
+        check_batch: Option<AgentCheckBatch>,
+        report: Option<VerificationReport>,
+        context_files: Vec<String>,
+    ) -> Result<ChatTurnResult> {
+        if !response.is_empty() {
+            self.session_store.append_message(
+                &session.id,
+                Some(&task.id),
+                "assistant",
+                &response,
+            )?;
+        }
+        let usage = self
+            .session_store
+            .read_task_usage(&session.id)
+            .ok()
+            .and_then(|usage| usage.get(&task.id).copied());
+        let estimated_cost = usage.as_ref().and_then(|usage| {
+            self.config.estimated_cost(&TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                source: usage.source,
+            })
+        });
+        let mut model_run =
+            ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
+        model_run.content = response.clone();
+        Ok(ChatTurnResult {
+            session,
+            task,
+            model_run,
+            context_files,
+            response,
+            command_proposal: None,
+            patch_proposal: None,
+            plan_proposal: None,
+            question_proposal: None,
+            fallback_proposal: None,
+            round_budget_proposal: None,
+            check_batch,
+            verification_report: report,
+            cancelled: false,
+            usage,
+            estimated_cost,
+        })
     }
 
     /// Continues a chat turn that stopped to ask the user whether a proposed
@@ -3540,6 +4251,7 @@ impl ChatOrchestrator {
                         provider_fallback: None,
                         round_budget: None,
                         question: None,
+                        check_batch: None,
                     })?;
                     self.note_pending_approvals(
                         &session,
@@ -3803,6 +4515,7 @@ impl ChatOrchestrator {
                                     provider_fallback: None,
                                     round_budget: None,
                                     question: None,
+                                    check_batch: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -4179,6 +4892,7 @@ impl ChatOrchestrator {
                                     provider_fallback: None,
                                     round_budget: None,
                                     question: None,
+                                    check_batch: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -4295,6 +5009,7 @@ impl ChatOrchestrator {
                                     provider_fallback: None,
                                     round_budget: None,
                                     question: None,
+                                    check_batch: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -4418,6 +5133,7 @@ impl ChatOrchestrator {
                                         question: Some(PendingQuestion {
                                             question_id: question.question_id().to_string(),
                                         }),
+                                        check_batch: None,
                                     })?;
                                     // A clean stop for a human decision, not a
                                     // crash: the marker says what it waits on.
@@ -4751,6 +5467,8 @@ impl ChatOrchestrator {
             question_proposal: proposals.question,
             fallback_proposal: None,
             round_budget_proposal: None,
+            check_batch: proposals.checks,
+            verification_report: None,
             cancelled: false,
             usage,
             estimated_cost,
@@ -4800,6 +5518,7 @@ impl ChatOrchestrator {
             provider_fallback: Some(offer.clone()),
             round_budget: None,
             question: None,
+            check_batch: None,
         })?;
         self.note_pending_approvals(
             &session,
@@ -4864,6 +5583,8 @@ impl ChatOrchestrator {
                 message: offer.message,
             }),
             round_budget_proposal: None,
+            check_batch: None,
+            verification_report: None,
             cancelled: false,
             usage,
             estimated_cost,
@@ -4921,6 +5642,7 @@ impl ChatOrchestrator {
             provider_fallback: None,
             round_budget: Some(pause),
             question: None,
+            check_batch: None,
         })?;
         self.note_pending_approvals(
             &session,
@@ -4991,6 +5713,8 @@ impl ChatOrchestrator {
                 rounds_more: self.default_tool_round_limit(),
                 at_hard_cap,
             }),
+            check_batch: None,
+            verification_report: None,
             cancelled: false,
             usage,
             estimated_cost,
@@ -5066,6 +5790,8 @@ impl ChatOrchestrator {
             question_proposal: None,
             fallback_proposal: None,
             round_budget_proposal: None,
+            check_batch: None,
+            verification_report: None,
             cancelled: true,
             usage,
             estimated_cost,
@@ -5652,6 +6378,9 @@ enum PausedFor {
     PlanReview,
     ProviderFallback,
     RoundBudget,
+    /// A batch of verification checks waiting for one card's decisions
+    /// (spec 23).
+    CheckBatch,
     Question,
     /// A file carrying more than one marker. No writer produces this, and
     /// guessing which pause it means is exactly the mistake this type exists
@@ -5666,6 +6395,7 @@ impl PausedFor {
             Self::PlanReview => "a plan review",
             Self::ProviderFallback => "a provider fallback offer",
             Self::RoundBudget => "a round-budget pause",
+            Self::CheckBatch => "a check approval",
             Self::Question => "a question",
             Self::Conflicting => "more than one kind of pause",
         }
@@ -5677,6 +6407,7 @@ impl PausedFor {
             Self::PlanReview => "resume_after_plan_decision",
             Self::ProviderFallback => "resume_after_fallback_decision",
             Self::RoundBudget => "resume_round_budget",
+            Self::CheckBatch => "resume_after_check_decision",
             Self::Question => "resume_after_answer",
             Self::Conflicting => "",
         }
@@ -5700,12 +6431,14 @@ fn paused_for(pending: &PendingChatTurn) -> PausedFor {
         pending.provider_fallback.is_some(),
         pending.round_budget.is_some(),
         pending.question.is_some(),
+        pending.check_batch.is_some(),
     ) {
-        (false, false, false, false) => PausedFor::Action,
-        (true, false, false, false) => PausedFor::PlanReview,
-        (false, true, false, false) => PausedFor::ProviderFallback,
-        (false, false, true, false) => PausedFor::RoundBudget,
-        (false, false, false, true) => PausedFor::Question,
+        (false, false, false, false, false) => PausedFor::Action,
+        (true, false, false, false, false) => PausedFor::PlanReview,
+        (false, true, false, false, false) => PausedFor::ProviderFallback,
+        (false, false, true, false, false) => PausedFor::RoundBudget,
+        (false, false, false, true, false) => PausedFor::Question,
+        (false, false, false, false, true) => PausedFor::CheckBatch,
         _ => PausedFor::Conflicting,
     }
 }
@@ -5785,6 +6518,40 @@ struct PendingChatTurn {
     /// turns written before the pause existed loadable.
     #[serde(default)]
     question: Option<PendingQuestion>,
+    /// Present when the pause is a verification check batch (spec 23). Carries
+    /// the checks to decide and the attempt's file hashes, so the resumed turn
+    /// finishes the report without re-deriving what the check saw.
+    #[serde(default)]
+    check_batch: Option<PendingCheckBatch>,
+}
+
+/// The persisted half of a check-batch pause (spec 23 §3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingCheckBatch {
+    checks: Vec<PendingCheckDecision>,
+    /// The task whose plan owns this verification, and the patch that made it
+    /// due.
+    due_task_id: String,
+    patch_id: String,
+    attempt: u32,
+    files_changed: Vec<String>,
+    file_hashes: BTreeMap<String, String>,
+}
+
+/// One check waiting on the user's decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingCheckDecision {
+    proposal_id: String,
+    /// The plan step this check owns, so the resumed turn can close it.
+    step_id: String,
+    working_directory: String,
+    command: String,
+}
+
+impl PendingCheckDecision {
+    fn check(&self) -> CheckId {
+        CheckId::new(self.working_directory.clone(), self.command.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -6010,6 +6777,36 @@ fn system_prompt_for_session(
     } else {
         prompt
     }
+}
+
+/// The task prompt of a verification continuation. Damaian's own words, not a
+/// user request: the model is told what the turn is for when repair begins
+/// (spec 23 `context.md` §13).
+const VERIFICATION_TURN_PROMPT: &str = "Verify the patch that was just applied.";
+
+/// What a verification turn says when it parks on the check card.
+const CHECK_BATCH_PAUSED_RESPONSE: &str =
+    "These checks need your approval before verification can continue.";
+
+/// A check's root as the report names it.
+fn root_label(working_directory: &str) -> &str {
+    if working_directory.is_empty() {
+        "repository root"
+    } else {
+        working_directory
+    }
+}
+
+/// The hash of every changed file that still exists. A deleted file is absent,
+/// which the report reads as a staleness mismatch rather than a pass.
+fn hash_existing_files(root: &Path, paths: &[String]) -> BTreeMap<String, String> {
+    let mut hashes = BTreeMap::new();
+    for path in paths {
+        if let Ok(hash) = file_hash(root.join(path)) {
+            hashes.insert(path.clone(), hash);
+        }
+    }
+    hashes
 }
 
 /// The tool result for an `ask_user` call nobody can answer.

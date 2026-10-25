@@ -16,8 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
-    CheckId, CheckOutcome, Config, Evidence, MockModelAdapter, PlanReport, PlanStep, Selection,
-    SkipReason, TaskPlan, VerificationEvent, VerificationOutcome, VerificationReport,
+    CancelToken, CheckId, CheckOutcome, CommandPurpose, Config, Evidence, HookConfig, HookEvent,
+    HookMode, HookSource, MockModelAdapter, PlanReport, PlanStep, Selection, SkipReason, TaskPlan,
+    TaskStatus, TurnProgress, TurnSink, VerificationEvent, VerificationOutcome, VerificationReport,
     VerificationState, WorkspaceEngine, fold_verification, is_documentation, propose_checks,
     select_roots,
 };
@@ -1270,5 +1271,636 @@ fn verification_events_round_trip_through_a_fresh_store() {
     assert_eq!(events.len(), 1);
     assert!(fold_verification(events.iter()).due.is_some());
 
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+// --- The verification turn (Task 4) ---------------------------------------
+
+fn verify_engine(
+    root: &std::path::Path,
+    data_dir: &std::path::Path,
+    shell: &str,
+    allow: &[&str],
+    block: &[&str],
+) -> WorkspaceEngine {
+    fs::create_dir_all(root).unwrap();
+    WorkspaceEngine::new(Config {
+        data_dir: data_dir.to_path_buf(),
+        enable_index_watcher: false,
+        shell: shell.to_string(),
+        command_allowlist: allow.iter().map(|entry| (*entry).to_string()).collect(),
+        command_blocklist: block.iter().map(|entry| (*entry).to_string()).collect(),
+        ..Config::default()
+    })
+}
+
+fn cargofile(root: &std::path::Path) {
+    write(root, "Cargo.toml", "[workspace]\nmembers = []\n");
+}
+
+fn run_verification(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    session_id: &str,
+    adapter: &mut dyn workspace_engine::ModelAdapter,
+) -> workspace_engine::ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .verify_due(root, session_id, adapter, &mut sink)
+        .expect("the verification turn should run")
+}
+
+fn resume_checks(
+    engine: &WorkspaceEngine,
+    batch_id: &str,
+    decisions: &[(String, bool)],
+    adapter: &mut dyn workspace_engine::ModelAdapter,
+) -> workspace_engine::ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_check_decision(batch_id, decisions, "tester", adapter, &mut sink)
+        .expect("the check batch should resume")
+}
+
+fn applied_change(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    files: &[(&str, &str, &str)],
+) -> (String, String) {
+    for (path, before, _) in files {
+        write(root, path, before);
+    }
+    let changes: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, _, after)| (*path, *after))
+        .collect();
+    let proposal = propose(engine, root, &edit_response(&changes));
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(root, &proposal.patch.id, None, None, "tester", false)
+        .expect("the patch should apply");
+    (proposal.session.id, proposal.task.id)
+}
+
+fn outcome_events(engine: &WorkspaceEngine, session_id: &str) -> Vec<VerificationEvent> {
+    engine
+        .session_store
+        .read_verification_events(session_id, &[])
+        .expect("the log should read")
+}
+
+#[test]
+fn an_auto_runnable_check_runs_and_the_report_says_passed() {
+    let root = temp_dir("verify-pass");
+    let data_dir = temp_dir("verify-pass-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert!(result.check_batch.is_none(), "the check was auto-runnable");
+    let report = result
+        .verification_report
+        .as_ref()
+        .expect("a report is returned");
+    assert_eq!(report.outcome, Some(VerificationOutcome::Passed));
+    assert_eq!(
+        report.passed,
+        vec![CheckId::new("", "cargo test")],
+        "{report:?}"
+    );
+    assert_eq!(result.task.status, TaskStatus::Complete);
+    assert!(result.response.contains("Verification complete"));
+
+    let plan = engine
+        .session_store
+        .read_task_plan(&session, &result.task.id)
+        .unwrap()
+        .expect("the verification task has a plan");
+    let step = plan
+        .steps
+        .iter()
+        .find(|step| step.title.contains("cargo test"))
+        .expect("a step per check");
+    assert_eq!(step.status, StepStatus::Completed);
+    assert!(step.evidence.iter().any(|evidence| matches!(
+        evidence,
+        Evidence::CommandExit {
+            exit_code: Some(0),
+            purpose: CommandPurpose::Check,
+            ..
+        }
+    )));
+
+    let events = outcome_events(&engine, &session);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        VerificationEvent::Finished {
+            outcome: VerificationOutcome::Passed,
+            ..
+        }
+    )));
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn two_checks_needing_approval_produce_one_batch_and_one_resume() {
+    let root = temp_dir("verify-batch");
+    let data_dir = temp_dir("verify-batch-data");
+    cargofile(&root);
+    write(
+        &root,
+        "packages/web/package.json",
+        "{\"scripts\":{\"test\":\"node test.js\"}}\n",
+    );
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[
+            ("src/a.rs", "let a = 1;\n", "let a = 2;\n"),
+            (
+                "packages/web/src/index.ts",
+                "export const x = 1;\n",
+                "export const x = 2;\n",
+            ),
+        ],
+    );
+    let mut adapter = MockModelAdapter::new("");
+
+    let paused = run_verification(&engine, &root, &session, &mut adapter);
+    let batch = paused
+        .check_batch
+        .as_ref()
+        .expect("both checks need approval");
+    assert_eq!(batch.checks.len(), 2, "{batch:?}");
+    assert!(
+        paused.command_proposal.is_none(),
+        "one card, not one per check"
+    );
+    assert!(paused.verification_report.is_none());
+    assert_eq!(paused.task.status, TaskStatus::WaitingForApproval);
+    // Both entries carry the policy's cause, not a blank.
+    assert!(batch.checks.iter().all(|check| !check.cause.is_empty()));
+
+    let root_check = batch
+        .checks
+        .iter()
+        .find(|check| check.command == "cargo test")
+        .expect("the root's cargo test is on the card");
+    let web_check = batch
+        .checks
+        .iter()
+        .find(|check| check.command == "npm run test")
+        .expect("the web package's test is on the card");
+    let decisions = vec![(root_check.id.clone(), true), (web_check.id.clone(), false)];
+    let resumed = resume_checks(&engine, &batch.id, &decisions, &mut adapter);
+
+    let report = resumed
+        .verification_report
+        .as_ref()
+        .expect("the resumed turn returns the report");
+    assert_eq!(report.outcome, Some(VerificationOutcome::Passed));
+    assert_eq!(report.passed, vec![CheckId::new("", "cargo test")]);
+    let declined = report
+        .skipped
+        .iter()
+        .find(|item| item.check.command == "npm run test")
+        .expect("the declined check is reported as skipped");
+    assert_eq!(declined.reason, SkipReason::DeclinedByUser);
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+
+    let plan = engine
+        .session_store
+        .read_task_plan(&session, &resumed.task.id)
+        .unwrap()
+        .expect("the plan survives the pause");
+    let web_step = plan
+        .steps
+        .iter()
+        .find(|step| step.title.contains("npm run test"))
+        .expect("the declined check has a step");
+    assert_eq!(web_step.status, StepStatus::Skipped);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_blocked_check_is_skipped_and_never_runs() {
+    let root = temp_dir("verify-blocked");
+    let data_dir = temp_dir("verify-blocked-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &["cargo test"]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert!(
+        result.check_batch.is_none(),
+        "a blocked check never reaches the card"
+    );
+    let report = result.verification_report.as_ref().unwrap();
+    assert!(report.passed.is_empty());
+    let skipped = report
+        .skipped
+        .iter()
+        .find(|item| item.check.command == "cargo test")
+        .expect("the blocked check is reported as skipped");
+    assert!(matches!(skipped.reason, SkipReason::Blocked { .. }));
+
+    let plan = engine
+        .session_store
+        .read_task_plan(&session, &result.task.id)
+        .unwrap()
+        .unwrap();
+    let step = plan
+        .steps
+        .iter()
+        .find(|step| step.title.contains("cargo test"))
+        .unwrap();
+    assert_eq!(step.status, StepStatus::Skipped);
+    assert!(step.evidence.is_empty(), "a blocked check observed nothing");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn require_approval_for_all_commands_puts_an_allowlisted_check_on_the_card() {
+    let root = temp_dir("verify-all-approval");
+    let data_dir = temp_dir("verify-all-approval-data");
+    cargofile(&root);
+    fs::create_dir_all(&root).unwrap();
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: data_dir.clone(),
+        enable_index_watcher: false,
+        shell: "/usr/bin/true".to_string(),
+        command_allowlist: vec!["cargo test".to_string()],
+        require_approval_for_all_commands: true,
+        ..Config::default()
+    });
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let batch = result
+        .check_batch
+        .as_ref()
+        .expect("the flag puts even an allowlisted check on the card");
+    assert_eq!(batch.checks.len(), 1);
+    assert_eq!(batch.checks[0].command, "cargo test");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn verify_due_refuses_a_session_that_is_no_longer_code() {
+    let root = temp_dir("verify-ask");
+    let data_dir = temp_dir("verify-ask-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    engine
+        .session_store
+        .set_session_mode(&session, workspace_engine::SessionMode::Ask, "user")
+        .unwrap();
+    let before = outcome_events(&engine, &session).len();
+    let mut adapter = MockModelAdapter::new("");
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+
+    let error = engine
+        .chat_orchestrator
+        .verify_due(&root, &session, &mut adapter, &mut sink)
+        .expect_err("Ask mode must refuse verification");
+    assert!(matches!(
+        error,
+        workspace_engine::ClientError::AccessDenied(_)
+    ));
+    assert_eq!(
+        outcome_events(&engine, &session).len(),
+        before,
+        "nothing ran"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_failing_check_blocks_its_step_and_fails_the_report() {
+    let root = temp_dir("verify-fail");
+    let data_dir = temp_dir("verify-fail-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert_eq!(report.outcome, Some(VerificationOutcome::Failed));
+    assert!(report.passed.is_empty());
+    assert_eq!(
+        report.failed[0].reason, "exit code 1",
+        "the exit code is reported, not laundered"
+    );
+    assert_eq!(result.task.status, TaskStatus::Failed);
+    let plan = engine
+        .session_store
+        .read_task_plan(&session, &result.task.id)
+        .unwrap()
+        .unwrap();
+    let step = plan
+        .steps
+        .iter()
+        .find(|step| step.title.contains("cargo test"))
+        .unwrap();
+    assert_eq!(step.status, StepStatus::Blocked);
+    assert!(step.evidence.iter().any(|evidence| matches!(
+        evidence,
+        Evidence::CommandExit {
+            exit_code: Some(1),
+            purpose: CommandPurpose::Check,
+            ..
+        }
+    )));
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_check_batch_cannot_be_resumed_through_the_command_route() {
+    let root = temp_dir("verify-wrong-route");
+    let data_dir = temp_dir("verify-wrong-route-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+    let paused = run_verification(&engine, &root, &session, &mut adapter);
+    let batch = paused.check_batch.as_ref().unwrap();
+
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let error = engine
+        .chat_orchestrator
+        .resume_after_command_decision(&batch.id, true, "tester", &mut adapter, &mut sink)
+        .expect_err("the command route must refuse a check batch");
+    assert!(
+        error.to_string().contains("resume_after_check_decision"),
+        "{error}"
+    );
+
+    // The refusal put the pause back, so the right route still works.
+    let resumed = resume_checks(
+        &engine,
+        &batch.id,
+        &batch
+            .checks
+            .iter()
+            .map(|check| (check.id.clone(), true))
+            .collect::<Vec<_>>(),
+        &mut adapter,
+    );
+    assert_eq!(
+        resumed.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::Passed)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_command_pause_cannot_be_resumed_through_the_check_route() {
+    let root = temp_dir("verify-wrong-route-reverse");
+    let data_dir = temp_dir("verify-wrong-route-reverse-data");
+    write(&root, "src/a.rs", "let a = 1;\n");
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    let mut adapter = MockModelAdapter::new_sequence(vec![
+        "DAMAIAN_COMMAND_V1\nCOMMAND: sed -i '' 's/1/2/' src/a.rs\nREASON: Bump the constant.\nEND_COMMAND\n"
+            .to_string(),
+        "Done.".to_string(),
+    ]);
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let turn = engine
+        .chat_orchestrator
+        .ask_with_session(&root, "Bump it.", &[], None, &mut adapter, &mut sink)
+        .expect("the turn should pause for approval");
+    let proposal = turn.command_proposal.as_ref().expect("a command pause");
+
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let error = engine
+        .chat_orchestrator
+        .resume_after_check_decision(&proposal.id, &[], "tester", &mut adapter, &mut sink)
+        .expect_err("the check route must refuse a command pause");
+    assert!(
+        error.to_string().contains("resume_after_command_decision"),
+        "{error}"
+    );
+
+    let resumed = engine
+        .chat_orchestrator
+        .resume_after_command_decision(&proposal.id, true, "tester", &mut adapter, &mut sink)
+        .expect("the command pause survives and resumes");
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn verify_due_with_no_detected_checks_says_so() {
+    let root = temp_dir("verify-no-checks");
+    let data_dir = temp_dir("verify-no-checks-data");
+    // No manifest anywhere, so the selected root detects nothing.
+    write(&root, "src/a.rs", "let a = 1;\n");
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert_eq!(report.outcome, Some(VerificationOutcome::NoChecksAvailable));
+    assert!(report.passed.is_empty());
+    assert!(result.response.contains("No checks were available"));
+    assert!(!result.response.contains("Verification complete"));
+    assert_eq!(result.task.status, TaskStatus::Complete);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_documentation_only_patch_verifies_nothing_and_says_so() {
+    let root = temp_dir("verify-docs");
+    let data_dir = temp_dir("verify-docs-data");
+    cargofile(&root);
+    write(&root, "docs/guide.md", "# Guide\n");
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("docs/guide.md", "# Guide\n", "# Guide, revised\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert_eq!(
+        report.outcome,
+        Some(VerificationOutcome::OnlyDocumentationChanged)
+    );
+    assert!(report.passed.is_empty());
+    assert!(result.response.contains("only documentation changed"));
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn an_after_check_hook_sees_the_verification_run() {
+    let root = temp_dir("verify-after-check");
+    let data_dir = temp_dir("verify-after-check-data");
+    cargofile(&root);
+    let envelope = root.join("after-check.json");
+    let hook_script = root.join("hooks").join("capture.sh");
+    fs::create_dir_all(hook_script.parent().unwrap()).unwrap();
+    fs::write(
+        &hook_script,
+        format!(
+            "cat > {}\necho '{{\"hookApiVersion\":1,\"verdict\":\"allow\"}}'\n",
+            envelope.display()
+        ),
+    )
+    .unwrap();
+    let hook = HookConfig {
+        id: "capture_check".to_string(),
+        command: "/bin/sh".to_string(),
+        args: vec![hook_script.to_string_lossy().to_string()],
+        events: vec![HookEvent::AfterCheck],
+        mode: HookMode::Mandatory,
+        order: 0,
+        timeout_ms: Some(5_000),
+        enabled: true,
+        source: HookSource::User,
+    };
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: data_dir.clone(),
+        enable_index_watcher: false,
+        shell: "/usr/bin/false".to_string(),
+        command_allowlist: vec!["cargo test".to_string()],
+        hooks: vec![hook],
+        ..Config::default()
+    });
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+    assert_eq!(
+        result.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::Failed)
+    );
+
+    let captured: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&envelope).expect("the hook wrote its envelope"))
+            .unwrap();
+    assert_eq!(captured["event"], "after_check");
+    assert_eq!(captured["payload"]["command"], "cargo test");
+    assert_eq!(captured["payload"]["exitCode"], 1);
+    assert!(
+        captured["payload"]["findingIds"].is_array(),
+        "the payload carries the finding ids field: {captured}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);
 }

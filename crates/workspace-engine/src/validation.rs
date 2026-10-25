@@ -517,6 +517,14 @@ impl ValidationOrchestrator {
         self.command_store.load_proposal(proposal_id)
     }
 
+    /// The policy this orchestrator classifies with. The verification loop
+    /// builds a repository map from the same policy, so the map's per-root
+    /// commands and the proposals the loop stores cannot disagree about a risk
+    /// or an allowlist entry (spec 23 Task 4).
+    pub(crate) fn command_policy(&self) -> &CommandPolicy {
+        &self.command_policy
+    }
+
     pub fn reject_proposal(&self, proposal_id: &str, rejected_by: &str) -> Result<PathBuf> {
         let path = self.command_store.mark_rejected(proposal_id, rejected_by)?;
         self.audit_log.record(

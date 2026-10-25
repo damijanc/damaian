@@ -261,8 +261,8 @@ pub enum ExportFormat {
 /// link back to the task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApprovalRef {
-    /// `"command"`, `"patch"`, `"plan"`, `"provider_fallback"` or
-    /// `"round_budget"`.
+    /// `"command"`, `"patch"`, `"plan"`, `"provider_fallback"`,
+    /// `"round_budget"` or `"checks"`.
     pub kind: String,
     pub proposal_id: String,
 }
@@ -1772,7 +1772,9 @@ impl SessionStore {
     }
 
     /// Every verification event in the session belonging to one of
-    /// `task_ids`, in log order.
+    /// `task_ids`, in log order. An empty `task_ids` means every task, which is
+    /// what a verification turn needs to find the due event before it knows
+    /// which task proposed the patch.
     ///
     /// Takes a task chain because each verification turn is a new task carrying
     /// the plan: the `Due` names the task that proposed the patch, while the
@@ -1803,7 +1805,7 @@ impl SessionStore {
             else {
                 continue;
             };
-            if task_ids.iter().any(|id| *id == parsed.task_id()) {
+            if task_ids.is_empty() || task_ids.iter().any(|id| *id == parsed.task_id()) {
                 events.push(parsed);
             }
         }
