@@ -1167,9 +1167,10 @@ fn a_blocked_scenario_is_still_skipped_and_says_why() {
 }
 
 /// Guards the count in spec 18 §6, now that spec 17 has landed: every scenario
-/// runs and none is blocked. Twenty-three: spec 59 added `long_discovery` and
-/// `read_loop`, spec 62 added `approval_causes`, and spec 50 added
-/// `answered_question`.
+/// runs and none is blocked. Twenty-five: spec 59 added `long_discovery` and
+/// `read_loop`, spec 62 added `approval_causes`, spec 50 added
+/// `answered_question`, and spec 23 added `verified_repair` and
+/// `repair_limit_exhausted`.
 #[test]
 fn every_scenario_runs_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
@@ -1184,7 +1185,7 @@ fn every_scenario_runs_and_none_is_blocked() {
         Vec::<&str>::new(),
         "no scenario is deferred any more"
     );
-    assert_eq!(all.len(), 23, "twenty-three scenarios should run");
+    assert_eq!(all.len(), 25, "twenty-five scenarios should run");
 }
 
 #[test]
@@ -1471,8 +1472,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        23,
-        "all twenty-three scenario files should be accounted for"
+        25,
+        "all twenty-five scenario files should be accounted for"
     );
     assert_eq!(
         built

@@ -5,8 +5,8 @@ use workspace_engine::{
     AgentCommandProposal, AgentPatchProposal, CancelToken, ChatTurnOptions, ClientError, Config,
     CurlModelTransport, MockModelAdapter, ModelAdapter, ModelProviderConfig, ModelRequest,
     OpenAICompatibleAdapter, ProcessRegistry, Result, RoundBudgetDecision, SecretScanner,
-    SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink, UsageSource, WorkspaceEngine,
-    classify_session, resume,
+    SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink, UsageSource,
+    VerificationReport, WorkspaceEngine, classify_session, resume,
 };
 
 use crate::fixture::{self, Materialized};
@@ -43,6 +43,9 @@ pub struct Run {
     /// put up for an answer, and, like `continuation_request`, only the
     /// deterministic tier can supply it.
     pub answer_request: Option<String>,
+    /// The report the verification continuation produced, when the scenario
+    /// asked for one (spec 23 Task 9). `None` for every other scenario.
+    pub verification: Option<VerificationReport>,
     pub trace: Trace,
 }
 
@@ -302,6 +305,7 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
         apply_error: None,
         continuation_request: None,
         answer_request: None,
+        verification: None,
         trace: Trace::default(),
     })
 }
@@ -533,6 +537,108 @@ fn drive(
             false,
         ) {
             apply_error = Some(format!("{error:?}"));
+        }
+    }
+
+    // The patch the user reviewed, kept because the final outcome of a
+    // verification scenario is the report turn, which proposes no patch.
+    let applied_patch = outcome
+        .as_ref()
+        .ok()
+        .and_then(|result| result.patch_proposal.clone());
+
+    // Spec 23 Task 9: apply the proposed patch and drive the verification
+    // continuation — the check card, any repair patch, and the final report —
+    // exactly as the shell does after a patch settles.
+    let mut verification = None;
+    if scenario.verify_after_apply
+        && let Ok(result) = &outcome
+        && result.patch_proposal.is_some()
+    {
+        if let Some(patch) = result.patch_proposal.clone() {
+            engine.edit_orchestrator.apply_stored_patch(
+                &materialized.root,
+                &patch.patch_id,
+                None,
+                None,
+                "eval-harness",
+                false,
+            )?;
+        }
+        let session_id = result.session.id.clone();
+        let mut current = None;
+        for _ in 0..8 {
+            let turn = match current.take() {
+                Some(turn) => turn,
+                None => {
+                    let cancel = CancelToken::new();
+                    let mut on_token = |_token: &str| {};
+                    let mut on_progress = |_event: TurnProgress| {};
+                    let mut sink = TurnSink {
+                        on_token: &mut on_token,
+                        on_progress: &mut on_progress,
+                        cancel: &cancel,
+                        steering: None,
+                    };
+                    engine.chat_orchestrator.verify_due(
+                        &materialized.root,
+                        &session_id,
+                        adapter,
+                        &mut sink,
+                    )?
+                }
+            };
+            if let Some(batch) = turn.check_batch.clone() {
+                let decisions = batch
+                    .checks
+                    .iter()
+                    .map(|check| {
+                        let approved = scenario
+                            .check_decisions
+                            .iter()
+                            .find(|decision| decision.command == check.command)
+                            .is_some_and(|decision| decision.approved);
+                        (check.id.clone(), approved)
+                    })
+                    .collect::<Vec<_>>();
+                let cancel = CancelToken::new();
+                let mut on_token = |_token: &str| {};
+                let mut on_progress = |_event: TurnProgress| {};
+                let mut sink = TurnSink {
+                    on_token: &mut on_token,
+                    on_progress: &mut on_progress,
+                    cancel: &cancel,
+                    steering: None,
+                };
+                current = Some(engine.chat_orchestrator.resume_after_check_decision(
+                    &batch.id,
+                    &decisions,
+                    "eval-harness",
+                    adapter,
+                    &mut sink,
+                )?);
+                continue;
+            }
+            if let Some(patch) = turn.patch_proposal.clone() {
+                engine.edit_orchestrator.apply_stored_patch(
+                    &materialized.root,
+                    &patch.patch_id,
+                    None,
+                    None,
+                    "eval-harness",
+                    false,
+                )?;
+                continue;
+            }
+            verification = turn.verification_report.clone();
+            outcome = Ok(turn);
+            break;
+        }
+        if verification.is_none() {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: verification did not reach a report in 8 continuations",
+                scenario.name
+            )));
         }
     }
 
@@ -776,12 +882,13 @@ fn drive(
         response,
         context_files,
         command_proposal,
-        patch_proposal,
+        patch_proposal: patch_proposal.or(applied_patch),
         apply_error,
         // Filled by `run` after the deterministic adapter's requests are
         // available; the live tier has no request record to read.
         continuation_request: None,
         answer_request: None,
+        verification,
         trace,
     })
 }

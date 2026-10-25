@@ -161,11 +161,16 @@ one definition rather than two that drift.
 | Stop after a denied approval | A denied approval ends the turn with no command executed |
 | Recover from a failed validation command | A failing check is reported and retried within `agent_tool_retry_limit`, then stops |
 | Resume an interrupted session — **was blocked, see below** | A session killed mid-task classifies per [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) and is not auto-retried |
+| Verify a change, repair a failure | A failing `cargo test` is repaired, rerun, and the report's passed list holds only checks that ran with exit 0 ([spec 23](../23_verification_loop/proposal.md) §5.8) |
+| Verification that cannot be repaired | Exhausting the repair limit reports what still fails and never claims completion ([spec 23](../23_verification_loop/proposal.md) §5.8) |
 
-That is thirteen rows for the roadmap's twelve items, because "find an exact
+That is fifteen rows for the roadmap's twelve items, because "find an exact
 symbol and a conceptual feature" is two different mechanisms — exact match
 versus embedding retrieval — with different failure modes, and collapsing them
-would hide a regression in either.
+would hide a regression in either. The last two rows landed with spec 23: the
+`verified_repair` and `repair_limit_exhausted` scenarios apply a scripted patch,
+answer the check card, apply the repair patch and assert on the report's own
+passed and outcome fields.
 
 **Twelve of the thirteen were implementable when this spec was written. The
 resume scenario was not, and was deferred to

@@ -106,6 +106,15 @@ pub struct Asserts {
     /// §5.5), which should be zero. Fails as well when the run executed no
     /// exploration command, since a zero over nothing measured nothing.
     pub exploration_findings: Option<u64>,
+    /// The verification outcome the run must report (spec 23 Task 9).
+    pub verification_outcome: Option<String>,
+    /// A phrase the final report's summary must not contain. The negative
+    /// scenario uses `"complete"`, which is the claim an optimistic loop would
+    /// make.
+    pub verification_summary_excludes: Option<String>,
+    /// The exact commands the report lists as passed. The point is that none of
+    /// them was merely skipped or stale.
+    pub verification_passed_commands: Option<Vec<String>>,
     /// Assertion names that depend on a scripted tool call and are therefore
     /// skipped in the live tier (proposal §5.3), so a scenario stays one
     /// definition rather than two that drift.
@@ -157,6 +166,13 @@ pub struct Scenario {
     /// boundary so a malformed line is a load error, not a silently ignored
     /// setting. Applied at user scope: the harness is the user here.
     pub config_overlay: Option<ConfigOverlay>,
+    /// When set, the runner applies the proposed patch and drives the
+    /// verification continuation to a report, including any check card and
+    /// repair turns (spec 23 Task 9).
+    pub verify_after_apply: bool,
+    /// How each check on a verification card is answered, matched by command.
+    /// A check the list omits is declined, which is the card's default.
+    pub check_decisions: Vec<CheckDecision>,
     /// When set, the runner leaves the turn's task mid-action — an
     /// `action_started` with no `action_finished` — then reopens the store and
     /// classifies, which is what a restart does. See [`CrashMidAction`].
@@ -193,6 +209,10 @@ struct RawScenario {
     #[serde(default)]
     config_overlay: Option<String>,
     #[serde(default)]
+    verify_after_apply: bool,
+    #[serde(default)]
+    check_decisions: Vec<CheckDecision>,
+    #[serde(default)]
     crash_mid_action: Option<CrashMidAction>,
     #[serde(default, rename = "turn")]
     turns: Vec<RawTurn>,
@@ -227,6 +247,15 @@ pub struct CrashMidAction {
     /// Whether the interrupted action could be observed outside this process.
     /// `true` is what makes the outcome unknowable and the retry unsafe.
     pub side_effecting: bool,
+}
+
+/// One check card answer (spec 23 Task 9), matched by command so a scenario
+/// does not have to know a proposal id the engine creates at run time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct CheckDecision {
+    pub command: String,
+    pub approved: bool,
 }
 
 #[derive(Deserialize)]
@@ -320,6 +349,8 @@ pub fn load(path: &Path) -> Result<Scenario> {
             })?),
             None => None,
         },
+        verify_after_apply: raw.verify_after_apply,
+        check_decisions: raw.check_decisions,
         crash_mid_action: raw.crash_mid_action,
         turns,
         asserts: raw.asserts,

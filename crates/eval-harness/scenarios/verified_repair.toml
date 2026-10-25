@@ -1,0 +1,68 @@
+name = "verified_repair"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Add a retry to the upload client and verify it"
+
+# The model proposes a patch that does not compile, then repairs it once the
+# check reports the failure. This is spec 23's end-to-end loop: apply → run
+# checks → find → repair → rerun → report.
+verify_after_apply = true
+check_decisions = [{ command = "cargo test", approved = true }]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs" } },
+]
+
+[[turn]]
+content = "I added a retry helper."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Add upload retry", files = [
+    { path = "src/upload.rs", status = "modified", content = """
+pub fn upload(payload: &str) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("payload was empty".to_string());
+    }
+    Ok(())
+}
+
+pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
+    "this is not a Result"
+}
+""" },
+  ] } },
+]
+
+[[turn]]
+content = "The check failed with a type error; here is the fix."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Fix the retry return type", files = [
+    { path = "src/upload.rs", status = "modified", content = """
+pub fn upload(payload: &str) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("payload was empty".to_string());
+    }
+    Ok(())
+}
+
+pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
+    let mut last = Err("no attempt was made".to_string());
+    for _ in 0..attempts.max(1) {
+        last = upload(payload);
+        if last.is_ok() {
+            return last;
+        }
+    }
+    last
+}
+""" },
+  ] } },
+]
+
+[assert]
+verification_outcome = "passed"
+verification_passed_commands = ["cargo test"]
+final_task_status = "complete"
+patch_touches = ["src/upload.rs"]
+files_changed_outside_patch = 0

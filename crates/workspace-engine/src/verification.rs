@@ -141,6 +141,20 @@ pub enum VerificationOutcome {
     OnlyDocumentationChanged,
 }
 
+impl VerificationOutcome {
+    /// The wire and report name, matching the serde representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::RepairLimitExhausted => "repair_limit_exhausted",
+            Self::NoRepairApplied => "no_repair_applied",
+            Self::NoChecksAvailable => "no_checks_available",
+            Self::OnlyDocumentationChanged => "only_documentation_changed",
+        }
+    }
+}
+
 /// A session event, appended to the log beside the plan it populates.
 ///
 /// One event kind per variant; the wire names are the session-event kinds

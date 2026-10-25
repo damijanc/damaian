@@ -279,6 +279,62 @@ pub fn evaluate(
             );
         }
 
+        // Spec 23 Task 9: the report, not the task status alone. A scenario
+        // naming an outcome is asserting that verification actually reached it,
+        // and the passed-commands list is what separates "ran and exited zero"
+        // from "skipped" or "stale".
+        if let Some(expected) = &asserts.verification_outcome {
+            let actual = run
+                .verification
+                .as_ref()
+                .and_then(|report| report.outcome)
+                .map(|outcome| outcome.as_str().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            push(
+                "verification_outcome",
+                &actual == expected,
+                expected.clone(),
+                actual,
+            );
+        }
+
+        if let Some(excluded) = &asserts.verification_summary_excludes {
+            push(
+                "verification_summary_excludes",
+                !run.response.contains(excluded.as_str()),
+                format!("not containing {excluded:?}"),
+                if run.response.contains(excluded.as_str()) {
+                    "the word is present".to_string()
+                } else {
+                    "absent".to_string()
+                },
+            );
+        }
+
+        if let Some(expected) = &asserts.verification_passed_commands {
+            let passed = run
+                .verification
+                .as_ref()
+                .map(|report| {
+                    let mut commands: Vec<String> = report
+                        .passed
+                        .iter()
+                        .map(|check| check.command.clone())
+                        .collect();
+                    commands.sort();
+                    commands
+                })
+                .unwrap_or_default();
+            let mut wanted = expected.clone();
+            wanted.sort();
+            push(
+                "verification_passed_commands",
+                wanted == passed,
+                format!("{wanted:?}"),
+                format!("{passed:?}"),
+            );
+        }
+
         // §5.8's replay claim, read from the request the mock adapter recorded
         // rather than from the session log the request was rebuilt from.
         if let Some(wanted) = &asserts.continuation_request_contains {

@@ -1,0 +1,58 @@
+name = "repair_limit_exhausted"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Add a retry to the upload client"
+
+# The negative of `verified_repair`: the repair never fixes the compile error,
+# so the limit is exhausted. The report must not claim success.
+verify_after_apply = true
+check_decisions = [{ command = "cargo test", approved = true }]
+config_overlay = """
+agent_tool_retry_limit=1
+"""
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs" } },
+]
+
+[[turn]]
+content = "I added a retry helper."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Add upload retry", files = [
+    { path = "src/upload.rs", status = "modified", content = """
+pub fn upload(payload: &str) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("payload was empty".to_string());
+    }
+    Ok(())
+}
+
+pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
+    "this is not a Result"
+}
+""" },
+  ] } },
+]
+
+[[turn]]
+content = "I tried another fix."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Try again", files = [
+    { path = "src/upload.rs", status = "modified", content = """
+pub fn upload(payload: &str) -> Result<(), String> {
+    let _: i32 = "still not a number";
+    if payload.is_empty() {
+        return Err("payload was empty".to_string());
+    }
+    Ok(())
+}
+""" },
+  ] } },
+]
+
+[assert]
+verification_outcome = "repair_limit_exhausted"
+verification_summary_excludes = "complete"
+final_task_status = "failed"
