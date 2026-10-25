@@ -1523,18 +1523,34 @@ fn a_rate_with_no_observations_is_not_reported_as_zero() {
 /// ```
 ///
 /// This test is how you exercise the live tier against a real provider.
+///
+/// It goes through `run_scenarios`, as the binary does, so the scenario's
+/// `[assert]` block is evaluated. It used to call `run_live` directly and check
+/// only that a call happened: on 2026-10-25 an OpenRouter run whose answer was
+/// raw tool-call markup would have passed it.
 #[test]
 #[ignore = "needs provider credentials and network"]
 fn live_tier_runs_one_scenario_against_a_real_provider() {
     let path = scenario::scenarios_dir().join("file_references.toml");
     let loaded = scenario::load(&path).expect("scenario");
-    let run = eval_harness::runner::run_live(&loaded).expect("live run");
+    let built =
+        eval_harness::run_scenarios(std::slice::from_ref(&loaded), Tier::Live).expect("live run");
+    let record = &built.records[0];
 
-    assert!(!run.record.provider.is_empty());
-    assert_eq!(run.record.tier, "live");
+    assert!(!record.provider.is_empty());
+    assert_eq!(record.tier, "live");
     assert!(
-        run.record.model_calls > 0,
+        record.model_calls > 0,
         "a live run must actually call the provider"
+    );
+    assert!(
+        record.assertions.iter().any(|assertion| !assertion.skipped),
+        "a live run must evaluate at least one of the scenario's assertions"
+    );
+    let failures = report::failed_assertions(&built);
+    assert!(
+        failures.is_empty(),
+        "the live run failed its scenario's assertions: {failures:?}"
     );
     // Spec 19 supplies the figure, and a real call must carry one either way.
     // Which way is a property of the provider, not of this harness: DeepSeek
@@ -1542,7 +1558,7 @@ fn live_tier_runs_one_scenario_against_a_real_provider() {
     // `stream_options` yields an honest `len / 4` estimate. Asserting either
     // one specifically would make this test a claim about the provider.
     assert!(
-        run.record.tokens.input > 0,
+        record.tokens.input > 0,
         "a live run must record a token figure, measured or estimated"
     );
 }

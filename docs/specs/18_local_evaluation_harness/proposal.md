@@ -474,14 +474,15 @@ model is now set after the defaults, and
 it without credentials. The results above were taken with the model forced
 through `OPENROUTER_MODEL`, which the built-in template reads.
 
+**The documented live test checked no assertion.** It called `run_live`
+directly and asserted only that a provider was called and a token figure
+recorded, never the scenario's `[assert]` block, although the live tier is
+defined as keeping a scenario's assertions; a run whose answer was raw tool-call
+markup would have passed it. It now runs through `run_scenarios`, as the binary
+does, and fails on any failed assertion or when none was evaluated.
+
 **Still open, found by the same run:**
 
-- **The documented live test checks no assertion.** It asserts only that a
-  provider was called and a token figure recorded, never the scenario's
-  `[assert]` block, although the live tier is defined as keeping a scenario's
-  assertions. A run whose answer was raw tool-call markup would still pass it.
-  `run_tier` does evaluate assertions; the credential-gated test that
-  `docs/DEVELOPMENT.md` tells people to run does not.
 - **`deepseek/deepseek-chat` sometimes writes its tool call as text.** In two of
   five task runs the model put a complete, valid `propose_patch` call into the
   message content in DeepSeek's own separator syntax rather than into
