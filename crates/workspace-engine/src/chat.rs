@@ -13,7 +13,7 @@ use crate::command_policy::{
 use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::config::{Config, CostEstimate, McpTransport};
-use crate::context_manager::{ContextManager, ContextPlan, PromptSectionName};
+use crate::context_manager::{ContextManager, ContextPlan, ContextRequest, PromptSectionName};
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
 use crate::error::{ClientError, ProviderRefusal, Result};
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
@@ -1027,16 +1027,26 @@ impl ChatOrchestrator {
         };
         hook_context.extend(before_context);
 
-        let context = self.context_manager.build_context_with_hooks(
+        // The plan a resumed turn carries (`carry_plan_from_the_previous_turn`
+        // above). Read once here and handed to assembly so the model sees where
+        // the previous turn got to. `run_agentic_turn` reads the same plan again
+        // for its own mutable copy; nothing writes one between the two reads.
+        let carried_plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)
+            .ok()
+            .flatten();
+        let context = self.context_manager.build_context(ContextRequest {
             repository_root,
-            &index.repository_id,
-            &task.id,
+            repository_id: &index.repository_id,
+            task_id: &task.id,
             prompt,
-            Some(&index),
+            index: Some(&index),
             explicit_paths,
-            self.config.context_token_budget(),
-            &hook_context,
-        );
+            limit: self.config.context_token_budget(),
+            hook_context: &hook_context,
+            plan: carried_plan.as_ref(),
+        });
         let model_prompt = build_model_prompt(&context, &prior_messages, &self.scanner, None);
         let mode = self.session_store.session_mode(&session.id);
         // A worker is never invited to hand off further work (spec 57 §5.0).
@@ -10495,6 +10505,7 @@ mod approval_prompt_wording_tests {
                 root_path: None,
             }],
             files: Vec::new(),
+            excluded: Vec::new(),
         };
         let with_result = build_model_prompt(
             &plan,

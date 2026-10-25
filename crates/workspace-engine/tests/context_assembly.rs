@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use workspace_engine::context_manager::ExclusionReason;
 use workspace_engine::{
-    CancelToken, ChatTurnResult, Config, ConfigOverlay, ContextCategory, ContextItem, ContextKind,
-    ContextPlan, LineRange, MockModelAdapter, ModelAdapter, TurnProgress, TurnSink,
-    WorkspaceEngine,
+    CancelToken, ChatTurnResult, CollectionSource, Config, ConfigOverlay, ContextCategory,
+    ContextItem, ContextKind, ContextPlan, ContextRequest, ExclusionRecord, LineRange,
+    MockModelAdapter, ModelAdapter, PlanStep, Provenance, RepositoryIndex, StepStatus, Symbol,
+    SymbolIndexStore, TaskPlan, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -407,4 +409,606 @@ fn a_category_orders_before_the_categories_after_it() {
             pair[1]
         );
     }
+}
+
+// ---- Task 2: collection sources and exclusion at collection time ----
+
+/// One assembly with the Task 2 request shape, at the default budget.
+fn assemble(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    repository_id: &str,
+    prompt: &str,
+    explicit_paths: &[String],
+    index: Option<&RepositoryIndex>,
+    plan: Option<&TaskPlan>,
+) -> ContextPlan {
+    engine.context_manager.build_context(ContextRequest {
+        repository_root: repo,
+        repository_id,
+        task_id: "task-2",
+        prompt,
+        index,
+        explicit_paths,
+        limit: 16_000,
+        hook_context: &[],
+        plan,
+    })
+}
+
+/// Every restriction record for `path`, so a test can state which category it
+/// came from instead of accepting any record.
+fn restrictions_for<'a>(plan: &'a ContextPlan, path: &str) -> Vec<&'a ExclusionRecord> {
+    plan.excluded
+        .iter()
+        .filter(|record| {
+            record.reason == ExclusionReason::RestrictedPath && record.path.as_deref() == Some(path)
+        })
+        .collect()
+}
+
+fn assert_absent(plan: &ContextPlan, path: &str) {
+    assert!(
+        !plan
+            .items
+            .iter()
+            .any(|item| item.path.as_deref() == Some(path)),
+        "{path} became an included item: {:?}",
+        plan.items
+            .iter()
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !plan.files.iter().any(|included| included == path),
+        "{path} reached the included file list: {:?}",
+        plan.files
+    );
+}
+
+#[test]
+fn a_restricted_explicit_path_is_excluded_at_collection() {
+    let repo = fixture_repo("restricted-explicit");
+    write_fixture(&repo, "secrets/x.rs", "pub fn leaked() {}\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["secrets/x.rs".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Review the code",
+        &explicit,
+        Some(&index),
+        None,
+    );
+
+    assert_absent(&plan, "secrets/x.rs");
+    let records = restrictions_for(&plan, "secrets/x.rs");
+    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records[0].category, ContextCategory::FileRanges);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_restricted_prompt_mention_is_excluded_at_collection() {
+    let repo = fixture_repo("restricted-mention");
+    write_fixture(&repo, "secrets/x.rs", "pub fn leaked() {}\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Explain secrets/x.rs",
+        &[],
+        Some(&index),
+        None,
+    );
+
+    assert_absent(&plan, "secrets/x.rs");
+    let records = restrictions_for(&plan, "secrets/x.rs");
+    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records[0].category, ContextCategory::FileRanges);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_restricted_keyword_hit_is_excluded_at_collection() {
+    let repo = fixture_repo("restricted-keyword");
+    write_fixture(
+        &repo,
+        "secrets/keyword_probe.rs",
+        "pub fn keywordprobe() {}\n",
+    );
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    assert!(
+        index
+            .keyword_search("keywordprobe", 8)
+            .iter()
+            .any(|hit| hit.path == "secrets/keyword_probe.rs"),
+        "the fixture is not a keyword hit, so the test proves nothing"
+    );
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "keywordprobe",
+        &[],
+        Some(&index),
+        None,
+    );
+
+    assert_absent(&plan, "secrets/keyword_probe.rs");
+    let records = restrictions_for(&plan, "secrets/keyword_probe.rs");
+    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    // A search hit is `SearchResults`, not `FileRanges`: the two are ordered
+    // and budgeted differently (§5.3), while the header still says
+    // `retrieved_file`.
+    assert_eq!(records[0].category, ContextCategory::SearchResults);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A keyword search sees a file's whole content and a semantic search sees its
+/// chunks, so with eight path-named hits and one content-only hit the semantic
+/// list includes the content-only path and the keyword list does not.
+fn semantic_only_fixture(name: &str, content_only_path: &str) -> PathBuf {
+    let repo = temp_dir(name);
+    for number in 1..=8 {
+        write_fixture(
+            &repo,
+            &format!("probe/semanticprobe_{number:02}.rs"),
+            "// filler\n",
+        );
+    }
+    write_fixture(&repo, content_only_path, "// semanticprobe\n");
+    repo
+}
+
+#[test]
+fn a_restricted_semantic_hit_is_excluded_at_collection() {
+    let repo = semantic_only_fixture("restricted-semantic", "aaa/secrets/notes.rs");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let restricted = "aaa/secrets/notes.rs";
+    assert!(
+        !index
+            .keyword_search("semanticprobe", 8)
+            .iter()
+            .any(|hit| hit.path == restricted),
+        "the fixture is a keyword hit too, so the semantic source is not tested"
+    );
+    assert!(
+        index
+            .semantic_search("semanticprobe", 8)
+            .iter()
+            .any(|hit| hit.path == restricted),
+        "the fixture is not a semantic hit, so the test proves nothing"
+    );
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "semanticprobe",
+        &[],
+        Some(&index),
+        None,
+    );
+
+    assert_absent(&plan, restricted);
+    let records = restrictions_for(&plan, restricted);
+    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records[0].category, ContextCategory::SearchResults);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_restricted_instruction_path_is_excluded_at_collection() {
+    let repo = fixture_repo("restricted-instruction");
+    write_fixture(&repo, "secrets/AGENTS.md", "Never leak a token.\n");
+    write_fixture(&repo, "secrets/x.rs", "pub fn leaked() {}\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Explain secrets/x.rs",
+        &[],
+        Some(&index),
+        None,
+    );
+
+    assert_absent(&plan, "secrets/AGENTS.md");
+    let records = restrictions_for(&plan, "secrets/AGENTS.md");
+    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records[0].category, ContextCategory::Instructions);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_restricted_project_rule_is_excluded_at_collection() {
+    let repo = fixture_repo("restricted-project-rule");
+    let mut config = test_config(&repo);
+    config.restricted_patterns = vec!["README.md".to_string()];
+    let engine = WorkspaceEngine::new(config);
+    let index = engine.indexer.index_repository(&repo).unwrap();
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Review the code",
+        &[],
+        Some(&index),
+        None,
+    );
+
+    assert_absent(&plan, "README.md");
+    let records = restrictions_for(&plan, "README.md");
+    assert_eq!(records.len(), 1, "{:?}", plan.excluded);
+    assert_eq!(records[0].category, ContextCategory::Instructions);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_restricted_path_is_never_an_included_item() {
+    let repo = temp_dir("restricted-everywhere");
+    write_fixture(&repo, "README.md", "# Fixture\n");
+    write_fixture(&repo, "src/lib.rs", "pub fn answer() -> usize { 42 }\n");
+    write_fixture(&repo, "secrets/x.rs", "pub fn leaked() {}\n");
+    write_fixture(&repo, "secrets/AGENTS.md", "Never leak a token.\n");
+    write_fixture(&repo, "aaa/secrets/notes.rs", "// semanticprobe\n");
+    for number in 1..=8 {
+        write_fixture(
+            &repo,
+            &format!("probe/semanticprobe_{number:02}.rs"),
+            "// filler\n",
+        );
+    }
+    let mut config = test_config(&repo);
+    config.restricted_patterns.push("README.md".to_string());
+    let engine = WorkspaceEngine::new(config);
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["secrets/x.rs".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Explain secrets/x.rs and semanticprobe",
+        &explicit,
+        Some(&index),
+        None,
+    );
+
+    for path in [
+        "secrets/x.rs",
+        "secrets/AGENTS.md",
+        "aaa/secrets/notes.rs",
+        "README.md",
+    ] {
+        assert_absent(&plan, path);
+        assert!(
+            !restrictions_for(&plan, path).is_empty(),
+            "{path} was never recorded as restricted: {:?}",
+            plan.excluded
+        );
+    }
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn every_collection_source_refuses_a_restricted_path() {
+    let repo = fixture_repo("collection-sources");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let restricted = "secrets/api_token.txt";
+    // Exhaustive on purpose: a new `CollectionSource` variant fails to compile
+    // here until its case says whether the policy applies.
+    let sources = [
+        CollectionSource::Explicit,
+        CollectionSource::Mention,
+        CollectionSource::KeywordHit,
+        CollectionSource::SemanticHit,
+        CollectionSource::Instruction,
+        CollectionSource::ProjectRule,
+        CollectionSource::Map,
+        CollectionSource::Symbols,
+        CollectionSource::HookContext,
+        CollectionSource::PlanState,
+    ];
+    for source in sources {
+        let expected = match source {
+            CollectionSource::Explicit
+            | CollectionSource::Mention
+            | CollectionSource::KeywordHit
+            | CollectionSource::SemanticHit
+            | CollectionSource::Instruction
+            | CollectionSource::ProjectRule
+            | CollectionSource::Map
+            | CollectionSource::Symbols => Some(ExclusionReason::RestrictedPath),
+            // These carry session content, not a file path, so there is no
+            // path for the policy to refuse.
+            CollectionSource::HookContext | CollectionSource::PlanState => None,
+        };
+        assert_eq!(
+            engine
+                .context_manager
+                .collection_exclusion(source, restricted),
+            expected,
+            "{source:?} decided wrongly for {restricted}"
+        );
+    }
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn keyword_hits_are_ordered_before_semantic_hits() {
+    let repo = semantic_only_fixture("hit-order", "aaa/notes.rs");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let keyword = index.keyword_search("semanticprobe", 8);
+    let semantic = index.semantic_search("semanticprobe", 8);
+    assert!(
+        keyword
+            .iter()
+            .all(|hit| hit.path.starts_with("probe/semanticprobe_")),
+        "the keyword list is not the path-named files: {keyword:?}"
+    );
+    assert!(
+        semantic.iter().any(|hit| hit.path == "aaa/notes.rs"),
+        "the semantic list does not hold the content-only file: {semantic:?}"
+    );
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "semanticprobe",
+        &[],
+        Some(&index),
+        None,
+    );
+    let position = |path: &str| {
+        plan.items
+            .iter()
+            .position(|item| item.path.as_deref() == Some(path))
+            .unwrap_or_else(|| panic!("{path} is not in the plan: {:?}", plan.files))
+    };
+    let semantic_only = position("aaa/notes.rs");
+    for hit in &keyword {
+        assert!(
+            position(&hit.path) < semantic_only,
+            "{} followed a semantic hit: {:?}",
+            hit.path,
+            plan.files
+        );
+    }
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_keyword_hit_and_a_semantic_hit_for_one_path_become_one_item() {
+    let repo = temp_dir("hit-dedup");
+    write_fixture(&repo, "src/probe.rs", "pub fn dedupeprobe() {}\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    assert!(
+        index
+            .keyword_search("dedupeprobe", 8)
+            .iter()
+            .any(|hit| hit.path == "src/probe.rs")
+    );
+    assert!(
+        index
+            .semantic_search("dedupeprobe", 8)
+            .iter()
+            .any(|hit| hit.path == "src/probe.rs")
+    );
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "dedupeprobe",
+        &[],
+        Some(&index),
+        None,
+    );
+
+    assert_eq!(
+        plan.items
+            .iter()
+            .filter(|item| item.path.as_deref() == Some("src/probe.rs"))
+            .count(),
+        1,
+        "{:?}",
+        plan.files
+    );
+    assert_eq!(
+        plan.files
+            .iter()
+            .filter(|path| path.as_str() == "src/probe.rs")
+            .count(),
+        1,
+        "{:?}",
+        plan.files
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_carried_plan_becomes_a_plan_state_item() {
+    let repo = fixture_repo("plan-state");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let session = engine
+        .session_store
+        .create_session("repo-plan-state", "plan")
+        .unwrap();
+    let task = engine
+        .session_store
+        .create_task(&session.id, "carry on", "provider", "model")
+        .unwrap();
+    let mut plan = TaskPlan::new(&task.id, 1);
+    plan.steps = vec![
+        PlanStep {
+            id: "1".to_string(),
+            title: "Inspect the parser".to_string(),
+            detail: None,
+            status: StepStatus::Completed,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+        },
+        PlanStep {
+            id: "2".to_string(),
+            title: "Add the range check".to_string(),
+            detail: Some("start with the empty case".to_string()),
+            status: StepStatus::InProgress,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+        },
+    ];
+    engine.session_store.create_plan(&task, &plan).unwrap();
+    let stored = engine
+        .session_store
+        .read_task_plan(&session.id, &task.id)
+        .unwrap()
+        .expect("the plan was just written");
+
+    let context = assemble(
+        &engine,
+        &repo,
+        "repo-plan-state",
+        "Continue the task",
+        &[],
+        None,
+        Some(&stored),
+    );
+
+    let item = context
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::PlanState)
+        .expect("the carried plan is in the plan");
+    assert_eq!(item.category, ContextCategory::PlanState);
+    assert_eq!(item.path, None);
+    assert!(
+        item.content.contains("Inspect the parser"),
+        "{}",
+        item.content
+    );
+    assert!(
+        item.content.contains("Add the range check"),
+        "{}",
+        item.content
+    );
+    assert!(
+        item.content.contains("start with the empty case"),
+        "{}",
+        item.content
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// `src/upload.rs` declares `upload_retry` on line 42 and `upload_once` on
+/// line 44; `src/main.rs` calls the first (the fixture `symbol_index.rs` uses).
+fn upload_repo(name: &str) -> PathBuf {
+    let repo = temp_dir(name);
+    let mut upload = "// filler\n".repeat(41);
+    upload.push_str("pub fn upload_retry() {}\n\npub fn upload_once() {}\n");
+    write_fixture(&repo, "src/upload.rs", &upload);
+    write_fixture(
+        &repo,
+        "src/main.rs",
+        "fn main() {\n    upload_retry();\n}\n",
+    );
+    repo
+}
+
+#[test]
+fn the_symbols_item_keeps_the_lowest_provenance_it_contains() {
+    let repo = upload_repo("symbols-lowest-provenance");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let (stored, _) = engine.symbol_index(&repo).unwrap();
+    let retry = stored
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "upload_retry")
+        .expect("the heuristic index has the symbol")
+        .clone();
+    let hash = index
+        .files
+        .iter()
+        .find(|file| file.path == "src/upload.rs")
+        .expect("the fixture is indexed")
+        .content_hash
+        .clone();
+    let store = SymbolIndexStore::new(&engine.config.data_dir, engine.audit_log.clone());
+    assert!(
+        store
+            .merge_language_server(
+                &index.repository_id,
+                "src/upload.rs",
+                &hash,
+                vec![Symbol {
+                    provenance: Provenance::LanguageServer,
+                    ..retry
+                }],
+            )
+            .unwrap(),
+        "the language-server symbol was not merged"
+    );
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Compare upload_retry and upload_once",
+        &[],
+        Some(&index),
+        None,
+    );
+
+    let item = plan
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::Symbols)
+        .expect("the prompt names two symbols");
+    assert!(
+        item.content
+            .contains("upload_retry (function, src/upload.rs:42)"),
+        "{}",
+        item.content
+    );
+    assert!(
+        item.content
+            .contains("upload_once (function, src/upload.rs:44"),
+        "{}",
+        item.content
+    );
+    assert_eq!(item.provenance, Some(Provenance::Heuristic));
+
+    fs::remove_dir_all(repo).unwrap();
 }

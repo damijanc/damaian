@@ -36,12 +36,12 @@ use workspace_engine::hooks::{
 };
 use workspace_engine::{
     ApprovalCause, AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, CommandPolicy,
-    CommandRunner, CommandStore, Config, ConfigOverlay, ConfigScope, ContextKind, EffectivePolicy,
-    HookConfig, HookEvent, HookMode, HookReview, HookSource, MAX_HOOK_TIMEOUT_MS, MockModelAdapter,
-    ModelAdapter, ModelProviderConfig, ProcessRegistry, RepositoryConfigReport, RepositoryKeyClass,
-    SecretScanner, Session, SessionMode, SessionStore, SourceKind, Task, TaskStatus, ToolCall,
-    TurnProgress, TurnSink, ValidationOrchestrator, WorkspaceEngine, classify_session,
-    repository_id_for_root, split_profile_keys,
+    CommandRunner, CommandStore, Config, ConfigOverlay, ConfigScope, ContextKind, ContextRequest,
+    EffectivePolicy, HookConfig, HookEvent, HookMode, HookReview, HookSource, MAX_HOOK_TIMEOUT_MS,
+    MockModelAdapter, ModelAdapter, ModelProviderConfig, ProcessRegistry, RepositoryConfigReport,
+    RepositoryKeyClass, SecretScanner, Session, SessionMode, SessionStore, SourceKind, Task,
+    TaskStatus, ToolCall, TurnProgress, TurnSink, ValidationOrchestrator, WorkspaceEngine,
+    classify_session, repository_id_for_root, split_profile_keys,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -3005,16 +3005,17 @@ fn a_before_context_hook_adds_a_redacted_hook_context_item_to_an_edit_plan() {
 
     // Charged to the turn budget like any other item: under a tiny budget it is
     // dropped rather than made privileged.
-    let plan = engine.context_manager.build_context_with_hooks(
-        &root,
-        &repository_id_for_root(&root),
-        "task",
-        "Add a",
-        None,
-        &[],
-        4,
-        &[("noter".to_string(), "x".repeat(400))],
-    );
+    let plan = engine.context_manager.build_context(ContextRequest {
+        repository_root: &root,
+        repository_id: &repository_id_for_root(&root),
+        task_id: "task",
+        prompt: "Add a",
+        index: None,
+        explicit_paths: &[],
+        limit: 4,
+        hook_context: &[("noter".to_string(), "x".repeat(400))],
+        plan: None,
+    });
     assert!(
         plan.items
             .iter()

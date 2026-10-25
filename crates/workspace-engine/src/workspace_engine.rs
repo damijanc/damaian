@@ -101,6 +101,7 @@ impl WorkspaceEngine {
         );
         let context_manager = ContextManager::new(
             file_access.clone(),
+            path_policy.clone(),
             scanner.clone(),
             config.data_dir.clone(),
             config.enable_semantic_search,

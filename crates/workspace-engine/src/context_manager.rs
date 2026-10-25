@@ -2,6 +2,7 @@ use crate::command_policy::CommandPolicy;
 use crate::file_access::{FileAccessController, LineRange};
 use crate::indexer::RepositoryIndex;
 use crate::path_policy::PathPolicy;
+use crate::plan::TaskPlan;
 use crate::repository_map::{RepositoryMap, RepositoryMapStore};
 use crate::secret_scanner::SecretScanner;
 use crate::symbol_index::{Provenance, SymbolIndexStore};
@@ -104,6 +105,11 @@ impl ContextKind {
     }
 
     /// The one place the kind-to-category decision lives (proposal §5.1).
+    ///
+    /// A search hit is `SearchResults`, not `FileRanges`: §5.3 orders exact
+    /// keyword hits before semantic ones and drops semantic hits first when
+    /// that category is over budget. `retrieved_file` stays the header spelling
+    /// either way, so the prompt is unchanged (Correction C18).
     pub fn category(self) -> ContextCategory {
         match self {
             Self::UserPrompt => ContextCategory::Required,
@@ -113,9 +119,58 @@ impl ContextKind {
             Self::PlanState => ContextCategory::PlanState,
             Self::RepositoryMap => ContextCategory::RepositoryMap,
             Self::Symbols => ContextCategory::Symbols,
-            Self::RetrievedFile | Self::ExplicitFile => ContextCategory::FileRanges,
+            Self::RetrievedFile => ContextCategory::SearchResults,
+            Self::ExplicitFile => ContextCategory::FileRanges,
         }
     }
+}
+
+/// Where one collection decision came from (proposal §5.3, §5.6).
+///
+/// The assembler matches on this with no wildcard arm, so a source that skips
+/// the collection-time path-policy check does not compile, and
+/// `every_collection_source_refuses_a_restricted_path` walks every variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionSource {
+    /// A path the caller passed as `explicit_paths`.
+    Explicit,
+    /// A path the prompt mentioned and the index resolved.
+    Mention,
+    /// An exact keyword-search hit.
+    KeywordHit,
+    /// A semantic-similarity hit.
+    SemanticHit,
+    /// An `AGENTS.md` in the hierarchy of a collected path.
+    Instruction,
+    /// A root project rule such as `README.md`.
+    ProjectRule,
+    /// The rendered repository map.
+    Map,
+    /// The rendered symbols block.
+    Symbols,
+    /// Context a hook returned.
+    HookContext,
+    /// The plan a resumed turn carries.
+    PlanState,
+}
+
+/// Why an item was left out of the plan (proposal §5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusionReason {
+    RestrictedPath,
+}
+
+/// One item that did not enter the plan, with the reason. Never content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExclusionRecord {
+    pub reason: ExclusionReason,
+    pub path: Option<String>,
+    #[serde(rename = "lineRange")]
+    pub range: Option<LineRange>,
+    pub category: ContextCategory,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +229,9 @@ pub struct ContextPlan {
     pub token_estimate: usize,
     pub items: Vec<ContextItem>,
     pub files: Vec<String>,
+    /// Everything collection left out, with the reason (proposal §5.6). Never
+    /// content.
+    pub excluded: Vec<ExclusionRecord>,
 }
 
 impl ContextPlan {
@@ -244,9 +302,32 @@ impl ContextPlan {
     }
 }
 
+/// Everything one assembly needs (Correction C12).
+///
+/// A struct rather than eight parameters: the argument list had already reached
+/// the `too_many_arguments` limit, and spec 27 adds a `pinned` field without
+/// touching what either caller passes for everything else. Spec 26 populates
+/// no extra source.
+pub struct ContextRequest<'a> {
+    pub repository_root: &'a Path,
+    pub repository_id: &'a str,
+    pub task_id: &'a str,
+    pub prompt: &'a str,
+    pub index: Option<&'a RepositoryIndex>,
+    pub explicit_paths: &'a [String],
+    pub limit: usize,
+    pub hook_context: &'a [(String, String)],
+    /// The plan a resumed turn carries, read from `SessionStore` by the caller.
+    /// `None` for a new turn, an edit, and every caller that has no plan.
+    pub plan: Option<&'a TaskPlan>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ContextManager {
     file_access: FileAccessController,
+    /// The engine's own instance, so collection time applies the same rule the
+    /// read path does (Correction C10). It is not a second policy.
+    path_policy: PathPolicy,
     scanner: SecretScanner,
     data_dir: PathBuf,
     enable_semantic_search: bool,
@@ -277,6 +358,7 @@ pub struct SymbolSource {
 impl ContextManager {
     pub fn new(
         file_access: FileAccessController,
+        path_policy: PathPolicy,
         scanner: SecretScanner,
         data_dir: PathBuf,
         enable_semantic_search: bool,
@@ -285,6 +367,7 @@ impl ContextManager {
     ) -> Self {
         Self {
             file_access,
+            path_policy,
             scanner,
             data_dir,
             enable_semantic_search,
@@ -293,149 +376,162 @@ impl ContextManager {
         }
     }
 
-    // Each argument is an independent input to the context plan; a params
-    // struct would be constructed at the single call site and immediately
-    // destructured here.
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_context(
+    /// The collection-time half of proposal §5.6's double check.
+    ///
+    /// The read path checks again inside [`FileAccessController::read_file`];
+    /// this is not a second rule set, it is the engine's own [`PathPolicy`]
+    /// applied before a file is even opened (Correction C10). Checking twice is
+    /// deliberate: a single check at the end is one new collection path away
+    /// from being bypassed.
+    ///
+    /// Public so `every_collection_source_refuses_a_restricted_path` can walk
+    /// every variant. The match has no wildcard arm: a new source has to decide
+    /// whether the policy applies before it compiles.
+    pub fn collection_exclusion(
         &self,
-        repository_root: impl AsRef<Path>,
-        repository_id: &str,
-        task_id: &str,
-        prompt: &str,
-        index: Option<&RepositoryIndex>,
-        explicit_paths: &[String],
-        token_budget: usize,
-    ) -> ContextPlan {
-        self.build_context_with_hooks(
+        source: CollectionSource,
+        path: &str,
+    ) -> Option<ExclusionReason> {
+        let restricted = match source {
+            CollectionSource::Explicit => self.path_policy.is_restricted(path, false),
+            CollectionSource::Mention => self.path_policy.is_restricted(path, false),
+            CollectionSource::KeywordHit => self.path_policy.is_restricted(path, false),
+            CollectionSource::SemanticHit => self.path_policy.is_restricted(path, false),
+            CollectionSource::Instruction => self.path_policy.is_restricted(path, false),
+            CollectionSource::ProjectRule => self.path_policy.is_restricted(path, false),
+            // Both stores already filter their own inputs, and the rendered
+            // block has no path of its own. The arms still apply the policy so
+            // the exhaustive walk has one answer for every source rather than
+            // a special case hiding where a path is not checked.
+            CollectionSource::Map => self.path_policy.is_restricted(path, false),
+            CollectionSource::Symbols => self.path_policy.is_restricted(path, false),
+            // Session content, not file content: `add_text` carries it and the
+            // path policy has no path to judge.
+            CollectionSource::HookContext => false,
+            CollectionSource::PlanState => false,
+        };
+        restricted.then_some(ExclusionReason::RestrictedPath)
+    }
+
+    pub fn build_context(&self, request: ContextRequest<'_>) -> ContextPlan {
+        let ContextRequest {
             repository_root,
             repository_id,
             task_id,
             prompt,
             index,
             explicit_paths,
-            token_budget,
-            &[],
-        )
-    }
+            limit,
+            hook_context,
+            plan,
+        } = request;
 
-    /// [`Self::build_context`] with the context a `session_start` or
-    /// `before_context` hook returned (spec 32 `context.md` §10). Each entry
-    /// becomes an ordinary `hook_context` item through the same `add_text`
-    /// path as every other item, so it is redacted and charged to the turn's
-    /// budget rather than being a privileged channel.
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_context_with_hooks(
-        &self,
-        repository_root: impl AsRef<Path>,
-        repository_id: &str,
-        task_id: &str,
-        prompt: &str,
-        index: Option<&RepositoryIndex>,
-        explicit_paths: &[String],
-        token_budget: usize,
-        hook_context: &[(String, String)],
-    ) -> ContextPlan {
         let mut items = Vec::new();
         let mut files = Vec::new();
+        let mut excluded = Vec::new();
         let mut token_estimate = 0;
 
         add_text(
             &self.scanner,
             &mut items,
             &mut token_estimate,
-            token_budget,
+            limit,
             ContextKind::UserPrompt,
+            None,
             None,
             prompt,
         );
 
-        let requested_paths: Vec<(String, bool)> = explicit_paths
-            .iter()
-            .map(|path| (path.clone(), true))
-            .collect();
+        let requested_paths = explicit_paths.to_vec();
         let mentioned_paths = prompt_file_mentions(prompt, index);
-        let mut context_paths = requested_paths
+        // Kept apart rather than concatenated (proposal §5.3): exact keyword
+        // hits are evidence, semantic hits are suggestions, and when
+        // `SearchResults` is over budget the semantic ones go first. Both use
+        // the `retrieved_file` header; only the category differs.
+        let keyword_hits = index
+            .map(|index| index.keyword_search(prompt, 8))
+            .unwrap_or_default();
+        let semantic_hits = index
+            .map(|index| {
+                if self.enable_semantic_search {
+                    VectorIndexCache::semantic_search(&self.data_dir, index, prompt, 8)
+                } else {
+                    index.semantic_search(prompt, 8)
+                }
+            })
+            .unwrap_or_default();
+
+        // Candidate paths, in the order they are considered. Instruction paths
+        // are derived from every candidate, including the ones collection will
+        // refuse: a restricted `secrets/AGENTS.md` beside a restricted path is
+        // considered and recorded, not silently never noticed.
+        let mut context_paths = requested_paths.clone();
+        for path in mentioned_paths
             .iter()
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        for path in &mentioned_paths {
+            .chain(keyword_hits.iter().map(|hit| &hit.path))
+            .chain(semantic_hits.iter().map(|hit| &hit.path))
+        {
             if !context_paths.iter().any(|existing| existing == path) {
                 context_paths.push(path.clone());
             }
         }
 
-        let search_results = index.map(|index| {
-            let mut results = index.keyword_search(prompt, 8);
-            results.extend(if self.enable_semantic_search {
-                VectorIndexCache::semantic_search(&self.data_dir, index, prompt, 8)
-            } else {
-                index.semantic_search(prompt, 8)
-            });
-            results
-        });
-        if let Some(results) = &search_results {
-            for result in results {
-                if !context_paths
-                    .iter()
-                    .any(|existing| existing == &result.path)
-                {
-                    context_paths.push(result.path.clone());
-                }
-            }
-        }
-
         for path in context_paths.iter().filter(|path| {
-            requested_paths
-                .iter()
-                .any(|(requested, _)| requested == *path)
+            requested_paths.iter().any(|requested| requested == *path)
                 || mentioned_paths.iter().any(|mentioned| mentioned == *path)
         }) {
-            let allow_outside_root = requested_paths
-                .iter()
-                .find(|(requested, _)| *requested == *path)
-                .map(|(_, allow)| *allow)
-                .unwrap_or(false);
+            let requested = requested_paths.iter().any(|requested| requested == path);
+            let source = if requested {
+                CollectionSource::Explicit
+            } else {
+                CollectionSource::Mention
+            };
             self.add_file(
-                repository_root.as_ref(),
+                repository_root,
                 repository_id,
                 task_id,
-                path,
+                path.as_str(),
+                source,
                 ContextKind::ExplicitFile,
                 &mut files,
                 &mut items,
+                &mut excluded,
                 &mut token_estimate,
-                token_budget,
-                allow_outside_root,
+                limit,
+                requested,
             );
         }
 
         for instruction_path in agent_instruction_paths(&context_paths) {
             self.add_file(
-                repository_root.as_ref(),
+                repository_root,
                 repository_id,
                 task_id,
                 &instruction_path,
+                CollectionSource::Instruction,
                 ContextKind::AgentInstruction,
                 &mut files,
                 &mut items,
+                &mut excluded,
                 &mut token_estimate,
-                token_budget,
+                limit,
                 false,
             );
         }
 
         for rule_path in PROJECT_RULES {
             self.add_file(
-                repository_root.as_ref(),
+                repository_root,
                 repository_id,
                 task_id,
                 rule_path,
+                CollectionSource::ProjectRule,
                 ContextKind::ProjectRule,
                 &mut files,
                 &mut items,
+                &mut excluded,
                 &mut token_estimate,
-                token_budget,
+                limit,
                 false,
             );
         }
@@ -448,8 +544,9 @@ impl ContextManager {
                 &self.scanner,
                 &mut items,
                 &mut token_estimate,
-                token_budget,
+                limit,
                 ContextKind::RepositoryMap,
+                None,
                 None,
                 &text,
             );
@@ -457,7 +554,7 @@ impl ContextManager {
 
         // The symbols the prompt names, in the same place for the same
         // reason: it displaces retrieved files, never instructions or the map.
-        if let Some(text) = index
+        if let Some((text, provenance)) = index
             .zip(map.as_ref())
             .and_then(|(index, map)| self.symbols_text(index, map, prompt))
         {
@@ -465,9 +562,10 @@ impl ContextManager {
                 &self.scanner,
                 &mut items,
                 &mut token_estimate,
-                token_budget,
+                limit,
                 ContextKind::Symbols,
                 None,
+                provenance,
                 &text,
             );
         }
@@ -482,25 +580,47 @@ impl ContextManager {
                 &self.scanner,
                 &mut items,
                 &mut token_estimate,
-                token_budget,
+                limit,
                 ContextKind::HookContext,
                 Some(format!("hook:{hook_id}")),
+                None,
                 text,
             );
         }
 
-        if let Some(results) = search_results {
-            for result in results {
+        // A plan a resumed turn carried (`chat.rs`'s
+        // `carry_plan_from_the_previous_turn`) is ordinary, redacted, charged
+        // context — not a privileged channel (proposal §5.11).
+        if let Some(text) = plan.and_then(plan_state_text) {
+            add_text(
+                &self.scanner,
+                &mut items,
+                &mut token_estimate,
+                limit,
+                ContextKind::PlanState,
+                None,
+                None,
+                &text,
+            );
+        }
+
+        for (source, hits) in [
+            (CollectionSource::KeywordHit, &keyword_hits),
+            (CollectionSource::SemanticHit, &semantic_hits),
+        ] {
+            for hit in hits {
                 self.add_file(
-                    repository_root.as_ref(),
+                    repository_root,
                     repository_id,
                     task_id,
-                    &result.path,
+                    &hit.path,
+                    source,
                     ContextKind::RetrievedFile,
                     &mut files,
                     &mut items,
+                    &mut excluded,
                     &mut token_estimate,
-                    token_budget,
+                    limit,
                     false,
                 );
             }
@@ -512,6 +632,7 @@ impl ContextManager {
             token_estimate,
             items,
             files,
+            excluded,
         }
     }
 
@@ -537,18 +658,22 @@ impl ContextManager {
         (max_tokens > 0).then(|| map.render_for_model(max_tokens).text)
     }
 
-    /// The symbols the prompt's identifiers name, or `None` when the ceiling
-    /// is `0`, nothing matches, or the symbol index cannot be loaded or
-    /// stored, which leaves the item out rather than failing the turn. It
-    /// reads the stored index as it is, whatever an eager definition pass has
-    /// merged so far, and never waits on a language server (`context.md`
-    /// §8).
+    /// The symbols the prompt's identifiers name and the provenance of the
+    /// weakest one shown, or `None` when the ceiling is `0`, nothing matches,
+    /// or the symbol index cannot be loaded or stored, which leaves the item
+    /// out rather than failing the turn. It reads the stored index as it is,
+    /// whatever an eager definition pass has merged so far, and never waits on
+    /// a language server (`context.md` §8).
+    ///
+    /// The block's provenance is the **lowest** among the lines it actually
+    /// contains (proposal §5.3): one heuristic symbol makes the whole block a
+    /// guess, however many exact ones sit beside it.
     fn symbols_text(
         &self,
         index: &RepositoryIndex,
         map: &RepositoryMap,
         prompt: &str,
-    ) -> Option<String> {
+    ) -> Option<(String, Option<Provenance>)> {
         let source = &self.symbols;
         if source.max_tokens == 0 {
             return None;
@@ -562,7 +687,17 @@ impl ContextManager {
             return None;
         }
         let rendered = symbols.render_for_model(&matches, source.max_tokens);
-        (!rendered.text.is_empty()).then_some(rendered.text)
+        if rendered.text.is_empty() {
+            return None;
+        }
+        // `Provenance::Heuristic` sorts after `LanguageServer`, so the maximum
+        // is the least authoritative entry present in the rendered block.
+        let provenance = matches
+            .iter()
+            .take(rendered.shown)
+            .map(|matched| matched.symbol.provenance)
+            .max();
+        Some((rendered.text, provenance))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -572,14 +707,33 @@ impl ContextManager {
         repository_id: &str,
         task_id: &str,
         path: &str,
+        source: CollectionSource,
         kind: ContextKind,
         files: &mut Vec<String>,
         items: &mut Vec<ContextItem>,
+        excluded: &mut Vec<ExclusionRecord>,
         token_estimate: &mut usize,
         token_budget: usize,
         allow_outside_root: bool,
     ) {
         if files.iter().any(|existing| existing == path) {
+            return;
+        }
+        // The collection-time check, before the file is opened (proposal §5.6).
+        // `read_file` checks again; this one is what keeps a restricted path
+        // from being read at all, and what puts it in the record as considered
+        // and refused rather than never noticed.
+        if let Some(reason) = self.collection_exclusion(source, path) {
+            push_exclusion(
+                excluded,
+                ExclusionRecord {
+                    reason,
+                    path: Some(path.to_string()),
+                    range: None,
+                    category: kind.category(),
+                    detail: None,
+                },
+            );
             return;
         }
         // `Whole`, not the tool's bounded window: this function has its own
@@ -603,6 +757,7 @@ impl ContextManager {
             token_budget,
             kind,
             Some(file.path.clone()),
+            None,
             &file.content,
         );
         if added {
@@ -611,6 +766,49 @@ impl ContextManager {
     }
 }
 
+/// Record an exclusion once per `(reason, path)`. The same restricted path can
+/// be reached by more than one source — a prompt mention is also a keyword hit
+/// — and the manifest wants the fact, not a copy per route.
+fn push_exclusion(excluded: &mut Vec<ExclusionRecord>, record: ExclusionRecord) {
+    let duplicate = excluded
+        .iter()
+        .any(|existing| existing.reason == record.reason && existing.path == record.path);
+    if !duplicate {
+        excluded.push(record);
+    }
+}
+
+/// A carried plan as the `plan_state` item's text (proposal §5.11).
+///
+/// Only the steps: evidence is the panel's record of what happened, not a
+/// prompt input. `None` for a plan with no steps, which is a plan with nothing
+/// to carry.
+fn plan_state_text(plan: &TaskPlan) -> Option<String> {
+    if plan.steps.is_empty() {
+        return None;
+    }
+    let mut text = String::from("The plan this task is carrying forward:\n");
+    for (index, step) in plan.steps.iter().enumerate() {
+        let status = match step.status {
+            crate::plan::StepStatus::Pending => "pending",
+            crate::plan::StepStatus::InProgress => "in progress",
+            crate::plan::StepStatus::Completed => "completed",
+            crate::plan::StepStatus::Blocked => "blocked",
+            crate::plan::StepStatus::Skipped => "skipped",
+        };
+        text.push_str(&format!("{}. [{status}] {}", index + 1, step.title));
+        if let Some(detail) = &step.detail {
+            text.push_str(&format!(" — {detail}"));
+        }
+        text.push('\n');
+    }
+    Some(text)
+}
+
+// The accumulators are borrowed plan state and the rest are the item's own
+// fields; a params struct would be built at each call site only to be
+// destructured here. Task 4 folds the budget accumulators into one type.
+#[allow(clippy::too_many_arguments)]
 fn add_text(
     scanner: &SecretScanner,
     items: &mut Vec<ContextItem>,
@@ -618,6 +816,7 @@ fn add_text(
     token_budget: usize,
     kind: ContextKind,
     path: Option<String>,
+    provenance: Option<Provenance>,
     content: &str,
 ) -> bool {
     if content.is_empty() {
@@ -647,7 +846,7 @@ fn add_text(
         } else {
             "redacted".to_string()
         },
-        provenance: None,
+        provenance,
         root_path: None,
     });
     true

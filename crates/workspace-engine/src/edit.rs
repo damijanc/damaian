@@ -6,7 +6,7 @@ use crate::checkpoint::{
     CheckpointRequest, CheckpointStore,
 };
 use crate::config::Config;
-use crate::context_manager::{ContextManager, ContextPlan, PromptSectionName};
+use crate::context_manager::{ContextManager, ContextPlan, ContextRequest, PromptSectionName};
 use crate::error::{ClientError, Result};
 use crate::finding::{Finding, FindingDraft, FindingSource, Severity};
 use crate::hash::{create_id, repository_id_for_root};
@@ -506,16 +506,18 @@ impl EditOrchestrator {
             }
             outcome.context
         };
-        let context = self.context_manager.build_context_with_hooks(
-            repository_root.as_ref(),
-            &index.repository_id,
-            &task.id,
+        let context = self.context_manager.build_context(ContextRequest {
+            repository_root: repository_root.as_ref(),
+            repository_id: &index.repository_id,
+            task_id: &task.id,
             prompt,
-            Some(&index),
+            index: Some(&index),
             explicit_paths,
-            self.config.context_token_budget(),
-            &hook_context,
-        );
+            limit: self.config.context_token_budget(),
+            hook_context: &hook_context,
+            // A one-shot edit has no turn whose plan it could carry.
+            plan: None,
+        });
         let request = ModelRequest {
             provider: self.config.model_provider.clone(),
             model: self.config.model_name.clone(),

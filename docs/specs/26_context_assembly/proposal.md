@@ -273,7 +273,14 @@ exactly one category, and the mapping is the one place that decision lives:
 | `PlanState` | `PlanState` |
 | `RepositoryMap` | `RepositoryMap` |
 | `Symbols` | `Symbols` |
-| `RetrievedFile`, `ExplicitFile` | `FileRanges` |
+| `RetrievedFile` | `SearchResults` |
+| `ExplicitFile` | `FileRanges` |
+
+A search hit is `SearchResults`, not `FileRanges` (C18): §5.3 orders exact keyword
+hits before semantic ones and drops semantic hits first when that category is
+over budget, which `FileRanges` — the explicitly requested and mentioned paths —
+does not describe. The header still prints `retrieved_file` for a search hit and
+`explicit_file` for an explicit one, so splitting the category changes no prompt.
 
 `HookContext` is its own category rather than sharing `Pinned`: spec 32's Task 10
 requires `hook_context` to survive as a category, and giving it a share is what
@@ -366,6 +373,15 @@ two lists are concatenated before any of this is visible — `keyword_search`
 results are extended with `semantic_search` and both become `retrieved_file`
 paths (`context_manager.rs:164-182`) — so the source has to be carried per
 result before this rule can exist.
+
+Assembly therefore keeps the two searches as separate lists, adds keyword hits
+first, and deduplicates by path so a path found by both becomes one item. Each
+result carries its `CollectionSource` (`KeywordHit` or `SemanticHit`) through the
+collection-time check, so a restricted path is refused on either route and
+recorded once. Both use the `retrieved_file` header and the `SearchResults`
+category; only the order differs. The eight former parameters travel in one
+`ContextRequest` struct (C12), which also removes `build_context_with_hooks`:
+hook context is one more field rather than a second entry point.
 
 ### 5.4 Range deduplication
 
@@ -480,9 +496,20 @@ being bypassed by a new collection path, and the acceptance criterion is written
 to assert exclusion **at every stage** so a new source cannot be added without a
 test forcing it through the check.
 
+The check is `ContextManager::collection_exclusion`, and its input is one of the
+ten `CollectionSource` variants. The match has **no wildcard arm**, so a new
+source does not compile until it says whether the policy applies, and
+`every_collection_source_refuses_a_restricted_path` walks every variant. The
+explicit, mention, keyword-hit, semantic-hit, instruction and project-rule
+sources all call `PathPolicy::is_restricted`; the map and symbol stores already
+filter their own inputs, and hook context and plan state carry session content
+with no path to judge. The refused path becomes an `ExclusionRecord` with
+`RestrictedPath`, carrying its category and path but never its content.
+
 `ContextManager` does not hold a `PathPolicy` today, so it gains one, wired from
 `workspace_engine.rs:88-117`. That is a plain field, not a second policy
-implementation: the same `PathPolicy` instance the read path uses.
+implementation: the same `PathPolicy` instance the read path uses, passed to
+`ContextManager::new` beside the `FileAccessController` built from it.
 
 A restricted path never enters the manifest's `included` list, and appears in
 `excluded` as `RestrictedPath` — which is itself the assertion that it was
@@ -630,7 +657,12 @@ invent one:
 A reserved category still appears in the manifest with its allocation and zero
 use, and its share is redistributed by §5.2 like any unused share. `PlanState` is
 **not** reserved: a plan already persists and is carried between turns
-(`session.rs:1554`, `chat.rs:2727-2738`), so this spec renders it as an item.
+(`session.rs:1554`, `chat.rs:2727-2738`), so this spec renders it as an item. The
+caller reads the plan for the current task once before assembly — the turn
+carries it via `carry_plan_from_the_previous_turn`, so a new turn has none — and
+passes it in `ContextRequest::plan`. The item lists each step in order with its
+status and detail; evidence stays on the panel and is not a prompt input. A plan
+with no steps produces no item, because there is nothing to carry.
 
 ## 6. Acceptance Criteria
 

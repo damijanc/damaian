@@ -50,15 +50,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use workspace_engine::finding::{FindingSource, FindingStatus, Severity, SourceRange};
 use workspace_engine::language::extract_symbols;
 use workspace_engine::{
-    AuditLog, CommandPolicy, Config, ConfigOverlay, ContextKind, ContextPlan, Declaration,
-    LANGUAGE_SERVER_LANGUAGES, LanguageServerError, LanguageServerHub, LanguageServerLaunch,
-    LanguageServerLimits, LanguageServerState, MERGE_LINE_TOLERANCE, MatchQuality,
-    MockModelAdapter, PathPolicy, ProcessIdentity, ProcessKind, ProcessRegistry, ProjectIndexer,
-    Provenance, RebuildReason, RegisteredProcess, RelationKind, RelationTarget, RepositoryIndex,
-    RepositoryKeyClass, RepositoryMap, RepositoryTrustStore, SYMBOL_INDEX_SCHEMA_VERSION,
-    SecretScanner, SweepScope, Symbol, SymbolIndex, SymbolIndexStore, SymbolKind, SymbolLoad,
-    SymbolRef, WorkspaceEngine, extract_declarations, merge, read_message, run_definition_pass,
-    write_message,
+    AuditLog, CommandPolicy, Config, ConfigOverlay, ContextKind, ContextPlan, ContextRequest,
+    Declaration, LANGUAGE_SERVER_LANGUAGES, LanguageServerError, LanguageServerHub,
+    LanguageServerLaunch, LanguageServerLimits, LanguageServerState, MERGE_LINE_TOLERANCE,
+    MatchQuality, MockModelAdapter, PathPolicy, ProcessIdentity, ProcessKind, ProcessRegistry,
+    ProjectIndexer, Provenance, RebuildReason, RegisteredProcess, RelationKind, RelationTarget,
+    RepositoryIndex, RepositoryKeyClass, RepositoryMap, RepositoryTrustStore,
+    SYMBOL_INDEX_SCHEMA_VERSION, SecretScanner, SweepScope, Symbol, SymbolIndex, SymbolIndexStore,
+    SymbolKind, SymbolLoad, SymbolRef, WorkspaceEngine, extract_declarations, merge, read_message,
+    run_definition_pass, write_message,
 };
 use workspace_engine::{Evidence, FileDiagnostics, PlanStep, StepStatus, TaskPhase, TaskPlan};
 
@@ -3190,15 +3190,17 @@ impl Repo {
 
     fn context(&self, engine: &WorkspaceEngine, prompt: &str) -> ContextPlan {
         let index = self.index();
-        engine.context_manager.build_context(
-            &self.root,
-            &index.repository_id,
-            "task_symbols",
+        engine.context_manager.build_context(ContextRequest {
+            repository_root: &self.root,
+            repository_id: &index.repository_id,
+            task_id: "task_symbols",
             prompt,
-            Some(&index),
-            &[],
-            16_000,
-        )
+            index: Some(&index),
+            explicit_paths: &[],
+            limit: 16_000,
+            hook_context: &[],
+            plan: None,
+        })
     }
 }
 
