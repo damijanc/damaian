@@ -1,7 +1,7 @@
 # Feature Spec: A Plan Left Open When the Turn Ends
 
-Status: Done 2026-10-25 (implementation; §6's live acceptance run and CI are
-still outstanding — see §7.1). Started 2026-10-24 and implemented in ten tasks
+Status: Done 2026-10-25 (implementation and live acceptance; CI is still
+outstanding — see §7.1). Started 2026-10-24 and implemented in ten tasks
 ([`tasks.md`](tasks.md)); Tasks 1–8 edited `chat.rs`. The one reminder per turn,
 the evidence carried across pauses and attached at a true end, the declined
 plan's `Skipped` steps, the `plan_left_open` audit record and the panel's
@@ -460,7 +460,7 @@ not stuck; how to read `plan_left_open` and `plan_reminder_sent`).
 | An ended panel never says "running" | `an_ended_plan_summary_says_not_marked_done`, `an_ended_plan_with_a_blocked_step_still_names_it`, `an_ended_turn_s_plan_is_not_active`, `the_plan_event_carries_whether_the_turn_is_active`; the JS label reads `plan.active !== false`. Rendering it in a browser is a manual check that was **not** run (see `tasks.md`, Task 7 Step 6) | Automated contract; manual UI unverified |
 | While the turn runs the panel is unchanged | `the_states_whose_turn_is_still_running_are_exactly_the_non_terminal_work_states`; `plan.active: true` from `TurnProgress::Plan` and `task_states_json` for a `RunningTool` task | Automated |
 | Deterministic scenarios pass in CI | `cargo nextest -p eval-harness` (92 tests) and `cargo run -p eval-harness -- run --tier deterministic` passed locally; CI has not run | Automated locally |
-| **Live:** §1's prompt against `deepseek-v4-flash` | **Not run.** It needs a real provider key and a network call, and this task did not make one. No token figure or panel observation is claimed. | Manual, outstanding |
+| **Live:** §1's prompt against `deepseek-v4-flash` | **Passed 2026-10-25.** The §1 prompt verbatim, default budgets and Code mode, against a disposable clone of this branch (`1d263bf`) with an isolated data directory. The model planned four steps, ran the work, answered, received the one reminder (`openSteps: 4`), used *Continue* after the round-budget pause the reminder's charge exposed, and then closed all four steps. `TurnProgress::PlanFinished` arrived once; no `plan_left_open` was written. Step 1 carried 20 evidence items; steps 2–4 closed unverified. 27 model calls, 2,218,346 input (1,934,208 cached) and 17,662 output tokens. The reminder round itself cost **80,774 input (66,432 cached) and 249 output**. The final response was the report. | Manual, passed |
 
 ### 7.2 Implementation discoveries
 
@@ -487,3 +487,20 @@ not stuck; how to read `plan_left_open` and `plan_reminder_sent`).
 - **The JS label has no automated check.** There is no JavaScript test harness;
   the contract (`active`) is tested and the label was reviewed by reading the
   code, but the rendered panel was not checked in a browser in this session.
+- **The live prompt needs approvals, so the accepted run used a disposable
+  clone.** In Code mode §1's prompt asks for a shell-control read
+  (`ls … && grep … | head`), which pauses for approval; two Plan-mode attempts
+  refused it and the model then answered without ever planning. The accepted run
+  drove Code mode with approvals granted, against a clone of the committed
+  branch, so no command could touch the working checkout. The clone lived under
+  `target/`, which the model noticed and called a fixture copy; that is an
+  artefact of the isolation method, not of the engine.
+- **The reminder consumed the last action round and the turn paused at its round
+  budget.** The live run needed *Continue* before the model could close its
+  steps. That is the two-round gate doing what §5.2 asks — it left room for the
+  reminder's own round, not a further one — and it makes #61's continuation part
+  of the happy path on a long planned turn. The driver granted *Continue*; a
+  user would have seen the round-budget card.
+- **The reminder itself is one measured model call.** On the live run it cost
+  80,774 input (66,432 cached) and 249 output tokens; the entire 27-call turn
+  cost 2,218,346 input (1,934,208 cached) and 17,662 output.

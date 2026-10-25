@@ -19,7 +19,7 @@ decisions it left open in [`context.md`](context.md)
 | 7 · The panel: `active`, summary, "not finished", live event | Done 2026-10-25 | `TaskStatus::is_active` is an exhaustive match (the two crash states are inactive); `PlanReport::summary(active)` leads with "Turn ended with N steps not marked done" while keeping blocked/finished; `plan_json(plan, active)` and `TurnEvent::Plan { plan, active }`; `TurnProgress::PlanFinished` sent once at a true end; `worker.rs` maps it; `renderPlanPanel` says "running" only while `plan.active !== false` and "not finished" otherwise. Tests: status partition, crash-state test, three summary tests, shell task-state and event tests, `the_turn_reports_its_plan_as_finished_when_it_ends`, `a_pause_reports_no_finished_plan`. The JS label change is checked by hand (no JS harness); no shell rebuild was run. |
 | 8 · The session-log reminder line and the next-turn seed | Done 2026-10-25 | `parse_message_event` reads `kind`; the question/answer transcript entries set `None`; the shell's `message_json` forwards it; `renderMessages` renders a tagged entry through `appendChatMessage("system", …)`; `build_model_prompt` skips tagged reminders. Tests: `a_message_with_a_kind_round_trips_and_an_old_one_reads_none` (including a raw old line), `the_reminder_is_a_tagged_system_line_in_a_reloaded_session`, `a_plan_reminder_does_not_seed_the_next_turn` with an ordinary-message negative control. |
 | 9 · Eval fields and the deterministic scenarios | Done 2026-10-25 | `RecordedPlan` gained `remindersSent`, `leftOpenAtEnd`, `openStepEvidence`; `Run.lastAssistantMessage` reads the final task log. Asserts added: `plan_reminders`, `plan_verified`, `plan_unverified`, `plan_outstanding`, `plan_left_open`, `plan_open_evidence`, `last_assistant_message_contains`. New `plan_answer_without_complete_step` and `plan_left_open_at_end`; `planned_task` asserts zero reminders; count guard 23 → 25. `cargo nextest -p eval-harness` passed (92 tests) and the deterministic tier passed. |
-| 10 · Docs, acceptance walk, live run, close | Done 2026-10-25 | §6 walked in `proposal.md` §7; user guide and troubleshooting updated; README status/current-state and CHANGELOG Unreleased updated; status marked Done in all four places. Scoped checks: fast five (fmt/node/lint/typos/deny), crate clippy for `workspace-engine`, `desktop-shell` and `eval-harness`, `nextest -p workspace-engine` (1514 tests), `nextest -p desktop-shell --lib` (178), `nextest -p eval-harness` (92), and the deterministic tier. The full workspace clippy/nextest gate was left to CI. **The live criterion was not exercised** — it needs a real provider key and is a manual step; `proposal.md` §7 records that. |
+| 10 · Docs, acceptance walk, live run, close | Done 2026-10-25 | §6 walked in `proposal.md` §7; user guide and troubleshooting updated; README status/current-state and CHANGELOG Unreleased updated; status marked Done in all four places. Scoped checks: fast five (fmt/node/lint/typos/deny), crate clippy for `workspace-engine`, `desktop-shell` and `eval-harness`, `nextest -p workspace-engine` (1514 tests), `nextest -p desktop-shell --lib` (178), `nextest -p eval-harness` (92), and the deterministic tier. The full workspace clippy/nextest gate was left to CI. **Live criterion passed 2026-10-25:** four planned steps, one reminder with four open, *Continue* after the round-budget pause, all steps closed, no `plan_left_open`; the reminder round cost 80,774 input (66,432 cached) and 249 output, and the final response was the report. The temporary driver, clone and data directories were deleted. The manual browser UI check remains unticked (Task 7 Step 6). |
 
 **Goal:** When a turn would end while its plan still has pending or in-progress
 steps, Damaian sends one reminder asking the model to close the steps it
@@ -755,17 +755,21 @@ fields. If one fails, fix the wiring it names and record the deviation.
 - [x] **Step 1: Walk every acceptance criterion in §6** against the finished
   tree and record the per-criterion evidence in `proposal.md` §7 (a table like
   spec 31's §7.1). Name the test for each; say which criteria are manual.
-- [ ] **Step 2: Live run per §6.** **Not done in this session:** it needs a real
-  provider key and a network call, and no live run was made. Nothing is claimed
-  about the reminder's live behaviour beyond the deterministic scenarios; see
-  `proposal.md` §7. Re-run §1's prompt against
-  `deepseek-v4-flash` on this repository with an isolated `DAMAIAN_DATA_DIR`.
-  Accepted if the turn either closes its steps after the reminder or ends with
-  the panel reading "not finished", and the step evidence lists the commands it
-  ran. Record in §7 and here: which happened, how many tokens the reminder round
-  cost, and whether the final response was the report. If the CLI cannot observe
-  the panel without a UI, use the desktop shell or a temporary `#[ignore]` driver
-  as spec 62 did; delete the driver and data directory afterwards.
+- [x] **Step 2: Live run per §6.** **Passed 2026-10-25.** The §1 prompt,
+  verbatim, against `deepseek-v4-flash` with default budgets and an isolated
+  `DAMAIAN_DATA_DIR`: the model planned four steps, answered, received the one
+  reminder (`openSteps: 4`), took *Continue* at the round-budget pause the
+  reminder's charge exposed, and closed all four steps. One
+  `PlanFinished`, no `plan_left_open`, step 1 with 20 evidence items and steps
+  2–4 completed unverified; 27 model calls, 2,218,346 input (1,934,208 cached),
+  17,662 output. The reminder round cost 80,774 input (66,432 cached) and 249
+  output; the final response was the report. The key was read inline from the
+  macOS Keychain (`security find-generic-password -s deepseek-api-key -w`) and
+  never printed or stored. Because the prompt asks for shell-control reads that
+  Code mode pauses on, the accepted run used a disposable clone of the committed
+  branch with approvals granted by a temporary `#[ignore]` driver; the driver,
+  clone and data directories were deleted afterwards. Details and caveats in
+  `proposal.md` §7.
 - [x] **Step 3: Documentation.**
   - `docs/USER_GUIDE.md` → **The Plan Panel** / **What each step says**: what
     "not finished" and "Turn ended with N steps not marked done." mean; that the
