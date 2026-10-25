@@ -8,7 +8,9 @@ reload, and the eval harness reads the same `read_task_usage` rather than
 counting anything itself, so spec 18's token row is a real number instead of
 `notApplicable`. **Validated against DeepSeek**, which reports usage on every
 call; the `len / 4` estimate measured 2.5–6.3% high, always in the safe
-direction. OpenAI remains untested. See §7. Requirement 2's completion report
+direction. **Validated against OpenRouter** on 2026-10-25, which also reports
+its own cost; across three models there the estimate erred both ways, by up to
+29%. OpenAI's own API remains untested. See §7. Requirement 2's completion report
 waits on spec 23.
 Order: 19 of 19
 Plan: `docs/PLAN/01_phase_1_trust_and_recovery.md`, Phase 1, Work
@@ -271,8 +273,8 @@ and returns `prompt_tokens`/`completion_tokens`, so `UsageSource::Measured` is
 now produced by something other than a test — on every call of every scenario.
 The probe never fired: no `model_usage_reporting_unsupported` was audited, and
 two prompts produced exactly two model calls, confirming the probe rides on the
-first request rather than costing one of its own. **No other provider has been
-tested**; OpenAI in particular remains unmeasured.
+first request rather than costing one of its own. OpenRouter followed on
+2026-10-25, below; OpenAI's own API remains unmeasured.
 
 **The `len / 4` estimate runs high by 2.5% to 6.3%.**
 
@@ -318,6 +320,45 @@ hit rate under-reports. The figure is honest about being *derived from your
 rates* and says nothing about how well those rates fit — that gap should be
 either closed or documented before anyone treats the number as a bill. Neither
 this spec nor `USER_GUIDE.md` currently says it.
+
+### Validated against OpenRouter on 2026-10-25
+
+Three models through OpenRouter — `deepseek/deepseek-chat`, `openai/gpt-4.1`
+and `anthropic/claude-sonnet-4.5` — over spec 18's live-tier test and
+engine-driven `ask` and patch turns. No accounting code changed.
+
+**OpenRouter reports usage, cache hits and cost.** Every call was `measured`.
+OpenRouter ends a stream with an extra frame that repeats `finish_reason` and
+carries `usage` including `usage.cost`; it parsed without duplicated content or
+invented tool calls. `prompt_tokens_details.cached_tokens` is read: DeepSeek's
+upstream reported 3,264–7,168 of about 7,265 input tokens cached on a turn's
+second call, while GPT-4.1 and Claude reported zero, which is recorded as a
+measured zero rather than as missing.
+
+**`ModelRun::reported_cost` now has a live producer.** It had none after the
+DeepSeek run. OpenRouter's `usage.cost` arrived on every call and is stored as
+`reportedCost`; across sixteen engine-driven calls it matched the catalogue
+rates (input × input price + output × output price) exactly. With no rates
+configured, Damaian's own `estimated_cost` stays `None`, so the provider's
+figure is never presented as Damaian's arithmetic. Two earlier calls to
+`deepseek/deepseek-chat` cost 6.5% and 23.8% more than the catalogue headline,
+presumably because OpenRouter routed them to a pricier upstream. That is the
+better reason to prefer the reported figure: it is what was billed, and a
+user-configured rate cannot know the route.
+
+**The `len / 4` estimate does not carry across tokenizers.** DeepSeek's own
+API put it 2.5–6.3% high, always in the safe direction. Through OpenRouter, on
+task-mode calls:
+
+| model | measured against the marker estimate |
+|---|---|
+| `deepseek/deepseek-chat` | 4.0–4.8% above |
+| `anthropic/claude-sonnet-4.5` | 14.6–15.1% above |
+| `openai/gpt-4.1` | 28.6–28.7% below |
+
+Two of three now *under*-estimate, so the DeepSeek finding that the estimate
+errs safe does not generalise. It matters only where no measured figure exists:
+the pre-call marker, and a call lost to a crash.
 
 ### Two config defects this measurement exposed
 

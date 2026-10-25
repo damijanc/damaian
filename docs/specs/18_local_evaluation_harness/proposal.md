@@ -444,6 +444,63 @@ refuses rather than falling back to something local, joined now by
 `the_live_tier_drives_the_live_runner_rather_than_the_mock`, which is the
 regression test for the selection and dispatch defects above.
 
+### The live tier against OpenRouter, 2026-10-25
+
+The first provider other than DeepSeek. One run of
+`live_tier_runs_one_scenario_against_a_real_provider` per model the installed
+config lists, plus engine-driven `ask` and `propose_patch` turns against a
+throwaway repository:
+
+| model | live-tier test | native tool calls and patch |
+|---|---|---|
+| `deepseek/deepseek-chat` | pass, 10.4 s | complete in 3 of 5 task runs; see below |
+| `openai/gpt-4.1` | pass, 5.0 s | complete; also chose `run_command`, which paused for approval |
+| `anthropic/claude-sonnet-4.5` | pass, 18.1 s | complete, by `propose_patch` and by `edit_file` |
+
+Base URL, auth, streaming (OpenRouter's `: OPENROUTER PROCESSING` comments,
+fragmented tool-call arguments, and its extra final usage frame), measured usage
+and the provider's reported cost all worked without code changes. Spec 19 §7
+records the accounting figures.
+
+**The live tier called the wrong model.** `live_config` set `model_name` and
+then called `apply_model_provider_defaults`, which replaces it with the
+provider's first listed model. Every OpenRouter run sent its requests to
+`anthropic/claude-sonnet-5.5`, the built-in default, while each record named
+the model it had been asked for; `DAMAIAN_EVAL_MODEL=deepseek-v4-pro` would
+likewise have run `deepseek-v4-flash`. The 2026-09-10 run asked for
+`deepseek-v4-flash`, DeepSeek's first listed model, so its figures stand. The
+model is now set after the defaults, and
+`the_live_tier_calls_the_requested_model_and_not_the_providers_default` checks
+it without credentials. The results above were taken with the model forced
+through `OPENROUTER_MODEL`, which the built-in template reads.
+
+**Still open, found by the same run:**
+
+- **The documented live test checks no assertion.** It asserts only that a
+  provider was called and a token figure recorded, never the scenario's
+  `[assert]` block, although the live tier is defined as keeping a scenario's
+  assertions. A run whose answer was raw tool-call markup would still pass it.
+  `run_tier` does evaluate assertions; the credential-gated test that
+  `docs/DEVELOPMENT.md` tells people to run does not.
+- **`deepseek/deepseek-chat` sometimes writes its tool call as text.** In two of
+  five task runs the model put a complete, valid `propose_patch` call into the
+  message content in DeepSeek's own separator syntax rather than into
+  `tool_calls`. Nothing recognised it, so the turn ended `complete` with no patch
+  and the markup stored as the answer. Both failures used a prompt that asked
+  for "a patch" without naming the tool; runs that named it succeeded. Damaian
+  does not record which upstream provider OpenRouter routed a request to, so
+  this cannot yet be tied to a route rather than to the prompt.
+- **No output ceiling is sent to OpenRouter.** Its built-in entry and both
+  per-model tables carry nothing for it, so requests go without `max_tokens`
+  and the context budget falls back to 16,000 tokens for models that accept far
+  more. The `max_output_tokens: None` comment in `live_config` ("the built-in
+  per-model ceiling still applies") holds only for DeepSeek. No truncation was
+  seen; the largest output was 260 tokens.
+- **OpenRouter's reasoning fields are not read.** The adapter replays only
+  DeepSeek's `reasoning_content`. No response in this run carried OpenRouter's
+  `reasoning` or `reasoning_details`, so the gap is unexercised rather than
+  observed.
+
 ### What the review gate caught
 
 The first generated baseline **contained the seeded AWS key**, violating §6's

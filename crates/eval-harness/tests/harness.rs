@@ -1754,6 +1754,31 @@ fn both_tiers_offer_the_model_the_same_tools() {
     );
 }
 
+/// The live tier must call the model it was asked for.
+///
+/// `apply_model_provider_defaults` replaces `model_name` with the provider's
+/// first listed model, and `live_config` used to call it after setting the
+/// model. The first OpenRouter run (2026-10-25) asked for three models and
+/// sent every request to `anthropic/claude-sonnet-5.5`, while each run record
+/// named the requested model. The same overwrite turned `deepseek-v4-pro` into
+/// `deepseek-v4-flash`.
+#[test]
+fn the_live_tier_calls_the_requested_model_and_not_the_providers_default() {
+    let dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+
+    for (provider, model) in [
+        ("openrouter", "openai/gpt-4.1"),
+        ("openrouter", "deepseek/deepseek-chat"),
+        ("deepseek", "deepseek-v4-pro"),
+    ] {
+        let live = eval_harness::runner::live_config(&dir, provider, model);
+        assert_eq!(
+            live.model_name, model,
+            "{provider}: the request must name the model the run record names"
+        );
+    }
+}
+
 /// A run record's tool calls must describe the run, not the script.
 ///
 /// `drive` built the list from `scenario.turns` and stamped every entry with

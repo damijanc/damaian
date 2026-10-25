@@ -235,11 +235,14 @@ pub fn live_config(data_dir: &Path, provider: &str, model: &str) -> Config {
         ..Config::default()
     };
     config.model_provider = provider.to_string();
-    config.model_name = model.to_string();
     // Fills `model_base_url` and `model_api_key_env` from the provider entry,
     // which is what the CLI and the desktop shell both rely on before building
     // a transport.
     config.apply_model_provider_defaults();
+    // After the defaults, which replace `model_name` with the provider's first
+    // listed model: set before them, every OpenRouter run called Claude while
+    // its record named the requested model.
+    config.model_name = model.to_string();
 
     // Both tiers must offer the model the same tools, or their assertions
     // measure different assistants and §5.3's single scenario definition buys
