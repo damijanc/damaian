@@ -371,6 +371,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         agent_max_questions_per_turn,
         agent_max_task_tokens,
         agent_max_turn_messages,
+        agent_max_turn_notes_chars,
         agent_max_exploration_rounds,
         project_roots_added,
         project_roots_removed,
@@ -565,6 +566,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         checkpoint_retention_days,
         agent_max_task_tokens,
         agent_max_turn_messages,
+        agent_max_turn_notes_chars,
         agent_max_exploration_rounds,
         mcp_enabled,
         mcp_server_allowlist,
@@ -697,6 +699,9 @@ fn equals_base_limit(key: &str, carried: &ConfigOverlay, base: &Config) -> bool 
         "command_timeout_secs" => carried.command_timeout_secs == Some(base.command_timeout_secs),
         "agent_max_turn_messages" => {
             carried.agent_max_turn_messages == Some(base.agent_max_turn_messages)
+        }
+        "agent_max_turn_notes_chars" => {
+            carried.agent_max_turn_notes_chars == Some(base.agent_max_turn_notes_chars)
         }
         "agent_max_exploration_rounds" => {
             carried.agent_max_exploration_rounds == Some(base.agent_max_exploration_rounds)

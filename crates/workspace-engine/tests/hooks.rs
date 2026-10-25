@@ -3629,6 +3629,157 @@ fn a_before_task_complete_hook_that_always_denies_stops_at_the_round_budget() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Spec 66 `context.md` D1: the hook runs first. When it denies, the next
+/// request carries the hook's note and not the plan reminder; when it allows,
+/// the reminder is sent once and the turn closes its steps.
+#[test]
+fn a_plan_reminder_waits_for_before_task_complete() {
+    let root = temp_dir("chat-reminder-after-hook");
+    write(&root.join("README.md"), "# repo\n");
+    let counter = root.join("complete-count");
+    let body = format!(
+        "count=$(cat {counter} 2>/dev/null || echo 0)\n\
+         count=$((count + 1))\n\
+         echo \"$count\" > {counter}\n\
+         if [ \"$count\" -eq 1 ]; then\n\
+           echo '{{\"hookApiVersion\":1,\"verdict\":\"deny\",\"reason\":\"run the formatter first\"}}'\n\
+         else\n\
+           echo '{{\"hookApiVersion\":1,\"verdict\":\"allow\"}}'\n\
+         fi\n",
+        counter = counter.display()
+    );
+    let mut hook = sh_hook("before_complete", &script(&root, "before_complete", &body));
+    hook.events = vec![HookEvent::BeforeTaskComplete];
+    let (config, engine) = engine_for(&root, vec![hook]);
+
+    let plan = ToolCall {
+        id: "call_plan".to_string(),
+        name: "propose_plan".to_string(),
+        arguments_json: r#"{"steps":[{"title":"Read the source"},{"title":"Write the report"}]}"#
+            .to_string(),
+    };
+    let complete = ToolCall {
+        id: "call_complete".to_string(),
+        name: "complete_step".to_string(),
+        arguments_json: "{}".to_string(),
+    };
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            "All done.".to_string(),
+            "All done.".to_string(),
+            String::new(),
+            "Done.".to_string(),
+        ],
+        vec![
+            vec![plan],
+            Vec::new(),
+            Vec::new(),
+            vec![complete.clone(), complete],
+            Vec::new(),
+        ],
+    );
+
+    let result = chat_turn(
+        &engine,
+        &root,
+        None,
+        &mut adapter,
+        ChatTurnOptions::default(),
+    )
+    .expect("the turn runs");
+
+    assert_eq!(result.task.status, TaskStatus::Complete);
+    // Requests: 0 before the plan call, 1 after the plan result, 2 after the
+    // hook's denial, 3 after the reminder.
+    let after_denial = &adapter.requests[2];
+    assert!(
+        after_denial.messages.last().is_some_and(|message| message
+            .content
+            .contains("A hook did not let this task complete")),
+        "the hook's note reaches the model first: {after_denial:?}"
+    );
+    assert!(
+        !after_denial
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Your plan still has open steps")),
+        "the reminder must not ride beside the hook's denial"
+    );
+    let after_allow = &adapter.requests[3];
+    assert!(
+        after_allow
+            .messages
+            .last()
+            .is_some_and(|message| message.content.contains("Your plan still has open steps")),
+        "the reminder follows the allow: {after_allow:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(config.data_dir.join("audit/events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("\"plan_reminder_sent\""))
+            .count(),
+        1,
+        "one reminder"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A hook that keeps denying consumes the rounds, so the reminder gate never
+/// finds room. The turn pauses at its round budget with no reminder sent.
+#[test]
+fn a_hook_that_always_denies_never_gets_a_reminder() {
+    let root = temp_dir("chat-reminder-hook-denies");
+    write(&root.join("README.md"), "# repo\n");
+    let mut hook = answering_hook(
+        &root,
+        "always_deny",
+        &[HookEvent::BeforeTaskComplete],
+        HookMode::Mandatory,
+        r#"{"hookApiVersion":1,"verdict":"deny","reason":"not yet"}"#,
+    );
+    hook.order = 0;
+    let mut config = config_for(&root, vec![hook]);
+    config.agent_max_tool_rounds = 3;
+    let engine = WorkspaceEngine::new(config.clone());
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_plan".to_string(),
+                name: "propose_plan".to_string(),
+                arguments_json:
+                    r#"{"steps":[{"title":"Read the source"},{"title":"Write the report"}]}"#
+                        .to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+
+    let result = chat_turn(
+        &engine,
+        &root,
+        None,
+        &mut adapter,
+        ChatTurnOptions::default(),
+    )
+    .expect("a budget stop is a pause");
+
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+    assert!(result.round_budget_proposal.is_some());
+    assert_eq!(hook_invocations(&config, "before_task_complete"), 2);
+    assert!(
+        !fs::read_to_string(config.data_dir.join("audit/events.jsonl"))
+            .unwrap_or_default()
+            .contains("\"plan_reminder_sent\""),
+        "a hook that consumes the rounds leaves no room for a reminder"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// A pause is not a completion. A turn that stops for command approval must
 /// not dispatch `before_task_complete` (`context.md` §3, §4).
 #[test]

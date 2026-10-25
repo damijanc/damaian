@@ -46,6 +46,11 @@ pub struct Run {
     /// The report the verification continuation produced, when the scenario
     /// asked for one (spec 23 Task 9). `None` for every other scenario.
     pub verification: Option<VerificationReport>,
+    /// The task's last assistant message as the session log holds it, which is
+    /// not always `response`: after a plan reminder the pre-reminder answer is
+    /// the response and the post-reminder reply follows it (spec 66 `context.md`
+    /// D4). `None` when the turn wrote no assistant message.
+    pub last_assistant_message: Option<String>,
     pub trace: Trace,
 }
 
@@ -306,6 +311,7 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
         continuation_request: None,
         answer_request: None,
         verification: None,
+        last_assistant_message: None,
         trace: Trace::default(),
     })
 }
@@ -501,6 +507,34 @@ fn drive(
         );
     }
 
+    // Spec 65 §5.9: a scenario may run a second user turn in the same session.
+    // The scripted responses continue where the first turn's script stopped, so
+    // the follow-up is a real new turn that inherits the first turn's notes
+    // rather than a replay of the same outcome.
+    if let Some(prompt) = &scenario.follow_up_prompt
+        && let Ok(first) = &outcome
+    {
+        let session_id = first.session.id.clone();
+        let cancel = CancelToken::new();
+        let mut on_follow_up_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_follow_up_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        outcome = engine.chat_orchestrator.ask_with_session_with_options(
+            &materialized.root,
+            prompt,
+            &[],
+            Some(&session_id),
+            adapter,
+            &mut sink,
+            turn_options(scenario),
+        );
+    }
+
     if let Ok(result) = &outcome
         && let Some(usage) = result.usage
     {
@@ -684,6 +718,11 @@ fn drive(
     // Spec 59 §5.6: exploration rounds are derived from the same session log,
     // not from the script, so the figure describes what the run dispatched.
     run_record.exploration_rounds = trace::exploration_rounds(&materialized.data_dir)?;
+    // Spec 65 requirement 11: the notes and repeat metrics read from the same
+    // log, so they describe what the run dispatched rather than the script.
+    run_record.notes_calls = trace::notes_calls(&materialized.data_dir)?;
+    run_record.repeated_elided_reads = trace::repeated_elided_reads(&materialized.data_dir)?;
+    run_record.carried_notes = trace::carried_notes(&materialized.data_dir)?;
 
     // filesChanged is the union of what the engine says it wrote — never a walk
     // of the working tree, which would also catch git's own bookkeeping.
@@ -780,6 +819,8 @@ fn drive(
     // `None` when the turn planned nothing, which is most of the deterministic
     // tier: those scenarios are short enough that §5.1 says a plan would be
     // ceremony, and the metric reports `notApplicable` rather than a zero.
+    let reminders_sent = trace.count("plan_reminder_sent");
+    let left_open_at_end = trace.count("plan_left_open") > 0;
     run_record.plan = outcome
         .as_ref()
         .ok()
@@ -792,6 +833,12 @@ fn drive(
         })
         .map(|plan| {
             let report = plan.report();
+            let open_step_evidence = plan
+                .steps
+                .iter()
+                .filter(|step| !step.status.is_terminal())
+                .map(|step| step.evidence.len() as u64)
+                .sum();
             RecordedPlan {
                 steps_planned: report.steps.len() as u64,
                 steps_verified: report.verified as u64,
@@ -799,8 +846,28 @@ fn drive(
                 steps_blocked: report.blocked as u64,
                 steps_skipped: report.skipped as u64,
                 steps_outstanding: report.outstanding as u64,
+                reminders_sent,
+                left_open_at_end,
+                open_step_evidence,
             }
         });
+
+    // Read before `outcome` is consumed below: the session log is where the
+    // post-reminder reply lives, and `result.response` is deliberately the
+    // earlier answer on a reminded turn (spec 66 `context.md` D4).
+    let last_assistant_message = outcome.as_ref().ok().and_then(|result| {
+        engine
+            .session_store
+            .read_messages(&result.session.id)
+            .ok()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "assistant")
+                    .map(|message| message.content.clone())
+            })
+    });
 
     let (final_status, response, context_files, command_proposal, patch_proposal) = match outcome {
         Ok(result) => (
@@ -889,6 +956,7 @@ fn drive(
         continuation_request: None,
         answer_request: None,
         verification,
+        last_assistant_message,
         trace,
     })
 }

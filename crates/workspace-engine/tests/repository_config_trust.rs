@@ -1419,6 +1419,64 @@ fn repository_config_may_shrink_the_turn_message_window_but_not_widen_it() {
     );
 }
 
+/// Spec 65 requirement 3. The notes bound is restrict-only for the same
+/// reason as the exploration allowance: the notes are sent on every later
+/// call, including the next turn's, so raising the bound spends the user's
+/// money on the repository's say-so.
+#[test]
+fn repository_config_may_lower_the_turn_notes_bound_but_not_raise_it() {
+    let lowered = fixture(
+        "turn-notes-lower",
+        "agent_max_turn_notes_chars=8000\n",
+        "agent_max_turn_notes_chars=2000\n",
+    );
+    assert_eq!(
+        lowered.load().agent_max_turn_notes_chars,
+        2000,
+        "a repository lowering the notes bound is a restriction and must be honoured"
+    );
+
+    let raised = fixture(
+        "turn-notes-raise",
+        "agent_max_turn_notes_chars=8000\n",
+        "agent_max_turn_notes_chars=16000\n",
+    );
+    assert_eq!(
+        raised.load().agent_max_turn_notes_chars,
+        8000,
+        "a repository raising the notes bound must be refused and the user's value kept"
+    );
+
+    let engine = WorkspaceEngine::new(raised.base());
+    let (_, report) = raised.load_reporting();
+    assert_eq!(
+        report
+            .rejected_keys
+            .iter()
+            .find(|rejected| rejected.key == "agent_max_turn_notes_chars")
+            .map(|rejected| rejected.class),
+        Some(RepositoryKeyClass::RestrictOnly)
+    );
+    engine
+        .repository_trust
+        .review(&report, &engine.audit_log)
+        .unwrap()
+        .expect("a restrict-only weakening should produce a notice");
+    let events = audit_events(&raised);
+    assert!(
+        events.contains("repository_config_key_rejected"),
+        "{events}"
+    );
+    assert!(
+        events.contains("\"key\":\"agent_max_turn_notes_chars\""),
+        "{events}"
+    );
+    assert!(events.contains("\"class\":\"restrict_only\""), "{events}");
+
+    lowered.cleanup();
+    raised.cleanup();
+}
+
 /// Spec 59 §5.4. The exploration allowance is restrict-only: a repository may
 /// lower it, because a restriction is always safe, but raising it spends the
 /// user's money on the repository's say-so.

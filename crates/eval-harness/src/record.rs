@@ -95,6 +95,18 @@ pub struct RecordedPlan {
     /// stopped turn, or a plan left waiting on review. Not an outcome, and
     /// counted apart from the four that are.
     pub steps_outstanding: u64,
+    /// How many plan reminders the run sent (spec 66 §5.5). A count rather than
+    /// a bool so "exactly one" can fail on two; a planless run has no
+    /// `RecordedPlan` at all, so a zero here always means a plan was measured.
+    pub reminders_sent: u64,
+    /// Whether the engine recorded `plan_left_open` for this run: it truly
+    /// ended with open steps. Read from the engine's own audit record rather
+    /// than derived from a second terminal-status mapping.
+    pub left_open_at_end: bool,
+    /// Evidence items attached to steps that were still open in the final plan.
+    /// This is how a scenario can see that the work a turn ran reached the step
+    /// it never closed.
+    pub open_step_evidence: u64,
 }
 
 /// A task's prompt-cache accounting, read back from `TaskUsage`
@@ -192,6 +204,16 @@ pub struct RunRecord {
     /// the scenario script. Reported beside `tool_rounds` so a reader can see
     /// how much of a turn was reading rather than acting.
     pub exploration_rounds: u64,
+    /// `turn_notes` calls the run dispatched (spec 65 requirement 11), read
+    /// from the session log's action markers.
+    pub notes_calls: u64,
+    /// Reads that repeated an earlier read in the same task. The engine knows
+    /// which repeats were caused by the elision of an earlier round; the log
+    /// does not, so this is an upper bound (spec 65 requirement 11).
+    pub repeated_elided_reads: u64,
+    /// Notes carried from an earlier turn into a later one (spec 65 requirement
+    /// 6), counted from `turn_notes` events marked `carried: true`.
+    pub carried_notes: u64,
     pub model_calls: u64,
     /// How many round-budget continuations the run granted, read from the
     /// `turn_budget_extended` audit records (spec 61 §5.4). Counted here rather
@@ -277,6 +299,9 @@ impl RunRecord {
             not_applicable: None,
             tool_rounds: 0,
             exploration_rounds: 0,
+            notes_calls: 0,
+            repeated_elided_reads: 0,
+            carried_notes: 0,
             model_calls: 0,
             continuations: 0,
             task_count: 0,

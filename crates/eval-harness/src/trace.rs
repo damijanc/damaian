@@ -215,6 +215,11 @@ const READ_ONLY_ACTION_MARKERS: [&str; 8] = [
     "read_git_log",
 ];
 
+/// A `turn_notes` call is not a read, but a round of reads and notes is still
+/// exploration (spec 65 requirement 8): recording a finding beside the read
+/// that produced it must not spend an action round.
+const NOTES_ACTION_MARKER: &str = "turn_notes";
+
 /// One round of the session log: the actions dispatched between two
 /// `model_call` markers. A round exists only if it dispatched something, which
 /// is what makes [`tool_rounds`] count tools rather than model calls.
@@ -259,7 +264,7 @@ fn rounds(data_dir: &Path) -> Result<Vec<Round>> {
                 continue;
             }
             let round = current.get_or_insert(Round { read_only: true });
-            if !READ_ONLY_ACTION_MARKERS.contains(&action) {
+            if !READ_ONLY_ACTION_MARKERS.contains(&action) && action != NOTES_ACTION_MARKER {
                 round.read_only = false;
             }
         }
@@ -303,6 +308,98 @@ pub fn exploration_rounds(data_dir: &Path) -> Result<u64> {
         .iter()
         .filter(|round| round.read_only)
         .count() as u64)
+}
+
+/// The `(taskId, action, ref)` of every action the run started, read from the
+/// session logs. The read tools are the same eight [`READ_ONLY_ACTION_MARKERS`]
+/// names; every other marker is an action or a turn-shaping call.
+fn action_markers(data_dir: &Path) -> Result<Vec<(String, String, String)>> {
+    let paths = session_log_paths(data_dir)?;
+    let mut markers = Vec::new();
+    for path in &paths {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+        for line in text.lines() {
+            let Ok(serde_json::Value::Object(event)) = serde_json::from_str(line.trim()) else {
+                continue;
+            };
+            if event.get("eventType").and_then(|value| value.as_str()) != Some("action_started") {
+                continue;
+            }
+            let Some(payload) = event.get("payload").and_then(|value| value.as_object()) else {
+                continue;
+            };
+            let text = |field: &str| {
+                payload
+                    .get(field)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            markers.push((text("taskId"), text("action"), text("ref")));
+        }
+    }
+    Ok(markers)
+}
+
+/// How many `turn_notes` calls the run dispatched (spec 65 requirement 11).
+/// Read from the action markers, not the scenario script: the script is not
+/// evidence of what happened.
+pub fn notes_calls(data_dir: &Path) -> Result<u64> {
+    Ok(action_markers(data_dir)?
+        .iter()
+        .filter(|(_, action, _)| action == "turn_notes")
+        .count() as u64)
+}
+
+/// Reads that repeated an earlier read of the same thing in the same task
+/// (spec 65 requirement 11).
+///
+/// The engine is what knows whether a read actually repeated an *elided* call;
+/// the log records identity, not the request window. This therefore counts a
+/// repeat anywhere in the turn, which is an upper bound on repeats caused by a
+/// cut: a scenario that reads the same file twice deliberately would count too.
+/// The deterministic scenario expects zero, where the two coincide.
+pub fn repeated_elided_reads(data_dir: &Path) -> Result<u64> {
+    let mut seen = std::collections::HashSet::new();
+    let mut repeats = 0;
+    for (task, action, reference) in action_markers(data_dir)? {
+        if !READ_ONLY_ACTION_MARKERS.contains(&action.as_str()) {
+            continue;
+        }
+        if !seen.insert((task, action, reference)) {
+            repeats += 1;
+        }
+    }
+    Ok(repeats)
+}
+
+/// Notes that the run carried from an earlier turn (spec 65 requirement 6),
+/// counted from `turn_notes` events with `carried: true`.
+pub fn carried_notes(data_dir: &Path) -> Result<u64> {
+    let paths = session_log_paths(data_dir)?;
+    let mut carried = 0;
+    for path in &paths {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+        for line in text.lines() {
+            let Ok(serde_json::Value::Object(event)) = serde_json::from_str(line.trim()) else {
+                continue;
+            };
+            if event.get("eventType").and_then(|value| value.as_str()) != Some("turn_notes") {
+                continue;
+            }
+            if event
+                .get("payload")
+                .and_then(|payload| payload.get("carried"))
+                .and_then(|carried| carried.as_bool())
+                == Some(true)
+            {
+                carried += 1;
+            }
+        }
+    }
+    Ok(carried)
 }
 
 /// A run's command findings grouped by purpose (spec 63 §5.5).

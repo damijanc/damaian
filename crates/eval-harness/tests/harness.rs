@@ -350,10 +350,10 @@ fn exploration_rounds_come_from_the_session_log() {
     let sessions = data_dir.join("sessions");
     std::fs::create_dir_all(&sessions).expect("sessions dir");
     let log = [
-        // Round one: two reads, both read tools.
+        // Round one: a read and a notes call, both exploration (spec 65).
         session_action_started("model_call"),
         session_action_started("read_file"),
-        session_action_started("read_git_log"),
+        session_action_started("turn_notes"),
         // Round two: a command beside a read — an action round.
         session_action_started("model_call"),
         session_action_started("run_command"),
@@ -372,7 +372,62 @@ fn exploration_rounds_come_from_the_session_log() {
     assert_eq!(
         trace::exploration_rounds(&data_dir).expect("exploration rounds"),
         2,
-        "two all-read rounds, and the mixed round is an action round"
+        "a read-and-notes round and the all-read round are exploration; the mixed round is not"
+    );
+}
+
+/// Spec 65 requirement 11: notes calls and repeated reads come from the same
+/// action markers, not from the script.
+#[test]
+fn notes_calls_and_repeated_reads_come_from_the_session_log() {
+    let data_dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+    let sessions = data_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions dir");
+    let log = [
+        session_action_started("model_call"),
+        session_action_started("read_file"),
+        session_action_started("turn_notes"),
+        // The same read again: a repeat by the log's reckoning.
+        session_action_started("read_file"),
+        session_action_started("turn_notes"),
+    ]
+    .join("\n");
+    std::fs::write(sessions.join("session-notes.jsonl"), log).expect("session log");
+
+    assert_eq!(trace::notes_calls(&data_dir).expect("notes calls"), 2);
+    assert_eq!(
+        trace::repeated_elided_reads(&data_dir).expect("repeated reads"),
+        1,
+        "the identical read_file marker after the first is a repeat"
+    );
+}
+
+/// Spec 65 §5.9: a scenario may run a second turn in the same session, and the
+/// second turn carries the first turn's notes.
+#[test]
+fn a_scenario_can_run_a_follow_up_turn_in_the_same_session() {
+    let path = scenario::scenarios_dir().join("long_exploration_memory.toml");
+    let loaded = scenario::load(&path).expect("the scenario should load");
+    assert!(
+        loaded.follow_up_prompt.is_some(),
+        "the scenario runs two turns"
+    );
+
+    let run = eval_harness::runner::run(&loaded).expect("the scenario should run");
+
+    assert_eq!(run.record.scenario, "long_exploration_memory");
+    assert_eq!(
+        run.record.task_count, 2,
+        "the follow-up is a second task, not a resumed first turn"
+    );
+    assert_eq!(run.record.notes_calls, 1, "round 2 took one note");
+    assert!(
+        run.record.carried_notes >= 1,
+        "the second turn carries the first turn's notes"
+    );
+    assert_eq!(
+        run.record.repeated_elided_reads, 0,
+        "the script never repeats a read"
     );
 }
 
@@ -1167,10 +1222,10 @@ fn a_blocked_scenario_is_still_skipped_and_says_why() {
 }
 
 /// Guards the count in spec 18 §6, now that spec 17 has landed: every scenario
-/// runs and none is blocked. Twenty-five: spec 59 added `long_discovery` and
+/// runs and none is blocked. Twenty-eight: spec 59 added `long_discovery` and
 /// `read_loop`, spec 62 added `approval_causes`, spec 50 added
-/// `answered_question`, and spec 23 added `verified_repair` and
-/// `repair_limit_exhausted`.
+/// `answered_question`, spec 23 added `verified_repair` and
+/// `repair_limit_exhausted`, and spec 66 added `plan_left_open`.
 #[test]
 fn every_scenario_runs_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
@@ -1185,7 +1240,7 @@ fn every_scenario_runs_and_none_is_blocked() {
         Vec::<&str>::new(),
         "no scenario is deferred any more"
     );
-    assert_eq!(all.len(), 25, "twenty-five scenarios should run");
+    assert_eq!(all.len(), 28, "twenty-eight scenarios should run");
 }
 
 #[test]
@@ -1472,8 +1527,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        25,
-        "all twenty-five scenario files should be accounted for"
+        28,
+        "all twenty-eight scenario files should be accounted for"
     );
     assert_eq!(
         built
@@ -2031,6 +2086,9 @@ fn a_run_that_worked_through_a_plan_reports_what_became_of_its_steps() {
                 steps_blocked: 1,
                 steps_skipped: 0,
                 steps_outstanding: 0,
+                reminders_sent: 0,
+                left_open_at_end: false,
+                open_step_evidence: 0,
             },
         ),
         record_with_plan(
@@ -2042,6 +2100,9 @@ fn a_run_that_worked_through_a_plan_reports_what_became_of_its_steps() {
                 steps_blocked: 0,
                 steps_skipped: 0,
                 steps_outstanding: 0,
+                reminders_sent: 0,
+                left_open_at_end: false,
+                open_step_evidence: 0,
             },
         ),
     ];
@@ -2100,6 +2161,9 @@ fn a_blocked_step_is_never_counted_among_the_completed_ones() {
             steps_blocked: 2,
             steps_skipped: 0,
             steps_outstanding: 0,
+            reminders_sent: 0,
+            left_open_at_end: false,
+            open_step_evidence: 0,
         },
     )];
 
@@ -2112,6 +2176,57 @@ fn a_blocked_step_is_never_counted_among_the_completed_ones() {
     assert_eq!(count("plan_steps_blocked"), 2);
     assert_eq!(count("plan_steps_verified"), 0);
     assert_eq!(count("plan_steps_completed_unverified"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// A plan left open at turn end. Spec 66 §5.5.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_plan_answer_without_complete_step_gets_one_reminder_and_closes_after_it() {
+    let path = scenario::scenarios_dir().join("plan_answer_without_complete_step.toml");
+    let loaded = scenario::load(&path).expect("the scenario should load");
+    let run = eval_harness::runner::run(&loaded).expect("the scenario should run");
+
+    let plan = run.record.plan.as_ref().expect("the turn planned");
+    assert_eq!(plan.reminders_sent, 1, "exactly one reminder");
+    assert_eq!(plan.steps_outstanding, 0, "all three steps closed");
+    assert_eq!(plan.steps_verified, 1, "the read's exit confirms step 1");
+    assert_eq!(plan.steps_unverified, 2);
+    assert!(!plan.left_open_at_end);
+    assert_eq!(run.response, "The report is written.");
+    assert_eq!(run.last_assistant_message.as_deref(), Some("Done."));
+}
+
+#[test]
+fn a_plan_left_open_at_end_records_the_reminder_and_the_open_step() {
+    let path = scenario::scenarios_dir().join("plan_left_open_at_end.toml");
+    let loaded = scenario::load(&path).expect("the scenario should load");
+    let run = eval_harness::runner::run(&loaded).expect("the scenario should run");
+
+    let plan = run.record.plan.as_ref().expect("the turn planned");
+    assert_eq!(plan.reminders_sent, 1);
+    assert_eq!(plan.steps_outstanding, 3);
+    assert!(plan.left_open_at_end);
+    assert_eq!(
+        plan.open_step_evidence, 1,
+        "the `ls src` exit reached the step it left open"
+    );
+    assert_eq!(run.response, "The report is written.");
+    assert_eq!(
+        run.last_assistant_message.as_deref(),
+        Some("Still not done.")
+    );
+}
+
+#[test]
+fn the_planned_task_scenario_gets_no_reminder() {
+    let path = scenario::scenarios_dir().join("planned_task.toml");
+    let loaded = scenario::load(&path).expect("the scenario should load");
+    let run = eval_harness::runner::run(&loaded).expect("the scenario should run");
+
+    let plan = run.record.plan.as_ref().expect("the turn planned");
+    assert_eq!(plan.reminders_sent, 0, "a closed plan is never reminded");
 }
 
 /// Spec 21 §6's last acceptance criterion, restated against this harness: a

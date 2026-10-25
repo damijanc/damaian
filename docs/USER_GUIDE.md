@@ -104,6 +104,7 @@ Common keys:
 | `enable_worker_sessions` | `false` | [Worker Sessions](#worker-sessions) | No |
 | `agent_max_tool_rounds` | `8` | Action rounds before a turn pauses ([While a turn runs](#while-a-turn-runs-and-how-it-ended)) | Yes |
 | `agent_max_exploration_rounds` | `24` | Read-only rounds before reads start counting as action rounds ([While a turn runs](#while-a-turn-runs-and-how-it-ended)) | Lower only |
+| `agent_max_turn_notes_chars` | `8000` | Characters of notes the assistant may keep per turn ([Notes](#notes-kept-during-and-between-turns)) | Lower only |
 | `agent_max_task_tokens` | none | Token cap per turn ([Capping What One Turn May Spend](#capping-what-one-turn-may-spend)) | Lower only |
 | `command_timeout_secs` | `600` | Deadline for a command Damaian runs | Lower only |
 | `require_approval_for_file_edits` | `true` | Ask before changing files | Turn on only |
@@ -125,7 +126,7 @@ Because that file arrives with a clone, a repository can only make Damaian *more
 - The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
 - `command_allowlist` is never taken from repository config; *Allow Always* writes to your own config instead. See [Allow Always](#allow-always).
 - Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, and the root overrides `project_roots_added` and `project_roots_removed` ([Repository Roots](#repository-roots)) — apply as written.
-- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, and `agent_max_exploration_rounds`. The first three bound how much one request may carry; `agent_max_exploration_rounds` bounds how many read-only rounds a turn may take. Raising one would widen what leaves your machine or how long a turn may run. A repository that tries is told to you like any other rejected key.
+- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, and `agent_max_turn_notes_chars`. The first three bound how much one request may carry; `agent_max_exploration_rounds` bounds how many read-only rounds a turn may take; `agent_max_turn_notes_chars` bounds how much the assistant's notes add to every later request. Raising one would widen what leaves your machine or how long a turn may run. A repository that tries is told to you like any other rejected key.
 - Each `context_budget.<category>` share can be lowered by a repository but never raised, and `context_budget.safety_margin` can be raised but never lowered. A share decides how much of the repository's own content is packed, so a clone may tighten it and may not widen it ([Output and Context Limits](#output-and-context-limits)).
 
 ### Semantic search
@@ -394,9 +395,19 @@ The choice is remembered in the app for each working folder and sent with each r
 
 ### While a turn runs, and how it ended
 
-Progress is shown inside the reply, not in the header. While a turn runs, a line in the assistant's message shows what it is doing ("Waiting for model", a tool's own label, "Streaming", "round 2/8", "round 2/8 · 12 reads" when the turn has also taken read-only rounds, or "Generating patch" for a file-change request), how long it has been running, and **Stop** when that kind of turn can be stopped. A chat message you send can be stopped. A turn that resumes after you approve a command, a plan or a fallback offer, and a patch being generated, show the line without Stop. When a turn finishes normally, the line disappears.
+Progress is shown inside the reply, not in the header. While a turn runs, a line in the assistant's message shows what it is doing ("Waiting for model", a tool's own label, "Streaming", "round 2/8", "round 2/8 · 12 reads" when the turn has also taken read-only rounds, "· notes 2.1k" when it has kept notes, or "Generating patch" for a file-change request), how long it has been running, and **Stop** when that kind of turn can be stopped. A chat message you send can be stopped. A turn that resumes after you approve a command, a plan or a fallback offer, and a patch being generated, show the line without Stop. When a turn finishes normally, the line disappears.
 
 A round in which the assistant only reads — `read_file`, `list_directory`, `search_content`, `search_codebase`, `read_git_status`, `read_git_diff`, `list_worktrees` or `read_git_log`, with no repeated call — is a *read-only round*. It is charged to `agent_max_exploration_rounds` (24 by default) instead of `agent_max_tool_rounds`. A round that runs a command, proposes a change, asks a question or repeats an earlier read is an *action round* and is charged as before. Spending the read-only allowance never pauses a turn by itself: later reads are simply charged as action rounds. Set `agent_max_exploration_rounds=0` to charge every round the way Damaian did before this allowance existed.
+
+### Notes kept during and between turns
+
+To keep a long investigation from losing what it found, the assistant can write **notes** with a `turn_notes` tool: short plain text such as paths, what a component does, how pieces connect, and open questions. On every later request of that turn the notes are sent in full, even after older rounds have been dropped from the request to keep it bounded. They also carry into the next turn of the same session, so a turn that investigates and a turn that acts share one record instead of starting over.
+
+The notes are bounded by `agent_max_turn_notes_chars` (8,000 characters by default, ceiling 32,000; a repository may lower it but never raise it). An append that would go over the bound is refused and the assistant is told the current size and to rewrite the record shorter with `replace`. Set it to `0` to turn the feature off completely: the tool is not offered and requests are exactly what they were before notes existed.
+
+A turn that has notes shows a collapsed **Notes** disclosure under its answer; when some of the text came from an earlier turn the label says **Notes (carried from the previous turn)**. The same text is included in a [session export](#exporting-a-session). While such a turn runs, the progress line adds `· notes 2.1k` beside the round and read counts.
+
+When older rounds are dropped, the request also names the calls that left the window and, once the window is full, warns which round leaves next. Both are for the assistant: they tell it what it has already looked at so it does not re-read it. A read it makes anyway still counts as a repeat, exactly as before.
 
 A turn that reaches its action-round limit (`agent_max_tool_rounds`, 8 by default) while the assistant still wants a tool does not stop: it pauses, and the reply names the action rounds it used against that limit and how many read-only rounds it had used. Select **Continue — N more** to give the same turn another segment of action rounds, keeping every message, tool result and plan step it had, or **Answer now** to have the assistant answer with what it has, with no tools. The pause comes before that final call, so nothing is spent until you choose. A turn can be continued up to 64 action rounds in total; at that cap only **Answer now** is offered. The pause is saved, so after a restart the same offer is still waiting. With a token cap set, the turn continues on its own instead of pausing (see [Capping What One Turn May Spend](#capping-what-one-turn-may-spend)).
 
@@ -616,6 +627,23 @@ Open **What confirms this** on any step to see the evidence itself — the comma
 and its exit code, or the files a patch wrote. This is what Damaian observed,
 never what the model said about its own work. A step whose command exited 3 is
 blocked no matter how confidently the reply describes it as done.
+
+### When the turn ends with steps still open
+
+The model does not get to mark a step done by saying so. If it answers while its
+plan still has steps open, Damaian sends it **one** reminder to call
+`complete_step` for the ones it finished. If it answers again without closing
+them, the turn ends and they stay open.
+
+That is not a stuck turn. An open step in an ended turn is shown as **not
+finished**, and the summary reads **"Turn ended with N steps not marked done."**
+Damaian knows what it observed; it does not know that the work was left undone,
+which is why the wording is not "failed". The answer is still the answer, and
+everything the step ran is still listed under **What confirms this**.
+
+A plan you declined at the review gate is different: its steps are shown as
+**skipped**, because your decision settled them. Damaian will not ask the model
+to complete work you refused.
 
 The panel survives a reload, so you can reopen an old session and still see
 what a turn came to.
@@ -1652,7 +1680,6 @@ There is no default: without this setting, nothing caps a turn's tokens and
 `agent_max_tool_rounds` and `agent_max_exploration_rounds` are the only bounds.
 The minimum accepted value is 1000 — below that, a turn would stop before it
 could do anything.
-
 With the cap set, a turn that reaches its action-round limit continues on its own
 instead of pausing for **Continue** ([While a turn runs](#while-a-turn-runs-and-how-it-ended)),
 and the messages it sends are bounded by `agent_max_turn_messages` so a long

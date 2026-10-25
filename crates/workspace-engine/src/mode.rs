@@ -171,9 +171,11 @@ pub(crate) fn profile_permits(
         | ToolAction::ReadGitLog { .. }
         | ToolAction::ProposePlan(_)
         | ToolAction::CompleteStep
-        // No capability key covers asking: it reads nothing, writes nothing
-        // outside the session log, and its answer authorises nothing.
-        | ToolAction::AskUser(_) => None,
+        // No capability key covers asking or note-taking: neither reads
+        // repository state, writes anything outside the session log, nor
+        // authorises anything.
+        | ToolAction::AskUser(_)
+        | ToolAction::TurnNotes { .. } => None,
         ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
             (!capabilities.allow_file_edits).then_some(ProfileLimit::FileEdits)
         }
@@ -250,7 +252,9 @@ pub(crate) fn mode_permits(
 
         // Spec 50: asking is allowed in every mode. Whether anyone can answer
         // narrows the offer in `chat.rs`; it never widens a mode.
-        ToolAction::AskUser(_) => Permission::Allowed,
+        // Spec 65: writing notes is allowed in every mode, beside the reads it
+        // records findings from. It writes only the turn's own notes.
+        ToolAction::AskUser(_) | ToolAction::TurnNotes { .. } => Permission::Allowed,
 
         ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
             if mode == Code {

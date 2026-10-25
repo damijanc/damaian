@@ -954,6 +954,18 @@ error[E0308]: mismatched types
           files; paths truncate from the left so the filename stays visible.
         </p>
       </div>
+      <div class="sg-card">
+        <button type="button" class="disclosure" aria-expanded="false">
+          <span class="disclosure-caret" aria-hidden="true"></span> Notes
+        </button>
+        <pre class="turn-notes">Approvals are decided in command_policy.rs.
+The cause enum is fed by the classifier in validation.rs.</pre>
+        <p class="sg-note">
+          A turn's notes (spec 65): short model-written findings kept visible after earlier
+          rounds are dropped, and carried into the next turn of the session. Shown expanded
+          here; collapsed by default in the app.
+        </p>
+      </div>
     </section>
 
     <section class="sg-section">

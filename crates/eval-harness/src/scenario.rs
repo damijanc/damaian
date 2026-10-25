@@ -96,6 +96,16 @@ pub struct Asserts {
     /// is a measurement of the run; an exact count is script-dependent in the
     /// deterministic tier and therefore `deterministic_only`.
     pub exploration_rounds: Option<u64>,
+    /// Exactly how many `turn_notes` calls the run dispatched (spec 65 §5.9).
+    pub notes_calls: Option<u64>,
+    /// That at least this many notes were carried from an earlier turn into a
+    /// later one (spec 65 §5.9). A count, not a boolean, so a run that carried
+    /// twice still passes.
+    pub carried_notes_at_least: Option<u64>,
+    /// That no read repeated an earlier read in the run (spec 65 §5.9). Read
+    /// from the log, where a repeat anywhere counts; the deterministic scenario
+    /// expects zero.
+    pub repeated_elided_reads: Option<u64>,
     /// What the classifier must conclude about the task left mid-action by
     /// `crash_mid_action`, as its `TaskStatus` string.
     pub recovered_classification: Option<String>,
@@ -115,6 +125,23 @@ pub struct Asserts {
     /// The exact commands the report lists as passed. The point is that none of
     /// them was merely skipped or stale.
     pub verification_passed_commands: Option<Vec<String>>,
+    /// How many plan reminders the run sent (spec 66 §5.5). A scenario that
+    /// asserts this without a plan fails rather than comparing `None`.
+    pub plan_reminders: Option<u64>,
+    /// The final plan's verified / unverified / outstanding counts (spec 66
+    /// §5.5). Each reads `RecordedPlan`, which exists only when the turn made a
+    /// plan, so a planless run fails the assertion instead of reading a
+    /// vacuous zero.
+    pub plan_verified: Option<u64>,
+    pub plan_unverified: Option<u64>,
+    pub plan_outstanding: Option<u64>,
+    /// Whether the engine recorded `plan_left_open` for the run.
+    pub plan_left_open: Option<bool>,
+    /// Evidence items on the steps still open in the final plan.
+    pub plan_open_evidence: Option<u64>,
+    /// Strings the task's last assistant message must contain, read from the
+    /// session log. Script-derived, so it is `deterministic_only`.
+    pub last_assistant_message_contains: Option<Vec<String>>,
     /// Assertion names that depend on a scripted tool call and are therefore
     /// skipped in the live tier (proposal §5.3), so a scenario stays one
     /// definition rather than two that drift.
@@ -161,6 +188,11 @@ pub struct Scenario {
     /// resumes each question through `resume_after_answer`. Empty is the
     /// headless default every other scenario keeps.
     pub answers: Vec<String>,
+    /// A second user turn in the same session, run after the first finishes
+    /// (spec 65 §5.9). Its scripted responses are the rest of `turns`, so one
+    /// scenario can measure what a later turn inherits. `None` is one turn, as
+    /// every scenario before this one had.
+    pub follow_up_prompt: Option<String>,
     /// Config this run needs beyond the defaults, in the same `key=value` form
     /// as `user.conf` (spec 59 §5.7's zero-allowance case is one). Parsed at the
     /// boundary so a malformed line is a load error, not a silently ignored
@@ -203,6 +235,10 @@ struct RawScenario {
     /// leaves the run headless.
     #[serde(default)]
     answers: Vec<String>,
+    /// A second user turn in the same session (spec 65 §5.9). The scripted
+    /// responses continue from where the first turn stopped.
+    #[serde(default)]
+    follow_up_prompt: Option<String>,
     /// The config as the same `key=value` lines `user.conf` uses. A string
     /// rather than a table because the engine's parser is the one authority on
     /// what the keys are and what values they accept.
@@ -343,6 +379,7 @@ pub fn load(path: &Path) -> Result<Scenario> {
         approval_decision: raw.approval_decision,
         round_budget_decision: raw.round_budget_decision,
         answers: raw.answers,
+        follow_up_prompt: raw.follow_up_prompt,
         config_overlay: match raw.config_overlay {
             Some(text) => Some(ConfigOverlay::parse(&text).map_err(|error| {
                 ClientError::InvalidInput(format!("{}: config_overlay: {error}", path.display()))

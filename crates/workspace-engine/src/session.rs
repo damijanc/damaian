@@ -8,7 +8,7 @@ use crate::mode::SessionMode;
 use crate::model::{TokenUsage, UsageSource};
 use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,21 @@ pub struct Session {
     /// can filter on it without a second migration when 52 lands. See spec 53
     /// §5.6.
     pub origin: String,
+}
+
+/// A turn's notes as the session log holds them (spec 65 §5.6).
+///
+/// The text has already been through the secret scanner: the chat loop redacts
+/// before it records, and the export redacts again through its own closure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnNotes {
+    pub text: String,
+    /// Whether the record still holds text carried from an earlier turn.
+    pub carried: bool,
+    /// The size of the change that produced this event.
+    pub chars: usize,
+    /// The running size of the record after the change.
+    pub total_chars: usize,
 }
 
 /// What makes a session a worker (spec 57 §5.1 step 7): where it came from,
@@ -170,6 +185,33 @@ impl TaskStatus {
         )
     }
 
+    /// Whether a turn is still going in this state, as the plan panel means it.
+    ///
+    /// Deliberately **not** `!is_terminal()`. `Interrupted` and
+    /// `UnknownExternalOutcome` are non-terminal — recovery can still act on
+    /// them — but no turn is running, and a crash-leftover plan must read "not
+    /// finished" rather than "running". The match is exhaustive so a new state
+    /// has to choose (spec 66 `context.md` D7).
+    pub fn is_active(&self) -> bool {
+        match self {
+            Self::Created
+            | Self::PreparingContext
+            | Self::WaitingForModel
+            | Self::RunningTool
+            | Self::WaitingForApproval
+            | Self::Paused
+            | Self::ApplyingPatch
+            | Self::Validating => true,
+            Self::Complete
+            | Self::Failed
+            | Self::Cancelled
+            | Self::ToolBudgetExhausted
+            | Self::TokenBudgetExhausted
+            | Self::Interrupted
+            | Self::UnknownExternalOutcome => false,
+        }
+    }
+
     /// Whether a crash in this state may have left a side effect part-done, and
     /// so must never be automatically repeated (requirement 5).
     ///
@@ -207,6 +249,12 @@ pub struct ChatMessage {
     pub task_id: Option<String>,
     pub role: String,
     pub content: String,
+    /// What wrote this entry, when it was not an ordinary chat turn. The only
+    /// value today is `"plan_reminder"` (spec 66 §5.5): the engine's nudge is a
+    /// user-role message in the request but must render as a system line and
+    /// must not seed the next turn as the user's own words. `None` for every
+    /// message a person or the model wrote.
+    pub kind: Option<String>,
     pub created_at_ms: u128,
 }
 
@@ -513,12 +561,29 @@ impl SessionStore {
         role: &str,
         content: &str,
     ) -> Result<ChatMessage> {
+        self.append_message_with_kind(session_id, task_id, role, content, None)
+    }
+
+    /// [`Self::append_message`] for an entry that is not an ordinary turn.
+    ///
+    /// `kind` is written as an extra field and read back as `None` by an older
+    /// log, so a message written before this existed is indistinguishable from
+    /// an ordinary one — which is what it was (spec 66 §5.5).
+    pub fn append_message_with_kind(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        role: &str,
+        content: &str,
+        kind: Option<&str>,
+    ) -> Result<ChatMessage> {
         let message = ChatMessage {
             id: create_id("msg"),
             session_id: session_id.to_string(),
             task_id: task_id.map(|value| value.to_string()),
             role: role.to_string(),
             content: content.to_string(),
+            kind: kind.map(|value| value.to_string()),
             created_at_ms: now_millis(),
         };
         self.append_session_event(session_id, "message_appended", &message_json(&message))?;
@@ -1036,6 +1101,73 @@ impl SessionStore {
             "createdAtMs": now_millis() as u64,
         });
         self.append_session_event(session_id, "question_asked", &payload.to_string())
+    }
+
+    /// Records one change to a turn's notes (spec 65 §5.6).
+    ///
+    /// The full text after the change is stored, already redacted by the chat
+    /// loop; `chars` is the size of the change and `total_chars` the running
+    /// record. The latest event for a task is that task's notes, and reading
+    /// goes through `active_events`, so a rewind drops the notes with the turn
+    /// they belong to.
+    pub fn record_turn_notes(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        replace: bool,
+        carried: bool,
+        text: &str,
+        chars: usize,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "taskId": task_id,
+            "replace": replace,
+            "carried": carried,
+            "text": text,
+            "chars": chars,
+            "totalChars": text.chars().count(),
+        });
+        self.append_session_event(session_id, "turn_notes", &payload.to_string())
+    }
+
+    /// Every task's latest notes in a session (spec 65 §5.6), keyed by task id.
+    ///
+    /// Reads `active_events`, so after a rewind the notes of a rewound-away
+    /// turn are gone and the turn before it is the previous turn — the same
+    /// rule `read_tasks` and `read_messages` already follow.
+    pub fn read_turn_notes(&self, session_id: &str) -> Result<BTreeMap<String, TurnNotes>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(BTreeMap::new());
+        };
+        let mut notes = BTreeMap::new();
+        for event in active_events(&content) {
+            if event.event_type != "turn_notes" {
+                continue;
+            }
+            let (Some(task_id), Some(text)) = (event.text("taskId"), event.text("text")) else {
+                continue;
+            };
+            notes.insert(
+                task_id,
+                TurnNotes {
+                    text,
+                    carried: event
+                        .payload
+                        .get("carried")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    chars: event
+                        .number("chars")
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(0),
+                    total_chars: event
+                        .number("totalChars")
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(0),
+                },
+            );
+        }
+        Ok(notes)
     }
 
     /// Records the user's answer. Refused when the question is unknown,
@@ -2246,6 +2378,7 @@ impl SessionStore {
         let tasks = self.read_tasks(session_id)?;
         let usage = self.read_task_usage(session_id)?;
         let plans = self.read_session_plans(session_id)?;
+        let notes = self.read_turn_notes(session_id)?;
 
         let mut redaction_count = 0usize;
         let mut redact = |text: &str| -> String {
@@ -2306,6 +2439,17 @@ impl SessionStore {
                             }
                         }
                     }
+                    if let Some(notes) = notes.get(&task.id) {
+                        let carried = if notes.carried {
+                            " (carried from the previous turn)"
+                        } else {
+                            ""
+                        };
+                        out.push_str(&format!("  - Notes{carried}:\n"));
+                        for line in redact(&notes.text).lines() {
+                            out.push_str(&format!("    {line}\n"));
+                        }
+                    }
                 }
                 out
             }
@@ -2347,6 +2491,10 @@ impl SessionStore {
                                     "status": step.status,
                                     "evidence": step.evidence,
                                 })).collect::<Vec<_>>(),
+                            })),
+                            "notes": notes.get(&task.id).map(|notes| serde_json::json!({
+                                "text": redact(&notes.text),
+                                "carried": notes.carried,
                             })),
                         })
                     })
@@ -2479,7 +2627,7 @@ fn task_json(task: &Task) -> String {
 
 fn message_json(message: &ChatMessage) -> String {
     format!(
-        "{{\"id\":\"{}\",\"sessionId\":\"{}\",\"taskId\":{},\"role\":\"{}\",\"content\":\"{}\",\"createdAtMs\":{}}}",
+        "{{\"id\":\"{}\",\"sessionId\":\"{}\",\"taskId\":{},\"role\":\"{}\",\"content\":\"{}\",\"createdAtMs\":{}{}}}",
         escape_json(&message.id),
         escape_json(&message.session_id),
         message
@@ -2489,7 +2637,12 @@ fn message_json(message: &ChatMessage) -> String {
             .unwrap_or_else(|| "null".to_string()),
         escape_json(&message.role),
         escape_json(&message.content),
-        message.created_at_ms
+        message.created_at_ms,
+        message
+            .kind
+            .as_ref()
+            .map(|value| format!(",\"kind\":\"{}\"", escape_json(value)))
+            .unwrap_or_default()
     )
 }
 
@@ -2704,6 +2857,7 @@ fn parse_message_event(event: &SessionEvent) -> Option<ChatMessage> {
         task_id: event.text("taskId"),
         role: event.text("role")?,
         content: event.text("content")?,
+        kind: event.text("kind"),
         created_at_ms: event.number("createdAtMs")?,
     })
 }
@@ -2731,6 +2885,7 @@ fn parse_transcript_event(event: &SessionEvent) -> Option<ChatMessage> {
             task_id: event.text("taskId"),
             role: "question".to_string(),
             content: event.text("question")?,
+            kind: None,
             created_at_ms: event.number("createdAtMs")?,
         }),
         "question_answered" => Some(ChatMessage {
@@ -2739,6 +2894,7 @@ fn parse_transcript_event(event: &SessionEvent) -> Option<ChatMessage> {
             task_id: event.text("taskId"),
             role: "answer".to_string(),
             content: event.text("answer")?,
+            kind: None,
             created_at_ms: event.number("createdAtMs")?,
         }),
         _ => None,
@@ -2915,6 +3071,53 @@ mod tests {
 
         let log = fs::read_to_string(store.session_log_path(&session.id)).unwrap();
         assert!(log.contains("\"setBy\":\"user\""));
+    }
+
+    /// Spec 66 `context.md` D10: the tag is what tells the conversation view
+    /// and the next turn's seed that the entry is the engine's nudge. A line
+    /// written before the field existed must read as an ordinary message.
+    #[test]
+    fn a_message_with_a_kind_round_trips_and_an_old_one_reads_none() {
+        let store = SessionStore::new(temp_data_dir("message-kind"));
+        let session = store.create_session("repo_1", "Kind").unwrap();
+
+        store
+            .append_message_with_kind(
+                &session.id,
+                None,
+                "user",
+                "Your plan still has open steps.",
+                Some("plan_reminder"),
+            )
+            .unwrap();
+        store
+            .append_message(&session.id, None, "user", "hello")
+            .unwrap();
+
+        let messages = store.read_messages(&session.id).unwrap();
+        assert_eq!(
+            messages[0].kind.as_deref(),
+            Some("plan_reminder"),
+            "the tag round-trips"
+        );
+        assert_eq!(messages[1].kind, None, "an ordinary message has no tag");
+
+        // A message appended before the field existed: no `kind` key at all.
+        let path = store.session_log_path(&session.id);
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(
+            file,
+            "{{\"seq\":99,\"eventType\":\"message_appended\",\"payload\":{{\"id\":\"msg_old\",\"sessionId\":\"{}\",\"taskId\":null,\"role\":\"user\",\"content\":\"old\",\"createdAtMs\":1}}}}",
+            session.id
+        )
+        .unwrap();
+
+        let messages = store.read_messages(&session.id).unwrap();
+        let old = messages
+            .iter()
+            .find(|message| message.id == "msg_old")
+            .expect("the old line parses");
+        assert_eq!(old.kind, None);
     }
 
     /// Mode is a capability the user configured, not conversation content:

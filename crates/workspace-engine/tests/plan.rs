@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::plan::{
     Evidence, PlanStep, StepOutcome, StepStatus, TaskPhase, TaskPlan, status_from_evidence,
 };
-use workspace_engine::{CommandPurpose, SessionStore, Task};
+use workspace_engine::{CommandPurpose, SessionStore, Task, TaskStatus};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -874,6 +874,47 @@ fn a_finished_plan_is_complete_even_while_something_awaits_review() {
 }
 
 // ---------------------------------------------------------------------------
+// What "open" means, in one place (spec 66 §5.1).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn open_steps_are_the_pending_and_in_progress_ones_in_plan_order() {
+    let mut plan = TaskPlan::new("task_1", 0);
+    plan.steps.push(step("step_1", StepStatus::Completed));
+    plan.steps.push(step("step_2", StepStatus::InProgress));
+    plan.steps.push(step("step_3", StepStatus::Skipped));
+    plan.steps.push(step("step_4", StepStatus::Pending));
+    plan.steps.push(step("step_5", StepStatus::Blocked));
+
+    let open: Vec<&str> = plan
+        .open_steps()
+        .into_iter()
+        .map(|step| step.id.as_str())
+        .collect();
+    assert_eq!(open, vec!["step_2", "step_4"]);
+}
+
+#[test]
+fn a_plan_with_only_terminal_steps_has_no_open_steps() {
+    let mut plan = TaskPlan::new("task_1", 0);
+    plan.steps.push(step("step_1", StepStatus::Completed));
+    plan.steps.push(step("step_2", StepStatus::Blocked));
+    plan.steps.push(step("step_3", StepStatus::Skipped));
+
+    assert!(plan.open_steps().is_empty());
+}
+
+#[test]
+fn a_blocked_step_is_not_open() {
+    // The reminder must never ask the model to close a step whose prerequisite
+    // failed: the model was already told so in the `complete_step` result.
+    let mut plan = TaskPlan::new("task_1", 0);
+    plan.steps.push(step("step_1", StepStatus::Blocked));
+
+    assert!(plan.open_steps().is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // Carrying a plan across a task boundary.
 //
 // `context.md` §3.1: a task is one turn, so "the plan survives" (§5.4) is true
@@ -1111,9 +1152,9 @@ fn a_step_still_running_is_not_reported_as_an_outcome() {
         "a plan with work still open is not complete"
     );
     assert!(
-        !report.summary().to_lowercase().contains("complete"),
+        !report.summary(true).to_lowercase().contains("complete"),
         "the summary said complete while two steps were still open: {}",
-        report.summary()
+        report.summary(true)
     );
 }
 
@@ -1132,9 +1173,9 @@ fn a_plan_with_a_blocked_step_is_never_summarised_as_complete() {
     assert!(!report.is_complete);
     assert_eq!(report.blocked, 1);
     assert!(
-        !report.summary().to_lowercase().contains("complete"),
+        !report.summary(true).to_lowercase().contains("complete"),
         "the summary said complete for a plan with a blocked step: {}",
-        report.summary()
+        report.summary(true)
     );
 }
 
@@ -1151,7 +1192,7 @@ fn a_plan_whose_steps_all_carry_evidence_is_complete() {
     assert!(report.is_complete);
     assert_eq!(report.verified, 2);
     assert_eq!(report.unverified, 0);
-    assert!(report.summary().contains("2 steps complete"));
+    assert!(report.summary(true).contains("2 steps complete"));
 }
 
 #[test]
@@ -1169,9 +1210,9 @@ fn an_unverified_step_is_still_complete_but_the_summary_says_so() {
     assert!(report.is_complete);
     assert_eq!(report.unverified, 1);
     assert!(
-        report.summary().contains("1 unverified"),
+        report.summary(true).contains("1 unverified"),
         "an unverified step must be visible in the summary: {}",
-        report.summary()
+        report.summary(true)
     );
 }
 
@@ -1184,7 +1225,92 @@ fn a_plan_with_no_steps_reports_nothing_rather_than_success() {
     let report = plan.report();
 
     assert!(!report.is_complete);
-    assert_eq!(report.summary(), "No steps planned.");
+    assert_eq!(report.summary(true), "No steps planned.");
+}
+
+// ---------------------------------------------------------------------------
+// An ended turn's wording (spec 66 §5.4).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_ended_plan_summary_says_not_marked_done() {
+    let mut plan = TaskPlan::new("task_1", 0);
+    plan.steps.push(step("step_1", StepStatus::InProgress));
+    plan.steps.push(step("step_2", StepStatus::Pending));
+    let report = plan.report();
+
+    assert_eq!(
+        report.summary(false),
+        "Turn ended with 2 steps not marked done."
+    );
+    assert_eq!(report.summary(true), "2 steps outstanding.");
+}
+
+#[test]
+fn an_ended_plan_with_a_blocked_step_still_names_it() {
+    let mut plan = TaskPlan::new("task_1", 0);
+    let mut done = step("step_1", StepStatus::Completed);
+    done.evidence.push(command_exit(Some(0)));
+    plan.steps.push(done);
+    plan.steps.push(step("step_2", StepStatus::Blocked));
+    plan.steps.push(step("step_3", StepStatus::InProgress));
+    let summary = plan.report().summary(false);
+
+    assert!(
+        summary.contains("Turn ended with 1 step not marked done"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("1 step blocked"),
+        "the blocked step is not hidden: {summary}"
+    );
+    assert!(summary.contains("1 finished"), "{summary}");
+}
+
+#[test]
+fn a_complete_plan_s_summary_ignores_active() {
+    let mut plan = TaskPlan::new("task_1", 0);
+    let mut done = step("step_1", StepStatus::Completed);
+    done.evidence.push(command_exit(Some(0)));
+    plan.steps.push(done);
+    let report = plan.report();
+
+    assert_eq!(report.summary(true), report.summary(false));
+    assert_eq!(report.summary(true), "1 step complete.");
+}
+
+#[test]
+fn the_states_whose_turn_is_still_running_are_exactly_the_non_terminal_work_states() {
+    let active: Vec<&str> = TaskStatus::all()
+        .iter()
+        .filter(|status| status.is_active())
+        .map(|status| status.as_str())
+        .collect();
+
+    assert_eq!(
+        active,
+        vec![
+            "created",
+            "preparing_context",
+            "waiting_for_model",
+            "running_tool",
+            "waiting_for_approval",
+            "paused",
+            "applying_patch",
+            "validating",
+        ]
+    );
+}
+
+#[test]
+fn the_two_crash_states_are_not_running_even_though_they_are_not_terminal() {
+    // Recovery can still act on these, but no turn is running: a
+    // crash-leftover plan must say "not finished", not "running". This is why
+    // `active` is not `!is_terminal()`.
+    for status in [TaskStatus::Interrupted, TaskStatus::UnknownExternalOutcome] {
+        assert!(!status.is_terminal(), "{status:?} stays recoverable");
+        assert!(!status.is_active(), "{status:?} has no turn running");
+    }
 }
 
 #[test]

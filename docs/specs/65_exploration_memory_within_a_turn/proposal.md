@@ -1,6 +1,8 @@
 # Feature Spec: Exploration Memory
 
-Status: Not started (planned 2026-10-24: see [`tasks.md`](tasks.md)).
+Status: Done 2026-10-25. Tasks 1–11 implemented; the live acceptance against
+`deepseek-v4-flash` is recorded in §6. See [`tasks.md`](tasks.md) for the
+per-task progress record and §7 for what landed and the honest caveats.
 Implementation of the tasks that touch the turn seed waits for
 [#26](../26_context_assembly/proposal.md) to land. Specified on 2026-10-18 from a review of
 [#59](../59_exploration_round_allowance/proposal.md)–[#64](../64_read_only_command_boundary.md),
@@ -599,9 +601,118 @@ per-key budget classes.
   without reading all of them again — and the run records how many reads it
   repeated from the first turn.
 
+### Live acceptance (2026-10-25)
+
+Run against `deepseek-v4-flash` on this repository (the spec-65 worktree,
+working tree dirty with this change), native tools on, default budgets
+(`agent_max_tool_rounds` 8, `agent_max_exploration_rounds` 24,
+`agent_max_turn_messages` 24). The driver was a temporary in-process
+`cargo` example (`crates/damaian-cli/examples/spec65_live.rs`) with an isolated
+data directory under `target/spec65-live/`; it continued every round-budget
+pause with *Continue*, used *Answer now* at the hard cap, approved only
+`low`-risk commands, declined everything else, and was deleted after the runs.
+No patch was proposed or applied, and no command outside the repository ran.
+
+| Run | Prompt | Notes | Model calls | *Continue*s | Notes calls | Repeats (upper bound) | Elided calls in the final request | Outcome |
+|---|---|---|---|---:|---:|---:|---:|---|
+| A | #59's motivating prompt | 8,000 | 9 | 0 | 1 | 5 | 7 | complete |
+| B | #59's motivating prompt | 0 | 11 | 0 | 0 | 3 | not listed (today's notice) | complete |
+| C | "Where is the command approval decision made, …?" | 8,000 | 10 | 0 | 1 | 1 | 3 | complete |
+| D | "Where is the command approval decision made, …?" | 0 | 33 | 1 | 0 | 14 | not listed (today's notice) | complete |
+| E | "Add a new approval cause …?" in C's session | 8,000 | 15 | 0 | 5 (+ the carry event) | 7 session-wide | 8 | complete |
+
+**Within a turn, A is accepted.** Its final request had elided seven calls:
+`list_directory docs depth 2`, `list_worktrees`, `read_file
+docs/specs/README.md`, `read_file scripts/check-spec-status.mjs`,
+`list_directory docs/specs depth 3`, `read_git_status`, and `search_content
+"^Status:" in docs/specs/**`. The answer still reported the complete spec
+status picture (66 specs: 46 Done, #49 and #65 In progress, #15 part-skipped,
+17 Not started), named `scripts/check-spec-status.mjs` as the consistency
+check, and reported the dirty tree and the `list_worktrees` result. Those facts
+were read only in elided calls and survived in the notes block written before
+the answer; the counts were checked against `docs/specs/README.md` and
+`npm run specs:check -- --strict` (66 specs). The notes were 1,526 characters at
+the answer and were the mechanism that kept those findings in view after the
+cut.
+
+**The `0` control, B,** took 11 model calls and had no notes tool, no notes
+block, and today's notice. Its repeated-read count (3) was lower than A's (5),
+so the "fewer repeats" expectation was **not** met for this prompt; the
+acceptance rests on A's use of elided findings, which is the criterion the
+spec says is sufficient. The `0` answer was also correct, because it re-read
+what it needed.
+
+**Prompt 2 is the clearer A/B.** C completed in 10 model calls with one note
+and one repeated read; D took **33 model calls, one *Continue*, and 14
+repeated reads**, and declined two high-risk shell commands. C's final request
+elided only the plan, the `AGENTS.md` read and an early search, so its
+elision evidence is shallow; D's cost is the evidence that without notes the
+turn keeps re-reading. The notes are what made C finish in one segment.
+
+**Across turns, E is accepted.** It started from C's session. The first
+`turn_notes` event for the new task was `carried: true` with C's 2,809
+characters, before the first request; five appends grew the record to 7,715 of
+8,000. The answer named the places the first turn found — the
+`ApprovalCause` enum in `command_policy.rs`, its two exhaustive matches
+(`as_str`, `plain_words`), the `classify_at` detection points, spec 62's cause
+table and audit fields, and the eval harness's first-cause grouping — and said
+what has to change. The session recorded seven repeated reads across both
+tasks, so it did re-read some material; it did not have to find the places
+again.
+
+**Caveats, recorded rather than hidden.** (1) A's `list_worktrees` returned no
+registered worktrees although `git worktree list` shows them, including this
+one; the answer faithfully reported the tool, so this is a spec-60/tool
+observation, not a notes failure. (2) A's repeated-read count is higher than
+B's; C/D is the comparison that shows the intended direction. (3) The driver
+declined every high-risk or shell-control command, so the runs are not a user
+who approves them; no code was changed. (4) The live run used the default
+window, so C's cut is shallow; A is the strong within-turn evidence.
+
 ## 7. Implementation Notes
 
-None yet. The planning pass on 2026-10-24 corrected this spec's drifted
-references and three factual claims; the table in [`tasks.md`](tasks.md) →
-Corrections records each one, and [`context.md`](context.md) is the code map
-the tasks were written against.
+Implemented 2026-10-25 (Tasks 1–11; the live acceptance is in §6; see
+[`tasks.md`](tasks.md) for the per-task record). What landed:
+
+- `agent_max_turn_notes_chars` (default 8,000, clamped at
+  `ABSOLUTE_TURN_NOTES_CHARS = 32_000`, restrict-only, `Capability`, label
+  "Notes size"). `0` is the off switch and takes today's request path.
+- `turn_notes` with `ActionEffect::Notes`: batchable with reads, charged as
+  exploration, bounded with a refusal that names the size and suggests
+  `replace`, redacted before storage, logged as a `turn_notes` event and
+  audited as sizes only.
+- `NotesWindow` pinning: notes after the seed, a calls-aware elision notice
+  (cap 40), and a pre-cut warning (cap 10) after the tail. The round budget
+  stays `max_messages - 3`.
+- The per-turn `RecordedCall` list (`round`, `message_index`, `line`, `key`,
+  `writes`), persisted in `PendingChatTurn` so the notice survives a pause and
+  `seen_read_calls` is rebuilt since the last write on resume.
+- Cross-turn carry with the carried header, a `carried: true` event before the
+  first request, a size-only audit, and rewind correctness through
+  `active_events`.
+- The user-visible notes disclosure and export, the `notesChars` progress
+  field, and a `long_exploration_memory` deterministic scenario with
+  `follow_up_prompt`.
+
+Deviations and open items, recorded so a later reader does not have to
+rediscover them:
+
+- **Task 7 was re-checked after #26 landed** on 2026-10-25 (main `e7e5258`).
+  The seed is still two messages and `bounded_messages` is unchanged, so the
+  notes block and the split point did not move; `build_model_prompt` now takes
+  a `ContextPlan` and a scanner, and this spec does not call it.
+- **The live acceptance was run on 2026-10-25** against `deepseek-v4-flash`;
+  the results and the honest caveats are in §6. The `0` control for the first
+  prompt had fewer repeated reads than the default, so the strong evidence is
+  that prompt's use of elided findings and prompt 2's 10-versus-33-call
+  comparison.
+- **The crash "log only" path is not reachable in the current recovery code.**
+  The call-list rebuild is exercised from a pending file that carries notes
+  with an empty call list; a real log-only resume has no `messages` to rebuild
+  from today.
+- **The eval harness's `repeated_elided_reads` is an upper bound.** The log
+  records action identity, not the request window, so it counts any repeated
+  read in a task rather than only one caused by a cut. The scenario expects
+  zero, where the two coincide.
+- Mutation testing (each task's Step 5) was not run; the scoped check results
+  and the test names are recorded in [`tasks.md`](tasks.md).

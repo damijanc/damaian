@@ -355,6 +355,16 @@ pub struct Config {
     /// the same reason as the read caps. The session log still holds every
     /// round; only the request is bounded.
     pub agent_max_turn_messages: usize,
+    /// Characters of `turn_notes` one turn may hold (spec 65).
+    ///
+    /// The notes are sent in every request of the turn and carried into the
+    /// next turn of the session, so this is a bound on what a long
+    /// investigation adds to every later call. Restrict-only, lower wins: a
+    /// repository may lower it, never raise it, because raising it spends the
+    /// user's money on the repository's say-so. `0` turns the feature off
+    /// completely: no tool, no notes block, no notice changes, and nothing
+    /// carried — the requests are exactly what they were before spec 65.
+    pub agent_max_turn_notes_chars: usize,
     /// Directories the user made project roots, repository-relative (spec 24
     /// §5.7). Validated when the map is built, not here, so a bad entry is
     /// shown in the map's `excluded` rather than failing the config load.
@@ -1140,6 +1150,7 @@ impl Config {
             agent_max_questions_per_turn,
             agent_max_task_tokens,
             agent_max_turn_messages,
+            agent_max_turn_notes_chars,
             agent_max_exploration_rounds,
             project_roots_added,
             project_roots_removed,
@@ -1628,6 +1639,11 @@ impl Config {
                 "agent_max_turn_messages",
                 &mut self.agent_max_turn_messages,
                 agent_max_turn_messages,
+            ),
+            (
+                "agent_max_turn_notes_chars",
+                &mut self.agent_max_turn_notes_chars,
+                agent_max_turn_notes_chars,
             ),
             ("max_read_lines", &mut self.max_read_lines, max_read_lines),
             (
@@ -2633,6 +2649,11 @@ impl Config {
         );
         push_line(
             &mut output,
+            "agent_max_turn_notes_chars",
+            &self.agent_max_turn_notes_chars.to_string(),
+        );
+        push_line(
+            &mut output,
             "project_roots_added",
             &join_list(&self.project_roots_added),
         );
@@ -2740,6 +2761,9 @@ impl Default for Config {
             // configuration does on upgrade (§5.4).
             agent_max_task_tokens: None,
             agent_max_turn_messages: 24,
+            // Roughly 2,000 tokens, under 2% of the request #59's motivating
+            // session sent (spec 65 §5.7).
+            agent_max_turn_notes_chars: 8_000,
             project_roots_added: Vec::new(),
             project_roots_removed: Vec::new(),
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
@@ -2819,6 +2843,7 @@ pub struct ConfigOverlay {
     pub agent_max_questions_per_turn: Option<u32>,
     pub agent_max_task_tokens: Option<u64>,
     pub agent_max_turn_messages: Option<usize>,
+    pub agent_max_turn_notes_chars: Option<usize>,
     pub agent_max_exploration_rounds: Option<u32>,
     pub project_roots_added: Option<Vec<String>>,
     pub project_roots_removed: Option<Vec<String>>,
@@ -2971,6 +2996,9 @@ classify_overlay_fields! {
     agent_max_questions_per_turn => Preference,
     agent_max_task_tokens => Capability,
     agent_max_turn_messages => Capability,
+    // Spec 65: restrict-only like the request window, and sent on every later
+    // call including the next turn's, so a capability.
+    agent_max_turn_notes_chars => Capability,
     // Spec 59: restrict-only, so a capability — a repository may lower the
     // read allowance, never raise it (§5.4).
     agent_max_exploration_rounds => Capability,
@@ -3230,6 +3258,9 @@ impl ConfigOverlay {
             "project_roots_removed" => self.project_roots_removed = Some(split_list(value)),
             "agent_max_turn_messages" => {
                 self.agent_max_turn_messages = Some(parse_read_lines(key, value)?)
+            }
+            "agent_max_turn_notes_chars" => {
+                self.agent_max_turn_notes_chars = Some(parse_turn_notes_chars(key, value)?)
             }
             "agent_max_exploration_rounds" => {
                 self.agent_max_exploration_rounds = Some(parse_exploration_round_count(key, value)?)
@@ -3594,6 +3625,7 @@ impl ConfigOverlay {
             agent_max_questions_per_turn,
             agent_max_task_tokens,
             agent_max_turn_messages,
+            agent_max_turn_notes_chars,
             agent_max_exploration_rounds,
             project_roots_added,
             project_roots_removed,
@@ -3797,6 +3829,13 @@ impl ConfigOverlay {
         }
         if let Some(value) = agent_max_turn_messages {
             push_line(&mut output, "agent_max_turn_messages", &value.to_string());
+        }
+        if let Some(value) = agent_max_turn_notes_chars {
+            push_line(
+                &mut output,
+                "agent_max_turn_notes_chars",
+                &value.to_string(),
+            );
         }
         if let Some(value) = project_roots_added {
             push_line(&mut output, "project_roots_added", &join_list(value));
@@ -4807,6 +4846,21 @@ fn parse_round_count(key: &str, value: &str) -> Result<u32> {
 fn parse_exploration_round_count(key: &str, value: &str) -> Result<u32> {
     let parsed = parse_u64(key, value)?;
     Ok(parsed.min(32) as u32)
+}
+
+/// Absolute upper bound for `agent_max_turn_notes_chars` (spec 65 §5.7).
+///
+/// The notes are sent in every request of the turn and carried into the next
+/// turn, so this is a bound on what a session adds to every later call.
+/// Raising it past this constant requires explicit work, not configuration.
+pub const ABSOLUTE_TURN_NOTES_CHARS: usize = 32_000;
+
+/// `agent_max_turn_notes_chars` accepts `0` ("notes off") and clamps a larger
+/// value to [`ABSOLUTE_TURN_NOTES_CHARS`], like the exploration allowance.
+/// Unlike `parse_read_lines`, zero is meaningful rather than a broken cap.
+fn parse_turn_notes_chars(key: &str, value: &str) -> Result<usize> {
+    let parsed = parse_u64(key, value)? as usize;
+    Ok(parsed.min(ABSOLUTE_TURN_NOTES_CHARS))
 }
 
 /// Takes the *lower* of the two at an untrusted scope, and whatever was given

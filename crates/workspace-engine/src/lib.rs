@@ -175,7 +175,7 @@ pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
     ActionMarker, ChatMessage, DanglingAction, ExportFormat, PatchFileDecision, PendingApprovalRef,
     SearchOptions, Session, SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskStatus,
-    TaskUsage, WorkerRecord,
+    TaskUsage, TurnNotes, WorkerRecord,
 };
 pub use steering::TurnSteering;
 pub use symbol_index::{

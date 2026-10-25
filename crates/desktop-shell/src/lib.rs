@@ -20,7 +20,7 @@ use workspace_engine::{
     ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
     ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState, RepositoryConfigReport,
     ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus,
-    SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink,
+    SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink,
     VerificationReport, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
     WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
     allow_always_eligible, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
@@ -607,6 +607,12 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         .session_store
         .read_session_web_diagnostics(&session_id)
         .map_err(|error| error.to_string())?;
+    // Each turn's final notes, joined by `taskId` (spec 65 §5.8). Already
+    // redacted when recorded.
+    let task_notes = engine
+        .session_store
+        .read_turn_notes(&session_id)
+        .map_err(|error| error.to_string())?;
     write_response(
         stream,
         request,
@@ -622,6 +628,7 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
                 &task_plans,
                 &task_failure_kinds,
                 &task_web_diagnostics,
+                &task_notes,
                 &engine.config
             )
         ),
@@ -2315,7 +2322,14 @@ fn turn_progress_event(progress: TurnProgress) -> Option<TurnEvent> {
     match progress {
         TurnProgress::Session(session_id) => Some(TurnEvent::Session(session_id)),
         TurnProgress::Phase(phase) => Some(TurnEvent::Phase(phase)),
-        TurnProgress::Plan(plan) => Some(TurnEvent::Plan(Box::new(plan))),
+        TurnProgress::Plan(plan) => Some(TurnEvent::Plan {
+            plan: Box::new(plan),
+            active: true,
+        }),
+        TurnProgress::PlanFinished(plan) => Some(TurnEvent::Plan {
+            plan: Box::new(plan),
+            active: false,
+        }),
         TurnProgress::WebDiagnostic(record) => Some(TurnEvent::WebDiagnostic(record)),
         TurnProgress::Paused | TurnProgress::Resumed | TurnProgress::NoteAdded { .. } => None,
     }
@@ -4024,8 +4038,12 @@ enum TurnEvent {
     Phase(TurnPhase),
     /// Boxed because a `TaskPlan` is much larger than the other variants, and
     /// an unboxed one would make every `TurnEvent` — one per streamed token —
-    /// carry its footprint.
-    Plan(Box<TaskPlan>),
+    /// carry its footprint. `active` is false only for the final event of a
+    /// turn that ended (spec 66 §5.4).
+    Plan {
+        plan: Box<TaskPlan>,
+        active: bool,
+    },
     /// Boxed for the same reason as `Plan`: a record carries a whole report.
     WebDiagnostic(Box<WebDiagnosticRecord>),
     Token(String),
@@ -4034,16 +4052,18 @@ enum TurnEvent {
 }
 
 /// Adds `explorationRound`/`maxExplorationRounds` beside the action counts;
-/// older readers ignore the new fields (spec 59 §5.5).
+/// older readers ignore the new fields (spec 59 §5.5). `notesChars` is the
+/// turn's notes size for the progress label (spec 65 §5.8).
 fn phase_json(phase: &TurnPhase) -> String {
     format!(
-        "{{\"phase\":\"{}\",\"label\":\"{}\",\"round\":{},\"maxRounds\":{},\"explorationRound\":{},\"maxExplorationRounds\":{}}}",
+        "{{\"phase\":\"{}\",\"label\":\"{}\",\"round\":{},\"maxRounds\":{},\"explorationRound\":{},\"maxExplorationRounds\":{},\"notesChars\":{}}}",
         phase.kind.as_str(),
         escape_json(&phase.label),
         phase.round,
         phase.max_rounds,
         phase.exploration_round,
-        phase.max_exploration_rounds
+        phase.max_exploration_rounds,
+        phase.notes_chars
     )
 }
 
@@ -4054,7 +4074,7 @@ fn phase_json(phase: &TurnPhase) -> String {
 /// `violatesSingleInProgress` is sent rather than left for the panel to work
 /// out, because a panel that silently rendered the first of two in-progress
 /// steps would conceal exactly the invariant requirement 2 exists to catch.
-pub(crate) fn plan_json(plan: &TaskPlan) -> String {
+pub(crate) fn plan_json(plan: &TaskPlan, active: bool) -> String {
     let report = plan.report();
     let steps = plan
         .steps
@@ -4077,10 +4097,11 @@ pub(crate) fn plan_json(plan: &TaskPlan) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"taskId\":\"{}\",\"steps\":[{}],\"summary\":\"{}\",\"isComplete\":{},\"verified\":{},\"unverified\":{},\"blocked\":{},\"skipped\":{},\"outstanding\":{},\"violatesSingleInProgress\":{}}}",
+        "{{\"taskId\":\"{}\",\"steps\":[{}],\"summary\":\"{}\",\"active\":{},\"isComplete\":{},\"verified\":{},\"unverified\":{},\"blocked\":{},\"skipped\":{},\"outstanding\":{},\"violatesSingleInProgress\":{}}}",
         escape_json(&plan.task_id),
         steps,
-        escape_json(&report.summary()),
+        escape_json(&report.summary(active)),
+        active,
         report.is_complete,
         report.verified,
         report.unverified,
@@ -4114,7 +4135,8 @@ fn plan_proposal_json(proposal: Option<&AgentPlanProposal>) -> String {
         "{{\"proposalId\":\"{}\",\"deferredAction\":\"{}\",\"plan\":{}}}",
         escape_json(&proposal.id),
         escape_json(&proposal.deferred_action),
-        plan_json(&proposal.plan)
+        // The review card is a turn waiting for a human, not one that ended.
+        plan_json(&proposal.plan, true)
     )
 }
 
@@ -4198,7 +4220,9 @@ fn relay_turn_events<W: Write>(
                         TurnEvent::Phase(phase) => {
                             write_sse_event(out, "phase", &phase_json(phase))
                         }
-                        TurnEvent::Plan(plan) => write_sse_event(out, "plan", &plan_json(plan)),
+                        TurnEvent::Plan { plan, active } => {
+                            write_sse_event(out, "plan", &plan_json(plan, *active))
+                        }
                         TurnEvent::WebDiagnostic(record) => {
                             write_sse_event(out, "web_diagnostic", &web_diagnostic_json(record))
                         }
@@ -4273,8 +4297,16 @@ where
 }
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
+    let turn_notes = match &result.turn_notes {
+        Some(notes) => format!(
+            "{{\"text\":\"{}\",\"carried\":{}}}",
+            escape_json(&notes.text),
+            notes.carried
+        ),
+        None => "null".to_string(),
+    };
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"checkBatch\":{},\"verificationReport\":{},\"usage\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"checkBatch\":{},\"verificationReport\":{},\"turnNotes\":{},\"usage\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -4291,6 +4323,7 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         question_proposal_json(result.question_proposal.as_ref()),
         check_batch_json(result.check_batch.as_ref()),
         verification_report_json(result.verification_report.as_ref()),
+        turn_notes,
         task_usage_json(result.usage.as_ref(), result.estimated_cost)
     )
 }
@@ -4874,6 +4907,7 @@ fn task_states_json(
     plans: &HashMap<String, TaskPlan>,
     failure_kinds: &HashMap<String, String>,
     web_diagnostics: &HashMap<String, Vec<WebDiagnosticRecord>>,
+    notes: &BTreeMap<String, TurnNotes>,
     config: &Config,
 ) -> String {
     let mut entries: Vec<&String> = statuses.keys().collect();
@@ -4901,8 +4935,18 @@ fn task_states_json(
             // Absent rather than an empty plan when the turn had none: a
             // trivial turn and a plan that proposed nothing are different
             // facts, and the panel must not appear for the first.
+            //
+            // `active` comes from the task status already in this payload, so a
+            // reloaded session agrees with the live stream about whether an
+            // open step is "running" (spec 66 §5.4). An unknown or legacy
+            // status is treated as ended: saying "running" about a turn we
+            // cannot classify is the wrong direction.
+            let active = statuses
+                .get(*id)
+                .and_then(|status| workspace_engine::TaskStatus::parse(status))
+                .is_some_and(|status| status.is_active());
             let plan_json_field = match plans.get(*id) {
-                Some(plan) => format!(",\"plan\":{}", plan_json(plan)),
+                Some(plan) => format!(",\"plan\":{}", plan_json(plan, active)),
                 None => String::new(),
             };
             // A named failure reason, when the turn failed with one (spec 48
@@ -4925,13 +4969,25 @@ fn task_states_json(
                 ),
                 _ => String::new(),
             };
+            // The turn's final notes, joined by `taskId` (spec 65 §5.8).
+            // Absent when the turn recorded none, so a reload shows the
+            // disclosure only for turns that have one.
+            let notes_field = match notes.get(*id) {
+                Some(notes) if !notes.text.is_empty() => format!(
+                    ",\"notes\":{{\"text\":\"{}\",\"carried\":{}}}",
+                    escape_json(&notes.text),
+                    notes.carried
+                ),
+                _ => String::new(),
+            };
             format!(
-                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}{}}}",
+                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}{}{}}}",
                 escape_json(id),
                 escape_json(&statuses[*id]),
                 usage_json,
                 failure_kind_field,
                 plan_json_field,
+                notes_field,
                 web_diagnostics_field
             )
         })
@@ -4962,8 +5018,15 @@ fn message_json(seq: u64, message: &ChatMessage, question: Option<&QuestionState
             )
         })
         .unwrap_or_default();
+    // `kind` is absent for an ordinary message, so the payload is unchanged
+    // for every session written before the plan reminder existed.
+    let kind_field = message
+        .kind
+        .as_ref()
+        .map(|kind| format!(",\"kind\":\"{}\"", escape_json(kind)))
+        .unwrap_or_default();
     format!(
-        "{{\"id\":\"{}\",\"sessionId\":\"{}\",\"taskId\":{},\"role\":\"{}\",\"content\":\"{}\",\"createdAtMs\":{},\"seq\":{}{}}}",
+        "{{\"id\":\"{}\",\"sessionId\":\"{}\",\"taskId\":{},\"role\":\"{}\",\"content\":\"{}\",\"createdAtMs\":{},\"seq\":{}{}{}}}",
         escape_json(&message.id),
         escape_json(&message.session_id),
         message
@@ -4975,6 +5038,7 @@ fn message_json(seq: u64, message: &ChatMessage, question: Option<&QuestionState
         escape_json(&message.content),
         message.created_at_ms,
         seq,
+        kind_field,
         question_fields
     )
 }
@@ -5142,8 +5206,8 @@ mod tests {
         desktop_settings_config_path, effective_policy_for_repo, engine_for_repo,
         forget_model_api_key, generated_secret_warnings_json, handle_connection, index_html,
         json_error, json_optional_string, keychain, language_servers_json, mcp_browser_arguments,
-        parse_form, parse_path_list, percent_decode, plan_json, plan_proposal_json,
-        question_proposal_json, relay_turn_events, remember_model_api_key,
+        message_json, parse_form, parse_path_list, percent_decode, phase_json, plan_json,
+        plan_proposal_json, question_proposal_json, relay_turn_events, remember_model_api_key,
         render_markdown_with_optional_file_links, repository_config_review_json,
         repository_config_write_target, require_api_token, resolve_shell_model_api_key,
         run_answer_question_request, run_server, run_terminal_command, save_config_file,
@@ -5161,12 +5225,12 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use workspace_engine::CheckpointRestoreResult;
     use workspace_engine::{
-        AgentPlanProposal, AgentQuestionProposal, AskUserInput, CancelToken, ChatTurnOptions,
-        ChatTurnResult, Config, Evidence, GeneratedSecretWarning, LanguageServerHub,
-        LanguageServerLaunch, LanguageServerState, LanguageServerStatus, MockModelAdapter,
-        PendingQuestionRef, PlanStep, SecretScanner, SessionMode, StepStatus, TaskPlan, TaskStatus,
-        TaskUsage, ToolCall, TurnProgress, TurnSink, UsageSource, WebDiagnosticRecord,
-        WebDiagnosticReport, WorkspaceEngine,
+        AgentPlanProposal, AgentQuestionProposal, AskUserInput, CancelToken, ChatMessage,
+        ChatTurnOptions, ChatTurnResult, Config, Evidence, GeneratedSecretWarning,
+        LanguageServerHub, LanguageServerLaunch, LanguageServerState, LanguageServerStatus,
+        MockModelAdapter, PendingQuestionRef, PhaseKind, PlanStep, SecretScanner, SessionMode,
+        StepStatus, TaskPlan, TaskStatus, TaskUsage, ToolCall, TurnNotes, TurnPhase, TurnProgress,
+        TurnSink, UsageSource, WebDiagnosticRecord, WebDiagnosticReport, WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
     };
 
@@ -5284,7 +5348,10 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let cancel = CancelToken::new();
         std::thread::spawn(move || {
-            let _ = sender.send(TurnEvent::Plan(Box::new(sample_plan())));
+            let _ = sender.send(TurnEvent::Plan {
+                plan: Box::new(sample_plan()),
+                active: true,
+            });
         });
 
         let mut out = FlakyWriter {
@@ -5309,6 +5376,85 @@ mod tests {
     }
 
     #[test]
+    fn an_ended_turn_s_plan_is_not_active() {
+        let mut plans = HashMap::new();
+        plans.insert("task_1".to_string(), sample_plan());
+        let mut statuses = HashMap::new();
+        statuses.insert("task_1".to_string(), "complete".to_string());
+
+        // `sample_plan` has one completed step and one in progress, so an ended
+        // turn must say the second was never marked done rather than "running".
+        let json = task_states_json(
+            &statuses,
+            &HashMap::new(),
+            &plans,
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &Config::default(),
+        );
+        assert!(json.contains("\"active\":false"), "{json}");
+        assert!(
+            json.contains("Turn ended with 1 step not marked done"),
+            "{json}"
+        );
+
+        statuses.insert("task_1".to_string(), "running_tool".to_string());
+        let json = task_states_json(
+            &statuses,
+            &HashMap::new(),
+            &plans,
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &Config::default(),
+        );
+        assert!(json.contains("\"active\":true"), "{json}");
+        assert!(json.contains("1 step outstanding"), "{json}");
+    }
+
+    #[test]
+    fn the_reminder_is_a_tagged_system_line_in_a_reloaded_session() {
+        // The conversation view needs the tag to render the engine's nudge as a
+        // system line rather than as something the user typed (spec 66 §5.5).
+        let tagged = ChatMessage {
+            id: "msg_1".to_string(),
+            session_id: "session_1".to_string(),
+            task_id: Some("task_1".to_string()),
+            role: "user".to_string(),
+            content: "Your plan still has open steps.".to_string(),
+            kind: Some("plan_reminder".to_string()),
+            created_at_ms: 5,
+        };
+        let json = message_json(1, &tagged, None);
+        assert!(json.contains("\"kind\":\"plan_reminder\""), "{json}");
+
+        let ordinary = ChatMessage {
+            id: "msg_2".to_string(),
+            session_id: "session_1".to_string(),
+            task_id: None,
+            role: "user".to_string(),
+            content: "hello".to_string(),
+            kind: None,
+            created_at_ms: 6,
+        };
+        let json = message_json(2, &ordinary, None);
+        assert!(!json.contains("\"kind\""), "{json}");
+    }
+
+    #[test]
+    fn the_plan_event_carries_whether_the_turn_is_active() {
+        match turn_progress_event(TurnProgress::Plan(sample_plan())) {
+            Some(TurnEvent::Plan { active, .. }) => assert!(active),
+            _ => panic!("the plan update must become a live plan event"),
+        }
+        match turn_progress_event(TurnProgress::PlanFinished(sample_plan())) {
+            Some(TurnEvent::Plan { active, .. }) => assert!(!active),
+            _ => panic!("the finished plan must become a live plan event"),
+        }
+    }
+
+    #[test]
     fn a_plan_with_two_steps_in_progress_says_so_rather_than_picking_one() {
         // Requirement 2 is an invariant, and a panel that quietly rendered the
         // first of two in-progress steps would hide exactly the bug the
@@ -5317,13 +5463,13 @@ mod tests {
         plan.steps[0].status = StepStatus::InProgress;
         assert!(plan.violates_single_in_progress());
 
-        let json = plan_json(&plan);
+        let json = plan_json(&plan, true);
         assert!(
             json.contains("\"violatesSingleInProgress\":true"),
             "got {json}"
         );
 
-        let json = plan_json(&sample_plan());
+        let json = plan_json(&sample_plan(), true);
         assert!(json.contains("\"violatesSingleInProgress\":false"));
     }
 
@@ -5332,7 +5478,7 @@ mod tests {
         let mut plan = sample_plan();
         plan.steps[1].status = StepStatus::Blocked;
 
-        let json = plan_json(&plan);
+        let json = plan_json(&plan, true);
         assert!(json.contains("\"isComplete\":false"), "got {json}");
         assert!(
             !json.to_lowercase().contains("\"summary\":\"complete"),
@@ -9063,6 +9209,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &Config::default(),
         );
 
@@ -9197,6 +9344,55 @@ mod tests {
     }
 
     #[test]
+    fn a_reopened_session_carries_each_turns_notes() {
+        let statuses = HashMap::from([("task_1".to_string(), "complete".to_string())]);
+        let notes = BTreeMap::from([(
+            "task_1".to_string(),
+            TurnNotes {
+                text: "Approvals live in command_policy.rs.".to_string(),
+                carried: true,
+                chars: 38,
+                total_chars: 38,
+            },
+        )]);
+
+        let json = task_states_json(
+            &statuses,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &notes,
+            &Config::default(),
+        );
+
+        assert!(
+            json.contains(
+                "\"notes\":{\"text\":\"Approvals live in command_policy.rs.\",\"carried\":true}"
+            ),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn phases_carry_the_notes_size() {
+        let phase = TurnPhase {
+            kind: PhaseKind::Model,
+            label: String::new(),
+            round: 1,
+            max_rounds: 8,
+            exploration_round: 2,
+            max_exploration_rounds: 24,
+            notes_chars: 2_100,
+        };
+
+        let json = phase_json(&phase);
+
+        assert!(json.contains("\"explorationRound\":2"), "{json}");
+        assert!(json.contains("\"notesChars\":2100"), "{json}");
+    }
+
+    #[test]
     fn a_task_with_no_usage_reports_none_rather_than_zero() {
         // A session written before usage existed. Absent, not zero: a zero is
         // indistinguishable from a real measurement of nothing.
@@ -9208,6 +9404,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &Config::default(),
         );
 
@@ -9229,6 +9426,7 @@ mod tests {
             &plans,
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &Config::default(),
         );
 
@@ -9253,6 +9451,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &Config::default(),
         );
 
@@ -9327,6 +9526,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &web_diagnostics,
+            &BTreeMap::new(),
             &Config::default(),
         );
 

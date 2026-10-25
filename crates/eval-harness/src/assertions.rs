@@ -417,6 +417,107 @@ pub fn evaluate(
             );
         }
 
+        // Spec 66 §5.5: plan reminders and what the plan left open. Every one
+        // reads `RecordedPlan`, which is absent for a planless run — so the
+        // assertion fails rather than comparing a vacuous zero.
+        let plan_value =
+            |read: fn(&crate::record::RecordedPlan) -> u64| run.record.plan.as_ref().map(read);
+        if let Some(expected) = asserts.plan_reminders {
+            let actual = plan_value(|plan| plan.reminders_sent);
+            push(
+                "plan_reminders",
+                actual == Some(expected),
+                expected.to_string(),
+                match actual {
+                    Some(value) => value.to_string(),
+                    None => "the run made no plan".to_string(),
+                },
+            );
+        }
+        if let Some(expected) = asserts.plan_verified {
+            let actual = plan_value(|plan| plan.steps_verified);
+            push(
+                "plan_verified",
+                actual == Some(expected),
+                expected.to_string(),
+                match actual {
+                    Some(value) => value.to_string(),
+                    None => "the run made no plan".to_string(),
+                },
+            );
+        }
+        if let Some(expected) = asserts.plan_unverified {
+            let actual = plan_value(|plan| plan.steps_unverified);
+            push(
+                "plan_unverified",
+                actual == Some(expected),
+                expected.to_string(),
+                match actual {
+                    Some(value) => value.to_string(),
+                    None => "the run made no plan".to_string(),
+                },
+            );
+        }
+        if let Some(expected) = asserts.plan_outstanding {
+            let actual = plan_value(|plan| plan.steps_outstanding);
+            push(
+                "plan_outstanding",
+                actual == Some(expected),
+                expected.to_string(),
+                match actual {
+                    Some(value) => value.to_string(),
+                    None => "the run made no plan".to_string(),
+                },
+            );
+        }
+        if let Some(expected) = asserts.plan_left_open {
+            let actual = run.record.plan.as_ref().map(|plan| plan.left_open_at_end);
+            push(
+                "plan_left_open",
+                actual == Some(expected),
+                expected.to_string(),
+                match actual {
+                    Some(value) => value.to_string(),
+                    None => "the run made no plan".to_string(),
+                },
+            );
+        }
+        if let Some(expected) = asserts.plan_open_evidence {
+            let actual = plan_value(|plan| plan.open_step_evidence);
+            push(
+                "plan_open_evidence",
+                actual == Some(expected),
+                expected.to_string(),
+                match actual {
+                    Some(value) => value.to_string(),
+                    None => "the run made no plan".to_string(),
+                },
+            );
+        }
+
+        if let Some(wanted) = &asserts.last_assistant_message_contains {
+            match &run.last_assistant_message {
+                Some(message) => {
+                    let missing: Vec<&String> = wanted
+                        .iter()
+                        .filter(|needle| !message.contains(needle.as_str()))
+                        .collect();
+                    push(
+                        "last_assistant_message_contains",
+                        missing.is_empty(),
+                        format!("{wanted:?}"),
+                        format!("last message: {message:?}, missing: {missing:?}"),
+                    );
+                }
+                None => push(
+                    "last_assistant_message_contains",
+                    false,
+                    format!("{wanted:?}"),
+                    "the task wrote no assistant message".to_string(),
+                ),
+            }
+        }
+
         if let Some(limit) = asserts.tool_rounds_at_most {
             let rounds = run.record.tool_rounds;
             push(
@@ -436,6 +537,36 @@ pub fn evaluate(
                 rounds == expected,
                 expected.to_string(),
                 rounds.to_string(),
+            );
+        }
+
+        // Spec 65 §5.9: the notes the run took, what it carried, and whether a
+        // read repeated an earlier one.
+        if let Some(expected) = asserts.notes_calls {
+            let calls = run.record.notes_calls;
+            push(
+                "notes_calls",
+                calls == expected,
+                expected.to_string(),
+                calls.to_string(),
+            );
+        }
+        if let Some(expected) = asserts.carried_notes_at_least {
+            let carried = run.record.carried_notes;
+            push(
+                "carried_notes_at_least",
+                carried >= expected,
+                format!("at least {expected}"),
+                carried.to_string(),
+            );
+        }
+        if let Some(expected) = asserts.repeated_elided_reads {
+            let repeats = run.record.repeated_elided_reads;
+            push(
+                "repeated_elided_reads",
+                repeats == expected,
+                expected.to_string(),
+                repeats.to_string(),
             );
         }
     }
