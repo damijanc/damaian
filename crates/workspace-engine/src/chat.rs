@@ -25,6 +25,7 @@ use crate::git_service::{DiffOptions, GitService, GitStatus, WorktreeListing};
 use crate::hash::{create_id, file_hash, now_millis};
 use crate::hooks::{HookContext, HookDispatcher, HookEvent, HookOutcome, Verdict};
 use crate::indexer::{ProjectIndexer, SearchResult};
+use crate::language::detect_language;
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
 use crate::mode::{Permission, SessionMode, permits, refusal_message};
 use crate::model::{
@@ -1242,36 +1243,117 @@ impl ChatOrchestrator {
             &map,
             &changed,
         )?;
-        match selection {
-            Selection::OnlyDocumentation => self.finish_verification_without_checks(
-                session,
-                task,
-                attempt,
-                VerificationOutcome::OnlyDocumentationChanged,
-                changed,
-                file_hashes,
-            ),
-            Selection::NoChecksAvailable { .. } => self.finish_verification_without_checks(
-                session,
-                task,
-                attempt,
-                VerificationOutcome::NoChecksAvailable,
-                changed,
-                file_hashes,
-            ),
-            Selection::Proposed(checks) => self.run_verification_checks(
-                repository_root,
-                session,
-                task,
-                due,
-                attempt,
-                checks,
-                changed,
-                file_hashes,
-                model_adapter,
-                sink,
-            ),
+        let browser = self.browser_check(session_id, &session, &task, &changed)?;
+        if browser.is_none() {
+            return match selection {
+                Selection::OnlyDocumentation => self.finish_verification_without_checks(
+                    session,
+                    task,
+                    attempt,
+                    VerificationOutcome::OnlyDocumentationChanged,
+                    changed,
+                    file_hashes,
+                ),
+                Selection::NoChecksAvailable { .. } => self.finish_verification_without_checks(
+                    session,
+                    task,
+                    attempt,
+                    VerificationOutcome::NoChecksAvailable,
+                    changed,
+                    file_hashes,
+                ),
+                Selection::Proposed(checks) => self.run_verification_checks(
+                    repository_root,
+                    session,
+                    task,
+                    due,
+                    attempt,
+                    checks,
+                    browser,
+                    changed,
+                    file_hashes,
+                    model_adapter,
+                    sink,
+                ),
+            };
         }
+        // A browser check can stand alone: a web-only change whose root detects
+        // no command still has behaviour to verify.
+        let checks = match selection {
+            Selection::Proposed(checks) => checks,
+            Selection::OnlyDocumentation | Selection::NoChecksAvailable { .. } => Vec::new(),
+        };
+        self.run_verification_checks(
+            repository_root,
+            session,
+            task,
+            due,
+            attempt,
+            checks,
+            browser,
+            changed,
+            file_hashes,
+            model_adapter,
+            sink,
+        )
+    }
+
+    /// Builds the browser check for a web-asset change (proposal §5.4).
+    ///
+    /// `None` when no changed path is a web asset: then there is no browser
+    /// check at all, not a skip. With a changed web asset the check is always
+    /// selected; only the target and the session's diagnostic approval decide
+    /// whether it runs.
+    fn browser_check(
+        &self,
+        session_id: &str,
+        session: &Session,
+        task: &Task,
+        changed: &[String],
+    ) -> Result<Option<BrowserCheck>> {
+        let web_changed = changed.iter().any(|path| {
+            matches!(
+                detect_language(path),
+                "html" | "css" | "javascript" | "typescript"
+            )
+        });
+        if !web_changed {
+            return Ok(None);
+        }
+        let Some(record) = self
+            .session_store
+            .read_session_web_diagnostics(session_id)?
+            .into_values()
+            .flatten()
+            .max_by_key(|record| record.recorded_at_ms)
+        else {
+            return Ok(Some(BrowserCheck::Skipped {
+                check: CheckId::browser("the changed page"),
+                reason: SkipReason::NoRunningTarget,
+            }));
+        };
+        let check = CheckId::browser(&record.url);
+        if !self
+            .session_store
+            .browser_diagnostics_allowed_for_session(session_id)?
+        {
+            return Ok(Some(BrowserCheck::Skipped {
+                check,
+                reason: SkipReason::Blocked {
+                    reason: "browser diagnostics are not approved for this session".to_string(),
+                },
+            }));
+        }
+        Ok(Some(BrowserCheck::Ready {
+            call: WebDiagnosticCall {
+                kind: WebDiagnosticKind::Inspect,
+                url: record.url.clone(),
+                arguments_json: serde_json::json!({"url": record.url}).to_string(),
+                session_id: Some(session.id.clone()),
+                task_id: Some(task.id.clone()),
+            },
+            check,
+        }))
     }
 
     /// Continues the verification turn parked on a check card (spec 23 §3).
@@ -1388,12 +1470,16 @@ impl ChatOrchestrator {
         due: crate::verification::VerificationDue,
         attempt: u32,
         checks: Vec<(CheckId, CommandProposal)>,
+        browser: Option<BrowserCheck>,
         changed: Vec<String>,
         file_hashes: BTreeMap<String, String>,
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
-        let selected: Vec<CheckId> = checks.iter().map(|(check, _)| check.clone()).collect();
+        let mut selected: Vec<CheckId> = checks.iter().map(|(check, _)| check.clone()).collect();
+        if let Some(browser) = &browser {
+            selected.push(browser.check().clone());
+        }
         self.session_store.append_verification_event(
             &session.id,
             &VerificationEvent::Started {
@@ -1425,6 +1511,20 @@ impl ChatOrchestrator {
             });
             step_ids.push(step_id);
         }
+        let browser_step = browser.as_ref().map(|browser| {
+            let step_id = "verify_browser".to_string();
+            plan.steps.push(PlanStep {
+                id: step_id.clone(),
+                title: format!("Check browser behaviour: {}", browser.check().command),
+                detail: Some("Browser diagnostics for the changed web assets".to_string()),
+                status: StepStatus::Pending,
+                depends_on: Vec::new(),
+                started_at_ms: None,
+                completed_at_ms: None,
+                evidence: Vec::new(),
+            });
+            step_id
+        });
         self.session_store.revise_plan(&task, &plan)?;
         sink.progress(TurnProgress::Plan(plan.clone()));
 
@@ -1476,6 +1576,28 @@ impl ChatOrchestrator {
                 &VerificationEvent::Check {
                     task_id: task.id.clone(),
                     check: check.clone(),
+                    outcome,
+                    file_hashes: file_hashes.clone(),
+                },
+            )?;
+        }
+
+        if let (Some(browser), Some(step_id)) = (browser.as_ref(), browser_step.as_deref()) {
+            let outcome = self.run_browser_check(
+                repository_root,
+                &session,
+                &task,
+                browser,
+                step_id,
+                &mut plan,
+                &file_hashes,
+                sink,
+            )?;
+            self.session_store.append_verification_event(
+                &session.id,
+                &VerificationEvent::Check {
+                    task_id: task.id.clone(),
+                    check: browser.check().clone(),
                     outcome,
                     file_hashes: file_hashes.clone(),
                 },
@@ -1580,6 +1702,93 @@ impl ChatOrchestrator {
         Ok(CheckOutcome::Ran {
             exit_code,
             marker_id,
+        })
+    }
+
+    /// Runs (or skips) the browser check and records what it saw.
+    ///
+    /// A diagnostic's verdict becomes the same pass/fail evidence a command's
+    /// exit code does, so the plan and the report read one way. A page that
+    /// cannot be reached at all is `no_running_target`, never a failure and
+    /// never a pass: nothing was observed about the page.
+    #[allow(clippy::too_many_arguments)]
+    fn run_browser_check(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        browser: &BrowserCheck,
+        step_id: &str,
+        plan: &mut TaskPlan,
+        _file_hashes: &BTreeMap<String, String>,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<CheckOutcome> {
+        let started = now_millis();
+        if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
+            step.status = StepStatus::InProgress;
+            step.started_at_ms = Some(started);
+            self.session_store.update_plan_step(task, step)?;
+            sink.progress(TurnProgress::Plan(plan.clone()));
+        }
+        let BrowserCheck::Ready { call, .. } = browser else {
+            let BrowserCheck::Skipped { reason, .. } = browser else {
+                unreachable!("all browser checks are ready or skipped")
+            };
+            self.close_verification_step(task, plan, step_id, StepStatus::Skipped)?;
+            sink.progress(TurnProgress::Plan(plan.clone()));
+            return Ok(CheckOutcome::Skipped(reason.clone()));
+        };
+        let (_, failed) = self.run_and_record_web_diagnostic(repository_root, call, sink)?;
+        if failed {
+            self.close_verification_step(task, plan, step_id, StepStatus::Skipped)?;
+            sink.progress(TurnProgress::Plan(plan.clone()));
+            return Ok(CheckOutcome::Skipped(SkipReason::NoRunningTarget));
+        }
+        let Some(record) = self
+            .session_store
+            .read_session_web_diagnostics(&session.id)?
+            .get(&task.id)
+            .and_then(|records| records.last())
+            .cloned()
+        else {
+            // The runner claimed success but recorded nothing: treat it as no
+            // observation rather than inventing a pass.
+            self.close_verification_step(task, plan, step_id, StepStatus::Skipped)?;
+            sink.progress(TurnProgress::Plan(plan.clone()));
+            return Ok(CheckOutcome::Skipped(SkipReason::NoRunningTarget));
+        };
+        // "Behaviour verified" means the diagnostic ran and recorded no Error
+        // finding (proposal §5.4). A page error, a console error and a failed
+        // request all become findings, so the findings are what decide rather
+        // than the report's summary flag.
+        let has_error = self
+            .session_store
+            .read_findings(&session.id, repository_root)?
+            .iter()
+            .any(|finding| {
+                finding.origin_ref() == Some(record.id.as_str())
+                    && finding.severity() == Severity::Error
+            });
+        let exit_code = if record.report.is_error || has_error {
+            1
+        } else {
+            0
+        };
+        let evidence = Evidence::CommandExit {
+            marker_id: record.id.clone(),
+            exit_code: Some(exit_code),
+            purpose: CommandPurpose::Check,
+        };
+        if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
+            step.evidence = vec![evidence];
+            step.status = status_from_evidence(&step.evidence);
+            step.completed_at_ms = Some(now_millis());
+            self.session_store.update_plan_step(task, step)?;
+        }
+        sink.progress(TurnProgress::Plan(plan.clone()));
+        Ok(CheckOutcome::Ran {
+            exit_code: Some(exit_code),
+            marker_id: record.id,
         })
     }
 
@@ -6849,6 +7058,30 @@ struct PendingCheckDecision {
 impl PendingCheckDecision {
     fn check(&self) -> CheckId {
         CheckId::new(self.working_directory.clone(), self.command.clone())
+    }
+}
+
+/// The browser half of a verification attempt (spec 23 proposal §5.4).
+///
+/// A web asset changed and the session has a diagnostic target: rerun it. With
+/// no target, or when diagnostics are not approved for this session, the check
+/// is still selected and reported as skipped, never inferred as verified.
+enum BrowserCheck {
+    Ready {
+        check: CheckId,
+        call: WebDiagnosticCall,
+    },
+    Skipped {
+        check: CheckId,
+        reason: SkipReason,
+    },
+}
+
+impl BrowserCheck {
+    fn check(&self) -> &CheckId {
+        match self {
+            Self::Ready { check, .. } | Self::Skipped { check, .. } => check,
+        }
     }
 }
 

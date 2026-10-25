@@ -392,9 +392,17 @@ impl VerificationReport {
                             report.behaviour_verified.push(check.label());
                         }
                     } else {
+                        // A browser check's "exit code" is the diagnostic's
+                        // verdict, not a process exit; saying "exit code 1"
+                        // would describe a command that never ran.
+                        let reason = if check.is_browser() {
+                            "the page reported errors".to_string()
+                        } else {
+                            failure_reason(*exit_code)
+                        };
                         report.failed.push(FailedCheck {
                             check: check.clone(),
-                            reason: failure_reason(*exit_code),
+                            reason,
                         });
                     }
                 }

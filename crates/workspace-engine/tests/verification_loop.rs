@@ -19,8 +19,10 @@ use workspace_engine::{
     CancelToken, CheckId, CheckOutcome, CommandPurpose, Config, Evidence, HookConfig, HookEvent,
     HookMode, HookSource, MockModelAdapter, PlanReport, PlanStep, RoundBudgetDecision, Selection,
     SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink, VerificationEvent,
-    VerificationOutcome, VerificationReport, VerificationState, WorkspaceEngine, fold_verification,
-    is_documentation, propose_checks, select_roots,
+    VerificationOutcome, VerificationReport, VerificationState, WebDiagnosticCall,
+    WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
+    WebDiagnosticsRunnerHandle, WorkspaceEngine, fold_verification, is_documentation,
+    propose_checks, select_roots,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -1405,6 +1407,10 @@ fn an_auto_runnable_check_runs_and_the_report_says_passed() {
         vec![CheckId::new("", "cargo test")],
         "{report:?}"
     );
+    assert!(
+        report.skipped.iter().all(|item| !item.check.is_browser()),
+        "a Rust-only change has no browser check at all: {report:?}"
+    );
     assert_eq!(result.task.status, TaskStatus::Complete);
     assert!(result.response.contains("Verification complete"));
 
@@ -2411,6 +2417,254 @@ fn a_repair_turn_that_hits_the_round_budget_pauses_instead_of_failing() {
         "a continuation is not another attempt"
     );
     assert_eq!(adapter.requests.len(), 2, "Continue runs one more round");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+// --- Browser behaviour verification (Task 6) -------------------------------
+
+struct StubBrowserRunner {
+    text: String,
+    is_error: bool,
+    details: Option<WebDiagnosticDetails>,
+    unreachable: bool,
+}
+
+impl StubBrowserRunner {
+    fn clean() -> Self {
+        Self {
+            text: "Page loaded with no errors.".to_string(),
+            is_error: false,
+            details: None,
+            unreachable: false,
+        }
+    }
+
+    fn page_errors() -> Self {
+        Self {
+            text: "Browser diagnostic found 1 page error.\n- pageerror: boom".to_string(),
+            is_error: false,
+            details: Some(WebDiagnosticDetails {
+                page_errors: vec!["boom".to_string()],
+                ..Default::default()
+            }),
+            unreachable: false,
+        }
+    }
+
+    fn unreachable() -> Self {
+        Self {
+            text: String::new(),
+            is_error: false,
+            details: None,
+            unreachable: true,
+        }
+    }
+}
+
+impl WebDiagnosticsRunner for StubBrowserRunner {
+    fn inspect(&self, _call: &WebDiagnosticCall) -> workspace_engine::Result<WebDiagnosticReport> {
+        if self.unreachable {
+            return Err(workspace_engine::ClientError::Io(
+                "no server is listening".to_string(),
+            ));
+        }
+        let mut report = WebDiagnosticReport::from_text(self.text.clone(), self.is_error);
+        report.details = self.details.clone();
+        Ok(report)
+    }
+
+    fn run_scenario(
+        &self,
+        call: &WebDiagnosticCall,
+    ) -> workspace_engine::Result<WebDiagnosticReport> {
+        self.inspect(call)
+    }
+}
+
+fn seed_browser_target(engine: &WorkspaceEngine, session_id: &str) {
+    engine
+        .session_store
+        .append_web_diagnostic(
+            session_id,
+            &WebDiagnosticRecord {
+                id: "webdiagrec_seed".to_string(),
+                task_id: "earlier_task".to_string(),
+                tool: "inspect_web_page".to_string(),
+                url: "http://127.0.0.1:3000/".to_string(),
+                recorded_at_ms: 1,
+                report: WebDiagnosticReport::from_text("earlier run", false),
+            },
+        )
+        .unwrap();
+}
+
+fn web_change(engine: &WorkspaceEngine, root: &std::path::Path) -> String {
+    let (session, _task) = applied_change(
+        engine,
+        root,
+        &[(
+            "src/app.js",
+            "export const answer = 1;\n",
+            "export const answer = 2;\n",
+        )],
+    );
+    session
+}
+
+#[test]
+fn a_clean_browser_check_is_behaviour_verified() {
+    let root = temp_dir("browser-clean");
+    let data_dir = temp_dir("browser-clean-data");
+    let mut engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(StubBrowserRunner::clean()));
+    let session = web_change(&engine, &root);
+    engine
+        .session_store
+        .allow_browser_diagnostics_for_session(&session, "tester")
+        .unwrap();
+    seed_browser_target(&engine, &session);
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert_eq!(report.outcome, Some(VerificationOutcome::Passed));
+    assert_eq!(
+        report.behaviour_verified,
+        vec!["browser check http://127.0.0.1:3000/".to_string()]
+    );
+    assert_eq!(
+        report.passed,
+        vec![CheckId::browser("http://127.0.0.1:3000/")]
+    );
+    assert!(report.skipped.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_page_with_errors_is_failed_and_not_behaviour_verified() {
+    let root = temp_dir("browser-errors");
+    let data_dir = temp_dir("browser-errors-data");
+    let mut engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(
+            StubBrowserRunner::page_errors(),
+        ));
+    let session = web_change(&engine, &root);
+    engine
+        .session_store
+        .allow_browser_diagnostics_for_session(&session, "tester")
+        .unwrap();
+    seed_browser_target(&engine, &session);
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert!(report.behaviour_verified.is_empty());
+    let failed = report
+        .failed
+        .iter()
+        .find(|item| item.check.is_browser())
+        .expect("the browser check failed");
+    assert_eq!(failed.reason, "the page reported errors");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn an_unreachable_page_is_skipped_with_no_running_target() {
+    let root = temp_dir("browser-unreachable");
+    let data_dir = temp_dir("browser-unreachable-data");
+    let mut engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(
+            StubBrowserRunner::unreachable(),
+        ));
+    let session = web_change(&engine, &root);
+    engine
+        .session_store
+        .allow_browser_diagnostics_for_session(&session, "tester")
+        .unwrap();
+    seed_browser_target(&engine, &session);
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert!(report.behaviour_verified.is_empty());
+    let skipped = report
+        .skipped
+        .iter()
+        .find(|item| item.check.is_browser())
+        .expect("the browser check is skipped");
+    assert_eq!(skipped.reason, SkipReason::NoRunningTarget);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_web_change_with_no_stored_target_is_skipped_with_no_running_target() {
+    let root = temp_dir("browser-no-target");
+    let data_dir = temp_dir("browser-no-target-data");
+    let mut engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(StubBrowserRunner::clean()));
+    let session = web_change(&engine, &root);
+    engine
+        .session_store
+        .allow_browser_diagnostics_for_session(&session, "tester")
+        .unwrap();
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert!(report.behaviour_verified.is_empty());
+    let skipped = report
+        .skipped
+        .iter()
+        .find(|item| item.check.is_browser())
+        .expect("the browser check is skipped");
+    assert_eq!(skipped.reason, SkipReason::NoRunningTarget);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn without_the_session_approval_the_browser_check_is_skipped_by_policy() {
+    let root = temp_dir("browser-unapproved");
+    let data_dir = temp_dir("browser-unapproved-data");
+    let mut engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(StubBrowserRunner::clean()));
+    let session = web_change(&engine, &root);
+    seed_browser_target(&engine, &session);
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().unwrap();
+    assert!(report.behaviour_verified.is_empty());
+    let skipped = report
+        .skipped
+        .iter()
+        .find(|item| item.check.is_browser())
+        .expect("the browser check is skipped");
+    assert!(matches!(skipped.reason, SkipReason::Blocked { .. }));
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);
