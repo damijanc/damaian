@@ -85,7 +85,7 @@ A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
 reports the disagreement.
 
-#25, #32, #50, #59 and #62 are all Done and merged into `main`. #26 context
+#25, #32, #50, #59, #62 and #66 are all Done and merged into `main`. #26 context
 assembly is Done (2026-10-25), so the keystone is no longer in flight.
 
 - **In progress:** #49 prompt cache — the accounting slice is done and the
@@ -98,9 +98,7 @@ assembly is Done (2026-10-25), so the keystone is no longer in flight.
   #27 context inspector; #33 MCP management; #51 external reference retrieval;
   #55 conversation compaction; #65 exploration memory (planned 2026-10-24 as a
   folder spec; its requirement 8's budget interaction is settled by #59, and its
-  carry-into-the-next-turn task no longer waits for #26); #66 plan left open at
-  turn end (#65 and #66 both edit `chat.rs`, so they do not pair with each
-  other).
+  carry-into-the-next-turn task no longer waits for #26).
 - **Blocked:** #28 on #27; #29 on #28; #30 on #28 and #29; #35 on #23; #36 on
   #35; #37 on #33, #35 and #36; #52 on #33; #39 on #38; #40 on #38 and #39; #54
   on Phase 1 WP3 (provider capability validation), which is unspecified.
@@ -322,7 +320,8 @@ Re-derived on 2026-10-24, when [#50](50_model_initiated_clarification/proposal.m
 and [#32](32_hooks/proposal.md) were finished and, with #25, #59 and #62, merged
 into `main`. No `Depends on:` line names #50 (only
 [#51](51_external_reference_retrieval.md) cites its §5.4 as a cross-reference)
-or #32, so nothing further is promoted. The ready set is #23, #26, #65 and #66.
+or #32, so nothing further is promoted. The ready set is #23, #26 and #65;
+#66 was built afterwards, on 2026-10-25.
 
 Re-checked on 2026-10-24, when [#26](26_context_assembly/proposal.md) was
 planned. It moved from the ready set into **In progress** without being built:
@@ -453,6 +452,22 @@ Task 1 begins. Three facts about pairing it, from its
   hook. A hook may therefore fire twice on a reminded turn, both times charged
   to the same action budget.
 
+Re-checked on 2026-10-25, when
+[#66](66_plan_left_open_at_turn_end/proposal.md) was finished. It edited
+`chat.rs` as a solo track, so it did not pair with #26 or #65. Two facts for
+whichever of those lands next, from #66's
+[`context.md`](66_plan_left_open_at_turn_end/context.md) §3 and §5:
+
+- **`PendingChatTurn` now carries `step_evidence` and `plan_reminder_sent`**
+  beside the seven literals #61's round-budget pause and #65's planned
+  `turn_notes`/call list use. #65 therefore adds its fields to the same seven
+  literals; both new fields are `#[serde(default)]`, so old pending turns still
+  load.
+- **#66's reminder sits beside spec 32's `before_task_complete`** at both
+  completion points and is sent only after the hook allows; it does not move the
+  hook. A hook may therefore fire twice on a reminded turn, both times charged
+  to the same action budget.
+
 ### Parallel work
 
 Two specs may be built at once, which is a **deliberate exception to the
@@ -560,8 +575,8 @@ is ready.
 | 62 | [62_approval_prompts_name_the_reason/](62_approval_prompts_name_the_reason/proposal.md) | **Done 2026-10-23** (started 2026-10-18; Tasks 1–7, the last on 2026-10-23; the live re-run named every prompt's cause, see its §6): `command_policy.rs` gains the closed `ApprovalCause` enum and `CommandClassification.causes`, and `reasons` is rendered from it, so every classifier branch and escalation names its cause as a value — including the `Network`/`HighRisk` split and `Blocklisted`/`Destructive`; the `Setting`/`ProfileBlocked` causes name the `require_approval_for_*` key (with its user/repository/profile source, threaded from the `RepositoryConfigReport`) and the `command_access` block respectively. The approval prompt now leads with the deciding cause's plain words, and "sandbox" has left the model-facing command text and the audit status; the pinned Code prompt and its spec-50 fixtures moved with it. The approval card now shows the first cause and the model's stated reason outside the "Why this command" disclosure, in the live, worker and reattached paths. The proposal stores its `causes` (as values, read back tolerantly by older-file rules) and `command_proposal_stored` audits their names in order, so a session can be analysed by cause without changing any decision. The deterministic eval harness now reports each run's approval prompts grouped by their first cause (`approval_prompts_by_cause`, plus a per-run line), and the new `approval_causes` scenario produces two prompts with distinct causes so the grouping is measured. `USER_GUIDE.md`, `TROUBLESHOOTING.md` and `SECURITY.md` now document the card's two lines, how to read a cause, and what runs without asking without claiming a sandbox. Specified 2026-10-17: every approval said "because it cannot run in sandbox mode", and there is no sandbox. The classifier returns structured `ApprovalCause`s, the prompt's first line names the deciding one (which shell control, which keyword, which setting and who set it), the model's own reason is shown beside it, and "sandbox" leaves every user- and model-facing string. Changes no approval decision. |
 | 63 | [63_exploratory_command_failures/](63_exploratory_command_failures/proposal.md) | **Done 2026-10-23.** Tasks 1–5 built 2026-10-17/18; Task 6 walked the §6 criteria and documented the purpose split. Commands get a purpose (check, exploration, other) that never influences approval; a failed exploration command records no finding and blocks no plan step, while checks and unknown commands behave as today. Prompted by a zsh glob error and an `ls` of a missing directory becoming open **error** findings; the model is now told its shell and zsh's glob rule. |
 | 64 | [64_read_only_command_boundary.md](64_read_only_command_boundary.md) | **Done 2026-10-23.** Found the read-only list is not read-only (`git diff --output=<file>` writes) and replaces the prefix match with a tokenizer, per-program option lists and `PathPolicy` checks on every path argument. It then admits `cd <dir> &&` and `&&`/`|` pipelines of admitted commands into stdin-only filters, and the §5.7 documentation (user guide, security, troubleshooting) was written to close it. |
-| 65 | [65_exploration_memory_within_a_turn/](65_exploration_memory_within_a_turn/proposal.md) | **Not started — planned 2026-10-24; the next priority now that #59 is done.** Specified 2026-10-18, revised 2026-10-19, planned as a folder spec on 2026-10-24 ([`tasks.md`](65_exploration_memory_within_a_turn/tasks.md)); the task that carries notes into the next turn waits for #26 to land, because both edit the turn seed in `chat.rs`. `bounded_messages` sends only the last ~7 rounds, so in a long turn most of what the agent read is gone before it answers. Adds a `turn_notes` tool whose bounded text (default 8,000 characters, restrict-only) is pinned after the seed, never elided, and carried into the next turn of the session; the elision notice names the calls that left the window and a warning names the round about to leave. Requirement 8, the budget interaction, is settled by #59's exploration allowance (default 24, ceiling 32, restrict-only); the call list extends #59's `read_call_key`, which covers read tools only and is not persisted. |
-| 66 | [66_plan_left_open_at_turn_end/](66_plan_left_open_at_turn_end/proposal.md) | **Not started; split into a folder and planned 2026-10-24** in ten tasks (see its `tasks.md`). Specified 2026-10-24 from a session that answered in full and left step 1 of 4 *running*. [`context.md`](66_plan_left_open_at_turn_end/context.md) found that the "empty decode" completion the flat spec cites no longer exists, that `TaskStatus` has two more states than §5.4 listed (`Interrupted` and `UnknownExternalOutcome`, both inactive for the panel), that a declined plan must be marked skipped or the reminder would close untouched steps, and that spec 32's `before_task_complete` runs at both completion points, so the hook must go first. Adds one reminder per turn when the model answers with open steps, persists step evidence across pauses and attaches it at turn end, and labels an ended turn's open step "not finished". Closes nothing on the model's behalf (#21 requirement 6). |
+| 65 | [65_exploration_memory_within_a_turn/](65_exploration_memory_within_a_turn/proposal.md) | **Not started — planned 2026-10-24; the next priority now that #59 and #26 are done.** Specified 2026-10-18, revised 2026-10-19, planned as a folder spec on 2026-10-24 ([`tasks.md`](65_exploration_memory_within_a_turn/tasks.md)); the task that carries notes into the next turn no longer waits for #26. `bounded_messages` sends only the last ~7 rounds, so in a long turn most of what the agent read is gone before it answers. Adds a `turn_notes` tool whose bounded text (default 8,000 characters, restrict-only) is pinned after the seed, never elided, and carried into the next turn of the session; the elision notice names the calls that left the window and a warning names the round about to leave. Requirement 8, the budget interaction, is settled by #59's exploration allowance (default 24, ceiling 32, restrict-only); the call list extends #59's `read_call_key`, which covers read tools only and is not persisted. |
+| 66 | [66_plan_left_open_at_turn_end/](66_plan_left_open_at_turn_end/proposal.md) | **Done 2026-10-25 (implementation and live acceptance; CI is outstanding — see its §7.1)** (started 2026-10-24; Tasks 1–10, the last on 2026-10-25; §6's manual and deterministic criteria walked in its §7, and the deterministic `plan_answer_without_complete_step` and `plan_left_open_at_end` scenarios pass). Specified 2026-10-24 from a session that answered in full and left step 1 of 4 *running*. One reminder per turn when the model answers with open steps, sent after `before_task_complete` allows and only when the round and token budgets leave room for a tool-carrying call; step evidence persists in `PendingChatTurn` across every pause and is attached at a true turn end without closing the step; a declined plan's remaining steps are marked skipped; and an ended turn's open step reads "not finished" with "Turn ended with N steps not marked done." Nothing is closed on the model's behalf (#21 requirement 6). |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:

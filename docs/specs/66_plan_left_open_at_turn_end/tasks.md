@@ -4,22 +4,22 @@
 
 **Implements:** [`proposal.md`](proposal.md) in full · corrections and the
 decisions it left open in [`context.md`](context.md)
-**Started:** not yet (planned 2026-10-24)
+**Started:** 2026-10-24 — **Done:** 2026-10-25
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · `TaskPlan::open_steps` and one definition of open | Not started | **Edits `chat.rs`.** Reads [`context.md`](context.md) §1 and §8. Replaces the two inline "open step" filters in `chat.rs` |
-| 2 · Persisted evidence and the per-turn fields | Not started | **Edits `chat.rs`.** Adds two `#[serde(default)]` fields to `PendingChatTurn` and seeds them on resume. Read D6 |
-| 3 · The approved command's exit reaches the step | Not started | **Edits `chat.rs`.** The command-approval resume; D14 |
-| 4 · Turn-end evidence attach and `plan_left_open` | Not started | **Edits `chat.rs`.** Normal end, cancel, failure and declined fallback; never on a pause. D6 |
-| 5 · The reminder in the loop | Not started | **Edits `chat.rs` and `session.rs`.** Once per turn, after the hook, budget-gated, two-answers rule, declined plan skipped; D1–D5, D10, D12 |
-| 6 · The reminder across pauses and with hooks | Not started | **Edits `chat.rs` only if a test finds missing wiring.** Approval, plan-review, question, *Continue*, restart, `before_task_complete` order |
-| 7 · The panel: `active`, summary, "not finished", live event | Not started | **Edits `chat.rs`.** `TaskStatus::is_active`, `summary(active)`, `plan_json(active)`, `TurnProgress::PlanFinished`, `renderPlanPanel`; D7–D9 |
-| 8 · The session-log reminder line and the next-turn seed | Not started | **Edits `chat.rs`.** `ChatMessage.kind` rendering and the `build_model_prompt` filter; D10 |
-| 9 · Eval fields and the deterministic scenarios | Not started | `RecordedPlan.remindersSent`/`leftOpenAtEnd`/`openStepEvidence`, five asserts, two scenarios, count 23 → 25 |
-| 10 · Docs, acceptance walk, live run, close | Not started | Do not run the full workspace gate locally; it runs on CI. Mark Done everywhere |
+| 1 · `TaskPlan::open_steps` and one definition of open | Done 2026-10-24 | Added `open_steps` with three tests in `tests/plan.rs` (`open_steps_are_the_pending_and_in_progress_ones_in_plan_order`, `a_plan_with_only_terminal_steps_has_no_open_steps`, `a_blocked_step_is_not_open`). Both inline filters in `chat.rs` (`carry_plan_from_the_previous_turn`, `token_budget_exhausted_response`) now use it. Scoped `cargo nextest -p workspace-engine --test plan` passed (60 tests then). |
+| 2 · Persisted evidence and the per-turn fields | Done 2026-10-24 | `PendingChatTurn` gained `#[serde(default)] step_evidence` and `plan_reminder_sent`; all seven literals write them; `run_agentic_turn` takes and seeds both and the seven resume sites pass them. The old-buffer floor and the C10 comment were corrected. Tests: `a_plan_review_pause_carries_the_evidence_and_the_reminder_flag`, `a_pending_turn_written_before_step_evidence_still_loads` (fields stripped from the pending JSON, resumed on a second engine). |
+| 3 · The approved command's exit reaches the step | Done 2026-10-25 | The command resume pushes `evidence_for(CommandExit, execution.id)` onto the carried buffer, before the resumed loop. `an_approved_command_reaches_the_open_step_as_evidence` asserts `exitCode: Some(0)`, the earlier read, and that the marker id equals `stored_command_executed.commandId` (D14). |
+| 4 · Turn-end evidence attach and `plan_left_open` | Done 2026-10-25 | `settle_plan_at_turn_end` extends the open step in memory and appends each item best-effort, then audits `plan_left_open` (`openSteps`, `reminderSent`, `stopReason`). Called on the true end, in `finish_cancelled_turn`, before both provider-failure returns, and on a declined fallback; never on a pause. Tests: answered-open, blocked-plan no reminder, cancelled (stop token), provider failure (`PlansReadsThenFails`), and the pause test asserts no `plan_left_open`. |
+| 5 · The reminder in the loop | Done 2026-10-25 | `plan_reminder_message` and the pure `plan_reminder_allowed` gate (at most once, not on *Answer now*, `action_rounds + 1 < max_rounds`, shared `token_ceiling_spend` after the answer round). Both completion points send it after `before_task_complete` allows; the pre-reminder answer is kept as the response on a true completion and the post-reminder reply follows it. A declined plan's non-terminal steps are written `Skipped` with `completed_at_ms` and sent on the sink. `ChatMessage.kind`/`append_message_with_kind` landed here. Tests: reminder/closes, second answer/open, closed, blocked, planless, declined, gate unit tests, text test, and the two-answers assertions in `plan_turn.rs`. |
+| 6 · The reminder across pauses and with hooks | Done 2026-10-25 | Mostly tests; no missing wiring found. Tests: `the_reminder_is_not_sent_twice_across_a_command_approval` (resumed on a second `WorkspaceEngine`), `the_reminder_is_not_sent_twice_across_a_plan_review`, `a_plan_reminder_waits_for_before_task_complete` (hook note first, reminder after the allow), `a_hook_that_always_denies_never_gets_a_reminder`. The round-budget *Continue* and question paths use the same saved/seeded fields; their pause literals were verified by the compiler's exhaustive literals rather than a new end-to-end test. |
+| 7 · The panel: `active`, summary, "not finished", live event | Done 2026-10-25 | `TaskStatus::is_active` is an exhaustive match (the two crash states are inactive); `PlanReport::summary(active)` leads with "Turn ended with N steps not marked done" while keeping blocked/finished; `plan_json(plan, active)` and `TurnEvent::Plan { plan, active }`; `TurnProgress::PlanFinished` sent once at a true end; `worker.rs` maps it; `renderPlanPanel` says "running" only while `plan.active !== false` and "not finished" otherwise. Tests: status partition, crash-state test, three summary tests, shell task-state and event tests, `the_turn_reports_its_plan_as_finished_when_it_ends`, `a_pause_reports_no_finished_plan`. The JS label was checked in the real web UI on 2026-10-25 against a seeded completed task with an open step: "not finished", the ended-turn summary, and no "running" label (no JS harness exists). |
+| 8 · The session-log reminder line and the next-turn seed | Done 2026-10-25 | `parse_message_event` reads `kind`; the question/answer transcript entries set `None`; the shell's `message_json` forwards it; `renderMessages` renders a tagged entry through `appendChatMessage("system", …)`; `build_model_prompt` skips tagged reminders. Tests: `a_message_with_a_kind_round_trips_and_an_old_one_reads_none` (including a raw old line), `the_reminder_is_a_tagged_system_line_in_a_reloaded_session`, `a_plan_reminder_does_not_seed_the_next_turn` with an ordinary-message negative control. |
+| 9 · Eval fields and the deterministic scenarios | Done 2026-10-25 | `RecordedPlan` gained `remindersSent`, `leftOpenAtEnd`, `openStepEvidence`; `Run.lastAssistantMessage` reads the final task log. Asserts added: `plan_reminders`, `plan_verified`, `plan_unverified`, `plan_outstanding`, `plan_left_open`, `plan_open_evidence`, `last_assistant_message_contains`. New `plan_answer_without_complete_step` and `plan_left_open_at_end`; `planned_task` asserts zero reminders; count guard 23 → 25. `cargo nextest -p eval-harness` passed (92 tests) and the deterministic tier passed. |
+| 10 · Docs, acceptance walk, live run, close | Done 2026-10-25 | §6 walked in `proposal.md` §7; user guide and troubleshooting updated; README status/current-state and CHANGELOG Unreleased updated; status marked Done in all four places. Scoped checks: fast five (fmt/node/lint/typos/deny), crate clippy for `workspace-engine`, `desktop-shell` and `eval-harness`, `nextest -p workspace-engine` (1514 tests), `nextest -p desktop-shell --lib` (178), `nextest -p eval-harness` (92), and the deterministic tier. The full workspace clippy/nextest gate was left to CI. **Live criterion passed 2026-10-25:** four planned steps, one reminder with four open, *Continue* after the round-budget pause, all steps closed, no `plan_left_open`; the reminder round cost 80,774 input (66,432 cached) and 249 output, and the final response was the report. The temporary driver, clone and data directories were deleted. The manual browser UI check passed on 2026-10-25 (Task 7 Step 6). |
 
 **Goal:** When a turn would end while its plan still has pending or in-progress
 steps, Damaian sends one reminder asking the model to close the steps it
@@ -199,7 +199,7 @@ they edit the same file.
 **Requirements:** 1, §5.1. **Proposal:** §5.1. **Context:** §1, §8.
 **Files:** `plan.rs`, `chat.rs` (the two inline filters), `tests/plan.rs`.
 
-- [ ] **Step 1: Write the failing tests** in `crates/workspace-engine/tests/plan.rs`
+- [x] **Step 1: Write the failing tests** in `crates/workspace-engine/tests/plan.rs`
   (import `TaskPlan`, `StepStatus`, and the existing `step()` helper):
   - `open_steps_are_the_pending_and_in_progress_ones_in_plan_order`: a plan with
     `Completed`, `InProgress`, `Skipped`, `Pending`, `Blocked` yields exactly the
@@ -208,9 +208,9 @@ they edit the same file.
     Skipped only → empty;
   - `a_blocked_step_is_not_open`: one Blocked step → empty, so the reminder can
     never be sent for it.
-- [ ] **Step 2: Run them and confirm they fail to compile** on the missing
+- [x] **Step 2: Run them and confirm they fail to compile** on the missing
   method: `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test plan`.
-- [ ] **Step 3: Implement.** Add `TaskPlan::open_steps(&self) -> Vec<&PlanStep>`
+- [x] **Step 3: Implement.** Add `TaskPlan::open_steps(&self) -> Vec<&PlanStep>`
   beside `phase()`, filtering `!step.status.is_terminal()`. Doc comment: open is
   `Pending | InProgress`; `Blocked` is terminal for this purpose because #21
   already stops the handoff and tells the model. Replace the two inline
@@ -218,9 +218,9 @@ they edit the same file.
   - `carry_plan_from_the_previous_turn` (`chat.rs:2431`–`:2436`);
   - `token_budget_exhausted_response` (`chat.rs:7510`–`:7523`).
   No behaviour change; the existing token-ceiling and plan-carry tests pin it.
-- [ ] **Step 4: Falsify.** Make `open_steps` include `Blocked` → the blocked
+- [x] **Step 4: Falsify.** Make `open_steps` include `Blocked` → the blocked
   test fails; exclude `InProgress` → the order test fails. Restore both.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -228,7 +228,7 @@ they edit the same file.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test plan --test plan_turn
   ```
 
-- [ ] **Step 6: Update this task's Progress row** (what landed, checks,
+- [x] **Step 6: Update this task's Progress row** (what landed, checks,
   mutations) and ask before committing. Subject:
   `Give a plan one definition of an open step`.
 
@@ -238,7 +238,7 @@ they edit the same file.
 **Files:** `chat.rs`; tests `plan_turn.rs`, `round_budget.rs`,
 `clarification.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `a_plan_review_pause_carries_the_evidence_it_has_accrued`
     (`plan_turn.rs`): propose a two-step plan; in the next round script
     `read_file` on `src/a.rs` **and** a `propose_patch` call, so the read runs
@@ -258,9 +258,9 @@ they edit the same file.
     `remove("plan_reminder_sent")`, rewrite it, resume with *Continue*; the
     resume succeeds. Follow the pattern at
     `tests/exploration_rounds.rs:565`–`:600`.
-- [ ] **Step 2: Run them and confirm they fail** (or fail to compile on the
+- [x] **Step 2: Run them and confirm they fail** (or fail to compile on the
   missing fields): the three test files named above.
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - Add to `PendingChatTurn` beside `exploration_rounds`/`round_budget`:
     `#[serde(default)] step_evidence: Vec<crate::plan::Evidence>` and
     `#[serde(default)] plan_reminder_sent: bool`, with comments saying why a
@@ -277,12 +277,12 @@ they edit the same file.
   - Correct the comment at `chat.rs:2717`–`:2726`: a crash loses the evidence of
     the running step **unless** the turn was paused, because a paused turn now
     carries it.
-- [ ] **Step 4: Falsify.** (1) Seed `step_evidence` from `Vec::new()` on resume →
+- [x] **Step 4: Falsify.** (1) Seed `step_evidence` from `Vec::new()` on resume →
   the plan-review resume loses the read, the first test fails. (2) Save an empty
   vector at a pause → the pending-JSON assertion fails. (3) Remove
   `#[serde(default)]` from `step_evidence` → the old-file resume fails to load.
   Restore each.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -290,7 +290,7 @@ they edit the same file.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test plan_turn --test round_budget --test clarification
   ```
 
-- [ ] **Step 6: Update the Progress row** and ask before committing. Subject:
+- [x] **Step 6: Update the Progress row** and ask before committing. Subject:
   `Carry a turn's step evidence across its pauses`.
 
 ## Task 3: The approved command's exit reaches the step
@@ -298,7 +298,7 @@ they edit the same file.
 **Requirements:** 3 (second half), §5.3. **Context:** §1, §3 D14.
 **Files:** `chat.rs`; tests `plan_turn.rs` (or `command_lifecycle.rs`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
   `an_approved_command_reaches_the_open_step_as_evidence` in `plan_turn.rs`:
   propose a plan; approve the plan review; then script a command that needs
   approval (the `sed -i '' 's/1/2/' src/a.rs` call used by
@@ -308,9 +308,9 @@ they edit the same file.
   `kind: "commandExit"`, `exitCode: Some(0)`, and the purpose the classifier
   assigned, **and** any read that preceded the pause. Also assert the same
   `commandId` appears on the `stored_command_executed` audit event.
-- [ ] **Step 2: Run it and confirm it fails**: the command runs (the audit has
+- [x] **Step 2: Run it and confirm it fails**: the command runs (the audit has
   it) but the plan's evidence does not.
-- [ ] **Step 3: Implement.** In `resume_after_command_decision_with_options`,
+- [x] **Step 3: Implement.** In `resume_after_command_decision_with_options`,
   after `run_proposal` returns `record`, push
   `evidence_for(&ActionOutcome::CommandExit(record.execution.exit_code,
   record.execution.purpose), &record.execution.id)` onto the mutable
@@ -318,11 +318,11 @@ they edit the same file.
   `run_agentic_turn`. Use the execution id, not the finished
   `awaiting_approval` marker (D14). Do not add a marker around the resumed
   execution.
-- [ ] **Step 4: Falsify.** Push nothing → the test fails; push
+- [x] **Step 4: Falsify.** Push nothing → the test fails; push
   `ActionOutcome::Ok` → `evidence_for` returns `None` and the test fails; use
   `pending.proposal_id` as the marker id → change the test to assert the id
   matches the `stored_command_executed.commandId`; it fails. Restore.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -330,7 +330,7 @@ they edit the same file.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test plan_turn --test command_lifecycle
   ```
 
-- [ ] **Step 6: Update the Progress row** and ask before committing. Subject:
+- [x] **Step 6: Update the Progress row** and ask before committing. Subject:
   `Count an approved command's exit as plan evidence`.
 
 ## Task 4: Turn-end evidence attach and `plan_left_open`
@@ -339,7 +339,7 @@ they edit the same file.
 **Files:** `chat.rs`; tests `plan_turn.rs`, `foundation.rs`,
 `provider_limits.rs`, `round_budget.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `a_turn_that_answers_with_a_step_open_keeps_it_open_with_its_evidence`
     (`plan_turn.rs`): plan, read `src/a.rs`, answer. At this task there is no
     reminder yet, so the answer ends the turn. Assert the step is still
@@ -362,9 +362,9 @@ they edit the same file.
     command-approval pause with evidence in the pending turn writes **no**
     `plan_left_open` and no new `plan_step_updated` for the open step; the
     evidence is in the pending JSON instead.
-- [ ] **Step 2: Run them and confirm they fail** (no `plan_left_open`, no
+- [x] **Step 2: Run them and confirm they fail** (no `plan_left_open`, no
   attached evidence).
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - Add a helper, e.g.
     `fn settle_plan_at_turn_end(&self, session: &Session, task: &Task, plan: Option<&mut TaskPlan>, step_evidence: &mut Vec<Evidence>, reminder_sent: bool, stop_reason: &str)`.
     It returns early with no plan. It finds the `InProgress` step, extends its
@@ -381,12 +381,12 @@ they edit the same file.
     `pending.step_evidence` and the plan read from the log.
   - Do **not** call it when `pending` or `pending_question` is set: that is a
     pause.
-- [ ] **Step 4: Falsify.** Call it on a pause → the pause test fails; recompute
+- [x] **Step 4: Falsify.** Call it on a pause → the pause test fails; recompute
   the step status after attaching → the "still InProgress" assertion fails; skip
   the cancel path → the cancel test fails; omit the audit → the audit assertion
   fails; put a step title in an audit field → assert the title is absent from
   the audit line and it fails. Restore.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -394,7 +394,7 @@ they edit the same file.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test plan_turn --test foundation --test provider_limits --test round_budget
   ```
 
-- [ ] **Step 6: Update the Progress row** and ask before committing. Subject:
+- [x] **Step 6: Update the Progress row** and ask before committing. Subject:
   `Attach a turn's step evidence when the turn ends`.
 
 ## Task 5: The reminder in the loop
@@ -403,7 +403,7 @@ they edit the same file.
 D10, D12; §4.5.
 **Files:** `chat.rs`, `session.rs`; tests `plan_turn.rs`, inline `chat.rs`.
 
-- [ ] **Step 1: Write the failing tests** in `crates/workspace-engine/tests/plan_turn.rs`
+- [x] **Step 1: Write the failing tests** in `crates/workspace-engine/tests/plan_turn.rs`
   unless noted. Use `MockModelAdapter::new_sequence_with_tool_calls` and inspect
   `adapter.requests`.
   1. `an_answer_with_open_steps_gets_one_reminder_and_closes_after_it`: a
@@ -444,8 +444,8 @@ D10, D12; §4.5.
   11. `the_reminder_round_is_charged_to_the_action_budget`: after the reminder,
       the `model_request_prepared` record's `toolRound` is one higher, and
       `explorationRounds` did not move.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Implement.**
   - Add `plan_reminder_message(plan: &TaskPlan) -> String` beside
     `plan_review_response` (`chat.rs:6692`), using `open_steps()` and the
     proposal §5.2 text.
@@ -477,14 +477,14 @@ D10, D12; §4.5.
   - Add `ChatMessage.kind: Option<String>`, `append_message_with_kind`, and the
     optional `"kind"` field in `message_json` (the write side; Task 8 adds the
     read/parse and the UI).
-- [ ] **Step 4: Falsify.** (1) Send the reminder for a closed plan → test 3
+- [x] **Step 4: Falsify.** (1) Send the reminder for a closed plan → test 3
   fails. (2) Remove the `plan_reminder_sent` check → a second reminder appears
   and test 1's one-event assertion fails. (3) Use `action_rounds < max_rounds`
   for the gate → test 7 sends a reminder the model cannot act on and fails.
   (4) Skip the Answer-now check → test 6 fails. (5) Leave a declined plan open →
   test 9 fails. (6) Drop the `kind` from the log append → the session-log
   assertion fails. Restore each.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -492,7 +492,7 @@ D10, D12; §4.5.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test plan_turn --test plan --lib
   ```
 
-- [ ] **Step 6: Update the Progress row** and ask before committing. Subject:
+- [x] **Step 6: Update the Progress row** and ask before committing. Subject:
   `Remind a turn once to close the plan steps it finished`.
 
 ## Task 6: The reminder across pauses and with hooks
@@ -505,7 +505,7 @@ D10, D12; §4.5.
 This task is mostly tests: Tasks 2 and 5 should already persist and seed both
 fields. If one fails, fix the wiring it names and record the deviation.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   1. `the_reminder_is_not_sent_twice_across_a_command_approval`
      (`plan_turn.rs`): plan/read/answer → reminder; the post-reminder round
      requests an approval command; the pending JSON has
@@ -531,17 +531,17 @@ fields. If one fails, fix the wiring it names and record the deviation.
   7. `a_hook_that_always_denies_never_gets_a_reminder` (`hooks.rs`): the turn
      ends at the budget with zero reminders and the task
      `ToolBudgetExhausted` (give the test a nextest timeout).
-- [ ] **Step 2: Run them and confirm they fail** if the wiring is missing; where
+- [x] **Step 2: Run them and confirm they fail** if the wiring is missing; where
   a test passes immediately, say so in the Progress row and keep it as the
   regression guard.
-- [ ] **Step 3: Implement only what a test proves missing.** Likely candidates:
+- [x] **Step 3: Implement only what a test proves missing.** Likely candidates:
   a resume that forgot to pass `pending.plan_reminder_sent`/`step_evidence`; the
   question/round-budget literal missing a field; the reminder placed before the
   hook. Do not restructure Tasks 2 or 5.
-- [ ] **Step 4: Falsify.** Reset the flag in one resume → its test fails; drop
+- [x] **Step 4: Falsify.** Reset the flag in one resume → its test fails; drop
   the evidence in `pause_for_round_budget` → test 4 fails; move the reminder
   before the hook → test 6 fails. Restore.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -549,7 +549,7 @@ fields. If one fails, fix the wiring it names and record the deviation.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test plan_turn --test round_budget --test clarification --test hooks
   ```
 
-- [ ] **Step 6: Update the Progress row** and ask before committing. Subject:
+- [x] **Step 6: Update the Progress row** and ask before committing. Subject:
   `Keep one plan reminder across a turn's pauses`.
 
 ## Task 7: The panel: `active`, the summary, "not finished", the live event
@@ -559,7 +559,7 @@ fields. If one fails, fix the wiring it names and record the deviation.
 `desktop-shell/src/worker.rs`, `static/app.js`; tests `tests/plan.rs`,
 `tests/plan_turn.rs`, inline `desktop-shell/src/lib.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `the_states_whose_turn_is_still_running_are_exactly_the_non_terminal_work_states`
     (`session.rs` `mod tests` or `tests/plan.rs`): over `TaskStatus::all()`, the
     true set is `Created`, `PreparingContext`, `WaitingForModel`, `RunningTool`,
@@ -589,8 +589,8 @@ fields. If one fails, fix the wiring it names and record the deviation.
     `TurnProgress::PlanFinished`; it arrives once at a true end, with the open
     step and its attached evidence. `a_pause_reports_no_finished_plan`: a
     command-approval pause emits none.
-- [ ] **Step 2: Run them and confirm they fail** (missing variants/fields).
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail** (missing variants/fields).
+- [x] **Step 3: Implement.**
   - `session.rs`: `TaskStatus::is_active` with the exhaustive match and the doc
     comment distinguishing it from `is_terminal` (D7).
   - `plan.rs`: `PlanReport::summary(&self, active: bool)`; when
@@ -609,13 +609,13 @@ fields. If one fails, fix the wiring it names and record the deviation.
   - `app.js`: in `renderPlanPanel`, an `in_progress` step gets "running" when
     `plan.active !== false`, and "not finished" otherwise. Pending steps stay
     unlabelled. Update the `STEP_OUTCOME_LABELS` comment if needed.
-- [ ] **Step 4: Falsify.** Use `!is_terminal()` for `active` → the crash test
+- [x] **Step 4: Falsify.** Use `!is_terminal()` for `active` → the crash test
   fails; always true → the ended test fails; make `summary` ignore `active` →
   the wording test fails; drop `PlanFinished` → the plan_turn test fails; keep
   the "running" label unconditional → the JSON has `active:false` but the UI
   still says running (manual check; the test does not catch it, so record the
   manual check). Restore.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -627,11 +627,16 @@ fields. If one fails, fix the wiring it names and record the deviation.
   npm run lint:web
   ```
 
-- [ ] **Step 6: Check the UI by hand.** Rebuild the shell, run it on a spare port
-  with a scratch `DAMAIAN_DATA_DIR`, drive a turn that leaves a step open, and
-  confirm the panel says "not finished" and "Turn ended with N steps not marked
-  done." Record what was checked.
-- [ ] **Step 7: Update the Progress row** and ask before committing. Subject:
+- [x] **Step 6: Check the UI by hand.** **Checked 2026-10-25** in the real web UI
+  (`desktop-shell` served on 127.0.0.1:4897, scratch `DAMAIAN_DATA_DIR`, a
+  session with a `Complete` task and a two-step plan whose second step stayed
+  `in_progress`). The rendered panel read **"Turn ended with 1 step not marked
+  done, 1 finished."**, the ended step was labelled **"not finished"** (no
+  "running" label anywhere), the completed step read "confirmed", and both
+  "What confirms this" disclosures showed their evidence (a command exit 0 and
+  a file read). The summary's `data-complete` was `false`. The temporary seed +
+  server test and its data directory were deleted afterwards.
+- [x] **Step 7: Update the Progress row** and ask before committing. Subject:
   `Stop calling an ended turn's plan step running`.
 
 ## Task 8: The session-log reminder line and the next-turn seed
@@ -640,7 +645,7 @@ fields. If one fails, fix the wiring it names and record the deviation.
 **Files:** `session.rs` (the read/parse side; Task 5 landed the write side),
 `desktop-shell/src/lib.rs`, `static/app.js`, `chat.rs`; tests inline.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `a_message_with_a_kind_round_trips_and_an_old_one_reads_none`
     (`session.rs` `mod tests`): `append_message_with_kind(..., Some("plan_reminder"))`
     reads back with the kind; an ordinary message reads `None`; an old
@@ -652,8 +657,8 @@ fields. If one fails, fix the wiring it names and record the deviation.
     `build_model_prompt` with a prior message whose kind is `plan_reminder`; its
     text is absent. An ordinary user message is still present (the negative
     control).
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Implement.**
   - `session.rs`: parse `kind` in `parse_message_event` (Task 5 wrote it); the
     question transcript entries set `None`; an old line without the field reads
     `None`.
@@ -663,10 +668,10 @@ fields. If one fails, fix the wiring it names and record the deviation.
     an answer, a rewind anchor or a question.
   - `chat.rs` `build_model_prompt`: skip `ChatMessage`s with
     `kind == Some("plan_reminder")` in the recent-message seed (D10).
-- [ ] **Step 4: Falsify.** Drop `kind` in `parse_message_event` → the shell test
+- [x] **Step 4: Falsify.** Drop `kind` in `parse_message_event` → the shell test
   fails; include tagged entries in `build_model_prompt` → the seed test fails;
   render it as a user bubble → manual check (record). Restore.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -678,7 +683,7 @@ fields. If one fails, fix the wiring it names and record the deviation.
   npm run lint:web
   ```
 
-- [ ] **Step 6: Update the Progress row** and ask before committing. Subject:
+- [x] **Step 6: Update the Progress row** and ask before committing. Subject:
   `Show a plan reminder as a system line, not as the user's words`.
 
 ## Task 9: Eval fields and the deterministic scenarios
@@ -690,15 +695,15 @@ fields. If one fails, fix the wiring it names and record the deviation.
 `scenarios/plan_left_open_at_end.toml`, `scenarios/planned_task.toml`,
 `tests/harness.rs`.
 
-- [ ] **Step 1: Write the failing tests** in
+- [x] **Step 1: Write the failing tests** in
   `crates/eval-harness/tests/harness.rs`:
   - `a_plan_answer_without_complete_step_gets_one_reminder_and_closes_after_it`;
   - `a_plan_left_open_at_end_records_the_reminder_and_the_open_step`;
   - `the_planned_task_scenario_gets_no_reminder`;
   - update `every_scenario_runs_and_none_is_blocked`'s count from 23 to 25 and
     its comment.
-- [ ] **Step 2: Run them and confirm they fail** (the scenarios do not exist).
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail** (the scenarios do not exist).
+- [x] **Step 3: Implement.**
   - `record.rs`: `RecordedPlan` gains `reminders_sent: u64`,
     `left_open_at_end: bool`, `open_step_evidence: u64`, with doc comments
     (camelCase on the wire).
@@ -726,12 +731,12 @@ fields. If one fails, fix the wiring it names and record the deviation.
     `plan_outstanding = 3`, `plan_left_open = true`, `plan_open_evidence = 1`,
     the first answer is the response, and the last message is the second answer.
   - `scenarios/planned_task.toml`: add `plan_reminders = 0`.
-- [ ] **Step 4: Falsify.** Make `reminders_sent` a constant 1 → the planned_task
+- [x] **Step 4: Falsify.** Make `reminders_sent` a constant 1 → the planned_task
   zero-reminder scenario fails; make `left_open_at_end` always false → the
   second scenario fails; drop `open_step_evidence` to 0 → the second scenario
   fails; read `last_assistant_message` from the turn response → the "Done."
   assertion fails. Restore.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -740,7 +745,7 @@ fields. If one fails, fix the wiring it names and record the deviation.
   CARGO_TARGET_DIR="$PWD/target" cargo run -p eval-harness -- run --tier deterministic
   ```
 
-- [ ] **Step 6: Update the Progress row** and ask before committing. Subject:
+- [x] **Step 6: Update the Progress row** and ask before committing. Subject:
   `Measure a plan left open at turn end in the eval harness`.
 
 ## Task 10: Docs, acceptance walk, live run, close
@@ -749,18 +754,25 @@ fields. If one fails, fix the wiring it names and record the deviation.
 `docs/TROUBLESHOOTING.md`, `proposal.md` §7, `docs/specs/README.md`,
 `CHANGELOG.md`, this file.
 
-- [ ] **Step 1: Walk every acceptance criterion in §6** against the finished
+- [x] **Step 1: Walk every acceptance criterion in §6** against the finished
   tree and record the per-criterion evidence in `proposal.md` §7 (a table like
   spec 31's §7.1). Name the test for each; say which criteria are manual.
-- [ ] **Step 2: Live run per §6.** Re-run §1's prompt against
-  `deepseek-v4-flash` on this repository with an isolated `DAMAIAN_DATA_DIR`.
-  Accepted if the turn either closes its steps after the reminder or ends with
-  the panel reading "not finished", and the step evidence lists the commands it
-  ran. Record in §7 and here: which happened, how many tokens the reminder round
-  cost, and whether the final response was the report. If the CLI cannot observe
-  the panel without a UI, use the desktop shell or a temporary `#[ignore]` driver
-  as spec 62 did; delete the driver and data directory afterwards.
-- [ ] **Step 3: Documentation.**
+- [x] **Step 2: Live run per §6.** **Passed 2026-10-25.** The §1 prompt,
+  verbatim, against `deepseek-v4-flash` with default budgets and an isolated
+  `DAMAIAN_DATA_DIR`: the model planned four steps, answered, received the one
+  reminder (`openSteps: 4`), took *Continue* at the round-budget pause the
+  reminder's charge exposed, and closed all four steps. One
+  `PlanFinished`, no `plan_left_open`, step 1 with 20 evidence items and steps
+  2–4 completed unverified; 27 model calls, 2,218,346 input (1,934,208 cached),
+  17,662 output. The reminder round cost 80,774 input (66,432 cached) and 249
+  output; the final response was the report. The key was read inline from the
+  macOS Keychain (`security find-generic-password -s deepseek-api-key -w`) and
+  never printed or stored. Because the prompt asks for shell-control reads that
+  Code mode pauses on, the accepted run used a disposable clone of the committed
+  branch with approvals granted by a temporary `#[ignore]` driver; the driver,
+  clone and data directories were deleted afterwards. Details and caveats in
+  `proposal.md` §7.
+- [x] **Step 3: Documentation.**
   - `docs/USER_GUIDE.md` → **The Plan Panel** / **What each step says**: what
     "not finished" and "Turn ended with N steps not marked done." mean; that the
     answer is still the answer; that a declined plan shows its steps as skipped.
@@ -768,7 +780,7 @@ fields. If one fails, fix the wiring it names and record the deviation.
     step is open after the turn ended (not stuck); how to read
     `plan_reminder_sent` and `plan_left_open`; the tagged
     `"kind":"plan_reminder"` message; why a declined plan is skipped.
-- [ ] **Step 4: Close per AGENTS.md "When a spec becomes Done".**
+- [x] **Step 4: Close per AGENTS.md "When a spec becomes Done".**
   - `Status:` in `proposal.md`, the README implementation-order row, this
     file's Progress table and its `**Started:** … — **Done:** …` header.
   - `grep -rn "66_plan_left_open_at_turn_end" docs/ CHANGELOG.md`: no
@@ -778,9 +790,10 @@ fields. If one fails, fix the wiring it names and record the deviation.
   - Remove #66's line from `CHANGELOG.md`'s `Unreleased` (it is present today:
     "Stop showing a finished turn's plan as still running…").
   - Run `npm run specs:check -- --strict`.
-- [ ] **Step 5: Checks.** Fast checks and scoped clippy/tests locally; the full
-  seven-check gate runs on **CI**, not locally (AGENTS.md since 2026-10-15), and
-  the user pushes. Record the CI result here when it is green, and say plainly
-  that the workspace clippy and test suite were left to CI.
-- [ ] **Step 6: Ask before committing.** Subject:
+- [ ] **Step 5: Checks.** Fast checks and scoped clippy/tests ran locally and
+  passed (listed in the Progress row); the full seven-check gate runs on **CI**,
+  not locally (AGENTS.md since 2026-10-15), and the user pushes. **CI has not
+  run yet**, so its result is not recorded; the workspace clippy and test suite
+  were left to it.
+- [x] **Step 6: Ask before committing.** Subject:
   `Close the plan-left-open spec with docs and acceptance results`.

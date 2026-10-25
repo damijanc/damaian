@@ -545,7 +545,8 @@ fn describe_approval(
                 "{{\"proposalId\":\"{}\",\"deferredAction\":\"{}\",\"plan\":{}}}",
                 escape_json(&proposal_id),
                 escape_json(&deferred_action),
-                plan_json(&plan)
+                // The reattached review is a paused turn, still waiting.
+                plan_json(&plan, true)
             ),
             unavailable_reason: None,
         },

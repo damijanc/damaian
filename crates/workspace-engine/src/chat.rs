@@ -143,6 +143,17 @@ enum StopReason {
     TokenBudget,
 }
 
+impl StopReason {
+    /// The name written to `plan_left_open` and read by the eval harness.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::ToolBudget => "tool_budget",
+            Self::TokenBudget => "token_budget",
+        }
+    }
+}
+
 /// Which stage of a turn is running. Drives the progress indicator, so the user
 /// can tell a slow provider apart from a running tool apart from a hang.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +231,11 @@ pub enum TurnProgress {
     /// never existed. The plan is small and changes a handful of times per
     /// turn, so there is nothing to save by being clever here.
     Plan(TaskPlan),
+    /// The plan at the moment the turn truly ended, sent once so the panel can
+    /// stop describing an open step as running (spec 66 §5.4). A pause sends
+    /// none: the turn is not over. Carries the plan whole, like [`Self::Plan`],
+    /// so the final event also carries evidence attached at the end.
+    PlanFinished(TaskPlan),
     /// One browser diagnostic run, already redacted, sent once per run when
     /// it finishes (spec 12 `context.md` §3.3). The same record is appended
     /// to the session log, so a reload shows what the live stream did.
@@ -280,6 +296,10 @@ impl TurnSink<'_> {
 
     fn plan(&mut self, plan: &TaskPlan) {
         (self.on_progress)(TurnProgress::Plan(plan.clone()));
+    }
+
+    fn plan_finished(&mut self, plan: &TaskPlan) {
+        (self.on_progress)(TurnProgress::PlanFinished(plan.clone()));
     }
 
     fn web_diagnostic(&mut self, record: WebDiagnosticRecord) {
@@ -1081,6 +1101,8 @@ impl ChatOrchestrator {
             messages,
             0,
             0,
+            Vec::new(),
+            false,
             model_adapter,
             sink,
             options,
@@ -1147,6 +1169,10 @@ impl ChatOrchestrator {
         let mut after_tool_action: Option<ToolAction> = None;
         let mut after_tool_outcome: Option<ActionOutcome> = None;
         let mut after_tool_termination: Option<CommandTermination> = None;
+        // The evidence the paused turn was already carrying. The approved
+        // command's own exit is added to it below (spec 66 §5.3); everything
+        // else resumes with exactly what the pause saved.
+        let mut step_evidence = pending.step_evidence.clone();
         let (assistant_summary, mut tool_result_content) = if let Some(web_call) =
             &pending.web_diagnostic_call
         {
@@ -1351,6 +1377,20 @@ impl ChatOrchestrator {
                     &pending.task,
                     &census,
                 );
+                // The command the user approved is evidence for the step it
+                // served. The resumed execution is not bracketed by a new
+                // action marker, so the execution's own id is the breadcrumb —
+                // it is the `commandId` on the `stored_command_executed`
+                // record that carries the exit (spec 66 `context.md` D14).
+                if let Some(evidence) = evidence_for(
+                    &ActionOutcome::CommandExit(
+                        record.execution.exit_code,
+                        record.execution.purpose,
+                    ),
+                    &record.execution.id,
+                ) {
+                    step_evidence.push(evidence);
+                }
                 after_tool_action = Some(ToolAction::Command(command_request.clone()));
                 after_tool_outcome = Some(ActionOutcome::CommandExit(
                     record.execution.exit_code,
@@ -1456,6 +1496,8 @@ impl ChatOrchestrator {
             messages,
             pending.round + 1,
             pending.exploration_rounds,
+            step_evidence,
+            pending.plan_reminder_sent,
             model_adapter,
             sink,
             pending.turn_options,
@@ -1498,10 +1540,30 @@ impl ChatOrchestrator {
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
 
-        let plan = self
+        let mut plan = self
             .session_store
             .read_task_plan(&pending.session.id, &pending.task.id)?;
         let note = if !approved {
+            // A declined plan is settled by the user's decision, not the
+            // model's. Every non-terminal step becomes `Skipped`, so the plan
+            // is not open: the reminder never asks the model to complete work
+            // the user refused, and the panel reports what happened. The step
+            // keeps any evidence it already had (spec 66 `context.md` D5).
+            if let Some(current) = plan.as_mut() {
+                let now = now_millis();
+                for step in current
+                    .steps
+                    .iter_mut()
+                    .filter(|step| !step.status.is_terminal())
+                {
+                    step.status = crate::plan::StepStatus::Skipped;
+                    step.completed_at_ms = Some(now);
+                    let skipped = step.clone();
+                    self.session_store
+                        .update_plan_step(&pending.task, &skipped)?;
+                }
+                sink.plan(current);
+            }
             // The same shape as a declined command: the work does not happen,
             // and the model is told plainly rather than left to infer it from
             // a tool result that never arrives.
@@ -1581,6 +1643,8 @@ impl ChatOrchestrator {
             messages,
             pending.round + 1,
             pending.exploration_rounds,
+            pending.step_evidence,
+            pending.plan_reminder_sent,
             model_adapter,
             sink,
             pending.turn_options,
@@ -1733,6 +1797,8 @@ impl ChatOrchestrator {
             messages,
             pending.round + 1,
             pending.exploration_rounds,
+            pending.step_evidence,
+            pending.plan_reminder_sent,
             model_adapter,
             sink,
             pending.turn_options,
@@ -1791,12 +1857,30 @@ impl ChatOrchestrator {
             ],
         )?;
         self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+        // Declining the fallback fails the task without re-entering the loop,
+        // so this is the one place outside it that must settle the plan from
+        // the evidence the pause carried (spec 66 `context.md` D6).
+        let mut plan = self
+            .session_store
+            .read_task_plan(&pending.session.id, &pending.task.id)?;
+        let mut step_evidence = pending.step_evidence.clone();
+        let _ = self.settle_plan_at_turn_end(
+            &pending.session,
+            &pending.task,
+            &mut plan,
+            &mut step_evidence,
+            pending.plan_reminder_sent,
+            "failed",
+        );
         self.session_store.update_task_status_with_kind(
             &pending.task,
             TaskStatus::Failed,
             Some(offer.message.as_str()),
             Some(offer.refusal_code.as_str()),
         )?;
+        if let Some(current) = plan.as_ref() {
+            sink.plan_finished(current);
+        }
         Err(ClientError::Provider(
             ProviderRefusal::from_code(&offer.refusal_code).unwrap_or(ProviderRefusal::Unknown),
             offer.message,
@@ -1873,6 +1957,8 @@ impl ChatOrchestrator {
             pending.messages,
             pending.round,
             pending.exploration_rounds,
+            pending.step_evidence,
+            pending.plan_reminder_sent,
             model_adapter,
             sink,
             turn_options,
@@ -1975,6 +2061,8 @@ impl ChatOrchestrator {
                     messages,
                     pending.round,
                     pending.exploration_rounds,
+                    pending.step_evidence,
+                    pending.plan_reminder_sent,
                     model_adapter,
                     sink,
                     turn_options,
@@ -2009,6 +2097,8 @@ impl ChatOrchestrator {
                     pending.messages,
                     pending.round,
                     pending.exploration_rounds,
+                    pending.step_evidence,
+                    pending.plan_reminder_sent,
                     model_adapter,
                     sink,
                     turn_options,
@@ -2449,13 +2539,7 @@ impl ChatOrchestrator {
         else {
             return Ok(());
         };
-        let outstanding = plan.steps.iter().any(|step| {
-            matches!(
-                step.status,
-                crate::plan::StepStatus::Pending | crate::plan::StepStatus::InProgress
-            )
-        });
-        if !outstanding {
+        if plan.open_steps().is_empty() {
             return Ok(());
         }
         self.session_store.resume_plan(task, &previous.id)
@@ -2522,6 +2606,165 @@ impl ChatOrchestrator {
         Ok(None)
     }
 
+    /// The task's ceiling and recorded spend, or `None` when no ceiling is set.
+    ///
+    /// One reader for both the pre-call check and the reminder gate: the
+    /// reminder must be judged on the spend *after* the answer round, and two
+    /// copies of this read could disagree about which figure the ceiling is
+    /// compared with (spec 66 `context.md` D12).
+    fn token_ceiling_spend(&self, session_id: &str, task_id: &str) -> Result<Option<(u64, u64)>> {
+        let Some(ceiling) = self.config.agent_max_task_tokens else {
+            return Ok(None);
+        };
+        let spent = self
+            .session_store
+            .read_task_usage(session_id)?
+            .get(task_id)
+            .map(|usage| usage.input_tokens + usage.output_tokens)
+            .unwrap_or(0);
+        Ok(Some((ceiling, spent)))
+    }
+
+    /// The reminder to send at a completion point, and how many steps are open,
+    /// or `None` when the gate does not allow one (spec 66 §5.2).
+    ///
+    /// The budget condition is deliberately two rounds of room: the reminder is
+    /// charged before the next call, and a call landing at `max_rounds` would
+    /// have its tools withheld — the model could not call `complete_step` even
+    /// though it was just asked to.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_reminder_note(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        plan: Option<&TaskPlan>,
+        reminder_sent: bool,
+        action_rounds: u32,
+        max_rounds: u32,
+        answer_now: bool,
+    ) -> Result<Option<(String, usize)>> {
+        let Some(plan) = plan else {
+            return Ok(None);
+        };
+        let open = plan.open_steps();
+        let ceiling = self.token_ceiling_spend(session_id, task_id)?;
+        // *Answer now* is the user's decision to end the turn with no rounds
+        // left; re-entering it would be unbounded for the reason the hook is
+        // skipped there (spec 66 `context.md` D2).
+        if !plan_reminder_allowed(
+            reminder_sent,
+            open.len(),
+            action_rounds,
+            max_rounds,
+            answer_now,
+            ceiling,
+        ) {
+            return Ok(None);
+        }
+        Ok(Some((plan_reminder_message(plan), open.len())))
+    }
+
+    /// Attaches the turn's accrued evidence to whichever step is still open,
+    /// and audits the plan left open (spec 66 §5.2, §5.3).
+    ///
+    /// Only a true end calls this. Attaching is not closing: the step keeps its
+    /// status, and `append_step_evidence` never recomputes one. Best-effort
+    /// writes — an unwritable log must not turn a finished turn into an error,
+    /// the same rule `edit.rs` follows.
+    fn settle_plan_at_turn_end(
+        &self,
+        session: &Session,
+        task: &Task,
+        plan: &mut Option<TaskPlan>,
+        step_evidence: &mut Vec<crate::plan::Evidence>,
+        plan_reminder_sent: bool,
+        stop_reason: &str,
+    ) -> Result<()> {
+        let accrued = std::mem::take(step_evidence);
+        let Some(current) = plan.as_mut() else {
+            return Ok(());
+        };
+        if !accrued.is_empty()
+            && let Some(open) = current
+                .steps
+                .iter_mut()
+                .find(|step| step.status == crate::plan::StepStatus::InProgress)
+        {
+            // Extend the in-memory plan so the final panel event carries the
+            // same evidence the log now does.
+            open.evidence.extend(accrued.iter().cloned());
+            for item in accrued {
+                let _ = self
+                    .session_store
+                    .append_step_evidence(&session.id, &task.id, item);
+            }
+        }
+        let open_steps = current.open_steps().len();
+        if open_steps > 0 {
+            self.audit_log.record(
+                "plan_left_open",
+                &[
+                    ("actor", "system".to_string()),
+                    ("sessionId", session.id.clone()),
+                    ("taskId", task.id.clone()),
+                    ("openSteps", open_steps.to_string()),
+                    ("reminderSent", plan_reminder_sent.to_string()),
+                    ("stopReason", stop_reason.to_string()),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Keeps the answer that triggered the reminder, then appends the reminder
+    /// itself to the request and the session log (spec 66 §5.2).
+    ///
+    /// The pre-reminder answer is the turn's response on a true completion, so
+    /// it must reach the log even if the post-reminder reply is just "Done.".
+    #[allow(clippy::too_many_arguments)]
+    fn send_plan_reminder(
+        &self,
+        session: &Session,
+        task: &Task,
+        answer: &str,
+        model_run: &ModelRun,
+        reminder: &str,
+        open_steps: usize,
+        messages: &mut Vec<ModelMessage>,
+        pre_reminder_answer: &mut Option<String>,
+    ) -> Result<()> {
+        if !answer.trim().is_empty() {
+            self.session_store
+                .append_message(&session.id, Some(&task.id), "assistant", answer)?;
+            *pre_reminder_answer = Some(answer.to_string());
+        }
+        messages.push(
+            ModelMessage::assistant(answer.to_string())
+                .with_reasoning_content(model_run.reasoning_content.clone()),
+        );
+        // Tagged so the conversation view renders it as a system line rather
+        // than as something the user typed, and so a later turn's seed skips it
+        // (spec 66 `context.md` D10).
+        self.session_store.append_message_with_kind(
+            &session.id,
+            Some(&task.id),
+            "user",
+            reminder,
+            Some("plan_reminder"),
+        )?;
+        messages.push(ModelMessage::user(reminder.to_string()));
+        self.audit_log.record(
+            "plan_reminder_sent",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
+                ("openSteps", open_steps.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_agentic_turn(
         &self,
@@ -2532,6 +2775,12 @@ impl ChatOrchestrator {
         mut messages: Vec<ModelMessage>,
         mut action_rounds: u32,
         mut exploration_rounds: u32,
+        // Evidence accrued before this resume, carried in the pending turn.
+        // The turn starts empty; every pause seeds it (spec 66 §5.3).
+        mut step_evidence: Vec<crate::plan::Evidence>,
+        // Whether this turn already sent its one plan reminder. Carried so a
+        // resume cannot remind twice (spec 66 §5.2).
+        mut plan_reminder_sent: bool,
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
         turn_options: ChatTurnOptions,
@@ -2739,8 +2988,9 @@ impl ChatOrchestrator {
         // *accrual* has no home on disk until the step closes: evidence belongs
         // to a step, and which step is open is a fact about this turn. The plan
         // itself is written through as it changes, so a crash loses at most the
-        // evidence of the step that was still running — which is the step whose
-        // outcome was genuinely unknown.
+        // evidence of the step that was still running — unless the turn was
+        // paused, because a paused turn carries it in `PendingChatTurn` and the
+        // resumed loop seeds it from there (spec 66 §5.3).
         // Seeded from the log rather than left empty: a resumed turn already
         // has a plan (see `carry_plan_from_the_previous_turn`), and starting this
         // at `None` would make `complete_step` report "there is no plan" while
@@ -2749,7 +2999,6 @@ impl ChatOrchestrator {
             .session_store
             .read_task_plan(&session.id, &task.id)
             .unwrap_or_default();
-        let mut step_evidence: Vec<crate::plan::Evidence> = Vec::new();
         // A turn that arrives with a plan already in hand — resumed after a
         // token stop, or after the user approved or revised it — shows it
         // before doing any work. Without this the panel would stay empty until
@@ -2779,7 +3028,12 @@ impl ChatOrchestrator {
         // canonical form below. It lives for one turn: a resumed turn starts
         // with an empty set, and a round that writes clears it.
         let mut seen_read_calls: HashSet<Vec<String>> = HashSet::new();
-        let (final_run, response, proposals, stop_reason) = loop {
+        // The answer that triggered the one plan reminder, if one was sent. On a
+        // true completion it is the turn's response, and the post-reminder
+        // answer follows it as a second message (spec 66 `context.md` D4). A
+        // pause or budget stop after the reminder keeps its own response.
+        let mut pre_reminder_answer: Option<String> = None;
+        let (final_run, mut response, proposals, stop_reason) = loop {
             // Spec 57 §5.4, in its order: a pause holds here, before the
             // cancel check, so a stop that arrives while paused ends the turn
             // through the same path as any other stop.
@@ -2828,6 +3082,10 @@ impl ChatOrchestrator {
                     context_files,
                     &partial_response,
                     cancelled_run,
+                    plan,
+                    step_evidence,
+                    plan_reminder_sent,
+                    sink,
                 );
             }
 
@@ -2859,7 +3117,7 @@ impl ChatOrchestrator {
             // rounds, so that call is the most expensive of the turn. A ceiling
             // whose enforcement action is to spend more than the ceiling is not
             // a ceiling. `context.md` §3.3.
-            if let Some(ceiling) = self.config.agent_max_task_tokens {
+            if let Some((ceiling, spent)) = self.token_ceiling_spend(&session.id, &task.id)? {
                 // Absent usage is zero here, not "unknown". `read_task_usage`
                 // omits a task with no events because "not recorded" and "used
                 // nothing" differ for a *report*; for a *ceiling* nothing spent
@@ -2870,12 +3128,6 @@ impl ChatOrchestrator {
                 // An `Estimated` total is checked like any other: declining to
                 // enforce on one would make the ceiling inoperative for every
                 // provider that does not report usage (§5.4).
-                let spent = self
-                    .session_store
-                    .read_task_usage(&session.id)?
-                    .get(&task.id)
-                    .map(|usage| usage.input_tokens + usage.output_tokens)
-                    .unwrap_or(0);
                 if spent >= ceiling {
                     let response = token_budget_exhausted_response(ceiling, spent, plan.as_ref());
                     let mut stopped = ModelRun::cancelled_before_start(
@@ -2914,6 +3166,8 @@ impl ChatOrchestrator {
                     messages,
                     action_rounds,
                     exploration_rounds,
+                    step_evidence.clone(),
+                    plan_reminder_sent,
                     max_rounds,
                     round_budget_extension,
                     turn_options,
@@ -3048,6 +3302,10 @@ impl ChatOrchestrator {
                         context_files,
                         &partial_response,
                         cancelled_run,
+                        plan,
+                        step_evidence,
+                        plan_reminder_sent,
+                        sink,
                     );
                 }
                 Err(ClientError::Provider(refusal, message)) => {
@@ -3118,24 +3376,51 @@ impl ChatOrchestrator {
                             messages,
                             action_rounds,
                             exploration_rounds,
+                            step_evidence.clone(),
+                            plan_reminder_sent,
                             turn_options,
                             offer,
                         );
                     }
+                    // A provider failure is a true end, so the open step keeps
+                    // its accrued evidence (spec 66 §5.3). Best-effort: an
+                    // unwritable log must not hide the provider's error.
+                    let _ = self.settle_plan_at_turn_end(
+                        &session,
+                        &task,
+                        &mut plan,
+                        &mut step_evidence,
+                        plan_reminder_sent,
+                        "failed",
+                    );
                     let _ = self.session_store.update_task_status_with_kind(
                         &task,
                         TaskStatus::Failed,
                         Some(message.as_str()),
                         Some(refusal.code()),
                     );
+                    if let Some(current) = plan.as_ref() {
+                        sink.plan_finished(current);
+                    }
                     return Err(ClientError::Provider(refusal, message));
                 }
                 Err(error) => {
+                    let _ = self.settle_plan_at_turn_end(
+                        &session,
+                        &task,
+                        &mut plan,
+                        &mut step_evidence,
+                        plan_reminder_sent,
+                        "failed",
+                    );
                     let _ = self.session_store.update_task_status(
                         &task,
                         TaskStatus::Failed,
                         Some(&error.to_string()),
                     );
+                    if let Some(current) = plan.as_ref() {
+                        sink.plan_finished(current);
+                    }
                     return Err(error);
                 }
             };
@@ -3197,6 +3482,10 @@ impl ChatOrchestrator {
                     context_files,
                     &partial,
                     model_run,
+                    plan,
+                    step_evidence,
+                    plan_reminder_sent,
+                    sink,
                 );
             }
             partial_response = redacted.clone();
@@ -3277,6 +3566,34 @@ impl ChatOrchestrator {
                     action_rounds += 1;
                     continue;
                 }
+                // The reminder runs after the hook allows, so the hook sees the
+                // answer and the plan as they stand (spec 66 `context.md` D1).
+                // At a forced-final call the two-round gate is already false,
+                // because `action_rounds >= max_rounds`; kept here so both
+                // completion points share one rule.
+                if let Some((reminder, open_steps)) = self.plan_reminder_note(
+                    &session.id,
+                    &task.id,
+                    plan.as_ref(),
+                    plan_reminder_sent,
+                    action_rounds,
+                    max_rounds,
+                    turn_options.round_budget_answer_now,
+                )? {
+                    self.send_plan_reminder(
+                        &session,
+                        &task,
+                        &redacted,
+                        &model_run,
+                        &reminder,
+                        open_steps,
+                        &mut messages,
+                        &mut pre_reminder_answer,
+                    )?;
+                    plan_reminder_sent = true;
+                    action_rounds += 1;
+                    continue;
+                }
                 break (
                     model_run,
                     redacted,
@@ -3316,6 +3633,32 @@ impl ChatOrchestrator {
                                 .with_reasoning_content(model_run.reasoning_content.clone()),
                         );
                         messages.push(ModelMessage::user(note));
+                        action_rounds += 1;
+                        continue;
+                    }
+                    // Only after the hook allows: the reminder is the last
+                    // thing between the turn and its end, not a second engine
+                    // note beside the hook's (spec 66 `context.md` D1).
+                    if let Some((reminder, open_steps)) = self.plan_reminder_note(
+                        &session.id,
+                        &task.id,
+                        plan.as_ref(),
+                        plan_reminder_sent,
+                        action_rounds,
+                        max_rounds,
+                        turn_options.round_budget_answer_now,
+                    )? {
+                        self.send_plan_reminder(
+                            &session,
+                            &task,
+                            &redacted,
+                            &model_run,
+                            &reminder,
+                            open_steps,
+                            &mut messages,
+                            &mut pre_reminder_answer,
+                        )?;
+                        plan_reminder_sent = true;
                         action_rounds += 1;
                         continue;
                     }
@@ -3522,6 +3865,10 @@ impl ChatOrchestrator {
                         context_files: context_files.clone(),
                         round: action_rounds,
                         exploration_rounds,
+                        // A pause carries the open step's evidence and the
+                        // reminder flag; neither is attached or reset here.
+                        step_evidence: step_evidence.clone(),
+                        plan_reminder_sent,
                         messages: messages.clone(),
                         // The deferred call is deliberately dropped rather than
                         // stored: it was never dispatched, and the resumed turn
@@ -3791,6 +4138,8 @@ impl ChatOrchestrator {
                                     context_files: context_files.clone(),
                                     round: action_rounds,
                                     exploration_rounds,
+                                    step_evidence: step_evidence.clone(),
+                                    plan_reminder_sent,
                                     messages: messages.clone(),
                                     matched_tool_call: matched_tool_call.clone(),
                                     last_content: redacted.clone(),
@@ -4167,6 +4516,8 @@ impl ChatOrchestrator {
                                     context_files: context_files.clone(),
                                     round: action_rounds,
                                     exploration_rounds,
+                                    step_evidence: step_evidence.clone(),
+                                    plan_reminder_sent,
                                     messages: messages.clone(),
                                     matched_tool_call: matched_tool_call.clone(),
                                     last_content: redacted.clone(),
@@ -4279,6 +4630,8 @@ impl ChatOrchestrator {
                                     context_files: context_files.clone(),
                                     round: action_rounds,
                                     exploration_rounds,
+                                    step_evidence: step_evidence.clone(),
+                                    plan_reminder_sent,
                                     messages: messages.clone(),
                                     matched_tool_call: matched_tool_call.clone(),
                                     last_content: redacted.clone(),
@@ -4404,6 +4757,8 @@ impl ChatOrchestrator {
                                         context_files: context_files.clone(),
                                         round: action_rounds,
                                         exploration_rounds,
+                                        step_evidence: step_evidence.clone(),
+                                        plan_reminder_sent,
                                         messages: messages.clone(),
                                         matched_tool_call: matched_tool_call.clone(),
                                         last_content: redacted.clone(),
@@ -4633,8 +4988,6 @@ impl ChatOrchestrator {
             }
         };
 
-        self.session_store
-            .append_message(&session.id, Some(&task.id), "assistant", &response)?;
         // A turn that ends awaiting a decision records *which* proposal, so a
         // restart reattaches it instead of rebuilding a card from partial data
         // (§5.5).
@@ -4667,6 +5020,51 @@ impl ChatOrchestrator {
             .question
             .as_ref()
             .map(|proposal| PendingQuestionRef::recorded(proposal.question_id.clone()));
+        let truly_completed = pending.is_none() && pending_question.is_none();
+
+        // Spec 66 `context.md` D4: on a true completion the answer that
+        // triggered the reminder is the turn's response, and the post-reminder
+        // answer follows it as a second message. A pause or budget stop keeps
+        // its own response — replacing it with the earlier answer would hide
+        // the card or the budget notice the user is being shown.
+        match pre_reminder_answer.take() {
+            Some(earlier) if truly_completed => {
+                if !response.trim().is_empty() {
+                    self.session_store.append_message(
+                        &session.id,
+                        Some(&task.id),
+                        "assistant",
+                        &response,
+                    )?;
+                }
+                response = earlier;
+            }
+            _ => {
+                self.session_store.append_message(
+                    &session.id,
+                    Some(&task.id),
+                    "assistant",
+                    &response,
+                )?;
+            }
+        }
+
+        if truly_completed {
+            // Attaching the buffer is the true end's job; a pause carried it
+            // instead (spec 66 §5.3). Nothing here changes a step's status.
+            self.settle_plan_at_turn_end(
+                &session,
+                &task,
+                &mut plan,
+                &mut step_evidence,
+                plan_reminder_sent,
+                stop_reason.as_str(),
+            )?;
+            if let Some(current) = plan.as_ref() {
+                sink.plan_finished(current);
+            }
+        }
+
         task = match (&pending, &pending_question) {
             (Some(pending), None) => self.session_store.await_approval(&task, pending)?,
             // A question link goes under its own status key through
@@ -4773,6 +5171,8 @@ impl ChatOrchestrator {
         messages: Vec<ModelMessage>,
         action_rounds: u32,
         exploration_rounds: u32,
+        step_evidence: Vec<crate::plan::Evidence>,
+        plan_reminder_sent: bool,
         turn_options: ChatTurnOptions,
         offer: PendingProviderFallback,
     ) -> Result<ChatTurnResult> {
@@ -4786,6 +5186,8 @@ impl ChatOrchestrator {
             context_files: context_files.clone(),
             round: action_rounds,
             exploration_rounds,
+            step_evidence,
+            plan_reminder_sent,
             // The request as the provider refused it: approving re-issues this
             // round, so nothing is appended for a call that never answered.
             messages,
@@ -4887,6 +5289,8 @@ impl ChatOrchestrator {
         messages: Vec<ModelMessage>,
         action_rounds: u32,
         exploration_rounds: u32,
+        step_evidence: Vec<crate::plan::Evidence>,
+        plan_reminder_sent: bool,
         max_rounds: u32,
         rounds_granted: u32,
         turn_options: ChatTurnOptions,
@@ -4907,6 +5311,8 @@ impl ChatOrchestrator {
             context_files: context_files.clone(),
             round: action_rounds,
             exploration_rounds,
+            step_evidence,
+            plan_reminder_sent,
             // The conversation so far, unchanged: nothing was dispatched, so
             // resuming replays it and the model simply asks for its tool again.
             messages,
@@ -5013,6 +5419,10 @@ impl ChatOrchestrator {
         context_files: Vec<String>,
         partial: &str,
         model_run: ModelRun,
+        mut plan: Option<TaskPlan>,
+        mut step_evidence: Vec<crate::plan::Evidence>,
+        plan_reminder_sent: bool,
+        sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         // Through the same scanner as a completed turn: stopping does not
         // suspend the redaction guarantee.
@@ -5024,6 +5434,19 @@ impl ChatOrchestrator {
                 "assistant",
                 &response,
             )?;
+        }
+        // A stop is a true end: the step stays open, with what it ran attached
+        // (spec 66 §5.3). It never changes the step's status.
+        self.settle_plan_at_turn_end(
+            &session,
+            &task,
+            &mut plan,
+            &mut step_evidence,
+            plan_reminder_sent,
+            "cancelled",
+        )?;
+        if let Some(current) = plan.as_ref() {
+            sink.plan_finished(current);
         }
         let task = self
             .session_store
@@ -5730,6 +6153,21 @@ struct PendingChatTurn {
     /// existed loadable, with no exploration rounds spent.
     #[serde(default)]
     exploration_rounds: u32,
+    /// Evidence accrued for the step that was open when the turn paused. A
+    /// pause carries it so a step closed after the resume is judged on
+    /// everything it ran (spec 66 §5.3), without attaching anything to the step
+    /// early — attaching is the true turn end's job. `#[serde(default)]` keeps
+    /// pending turns written before this field existed loadable; the worst case
+    /// is a resumed step judged on less evidence, which is today's behaviour.
+    #[serde(default)]
+    step_evidence: Vec<crate::plan::Evidence>,
+    /// Whether this turn has already sent its one plan reminder (spec 66
+    /// §5.2). Carried so an approval, plan-review, question, *Continue* or
+    /// crash resume cannot remind a second time. `#[serde(default)]` keeps
+    /// older pending turns loadable; they resume as `false`, which is today's
+    /// behaviour plus at most one reminder.
+    #[serde(default)]
+    plan_reminder_sent: bool,
     messages: Vec<ModelMessage>,
     matched_tool_call: Option<ToolCall>,
     last_content: String,
@@ -6141,8 +6579,12 @@ fn build_model_prompt(
         }
     }
 
+    // A plan reminder is the engine's nudge, not the user's words: seeding a
+    // later turn with it would present an instruction as something the user
+    // said (spec 66 `context.md` D10).
     let recent_messages = prior_messages
         .iter()
+        .filter(|message| message.kind.as_deref() != Some("plan_reminder"))
         .rev()
         .take(8)
         .collect::<Vec<_>>()
@@ -6724,6 +7166,55 @@ fn provider_fallback_response(offer: &PendingProviderFallback) -> String {
         "{} refused this request ({}): {}\n\n{} is configured and could answer this turn instead. Nothing has been switched; declining leaves the task failed.",
         offer.refused_provider, offer.refusal_code, offer.message, offer.fallback_provider
     )
+}
+
+/// The one reminder a turn gets when it would end with steps still open (spec
+/// 66 §5.2).
+///
+/// A user message rather than a system one, so it sits at the end of the
+/// request where the model reads it and `bounded_messages` treats it like any
+/// other round. It asks the model to close what it finished — it never closes
+/// anything itself, and #21 requirement 6 still decides each status from the
+/// step's own evidence.
+/// The gate the reminder passes through (spec 66 §5.2).
+///
+/// Split from [`ChatOrchestrator::plan_reminder_note`] so the decision can be
+/// tested without a turn built around it, the way the plan rules themselves
+/// are. `ceiling` is `(ceiling, spent)` after the answer round, or `None` with
+/// no ceiling configured.
+fn plan_reminder_allowed(
+    reminder_sent: bool,
+    open_steps: usize,
+    action_rounds: u32,
+    max_rounds: u32,
+    answer_now: bool,
+    ceiling: Option<(u64, u64)>,
+) -> bool {
+    if reminder_sent || answer_now || open_steps == 0 {
+        return false;
+    }
+    // Two rounds of room, not one: the reminder is charged before the next
+    // call, and a call landing at the limit has its tools withheld.
+    if action_rounds + 1 >= max_rounds {
+        return false;
+    }
+    !matches!(ceiling, Some((ceiling, spent)) if spent >= ceiling)
+}
+
+fn plan_reminder_message(plan: &TaskPlan) -> String {
+    let open = plan.open_steps();
+    let mut text = String::from("Your plan still has open steps:\n");
+    for (index, step) in open.iter().enumerate() {
+        text.push_str(&format!("  {}. {}", index + 1, step.title));
+        if step.status == crate::plan::StepStatus::InProgress {
+            text.push_str(" (in progress)");
+        }
+        text.push('\n');
+    }
+    text.push_str(
+        "Call complete_step once for each step whose work is done — Damaian decides its status from what the step ran. If a step was not done, answer again without calling it, and the turn ends with that step open.",
+    );
+    text
 }
 
 fn plan_review_response(plan: &TaskPlan, deferred_action: &str) -> String {
@@ -7546,14 +8037,8 @@ fn token_budget_exhausted_response(
 ) -> String {
     let remaining: Vec<&str> = plan
         .map(|plan| {
-            plan.steps
-                .iter()
-                .filter(|step| {
-                    matches!(
-                        step.status,
-                        crate::plan::StepStatus::Pending | crate::plan::StepStatus::InProgress
-                    )
-                })
+            plan.open_steps()
+                .into_iter()
                 .map(|step| step.title.as_str())
                 .collect()
         })
@@ -10544,6 +11029,73 @@ mod approval_prompt_wording_tests {
     }
 
     #[test]
+    fn a_plan_reminder_does_not_seed_the_next_turn() {
+        // The reminder is engine-authored, not the user's words. Seeding a
+        // later turn with it would present an instruction as something the
+        // user said (spec 66 `context.md` D10).
+        let reminder = ChatMessage {
+            id: "msg_reminder".to_string(),
+            session_id: "session_1".to_string(),
+            task_id: None,
+            role: "user".to_string(),
+            content: "Your plan still has open steps.".to_string(),
+            kind: Some("plan_reminder".to_string()),
+            created_at_ms: 1,
+        };
+        let ordinary = ChatMessage {
+            id: "msg_user".to_string(),
+            session_id: "session_1".to_string(),
+            task_id: None,
+            role: "user".to_string(),
+            content: "the user's own words".to_string(),
+            kind: None,
+            created_at_ms: 2,
+        };
+
+        let plan = crate::context_manager::ContextPlan {
+            repository_id: "repo".to_string(),
+            task_id: "task".to_string(),
+            token_estimate: 2,
+            items: vec![crate::context_manager::ContextItem {
+                category: crate::context_manager::ContextCategory::Required,
+                kind: crate::context_manager::ContextKind::UserPrompt,
+                path: None,
+                range: None,
+                content: "Question".to_string(),
+                tokens: 2,
+                redaction_status: "clean".to_string(),
+                provenance: None,
+                root_path: None,
+            }],
+            files: Vec::new(),
+            manifest: crate::context_manager::ContextManifest {
+                repository_id: "repo".to_string(),
+                task_id: "task".to_string(),
+                assembled_at_ms: 0,
+                limit: crate::context_manager::EffectiveLimit::declared(2),
+                total_tokens: 2,
+                categories: Vec::new(),
+                included: Vec::new(),
+                excluded: Vec::new(),
+            },
+        };
+        let prompt = build_model_prompt(
+            &plan,
+            &[reminder, ordinary],
+            &SecretScanner::default(),
+            None,
+        );
+        assert!(
+            !prompt.contains("Your plan still has open steps."),
+            "a tagged reminder must not seed the next turn: {prompt}"
+        );
+        assert!(
+            prompt.contains("the user's own words"),
+            "the negative control: an ordinary message still seeds it: {prompt}"
+        );
+    }
+
+    #[test]
     fn the_auto_run_description_says_the_policy_runs_it_without_asking() {
         for shell in ["/bin/zsh", "/bin/bash"] {
             for text in [
@@ -10558,6 +11110,92 @@ mod approval_prompt_wording_tests {
                 assert!(!text.contains("sandbox-safe"), "{text}");
             }
         }
+    }
+
+    #[test]
+    fn the_reminder_gate_needs_room_under_the_token_ceiling() {
+        // At or over the ceiling there is no room for the call the reminder
+        // would ask for, so the turn ends as it does today.
+        assert!(!plan_reminder_allowed(
+            false,
+            2,
+            1,
+            8,
+            false,
+            Some((100, 100))
+        ));
+        assert!(!plan_reminder_allowed(
+            false,
+            2,
+            1,
+            8,
+            false,
+            Some((100, 101))
+        ));
+        assert!(plan_reminder_allowed(
+            false,
+            2,
+            1,
+            8,
+            false,
+            Some((100, 99))
+        ));
+        assert!(plan_reminder_allowed(false, 2, 1, 8, false, None));
+    }
+
+    #[test]
+    fn the_reminder_gate_needs_two_rounds_of_room() {
+        // A reminder that lands the next call at the limit would have its tools
+        // withheld, so the model could not call `complete_step` even though it
+        // was just asked to.
+        assert!(!plan_reminder_allowed(false, 1, 7, 8, false, None));
+        assert!(plan_reminder_allowed(false, 1, 6, 8, false, None));
+        // Already sent, *Answer now*, and nothing open all refuse.
+        assert!(!plan_reminder_allowed(true, 1, 1, 8, false, None));
+        assert!(!plan_reminder_allowed(false, 1, 1, 8, true, None));
+        assert!(!plan_reminder_allowed(false, 0, 1, 8, false, None));
+    }
+
+    #[test]
+    fn the_reminder_text_names_every_open_step_and_the_in_progress_one() {
+        let mut plan = TaskPlan::new("task_1", 0);
+        plan.steps.push(crate::plan::PlanStep {
+            id: "step_1".to_string(),
+            title: "Collect statuses".to_string(),
+            detail: None,
+            status: crate::plan::StepStatus::InProgress,
+            depends_on: Vec::new(),
+            started_at_ms: Some(1),
+            completed_at_ms: None,
+            evidence: Vec::new(),
+        });
+        plan.steps.push(crate::plan::PlanStep {
+            id: "step_2".to_string(),
+            title: "Already done".to_string(),
+            detail: None,
+            status: crate::plan::StepStatus::Completed,
+            depends_on: Vec::new(),
+            started_at_ms: Some(1),
+            completed_at_ms: Some(2),
+            evidence: Vec::new(),
+        });
+        plan.steps.push(crate::plan::PlanStep {
+            id: "step_3".to_string(),
+            title: "Write the report".to_string(),
+            detail: None,
+            status: crate::plan::StepStatus::Pending,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+        });
+
+        let text = plan_reminder_message(&plan);
+
+        assert!(text.contains("1. Collect statuses (in progress)"), "{text}");
+        assert!(text.contains("2. Write the report"), "{text}");
+        assert!(!text.contains("Already done"), "{text}");
+        assert!(text.contains("complete_step"), "{text}");
     }
 }
 
