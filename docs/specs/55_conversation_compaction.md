@@ -7,7 +7,7 @@ Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work Package 6
 local-only and not committed, so the reference is a name rather than a link;
 this spec is self-contained.
 Depends on: [#26](26_context_assembly/proposal.md) (the budget the recency window is
-sized from) — **not built**. Everything else named below is a cross-reference,
+sized from) — built (Done 2026-10-25). Everything else named below is a cross-reference,
 not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
 interface), section 19 (open gaps).

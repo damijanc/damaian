@@ -111,6 +111,8 @@ Common keys:
 | `audit_retention_days` | `90` | How long audit records are kept | Yes |
 | `repository_map_max_tokens` | `800` | Size of the [repository map](#the-map-the-assistant-sees) | Lower only |
 | `symbol_context_max_tokens` | `1600` | Size of the symbol hints added when a prompt names one ([Symbol Search and Language Servers](#symbol-search-and-language-servers)) | Lower only |
+| `context_budget.<category>` | Per category | Share of the context budget one category may use ([Output and Context Limits](#output-and-context-limits)) | Lower only |
+| `context_budget.safety_margin` | `0.1000` | Share of a measured provider window held back for estimate error | Raise only |
 | `language_server.<language>` | none | Command for an optional language server ([Language servers](#language-servers)) | No |
 
 Repository-scoped settings are not edited from Settings. Put repository defaults in `.damaian/config.conf` inside the selected repository. Repository settings are included in the [effective policy view](#reading-the-effective-policy-view).
@@ -123,6 +125,7 @@ Because that file arrives with a clone, a repository can only make Damaian *more
 - `command_allowlist` is never taken from repository config; *Allow Always* writes to your own config instead. See [Allow Always](#allow-always).
 - Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, and the root overrides `project_roots_added` and `project_roots_removed` ([Repository Roots](#repository-roots)) — apply as written.
 - The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, and `agent_max_exploration_rounds`. The first three bound how much one request may carry; `agent_max_exploration_rounds` bounds how many read-only rounds a turn may take. Raising one would widen what leaves your machine or how long a turn may run. A repository that tries is told to you like any other rejected key.
+- Each `context_budget.<category>` share can be lowered by a repository but never raised, and `context_budget.safety_margin` can be raised but never lowered. A share decides how much of the repository's own content is packed, so a clone may tighten it and may not widen it ([Output and Context Limits](#output-and-context-limits)).
 
 ### Semantic search
 
@@ -269,6 +272,52 @@ model_provider.deepseek.max_output_tokens=384000
 ```
 
 Setting a value higher than the model actually allows causes the provider to reject the request outright, so prefer the built-in defaults unless you know the model's real limit.
+
+### What goes into context
+
+Every request is assembled the same way. The collected items are sent in one `Repository context:` block, followed by the last eight messages of the conversation under `Recent conversation:` (each cut to 2,000 characters), followed by your message under `User request:`. Your message appears once. Within the repository block each item is one section headed `--- <source>: <path> ---`; the source labels are listed in [Reading a turn's context manifest](TROUBLESHOOTING.md#reading-a-turns-context-manifest). Items are added in a fixed order: the files you named or added, the `AGENTS.md` files that apply to the collected paths, the root project rules, the repository map, symbol hints, hook context, a carried plan, then keyword and semantic search hits. A line range would append `:start-end` to the path; no source produces one yet, so every item is a whole file or a rendered block. A one-shot edit request sends the same items under its own `User edit request:` heading, which comes first because that request makes a single call.
+
+Your message is secret-scanned before it is sent, and so is every earlier message replayed under `Recent conversation:`. Sessions store messages as you typed them, so this is what keeps a credential from an older turn out of a later request: a detected value is replaced by Damaian's redaction marker rather than sent in cleartext.
+
+**Each category has a share of the budget.** `context_token_budget` is divided by category. The order below is the order the budget is shared, and the order content is dropped when it runs short:
+
+| Category | Default share | What it holds |
+|---|---|---|
+| `required` | none | Your message. Never dropped and never truncated; it is subtracted before any category is allocated. |
+| `instructions` | 10% | The `AGENTS.md` files for the collected paths, root first and each nested file after it, then the root project rules (`README.md`, `CONTRIBUTING.md`, `.editorconfig`, `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `pom.xml`, `build.gradle`). When this category runs short the most specific `AGENTS.md` survives; the root project rules are dropped first, then broader instruction files. |
+| `hook_context` | 5% | Text a [hook](#hooks) returned for this turn. |
+| `pinned` | 15% | Reserved for context you select item by item; no shipped feature produces it yet, so its share is released. |
+| `plan_state` | 5% | The plan a continued or resumed turn carries forward, as numbered steps with their status and detail. |
+| `repository_map` | 5% | The [repository map](#the-map-the-assistant-sees) block, still capped by `repository_map_max_tokens`. |
+| `symbols` | 10% | The symbol hints block, still capped by `symbol_context_max_tokens`. |
+| `search_results` | 15% | Files found by search: exact keyword hits first, then semantic-similarity hits. Semantic hits are dropped first when this category runs short. |
+| `file_ranges` | 25% | Files you named in the prompt and files you added with **+** ([Chat](#chat)); explicit paths are ordered ahead of mentioned ones. |
+| `findings` | 5% | Reserved for the [findings](#fix-n-errors-and-the-findings-list) repair flow. The assistant still receives only the findings you select for a repair request, so nothing fills this automatically today and its share is released. |
+| `conversation_summary` | 5% | Reserved for a future conversation summary. Nothing fills it yet, so its share is released. |
+
+A category that uses less than its share releases the remainder to the categories after it. In a repository with no hook context, no carried plan, no pinned context, no findings and no conversation summary, the five unused shares add up to 35% of the budget released to the categories that do have content. A category that wants more than its share is shortened within itself — its lowest-priority items are dropped, or the map or symbols block is re-rendered smaller — and it never takes from another category.
+
+Each share is its own key in your user config ([Settings](#settings)), written as a decimal fraction with at most four places:
+
+```text
+context_budget.instructions=0.1000
+context_budget.hook_context=0.0500
+context_budget.pinned=0.1500
+context_budget.plan_state=0.0500
+context_budget.repository_map=0.0500
+context_budget.symbols=0.1000
+context_budget.search_results=0.1500
+context_budget.file_ranges=0.2500
+context_budget.findings=0.0500
+context_budget.conversation_summary=0.0500
+context_budget.safety_margin=0.1000
+```
+
+The defaults sum to exactly `1.00`; a set that sums above `1.00` is a configuration error naming the key family rather than a silent scale-down. `damaian config-show` prints the resolved values. `context_budget.safety_margin` is reserved from a *measured* provider window and never from the declared budget; Damaian does not measure a window today, so the limit is `context_token_budget` used unchanged. See [Troubleshooting](TROUBLESHOOTING.md#reading-a-turns-context-manifest) for what a turn's manifest records.
+
+A repository's `.damaian/config.conf` may lower a share and raise the margin, and never the other way: a share steers traffic toward or away from the repository's own content, and a clone may tighten a bound but not widen one. A raise there is refused and reported like any other rejected key. A permission profile has the same one-way limit.
+
+**When your message alone does not fit.** The request is never truncated and never sent without your message. If your message is larger than the whole context budget, the turn fails with `Required context needs N tokens but the context budget is M` and no request is sent. Raise **Context budget** in the **Provider details** panel above, or send a shorter message.
 
 ## Working Folder
 

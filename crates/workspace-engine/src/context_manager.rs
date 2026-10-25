@@ -297,20 +297,25 @@ impl ContextKind {
 
 /// The bytes-per-token ratio an item is measured with (proposal §5.8).
 ///
-/// **Provisional ratios.** They come from published rules of thumb, not from a
-/// measurement against a provider, and Task 7 replaces them with the ratios
-/// `calibration_measures_bytes_per_token` reports:
+/// **Measured** (Task 7, 2026-10-25) with
+/// `calibration_measures_bytes_per_token` against `deepseek` /
+/// `deepseek-v4-flash`, one call per document:
 ///
-/// | type | bytes / token | derivation |
-/// |---|---|---|
-/// | prose and Markdown | 4 | today's fixed ratio. Spec 19 §7 measured it 2.5–6.3% high on DeepSeek, so prose keeps a figure already known not to under-count |
-/// | source code | 3.5 | short identifiers and punctuation-heavy lines are the commonly cited ~3–3.5 bytes/token case; the denser ratio over-counts rather than under-counts |
-/// | structured data | 3 | quoted keys, braces, commas and short scalar values put a token boundary at nearly every mark |
+/// | type | bytes / token | measured | note |
+/// |---|---|---|---|
+/// | prose and Markdown | 4 | 4.50 | keeps `len / 4`: the measurement says that ratio over-estimates prose by about 13%, consistent with spec 19 §7's 2.5–6.3% high. Classification therefore never estimates prose below `len / 4`, and the headroom stands in for the margin the declared path does not subtract |
+/// | source code | 3.6 (18/5) | 3.61 | short identifiers and punctuation-heavy lines tokenize denser than prose |
+/// | structured data | 2.4 (12/5) | 2.45 | quoted keys, braces, commas and short scalar values put a token boundary at nearly every mark |
 ///
-/// Every ratio is at or below four bytes per token, so no classified content is
-/// estimated lower than `len / 4` did. Integer arithmetic decides the estimate:
-/// no float participates in inclusion, so `prompt_cache`'s determinism guard
-/// still holds.
+/// The measured figures include about 15 tokens of instruction and chat-template
+/// overhead in the provider's input count, so a document-only ratio would be a
+/// little higher and these constants over-count tokens slightly — the safe
+/// direction. One sample per type from one provider is the evidence this ratio
+/// has; it replaces the published rules of thumb Task 6 landed, and the prose
+/// ratio is the one figure deliberately left alone.
+///
+/// Integer arithmetic decides the estimate: no float participates in inclusion,
+/// so `prompt_cache`'s determinism guard still holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenEstimate {
     Prose,
@@ -350,8 +355,8 @@ impl TokenEstimate {
     pub const fn bytes_per_token(self) -> (u32, u32) {
         match self {
             Self::Prose => (4, 1),
-            Self::Code => (7, 2),
-            Self::Structured => (3, 1),
+            Self::Code => (18, 5),
+            Self::Structured => (12, 5),
         }
     }
 

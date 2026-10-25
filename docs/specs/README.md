@@ -5,7 +5,7 @@ Source: gap analysis against `ai_coding_assistant_specification.md` and `ai_codi
 
 These specs describe features that close gaps between the product specification and the current state of the codebase. Each spec is self-contained: motivation, current state (with file references), requirements, non-goals, design, and acceptance criteria.
 
-They were meant to be implemented one at a time, in the order listed. That still holds by default, but **[What to build next](#what-to-build-next-and-what-may-run-in-parallel) is the section to read before picking one** — it records which specs are actually unblocked, which two keystones the rest of the directory waits on, and the one file-level constraint that decides whether two specs can be built at the same time.
+They were meant to be implemented one at a time, in the order listed. That still holds by default, but **[What to build next](#what-to-build-next-and-what-may-run-in-parallel) is the section to read before picking one** — it records which specs are actually unblocked and the one file-level constraint that decides whether two specs can be built at the same time.
 
 Specs 1–6 came from the original gap analysis. Later entries are added as
 design changes come up; #7 came from a reported bug rather than the analysis,
@@ -79,33 +79,39 @@ directory was renamed from `ROADMAP` to `PLAN` because it was never a roadmap:
 
 ## What to build next, and what may run in parallel
 
-### Current state (2026-10-24)
+### Current state (2026-10-25)
 
 A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
 reports the disagreement.
 
-#25, #32, #50, #59 and #62 are all Done and merged into `main`.
+#25, #32, #50, #59 and #62 are all Done and merged into `main`. #26 context
+assembly is Done (2026-10-25), so the keystone is no longer in flight.
 
-- **In progress:** #26 context assembly (planned 2026-10-24; its last
-  dependency, #25, is built) and #49 prompt cache (accounting slice done; the
-  reuse slice is blocked on #55 or #26). #26 and #49's reuse slice never run
-  together.
+- **In progress:** #49 prompt cache — the accounting slice is done and the
+  reuse slice (requirement 4) is the only unbuilt requirement. #26's ordering
+  now exists, but the spec's own `Depends on:` line still names Phase 1 WP3
+  (provider capability validation) as unspecified, and the eight-message
+  sliding window it is most sensitive to is #55's to replace, so it is not in
+  the ready set.
 - **Ready, not started:** #23 verification loop;
-  #65 exploration memory (planned 2026-10-24 as a folder spec; its requirement
-  8's budget interaction is settled by #59, and its carry-into-the-next-turn
-  task waits for #26); #66 plan left open at turn end (edits `chat.rs`, so it
-  does not pair with #26 or #65).
-- **Blocked:** #27, #33, #51, #54 and #55 on #26; #28 on #26 and #27; #29 on
-  #28; #30 on #28 and #29; #35 on #23; #36 on #35; #37 on #33, #35 and #36;
-  #52 on #33; #39 on #38; #40 on #38 and #39.
+  #27 context inspector; #33 MCP management; #51 external reference retrieval;
+  #55 conversation compaction; #65 exploration memory (planned 2026-10-24 as a
+  folder spec; its requirement 8's budget interaction is settled by #59, and its
+  carry-into-the-next-turn task no longer waits for #26); #66 plan left open at
+  turn end (#65 and #66 both edit `chat.rs`, so they do not pair with each
+  other).
+- **Blocked:** #28 on #27; #29 on #28; #30 on #28 and #29; #35 on #23; #36 on
+  #35; #37 on #33, #35 and #36; #52 on #33; #39 on #38; #40 on #38 and #39; #54
+  on Phase 1 WP3 (provider capability validation), which is unspecified.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
 - **Pairing:** two specs may run together only if at most one of them edits
-  `chat.rs`, and #26, #55 and #49's reuse slice never run together — see
-  [Parallel work](#parallel-work).
+  `chat.rs`, and #55, #49's reuse slice, #65 and #66 never run with each other —
+  all four edit `build_model_prompt` or the turn loop. #26 is Done and no
+  longer constrains anything. See [Parallel work](#parallel-work).
 - **Open decision:** the priority table below predates #59–#65 and does not
-  rank them; the text after it calls #65 the priority now that #59 is done.
-  Where #65 ranks against #26 is the owner's call.
+  rank them; the text after it calls #65 the priority now that #59 and #26 are
+  done.
 
 ### History
 
@@ -330,25 +336,47 @@ cannot run beside #55 or #49's reuse slice, and #65 and #66 must be added to
 that list — all four edit the same function, and #65/#66 also edit the turn
 loop.
 
-**#26 is the keystone now that #24 and #25 have landed.** The whole tail waits
-on #26, and nothing else in front of it is unbuilt. Preferring a spec that
-unblocks nothing over it costs more than it looks like it does.
+Re-derived on 2026-10-25, when [#26](26_context_assembly/proposal.md) was
+finished. Six `Depends on:` lines named #26 not built: #27, #28, #33, #51, #54
+and #55. #26 leaves the in-progress set. **Four are promoted:** #27 (its only
+dependency), #33 (#20, #31 and #26 all built), #51 (#20 and #26) and #55 (only
+#26). **Two are not:** #28 still waits on #27, and #54 still waits on Phase 1
+WP3 (provider capability validation), which is unspecified. #49's reuse slice
+is no longer blocked on #26's ordering, but its own `Depends on:` line still
+names Phase 1 WP3, and the eight-message window it is most sensitive to is
+#55's to replace, so it is not promoted; #49 stays in progress with its
+accounting slice done. #26's completion also retires the pairing rule that named
+it: `build_model_prompt` is no longer work in progress, so the constraint now
+binds #55, #49's reuse slice, #65 and #66. Two open points #26 recorded are not
+blockers and are inherited by #27 and by whoever builds the first range
+producer: no collection source yields a `LineRange` yet, so range deduplication
+is implemented and unit-tested but inert in production, and no Observed
+capability profile exists, so every limit is `Declared`. The ready set is #23,
+#27, #33, #51, #55, #65 and #66.
+
+**#26 is Done (2026-10-25), so the tail it was blocking is open.** Nothing else
+in front of it is unbuilt. The specs it unblocked are #27, #33, #51 and #55;
+#65 remains the stated priority, and #23 is still the last thing in front of
+#35.
 
 | | Build | Why here |
 |---|---|---|
-| 1 | **#26 context assembly** | The keystone now that #24 and #25 are done: #26 waits on nothing, and it is the real unlock for #27, #33, #49's reuse slice, #51, #54 and #55 |
-| 2 | #23 verification | Ready now that #22 is done; the last thing in front of #35. Its loop lives in `chat.rs`, so check the parallel rule below before pairing it |
-| 3 | #55 compaction | Also unblocks #49's reuse slice, which is why that slice waits |
-| 4 | #27, #54, #51 | The fan-out once #26 has landed |
-| 5 | #28 → #29 → #30 | Memory, strictly serial |
+| 1 | **#65 exploration memory** | The stated next priority: it keeps what a turn's reads found in view after the request window drops them, and carries it into the next turn. It edits `chat.rs`, so check the parallel rule below |
+| 2 | #23 verification | Ready now that #22 is done; the last thing in front of #35. Its loop lives in `chat.rs` too |
+| 3 | #55 compaction | Now unblocked by #26; also what makes #49's reuse slice worth measuring |
+| 4 | #27, #33, #51 | The fan-out #26 unblocked. #27 also unblocks #28 |
+| 5 | #28 → #29 → #30 | Memory, strictly serial behind #27 |
 | 6 | #35 → #36/#37; #33 → #52 | Delivery and extensibility clusters |
 | 7 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not". #38 is deferred; #57 is done, so its stage 1 is due for re-evaluation |
+
+#54 stays off this table until Phase 1 WP3's provider capability validation is
+specified; #26 is no longer what it waits on.
 
 [#56](56_provider_fallback_consent/proposal.md), the opportunistic one, is done
 (2026-10-12): it closed the half of #48 that had shipped as only a negative
 guarantee.
 [#50](50_model_initiated_clarification/proposal.md) is done (2026-10-24) and
-unblocks nothing, which is why it sits off the table rather than above #26.
+unblocks nothing, which is why it sits off the table rather than above #65.
 [#32](32_hooks/proposal.md), also done (2026-10-24), sits off the table for the
 same reason: no `Depends on:` line names it.
 [#57](57_worker_sessions/proposal.md), added on 2026-10-03, sits off the table
@@ -360,8 +388,9 @@ promoted. #35 and #37 name it only as a cross-reference: they add *Commit…*
 and *Create PR* to its contextual-action slot when they are built.
 [#49](49_prompt_cache_accounting_and_reuse/proposal.md)'s accounting slice is
 done, off this table for the same reason #56 is: nothing left in it is
-unbuilt. Its reuse slice re-enters this table once #55 or #26
-unblocks it.
+unbuilt. Its reuse slice re-enters this table once #55 replaces the sliding
+window and the spec's Phase 1 WP3 line is resolved; #26's ordering, one of the
+two things it previously waited on, now exists.
 [#59](59_exploration_round_allowance/proposal.md), added on 2026-10-17, sits
 off the table like #50 and #57: every dependency (#21, #34, #47) is built and
 nothing depends on it, so it joined the ready set beside #23; it is done
@@ -399,12 +428,11 @@ turn the rounds, #61 keeps a stopped turn alive, and #65 keeps what those rounds
 found in view once the request window drops them, and carries it into the next
 turn. Nothing formally depends on it, but new feature work should not jump
 ahead of it. It edits `bounded_messages`, the turn seed and the turn loop in
-`chat.rs`, so it does not pair with another spec that edits that file. #62 has
-finished, but #26 is being implemented now and rewrites `build_model_prompt`
-and the assembly around it, so **#65's carry-into-the-next-turn task waits for
-#26 to land**; its earlier tasks do not touch the seed. Its per-turn call list
-extends the identity #59's Task 3 added (`read_call_key`), which covers read
-tools only and is not yet persisted.
+`chat.rs`, so it does not pair with #55, #66 or #49's reuse slice. #62 has
+finished, and #26's completion removed the last collision — its
+carry-into-the-next-turn task is unblocked — so nothing else holds it back. Its
+per-turn call list extends the identity #59's Task 3 added (`read_call_key`),
+which covers read tools only and is not yet persisted.
 
 Re-checked on 2026-10-24, when [#66](66_plan_left_open_at_turn_end/proposal.md)
 was planned. The ready set is unchanged: #66 stays **Not started** until its
@@ -412,9 +440,9 @@ Task 1 begins. Three facts about pairing it, from its
 [`context.md`](66_plan_left_open_at_turn_end/context.md) §3 and §5:
 
 - **It edits `chat.rs` in Tasks 1–8**, so it may pair only with a spec that
-  never edits that file. Neither #26 (in progress) nor #65 (planned in parallel)
-  qualifies, so #66 is a solo `chat.rs` track. Whichever of #26 and #66 reaches
-  `chat.rs` second waits or rebases; #65 and #66 are strictly serial.
+  never edits that file. Neither #65 (planned in parallel), #55 nor #49's reuse
+  slice qualifies, so #66 is a solo `chat.rs` track; #65 and #66 are strictly
+  serial. #26 is Done and no longer competes for the file.
 - **It adds two fields to `PendingChatTurn`** (`step_evidence`,
   `plan_reminder_sent`) at the same seven literals #61's round-budget pause and
   #65's planned `turn_notes`/call list use. That is a rebase, not a blocker, but
@@ -438,11 +466,12 @@ the dependency graph, it is that file.
   it changed no request and touched only `model.rs`, `config.rs`, `session.rs`,
   `app.js` and the harness, so it could pair with #20, which lives in `chat.rs`
   and the UI.
-- **Never together:** #26, #55 and #49's reuse slice. All three rewrite
-  `build_model_prompt` and the assembly around it; that shared function is why
-  #49's second slice is blocked in the first place. #54 and #55 also both
-  restructure the message array.
-- **Genuinely independent once #26 lands:** #27, #51 and #23.
+- **Never together:** #55, #49's reuse slice, #65 and #66 — any pair. All four
+  rewrite `build_model_prompt` or the turn loop around it; that shared function
+  is why #49's second slice was blocked in the first place. #54 and #55 also
+  both restructure the message array. #26 is Done and no longer constrains
+  anything.
+- **Genuinely independent of that cluster:** #27, #51, #33 and #23.
 
 Running two tracks: give each worktree its own `CARGO_TARGET_DIR` (a shared one
 thrashes), agree up front which track owns `chat.rs` so the other rebases, and
@@ -491,8 +520,8 @@ is ready.
 | 23 | [23_verification_loop/](23_verification_loop/proposal.md) | **Not started; split into a folder and planned 2026-10-09.** See `tasks.md` for the ten-task breakdown. [`context.md`](23_verification_loop/context.md) found that a patch is applied after the turn that proposed it has ended, so the loop is a continuation the apply path triggers rather than a step inside a turn. It also found that detection gives a Cargo root `cargo test` and nothing else, so checks are selected by the root that owns each changed file, not by a file-category table. Roadmap Phase 2 WP3. Sequences apply → discover checks → run → find → repair → rerun → report, driven by the orchestrator rather than the model, so a completion report distinguishes verified from assumed. Consumes #21, #22 and #24. |
 | 24 | [24_repository_map_and_monorepo_boundaries/](24_repository_map_and_monorepo_boundaries/proposal.md) | **Done 2026-10-09.** Roadmap Phase 3 WP2, built in nine tasks. A deterministic map of project roots, persisted per repository and rebuilt on an input fingerprint, rendered into model context under `repository_map_max_tokens` (default 800, lower-only from a repository). A command discovered in, or requested for, `packages/api` runs there. Allow Always in a sub-root writes a root-qualified grant, and a plain allowlist entry applies at the repository root only. Containment is always checked against the repository root. Roots are corrected through `project_roots_added`/`project_roots_removed` in repository config, from Settings or `damaian repo-root`. Reuses `detect_project_commands`' manifest list per root rather than inventing a second one. `context.md` records where the code contradicted the design. Not built: frameworks and per-root permission restrictions (`proposal.md` §7.1). |
 | 25 | [25_symbol_and_relationship_index/](25_symbol_and_relationship_index/proposal.md) | **Done 2026-10-23 (started 2026-10-13).** Split into a folder and planned 2026-10-09, re-checked against `main` 2026-10-12, built in eleven tasks. [`context.md`](25_symbol_and_relationship_index/context.md) records where the code contradicted the design: spec 46's registry is built, LSP framing is not MCP's, sessions have no close event, and restricted files are indexed. The three pieces that need `chat.rs` remain deferred (§12): an agent-facing symbol tool, task attribution for diagnostics, and symbols in `search_codebase` output. Roadmap Phase 3 WP3. A rescope, not greenfield: `FileRecord.symbols`/`imports` already existed as prefix heuristics. Adds locations, kinds, relationships, a `symbols` context item, on-demand references, and a `Provenance` label separating language-server fact from heuristic guess. Satisfies Phase 2's deferred LSP dependency. A Task 11 follow-up wired the eager definition pass to the first symbol search, so language-server definitions and diagnostics are reachable in the app; the Tauri app's exit path still relies on EOF and the next launch's sweep, as Task 5 recorded. |
-| 26 | [26_context_assembly/proposal.md](26_context_assembly/proposal.md) | **In progress** (planned 2026-10-24; no task started). Roadmap Phase 3 WP4. Its last dependency, #25, is built (2026-10-23), so it is now the keystone. Replaces the single first-come-first-served budget with per-category allocation, range deduplication, and a manifest recording what was excluded and why. Adds line ranges to `ContextItem`, without which two of its requirements are unexpressible. Its [`context.md`](26_context_assembly/context.md) maps the current pipeline and what #49, #55, #65 and the eval harness already rely on; [`tasks.md`](26_context_assembly/tasks.md) holds the corrections and the seven-task breakdown. |
-| 27 | [27_context_inspector.md](27_context_inspector.md) | **Not started.** Roadmap Phase 3 WP5. Renders #26's manifest pre- and post-send, and adds pins and path restrictions. Makes "the user can see what context the agent uses" true; Phase 3b's memory arrives as one more category in this view. |
+| 26 | [26_context_assembly/proposal.md](26_context_assembly/proposal.md) | **Done 2026-10-25** (planned 2026-10-24; Tasks 1–6 on 2026-10-25, Task 7 closing the same day). Roadmap Phase 3 WP4. Replaced the single first-come-first-served budget with per-category allocation whose shares a repository may lower but never raise, range deduplication with ranged reads outside the tool line cap, exclusion records naming why content was dropped or shortened, and a content-free manifest recorded once per assembly as `context_assembled`. Also fixed a security hole planning found: the user's prompt and replayed earlier turns now pass through the secret scanner, where both used to reach the provider in cleartext. The estimator is content-aware and calibrated against a live provider measurement (prose 4 B/token, code 3.6, structured 2.4). Its [`context.md`](26_context_assembly/context.md) records the pre-implementation pipeline; [`tasks.md`](26_context_assembly/tasks.md) holds the corrections and the seven tasks. Two open points in its §7 are inherited rather than fixed: no collection source yields a `LineRange` yet, so range merging is implemented and unit-tested but inert, and no Observed capability profile exists, so every limit is `Declared`. |
+| 27 | [27_context_inspector.md](27_context_inspector.md) | **Not started; ready** — its only dependency, #26, is Done 2026-10-25. Roadmap Phase 3 WP5. Renders #26's manifest pre- and post-send, and adds pins and path restrictions. Makes "the user can see what context the agent uses" true; Phase 3b's memory arrives as one more category in this view. |
 | 28 | [28_memory_model_and_storage.md](28_memory_model_and_storage.md) | **Not started.** Roadmap Phase 3b WP1. The memory record and store, with a `project_key` resolved from the repository's root commit — because `repository_id` is a path hash and cannot give the sharing property the roadmap asks for. Memory refuses secrets rather than redacting them. |
 | 29 | [29_memory_creation_and_consent.md](29_memory_creation_and_consent.md) | **Not started.** Roadmap Phase 3b WP2. The consent gate: `MemoryProposal` and `MemoryEntry` are separate types with one conversion requiring a user confirmation, so unconfirmed persistence is unrepresentable. Instruction-shaped candidates from untrusted origins get no proposal at all. |
 | 30 | [30_memory_retrieval_and_lifecycle.md](30_memory_retrieval_and_lifecycle.md) | **Not started.** Roadmap Phase 3b WP4. Memory reaches the model only as a `ContextItem` in the lowest-priority category, is visible and removable in #27, and is marked stale by hash comparison against its evidence. Proven by prompt-injection evals, not design argument. |
@@ -514,7 +543,7 @@ is ready.
 | 46 | [46_process_registry_and_orphan_sweep/proposal.md](46_process_registry_and_orphan_sweep/proposal.md) | **Done.** Split out of #17. An **owner-scoped** registry — one JSON file per live child under `<data_dir>/processes/` — covering MCP stdio servers, `curl` model calls, PTY sessions and shell commands, swept at launch, at CLI startup and on Ctrl-C. A recorded PID is killed only when it is still alive *and* its start time matches, so every state that is not provably a live process of ours collapses to "do not kill". |
 | 47 | [47_agent_working_capability/](47_agent_working_capability/proposal.md) | **Done.** Split into a folder and designed on 2026-09-17; all eight requirements built and closed out on 2026-09-18: ranged reads, `list_directory`, `search_content`, anchor-based region edits, stoppable/timed/streaming commands, a bounded continuation past the eight-round limit and within-round concurrent dispatch of read-only calls. It adds no autonomy. **The live-tier A/B did not support the spec's premise** (§7.2): **+106% tokens** bought **approval stops falling 17 → 4**, not fewer rounds. |
 | 48 | [48_provider_limits_and_backpressure/proposal.md](48_provider_limits_and_backpressure/proposal.md) | **Done.** Roadmap Phase 1 WP7. A provider rate limit ends the turn, and the code written to prevent that cannot see it: a 429 arrives as a parsed error body and returns immediately with no retry, while `is_retryable_message`'s `"rate limit"` and `"429"` arms are reachable only from the transport-failure path — where they never fire, because `curl -sS` exits zero on a 4xx. Captures status and headers via `dump-header` rather than a stdout sentinel a model could emit, classifies refusals from status first and never from prose, honours `Retry-After` under both an attempt count and a wall-clock ceiling, and makes the outcome a `failureKind` on the existing failed state rather than a fourteenth state — three fewer kill-matrix cells for the same information. A refused call records measured zero, so it cannot inflate #19's totals through the estimate written before the call. |
-| 49 | [49_prompt_cache_accounting_and_reuse/](49_prompt_cache_accounting_and_reuse/proposal.md) | **In progress.** Split into a folder and planned on 2026-09-18. Roadmap Phase 1 WP8. The **accounting slice** (requirements 1, 2, 3, 6, 8, plus requirement 5's guard) is **Done as of 2026-09-23**: `cached_input_tokens` and a cached rate, so cost is no longer overstated for providers that cache automatically. The **reuse slice** (requirement 4) remains blocked, because the conversation section is a **sliding window of the last eight messages** that changes the prefix every turn; it waits on #55 or #26. |
+| 49 | [49_prompt_cache_accounting_and_reuse/](49_prompt_cache_accounting_and_reuse/proposal.md) | **In progress.** Split into a folder and planned on 2026-09-18. Roadmap Phase 1 WP8. The **accounting slice** (requirements 1, 2, 3, 6, 8, plus requirement 5's guard) is **Done as of 2026-09-23**: `cached_input_tokens` and a cached rate, so cost is no longer overstated for providers that cache automatically. The **reuse slice** (requirement 4) is the only unbuilt requirement. #26's stable-to-volatile ordering now exists, but the conversation section is still a **sliding window of the last eight messages** that changes the prefix every turn, so the slice waits on #55's replacement; the spec's own `Depends on:` line also names Phase 1 WP3 as unspecified. |
 | 50 | [50_model_initiated_clarification/](50_model_initiated_clarification/proposal.md) | **Done 2026-10-24** (planned 2026-10-07; Tasks 1–8, the last on 2026-10-24; the live usage measurement was not run, see its §7). Roadmap Phase 2 WP8. An `ask_user` tool whose load-bearing rule is that an answer can never satisfy an approval, enforced by types rather than discipline. It reuses the existing waiting state and reattach machinery, is bounded to two questions per turn, and is absent from the tool list where no user can answer. |
 | 51 | [51_external_reference_retrieval.md](51_external_reference_retrieval.md) | **Not started.** Roadmap Phase 3 WP8. Damaian cannot read a page, so every task against a third-party API runs on what the model remembers about an unnamed version of it. `fetch_url` and an optional `search_web`, with fetched content entering as a lowest-priority provenance-labelled `ContextItem` proven non-authoritative by injection evals rather than by argument — #30's treatment of memory, reused. Its §5.3 is the reason it is Should-tier: a URL is the first place the model chooses what leaves the machine, so host approval lives in user scope on the forbidden-for-repository list, a URL carrying repository content or a secret is refused *before* the approval dialog rather than by it, and cross-host redirects are not followed. |
 | 52 | [52_mcp_server_mode.md](52_mcp_server_mode.md) | **Not started.** Roadmap Phase 4 WP6. #06 and #33 are client-side only, so Damaian's indexed search, redaction and path policy are reachable only from its own window — the alternative being to give another tool raw filesystem access. Exposes a read-only subset over stdio, with the set computed as the intersection of read-only and profile-permitted rather than listed, so a tool added later is excluded until classified. The repository is fixed at launch and unreachable from the wire; a server has no user, therefore no approval, therefore nothing that writes. |

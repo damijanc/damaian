@@ -1,15 +1,31 @@
 # Feature Spec: Context Assembly
 
-Status: In progress. Split into a folder and planned on 2026-10-24, checked
-against `main` that day. The design holds; its file and line references did not,
+Status: Done 2026-10-25. Split into a folder and planned on 2026-10-24, checked
+against `main` that day, and built in seven tasks on 2026-10-24–25.
+**Acceptance:** the deterministic tier passes all 23 scenarios with completion
+1.000, check pass 0.7241 (21/29 scenario check commands), 0 approval-policy
+violations, 0 restricted-path/secret violations, 0 unrelated files changed and
+recovery 1.000. Compared by hand against `evals/baseline.json` (§7), the moved
+aggregates are explained by the tier growing from 16 to 23 scenarios rather than
+by a behaviour change; against the pre-implementation tree the same tier leaves
+every count and rate identical and the whole-request estimate falls from 399391
+to 397245 tokens, lower in every scenario. Scoped tests and clippy
+passed locally; the full seven-check gate is left to CI (§7 records that, and
+does not claim CI passed). The estimate is calibrated against
+provider-reported measured usage from one live run against
+`deepseek`/`deepseek-v4-flash` (§7); the offline half over recorded traffic was
+not run. Known open points — no collection source yields line ranges, so range
+deduplication is implemented but inert in production, and no Observed
+capability profile exists, so every limit is Declared — are recorded in §7 and
+do not block acceptance. The design holds; its file and line references did not,
 and three of its statements about the current code were wrong (there is already
 path-level deduplication, `LineRange` already exists, and the user prompt is sent
 twice). Planning also found a security hole the spec now closes: the user's
 prompt is not redacted on any path to the provider, while the duplicate copy of
-it is. [`context.md`](context.md) records the current code, that finding, and
-what other specs already rely on here; [`tasks.md`](tasks.md) carries the
-corrections table, the task breakdown, and the questions this planning round
-could not answer from the code alone.
+it is. [`context.md`](context.md) records the pre-implementation code, that
+finding, and what other specs already rely on here; [`tasks.md`](tasks.md)
+carries the corrections table, the task breakdown, and the questions this
+planning round could not answer from the code alone.
 Order: 26 of 27
 Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 4 (Must). That directory is local-only and not committed, so the
@@ -608,17 +624,23 @@ the sanity bound the new estimator has to beat; per-content-type ratios need a
 live measurement, because only the request's total is reported. §7 records how
 that measurement runs and what it is allowed to read.
 
-**The provisional ratios, and why Task 7 replaces them.** Task 6 lands the
-estimator with three ratios and no provider measurement behind them. They are
-labelled provisional in the code (`TokenEstimate`) as well as here; the live
-calibration in §7 replaces them with measured values. Until then they come from
-the figures below:
+**The measured ratios (Task 7, 2026-10-25).** Task 6 landed the estimator with
+three ratios from published rules of thumb, labelled provisional in the code and
+here. The live calibration in §7 replaced two of them with measured values. The
+ratios are:
 
-| content type | selected by | bytes / token | derivation |
-|---|---|---|---|
-| prose and Markdown | `.md`, `.markdown`, `.mdx`, `.txt`, `.rst`, `.adoc`; prose-like kinds | 4 | today's fixed ratio. Spec 19 §7 measured the whole-request figure 2.5–6.3% high on DeepSeek, so prose keeps a ratio already known not to under-count |
-| source code | `.rs`, `.go`, `.py`, `.js`, `.ts`, `.java`, `.kt`, `.c`, `.h`, `.cpp`, `.cs`, `.rb`, `.php`, `.swift`, `.sh`, `.sql`; also a file with no recognised extension | 3.5 (7/2) | short identifiers and punctuation-heavy lines are the commonly cited ~3–3.5 bytes/token case for code. Over-counting is the safe direction |
-| structured data | `.json`, `.jsonc`, `.jsonl`, `.yaml`, `.yml`, `.toml`, `.xml`, `.csv`, `.tsv`, `.html`, `.css`, `.scss`, `.lock`, `.ipynb` | 3 | quoted keys, braces, commas and short scalar values put a token boundary at nearly every mark |
+| content type | selected by | bytes / token | measured | derivation |
+|---|---|---|---|---|
+| prose and Markdown | `.md`, `.markdown`, `.mdx`, `.txt`, `.rst`, `.adoc`; prose-like kinds | 4 (4/1) | 4.50 | `len / 4` over-estimates prose by about 13%, consistent with spec 19 §7's 2.5–6.3% high, so the ratio is left alone. Classification never estimates prose below `len / 4`, and the headroom stands in for the margin the declared path does not subtract |
+| source code | `.rs`, `.go`, `.py`, `.js`, `.ts`, `.java`, `.kt`, `.c`, `.h`, `.cpp`, `.cs`, `.rb`, `.php`, `.swift`, `.sh`, `.sql`; also a file with no recognised extension | 3.6 (18/5) | 3.61 | short identifiers and punctuation-heavy lines tokenize denser than prose. Over-counting is the safe direction |
+| structured data | `.json`, `.jsonc`, `.jsonl`, `.yaml`, `.yml`, `.toml`, `.xml`, `.csv`, `.tsv`, `.html`, `.css`, `.scss`, `.lock`, `.ipynb` | 2.4 (12/5) | 2.45 | quoted keys, braces, commas and short scalar values put a token boundary at nearly every mark |
+
+The measurement is one call per document against `deepseek` /
+`deepseek-v4-flash`, and the provider's input count includes about 15 tokens of
+instruction and chat-template overhead. A document-only ratio is therefore a
+little higher than the reported one, so these figures over-count tokens slightly,
+which is the safe direction. It is one sample per type from one provider; §7
+records the table.
 
 Every ratio is at or below four bytes per token, so no classified content is
 estimated lower than `len / 4` was; the estimate can grow but never shrink, and
@@ -775,7 +797,8 @@ To be completed during implementation. Record:
 - The measured bytes-per-token ratio per content type from the §5.8 calibration,
   against which provider, and how far `len / 4` was off. This is the number that
   justifies the safety margin. The calibration has two halves, and both are
-  recorded here:
+  recorded here — the live half was run on 2026-10-25, the offline half was not
+  run and is recorded as such:
   1. **Offline, from recorded usage.** Every `model_request_prepared` audit event
      carries a whole-request estimate computed with `len / 4`
      (`chat.rs:2921-2926`), and every completed call records measured input
@@ -795,10 +818,8 @@ To be completed during implementation. Record:
      resolved from `model_api_key_env` exactly as a non-desktop turn resolves it,
      and the doc comment records that a `keychain:` reference is not readable
      from this crate, so that setup uses a config naming an environment variable
-     or measures the same documents through the app instead. The constants and
-     this section are updated from its output; if neither route happens, this half
-     is recorded as outstanding and the constants stay at their provisional
-     defaults.
+     or measures the same documents through the app instead. **The owner ran it on
+     2026-10-25**; the constants and this section are updated from its output.
 - The gutter size chosen for range merging in §5.4, and whether one gutter value
   covered both search-hit clusters and instruction ranges.
 - Whether any collection source proved awkward to check at collection time, per
@@ -822,3 +843,176 @@ ranges to measure. The boundary is therefore pinned by
 answerable**: the first real range producer has to re-check it. If ranges later
 arrive from findings (§5.3's `FileRanges` third tier) or from pinned selections,
 revisit the value with that producer's data rather than changing it silently.
+
+### Calibration against a provider (Task 7, 2026-10-25)
+
+**Step 2, live: run by the owner on 2026-10-25.** The agent did not run it and
+read no key. `calibration_measures_bytes_per_token` (`tests/context_assembly.rs`,
+`#[ignore]`) sent three fixed documents one call each to **provider
+`deepseek`, model `deepseek-v4-flash`**, through the same
+`OpenAICompatibleAdapter` + `CurlModelTransport` path a turn uses, and read the
+provider's reported `input_tokens` (`UsageSource::Measured`, the figure spec 19
+records as measured usage).
+
+| type | bytes | reported input tokens | bytes / token | `len / 4` estimate | `len / 4` error |
+|---|---|---|---|---|---|
+| prose | 1130 | 251 | 4.50 | 283 | +13% (over) |
+| rust | 1332 | 369 | 3.61 | 333 | −10% (under) |
+| json | 1037 | 424 | 2.45 | 260 | −39% (under) |
+
+The reported input count includes about 15 tokens of instruction and
+chat-template overhead, so a document-only ratio is a little higher (more bytes
+per token) than each row's figure; the chosen constants over-count tokens
+slightly, which is the safe direction. It is **one sample per type from one
+provider**, not a distribution, and the first attempt failed with
+`Model provider returned no assistant content` because `max_tokens: 16` was
+consumed by the reasoning model's hidden output: the test now asks for 1024, and
+only input usage is calibrated. The test's printed ratio was also fixed: it
+passed a hundredths-scale value to a percent formatter and printed `45.00`, and
+now prints `4.50`.
+
+**Chosen ratios (§5.8):** code **18/5 = 3.6** bytes per token (measured 3.61),
+structured **12/5 = 2.4** (measured 2.45), prose **4/1 unchanged** (measured
+4.50). Prose stays at 4 on purpose: using the measurement would lower prose
+estimates, and Task 6's rule is that classification never estimates below
+`len / 4`; the measured 13% over-estimate is headroom that stands in for the
+safety margin the Declared path does not subtract. `Symbols` and `RepositoryMap`
+stay on the prose ratio for the renderer-ceiling reason §5.8 records.
+
+**How far `len / 4` was off:** +13% high for prose, 10% low for Rust code and
+39% low for JSON. The two low figures are why the per-type ratios exist; spec
+19 §7's whole-request measurement of 2.5–6.3% high on DeepSeek agreed with the
+prose direction and could not show the code and structured errors, because only
+the request total is reported.
+
+**Acceptance.** The criterion "the improved estimate is calibrated against
+measured usage from spec 19" is met by this live measurement of
+provider-reported usage: the harness's measurement is spec 19's
+`UsageSource::Measured` input-token figure, read through the adapter rather than
+from a stored log. It is not met by an offline comparison over recorded
+traffic, because that half was not run: see the next paragraph.
+
+**Step 1, offline: not run.** `calibration_compares_estimates_with_recorded_usage`
+was not run because the owner did not provide a data directory to read, and
+inventing a corpus or a ratio would be worse than recording the gap. It reads
+nothing by default and prints how to point it at a directory; the command is in
+its doc comment. Consequences: there is no per-machine whole-request
+estimate-vs-measured distribution, and no figure for how often redistribution
+triggers in real use (the tier's manifests are not retained by the harness,
+and no live session corpus was read). The deterministic tier's
+`context_contains`/`context_excludes`/`context_ranks_within` results are
+unchanged (see the next section), so nothing in the acceptance run depends on
+this.
+
+### Acceptance run against `evals/baseline.json` (2026-10-25)
+
+Command, from the worktree root:
+
+```sh
+CARGO_TARGET_DIR="$PWD/target" cargo run -p eval-harness -- run --tier deterministic
+```
+
+All 23 scenarios pass and every assertion passes. (`check_pass_rate` below
+counts *scenario check commands*: it includes the eight `ls no-such-directory`
+failures that `failed_validation_retry` exists to exercise, so it is not a
+measure of whether this tier is green.)
+
+`evals/baseline.json` was recorded when the tier held **16** scenarios
+(fixture version 4, committed 2026-09-18); the tier now holds **23**, so seven
+scenarios have no like-for-like predecessor and the aggregate metrics shift with
+the scenario set. Each moved metric is therefore explained below rather than read
+as a change in behaviour. Per scenario, every `context_contains`,
+`context_excludes` and `context_ranks_within` assertion reports exactly the
+`actual` string the baseline recorded, where both have the scenario: the
+included-file lists and the `src/checkout.rs` rank are unchanged.
+
+| Metric | Baseline (2026-09-18) | 2026-10-25 | Explanation |
+|---|---|---|---|
+| Task completion rate | 1.000 | 1.000 | Unchanged. This is the acceptance criterion, and it holds. |
+| Check pass rate | 0.1111 (1/9) | 0.7241 (21/29) | Rose because seven scenarios joined the tier and each contributes passing checks; the eight deliberate failures in `failed_validation_retry` are unchanged. The denominator changed, so this is not comparable as a quality figure across the two rows. |
+| Approval-policy violations | 0 | 0 | Unchanged. |
+| Restricted-path and secret violations | 0 | 0 | Unchanged. |
+| Unrelated files changed | 0 | 0 | Unchanged. |
+| Recovery success | 1.000 | 1.000 | Unchanged (the one scenario that injects a crash, `resume_interrupted_session`). |
+| Tool and model error rate | 0.2727 (9/33) | 0.1190 (10/84) | The denominator grew from 33 tool calls to 84; the deliberate failures are the same eight retries plus the refused restricted read, and the tenth is `worktree_survey`'s planted-path `read_git_diff`, which that scenario expects to refuse. Not an improvement in behaviour. |
+| Latency, median | 44 ms | 62 ms | The tier now includes the round-budget pause and long-discovery scenarios (`answer_now_ends_the_turn` ≈ 610 ms, `continue_keeps_state` ≈ 840 ms), which shift the distribution and dominate p90; four repeat runs on this date ranged 62–183 ms median and 572–896 ms p90, so both figures are also noisy at this scale. |
+| Latency, p90 | 109 ms | 590 ms | Same cause as the median. |
+| Model calls and tool rounds per task | 2.5 (40/16) | 4.043 (93/23) | Seven added scenarios include the longest turns in the tier (`long_discovery` 15 calls, `continue_keeps_state` 12, `read_loop` 10, `answer_now_ends_the_turn` 9). |
+| Input and output tokens (estimated) | 101963 | 397245 | 237430 of the increase is the seven new scenarios. The 16 baseline scenarios went 101963 → 159815 because 55 commits after the baseline touched `chat.rs`, adding tool definitions and system-prompt text that are part of the request body this figure estimates; it is a whole-request estimate, not a context figure. §7's next paragraph separates this spec's own effect. |
+| Provider cost | not applicable (live-tier) | same | Unchanged marker. |
+| Manual repair rate / Patch acceptance rate | not recorded (human) | same | Unchanged markers. |
+| Memory recall usefulness / Memory correction rate | not applicable (phase-3b) | same | Unchanged markers. |
+| Plan steps planned / verified / completed unverified / blocked | 2 / 1 / 1 / 0 | 2 / 1 / 1 / 0 | Unchanged. |
+| Cache hit rate, Findings from exploration commands, Approval prompts by first cause | no baseline row | `not applicable (no-cache-report)`, 0, `setting 1 · shell_control 1 · unknown 2` | Metrics added to the tier after the baseline was committed (specs 49, 59, 32); there is nothing to compare them against. |
+
+**What this spec itself moved.** To separate its effect from the drift since
+September, the same tier was run on the pre-implementation tree (the parent of
+Task 1, exported with `git archive`) in a separate checkout with its own target
+directory. All 23 scenarios run there too, with the same assertions. Every
+count and rate is identical — completion 1.000, check pass 0.7241, 0
+approval-policy violations, 0 restricted-path/secret violations, 0 unrelated
+files changed, recovery 1.000, tool and model error rate 0.119, 4.043 model
+calls per task, plan 2/1/1/0 — and **tokens fall from 399391 to 397245**
+(−2146, −0.54%), lower in every one of the 23 scenarios and higher in none,
+because the user request is no longer sent twice; the included-file lists are
+identical, so no category share dropped an item in this tier. Median latency
+moved 67 → 62 ms and p90 583 → 590 ms between the two runs, which is this
+machine's run-to-run noise at these durations rather than a change. No acceptance
+metric regressed; the completion rate the acceptance criterion names is
+unchanged.
+
+**Re-run after the measured ratios landed (2026-10-25).** The estimator's
+constants changed code 3.5 → 3.6 and structured 3 → 2.4, which changes what
+fits a category share. Re-running the tier produced the same figures —
+completion 1.000, check pass 0.7241, 0 violations, error rate 0.1190, 4.043
+calls per task, 397245 tokens — and every `context_contains`,
+`context_excludes` and `context_ranks_within` actual string is unchanged from
+the baseline's. Nothing moved because the tier's fixtures fit inside their
+category shares either way, and the harness's token figure is the model
+adapter's whole-request `len / 4` estimate, not the per-item estimator. Latency
+read 62–183 ms median and 572–896 ms p90 across four runs of this date, which
+is this machine's run-to-run variance rather than a change (the developer Mac's
+process launches stall intermittently; the same variance is recorded in
+`docs/DEVELOPMENT.md`).
+
+### Known open points (2026-10-25)
+
+None of these blocks acceptance; each is recorded so a later spec does not
+rediscover it:
+
+- **No collection source yields a `LineRange` yet.** Range deduplication,
+  whole-file absorption and per-item line provenance are implemented and
+  covered by unit tests, but inert in production: every source asks for the
+  whole file, so `lineRange` is null on every included item and
+  `deduplicated_into_range` can never be recorded. §5.4 records the seam;
+  `no_collection_source_yields_a_line_range_yet` fails the day a producer
+  appears, at which point the merge must also be covered through
+  `build_context` and the `GUTTER = 2` value re-checked.
+- **Every limit is `Declared`.** `EffectiveLimit::observed` exists and is
+  unit-tested, but no capability profile calls it (Phase 1 WP3), so
+  `context_budget.safety_margin` never changes a live limit and
+  `limit.source` is always `declared` with `window: null`. The margin is
+  therefore headroom that is configured but unspent; the prose ratio's 13%
+  over-estimate (the calibration above) is the de facto margin today.
+- **The offline calibration half was not run** (no data directory was
+  provided), so there is no per-machine distribution of the whole-request
+  estimate against measured usage. The live half is the evidence for the
+  ratios, and it is one sample per type from one provider.
+- **Redistribution frequency and per-category usage of the eval tier were not
+  measured.** The harness does not retain its manifests, and no live session
+  corpus was read. `categories[].allocated` in a `context_assembled` event is
+  where to read it; if most categories routinely release their share, the
+  defaults rather than the mechanism are wrong (§5.2).
+- **The collection-time check has one awkward family: path spelling.**
+  Explicit and mentioned paths can arrive as `./x`, `../x` or an absolute
+  in-repo path, so the check has to normalise with the read path's own
+  resolver before comparing (Task 5's Step 3a). That is the place a future
+  source could bypass the check by comparing raw strings, which is why every
+  source goes through `add_file`/`normalise_candidate` and the exhaustive
+  `CollectionSource` walk exists.
+- **The full seven-check quality gate is left to CI.** Locally, the named
+  test files, scoped `workspace-engine` clippy, `scripts/quality-gate.sh fmt
+  node lint typos deny` and `npm run specs:check -- --strict` passed. The
+  workspace clippy and test suite were not run locally by policy; their result
+  is to be recorded here once the branch is pushed and CI is green — this
+  document does not claim it passed.

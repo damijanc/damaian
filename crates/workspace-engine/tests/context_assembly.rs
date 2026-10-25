@@ -1212,7 +1212,7 @@ fn each_category_stops_at_its_configured_share() {
     let repo = fixture_repo("share-cap");
     let engine = WorkspaceEngine::new(config_with_shares(
         &repo,
-        "context_budget.file_ranges=0.0101\n",
+        "context_budget.file_ranges=0.0091\n",
     ));
     let index = engine.indexer.index_repository(&repo).unwrap();
     let explicit = vec!["src/lib.rs".to_string()];
@@ -1244,9 +1244,9 @@ fn each_category_stops_at_its_configured_share() {
     }
     let file_ranges = usage(&plan, ContextCategory::FileRanges);
     assert!(file_ranges.truncated, "{file_ranges:?}");
-    assert_eq!(file_ranges.allocated, 10, "1.01% of ~991 tokens");
+    assert_eq!(file_ranges.allocated, 9, "0.91% of ~991 tokens");
     assert_eq!(
-        file_ranges.used, 10,
+        file_ranges.used, 9,
         "the explicit file only, at the code ratio's estimate for src/lib.rs"
     );
 
@@ -1286,7 +1286,7 @@ fn an_unused_share_moves_to_later_categories() {
     );
     assert!(file_ranges.used <= file_ranges.allocated);
     assert_eq!(
-        file_ranges.used, 10,
+        file_ranges.used, 9,
         "the explicit file fits either way, at the code ratio's estimate for src/lib.rs"
     );
     assert!(
@@ -2197,7 +2197,7 @@ fn the_owning_root_is_set_even_with_the_map_item_turned_off() {
 
 // ---- Task 6: a content-aware estimate ----
 
-/// The three paths that select the three provisional ratios. ASCII fixture
+/// The three paths that select the three measured ratios. ASCII fixture
 /// names, so a character is a byte and `chars / tokens` needs no conversion.
 const PROSE_PATH: &str = "docs/notes.md";
 const CODE_PATH: &str = "src/billing.rs";
@@ -2214,11 +2214,11 @@ fn prose_code_and_json_get_different_estimates_for_the_same_length() {
     assert_eq!(code, TokenEstimate::Code);
     assert_eq!(structured, TokenEstimate::Structured);
 
-    // The provisional ratios of proposal §5.8, at 1,000 bytes: 4, 3.5 and 3
-    // bytes per token. Task 7 replaces both the ratios and these figures.
+    // The measured ratios of proposal §5.8, at 1,000 bytes: 4, 3.6 and 2.4
+    // bytes per token.
     assert_eq!(prose.tokens(&text), 250, "prose keeps 4 bytes per token");
-    assert_eq!(code.tokens(&text), 286, "1,000 * 2 / 7, rounded up");
-    assert_eq!(structured.tokens(&text), 334, "1,000 / 3, rounded up");
+    assert_eq!(code.tokens(&text), 278, "1,000 * 5 / 18, rounded up");
+    assert_eq!(structured.tokens(&text), 417, "1,000 * 5 / 12, rounded up");
 
     let mut estimates = [
         prose.tokens(&text),
@@ -2226,7 +2226,7 @@ fn prose_code_and_json_get_different_estimates_for_the_same_length() {
         structured.tokens(&text),
     ];
     estimates.sort_unstable();
-    assert_eq!(estimates, [250, 286, 334], "three types, three estimates");
+    assert_eq!(estimates, [250, 278, 417], "three types, three estimates");
 }
 
 #[test]
@@ -2625,7 +2625,11 @@ fn calibration_measures_bytes_per_token() {
             reasoning_level: Some(config.model_reasoning_level.clone()),
             stream: true,
             tools: None,
-            max_tokens: Some(16),
+            // Room for a reasoning model's hidden output: deepseek-v4-flash
+            // spends output tokens on reasoning before any content, so a small
+            // ceiling fails with "no assistant content". Only input usage is
+            // calibrated, so the reply may be as short as the provider allows.
+            max_tokens: Some(1024),
             request_usage: true,
             emit_cache_breakpoints: false,
         };
@@ -2647,11 +2651,16 @@ fn calibration_measures_bytes_per_token() {
             tokens <= bytes && tokens * 8 >= bytes,
             "{name}: {bytes} bytes measured {tokens} input tokens"
         );
-        let bytes_per_token_bps = bytes * 10_000 / tokens;
+        // Hundredths, so the print shows two decimals without a float. The
+        // provider's count includes instruction overhead, so this ratio reads
+        // slightly below the document-only one; the constants in
+        // `TokenEstimate` are rounded down from it, which over-counts tokens.
+        let bytes_per_token_hundredths = bytes * 100 / tokens;
         println!(
-            "{name}: {bytes} bytes, {tokens} input tokens = {:.2} bytes/token; \
+            "{name}: {bytes} bytes, {tokens} input tokens = {}.{:02} bytes/token; \
              len / 4 would have estimated {} input tokens",
-            format_basis_points(u128::from(bytes_per_token_bps)),
+            bytes_per_token_hundredths / 100,
+            bytes_per_token_hundredths % 100,
             bytes.div_ceil(4)
         );
     }

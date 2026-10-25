@@ -53,6 +53,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | A permission profile key has no effect | [A permission profile key had no effect](#a-permission-profile-key-had-no-effect) |
 | A file read or search result was cut short | [A file read or search result was truncated](#a-file-read-or-search-result-was-truncated) |
 | A file is missing from the model's context | [A file the model should see is missing from context](#a-file-the-model-should-see-is-missing-from-context) |
+| Why a file or search hit was excluded, or what a turn's context actually held | [Reading a turn's context manifest](#reading-a-turns-context-manifest) |
 | A `worktree` argument is refused | [A `worktree` argument is refused](#a-worktree-argument-is-refused) |
 | A project root is missing or wrong, or a command ran in the wrong directory | [Repository roots and the repository map](#repository-roots-and-the-repository-map) |
 | Symbol search shows only `likely` results, or a configured language server will not start | [Symbol search shows only likely results, or a language server will not start](#symbol-search-shows-only-likely-results-or-a-language-server-will-not-start) |
@@ -725,7 +726,7 @@ Event types grouped by what they tell you:
 
 | Area | Event types |
 |------|-------------|
-| Model turn | `model_request_prepared`, `model_response_completed`, `edit_model_request_prepared`, `chat_turn_cancelled`, `model_usage_reporting_unsupported`, `turn_continued` |
+| Model turn | `context_assembled`, `model_request_prepared`, `model_response_completed`, `edit_model_request_prepared`, `chat_turn_cancelled`, `model_usage_reporting_unsupported`, `turn_continued` |
 | Round budget | `round_budget_paused`, `round_budget_decision`, `turn_budget_extended` |
 | Plan review | `plan_review_decision` |
 | Patches | `patch_proposed`, `edit_patch_ready_for_approval`, `edit_failed`, `patch_applied`, `patch_hunks_rejected`, `patch_rollback_started`, `patch_rolled_back`, `stored_patch_applied`, `stored_patch_files_rejected`, `stored_patch_rejected`, `stored_patch_rolled_back` |
@@ -774,6 +775,129 @@ Useful reads:
   error. To check the bar's `+N −M`, compare it with
   `git diff --numstat HEAD` plus the line counts of untracked text files
   (files over 1 MiB or with a NUL byte in the first 8 KiB are not counted).
+- `context_assembled` is the one event that says what a turn's context held and
+  what it left out: [Reading a turn's context manifest](#reading-a-turns-context-manifest).
+
+### Reading a turn's context manifest
+
+Each model turn records one `context_assembled` event before its first
+`model_request_prepared`, and each one-shot edit records one before
+`edit_model_request_prepared`. It carries the manifest — every included item by
+path, range and owning root, every item left out with a reason, and what each
+context category was allowed and used. **The manifest holds no file content**, so
+it is safe to paste into a bug report.
+
+```bash
+# The latest turn's manifest, pretty-printed.
+jq -c 'select(.eventType=="context_assembled")' "$DATA_DIR/audit/events.jsonl" \
+  | tail -1 | jq -r '.manifest | fromjson'
+```
+
+All fields can be read straight off the event:
+
+```bash
+jq -r 'select(.eventType=="context_assembled")
+  | "\(.timestampMs) task=\(.taskId) tokens=\(.tokenEstimate)"' "$DATA_DIR/audit/events.jsonl" | tail -5
+```
+
+The event itself holds `actor` (`system`), `sessionId`, `repositoryId`,
+`taskId`, `tokenEstimate` (the manifest's `totalTokens`) and `manifest`, the
+whole manifest as a JSON string. Every audit field value is a string, so the
+manifest is parsed with `fromjson` rather than read field by field.
+
+Inside the manifest:
+
+| Field | Meaning |
+|---|---|
+| `repositoryId`, `taskId` | Which checkout and which task the assembly was for. |
+| `assembledAtMs` | When it was assembled. The only time-dependent field; it never reaches the prompt. |
+| `limit` | The token limit categories divided, and where it came from — see [Declared and observed limits](#declared-and-observed-limits). |
+| `totalTokens` | Sum of the included items' estimated tokens. |
+| `categories` | One entry per category **in budget order**: `category`, `allocated` (after redistribution from earlier categories), `used`, `items`, `truncated`, `estimated`. `estimated` is always `true` for assembly: the figure is the estimator's, never a provider measurement. |
+| `included` | One entry per item: `category`, `kind`, `path`, `lineRange`, `tokens`, `rootPath`, `provenance`. `kind` is the source label the prompt header shows (`explicit_file`, `retrieved_file`, `agent_instruction`, `project_rule`, `hook_context`, `repository_map`, `symbols`, `plan_state`); your own message is listed as `user_prompt` with no path. `category` is the budget bucket, which is not always the same thing: a search hit is `kind: retrieved_file` but `category: search_results`. The entry records where the item came from and how big it was, never its text. |
+| `excluded` | One entry per item left out or shortened: `reason`, `path`, `lineRange`, `category`, `detail`. |
+
+`rootPath` is the repository root that owns the path: `""` means the repository
+root itself, `"packages/api"` a nested root from the repository map. It is
+`null` for content with no file identity (the map and symbols blocks, hook
+context, a carried plan) and for a file whose owning root could not be resolved,
+including when no repository map could be loaded.
+
+`lineRange` is `null` for every item today. The field and the range-merge
+machinery exist, but no collection source produces a line range yet: a search
+hit contributes the whole file, and the symbols block is one rendered block.
+Until a source does, `deduplicated_into_range` records cannot appear either.
+
+`provenance` is the weakest source behind an included item: `language_server`
+when a language server supplied the symbols the block shows, `heuristic` when
+only source-text matching did, and `null` otherwise. Only the symbols block
+carries one today; a file item, an instruction file and hook context are `null`.
+
+#### Exclusion reasons
+
+| Reason | What it means | Produced today? |
+|---|---|---|
+| `restricted_path` | The path matched `restricted_patterns`, at collection or at read time. It was never opened. | Yes |
+| `category_budget_exhausted` | The item did not fit its category's share. Once one item in a category does not fit, every lower-priority item in that category is dropped too, so the dropped set is the tail of the category's priority order, not a scatter. | Yes |
+| `truncated` | The item **is** included, but shorter: the repository map or the symbols block was re-rendered at a smaller ceiling to fit the category's share. `detail` names the ceiling. | Yes |
+| `too_large` | A whole-file read was refused because the file exceeds `max_file_bytes`. | Yes |
+| `binary` | A whole-file read was refused because the file looks binary. | Yes |
+| `deduplicated_into_range` | A line range was merged into another range for the same path, or absorbed by a whole-file item. | Not yet: nothing produces a line range. |
+
+`secret_bearing`, `total_budget_exhausted` and `user_removed` are not produced
+by this version; they arrive with the stages that generate them. A file that is
+simply missing or unreadable, and a path that resolves outside the repository
+root, produce **no** record: the enum has no reason for them, and inventing one
+would be worse than the omission.
+
+#### Declared and observed limits
+
+`limit.source` says how `limit.tokens` was decided:
+
+- `declared` — `context_token_budget` for the selected provider and model, used
+  unchanged: `safetyMarginBps` is `0` and `window` is `null`. **This is what
+  every turn records today.** `context_token_budget` is a packing budget, not a
+  provider's context window, so subtracting a safety margin from it would only
+  shrink a number that is already well below the window.
+- `observed` — a measured provider window: `window` is the window, and
+  `limit.tokens` is that window minus `safetyMarginBps` of it
+  (`context_budget.safety_margin`, 10% by default). No capability profile is
+  measured yet, so nothing produces this.
+
+The limit bounds the assembled repository context and your message only. The
+system prompt, the tool definitions and the `Recent conversation:` block are
+added outside it, so the request body the provider sees can be larger than
+`limit.tokens`.
+
+#### When content is `category_budget_exhausted`
+
+That reason means the category ran out of its share, not that the file was
+refused. Check `categories` first: if that category's `used` equals its
+`allocated`, the share is what bound it; if `allocated` is already above the
+category's nominal percentage, earlier categories released their remainder and
+it still was not enough.
+
+Any of these changes it, in the order that is usually cheapest:
+
+1. **Name the file in the prompt.** A file that search found is
+   `category: search_results`; naming it (or adding it with **+**) collects it
+   as `category: file_ranges`, which has its own, larger share. This is the one
+   fix that needs no config edit.
+2. **Raise that category's share** in your user config, lowering another by the
+   same amount so the shares still sum to at most `1.00`. A repository can only
+   lower a share and raise the margin, so this edit belongs in your own config,
+   not in `.damaian/config.conf`.
+3. **Raise `context_token_budget`** for the provider and model. This raises
+   every share proportionally, and it raises what every turn costs, because the
+   context is re-sent and re-billed each turn.
+4. **Set a share to `0`** to turn a category off deliberately. Its items then
+   appear as `category_budget_exhausted` and its whole share is released to the
+   categories after it.
+
+If the dropped item is an `AGENTS.md` file, remember the truncation order: the
+most specific nested file is kept and the root file or a root project rule is
+dropped first, because nested instructions override broader ones. If it is a
+semantic search hit, expect it to be dropped before a keyword hit.
 
 ### Session logs
 
@@ -2104,7 +2228,11 @@ Two independent filters, both visible in `config-show`:
   `*.pem`, `*.key`, `**/secrets/**`), surfacing as `ClientError::AccessDenied`.
 
 Confirm what was actually sent by reading `contextFiles` on the
-`model_request_prepared` event rather than reasoning about the patterns.
+`model_request_prepared` event rather than reasoning about the patterns. When a
+turn did run and a specific file is absent, the `excluded` list on its
+`context_assembled` event names the reason — a restricted path, a category
+share, or a read refusal — in
+[Reading a turn's context manifest](#reading-a-turns-context-manifest).
 
 ### A `worktree` argument is refused
 

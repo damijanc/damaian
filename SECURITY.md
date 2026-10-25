@@ -25,7 +25,7 @@ Do not commit real API keys, provider tokens, certificates, private keys, or loc
 
 Damaian supports macOS Keychain-backed model API key storage from desktop settings. Config files should store Keychain references such as `keychain:model-api-key` or environment variable names for CLI/development workflows, never raw provider keys.
 
-Secret scanning redacts detected credentials from indexed context, command output, patch diffs, Git diff output, audit log fields, and model-visible command results. Generated file content is still checked before apply and is blocked by default when hardcoded secrets are detected.
+Secret scanning redacts detected credentials from indexed context, the user's prompt, earlier conversation turns replayed into a request, command output, patch diffs, Git diff output, audit log fields, and model-visible command results. Session messages are stored as typed, so a prompt and the replayed turns are scanned on the way into every request rather than at storage time; a credential typed once into a message is re-sent redacted on every later turn, not in cleartext. Generated file content is still checked before apply and is blocked by default when hardcoded secrets are detected.
 
 That block is a warning the user can overrule, not a hard stop. When a selected file is flagged, the apply reports which file tripped the check and which detection categories fired — never the matched value — and applies nothing. The user reviews the diff and may then apply anyway (`Apply Anyway` in the desktop app, `--allow-generated-secrets` in the CLI). The override is per-apply, is never inferred or remembered, and is recorded in the audit log as `generatedSecretOverride=true`.
 
@@ -158,7 +158,7 @@ Security-relevant actions — commands run or refused, patches applied or reject
 
 ## Data That Leaves Your Machine
 
-Prompts and the context Damaian assembles go to the model provider you configured, and only there. Two cases can reach somewhere else, and both need you each time:
+Prompts and the context Damaian assembles go to the model provider you configured, and only there. Detected credentials in the prompt, in the replayed earlier turns, and in every context item are redacted first (see [Secret Handling](#secret-handling)). Two cases can reach somewhere else, and both need you each time:
 
 - **Provider fallback.** When a provider refuses a turn and a second qualifying provider is configured, the desktop app offers to answer that one turn with it. The offer is refused unless you accept it, it never becomes permanent, and it covers only the turn it was offered for.
 - **Browser diagnostics on a remote URL.** Inspecting a local page (`localhost`, `127.0.0.1`, `[::1]`) runs without asking. Any page outside your machine asks every time and shows the origin it will reach; the per-session grant never covers a remote URL.

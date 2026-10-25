@@ -6,7 +6,7 @@ Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 9 (Should). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#26](26_context_assembly/proposal.md) (the budget an image counts against)
-— **not built**; Phase 1 WP3 (provider capability validation) —
+— built (Done 2026-10-25); Phase 1 WP3 (provider capability validation) —
 **unspecified**. Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
