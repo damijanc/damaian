@@ -295,6 +295,94 @@ impl ContextKind {
     }
 }
 
+/// The bytes-per-token ratio an item is measured with (proposal §5.8).
+///
+/// **Provisional ratios.** They come from published rules of thumb, not from a
+/// measurement against a provider, and Task 7 replaces them with the ratios
+/// `calibration_measures_bytes_per_token` reports:
+///
+/// | type | bytes / token | derivation |
+/// |---|---|---|
+/// | prose and Markdown | 4 | today's fixed ratio. Spec 19 §7 measured it 2.5–6.3% high on DeepSeek, so prose keeps a figure already known not to under-count |
+/// | source code | 3.5 | short identifiers and punctuation-heavy lines are the commonly cited ~3–3.5 bytes/token case; the denser ratio over-counts rather than under-counts |
+/// | structured data | 3 | quoted keys, braces, commas and short scalar values put a token boundary at nearly every mark |
+///
+/// Every ratio is at or below four bytes per token, so no classified content is
+/// estimated lower than `len / 4` did. Integer arithmetic decides the estimate:
+/// no float participates in inclusion, so `prompt_cache`'s determinism guard
+/// still holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenEstimate {
+    Prose,
+    Code,
+    Structured,
+}
+
+impl TokenEstimate {
+    /// The ratio for one item, from its kind and its file extension.
+    ///
+    /// This is a content *type* choice, not a scan of the text: it costs one
+    /// extension lookup and cannot make the same content estimate differently
+    /// between two assemblies.
+    pub fn for_item(kind: ContextKind, path: Option<&str>) -> Self {
+        if let Some(estimate) = path.and_then(estimate_for_extension) {
+            return estimate;
+        }
+        match kind {
+            // A file the user or the search named, with no extension in the
+            // table below (a `Makefile`, a generated script with no suffix), is
+            // measured as code: over-estimating is the safe direction, and
+            // under-estimating is what would let an item overflow its share.
+            ContextKind::ExplicitFile | ContextKind::RetrievedFile => Self::Code,
+            // Everything else keeps today's ratio. That includes the path-less
+            // rendered blocks (the map and the symbols list): their own
+            // renderer fits them to a ceiling counted with `len / 4`
+            // (`render_for_model`), so re-measuring the same text with a denser
+            // ratio would report more tokens than the ceiling it was rendered
+            // to. Those ceilings move only when their renderers share this
+            // estimator, which is outside "change only inside `add_text`".
+            _ => Self::Prose,
+        }
+    }
+
+    /// Bytes per token as a fraction, so tokens are `ceil(len * denominator /
+    /// numerator)` in integers.
+    pub const fn bytes_per_token(self) -> (u32, u32) {
+        match self {
+            Self::Prose => (4, 1),
+            Self::Code => (7, 2),
+            Self::Structured => (3, 1),
+        }
+    }
+
+    /// An estimate for already-redacted text. Zero only for empty text, which
+    /// `add_text` refuses before it gets here.
+    pub fn tokens(self, text: &str) -> usize {
+        let (numerator, denominator) = self.bytes_per_token();
+        (text.len() as u128 * u128::from(denominator)).div_ceil(u128::from(numerator)) as usize
+    }
+}
+
+/// The extensions the estimate classifies. Indexing's `detect_language` is a
+/// different map with a different job (it drives symbol extraction) and is left
+/// alone; an extension missing here falls back to the kind's default.
+fn estimate_for_extension(path: &str) -> Option<TokenEstimate> {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "md" | "markdown" | "mdx" | "txt" | "rst" | "adoc" => TokenEstimate::Prose,
+        "json" | "jsonc" | "jsonl" | "yaml" | "yml" | "toml" | "xml" | "csv" | "tsv" | "html"
+        | "htm" | "css" | "scss" | "lock" | "ipynb" => TokenEstimate::Structured,
+        "rs" | "go" | "py" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "java" | "kt"
+        | "kts" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "cs" | "rb" | "php" | "swift"
+        | "m" | "mm" | "scala" | "sh" | "bash" | "zsh" | "fish" | "sql" | "lua" | "ex" | "exs"
+        | "erl" | "hs" | "ml" | "clj" | "zig" | "vue" | "svelte" | "proto" => TokenEstimate::Code,
+        _ => return None,
+    })
+}
+
 /// Where one collection decision came from (proposal §5.3, §5.6).
 ///
 /// The assembler matches on this with no wildcard arm, so a source that skips
@@ -1788,7 +1876,7 @@ fn add_text(
         return None;
     }
     let redaction = scanner.redact(content);
-    let tokens = redaction.text.len().div_ceil(4);
+    let tokens = TokenEstimate::for_item(kind, path.as_deref()).tokens(&redaction.text);
     Some(ContextItem {
         category: kind.category(),
         kind,

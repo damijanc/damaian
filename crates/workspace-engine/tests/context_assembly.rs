@@ -5,6 +5,7 @@
 //! two places unredacted text used to reach the provider: the user request and
 //! the replayed conversation (Correction C17).
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,9 +15,10 @@ use workspace_engine::context_manager::ExclusionReason;
 use workspace_engine::{
     CancelToken, CategoryUsage, ChatTurnResult, ClientError, CollectionSource, Config,
     ConfigOverlay, ContextCategory, ContextItem, ContextKind, ContextManifest, ContextPlan,
-    ContextRequest, ExclusionRecord, LimitSource, LineRange, MockModelAdapter, ModelAdapter,
-    PlanStep, Provenance, RepositoryIndex, StepStatus, Symbol, SymbolIndexStore, TaskPlan,
-    TurnProgress, TurnSink, WorkspaceEngine,
+    ContextRequest, CurlModelTransport, ExclusionRecord, LimitSource, LineRange, MockModelAdapter,
+    ModelAdapter, ModelMessage, ModelRequest, OpenAICompatibleAdapter, PlanStep, ProcessRegistry,
+    Provenance, RepositoryIndex, StepStatus, Symbol, SymbolIndexStore, TaskPlan, TokenEstimate,
+    TurnProgress, TurnSink, UsageSource, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1210,7 +1212,7 @@ fn each_category_stops_at_its_configured_share() {
     let repo = fixture_repo("share-cap");
     let engine = WorkspaceEngine::new(config_with_shares(
         &repo,
-        "context_budget.file_ranges=0.01\n",
+        "context_budget.file_ranges=0.0101\n",
     ));
     let index = engine.indexer.index_repository(&repo).unwrap();
     let explicit = vec!["src/lib.rs".to_string()];
@@ -1242,8 +1244,11 @@ fn each_category_stops_at_its_configured_share() {
     }
     let file_ranges = usage(&plan, ContextCategory::FileRanges);
     assert!(file_ranges.truncated, "{file_ranges:?}");
-    assert_eq!(file_ranges.allocated, 9, "1% of ~991 tokens");
-    assert_eq!(file_ranges.used, 8, "the explicit file only");
+    assert_eq!(file_ranges.allocated, 10, "1.01% of ~991 tokens");
+    assert_eq!(
+        file_ranges.used, 10,
+        "the explicit file only, at the code ratio's estimate for src/lib.rs"
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }
@@ -1280,7 +1285,10 @@ fn an_unused_share_moves_to_later_categories() {
         file_ranges.allocated
     );
     assert!(file_ranges.used <= file_ranges.allocated);
-    assert_eq!(file_ranges.used, 8, "the explicit file fits either way");
+    assert_eq!(
+        file_ranges.used, 10,
+        "the explicit file fits either way, at the code ratio's estimate for src/lib.rs"
+    );
     assert!(
         usage(&plan, ContextCategory::Pinned).used == 0,
         "Pinned is reserved and releases its share"
@@ -2186,3 +2194,546 @@ fn the_owning_root_is_set_even_with_the_map_item_turned_off() {
 
     fs::remove_dir_all(repo).unwrap();
 }
+
+// ---- Task 6: a content-aware estimate ----
+
+/// The three paths that select the three provisional ratios. ASCII fixture
+/// names, so a character is a byte and `chars / tokens` needs no conversion.
+const PROSE_PATH: &str = "docs/notes.md";
+const CODE_PATH: &str = "src/billing.rs";
+const STRUCTURED_PATH: &str = "assets/config.json";
+
+#[test]
+fn prose_code_and_json_get_different_estimates_for_the_same_length() {
+    let text = "x".repeat(1_000);
+    let prose = TokenEstimate::for_item(ContextKind::AgentInstruction, Some(PROSE_PATH));
+    let code = TokenEstimate::for_item(ContextKind::RetrievedFile, Some(CODE_PATH));
+    let structured = TokenEstimate::for_item(ContextKind::RetrievedFile, Some(STRUCTURED_PATH));
+
+    assert_eq!(prose, TokenEstimate::Prose);
+    assert_eq!(code, TokenEstimate::Code);
+    assert_eq!(structured, TokenEstimate::Structured);
+
+    // The provisional ratios of proposal §5.8, at 1,000 bytes: 4, 3.5 and 3
+    // bytes per token. Task 7 replaces both the ratios and these figures.
+    assert_eq!(prose.tokens(&text), 250, "prose keeps 4 bytes per token");
+    assert_eq!(code.tokens(&text), 286, "1,000 * 2 / 7, rounded up");
+    assert_eq!(structured.tokens(&text), 334, "1,000 / 3, rounded up");
+
+    let mut estimates = [
+        prose.tokens(&text),
+        code.tokens(&text),
+        structured.tokens(&text),
+    ];
+    estimates.sort_unstable();
+    assert_eq!(estimates, [250, 286, 334], "three types, three estimates");
+}
+
+#[test]
+fn an_identifier_heavy_snippet_is_estimated_higher_than_prose_of_the_same_length() {
+    let code =
+        "let total_invoice_amount = calculate_line_item_subtotal(quantity, unit_price_cents);";
+    let mut prose = String::from(
+        "The invoice total is calculated from each line item's quantity and unit price.",
+    );
+    while prose.len() < code.len() {
+        prose.push('.');
+    }
+    prose.truncate(code.len());
+    assert_eq!(
+        code.len(),
+        prose.len(),
+        "the comparison is about content type"
+    );
+
+    let code_estimate = TokenEstimate::for_item(ContextKind::RetrievedFile, Some(CODE_PATH));
+    let prose_estimate = TokenEstimate::for_item(ContextKind::AgentInstruction, Some(PROSE_PATH));
+    assert!(
+        code_estimate.tokens(code) > prose_estimate.tokens(&prose),
+        "identifier-heavy code ({}) must be estimated above prose ({})",
+        code_estimate.tokens(code),
+        prose_estimate.tokens(&prose)
+    );
+}
+
+#[test]
+fn the_estimate_is_monotone_in_length() {
+    for (kind, path) in [
+        (ContextKind::AgentInstruction, PROSE_PATH),
+        (ContextKind::RetrievedFile, CODE_PATH),
+        (ContextKind::RetrievedFile, STRUCTURED_PATH),
+    ] {
+        let estimate = TokenEstimate::for_item(kind, Some(path));
+        let mut previous = 0;
+        for length in [1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 64, 255, 1_000, 4_096] {
+            let tokens = estimate.tokens(&"x".repeat(length));
+            assert!(
+                tokens >= previous,
+                "{path} at {length} bytes estimated {tokens}, below {previous}"
+            );
+            assert!(tokens > 0, "{path} at {length} bytes estimated nothing");
+            previous = tokens;
+        }
+        assert!(
+            previous > estimate.tokens("x"),
+            "{path} must not be flat in length"
+        );
+    }
+}
+
+#[test]
+fn the_estimate_is_never_zero_for_non_empty_content() {
+    for (kind, path) in [
+        (ContextKind::AgentInstruction, PROSE_PATH),
+        (ContextKind::RetrievedFile, CODE_PATH),
+        (ContextKind::RetrievedFile, STRUCTURED_PATH),
+    ] {
+        let estimate = TokenEstimate::for_item(kind, Some(path));
+        for length in 1..=12 {
+            assert!(
+                estimate.tokens(&"x".repeat(length)) >= 1,
+                "{path} estimated nothing for {length} bytes"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_assembly_measures_each_item_with_its_content_type_ratio() {
+    let repo = fixture_repo("estimate-wiring");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let explicit = vec!["src/lib.rs".to_string(), "README.md".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        "repo_estimate",
+        "Review",
+        &explicit,
+        None,
+        None,
+    );
+
+    for path in ["src/lib.rs", "README.md"] {
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.path.as_deref() == Some(path))
+            .unwrap_or_else(|| panic!("{path} should be an included item"));
+        let estimate = TokenEstimate::for_item(item.kind, item.path.as_deref());
+        assert_eq!(
+            item.tokens,
+            estimate.tokens(&item.content),
+            "{path} was not measured with its content type's ratio"
+        );
+    }
+
+    let code = plan
+        .items
+        .iter()
+        .find(|item| item.path.as_deref() == Some("src/lib.rs"))
+        .unwrap();
+    assert!(
+        code.tokens > code.content.len().div_ceil(4),
+        "the code ratio must differ from len / 4: {} vs {}",
+        code.tokens,
+        code.content.len().div_ceil(4)
+    );
+    let prose = plan
+        .items
+        .iter()
+        .find(|item| item.path.as_deref() == Some("README.md"))
+        .unwrap();
+    assert_eq!(
+        prose.tokens,
+        prose.content.len().div_ceil(4),
+        "prose keeps today's figure"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn each_category_reports_whether_its_tokens_are_measured_or_estimated() {
+    let repo = fixture_repo("estimate-marked");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let explicit = vec!["src/lib.rs".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        "repo_marked",
+        "Explain src/lib.rs",
+        &explicit,
+        None,
+        None,
+    );
+
+    assert_eq!(plan.manifest.categories.len(), 11);
+    for usage in &plan.manifest.categories {
+        assert!(
+            usage.estimated,
+            "{:?} reports an estimate as measured",
+            usage.category
+        );
+    }
+    assert_eq!(
+        plan.manifest.total_tokens,
+        plan.items.iter().map(|item| item.tokens).sum::<usize>(),
+        "the manifest total is the sum of the estimates"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Compares the estimate recorded with each request against the input tokens
+/// the provider reported, over an existing Damaian data directory. Offline: it
+/// reads `model_request_prepared` from the audit log and `task_usage_recorded`
+/// from the session logs, reads no API key, and writes nothing.
+///
+/// Ignored because it inspects a real data directory instead of a fixture. Run
+/// it manually:
+///
+/// ```text
+/// DAMAIAN_CALIBRATION_DATA_DIR="$HOME/Library/Application Support/DamaianClient" \
+///   CARGO_TARGET_DIR="$PWD/target" \
+///   cargo nextest run -p workspace-engine --test context_assembly \
+///   --run-ignored ignored-only -E 'test(calibration_compares)'
+/// ```
+///
+/// With the variable unset it prints how to set it and returns.
+#[test]
+#[ignore = "reads a real Damaian data directory; run manually (see the doc comment)"]
+fn calibration_compares_estimates_with_recorded_usage() {
+    let Some(data_dir) = std::env::var_os("DAMAIAN_CALIBRATION_DATA_DIR") else {
+        println!(
+            "calibration_compares_estimates_with_recorded_usage needs a data directory: \
+             DAMAIAN_CALIBRATION_DATA_DIR=<data dir> CARGO_TARGET_DIR=\"$PWD/target\" \
+             cargo nextest run -p workspace-engine --test context_assembly \
+             --run-ignored ignored-only -E 'test(calibration_compares)'"
+        );
+        return;
+    };
+    let data_dir = PathBuf::from(data_dir);
+
+    // Estimates are recorded per request round; usage is recorded per call.
+    // Both are keyed by (session, task) and paired in file order, which is the
+    // order the rounds were attempted in.
+    let mut estimates: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for event in audit_events(&data_dir, "model_request_prepared") {
+        let (Some(session), Some(task)) = (event["sessionId"].as_str(), event["taskId"].as_str())
+        else {
+            continue;
+        };
+        let Some(estimate) = event["tokenEstimate"]
+            .as_str()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        estimates
+            .entry((session.to_string(), task.to_string()))
+            .or_default()
+            .push(estimate);
+    }
+
+    let measured = recorded_input_tokens(&data_dir);
+    let mut pairs: Vec<(String, usize, u64)> = Vec::new();
+    let mut unpaired = 0usize;
+    for (key, estimates) in &estimates {
+        let Some(measured) = measured.get(key) else {
+            unpaired += estimates.len();
+            continue;
+        };
+        for (estimate, actual) in estimates.iter().zip(measured) {
+            pairs.push((format!("{} / {}", key.1, key.0), *estimate, *actual));
+        }
+        unpaired += estimates.len().saturating_sub(measured.len());
+        unpaired += measured.len().saturating_sub(estimates.len());
+    }
+    pairs.sort_by(|left, right| left.0.cmp(&right.0));
+
+    if pairs.is_empty() {
+        println!(
+            "no paired model_request_prepared / task_usage_recorded rounds in {}: nothing to compare",
+            data_dir.display()
+        );
+        return;
+    }
+
+    let mut estimated_total = 0u64;
+    let mut measured_total = 0u64;
+    for (key, estimate, actual) in &pairs {
+        estimated_total += *estimate as u64;
+        measured_total += actual;
+        let bps = (*estimate as u128 * 10_000) / u128::from(*actual);
+        println!(
+            "task {key}: estimate {estimate}, measured {actual} input tokens, {:.2}% of measured",
+            format_basis_points(bps)
+        );
+    }
+    let overall = (u128::from(estimated_total) * 10_000) / u128::from(measured_total);
+    println!(
+        "{} paired rounds ({unpaired} unpaired): estimate {estimated_total}, measured {measured_total} input tokens, {:.2}%",
+        pairs.len(),
+        format_basis_points(overall)
+    );
+    println!(
+        "positive error means the estimate runs high; spec 19 §7 measured the \
+         whole-request len / 4 estimate at +2.5% to +6.3% on DeepSeek"
+    );
+}
+
+/// `model_request_prepared`'s token estimates, paired with the usage recorded
+/// for the same (session, task). Reads `sessions/*.jsonl`; the file stem is the
+/// session id the audit event names.
+fn recorded_input_tokens(data_dir: &Path) -> HashMap<(String, String), Vec<u64>> {
+    let mut measured: HashMap<(String, String), Vec<u64>> = HashMap::new();
+    let Ok(entries) = fs::read_dir(data_dir.join("sessions")) else {
+        return measured;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let Some(session) = entry
+            .path()
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Ok(contents) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if event["eventType"] != "task_usage_recorded" {
+                continue;
+            }
+            let (Some(task), Some(input)) =
+                (event["taskId"].as_str(), event["inputTokens"].as_u64())
+            else {
+                continue;
+            };
+            measured
+                .entry((session.clone(), task.to_string()))
+                .or_default()
+                .push(input);
+        }
+    }
+    measured
+}
+
+/// Basis points as a percentage with two decimals, in integer arithmetic: the
+/// same reason assembly decides inclusion without floats.
+fn format_basis_points(bps: u128) -> String {
+    format!("{}.{:02}", bps / 100, bps % 100)
+}
+
+/// The live half of the calibration. Sends three fixed documents — a prose
+/// paragraph, a Rust function and a JSON object, each about 1–2 kB — one per
+/// call, and prints the provider-reported input tokens against the document's
+/// size for each.
+///
+/// It resolves the key exactly as a normal non-desktop turn does: the variable
+/// `config.model_api_key_env` names in the data directory's `user.conf`, read
+/// with `env::var`. It never prints, logs or stores the value, adds no
+/// environment variable of its own, and does not read the Keychain (that module
+/// belongs to `desktop-shell`). A `keychain:` reference therefore cannot be
+/// resolved from this crate: point `DAMAIAN_DATA_DIR` at a temporary directory
+/// whose `user.conf` names an environment variable, or measure the same three
+/// documents through the app instead.
+///
+/// Ignored because it calls a real model provider over the network; it spends
+/// the user's money and only runs when explicitly selected. Run it manually,
+/// with a **temporary** data directory so it cannot touch real state:
+///
+/// ```text
+/// DAMAIAN_DATA_DIR=/tmp/damaian-calibration \
+///   CARGO_TARGET_DIR="$PWD/target" \
+///   cargo nextest run -p workspace-engine --test context_assembly \
+///   --run-ignored ignored-only -E 'test(calibration_measures_bytes_per_token)'
+/// ```
+#[test]
+#[ignore = "calls a real model provider over the network; run manually (see the doc comment)"]
+fn calibration_measures_bytes_per_token() {
+    let Some(data_dir) = std::env::var_os("DAMAIAN_DATA_DIR") else {
+        println!(
+            "calibration_measures_bytes_per_token needs a temporary data directory: \
+             DAMAIAN_DATA_DIR=/tmp/damaian-calibration CARGO_TARGET_DIR=\"$PWD/target\" \
+             cargo nextest run -p workspace-engine --test context_assembly \
+             --run-ignored ignored-only -E 'test(calibration_measures_bytes_per_token)'"
+        );
+        return;
+    };
+    let data_dir = PathBuf::from(data_dir);
+    let real = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("Library")
+        .join("Application Support")
+        .join("DamaianClient");
+    assert_ne!(
+        data_dir, real,
+        "point DAMAIAN_DATA_DIR at a temporary directory, never the real one"
+    );
+
+    let (config, _report) = Config::load_for_repository_reporting(None)
+        .expect("the data directory's config should load");
+    let api_key = std::env::var(&config.model_api_key_env).unwrap_or_else(|_| {
+        panic!(
+            "set the environment variable `{}`, which this config's model_api_key_env names",
+            config.model_api_key_env
+        )
+    });
+    let transport = CurlModelTransport::new(
+        &config.model_base_url,
+        api_key,
+        ProcessRegistry::open(&config.data_dir).expect("the process registry should open"),
+        &config.data_dir,
+    );
+    let mut adapter = OpenAICompatibleAdapter::with_provider(
+        &config.model_provider,
+        &config.model_name,
+        transport,
+    );
+
+    println!(
+        "provider {} model {}",
+        config.model_provider, config.model_name
+    );
+
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_wait = |_seconds: u64| {};
+    for (name, document) in [
+        ("prose", CALIBRATION_PROSE),
+        ("rust", CALIBRATION_RUST),
+        ("json", CALIBRATION_JSON),
+    ] {
+        let request = ModelRequest {
+            provider: config.model_provider.clone(),
+            model: config.model_name.clone(),
+            messages: vec![ModelMessage::user(format!(
+                "Reply with the single word OK. Do not explain.\n\n{document}"
+            ))],
+            temperature: Some("0".to_string()),
+            reasoning_level: Some(config.model_reasoning_level.clone()),
+            stream: true,
+            tools: None,
+            max_tokens: Some(16),
+            request_usage: true,
+            emit_cache_breakpoints: false,
+        };
+        let run = adapter
+            .stream_response(&request, &cancel, &mut on_token, &mut on_wait)
+            .expect("the calibration call should succeed");
+        assert_eq!(
+            run.usage.source,
+            UsageSource::Measured,
+            "{name}: the provider did not report usage, so bytes per token cannot be calibrated"
+        );
+        let tokens = run.usage.input_tokens;
+        let bytes = document.len() as u64;
+        assert!(tokens > 0, "{name}: a measured call has input tokens");
+        // 1 to 8 bytes per token is the band any real tokenizer falls in for
+        // these documents. Outside it, the instruction or the reply dominated
+        // the count and the ratio says nothing about the document.
+        assert!(
+            tokens <= bytes && tokens * 8 >= bytes,
+            "{name}: {bytes} bytes measured {tokens} input tokens"
+        );
+        let bytes_per_token_bps = bytes * 10_000 / tokens;
+        println!(
+            "{name}: {bytes} bytes, {tokens} input tokens = {:.2} bytes/token; \
+             len / 4 would have estimated {} input tokens",
+            format_basis_points(u128::from(bytes_per_token_bps)),
+            bytes.div_ceil(4)
+        );
+    }
+}
+
+/// ASCII, so a character is a byte in the `chars / tokens` figures. Fixed
+/// content, not files: no repository and no index are involved.
+const CALIBRATION_PROSE: &str = "\
+Context assembly decides what a model sees before a turn begins. The pipeline \
+collects candidates from explicit paths, prompt mentions, keyword and semantic \
+search, the instruction hierarchy, project rules, the repository map, the \
+symbol index, hook additions and a carried plan. Each candidate is redacted, \
+measured and then charged to a category budget, so the sum of what is sent \
+stays inside the configured limit. A category that runs out of its share drops \
+its lowest-priority members first and records why it did so; an unused share \
+moves forward to later categories in pipeline order. The manifest describes \
+every included item by path, range and token estimate, and every exclusion by \
+reason, without ever carrying the content itself. That distinction matters, \
+because the manifest is written to the audit log where a reader can inspect \
+what the turn actually saw. The estimate is deliberately still an estimate: \
+assembly must choose before the call, while a provider reports the real figure \
+only afterwards. What improves here is the ratio behind the estimate, chosen \
+per kind of content rather than fixed for every byte.";
+
+const CALIBRATION_RUST: &str = "\
+use std::collections::HashMap;
+
+/// Accumulates per-category token use while a plan is assembled.
+pub struct BudgetLedger {
+    remaining_by_category: HashMap<u32, usize>,
+    dropped: Vec<(u32, String)>,
+}
+
+impl BudgetLedger {
+    pub fn new(shares: &[u16; 10], available: usize) -> Self {
+        let mut remaining_by_category = HashMap::with_capacity(shares.len());
+        for (category, share) in shares.iter().enumerate() {
+            let allocation = available * usize::from(*share) / 10_000;
+            remaining_by_category.insert(category as u32, allocation);
+        }
+        Self { remaining_by_category, dropped: Vec::new() }
+    }
+
+    /// Charge one item to its category, or record it as excluded.
+    pub fn charge(&mut self, category: u32, path: &str, tokens: usize) -> bool {
+        let Some(remaining) = self.remaining_by_category.get_mut(&category) else {
+            return false;
+        };
+        if tokens > *remaining {
+            self.dropped.push((category, path.to_string()));
+            return false;
+        }
+        *remaining -= tokens;
+        true
+    }
+
+    pub fn carry_forward(&mut self, from: u32, to: u32) -> usize {
+        let unused = self.remaining_by_category.remove(&from).unwrap_or(0);
+        *self.remaining_by_category.entry(to).or_insert(0) += unused;
+        unused
+    }
+}";
+
+const CALIBRATION_JSON: &str = "\
+{
+  \"schemaVersion\": 3,
+  \"repository\": { \"id\": \"repo_01hzy\", \"root\": \"packages/api\" },
+  \"categories\": [
+    { \"name\": \"required\", \"shareBps\": 0, \"used\": 41, \"truncated\": false },
+    { \"name\": \"instructions\", \"shareBps\": 1000, \"used\": 214, \"truncated\": false },
+    { \"name\": \"repository_map\", \"shareBps\": 500, \"used\": 388, \"truncated\": true },
+    { \"name\": \"symbols\", \"shareBps\": 1000, \"used\": 640, \"truncated\": false },
+    { \"name\": \"search_results\", \"shareBps\": 1500, \"used\": 1173, \"truncated\": false },
+    { \"name\": \"file_ranges\", \"shareBps\": 2500, \"used\": 2044, \"truncated\": false }
+  ],
+  \"included\": [
+    { \"path\": \"src/lib.rs\", \"lineRange\": { \"start\": 12, \"end\": 40 }, \"tokens\": 188 },
+    { \"path\": \"src/budget.rs\", \"lineRange\": null, \"tokens\": 731 }
+  ],
+  \"excluded\": [
+    { \"reason\": \"category_budget_exhausted\", \"path\": \"src/legacy.rs\", \"detail\": null },
+    { \"reason\": \"restricted_path\", \"path\": \"secrets/token.txt\", \"detail\": null }
+  ],
+  \"limit\": { \"tokens\": 64000, \"source\": \"declared\", \"safetyMarginBps\": 0 }
+}";

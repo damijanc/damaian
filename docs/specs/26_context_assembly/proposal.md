@@ -608,6 +608,35 @@ the sanity bound the new estimator has to beat; per-content-type ratios need a
 live measurement, because only the request's total is reported. §7 records how
 that measurement runs and what it is allowed to read.
 
+**The provisional ratios, and why Task 7 replaces them.** Task 6 lands the
+estimator with three ratios and no provider measurement behind them. They are
+labelled provisional in the code (`TokenEstimate`) as well as here; the live
+calibration in §7 replaces them with measured values. Until then they come from
+the figures below:
+
+| content type | selected by | bytes / token | derivation |
+|---|---|---|---|
+| prose and Markdown | `.md`, `.markdown`, `.mdx`, `.txt`, `.rst`, `.adoc`; prose-like kinds | 4 | today's fixed ratio. Spec 19 §7 measured the whole-request figure 2.5–6.3% high on DeepSeek, so prose keeps a ratio already known not to under-count |
+| source code | `.rs`, `.go`, `.py`, `.js`, `.ts`, `.java`, `.kt`, `.c`, `.h`, `.cpp`, `.cs`, `.rb`, `.php`, `.swift`, `.sh`, `.sql`; also a file with no recognised extension | 3.5 (7/2) | short identifiers and punctuation-heavy lines are the commonly cited ~3–3.5 bytes/token case for code. Over-counting is the safe direction |
+| structured data | `.json`, `.jsonc`, `.jsonl`, `.yaml`, `.yml`, `.toml`, `.xml`, `.csv`, `.tsv`, `.html`, `.css`, `.scss`, `.lock`, `.ipynb` | 3 | quoted keys, braces, commas and short scalar values put a token boundary at nearly every mark |
+
+Every ratio is at or below four bytes per token, so no classified content is
+estimated lower than `len / 4` was; the estimate can grow but never shrink, and
+§5.7's margin absorbs the error where a real limit makes it matter. The estimate
+is integer arithmetic — `ceil(len × denominator / numerator)` — so no float
+rounding can decide which item fits and `prompt_cache`'s determinism guard is
+unaffected. Content type comes from `kind` and the file extension only, never
+from scanning the text, so two assemblies of an unchanged repository measure
+identically.
+
+Two paths stay prose on purpose. `Symbols` and `RepositoryMap` items are
+path-less blocks whose own renderer (`render_for_model`) fits them to a ceiling
+counted with `len / 4`; measuring the same text with a denser ratio would report
+more tokens than the ceiling it was rendered to. Their ceilings move only when
+their renderers share this estimator, which is outside Task 6's "change only
+inside `add_text`" boundary and is recorded as a discovery rather than done
+here.
+
 It remains an estimate, is labelled as such in the manifest
 (`CategoryUsage::estimated`), and the safety margin in §5.7 is what absorbs the
 residual error. Where a provider reports usage, the measured figure supersedes
@@ -752,7 +781,9 @@ To be completed during implementation. Record:
      (`chat.rs:2921-2926`), and every completed call records measured input
      tokens (`task_usage_recorded`, spec 19 §5.4). Joining them per session and
      round gives the estimate/measured ratio for real traffic on this machine,
-     with no provider call and no key. This is the comparison that must show the
+     with no provider call and no key. The test (`calibration_compares_estimates_with_recorded_usage`,
+     `#[ignore]`) takes the directory to read from `DAMAIAN_CALIBRATION_DATA_DIR`
+     and writes nothing. This is the comparison that must show the
      new estimator is no worse than `len / 4` (spec 19 §7 measured 2.5–6.3%
      high).
   2. **Live, per content type.** Three small fixed fixture documents — prose, Rust
