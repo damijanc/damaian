@@ -16,10 +16,15 @@
 //! clothes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::command_policy::relative_location;
+use crate::error::Result;
 use crate::plan::{PlanReport, TaskPlan};
+use crate::repository_map::RepositoryMap;
+use crate::validation::{CommandProposal, ValidationOrchestrator};
 
 /// The command prefix that distinguishes a browser behaviour check from a
 /// project check. A browser check is still a [`CheckId`], so it is selected,
@@ -637,4 +642,95 @@ fn count(number: usize, noun: &str) -> String {
     } else {
         format!("{number} {noun}s")
     }
+}
+
+/// Whether a changed path is documentation, and so selects no checks.
+///
+/// Deliberately an extension list rather than `detect_language`: that maps every
+/// unknown extension to `text`, which would classify `Makefile` and `build.sh`
+/// as documentation and skip the checks for a change that can break the build
+/// (spec 23 `context.md` §2).
+pub fn is_documentation(path: &str) -> bool {
+    let Some((_, extension)) = path.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "md" | "txt" | "rst" | "adoc"
+    )
+}
+
+/// The roots whose checks a change selects.
+///
+/// Selection is by owning root and every non-removed root that encloses it, not
+/// by file category: a member change is a workspace change, and a workspace
+/// root's check is what catches a member breaking a sibling (proposal §5.2).
+/// Documentation selects nothing. Sorted and de-duplicated, so the caller can
+/// compare selections directly.
+pub fn select_roots(map: &RepositoryMap, changed: &[String]) -> Vec<String> {
+    let mut selected = BTreeSet::new();
+    for path in changed {
+        if is_documentation(path) {
+            continue;
+        }
+        for root in map.enclosing_roots(path) {
+            selected.insert(root.to_string());
+        }
+    }
+    selected.into_iter().collect()
+}
+
+/// What [`propose_checks`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    /// Only documentation changed: nothing is selected, and that is not a
+    /// failure or an empty success.
+    OnlyDocumentation,
+    /// The selected roots detect no project check at all. Distinct from
+    /// `Proposed(Vec::new())`, because "no checks were available" must read
+    /// differently from "checks passed" (proposal §5.2).
+    NoChecksAvailable { roots: Vec<String> },
+    /// Checks to propose, in the restricted map's order, each with the
+    /// policy's own proposal.
+    Proposed(Vec<(CheckId, CommandProposal)>),
+}
+
+/// Select the roots a change touched and ask the validation orchestrator for
+/// their detected checks.
+///
+/// `propose_detected_validations` is the only discovery path: this function
+/// restricts the map first, so nothing is stored and audited that will not run,
+/// and then calls it unchanged (proposal §5.2, `context.md` §2).
+pub fn propose_checks(
+    orchestrator: &ValidationOrchestrator,
+    repository_root: &Path,
+    map: &RepositoryMap,
+    changed: &[String],
+) -> Result<Selection> {
+    let roots = select_roots(map, changed);
+    if roots.is_empty() {
+        return Ok(Selection::OnlyDocumentation);
+    }
+    let proposals =
+        orchestrator.propose_detected_validations(repository_root, &map.restricted_to(&roots))?;
+    if proposals.is_empty() {
+        return Ok(Selection::NoChecksAvailable { roots });
+    }
+    Ok(Selection::Proposed(
+        proposals
+            .into_iter()
+            .map(|proposal| {
+                // Check identity is repository-relative. Proposals carry the
+                // absolute directory they will run in; the map only ever
+                // proposes roots inside the repository, so the relative form
+                // exists. The fallback keeps the identity unique rather than
+                // silently collapsing it onto the repository root.
+                let working_directory =
+                    relative_location(repository_root, Path::new(&proposal.working_directory))
+                        .unwrap_or_else(|| proposal.working_directory.clone());
+                let check = CheckId::new(working_directory, proposal.command.clone());
+                (check, proposal)
+            })
+            .collect(),
+    ))
 }

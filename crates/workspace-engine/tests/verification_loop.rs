@@ -1,10 +1,15 @@
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
-    CheckId, CheckOutcome, Evidence, PlanReport, PlanStep, SkipReason, TaskPlan, VerificationEvent,
-    VerificationOutcome, VerificationReport, VerificationState, fold_verification,
+    CheckId, CheckOutcome, Config, Evidence, PlanReport, PlanStep, Selection, SkipReason, TaskPlan,
+    VerificationEvent, VerificationOutcome, VerificationReport, VerificationState, WorkspaceEngine,
+    fold_verification, is_documentation, propose_checks, select_roots,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -476,4 +481,332 @@ fn an_interrupted_check_is_never_reported_as_passed() {
             .iter()
             .any(|item| item.check == interrupted && item.reason == "no result was recorded")
     );
+}
+
+// --- Selection by root (Task 2) -------------------------------------------
+
+static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn temp_dir(name: &str) -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should work")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "damaian-verify-{name}-{now}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("temp dir should be created");
+    dir
+}
+
+const MONOREPO: &[(&str, &str)] = &[
+    ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+    ("crates/engine/Cargo.toml", "[package]\nname = \"engine\"\n"),
+    ("crates/engine/src/lib.rs", "pub fn engine() {}\n"),
+    ("crates/cli/Cargo.toml", "[package]\nname = \"cli\"\n"),
+    ("crates/cli/src/main.rs", "fn main() {}\n"),
+    (
+        "packages/web/package.json",
+        "{\"scripts\":{\"test\":\"node test.js\"}}",
+    ),
+    ("packages/web/src/index.ts", "export {};\n"),
+    ("docs/guide.md", "# Guide\n"),
+    ("Makefile", "all:\n\ttrue\n"),
+    ("build.sh", "#!/bin/sh\ntrue\n"),
+];
+
+struct Monorepo {
+    root: PathBuf,
+    data_dir: PathBuf,
+}
+
+impl Monorepo {
+    fn new(name: &str) -> Self {
+        let root = temp_dir(name);
+        for (path, content) in MONOREPO {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, content).unwrap();
+        }
+        Self {
+            root,
+            data_dir: temp_dir(&format!("{name}-data")),
+        }
+    }
+
+    fn config(&self) -> Config {
+        Config {
+            data_dir: self.data_dir.clone(),
+            enable_index_watcher: false,
+            shell: "/usr/bin/true".to_string(),
+            ..Config::default()
+        }
+    }
+
+    fn engine(&self) -> WorkspaceEngine {
+        WorkspaceEngine::new(self.config())
+    }
+
+    fn map(&self, engine: &WorkspaceEngine) -> workspace_engine::RepositoryMap {
+        engine
+            .repository_map(&self.root)
+            .expect("the fixture should map")
+            .0
+    }
+
+    fn pending_proposals(&self) -> usize {
+        let directory = self.data_dir.join("commands").join("pending");
+        match fs::read_dir(directory) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "dcmd"))
+                .count(),
+            Err(_) => 0,
+        }
+    }
+}
+
+impl Drop for Monorepo {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.data_dir);
+    }
+}
+
+#[test]
+fn a_member_change_selects_its_own_root_and_every_enclosing_root() {
+    let repo = Monorepo::new("member");
+    let engine = repo.engine();
+    let map = repo.map(&engine);
+    let changed = vec!["crates/engine/src/lib.rs".to_string()];
+
+    assert_eq!(
+        select_roots(&map, &changed),
+        vec!["".to_string(), "crates/engine".to_string()]
+    );
+
+    let selection =
+        propose_checks(&engine.validation_orchestrator, &repo.root, &map, &changed).unwrap();
+    let Selection::Proposed(checks) = selection else {
+        panic!("expected proposed checks, got {selection:?}");
+    };
+    let directories: Vec<&str> = checks
+        .iter()
+        .map(|(check, _)| check.working_directory.as_str())
+        .collect();
+    assert!(directories.contains(&""));
+    assert!(directories.contains(&"crates/engine"));
+    assert!(!directories.contains(&"crates/cli"));
+    assert!(!directories.contains(&"packages/web"));
+    for (check, proposal) in &checks {
+        if check.working_directory == "crates/engine" {
+            assert!(proposal.working_directory.ends_with("crates/engine"));
+        }
+    }
+}
+
+#[test]
+fn a_web_change_does_not_duplicate_the_test_script() {
+    let repo = Monorepo::new("web");
+    let engine = repo.engine();
+    let map = repo.map(&engine);
+    let changed = vec!["packages/web/src/index.ts".to_string()];
+
+    assert_eq!(
+        select_roots(&map, &changed),
+        vec!["".to_string(), "packages/web".to_string()]
+    );
+
+    let selection =
+        propose_checks(&engine.validation_orchestrator, &repo.root, &map, &changed).unwrap();
+    let Selection::Proposed(checks) = selection else {
+        panic!("expected proposed checks, got {selection:?}");
+    };
+    let web_commands: Vec<&str> = checks
+        .iter()
+        .filter(|(check, _)| check.working_directory == "packages/web")
+        .map(|(check, _)| check.command.as_str())
+        .collect();
+    assert!(
+        web_commands.contains(&"npm run test"),
+        "the detected test script should be proposed: {web_commands:?}"
+    );
+    assert!(
+        !web_commands.contains(&"npm test"),
+        "test-shortcut runs the same script and is dropped within the root: {web_commands:?}"
+    );
+
+    let restricted = map.restricted_to(&["packages/web".to_string()]);
+    let names: Vec<&str> = restricted.roots[0]
+        .commands
+        .iter()
+        .map(|command| command.name.as_str())
+        .collect();
+    assert!(names.contains(&"test"));
+    assert!(!names.contains(&"test-shortcut"));
+}
+
+#[test]
+fn only_documentation_changes_select_nothing() {
+    let repo = Monorepo::new("docs");
+    let engine = repo.engine();
+    let map = repo.map(&engine);
+
+    assert_eq!(
+        propose_checks(
+            &engine.validation_orchestrator,
+            &repo.root,
+            &map,
+            &["docs/guide.md".to_string()]
+        )
+        .unwrap(),
+        Selection::OnlyDocumentation
+    );
+    assert!(select_roots(&map, &["docs/guide.md".to_string()]).is_empty());
+
+    assert!(is_documentation("docs/guide.md"));
+    assert!(is_documentation("NOTES.MD"));
+    assert!(!is_documentation("Makefile"));
+    assert!(!is_documentation("build.sh"));
+    assert!(!is_documentation("src/main.rs"));
+    assert_eq!(
+        select_roots(&map, &["Makefile".to_string()]),
+        vec!["".to_string()],
+        "a Makefile is not documentation, so the root that owns it is selected"
+    );
+}
+
+#[test]
+fn a_removed_root_is_never_selected() {
+    let repo = Monorepo::new("removed");
+    let engine = WorkspaceEngine::new(Config {
+        project_roots_removed: vec!["packages/web".to_string()],
+        ..repo.config()
+    });
+    let map = repo.map(&engine);
+
+    assert_eq!(
+        select_roots(&map, &["packages/web/src/index.ts".to_string()]),
+        vec!["".to_string()],
+        "a removed root owns nothing; its files belong to the nearest live root"
+    );
+}
+
+#[test]
+fn only_the_selected_roots_proposals_are_stored() {
+    let repo = Monorepo::new("stored");
+    let engine = repo.engine();
+    let map = repo.map(&engine);
+    let changed = vec!["crates/engine/src/lib.rs".to_string()];
+
+    let before = repo.pending_proposals();
+    let selection =
+        propose_checks(&engine.validation_orchestrator, &repo.root, &map, &changed).unwrap();
+    let Selection::Proposed(checks) = selection else {
+        panic!("expected proposed checks, got {selection:?}");
+    };
+    assert_eq!(
+        checks.len(),
+        2,
+        "the repository root and crates/engine each propose cargo test"
+    );
+    assert_eq!(
+        repo.pending_proposals() - before,
+        2,
+        "every proposed check is stored once and nothing else is"
+    );
+}
+
+#[test]
+fn test_shortcut_is_dropped_only_within_the_root_that_has_the_script() {
+    let command = |name: &str, command: &str| workspace_engine::RootCommand {
+        name: name.to_string(),
+        command: command.to_string(),
+        risk: workspace_engine::CommandRisk::Low,
+        working_directory: String::new(),
+    };
+    let root =
+        |path: &str, commands: Vec<workspace_engine::RootCommand>| workspace_engine::ProjectRoot {
+            path: path.to_string(),
+            detected_by: workspace_engine::RootEvidence::RepositoryRoot,
+            languages: Vec::new(),
+            manifests: Vec::new(),
+            entry_points: Vec::new(),
+            test_paths: Vec::new(),
+            generated_paths: Vec::new(),
+            major_directories: Vec::new(),
+            instruction_files: Vec::new(),
+            commands,
+            user_override: None,
+        };
+    let map = workspace_engine::RepositoryMap {
+        repository_id: "repo".to_string(),
+        schema_version: workspace_engine::REPOSITORY_MAP_SCHEMA_VERSION,
+        generated_at_ms: 0,
+        fingerprint: "fingerprint".to_string(),
+        roots: vec![
+            root(
+                "",
+                vec![
+                    command("test", "npm run test"),
+                    command("test-shortcut", "npm test"),
+                ],
+            ),
+            // Only the shortcut, as a hand-built map can hold even though
+            // detection would pair it with the script.
+            root("packages/api", vec![command("test-shortcut", "npm test")]),
+        ],
+        excluded: Vec::new(),
+    };
+
+    let restricted = map.restricted_to(&["".to_string(), "packages/api".to_string()]);
+    let root_names = |path: &str| -> Vec<String> {
+        restricted
+            .roots
+            .iter()
+            .find(|root| root.path == path)
+            .unwrap()
+            .commands
+            .iter()
+            .map(|command| command.name.clone())
+            .collect()
+    };
+    assert!(!root_names("").contains(&"test-shortcut".to_string()));
+    assert!(
+        root_names("packages/api").contains(&"test-shortcut".to_string()),
+        "dropping the shortcut in one root must not drop it in another"
+    );
+}
+
+#[test]
+fn a_repository_with_no_detected_checks_says_so() {
+    let root = temp_dir("no-checks");
+    let data_dir = temp_dir("no-checks-data");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: data_dir.clone(),
+        enable_index_watcher: false,
+        ..Config::default()
+    });
+    let map = engine.repository_map(&root).unwrap().0;
+
+    let selection = propose_checks(
+        &engine.validation_orchestrator,
+        &root,
+        &map,
+        &["src/main.rs".to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        selection,
+        Selection::NoChecksAvailable {
+            roots: vec!["".to_string()]
+        }
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
 }

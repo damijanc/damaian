@@ -280,6 +280,48 @@ pub struct RepositoryMap {
 }
 
 impl RepositoryMap {
+    /// A copy holding only `roots`, for a caller that will propose their
+    /// checks and nothing else.
+    ///
+    /// `propose_detected_validations` stores and audits a proposal per command,
+    /// so proposing on the whole map and discarding most of it would write
+    /// proposals that never run (spec 23 `context.md` §2). Within each kept
+    /// root, `npm test` (`test-shortcut`) is dropped when the root also
+    /// proposes `npm run test`: both run the same script. Nothing is
+    /// de-duplicated across roots, because whether a workspace root's check
+    /// covers a member depends on the manifest, and guessing wrong would skip
+    /// the test that mattered.
+    ///
+    /// Never persisted: only the restricted map's proposals are.
+    pub fn restricted_to(&self, roots: &[String]) -> RepositoryMap {
+        let wanted: BTreeSet<&str> = roots.iter().map(String::as_str).collect();
+        let mut restricted = self.clone();
+        restricted
+            .roots
+            .retain(|root| wanted.contains(root.path.as_str()));
+        for root in &mut restricted.roots {
+            let has_run_test = root
+                .commands
+                .iter()
+                .any(|item| item.command == "npm run test");
+            if has_run_test {
+                root.commands.retain(|item| item.name != "test-shortcut");
+            }
+        }
+        restricted
+    }
+
+    /// Every root that encloses `path` — its owning root and every root above
+    /// it — skipping removed roots. Empty only when no root encloses it.
+    pub fn enclosing_roots(&self, path: &str) -> Vec<&str> {
+        self.roots
+            .iter()
+            .filter(|root| root.user_override != Some(RootOverride::Removed))
+            .filter(|root| owns(&root.path, path))
+            .map(|root| root.path.as_str())
+            .collect()
+    }
+
     /// Derives the map from an index, with no second walk. Only the commands
     /// read the disk, through [`CommandPolicy::detect_root_commands`]. Every
     /// collection is sorted here rather than trusted to the index's order,

@@ -190,9 +190,9 @@ pub use validation::{
     command_approval_prompt, resolve_command_directory,
 };
 pub use verification::{
-    BROWSER_CHECK_PREFIX, CheckId, CheckOutcome, CheckRun, FailedCheck, SkipReason, SkippedCheck,
-    VerificationDue, VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
-    fold_verification,
+    BROWSER_CHECK_PREFIX, CheckId, CheckOutcome, CheckRun, FailedCheck, Selection, SkipReason,
+    SkippedCheck, VerificationDue, VerificationEvent, VerificationOutcome, VerificationReport,
+    VerificationState, fold_verification, is_documentation, propose_checks, select_roots,
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,
