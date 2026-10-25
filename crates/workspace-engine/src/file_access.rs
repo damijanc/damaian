@@ -4,6 +4,7 @@ use crate::error::{ClientError, Result};
 use crate::hash::file_hash;
 use crate::path_policy::PathPolicy;
 use crate::secret_scanner::SecretScanner;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
@@ -12,7 +13,8 @@ use std::path::Path;
 /// Spec 47 §5.6: this is the representation spec 26 adopts for `ContextItem`
 /// rather than defining a second one, because a ranged read is what produces
 /// the ranges that spec deduplicates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LineRange {
     pub start: usize,
     pub end: usize,

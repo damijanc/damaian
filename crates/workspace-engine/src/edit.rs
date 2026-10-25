@@ -6,7 +6,7 @@ use crate::checkpoint::{
     CheckpointRequest, CheckpointStore,
 };
 use crate::config::Config;
-use crate::context_manager::{ContextItem, ContextManager};
+use crate::context_manager::{ContextManager, ContextPlan, PromptSectionName};
 use crate::error::{ClientError, Result};
 use crate::finding::{Finding, FindingDraft, FindingSource, Severity};
 use crate::hash::{create_id, repository_id_for_root};
@@ -521,7 +521,7 @@ impl EditOrchestrator {
             model: self.config.model_name.clone(),
             messages: vec![
                 ModelMessage::system(edit_system_prompt()),
-                ModelMessage::user(build_edit_prompt(prompt, &context.items)),
+                ModelMessage::user(build_edit_prompt(&context)),
             ],
             temperature: Some("0".to_string()),
             reasoning_level: Some(self.config.model_reasoning_level.clone()),
@@ -1083,24 +1083,27 @@ fn edit_system_prompt() -> String {
     )
 }
 
-fn build_edit_prompt(prompt: &str, items: &[ContextItem]) -> String {
-    let mut output = String::new();
-    output.push_str("User edit request:\n");
-    output.push_str(prompt);
-    output.push_str("\n\nRepository context:\n");
-    for item in items {
-        output.push_str("\n--- ");
-        output.push_str(&item.kind);
-        if let Some(path) = &item.path {
-            output.push_str(": ");
-            output.push_str(path);
-        }
-        output.push_str(" ---\n");
-        output.push_str(&item.content);
-        if !item.content.ends_with('\n') {
-            output.push('\n');
+fn build_edit_prompt(plan: &ContextPlan) -> String {
+    let mut context = String::new();
+    let mut request = String::new();
+    for section in plan.sections() {
+        match section.name {
+            PromptSectionName::RepositoryContext => context = section.text,
+            PromptSectionName::UserRequest => request = section.text,
+            // A one-shot edit has no conversation block.
+            PromptSectionName::RecentConversation => {}
         }
     }
+
+    // The request comes only from the plan's redacted `Required` item, never
+    // from the caller's argument (Correction C17). The order stays
+    // request-first: a one-shot edit makes a single call, so there is no cache
+    // prefix to order and the existing shape is kept.
+    let mut output = String::new();
+    output.push_str("User edit request:\n");
+    output.push_str(&request);
+    output.push_str("\n\nRepository context:\n");
+    output.push_str(&context);
     output
 }
 

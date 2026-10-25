@@ -85,7 +85,8 @@ pub use config::{
     overlay_field_kinds, parse_mcp_transport,
 };
 pub use context_manager::{
-    ContextItem, ContextManager, ContextPlan, RepositoryMapSource, SymbolSource,
+    ContextCategory, ContextItem, ContextKind, ContextManager, ContextPlan, PromptSection,
+    PromptSectionName, RepositoryMapSource, SymbolSource,
 };
 pub use data_schema::{
     CURRENT_DATA_SCHEMA_VERSION, DataSchemaError, DataSchemaOutcome, ensure_data_dir_schema,

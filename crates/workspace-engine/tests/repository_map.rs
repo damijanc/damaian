@@ -40,7 +40,7 @@ use workspace_engine::finding::resolve_finding_path;
 use workspace_engine::indexer::SkippedFile;
 use workspace_engine::{
     ApprovalCause, AuditLog, CancelToken, ChatTurnResult, CommandPolicy, CommandRisk, CommandStore,
-    Config, ConfigOverlay, Degradation, DetectedRoot, ExcludedPath, ExclusionReason,
+    Config, ConfigOverlay, ContextKind, Degradation, DetectedRoot, ExcludedPath, ExclusionReason,
     MAX_ROOT_DEPTH, MapLoad, MockModelAdapter, ModelAdapter, PROJECT_MANIFESTS, ProjectIndexer,
     ProjectRoot, REPOSITORY_MAP_SCHEMA_VERSION, RebuildReason, RepositoryIndex, RepositoryKeyClass,
     RepositoryMap, RepositoryMapStore, RootCommand, RootDetection, RootEvidence, RootOverride,
@@ -1842,20 +1842,22 @@ fn build_context_places_one_map_item_before_retrieved_files() {
         &[],
         16_000,
     );
-    let kinds: Vec<&str> = plan.items.iter().map(|item| item.kind.as_str()).collect();
+    let kinds: Vec<ContextKind> = plan.items.iter().map(|item| item.kind).collect();
     let maps: Vec<usize> = kinds
         .iter()
         .enumerate()
-        .filter(|(_, kind)| **kind == "repository_map")
+        .filter(|(_, kind)| **kind == ContextKind::RepositoryMap)
         .map(|(position, _)| position)
         .collect();
     assert_eq!(maps.len(), 1, "{kinds:?}");
     let first_retrieved = kinds
         .iter()
-        .position(|kind| *kind == "retrieved_file")
+        .position(|kind| *kind == ContextKind::RetrievedFile)
         .expect("the prompt retrieves files, or this test proves nothing");
     assert!(maps[0] < first_retrieved, "{kinds:?}");
-    let last_rule = kinds.iter().rposition(|kind| *kind == "project_rule");
+    let last_rule = kinds
+        .iter()
+        .rposition(|kind| *kind == ContextKind::ProjectRule);
     assert!(last_rule.is_none_or(|rule| rule < maps[0]), "{kinds:?}");
 
     let item = &plan.items[maps[0]];
@@ -1885,7 +1887,10 @@ fn build_context_places_one_map_item_before_retrieved_files() {
         16_000,
     );
     assert!(
-        !plan.items.iter().any(|item| item.kind == "repository_map"),
+        !plan
+            .items
+            .iter()
+            .any(|item| item.kind == ContextKind::RepositoryMap),
         "a ceiling of 0 turns the item off"
     );
 
@@ -1898,7 +1903,12 @@ fn build_context_places_one_map_item_before_retrieved_files() {
         &[],
         16_000,
     );
-    assert!(!plan.items.iter().any(|item| item.kind == "repository_map"));
+    assert!(
+        !plan
+            .items
+            .iter()
+            .any(|item| item.kind == ContextKind::RepositoryMap)
+    );
 }
 
 #[test]

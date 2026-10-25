@@ -50,7 +50,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use workspace_engine::finding::{FindingSource, FindingStatus, Severity, SourceRange};
 use workspace_engine::language::extract_symbols;
 use workspace_engine::{
-    AuditLog, CommandPolicy, Config, ConfigOverlay, ContextPlan, Declaration,
+    AuditLog, CommandPolicy, Config, ConfigOverlay, ContextKind, ContextPlan, Declaration,
     LANGUAGE_SERVER_LANGUAGES, LanguageServerError, LanguageServerHub, LanguageServerLaunch,
     LanguageServerLimits, LanguageServerState, MERGE_LINE_TOLERANCE, MatchQuality,
     MockModelAdapter, PathPolicy, ProcessIdentity, ProcessKind, ProcessRegistry, ProjectIndexer,
@@ -3202,8 +3202,8 @@ impl Repo {
     }
 }
 
-fn kinds(plan: &ContextPlan) -> Vec<&str> {
-    plan.items.iter().map(|item| item.kind.as_str()).collect()
+fn kinds(plan: &ContextPlan) -> Vec<ContextKind> {
+    plan.items.iter().map(|item| item.kind).collect()
 }
 
 /// The one `symbols` item's content, asserting there is exactly one.
@@ -3211,7 +3211,7 @@ fn symbols_item(plan: &ContextPlan) -> &str {
     let items: Vec<_> = plan
         .items
         .iter()
-        .filter(|item| item.kind == "symbols")
+        .filter(|item| item.kind == ContextKind::Symbols)
         .collect();
     assert_eq!(items.len(), 1, "{:?}", kinds(plan));
     assert_eq!(items[0].path, None);
@@ -3235,14 +3235,17 @@ fn a_prompt_naming_a_symbol_gets_one_hedged_symbols_item_after_the_map() {
     assert!(!content.contains("matching symbols shown"), "{content}");
 
     let kinds = kinds(&plan);
-    let symbols = kinds.iter().position(|kind| *kind == "symbols").unwrap();
+    let symbols = kinds
+        .iter()
+        .position(|kind| *kind == ContextKind::Symbols)
+        .unwrap();
     let map = kinds
         .iter()
-        .position(|kind| *kind == "repository_map")
+        .position(|kind| *kind == ContextKind::RepositoryMap)
         .expect("the map is in the plan");
     let first_retrieved = kinds
         .iter()
-        .position(|kind| *kind == "retrieved_file")
+        .position(|kind| *kind == ContextKind::RetrievedFile)
         .expect("the prompt retrieves files, or the order is not tested");
     assert!(map < symbols && symbols < first_retrieved, "{kinds:?}");
 
@@ -3305,12 +3308,20 @@ fn no_symbols_item_at_ceiling_zero_or_for_a_prompt_that_names_nothing() {
     symbols_item(&repo.context(&repo.engine_with(1_600), prompt));
 
     let off = repo.context(&repo.engine_with(0), prompt);
-    assert!(!kinds(&off).contains(&"symbols"), "{:?}", kinds(&off));
-    assert!(kinds(&off).contains(&"repository_map"), "{:?}", kinds(&off));
+    assert!(
+        !kinds(&off).contains(&ContextKind::Symbols),
+        "{:?}",
+        kinds(&off)
+    );
+    assert!(
+        kinds(&off).contains(&ContextKind::RepositoryMap),
+        "{:?}",
+        kinds(&off)
+    );
 
     let nothing = repo.context(&repo.engine_with(1_600), "Please tidy the error messages.");
     assert!(
-        !kinds(&nothing).contains(&"symbols"),
+        !kinds(&nothing).contains(&ContextKind::Symbols),
         "{:?}",
         kinds(&nothing)
     );
@@ -3325,7 +3336,7 @@ fn no_symbols_item_at_ceiling_zero_or_for_a_prompt_that_names_nothing() {
         prompt,
     );
     assert!(
-        !kinds(&map_off).contains(&"repository_map"),
+        !kinds(&map_off).contains(&ContextKind::RepositoryMap),
         "{:?}",
         kinds(&map_off)
     );
@@ -3344,7 +3355,7 @@ fn a_small_ceiling_drops_matches_and_says_how_many_were_shown() {
     let item = plan
         .items
         .iter()
-        .find(|item| item.kind == "symbols")
+        .find(|item| item.kind == ContextKind::Symbols)
         .unwrap();
     assert!(item.tokens <= 120, "{} tokens", item.tokens);
     let shown = item
@@ -3373,10 +3384,10 @@ fn a_symbol_index_that_cannot_be_stored_is_left_out_and_the_turn_goes_on() {
         "Why does upload_retry give up so early?",
     );
     let kinds = kinds(&plan);
-    assert!(!kinds.contains(&"symbols"), "{kinds:?}");
-    assert!(kinds.contains(&"user_prompt"), "{kinds:?}");
-    assert!(kinds.contains(&"repository_map"), "{kinds:?}");
-    assert!(kinds.contains(&"retrieved_file"), "{kinds:?}");
+    assert!(!kinds.contains(&ContextKind::Symbols), "{kinds:?}");
+    assert!(kinds.contains(&ContextKind::UserPrompt), "{kinds:?}");
+    assert!(kinds.contains(&ContextKind::RepositoryMap), "{kinds:?}");
+    assert!(kinds.contains(&ContextKind::RetrievedFile), "{kinds:?}");
 }
 
 #[test]

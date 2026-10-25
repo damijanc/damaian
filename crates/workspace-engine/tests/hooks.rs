@@ -36,8 +36,8 @@ use workspace_engine::hooks::{
 };
 use workspace_engine::{
     ApprovalCause, AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, CommandPolicy,
-    CommandRunner, CommandStore, Config, ConfigOverlay, ConfigScope, EffectivePolicy, HookConfig,
-    HookEvent, HookMode, HookReview, HookSource, MAX_HOOK_TIMEOUT_MS, MockModelAdapter,
+    CommandRunner, CommandStore, Config, ConfigOverlay, ConfigScope, ContextKind, EffectivePolicy,
+    HookConfig, HookEvent, HookMode, HookReview, HookSource, MAX_HOOK_TIMEOUT_MS, MockModelAdapter,
     ModelAdapter, ModelProviderConfig, ProcessRegistry, RepositoryConfigReport, RepositoryKeyClass,
     SecretScanner, Session, SessionMode, SessionStore, SourceKind, Task, TaskStatus, ToolCall,
     TurnProgress, TurnSink, ValidationOrchestrator, WorkspaceEngine, classify_session,
@@ -3016,12 +3016,16 @@ fn a_before_context_hook_adds_a_redacted_hook_context_item_to_an_edit_plan() {
         &[("noter".to_string(), "x".repeat(400))],
     );
     assert!(
-        plan.items.iter().any(|item| item.kind == "user_prompt"),
+        plan.items
+            .iter()
+            .any(|item| item.kind == ContextKind::UserPrompt),
         "the budget was too small to compare anything: {:?}",
         plan.items
     );
     assert!(
-        plan.items.iter().all(|item| item.kind != "hook_context"),
+        plan.items
+            .iter()
+            .all(|item| item.kind != ContextKind::HookContext),
         "{:?}",
         plan.items
     );

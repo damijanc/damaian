@@ -245,6 +245,8 @@ pub struct ContextItem {
     pub kind: ContextKind,
     pub path: Option<String>,
     /// `None` means the whole file, or content with no file identity.
+    /// Serialised as `lineRange`.
+    #[serde(rename = "lineRange")]
     pub range: Option<LineRange>,
     pub content: String,
     pub tokens: usize,
@@ -578,8 +580,13 @@ function:
    specs assign the decision to this one or to #49.
 3. **The request is rendered once, redacted.** `Required` items render under the
    final `User request:` heading, and the `Repository context:` block holds only
-   the other categories. Because the `Required` item is produced by `add_text`,
-   it is already redacted (C17); the raw `prompt` argument is never written.
+   the other categories. Because `Required` items are produced by `add_text`,
+   they are already redacted (C17); the raw `prompt` argument is never written.
+   The heading already names the request, so its `--- user_prompt ---` item
+   header is not repeated inside it: the section is the item's content. The
+   one-shot edit keeps its own `User edit request:` preamble and its
+   request-first order — it makes a single call, so there is no cache prefix to
+   order — but it renders the same section from the same item.
 
 The redaction half is not cosmetic. Today `build_model_prompt` writes the raw
 `prompt` under `User request:` (`chat.rs:6126-6127`), and nothing redacts that

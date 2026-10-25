@@ -5,7 +5,7 @@
 **Implements:** [`proposal.md`](proposal.md), with the corrections below and the
 current-code map in [`context.md`](context.md)
 **Started:** 2026-10-24
-**Status:** In progress. Planned 2026-10-24 against `main`; no task started yet.
+**Status:** In progress. Planned 2026-10-24 against `main`; Task 1 landed 2026-10-25.
 
 ## Open questions for the owner
 
@@ -43,7 +43,7 @@ blocked. If the answer is different, the named task changes in one place.
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Categories, ranges and one renderer | Not started | |
+| 1 · Categories, ranges and one renderer | Done 2026-10-25 | **Landed:** `ContextCategory` (all 11 variants, derived `Ord` so declaration order *is* pipeline priority) and `ContextKind` (10 variants, `as_str()` returning today's exact prompt spellings, and `category()` as the single kind→category mapping). `ContextItem` gained `category`, `kind: ContextKind`, `range: Option<LineRange>` (serialised `lineRange`), `provenance: Option<Provenance>` and `root_path`; `LineRange` gained `Serialize`/`Deserialize`; `add_text`/`add_file` take a `ContextKind` and derive the category, so no caller can set them inconsistently. `ContextPlan::render_item` is the one header format (a range appends `path:start-end`), `sections()` returns the plan-owned blocks stable→volatile (`PromptSection`/`PromptSectionName`, each with `heading()`), and `included_paths()` is the Task 5 seam. `build_model_prompt` now takes `&ContextPlan` + `&SecretScanner` and `build_edit_prompt` takes `&ContextPlan`; neither takes the raw prompt. Chat order is `Repository context:` → `Recent conversation:` → `User request:`, the request is the redacted `Required` item's content, and each prior message is redacted *before* truncation. The edit flow keeps `User edit request:` first (a single call has no cache prefix to order) but renders through the same sections. Existing `item.kind` readers moved to `ContextKind` in `tests/repository_map.rs`, `tests/symbol_index.rs` and `tests/hooks.rs`; `tests/foundation.rs`'s assertions were prompt strings and stayed unchanged; chat's `approval_prompt_wording_tests` now builds a plan by hand. **Tests:** 10 new in `tests/context_assembly.rs` (range-less byte-identical, ranged header, section order, request once, chat and edit prompt redaction, replayed-turn redaction, oversized-prompt survival added by the review fix, chat/edit items identical, category order) and 3 serde unit tests in `context_manager.rs`. `cargo nextest run -p workspace-engine --test context_assembly --test foundation --test repository_map --test symbol_index --test hooks --test prompt_cache`: 404 passed, 3 skipped. `--lib -E 'test(context_manager)'`: 3 passed. `--lib -E 'test(chat::)'`: 70 passed. Scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean (deny included, no lock issue); `cargo run -p eval-harness -- run --tier deterministic`: all 23 scenarios pass, completion 1.000, check pass 0.724, 0 restricted-path/secret violations. **Falsified (all reverted, all caught):** (a) rendering `Required` in the context block as well as the request → `the_user_request_appears_once` (2 occurrences); (b) emitting the conversation block before the context → the order test; (c) changing the range-less header ` ---` to ` ----` → the byte-identical test; (d) overriding the request with a reintroduced raw `prompt` argument → the chat prompt-secret test printed the raw `AKIA…` key, and the same mutation in `build_edit_prompt` → the edit prompt-secret test; (e) using `message.content.clone()` instead of `scanner.redact` → the replayed-secret test printed the raw key. **Deviations:** (1) The request section is the `Required` item's content, not its `--- user_prompt ---` header — the heading already names it; proposal §5.10 records this. (2) The edit flow keeps request-first order; only chat moves to stable→volatile. (3) `sections()` returns only the two plan-owned sections; the conversation block is the caller's, because the plan holds no messages. (4) `ContextItem::range` keeps the proposal's field name and is serialised as `lineRange` (Task 1 Step 1's required serde name). **Discoveries for later tasks:** (1) `RetrievedFile` maps to `FileRanges`, so keyword/semantic hits currently land in `FileRanges`, not `SearchResults`; Task 2/4 must either add a `ContextKind` for them or let a collection source set the category explicitly — `add_text` deliberately has no category parameter today. (2) The legacy `command_context` block still renders after the request with its own `--- command_result ---` header; its only production call passes `None`, so it was left alone. (3) `tests/prompt_cache.rs` passed unchanged, so the new section order is still deterministic. **Review fix 2026-10-25:** the first cut rendered the request only from the `Required` item but left it subject to `add_text`'s budget check, so a prompt larger than `context_token_budget` produced an empty `User request:` — a regression against the old raw-prompt path. `add_text` now exempts `ContextCategory::Required` from the over-budget refusal while still redacting it and charging its tokens to `token_estimate`; it stays one code path, and a comment records that Task 4 replaces the exemption with the visible "Required item does not fit" error. New test `a_prompt_larger_than_the_budget_still_reaches_the_model_redacted` (16-token budget, prompt with a distinctive marker and an AWS key) asserts the marker and the redaction marker arrive and the raw key does not. **Falsified (reverted):** restoring the unconditional budget check makes that test fail on the empty `User request:`. Rerun: `--test context_assembly --test foundation --test prompt_cache` 179 passed; the six-file set 404 passed, 3 skipped; scoped clippy clean; `scripts/quality-gate.sh fmt typos` clean. |
 | 2 · Collection sources and exclusion at collection time | Not started | |
 | 3 · Range deduplication and ranged reads | Not started | |
 | 4 · Per-category budgets and the effective limit | Not started | |
@@ -258,7 +258,7 @@ item, makes the range expressible, makes one renderer the only place a header is
 written, and closes the two places where unredacted text reaches the provider
 (C17).
 
-- [ ] **Step 1: Write the failing tests** in
+- [x] **Step 1: Write the failing tests** in
       `crates/workspace-engine/tests/context_assembly.rs`, with `temp_dir`,
       `write_fixture` and `test_config` copied from `foundation.rs:20-61`
       (`enable_index_watcher: false`, `data_dir` inside the fixture).
@@ -292,9 +292,9 @@ written, and closes the two places where unredacted text reaches the provider
   In the four existing files, replace `item.kind == "retrieved_file"` with
   `item.kind == ContextKind::RetrievedFile` etc.; the prompt-string assertions
   stay as they are.
-- [ ] **Step 2: Run them and confirm they fail** on the missing types:
+- [x] **Step 2: Run them and confirm they fail** on the missing types:
       `cargo nextest run -p workspace-engine --test context_assembly`.
-- [ ] **Step 3: Implement.** Add the two enums (each with `as_str`, `ContextKind`'s
+- [x] **Step 3: Implement.** Add the two enums (each with `as_str`, `ContextKind`'s
       returning today's exact spellings), the three new fields (each `None` until a
       later task fills it), `PromptSection`, `render_item` and `sections()`; make
       `build_model_prompt` and `build_edit_prompt` use it.
@@ -305,16 +305,16 @@ written, and closes the two places where unredacted text reaches the provider
       no fallback to it. Pass each prior message's content through the orchestrator's
       `SecretScanner` before writing the conversation block (C17). Keep the item
       text and the trailing-newline behaviour identical.
-- [ ] **Step 4: Falsify.** (a) Render the request as a section *and* as a
+- [x] **Step 4: Falsify.** (a) Render the request as a section *and* as a
       `Required` item → `the_user_request_appears_once` fails; (b) restore the
       conversation-first order → the order test fails; (c) change the range-less
       header at all → the byte-identical test fails; (d) render the raw `prompt`
       argument instead of the `Required` items → the prompt-secret test fails and
       the raw token appears in the request; (e) write the conversation block
       without the scanner → the replayed-secret test fails. Revert each.
-- [ ] **Step 5: Update the proposal** for C1, C3, C4, C15, C16 and C17 (already
+- [x] **Step 5: Update the proposal** for C1, C3, C4, C15, C16 and C17 (already
       folded in; confirm §2, §5.1, §5.10 and §6 agree).
-- [ ] **Step 6: Scoped checks.** `cargo nextest run -p workspace-engine --test
+- [x] **Step 6: Scoped checks.** `cargo nextest run -p workspace-engine --test
       context_assembly --test foundation --test repository_map --test symbol_index
       --test hooks --test prompt_cache`, `cargo nextest run -p workspace-engine
       --lib -E 'test(context_manager)'`, scoped clippy for `workspace-engine`,
@@ -444,7 +444,8 @@ written, and closes the two places where unredacted text reaches the provider
       allocate, redistribute, truncate, and build `EffectiveLimit`.
       `build_context` now returns `Result<ContextPlan>`: a `Required` item that
       does not fit is `ClientError::InvalidInput` naming the limit, and both
-      callers propagate it so the turn fails visibly.
+      callers propagate it so the turn fails visibly. Replace Task 1's interim
+      exemption that lets `add_text` keep a `Required` item regardless of budget.
 - [ ] **Step 4: Falsify.** Strict caps without redistribution → the
       redistribution test fails; over-share stealing from the next category →
       the truncation test fails; accept a repository raise → the weakening case

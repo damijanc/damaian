@@ -13,7 +13,7 @@ use crate::command_policy::{
 use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::config::{Config, CostEstimate, McpTransport};
-use crate::context_manager::ContextManager;
+use crate::context_manager::{ContextManager, ContextPlan, PromptSectionName};
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
 use crate::error::{ClientError, ProviderRefusal, Result};
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
@@ -1037,7 +1037,7 @@ impl ChatOrchestrator {
             self.config.context_token_budget(),
             &hook_context,
         );
-        let model_prompt = build_model_prompt(prompt, &context.items, &prior_messages, None);
+        let model_prompt = build_model_prompt(&context, &prior_messages, &self.scanner, None);
         let mode = self.session_store.session_mode(&session.id);
         // A worker is never invited to hand off further work (spec 57 §5.0).
         let offer_handoffs = self.config.enable_worker_sessions
@@ -6099,12 +6099,27 @@ fn command_envelope_paragraph_read_only(shell: &str) -> String {
 }
 
 fn build_model_prompt(
-    prompt: &str,
-    items: &[crate::context_manager::ContextItem],
+    plan: &ContextPlan,
     prior_messages: &[ChatMessage],
+    scanner: &SecretScanner,
     command_context: Option<&str>,
 ) -> String {
     let mut output = String::new();
+    let mut request = String::new();
+    for section in plan.sections() {
+        match section.name {
+            PromptSectionName::RepositoryContext => {
+                output.push_str(section.name.heading());
+                output.push('\n');
+                output.push_str(&section.text);
+            }
+            PromptSectionName::UserRequest => request = section.text,
+            // The conversation block belongs to the caller: the plan holds no
+            // messages. It is written between these two below.
+            PromptSectionName::RecentConversation => {}
+        }
+    }
+
     let recent_messages = prior_messages
         .iter()
         .rev()
@@ -6114,31 +6129,32 @@ fn build_model_prompt(
         .rev()
         .collect::<Vec<_>>();
     if !recent_messages.is_empty() {
-        output.push_str("Recent conversation:\n");
+        output.push('\n');
+        output.push_str(PromptSectionName::RecentConversation.heading());
+        output.push('\n');
         for message in recent_messages {
             output.push_str(&message.role);
             output.push_str(": ");
-            output.push_str(&truncate_for_prompt(&message.content, 2_000));
-            output.push('\n');
-        }
-        output.push('\n');
-    }
-    output.push_str("User request:\n");
-    output.push_str(prompt);
-    output.push_str("\n\nRepository context:\n");
-    for item in items {
-        output.push_str("\n--- ");
-        output.push_str(&item.kind);
-        if let Some(path) = &item.path {
-            output.push_str(": ");
-            output.push_str(path);
-        }
-        output.push_str(" ---\n");
-        output.push_str(&item.content);
-        if !item.content.ends_with('\n') {
+            // Stored messages are verbatim by spec 16's design, so a secret
+            // typed in an earlier turn is still in the transcript. Redact
+            // before truncating: truncating first could leave half a secret
+            // straddling the cut with nothing left to recognise it (C17).
+            let redacted = scanner.redact(&message.content).text;
+            output.push_str(&truncate_for_prompt(&redacted, 2_000));
             output.push('\n');
         }
     }
+
+    // The request comes only from the plan's redacted `Required` item. The
+    // caller's prompt is never rendered, and there is deliberately no fallback
+    // to it: a fallback would reopen the leak the moment the item was absent
+    // (Correction C17).
+    output.push('\n');
+    output.push_str(PromptSectionName::UserRequest.heading());
+    output.push('\n');
+    output.push_str(&request);
+    output.push('\n');
+
     if let Some(command_context) = command_context {
         output.push_str("\n--- command_result ---\n");
         output.push_str(command_context);
@@ -10463,7 +10479,29 @@ mod approval_prompt_wording_tests {
             );
         }
 
-        let with_result = build_model_prompt("Question", &[], &[], Some("Command: pwd\n"));
+        let plan = crate::context_manager::ContextPlan {
+            repository_id: "repo".to_string(),
+            task_id: "task".to_string(),
+            token_estimate: 2,
+            items: vec![crate::context_manager::ContextItem {
+                category: crate::context_manager::ContextCategory::Required,
+                kind: crate::context_manager::ContextKind::UserPrompt,
+                path: None,
+                range: None,
+                content: "Question".to_string(),
+                tokens: 2,
+                redaction_status: "clean".to_string(),
+                provenance: None,
+                root_path: None,
+            }],
+            files: Vec::new(),
+        };
+        let with_result = build_model_prompt(
+            &plan,
+            &[],
+            &SecretScanner::default(),
+            Some("Command: pwd\n"),
+        );
         assert!(
             !with_result.to_lowercase().contains("sandbox"),
             "a command result sent to the model still says sandbox: {with_result}"

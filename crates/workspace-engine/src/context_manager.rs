@@ -1,11 +1,12 @@
 use crate::command_policy::CommandPolicy;
-use crate::file_access::FileAccessController;
+use crate::file_access::{FileAccessController, LineRange};
 use crate::indexer::RepositoryIndex;
 use crate::path_policy::PathPolicy;
 use crate::repository_map::{RepositoryMap, RepositoryMapStore};
 use crate::secret_scanner::SecretScanner;
-use crate::symbol_index::SymbolIndexStore;
+use crate::symbol_index::{Provenance, SymbolIndexStore};
 use crate::vector_index::VectorIndexCache;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -22,13 +23,148 @@ const PROJECT_RULES: &[&str] = &[
     "build.gradle",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The budget and priority bucket an item belongs to (proposal §5.1, §5.2).
+///
+/// Declaration order is the pipeline order and therefore the item order under
+/// a tight budget: `Ord` is derived so priority cannot drift from the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCategory {
+    /// Never dropped. The user's own message.
+    Required,
+    /// The `AGENTS.md` hierarchy and root project rules.
+    Instructions,
+    /// A rule or note the user installed through a hook (spec 32).
+    HookContext,
+    /// User-selected context (spec 27; reserved in spec 26).
+    Pinned,
+    PlanState,
+    RepositoryMap,
+    Symbols,
+    SearchResults,
+    FileRanges,
+    /// Reserved for spec 22's repair subset.
+    Findings,
+    /// Reserved for spec 55.
+    ConversationSummary,
+}
+
+impl ContextCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Instructions => "instructions",
+            Self::HookContext => "hook_context",
+            Self::Pinned => "pinned",
+            Self::PlanState => "plan_state",
+            Self::RepositoryMap => "repository_map",
+            Self::Symbols => "symbols",
+            Self::SearchResults => "search_results",
+            Self::FileRanges => "file_ranges",
+            Self::Findings => "findings",
+            Self::ConversationSummary => "conversation_summary",
+        }
+    }
+}
+
+/// The source label the prompt header shows.
+///
+/// Separate from [`ContextCategory`] because the model distinguishes "you asked
+/// for this file" from "search found it", and the spelling is the one every
+/// existing prompt already uses, so a range-less item renders byte-identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextKind {
+    UserPrompt,
+    ExplicitFile,
+    AgentInstruction,
+    ProjectRule,
+    HookContext,
+    RepositoryMap,
+    Symbols,
+    RetrievedFile,
+    PlanState,
+    Pinned,
+}
+
+impl ContextKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UserPrompt => "user_prompt",
+            Self::ExplicitFile => "explicit_file",
+            Self::AgentInstruction => "agent_instruction",
+            Self::ProjectRule => "project_rule",
+            Self::HookContext => "hook_context",
+            Self::RepositoryMap => "repository_map",
+            Self::Symbols => "symbols",
+            Self::RetrievedFile => "retrieved_file",
+            Self::PlanState => "plan_state",
+            Self::Pinned => "pinned",
+        }
+    }
+
+    /// The one place the kind-to-category decision lives (proposal §5.1).
+    pub fn category(self) -> ContextCategory {
+        match self {
+            Self::UserPrompt => ContextCategory::Required,
+            Self::AgentInstruction | Self::ProjectRule => ContextCategory::Instructions,
+            Self::HookContext => ContextCategory::HookContext,
+            Self::Pinned => ContextCategory::Pinned,
+            Self::PlanState => ContextCategory::PlanState,
+            Self::RepositoryMap => ContextCategory::RepositoryMap,
+            Self::Symbols => ContextCategory::Symbols,
+            Self::RetrievedFile | Self::ExplicitFile => ContextCategory::FileRanges,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContextItem {
-    pub kind: String,
+    pub category: ContextCategory,
+    pub kind: ContextKind,
     pub path: Option<String>,
+    /// `None` means the whole file, or content with no file identity. Serialised
+    /// as `lineRange` so a reader cannot mistake it for an index range.
+    #[serde(rename = "lineRange")]
+    pub range: Option<LineRange>,
     pub content: String,
     pub tokens: usize,
     pub redaction_status: String,
+    /// The lowest provenance among what this item contains (spec 25); `None`
+    /// for content that has no symbol provenance at all.
+    pub provenance: Option<Provenance>,
+    /// The repository root that owns `path` (spec 24); `None` when the item has
+    /// no file identity.
+    pub root_path: Option<String>,
+}
+
+/// One named block of the rendered user message, in stable-to-volatile order.
+///
+/// Named so spec 49's reuse slice can place a cache breakpoint at a boundary
+/// without re-parsing the string. Spec 26 emits no breakpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSection {
+    pub name: PromptSectionName,
+    /// The rendered block without its heading, which the caller owns.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PromptSectionName {
+    RepositoryContext,
+    RecentConversation,
+    UserRequest,
+}
+
+impl PromptSectionName {
+    pub fn heading(self) -> &'static str {
+        match self {
+            Self::RepositoryContext => "Repository context:",
+            Self::RecentConversation => "Recent conversation:",
+            Self::UserRequest => "User request:",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +174,74 @@ pub struct ContextPlan {
     pub token_estimate: usize,
     pub items: Vec<ContextItem>,
     pub files: Vec<String>,
+}
+
+impl ContextPlan {
+    /// The one item header format. Both prompt builders render through it, so
+    /// `--- kind: path ---` cannot drift between the chat and edit flows.
+    ///
+    /// The range is appended to the path (`src/lib.rs:12-40`), 1-based and
+    /// inclusive, so a ranged item names exactly what it contains.
+    pub fn render_item(item: &ContextItem) -> String {
+        let mut output = String::new();
+        output.push_str("\n--- ");
+        output.push_str(item.kind.as_str());
+        if let Some(path) = &item.path {
+            output.push_str(": ");
+            output.push_str(path);
+            if let Some(range) = item.range {
+                output.push_str(&format!(":{}-{}", range.start, range.end));
+            }
+        }
+        output.push_str(" ---\n");
+        output.push_str(&item.content);
+        if !item.content.ends_with('\n') {
+            output.push('\n');
+        }
+        output
+    }
+
+    /// The plan's own prompt sections, stable → volatile.
+    ///
+    /// Both are always present so the prompt's shape does not depend on whether
+    /// an item happened to fit. The conversation block sits between them and is
+    /// the caller's, because the messages do not belong to the plan.
+    ///
+    /// The request section is the redacted `Required` item's content: its
+    /// heading already names it, so the `--- user_prompt ---` header is not
+    /// repeated. That is also what keeps the request out of the repository
+    /// context block, where it used to be sent a second time.
+    pub fn sections(&self) -> Vec<PromptSection> {
+        let mut context = String::new();
+        let mut request = String::new();
+        for item in &self.items {
+            match item.category {
+                ContextCategory::Required => {
+                    if !request.is_empty() {
+                        request.push('\n');
+                    }
+                    request.push_str(&item.content);
+                }
+                _ => context.push_str(&Self::render_item(item)),
+            }
+        }
+
+        vec![
+            PromptSection {
+                name: PromptSectionName::RepositoryContext,
+                text: context,
+            },
+            PromptSection {
+                name: PromptSectionName::UserRequest,
+                text: request,
+            },
+        ]
+    }
+
+    /// The unique included paths, in inclusion order.
+    pub fn included_paths(&self) -> &[String] {
+        &self.files
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -141,7 +345,7 @@ impl ContextManager {
             &mut items,
             &mut token_estimate,
             token_budget,
-            "user_prompt",
+            ContextKind::UserPrompt,
             None,
             prompt,
         );
@@ -197,7 +401,7 @@ impl ContextManager {
                 repository_id,
                 task_id,
                 path,
-                "explicit_file",
+                ContextKind::ExplicitFile,
                 &mut files,
                 &mut items,
                 &mut token_estimate,
@@ -212,7 +416,7 @@ impl ContextManager {
                 repository_id,
                 task_id,
                 &instruction_path,
-                "agent_instruction",
+                ContextKind::AgentInstruction,
                 &mut files,
                 &mut items,
                 &mut token_estimate,
@@ -227,7 +431,7 @@ impl ContextManager {
                 repository_id,
                 task_id,
                 rule_path,
-                "project_rule",
+                ContextKind::ProjectRule,
                 &mut files,
                 &mut items,
                 &mut token_estimate,
@@ -245,7 +449,7 @@ impl ContextManager {
                 &mut items,
                 &mut token_estimate,
                 token_budget,
-                "repository_map",
+                ContextKind::RepositoryMap,
                 None,
                 &text,
             );
@@ -262,7 +466,7 @@ impl ContextManager {
                 &mut items,
                 &mut token_estimate,
                 token_budget,
-                "symbols",
+                ContextKind::Symbols,
                 None,
                 &text,
             );
@@ -279,7 +483,7 @@ impl ContextManager {
                 &mut items,
                 &mut token_estimate,
                 token_budget,
-                "hook_context",
+                ContextKind::HookContext,
                 Some(format!("hook:{hook_id}")),
                 text,
             );
@@ -292,7 +496,7 @@ impl ContextManager {
                     repository_id,
                     task_id,
                     &result.path,
-                    "retrieved_file",
+                    ContextKind::RetrievedFile,
                     &mut files,
                     &mut items,
                     &mut token_estimate,
@@ -368,7 +572,7 @@ impl ContextManager {
         repository_id: &str,
         task_id: &str,
         path: &str,
-        kind: &str,
+        kind: ContextKind,
         files: &mut Vec<String>,
         items: &mut Vec<ContextItem>,
         token_estimate: &mut usize,
@@ -412,7 +616,7 @@ fn add_text(
     items: &mut Vec<ContextItem>,
     token_estimate: &mut usize,
     token_budget: usize,
-    kind: &str,
+    kind: ContextKind,
     path: Option<String>,
     content: &str,
 ) -> bool {
@@ -421,13 +625,21 @@ fn add_text(
     }
     let redaction = scanner.redact(content);
     let tokens = redaction.text.len().div_ceil(4);
-    if *token_estimate + tokens > token_budget {
+    // `Required` is never dropped for budget (proposal §5.1). It is the user's
+    // own message, and the prompt is rendered only from this item (C17), so
+    // refusing it would send an empty `User request:` while the raw prompt went
+    // nowhere. It is still charged to the estimate, so the next item sees a
+    // budget that already accounts for it. Task 4 replaces this with a visible
+    // "Required item does not fit" error once categories are budgeted.
+    if kind.category() != ContextCategory::Required && *token_estimate + tokens > token_budget {
         return false;
     }
     *token_estimate += tokens;
     items.push(ContextItem {
-        kind: kind.to_string(),
+        category: kind.category(),
+        kind,
         path,
+        range: None,
         content: redaction.text,
         tokens,
         redaction_status: if redaction.findings.is_empty() {
@@ -435,6 +647,8 @@ fn add_text(
         } else {
             "redacted".to_string()
         },
+        provenance: None,
+        root_path: None,
     });
     true
 }
@@ -563,4 +777,68 @@ fn prompt_path_candidates(prompt: &str) -> Vec<String> {
             looks_like_path.then_some(candidate)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn categories_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ContextCategory::FileRanges).unwrap(),
+            "\"file_ranges\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ContextCategory::ConversationSummary).unwrap(),
+            "\"conversation_summary\""
+        );
+        assert_eq!(ContextCategory::HookContext.as_str(), "hook_context");
+    }
+
+    #[test]
+    fn kinds_serialize_with_todays_prompt_spellings() {
+        for (kind, spelling) in [
+            (ContextKind::UserPrompt, "user_prompt"),
+            (ContextKind::ExplicitFile, "explicit_file"),
+            (ContextKind::AgentInstruction, "agent_instruction"),
+            (ContextKind::ProjectRule, "project_rule"),
+            (ContextKind::HookContext, "hook_context"),
+            (ContextKind::RepositoryMap, "repository_map"),
+            (ContextKind::Symbols, "symbols"),
+            (ContextKind::RetrievedFile, "retrieved_file"),
+            (ContextKind::PlanState, "plan_state"),
+            (ContextKind::Pinned, "pinned"),
+        ] {
+            assert_eq!(kind.as_str(), spelling);
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{spelling}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn items_serialize_camel_case_with_line_range() {
+        let item = ContextItem {
+            category: ContextCategory::FileRanges,
+            kind: ContextKind::RetrievedFile,
+            path: Some("src/lib.rs".to_string()),
+            range: Some(LineRange { start: 12, end: 40 }),
+            content: "fn main() {}".to_string(),
+            tokens: 3,
+            redaction_status: "clean".to_string(),
+            provenance: Some(Provenance::Heuristic),
+            root_path: None,
+        };
+        let value = serde_json::to_value(&item).unwrap();
+
+        assert_eq!(value["category"], "file_ranges");
+        assert_eq!(value["kind"], "retrieved_file");
+        assert_eq!(value["redactionStatus"], "clean");
+        assert_eq!(value["lineRange"]["start"], 12);
+        assert_eq!(value["lineRange"]["end"], 40);
+        assert_eq!(value["provenance"], "heuristic");
+        assert_eq!(value["rootPath"], serde_json::Value::Null);
+    }
 }
