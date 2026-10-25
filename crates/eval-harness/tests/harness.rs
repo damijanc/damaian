@@ -1239,7 +1239,7 @@ fn every_scenario_runs_and_none_is_blocked() {
         Vec::<&str>::new(),
         "no scenario is deferred any more"
     );
-    assert_eq!(all.len(), 24, "twenty-four scenarios should run");
+    assert_eq!(all.len(), 26, "twenty-six scenarios should run");
 }
 
 #[test]
@@ -1526,8 +1526,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        24,
-        "all twenty-four scenario files should be accounted for"
+        26,
+        "all twenty-six scenario files should be accounted for"
     );
     assert_eq!(
         built
@@ -2085,6 +2085,9 @@ fn a_run_that_worked_through_a_plan_reports_what_became_of_its_steps() {
                 steps_blocked: 1,
                 steps_skipped: 0,
                 steps_outstanding: 0,
+                reminders_sent: 0,
+                left_open_at_end: false,
+                open_step_evidence: 0,
             },
         ),
         record_with_plan(
@@ -2096,6 +2099,9 @@ fn a_run_that_worked_through_a_plan_reports_what_became_of_its_steps() {
                 steps_blocked: 0,
                 steps_skipped: 0,
                 steps_outstanding: 0,
+                reminders_sent: 0,
+                left_open_at_end: false,
+                open_step_evidence: 0,
             },
         ),
     ];
@@ -2154,6 +2160,9 @@ fn a_blocked_step_is_never_counted_among_the_completed_ones() {
             steps_blocked: 2,
             steps_skipped: 0,
             steps_outstanding: 0,
+            reminders_sent: 0,
+            left_open_at_end: false,
+            open_step_evidence: 0,
         },
     )];
 
@@ -2166,6 +2175,57 @@ fn a_blocked_step_is_never_counted_among_the_completed_ones() {
     assert_eq!(count("plan_steps_blocked"), 2);
     assert_eq!(count("plan_steps_verified"), 0);
     assert_eq!(count("plan_steps_completed_unverified"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// A plan left open at turn end. Spec 66 §5.5.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_plan_answer_without_complete_step_gets_one_reminder_and_closes_after_it() {
+    let path = scenario::scenarios_dir().join("plan_answer_without_complete_step.toml");
+    let loaded = scenario::load(&path).expect("the scenario should load");
+    let run = eval_harness::runner::run(&loaded).expect("the scenario should run");
+
+    let plan = run.record.plan.as_ref().expect("the turn planned");
+    assert_eq!(plan.reminders_sent, 1, "exactly one reminder");
+    assert_eq!(plan.steps_outstanding, 0, "all three steps closed");
+    assert_eq!(plan.steps_verified, 1, "the read's exit confirms step 1");
+    assert_eq!(plan.steps_unverified, 2);
+    assert!(!plan.left_open_at_end);
+    assert_eq!(run.response, "The report is written.");
+    assert_eq!(run.last_assistant_message.as_deref(), Some("Done."));
+}
+
+#[test]
+fn a_plan_left_open_at_end_records_the_reminder_and_the_open_step() {
+    let path = scenario::scenarios_dir().join("plan_left_open_at_end.toml");
+    let loaded = scenario::load(&path).expect("the scenario should load");
+    let run = eval_harness::runner::run(&loaded).expect("the scenario should run");
+
+    let plan = run.record.plan.as_ref().expect("the turn planned");
+    assert_eq!(plan.reminders_sent, 1);
+    assert_eq!(plan.steps_outstanding, 3);
+    assert!(plan.left_open_at_end);
+    assert_eq!(
+        plan.open_step_evidence, 1,
+        "the `ls src` exit reached the step it left open"
+    );
+    assert_eq!(run.response, "The report is written.");
+    assert_eq!(
+        run.last_assistant_message.as_deref(),
+        Some("Still not done.")
+    );
+}
+
+#[test]
+fn the_planned_task_scenario_gets_no_reminder() {
+    let path = scenario::scenarios_dir().join("planned_task.toml");
+    let loaded = scenario::load(&path).expect("the scenario should load");
+    let run = eval_harness::runner::run(&loaded).expect("the scenario should run");
+
+    let plan = run.record.plan.as_ref().expect("the turn planned");
+    assert_eq!(plan.reminders_sent, 0, "a closed plan is never reminded");
 }
 
 /// Spec 21 §6's last acceptance criterion, restated against this harness: a

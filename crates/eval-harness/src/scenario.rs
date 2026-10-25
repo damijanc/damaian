@@ -116,6 +116,23 @@ pub struct Asserts {
     /// §5.5), which should be zero. Fails as well when the run executed no
     /// exploration command, since a zero over nothing measured nothing.
     pub exploration_findings: Option<u64>,
+    /// How many plan reminders the run sent (spec 66 §5.5). A scenario that
+    /// asserts this without a plan fails rather than comparing `None`.
+    pub plan_reminders: Option<u64>,
+    /// The final plan's verified / unverified / outstanding counts (spec 66
+    /// §5.5). Each reads `RecordedPlan`, which exists only when the turn made a
+    /// plan, so a planless run fails the assertion instead of reading a
+    /// vacuous zero.
+    pub plan_verified: Option<u64>,
+    pub plan_unverified: Option<u64>,
+    pub plan_outstanding: Option<u64>,
+    /// Whether the engine recorded `plan_left_open` for the run.
+    pub plan_left_open: Option<bool>,
+    /// Evidence items on the steps still open in the final plan.
+    pub plan_open_evidence: Option<u64>,
+    /// Strings the task's last assistant message must contain, read from the
+    /// session log. Script-derived, so it is `deterministic_only`.
+    pub last_assistant_message_contains: Option<Vec<String>>,
     /// Assertion names that depend on a scripted tool call and are therefore
     /// skipped in the live tier (proposal §5.3), so a scenario stays one
     /// definition rather than two that drift.

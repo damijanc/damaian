@@ -1,0 +1,49 @@
+name = "plan_left_open_at_end"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Work out what the upload client does, then write the report."
+
+# Spec 66 §5.5's second scenario: the model answers, receives the one
+# reminder, and answers again without closing anything. The turn ends with the
+# first answer as its response, the steps still open, and the command the turn
+# ran attached to the open step.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_plan", arguments = { steps = [
+    { title = "Collect the evidence" },
+    { title = "Verify the behaviour" },
+    { title = "Write the report" },
+  ] } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "Collect the evidence" } },
+]
+
+[[turn]]
+content = "The report is written."
+
+[[turn]]
+content = "Still not done."
+
+[assert]
+approval_required = false
+response_contains = ["The report is written."]
+plan_reminders = 1
+plan_outstanding = 3
+plan_left_open = true
+# The `ls src` exit was attached to the step that was still open when the turn
+# ended. On a pause it would instead be carried in the pending turn.
+plan_open_evidence = 1
+last_assistant_message_contains = ["Still not done."]
+final_task_status = "complete"
+deterministic_only = [
+  "plan_reminders",
+  "plan_outstanding",
+  "plan_left_open",
+  "plan_open_evidence",
+  "last_assistant_message_contains",
+]

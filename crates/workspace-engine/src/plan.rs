@@ -231,6 +231,16 @@ impl TaskPlan {
             > 1
     }
 
+    /// The steps whose outcome is still open: `Pending` or `InProgress`, in
+    /// plan order. `Blocked` is terminal for this purpose (#21 already stops
+    /// the handoff and tells the model), so it is not open.
+    pub fn open_steps(&self) -> Vec<&PlanStep> {
+        self.steps
+            .iter()
+            .filter(|step| !step.status.is_terminal())
+            .collect()
+    }
+
     /// Requirement 3's phase, **derived** from step state and never stored.
     ///
     /// §5.1: derived rather than set independently, so the phase cannot say
@@ -401,7 +411,14 @@ impl PlanReport {
     /// the step did finish — but the count is always named, because a plan
     /// reported as complete with three unverified steps and one reported as
     /// complete with none are different results.
-    pub fn summary(&self) -> String {
+    ///
+    /// `active` is whether a turn is still running (spec 66 §5.4). With open
+    /// steps and no turn, the summary says the turn ended with them not marked
+    /// done rather than only that they are outstanding: the difference is
+    /// whether the user is waiting for something. The blocked and finished
+    /// counts still follow, so the new sentence never hides a failure. With no
+    /// open steps the wording is the same either way.
+    pub fn summary(&self, active: bool) -> String {
         if self.steps.is_empty() {
             return "No steps planned.".to_string();
         }
@@ -412,10 +429,16 @@ impl PlanReport {
                 pluralise(self.verified + self.unverified, "step")
             ));
         } else {
+            if !active && self.outstanding > 0 {
+                parts.push(format!(
+                    "Turn ended with {} not marked done",
+                    pluralise(self.outstanding, "step")
+                ));
+            }
             if self.blocked > 0 {
                 parts.push(format!("{} blocked", pluralise(self.blocked, "step")));
             }
-            if self.outstanding > 0 {
+            if active && self.outstanding > 0 {
                 parts.push(format!(
                     "{} outstanding",
                     pluralise(self.outstanding, "step")
