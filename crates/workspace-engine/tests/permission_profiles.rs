@@ -583,6 +583,15 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "conversation_window_share=1.00\n",
             Reported("conversation_window_share"),
         ),
+        // Spec 28 §5.6: cross-project recall is the user's explicit decision,
+        // so a repository may not enable it (or disable it on the user's
+        // behalf).
+        case(
+            "memory_user_scope_enabled",
+            "",
+            "memory_user_scope_enabled=true\n",
+            Reported("memory_user_scope_enabled"),
+        ),
     ]
 }
 
@@ -3726,6 +3735,55 @@ fn pause_for_context_review_is_off_by_default_and_user_only() {
     assert_eq!(
         workspace_engine::rule_label("pause_for_context_review").as_deref(),
         Some("Pause before sending to review context")
+    );
+}
+
+#[test]
+fn memory_user_scope_is_off_by_default_and_user_only() {
+    assert!(!Config::default().memory_user_scope_enabled);
+
+    let (user, _) = load(
+        "memory-user-scope-user",
+        "memory_user_scope_enabled=true\n",
+        "",
+    );
+    assert!(user.memory_user_scope_enabled);
+
+    for value in ["true", "false"] {
+        let (config, report) = load(
+            "memory-user-scope-repo",
+            "",
+            &format!("memory_user_scope_enabled={value}\n"),
+        );
+        assert!(
+            !config.memory_user_scope_enabled,
+            "a repository may not set cross-project recall either way"
+        );
+        assert!(
+            report.rejected_keys.iter().any(|rejected| {
+                rejected.key == "memory_user_scope_enabled"
+                    && rejected.class == RepositoryKeyClass::Forbidden
+            }),
+            "a repository setting {value} must be reported as forbidden"
+        );
+    }
+
+    let overlay = ConfigOverlay {
+        memory_user_scope_enabled: Some(true),
+        ..ConfigOverlay::default()
+    };
+    let (carried, refused) = split_profile_keys(overlay);
+    assert!(carried.memory_user_scope_enabled.is_none());
+    assert!(
+        refused
+            .iter()
+            .any(|rejected| rejected.key == "memory_user_scope_enabled"
+                && rejected.class == RepositoryKeyClass::Forbidden),
+        "{refused:?}"
+    );
+    assert_eq!(
+        workspace_engine::rule_label("memory_user_scope_enabled").as_deref(),
+        Some("Remember facts across projects")
     );
 }
 

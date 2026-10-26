@@ -1189,3 +1189,23 @@ fn a_superseded_entry_keeps_the_link_to_its_replacement() {
         .unwrap();
     assert_eq!(second.supersedes.as_deref(), Some(first.id.as_str()));
 }
+
+#[test]
+fn the_engine_exposes_a_memory_store_that_follows_config() {
+    let root = temp_dir("engine-memory-store");
+    let config = test_config(&root);
+    let engine = workspace_engine::WorkspaceEngine::new(config.clone());
+    assert_eq!(
+        engine.memory_store.memory_dir(),
+        config.data_dir.join("memory")
+    );
+
+    let mut enabled = test_config(&root);
+    enabled.memory_user_scope_enabled = true;
+    let engine = workspace_engine::WorkspaceEngine::new(enabled);
+    engine
+        .memory_store
+        .insert(&root, None, user_entry("Prefer short commit subjects."))
+        .unwrap();
+    assert_eq!(engine.memory_store.user_entries().unwrap().len(), 1);
+}

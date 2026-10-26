@@ -16,7 +16,7 @@ criteria) · corrections and planning decisions in [`context.md`](context.md)
 | 4 · Store layout, schema version and migration | Done 2026-10-26 | `MemoryStore` + `MemoryStoreConfig` write `<data_dir>/memory/{schema.conf,project/<key>.jsonl,user.jsonl}` with the directory at `0700`. Append-only JSONL: one complete record per line, last record per id wins, first appearance fixes order, a torn final line is discarded, and an unparsable middle line is counted and skipped so one bad record cannot make the store unreadable. The flat marker mirrors `data_schema`: absent means version 0 if files exist (migrate) or fresh (initialise), equal proceeds, newer/unparsable/0 refuses with path and versions. Version-0 migration appends a complete record for every parseable legacy line — deriving sensitivity, defaulting `state` to `Active` — keeps the old line, writes the marker, and audits `memory_schema_migrated`. A project entry whose `project_key` differs from its file's is a hard error, not a filtered row. Reads do not create the directory; writes will. `DAMAIAN_DATA_DIR` is honoured through `Config::default_data_dir` (asserted with nextest's per-test process isolation). Ten new integration tests (19 in the file) pass; scoped clippy clean. |
 | 5 · Refusal path: secrets, evidence, scopes | Done 2026-10-26 | `MemoryStore::insert(root, identity, entry)` is the single write path and runs shape/scope, secret, evidence, sensitivity and persistence in that order. Secrets are refused with a category and never redacted; the statement and every evidence path are scanned. Evidence must be repository-relative (absolute, `..` and `./` refused), not `PathPolicy::is_restricted`, and not ignored by configured patterns or any per-directory `.gitignore` from the root down. Project writes require the resolved identity and a matching key; session writes require an existing session and reach the log only through `SessionStore::append_memory_record`/`memory_records` (`pub(crate)`, leaving `append_session_event` private); user writes refuse while disabled and reads return nothing without opening `user.jsonl`. Sensitivity is stored as `max(supplied, derived)`, so it can be raised but never lowered. Fourteen new integration tests (33 total) pass, including a session-scope write carrying a seeded fake AWS key that leaves no `memory_recorded` event and no secret in the log. Scoped clippy clean. |
 | 6 · Lifecycle transitions and audit | Done 2026-10-26 | `MemoryTarget { Project, Session, User }` and append-only transitions: `edit_statement` (re-runs shape, secret, evidence and sensitivity checks; refuses a non-active entry), `mark_state` (Superseded/Expired/Deleted/Active, idempotent on the same state), `supersede` (inserts the replacement first and only then retires the old entry), and `record_recall` (one event per entry). `AuditLog::record` gets `memory_created`, `memory_confirmed` (for `SuggestedAndConfirmed`), `memory_recalled`, `memory_edited`, `memory_superseded`, `memory_expired`, `memory_deleted`, and `memory_state_changed` for reactivation; recall has no state fields, so the log does not claim a transition. Fields are `entryId`, `scope`, `category`, `provenance`, `sensitivity` and `fromState`/`toState`, plus `statement` only when sensitivity is `Ordinary`. Six new tests (39 total) cover the full walk, confirmation, sensitivity absence from the whole audit file, a disabled audit log writing nothing, a refused edit leaving the old statement active, and the supersede link. Scoped clippy clean. |
-| 7 · User-scope config key and engine wiring | Not started | |
+| 7 · User-scope config key and engine wiring | Done 2026-10-26 | `memory_user_scope_enabled` (default `false`) added to `Config`/`ConfigOverlay` and carried through every exhaustive site named in `context.md` §5: apply (Forbidden), policy text, parse, `classify_overlay_fields!` (Capability), `split_profile_keys` (refused), and the rule label "Remember facts across projects". `WorkspaceEngine` now builds one `MemoryStore` from the resolved config (data dir, flag, ignore patterns) and exposes it as `memory_store`; `lib.rs` exports the record, store and identity types. The capability partition test required a new `weakening_cases()` entry, and a focused test covers default-off, user-on, repository-refused in both directions, profile-split refusal and the label. Scoped runs: `--test permission_profiles` 80 passed (1 ignored), `--test repository_config_trust` 50, lib `config::` 2, `--test memory` 40 (including an engine-wiring test); scoped clippy clean. |
 | 8 · Documentation and close-out | Not started | |
 
 **Goal:** Give Damaian a local, versioned, per-project memory store whose record
@@ -233,18 +233,18 @@ scoped clippy.
 
 ## Task 7 · User-scope config key and engine wiring
 
-- [ ] Add `memory_user_scope_enabled: bool` (default `false`) to `Config` and
+- [x] Add `memory_user_scope_enabled: bool` (default `false`) to `Config` and
       `ConfigOverlay`, and carry it through every exhaustive destructure listed
       in `context.md` §5: overlay apply (Forbidden), policy text, parse line,
       `classify_overlay_fields!` (Capability), `split_profile_keys` (refused),
       and `effective_policy::rule_label` ("Remember facts across projects").
-- [ ] Add a `weakening_cases()` entry in `tests/permission_profiles.rs` proving a
+- [x] Add a `weakening_cases()` entry in `tests/permission_profiles.rs` proving a
       repository cannot set the key either way, and that the profile split
       refuses it.
-- [ ] Construct `MemoryStore` in `WorkspaceEngine::build` and expose
+- [x] Construct `MemoryStore` in `WorkspaceEngine::build` and expose
       `pub memory_store: MemoryStore`; export the module and record types from
       `lib.rs`. Nothing else consumes it yet.
-- [ ] Test: default is false; user config true enables it; repository config
+- [x] Test: default is false; user config true enables it; repository config
       cannot set it in either direction; profile export does not carry it.
 
 **Verification:** `cargo nextest run -p workspace-engine --test

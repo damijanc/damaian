@@ -19,6 +19,7 @@ use crate::lsp::{
     DefinitionPass, LanguageServerHub, LanguageServerLaunch, PassClaim, Position, RepositoryUris,
     run_definition_pass, symbol_refs_from_locations,
 };
+use crate::memory::{MemoryStore, MemoryStoreConfig};
 use crate::navigation::NavigationController;
 use crate::patch_engine::PatchEngine;
 use crate::path_policy::PathPolicy;
@@ -52,6 +53,7 @@ pub struct WorkspaceEngine {
     pub commit: crate::commit::CommitEngine,
     pub checkpoint_store: CheckpointStore,
     pub session_store: SessionStore,
+    pub memory_store: MemoryStore,
     pub chat_orchestrator: ChatOrchestrator,
     pub patch_store: PatchStore,
     pub edit_orchestrator: EditOrchestrator,
@@ -140,6 +142,17 @@ impl WorkspaceEngine {
             CheckpointStore::new(config.clone(), audit_log.clone(), path_policy.clone());
         let repository_trust = RepositoryTrustStore::new(&config.data_dir);
         let session_store = SessionStore::new(&config.data_dir);
+        let memory_store = MemoryStore::new(
+            MemoryStoreConfig {
+                data_dir: config.data_dir.clone(),
+                user_scope_enabled: config.memory_user_scope_enabled,
+                ignore_patterns: config.ignore_patterns.clone(),
+            },
+            audit_log.clone(),
+            scanner.clone(),
+            path_policy.clone(),
+            session_store.clone(),
+        );
         let patch_store = PatchStore::new(&config.data_dir);
         let command_store = CommandStore::new(&config.data_dir);
         let validation_orchestrator = ValidationOrchestrator::new(
@@ -211,6 +224,7 @@ impl WorkspaceEngine {
             commit,
             checkpoint_store,
             session_store,
+            memory_store,
             chat_orchestrator,
             patch_store,
             edit_orchestrator,

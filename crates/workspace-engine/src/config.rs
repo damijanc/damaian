@@ -261,6 +261,12 @@ pub struct Config {
     /// waits for a human, which is neither a restriction nor a repository's
     /// business.
     pub pause_for_context_review: bool,
+    /// Whether memory may hold cross-project (user-scope) entries (spec 28
+    /// §5.6). Off by default. Forbidden to repository and profile config: a
+    /// clone that could turn it on would let one repository's content become a
+    /// statement recalled in every other repository, which is neither a
+    /// restriction nor the repository's business.
+    pub memory_user_scope_enabled: bool,
     /// Per-category shares of the context limit and the observed-window safety
     /// margin (spec 26 §5.2, §5.7). Restrict-only: a repository may lower a
     /// share and raise the margin, never the reverse.
@@ -1137,6 +1143,7 @@ impl Config {
             conversation_auto_compact,
             conversation_window_share,
             pause_for_context_review,
+            memory_user_scope_enabled,
             context_budget_instructions,
             context_budget_hook_context,
             context_budget_pinned,
@@ -1742,6 +1749,18 @@ impl Config {
         ) {
             self.pause_for_context_review = value;
             outcome.record(scope, "pause_for_context_review", None, false);
+        }
+        // Spec 28 §5.6: cross-project recall waits for an explicit user
+        // action with its own explanation, so no untrusted scope may enable it.
+        if let Some(value) = scoped(
+            memory_user_scope_enabled,
+            "memory_user_scope_enabled",
+            trusted,
+            forbidden,
+            rejected,
+        ) {
+            self.memory_user_scope_enabled = value;
+            outcome.record(scope, "memory_user_scope_enabled", None, false);
         }
         if let Some(value) = conversation_window_share
             && let Some(loosened) = restrict_only_share(
@@ -2587,6 +2606,15 @@ impl Config {
                 "false"
             },
         );
+        push_line(
+            &mut output,
+            "memory_user_scope_enabled",
+            if self.memory_user_scope_enabled {
+                "true"
+            } else {
+                "false"
+            },
+        );
         for (key, value) in context_budget_policy_lines(&self.context_budget) {
             push_line(&mut output, key, &format_basis_points(value));
         }
@@ -2818,6 +2846,7 @@ impl Default for Config {
             conversation_auto_compact: true,
             conversation_window_share: crate::compaction::DEFAULT_WINDOW_SHARE_BPS,
             pause_for_context_review: false,
+            memory_user_scope_enabled: false,
             context_budget: ContextBudget::default(),
             max_command_output_bytes: 1024 * 1024,
             command_timeout_secs: 600,
@@ -2907,6 +2936,8 @@ pub struct ConfigOverlay {
     pub conversation_window_share: Option<u16>,
     /// Spec 27 §5.1: off by default, and forbidden to repository and profile.
     pub pause_for_context_review: Option<bool>,
+    /// Spec 28 §5.6: off by default, and forbidden to repository and profile.
+    pub memory_user_scope_enabled: Option<bool>,
     /// `context_budget.*` shares, in basis points. Each is its own field so the
     /// overlay macro classifies it and a repository raise is refused by name.
     pub context_budget_instructions: Option<u16>,
@@ -3063,6 +3094,9 @@ classify_overlay_fields! {
     // Spec 27 §5.1: waits for a human on every turn; neither direction is a
     // restriction, so repository and profile config may not set it.
     pause_for_context_review => Capability,
+    // Spec 28 §5.6: cross-project recall widens where knowledge comes from, and
+    // enabling it is not a narrowing a repository may make.
+    memory_user_scope_enabled => Capability,
     // Spec 26 §5.2: a share steers model traffic toward or away from a
     // repository's own content, so a clone may lower one but never raise it.
     // The safety margin is the reverse direction (higher is restrictive).
@@ -3281,6 +3315,9 @@ impl ConfigOverlay {
             }
             "pause_for_context_review" => {
                 self.pause_for_context_review = Some(parse_bool(key, value)?)
+            }
+            "memory_user_scope_enabled" => {
+                self.memory_user_scope_enabled = Some(parse_bool(key, value)?)
             }
             // A zero window would compact on every turn; a window above the
             // whole budget would leave nothing to compact against.
@@ -3726,6 +3763,7 @@ impl ConfigOverlay {
             conversation_auto_compact,
             conversation_window_share,
             pause_for_context_review,
+            memory_user_scope_enabled,
             context_budget_instructions,
             context_budget_hook_context,
             context_budget_pinned,
@@ -3827,6 +3865,13 @@ impl ConfigOverlay {
             push_line(
                 &mut output,
                 "pause_for_context_review",
+                if *value { "true" } else { "false" },
+            );
+        }
+        if let Some(value) = memory_user_scope_enabled {
+            push_line(
+                &mut output,
+                "memory_user_scope_enabled",
                 if *value { "true" } else { "false" },
             );
         }

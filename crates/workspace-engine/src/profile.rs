@@ -337,6 +337,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         conversation_auto_compact,
         conversation_window_share,
         pause_for_context_review,
+        memory_user_scope_enabled,
         context_budget_instructions,
         context_budget_hook_context,
         context_budget_pinned,
@@ -423,6 +424,12 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         (
             "pause_for_context_review",
             pause_for_context_review.is_some(),
+        ),
+        // Spec 28 §5.6: cross-project recall is the user's decision with its
+        // own explanation, not a profile capability.
+        (
+            "memory_user_scope_enabled",
+            memory_user_scope_enabled.is_some(),
         ),
         ("shell", shell.is_some()),
         ("model_provider", model_provider.is_some()),
