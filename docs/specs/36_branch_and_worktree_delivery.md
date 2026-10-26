@@ -5,7 +5,7 @@ Order: 36 of 37
 Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#35](35_commit_preparation.md) (commit preparation) — **not
+Depends on: [#35](35_commit_preparation/proposal.md) (commit preparation) — **not
 built**; Phase 2 WP4 (worktree isolation, optional) — **unspecified**.
 Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
@@ -18,7 +18,7 @@ implementation specs:
 [`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) and
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
 (Git mutation is a capability repository config cannot grant),
-[`35_commit_preparation.md`](35_commit_preparation.md) (produces the commits this
+[`35_commit_preparation/proposal.md`](35_commit_preparation/proposal.md) (produces the commits this
 delivers), [`37_pull_request_creation.md`](37_pull_request_creation.md).
 
 **Dependency correction.** The roadmap makes this work package depend on Phase 2
@@ -32,7 +32,7 @@ is the Must-tier half; worktrees are the Should-tier half it must not depend on.
 
 ## 1. Motivation
 
-[Spec 35](35_commit_preparation.md) can produce a commit. It commits to whatever
+[Spec 35](35_commit_preparation/proposal.md) can produce a commit. It commits to whatever
 branch the repository is already on — which, for a user who opened Damaian on
 `main` and asked for a change, is `main`.
 
@@ -93,7 +93,7 @@ safe, and the two must not be reachable by the same code path.
 ## 4. Non-goals
 
 - Pushing or any remote write — [spec 37](37_pull_request_creation.md).
-- Committing — [spec 35](35_commit_preparation.md).
+- Committing — [spec 35](35_commit_preparation/proposal.md).
 - **Performing** merge, rebase, or cherry-pick. §5.5 is explicit: this work
   package implements *preparation and reporting* for those operations and does
   not execute any of them. Requirement 2's approval rule is stated so that a

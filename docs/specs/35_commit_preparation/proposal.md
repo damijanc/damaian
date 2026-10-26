@@ -1,31 +1,34 @@
 # Feature Spec: Commit Preparation
 
-Status: Not started
+Status: In progress
 Order: 35 of 37
 Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 1 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#16](16_session_checkpoints_and_rewind.md) (checkpoints) — built;
-[#22](22_findings_model_and_panel/proposal.md) (findings) — built;
-[#23](23_verification_loop/proposal.md) (the verification loop) — built (Done 2026-10-25);
-[#31](31_permission_profiles/proposal.md) (profiles) — built. Everything else
+Depends on: [#16](../16_session_checkpoints_and_rewind.md) (checkpoints) — built;
+[#22](../22_findings_model_and_panel/proposal.md) (findings) — built;
+[#23](../23_verification_loop/proposal.md) (the verification loop) — built (Done 2026-10-25);
+[#31](../31_permission_profiles/proposal.md) (profiles) — built. Everything else
 named below is a cross-reference, not a prerequisite.
+Also in this spec: [`context.md`](context.md) (pre-implementation state and the
+corrections planning found) and [`tasks.md`](tasks.md) (execution order and
+progress).
 Related spec sections: `ai_coding_assistant_specification.md` section 7.7 (diff
 and patch engine), section 7.4 (command approval), section 7.10 (secret
 detection). Related implementation specs:
-[`58_header_repo_bar_and_menus/proposal.md`](58_header_repo_bar_and_menus/proposal.md)
+[`58_header_repo_bar_and_menus/proposal.md`](../58_header_repo_bar_and_menus/proposal.md)
 (its §3.5 contextual-action slot is where *Commit…* appears in the desktop app),
-[`04_hunk_level_patch_apply.md`](04_hunk_level_patch_apply.md) (the per-file and
+[`04_hunk_level_patch_apply.md`](../04_hunk_level_patch_apply.md) (the per-file and
 per-hunk acceptance this commits),
-[`07_generated_secret_override.md`](07_generated_secret_override.md) (the
+[`07_generated_secret_override.md`](../07_generated_secret_override.md) (the
 warn-and-override mechanism §5.4 reuses),
-[`16_session_checkpoints_and_rewind.md`](16_session_checkpoints_and_rewind.md),
-[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
+[`16_session_checkpoints_and_rewind.md`](../16_session_checkpoints_and_rewind.md),
+[`17_durable_task_state_and_crash_recovery/proposal.md`](../17_durable_task_state_and_crash_recovery/proposal.md)
 (a commit is a side-effecting action with an unknown-outcome window),
-[`23_verification_loop/proposal.md`](23_verification_loop/proposal.md) (check evidence),
-[`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) and
-[`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
-(Git mutation is a capability), [`36_branch_and_worktree_delivery.md`](36_branch_and_worktree_delivery.md).
+[`23_verification_loop/proposal.md`](../23_verification_loop/proposal.md) (check evidence),
+[`31_permission_profiles/proposal.md`](../31_permission_profiles/proposal.md) and
+[`34_repository_config_trust_boundary.md`](../34_repository_config_trust_boundary.md)
+(Git mutation is a capability), [`36_branch_and_worktree_delivery.md`](../36_branch_and_worktree_delivery.md).
 
 ## 1. Motivation
 
@@ -35,7 +38,7 @@ requirement in this work package is new code, and all of it crosses from reading
 the user's repository to writing it — the largest trust boundary in the roadmap.
 
 The value is concrete. Damaian already applies changes selectively — per file and
-per hunk ([spec 04](04_hunk_level_patch_apply.md)) — so it knows exactly what the
+per hunk ([spec 04](../04_hunk_level_patch_apply.md)) — so it knows exactly what the
 user accepted. Right now that knowledge dies at the working tree: the user is
 left to stage and commit by hand, re-deciding what to include with none of the
 information Damaian has. Committing exactly the accepted set is a small step
@@ -71,7 +74,7 @@ matters. §5.4 handles this.
 - **Git is invoked with `-C <root>`**, not `current_dir` (`git_service.rs:38-43`,
   `:78-79`), so the program name resolves from `PATH` and the working directory
   is never changed. This avoids the relative-program hazard described in
-  [spec 34](34_repository_config_trust_boundary.md) §1, and new commands should
+  [spec 34](../34_repository_config_trust_boundary.md) §1, and new commands should
   keep the `-C` form.
 - **Acceptance is already selective and already plumbed.**
   `PatchEngine::apply_patch` takes `approved_paths: Option<&[String]>` and
@@ -81,7 +84,7 @@ matters. §5.4 handles this.
   `PatchEngine::preview_generated_secrets` (`patch_engine.rs:345`) scans the
   content that would be written and returns `GeneratedSecretWarning { path,
   categories, count }` carrying no matched text, and `apply_patch` gates on
-  `allow_generated_secrets` — [spec 07](07_generated_secret_override.md)'s
+  `allow_generated_secrets` — [spec 07](../07_generated_secret_override.md)'s
   warn-with-override contract.
 - **No Git hook awareness.** Nothing reads `.git/hooks` or reports what a
   `pre-commit` hook might do.
@@ -104,8 +107,8 @@ matters. §5.4 handles this.
 
 ## 4. Non-goals
 
-- Pushing, or anything remote — [spec 37](37_pull_request_creation.md).
-- Branch creation, merge, or rebase — [spec 36](36_branch_and_worktree_delivery.md).
+- Pushing, or anything remote — [spec 37](../37_pull_request_creation.md).
+- Branch creation, merge, or rebase — [spec 36](../36_branch_and_worktree_delivery.md).
 - Amend, reset, rebase, cherry-pick, or any history rewrite. Requirement 5
   forbids doing them without dedicated approval; this spec does not implement
   them at all, so the approval flow for them is future work.
@@ -189,7 +192,7 @@ Three properties this buys, each mapping to requirement 4:
 This is more machinery than `git add` plus `git commit`, and it is the machinery
 that makes requirement 4 true rather than approximately true. The
 `git stash`-adjacent approach in
-[spec 16](16_session_checkpoints_and_rewind.md) §5.1 uses the same
+[spec 16](../16_session_checkpoints_and_rewind.md) §5.1 uses the same
 `GIT_DIR`/index-isolation idea, so the technique is not novel to this spec.
 
 ### 5.4 The redacted-preview trap
@@ -206,7 +209,7 @@ call `preview_generated_secrets` makes (`patch_engine.rs:345-360`), and:
   reusing `GeneratedSecretWarning`'s shape which exists precisely to be safe to
   display.
 - Requires an explicit override to proceed, exactly as
-  [spec 07](07_generated_secret_override.md) established for generated patches.
+  [spec 07](../07_generated_secret_override.md) established for generated patches.
   The override is per commit and is audited.
 - States plainly in the approval UI that the diff above is redacted for display
   and the commit will contain the real content. A user who sees `[REDACTED]` and
@@ -216,7 +219,7 @@ This is not hypothetical: a repository with a real `.env`-style value in a
 tracked file, or a developer's local token pasted into a config file, produces
 exactly this situation. The commit is also the step after which the damage
 becomes hard to undo — a secret in Git history survives a later deletion, and
-[spec 37](37_pull_request_creation.md) may push it.
+[spec 37](../37_pull_request_creation.md) may push it.
 
 ### 5.5 Hooks: detect, describe, run, never bypass
 
@@ -249,7 +252,7 @@ repository's own protections. So the flow runs them explicitly:
 Because hooks are arbitrary local programs, they are executed through the
 existing command path with its timeout, output truncation, and `SecretScanner`
 redaction, and their PIDs are registered per
-[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 — a hanging
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.7 — a hanging
 `pre-commit` must not hang the session, and a crash must not leave it running.
 
 ### 5.6 Message suggestion
@@ -260,7 +263,7 @@ replace it. Today it is a template that never sees the diff and always prefixes
 
 The extension keeps that function as the **deterministic fallback** and adds a
 model-backed path in front of it: given the accepted diff and the task's plan
-([spec 21](21_task_plan_progress_and_budget/proposal.md)), draft a subject and body. When
+([spec 21](../21_task_plan_progress_and_budget/proposal.md)), draft a subject and body. When
 no model is configured, when the call fails, or when the result is empty, the
 existing template answers — so a commit is never blocked on a model call.
 
@@ -282,7 +285,7 @@ Two rules on the drafted message:
 — harmless, collected by `git gc` — or die after `update-ref` with no record.
 
 So a commit is bracketed by
-[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.3's action markers with
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.3's action markers with
 `sideEffecting: true`. A crash in between classifies as
 `unknown_external_outcome`, and recovery **does not re-commit**. Resolution is
 cheap and specific: compare `HEAD` against the expected old value recorded in the
@@ -298,14 +301,14 @@ surfaced in the completion report.
 A commit is a Git mutation and therefore a capability, not a convenience:
 
 - It requires explicit approval per commit. There is no `Allow Always` for
-  committing — [spec 10](10_persistent_command_approval.md)'s persistent
+  committing — [spec 10](../10_persistent_command_approval.md)'s persistent
   approval is exact-command for shell commands, and a standing permission to
   commit would remove the review step that requirement 1 exists to guarantee.
-- It is available only in Code mode ([spec 20](20_working_modes/proposal.md)) and only
+- It is available only in Code mode ([spec 20](../20_working_modes/proposal.md)) and only
   under a profile that permits Git mutation
-  ([spec 31](31_permission_profiles/proposal.md)). Ask, Plan, and Review cannot commit.
+  ([spec 31](../31_permission_profiles/proposal.md)). Ask, Plan, and Review cannot commit.
 - Repository config cannot grant it
-  ([spec 34](34_repository_config_trust_boundary.md)).
+  ([spec 34](../34_repository_config_trust_boundary.md)).
 - Every commit records path count, hunk count, message length, resulting SHA,
   hook outcomes, and whether a secret override was used, through
   `AuditLog::record`.
@@ -359,7 +362,7 @@ crash actually landed, and where the commit appears in the audit log.
 - No amend, reset, or history-rewriting operation is reachable from this work
   package.
 - Every quality-gate command from `AGENTS.md` passes, and the
-  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  [spec 18](../18_local_evaluation_harness/proposal.md) baseline shows no
   regression.
 
 ## 7. Implementation Notes
@@ -372,7 +375,7 @@ To be completed during implementation. Record:
   had to be refused rather than handled, say which and why refusing is correct.
 - How often the §5.4 secret check fired on real content, and whether it produced
   false positives severe enough to make the override routine. A routine override
-  is a defeated control, and [spec 07](07_generated_secret_override.md) exists
+  is a defeated control, and [spec 07](../07_generated_secret_override.md) exists
   because that already happened once.
 - Whether `core.hooksPath` was honoured correctly for repositories using a
   shared hooks directory.

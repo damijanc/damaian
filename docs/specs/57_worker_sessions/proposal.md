@@ -95,7 +95,7 @@ nothing a worker started keeps running.
   The repository is the only channel. A read-only result summary is a later,
   opt-in spec (§7).
 - **Merging a worker's branch.** The user merges, or asks a session to, through
-  ordinary approved git. [#35](../35_commit_preparation.md)–[#37](../37_pull_request_creation.md)
+  ordinary approved git. [#35](../35_commit_preparation/proposal.md)–[#37](../37_pull_request_creation.md)
   own delivery. The board only shows commits ahead.
 - **Running interactive sessions out of process.** Sessions the user chats in
   directly keep running in the shell exactly as today.

@@ -55,7 +55,7 @@ stoppable, with nothing outliving the application.
 **Why not now:**
 
 1. **It cannot start anyway.** The external-write readiness gate (§1) needs
-   [#35](35_commit_preparation.md)–[#37](37_pull_request_creation.md), none of
+   [#35](35_commit_preparation/proposal.md)–[#37](37_pull_request_creation.md), none of
    which is built.
 2. **The cost premise is unproven, and the nearest measurement points the other
    way.** [#47](47_agent_working_capability/proposal.md)'s live A/B found that

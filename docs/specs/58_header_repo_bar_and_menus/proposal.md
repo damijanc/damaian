@@ -26,7 +26,7 @@ rearranges), built; [#53](../53_session_search_and_export/proposal.md) (the
 search and export controls it moves), built.
 Everything else named below is a cross-reference, not a prerequisite.
 Related implementation specs:
-[`../35_commit_preparation.md`](../35_commit_preparation.md) and
+[`../35_commit_preparation/proposal.md`](../35_commit_preparation/proposal.md) and
 [`../37_pull_request_creation.md`](../37_pull_request_creation.md) (they fill
 the contextual-action slot this spec creates; not built here),
 [`../36_branch_and_worktree_delivery.md`](../36_branch_and_worktree_delivery.md)

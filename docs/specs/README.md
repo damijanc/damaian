@@ -79,7 +79,7 @@ directory was renamed from `ROADMAP` to `PLAN` because it was never a roadmap:
 
 ## What to build next, and what may run in parallel
 
-### Current state (2026-10-25)
+### Current state (2026-10-26)
 
 A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
@@ -89,15 +89,18 @@ reports the disagreement.
 `main`. #23 and #26 both finished on 2026-10-25, so the two keystones are no
 longer in flight.
 
-- **In progress:** #49 prompt cache — the accounting slice is done and the
-  reuse slice (requirement 4) is the only unbuilt requirement. #26's ordering
-  now exists, but the spec's own `Depends on:` line still names Phase 1 WP3
-  (provider capability validation) as unspecified, and the eight-message
-  sliding window it is most sensitive to is #55's to replace, so it is not in
-  the ready set.
-- **Ready, not started:** #27 context inspector; #33 MCP management; #35 commit
-  preparation (its last dependency, #23, was built on 2026-10-25); #51 external
-  reference retrieval; #55 conversation compaction.
+- **In progress:** #35 commit preparation, planned as a folder on 2026-10-26
+  (its last dependency, #23, was built on 2026-10-25). Its
+  [`context.md`](35_commit_preparation/context.md) records the pre-implementation
+  state and fifteen corrections; its [`tasks.md`](35_commit_preparation/tasks.md)
+  holds nine tasks. It runs beside #55 because it never edits `chat.rs`.
+  #49 prompt cache — the accounting slice is done and the reuse slice
+  (requirement 4) is the only unbuilt requirement. #26's ordering now exists,
+  but the spec's own `Depends on:` line still names Phase 1 WP3 (provider
+  capability validation) as unspecified, and the eight-message sliding window it
+  is most sensitive to is #55's to replace, so it is not in the ready set.
+- **Ready, not started:** #27 context inspector; #33 MCP management; #51
+  external reference retrieval; #55 conversation compaction.
 - **Blocked:** #28 on #27; #29 on #28; #30 on #28 and #29; #36 on #35; #37 on
   #33, #35 and #36; #52 on #33; #39 on #38; #40 on #38 and #39; #54 on Phase 1
   WP3 (provider capability validation), which is unspecified.
@@ -105,7 +108,9 @@ longer in flight.
 - **Pairing:** two specs may run together only if at most one of them edits
   `chat.rs`, and #55 and #49's reuse slice never run with each other — both
   edit `build_model_prompt` or the turn loop. #26, #65 and #66 are Done and no
-  longer constrain anything. See [Parallel work](#parallel-work).
+  longer constrain anything. #35 and #55 are running together on 2026-10-26:
+  #35 owns `commit.rs`, the shell and the config key, and never edits
+  `chat.rs`. See [Parallel work](#parallel-work).
 - **Open decision:** the priority table below predates #59–#64 and does not
   rank them; the text after it now calls #23 the priority with #65 done.
 
@@ -477,10 +482,23 @@ that work, from #66's
   to the same action budget.
 
 Re-derived on 2026-10-25, when [#23](23_verification_loop/proposal.md) finished.
-One `Depends on:` line named #23 not built: [#35](35_commit_preparation.md).
+One `Depends on:` line named #23 not built: [#35](35_commit_preparation/proposal.md).
 **One is promoted:** #35, whose other dependencies (#16, #22 and #31) were
 already built. #23 leaves the in-progress set. The ready set is now #27, #33,
 #35, #51 and #55.
+
+Re-checked on 2026-10-26, when [#35](35_commit_preparation/proposal.md) was
+planned. It moved from the ready set into **In progress** without being built:
+the flat spec became a folder, [`context.md`](35_commit_preparation/context.md)
+records the pre-implementation state and fifteen corrections, and
+[`tasks.md`](35_commit_preparation/tasks.md) holds nine tasks. No dependency
+line changes, because nothing waits on #35 until it is Done. What planning found
+that matters to the order: committing is not a capability in `ProfileCapabilities`
+today, so the spec adds the sixth capability key `allow_git_commits`; the
+durable record of acceptance is the session log's `patch_file_decided` events,
+which do not yet carry the applied hash or accepted hunks the commit needs; and
+message drafting belongs in the desktop shell because the engine holds no model
+adapter. #35 never edits `chat.rs`, so it pairs with #55.
 
 ### Parallel work
 
@@ -559,7 +577,7 @@ is ready.
 | 32 | [32_hooks/](32_hooks/proposal.md) | **Done 2026-10-24** (started 2026-10-07; Tasks 1–10, the last on 2026-10-24; see its `tasks.md`). Roadmap Phase 4 WP2. Nine lifecycle events, hooks as external programs returning a verdict — `deny`/`request_approval`/`warn`/`allow`, with no `approve`, so widening is unrepresentable. A repository may define a hook that stays inactive until reviewed at a hash, and may never touch a user hook. The workspace gate is left to CI; its own §7.1 records one criterion (the context inspector) as met only as a bounded `hook_context` item until #27. |
 | 33 | [33_mcp_management_and_deferred_discovery.md](33_mcp_management_and_deferred_discovery.md) | **Not started.** Roadmap Phase 4 WP4. Every enabled server's full schema currently reaches every request, outside #26's accounting. Adds a search tool with on-demand schemas, per-tool enable, lazy startup, and treats a remote read-only claim as an assertion that cannot lower an approval requirement. |
 | 34 | [34_repository_config_trust_boundary.md](34_repository_config_trust_boundary.md) | **Done — implemented ahead of #14 onward.** Bug-driven, not a roadmap graduation. `apply_overlay` is scope-blind, so repository config overrides user config: a repo-set `shell` runs its own script for every approved command (verified), a repo-set `model_base_url` exfiltrates the API key and code with no approval, and a repo `command_allowlist` executes commands unprompted. Adds a scope-aware overlay, a forbidden-key list, restrict-only merges, and moves `Allow Always` to user scope keyed by repository. Security subset of #31, extracted so it need not wait for Phase 4. |
-| 35 | [35_commit_preparation.md](35_commit_preparation.md) | **Not started.** Roadmap Phase 5 WP1. Damaian's first write to a user's Git repository. Builds the commit through a private index so the user's staging is never touched, runs hooks rather than bypassing them, and closes a trap: `GitService::diff` redacts, so a user could approve a diff showing `[REDACTED]` and commit the real secret. |
+| 35 | [35_commit_preparation/](35_commit_preparation/proposal.md) | **In progress** (planned 2026-10-26; Tasks 1–9). Roadmap Phase 5 WP1. Damaian's first write to a user's Git repository. Builds the commit through a private index so the user's staging is never touched, runs hooks rather than bypassing them, and closes a trap: `GitService::diff` redacts, so a user could approve a diff showing `[REDACTED]` and commit the real secret. The commit is the session's uncommitted accepted changes, proven byte-for-byte against the reviewed preview; a secret found in the real bytes needs a separate per-commit override; and committing is a Code-mode capability a profile or a repository may deny. |
 | 36 | [36_branch_and_worktree_delivery.md](36_branch_and_worktree_delivery.md) | **Not started.** Roadmap Phase 5 WP2. Branch suggestion, creation, ahead/behind, merge-base, and conflict prediction via `merge-tree --write-tree` so preparation provably cannot execute. Written to work with no worktree support, since its stated dependency (Phase 2 WP4) is Should-tier and unspecified. |
 | 37 | [37_pull_request_creation.md](37_pull_request_creation.md) | **Not started.** Roadmap Phase 5 WP4. Push and publication as two typed approvals that cannot substitute for each other, base branch asked for rather than inferred, force push refused rather than gated, and interrupted PR creation resolved by a duplicate search before any retry. Uses MCP rather than a bespoke client. |
 | 38 | [38_subagent_model.md](38_subagent_model.md) | **Not started; deferred 2026-10-09.** Stage 2 (editing subagents) is superseded by #57's worktree workers; stage 1 is re-evaluated once #57 and its result-summary follow-up have shipped, and may then be recorded as abandoned. Its §Deferral says why. Roadmap Phase 6 WP1, and gated on that phase's eight readiness gates being measured first. Subagents as in-process tasks whose capability can only be derived by narrowing a parent's, staged read-only-first. Corrects the roadmap's process-based framing and the flat `CancelToken`. |
@@ -634,7 +652,7 @@ expensive to answer halfway through an implementation.
 ## Spec layout
 
 #41 started as a trial of a folder layout, and it earned its keep: most specs
-planned since then are folders (12, 17–25, 31, 32, 41–44, 46–50, 53, 56–63),
+planned since then are folders (12, 17–25, 31, 32, 35, 41–44, 46–50, 53, 56–63),
 while the rest remain single files. A single-file spec becomes a folder when it
 is planned into tasks.
 
