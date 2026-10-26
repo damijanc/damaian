@@ -17,7 +17,7 @@ diagnostics for the user's own local app — a different capability with a
 different trust model, see §4),
 [`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (the category and budget this
 content enters through),
-[`27_context_inspector.md`](27_context_inspector.md) (where a user sees and
+[`27_context_inspector.md`](27_context_inspector/proposal.md) (where a user sees and
 removes it),
 [`30_memory_retrieval_and_lifecycle.md`](30_memory_retrieval_and_lifecycle.md)
 (the injection-resistance pattern this follows rather than reinvents),
@@ -85,7 +85,7 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
    configures a search provider, and is never a prerequisite for requirement 1.
 3. Fetched content enters the model's context as a distinct, provenance-labelled
    category at the lowest priority, is visible and removable in
-   [spec 27](27_context_inspector.md), and counts against the same context and
+   [spec 27](27_context_inspector/proposal.md), and counts against the same context and
    token budgets as everything else.
 4. **Fetched content is data and can never be an instruction.** This is proven
    by prompt-injection evaluations, not by a design argument.
@@ -249,7 +249,7 @@ treatment of memory rather than inventing a second approach:
   never merged into the system prompt, never presented as instructions, and
   never placed where repository instructions ([spec 11](11_agents_md_support.md))
   live.
-- It is visible in [spec 27](27_context_inspector.md)'s inspector with its URL,
+- It is visible in [spec 27](27_context_inspector/proposal.md)'s inspector with its URL,
   and removable there.
 - **Instruction-shaped fetched content is not obeyed and is reported.** A page
   containing "ignore previous instructions", a fake tool call, or text

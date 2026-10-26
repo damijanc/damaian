@@ -1,21 +1,26 @@
 # Feature Spec: Context Inspector
 
-Status: Not started
+Status: In progress (started 2026-10-26). Split into a folder and planned on
+2026-10-26 from [#26](../26_context_assembly/proposal.md)'s shipped manifest.
+[`context.md`](context.md) records the pre-implementation code, the corrections
+planning found, and the resolved §7 open question (whether separating assembly
+from sending restructures the turn path); [`tasks.md`](tasks.md) carries the
+Global Constraints, the task breakdown and the progress record.
 Order: 27 of 27
 Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 5 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#26](26_context_assembly/proposal.md) (the context manifest it renders) —
+Depends on: [#26](../26_context_assembly/proposal.md) (the context manifest it renders) —
 built (Done 2026-10-25). Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
 interface), section 7.3 (path and secret policy), section 7.9 (context
 assembly). Related implementation specs:
-[`05_clickable_file_references.md`](05_clickable_file_references.md)
+[`05_clickable_file_references.md`](../05_clickable_file_references.md)
 (navigation to referenced content),
-[`11_agents_md_support.md`](11_agents_md_support.md),
-[`20_working_modes/proposal.md`](20_working_modes/proposal.md) (session-scoped state pattern),
-[`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (produces the manifest this
+[`11_agents_md_support.md`](../11_agents_md_support.md),
+[`20_working_modes/proposal.md`](../20_working_modes/proposal.md) (session-scoped state pattern),
+[`26_context_assembly/proposal.md`](../26_context_assembly/proposal.md) (produces the manifest this
 renders — this spec is unusable without it).
 
 ## 1. Motivation
@@ -24,7 +29,7 @@ renders — this spec is unusable without it).
 claims, and it is currently false. There is no view of assembled context, before
 or after a call.
 
-[Spec 26](26_context_assembly/proposal.md) produces the data — a manifest of what was
+[Spec 26](../26_context_assembly/proposal.md) produces the data — a manifest of what was
 included, what was excluded, and why. This work package makes it visible and
 gives the user control over the optional parts. Shipping the assembly pipeline
 without the inspector ships the mechanism without the accountability: better
@@ -43,31 +48,59 @@ retrieval heuristics cannot make at all.
 
 ## 2. Current State
 
-- **No context view exists**, pre-send or post-send.
-- **`ContextPlan` is built and immediately consumed.**
-  `ContextManager::build_context` (`crates/workspace-engine/src/context_manager.rs:66`)
-  returns a `ContextPlan` (`context_manager.rs:31-38`) that the caller turns
-  into model messages within the same call path. It is never persisted, never
-  surfaced, and there is no point between assembly and sending where anything
-  could intervene.
-- **`ContextPlan` carries no exclusion or provenance data**:
-  `{ repository_id, task_id, token_estimate, items, files }`. What was left out
-  is unrecorded, so a pre-send view built on today's structure could show only
-  what happened to fit.
-- **`ContextItem` has no line range** (`context_manager.rs:22-29`), so content is
-  whole-file. [Spec 26](26_context_assembly/proposal.md) §5.1 adds ranges and categories;
-  this spec depends on that.
+Checked against the tree on 2026-10-26, after #26, #55 and #66 landed. `context.md`
+§2 has the full file:line map and every correction; this section is the summary
+the design depends on.
+
+- **No context view exists**, pre-send or post-send. The only live trace is a
+  transient `contextFiles` disclosure under an assistant message, and it does not
+  survive a reload.
+- **`ContextPlan` is assembled and sent in one call path.**
+  `ContextManager::build_context` (`crates/workspace-engine/src/context_manager.rs:1057`)
+  returns a `ContextPlan` (`context_manager.rs:576`) carrying `items`, `files` and
+  now a `manifest: ContextManifest` (`context_manager.rs:450`). `ChatOrchestrator`
+  calls it at `chat.rs:1157`, records `context_assembled`, renders the prompt at
+  `chat.rs:1179`, and enters `run_agentic_turn` at `chat.rs:1222`. There is no
+  pause or other intervention point between assembly and the first model call.
+- **The manifest already carries what requirement 1 asks for, with two gaps.**
+  It has the limit and its source, per-category allocation/use/count, every
+  included ref by path/range/tokens/provenance/root, and every exclusion with a
+  reason (`context_manager.rs:380-470`). It has **no conversation-summary row**:
+  #55 sends the summary inside the conversation block and leaves
+  `ContextCategory::ConversationSummary` unused. It also has **no symbol
+  provenance counts** — only the weakest provenance of the one symbols item — so
+  "12 symbols (4 heuristic)" cannot be rendered from it.
+- **`ContextItem` and `LineRange` exist.** `ContextItem` has `category`, `kind`,
+  `path`, `range`, `tokens`, `redaction_status`, `provenance` and `root_path`
+  (`context_manager.rs:528`); `LineRange` is `file_access.rs:16`. No collection
+  source produces a range yet (#26 §7), so every included item is whole-file
+  today; the inspector must still render a range the day one appears.
+- **`ExclusionReason` is incomplete for this spec.** It has `RestrictedPath`,
+  `DeduplicatedIntoRange`, `CategoryBudgetExhausted`, `Truncated`, `TooLarge`
+  and `Binary` (`context_manager.rs:420-440`). It has no `UserRemoved` (this
+  spec's removal), no reason for "not in the session's selected paths" (the path
+  restriction), and no reason for "a pinned file was deleted".
 - **Per-session state has an established pattern.**
   `SessionStore::allow_browser_diagnostics_for_session` /
-  `browser_diagnostics_allowed_for_session`
-  (`crates/workspace-engine/src/session.rs:261-291`) append an event and replay
-  the log. [Spec 20](20_working_modes/proposal.md) §5.4 follows it for session mode; pins
-  and path restrictions follow it here.
-- **Clickable file references exist** ([spec 05](05_clickable_file_references.md)),
-  opening a file in the app or the configured editor. This is the "open
-  referenced content" mechanism.
-- **Nothing is pinnable.** `explicit_paths` is a `build_context` parameter
-  (`context_manager.rs:73`) supplied per call, not durable session state.
+  `browser_diagnostics_allowed_for_session` (`session.rs:1063`/`:1079`) append one
+  event and replay the log. [Spec 20](../20_working_modes/proposal.md) §5.4
+  follows it for session mode (`session.rs:1100`/`:1129`); pins and path
+  restrictions follow it here.
+- **Clickable file references exist** ([spec 05](../05_clickable_file_references.md)).
+  `/api/open-vscode-file` opens a path and optional line; the inspector's path
+  buttons reuse it.
+- **Nothing is pinnable.** `explicit_paths` is a `ContextRequest` field
+  (`context_manager.rs:664`) supplied per call. The composer's existing "pinned"
+  chips are `localStorage` state sent as `explicit_paths` on each request
+  (`app.js:1859-1903`, `:11966`): a per-request attachment, not durable session
+  state and not the `Pinned` category.
+- **The turn path already has typed pauses.** `PendingChatTurn` (`chat.rs:8125`)
+  persists a turn and `PausedFor` (`chat.rs:8002`) makes every resume refuse a
+  pause it does not own. A pre-send review is a new kind of that mechanism, not a
+  new mechanism.
+- **The summary is sent outside the plan.** `build_model_prompt`
+  (`chat.rs:8670`) renders the #55 summary inside `Recent conversation:` and
+  already redacts it. Nothing records its size in the manifest.
 
 ## 3. Requirements
 
@@ -83,14 +116,14 @@ retrieval heuristics cannot make at all.
 ## 4. Non-goals
 
 - Changing what assembly selects. The inspector shows and constrains; the
-  selection logic is [spec 26](26_context_assembly/proposal.md).
+  selection logic is [spec 26](../26_context_assembly/proposal.md).
 - Editing context content. A user may include or exclude an item, and pin a
   range — not rewrite what a file says on the way to the model.
 - Showing raw provider payloads or message JSON. The view is categories, paths,
   ranges, and token counts.
 - A permanent per-repository context configuration. Pins and restrictions are
   session-scoped; repository-wide rules are `AGENTS.md`
-  ([spec 11](11_agents_md_support.md)) and `restricted_patterns`.
+  ([spec 11](../11_agents_md_support.md)) and `restricted_patterns`.
 - Retroactively changing a sent turn. Post-send is a record.
 - Memory inspection — Phase 3b, which adds a category to this view.
 - Diffing manifests between turns.
@@ -125,10 +158,43 @@ A pre-send view that blocks is technically closer to the requirement's wording
 and worse as a product; the requirement is that the user *can* see before
 sending, not that they must.
 
+**How the two halves coexist.** Both are the same `ContextManifest`:
+
+- **Without the pause**, the orchestrator emits the manifest as
+  `TurnProgress::Context` immediately after assembly and before the first model
+  call. The shell relays it as an SSE `context` event, so the header control and
+  panel show what this turn is about to send while the turn runs. It is the same
+  view the pause would show; the user simply cannot change it in flight.
+- **With the pause**, the turn saves a `PendingChatTurn` with a new
+  `PausedFor::ContextReview` and a `PendingContextReview` holding the prepared
+  plan, the already-built request messages, the conversation block and the
+  summary. `resume_after_context_decision` is the only route that may continue
+  it: it refuses every other pause kind, exactly as the existing resumes do. A
+  declined review fails the turn with no model call; an approved one enters the
+  same `run_agentic_turn` a non-paused turn would have entered.
+
+The pause is a new kind in the existing typed-pause machinery, not a new
+mechanism. That is deliberate: `pending_commands` is a single directory keyed by
+an id, and each resume already refuses the kinds it does not own (`chat.rs:8002`,
+`paused_for`). A pre-send review that could be resumed by a command-decision
+route would be an approval bypass wearing a review's clothes.
+
 ### 5.2 What the view shows
 
-Rendered from `ContextManifest` ([spec 26](26_context_assembly/proposal.md) §5.5), which
-already carries every field requirement 1 asks for:
+Rendered from `ContextManifest` ([spec 26](../26_context_assembly/proposal.md) §5.5), which
+carries the limit, the categories, the included refs and the exclusion records.
+Two fields #26 left for this spec are added to it:
+
+- **the conversation summary**, as its own `ConversationSummaryUsage` row (token
+  count, how many messages it covers, whether it is the facts-only fallback).
+  #55 sends the summary inside `Recent conversation:` rather than as a
+  `ContextItem`, so it is not an `IncludedRef`; the row is what makes its cost
+  visible and what lets the paused review remove it for a turn.
+- **symbol provenance counts**, as `total`, `language_server` and `heuristic` on
+  the symbols block, because the one `IncludedRef` can only carry the weakest
+  provenance among the lines shown.
+
+The rendering:
 
 ```text
 Context for this turn                    18,240 / 32,768 tokens  (declared limit)
@@ -156,15 +222,23 @@ Three things this rendering makes visible that nothing does today:
 - **The excluded list**, which is the half users actually need. "Why didn't it
   read `upload.rs`?" is answerable.
 - **The limit's source** — declared, observed, or default
-  ([spec 26](26_context_assembly/proposal.md) §5.7) — so conservative context is
+  ([spec 26](../26_context_assembly/proposal.md) §5.7) — so conservative context is
   attributable rather than mysterious.
-- **Heuristic counts**, carrying [spec 25](25_symbol_and_relationship_index/proposal.md)'s
+- **Heuristic counts**, carrying [spec 25](../25_symbol_and_relationship_index/proposal.md)'s
   provenance through to the surface. "12 symbols (4 heuristic)" tells the user
   how much of the structural information is a guess.
 
-Every path is a clickable reference ([spec 05](05_clickable_file_references.md)),
+Every path is a clickable reference ([spec 05](../05_clickable_file_references.md)),
 including in the excluded list — a restricted file should still be openable by
 the user, who has every right to read their own file.
+
+The view is built from the manifest, and the manifest holds **no content** by
+construction ([spec 26](../26_context_assembly/proposal.md) §5.5). The prepared
+`ContextItem`s stay in the engine and in the paused turn; the shell is never
+sent them. A restricted path therefore appears as a path with a reason, never as
+text, and the acceptance criterion "no content from a restricted or
+secret-bearing file is shown" is true because no content crosses the boundary —
+not because a renderer remembered to skip a field.
 
 ### 5.3 Post-send
 
@@ -177,6 +251,13 @@ The manifest is recorded per turn (already the case, via
 `AuditLog::record`), so the post-send view is available for any past turn in the
 session, not only the most recent. A user debugging a bad answer three turns ago
 can see what that turn was given.
+
+The reader takes the **newest `context_assembled` event per task**. That is what
+makes "what was actually sent" true after a removal: the pause records the first
+assembly, and a removal appends a second `context_assembled` with the amended
+manifest before the resumed turn sends anything. An unchanged turn has exactly
+one event. `/api/session` joins the newest manifest onto each task, and each
+assistant message offers the panel for its own task.
 
 Post-send is a record and is read-only.
 
@@ -191,20 +272,25 @@ Post-send is a record and is read-only.
 | Open referenced content | Opens in app or configured editor | — |
 
 Pins and restrictions persist as appended session events, following the
-`browser_diagnostics_allowed_for_session` pattern (`session.rs:261-291`) and
-[spec 20](20_working_modes/proposal.md) §5.4:
+`browser_diagnostics_allowed_for_session` pattern (`session.rs:1063`) and
+[spec 20](../20_working_modes/proposal.md) §5.4:
 
 ```json
 {"seq":88,"eventType":"context_pin_added","sessionId":"session_...",
  "path":"src/upload.rs","range":{"start":40,"end":120}}
+{"seq":89,"eventType":"context_pin_removed","sessionId":"session_...",
+ "path":"src/upload.rs","range":{"start":40,"end":120}}
+{"seq":90,"eventType":"context_pins_cleared","sessionId":"session_..."}
 {"seq":91,"eventType":"context_restriction_set","sessionId":"session_...",
  "paths":["src/upload.rs","tests/upload.rs"]}
+{"seq":92,"eventType":"context_restriction_cleared","sessionId":"session_..."}
 ```
 
 Replayed newest-wins, read by parsed `eventType` rather than substring matching,
-per [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2. Pins therefore
-survive a restart, which matters because a user who pinned three files for a
-long task should not lose that to a crash.
+per [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.2. A pin is
+identified by `(path, range)` so removing one does not remove a second range of
+the same file. Pins therefore survive a restart, which matters because a user
+who pinned three files for a long task should not lose that to a crash.
 
 **A restriction narrows; it never widens.** `path_policy.rs` and
 `restricted_patterns` still apply on top, so a user cannot restrict *to* a
@@ -212,13 +298,26 @@ restricted path and thereby include it. The restriction is an intersection with
 what policy already permits — stated explicitly because "restrict the session to
 selected paths" could be read as an override, and it is not.
 
+A path restriction filters the **file-bearing collection sources** — explicit
+paths, prompt mentions, keyword and semantic hits, project rules, and pins. It
+does not filter `Instructions`: the `AGENTS.md` hierarchy is the repository's
+policy and `Required` content is the user's own message, and silently ignoring a
+repository's rules because the user narrowed *content* would be a surprising and
+unsafe reading of "restrict to these paths". Both are still listed in the panel,
+and an instruction may still be removed for a turn. This is recorded again in
+`context.md` §4 because the sentence "only these paths are eligible for context"
+could be read more broadly.
+
 A pinned file that later becomes restricted, or is deleted, is reported in the
-excluded list with the reason rather than silently dropped from the pin list.
+excluded list with the reason rather than silently dropped from the pin list:
+`RestrictedPath` for policy, `Missing` for a file that no longer reads. The pin
+stays in the session state either way, so restoring the file restores the pin
+without the user re-pinning it.
 
 ### 5.5 What cannot be removed
 
 Requirement 3 is enforced by the type, not by the UI.
-[Spec 26](26_context_assembly/proposal.md) §5.1 defines `ContextCategory::Required` as the
+[Spec 26](../26_context_assembly/proposal.md) §5.1 defines `ContextCategory::Required` as the
 first variant, holding safety instructions and the user's own message. The
 inspector renders `Required` items as locked, and the removal path rejects a
 `Required` item — so a UI bug, or a future caller, cannot remove one.
@@ -232,19 +331,33 @@ API, not the absence of a button.
 removed for a turn. That is deliberate: repository instructions are the user's
 own content, and a user debugging whether an `AGENTS.md` rule is causing a
 behaviour needs to be able to take it out. Precedence stays
-[spec 11](11_agents_md_support.md)'s; removal is a per-turn user action, not a
+[spec 11](../11_agents_md_support.md)'s; removal is a per-turn user action, not a
 precedence change.
 
 ### 5.6 Surface
 
 A context control in the conversation header showing the current turn's token
 total, opening a panel with the §5.2 rendering. It shows the last assembled
-manifest between turns, so it is useful outside an active turn.
+manifest between turns, so it is useful outside an active turn. Each assistant
+message whose task has a recorded manifest gets a *Context* link that opens the
+same panel for that turn, which is how a past turn is inspected.
 
-Category rows expand to their items. An item row offers remove (if not
-`Required`) and pin. The excluded section is collapsed by default and shows its
-count, since it is long and mostly uninteresting until it is exactly what you
-need.
+Category rows expand to their items. An item row offers remove (only while a
+review is paused, and only if not `Required`) and pin. The excluded section is
+collapsed by default and shows its count, since it is long and mostly
+uninteresting until it is exactly what you need.
+
+The panel's controls are separate from the composer's existing attachment chips:
+those are sent as `explicit_paths` for the request being typed and live in
+`localStorage`; these are session events and change every subsequent turn.
+Labelling them differently ("Attached for this request" versus "Pinned for this
+session") is part of the work, not a detail — two controls that look identical
+and behave differently is worse than one.
+
+Removal needs a paused review because that is the only point at which a turn has
+been assembled and not sent. On a completed turn the panel is read-only, which is
+the same rule as §5.3 and is enforced by the pause kind rather than by a disabled
+button: `remove_context_item` refuses a proposal that is not a context review.
 
 ### 5.7 Documentation
 
@@ -269,7 +382,7 @@ to inspect a past turn's context.
 - A `Required` item cannot be removed: the removal path rejects it — asserted at
   the API, not by the absence of a UI control.
 - An `Instructions` item can be removed for a turn without altering
-  [spec 11](11_agents_md_support.md) precedence.
+  [spec 11](../11_agents_md_support.md) precedence.
 - Pinning a file or range includes it on subsequent turns, and pins survive a
   restart.
 - Clearing pins removes them from subsequent turns.

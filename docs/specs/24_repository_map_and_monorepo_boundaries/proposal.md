@@ -247,7 +247,7 @@ most useful information survives a large repository:
 When anything is dropped, the rendered map says so explicitly ("12 of 47 roots
 shown"), because a silently abridged map is a map the agent will draw wrong
 conclusions from. The full map remains available to the UI and the context
-inspector ([spec 27](../27_context_inspector.md)); only the rendered-for-model form
+inspector ([spec 27](../27_context_inspector/proposal.md)); only the rendered-for-model form
 is bounded.
 
 ### 5.5 Per-root command execution

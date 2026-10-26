@@ -386,7 +386,7 @@ The hook process environment:
   malformed, because the response is otherwise valid.
 - **The inspector criterion waits on spec 27.** "Context additions appear in
   the context inspector within a bounded category" cannot be met while
-  [#27](../27_context_inspector.md) does not exist, and #27 is a
+  [#27](../27_context_inspector/proposal.md) does not exist, and #27 is a
   cross-reference here, not a dependency. It is met as "a bounded
   `hook_context` item in the turn's context plan", recorded as such in the
   proposal's §7. #26 must keep `hook_context` as a category when it rewrites

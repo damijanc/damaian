@@ -46,7 +46,7 @@ precedence), [`../21_task_plan_progress_and_budget/proposal.md`](../21_task_plan
 [`../22_findings_model_and_panel/proposal.md`](../22_findings_model_and_panel/proposal.md) (findings as a
 category), [`../24_repository_map_and_monorepo_boundaries/`](../24_repository_map_and_monorepo_boundaries/proposal.md),
 [`../25_symbol_and_relationship_index/`](../25_symbol_and_relationship_index/proposal.md),
-[`../27_context_inspector.md`](../27_context_inspector.md) (renders the manifest this
+[`../27_context_inspector.md`](../27_context_inspector/proposal.md) (renders the manifest this
 spec produces), [`../49_prompt_cache_accounting_and_reuse/proposal.md`](../49_prompt_cache_accounting_and_reuse/proposal.md)
 (the section order this spec fixes is what its reuse slice needs),
 [`../55_conversation_compaction/proposal.md`](../55_conversation_compaction/proposal.md) (the
@@ -79,7 +79,7 @@ Three consequences:
   items and a token estimate, but no provenance and no account of what was
   excluded or why. The user cannot see what was sent, and neither can a
   developer debugging a bad answer. That is the gap
-  [spec 27](../27_context_inspector.md) exists to close, and it needs this spec to
+  [spec 27](../27_context_inspector/proposal.md) exists to close, and it needs this spec to
   produce the data.
 
 There are also three structural gaps that block the roadmap's requirements and
@@ -196,7 +196,7 @@ map, including the call sites this section only names.
 - A tokenizer per model family. §5.8 improves the estimate without adding a
   tokenizer dependency, and is explicit that the result is still an estimate.
 - Persisting assembled context beyond the manifest.
-- The inspector UI — [spec 27](../27_context_inspector.md).
+- The inspector UI — [spec 27](../27_context_inspector/proposal.md).
 - Prompt-cache breakpoints. This spec fixes the section order that
   [spec 49](../49_prompt_cache_accounting_and_reuse/proposal.md)'s reuse slice
   needs and makes the sections separately addressable; it emits no breakpoints
@@ -316,7 +316,7 @@ declaration order of
 priority is the enum's own ordering rather than a separate table that could
 disagree with it.
 
-`Required` is first and is the category [spec 27](../27_context_inspector.md)
+`Required` is first and is the category [spec 27](../27_context_inspector/proposal.md)
 forbids the user from removing. Naming it in the type is what makes that
 guarantee checkable rather than a UI convention. Today it holds exactly one
 thing: the user's message.
@@ -729,7 +729,7 @@ only decides where that block sits.
 Three categories in §5.1 have no collection source yet, and this spec does not
 invent one:
 
-- `Pinned` needs session-scoped storage, which is [spec 27](../27_context_inspector.md).
+- `Pinned` needs session-scoped storage, which is [spec 27](../27_context_inspector/proposal.md).
 - `ConversationSummary` needs [spec 55](../55_conversation_compaction/proposal.md) to
   produce a summary at all.
 - `Findings` exists in the model (spec 22), but the agent sees only the subset

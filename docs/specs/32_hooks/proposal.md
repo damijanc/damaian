@@ -200,7 +200,7 @@ navigable and repairable. `context` additions are bounded strings that enter
 context assembly as ordinary `ContextItem`s in a dedicated category
 ([spec 26](../26_context_assembly/proposal.md)) — not a privileged channel, subject to the
 same budget and the same visibility in the inspector
-([spec 27](../27_context_inspector.md)).
+([spec 27](../27_context_inspector/proposal.md)).
 
 ### 5.3 Hooks return verdicts, not edits
 
@@ -378,7 +378,7 @@ report means.
   persistence, and entry into context.
 - Hook output exceeding the byte ceiling is a failure, not a truncation.
 - `context` additions appear in the context inspector
-  ([spec 27](../27_context_inspector.md)) within a bounded category, not as
+  ([spec 27](../27_context_inspector/proposal.md)) within a bounded category, not as
   instructions.
 - Hook configuration is a capability key: a repository cannot add a hook without
   review, nor disable a user's hook.
