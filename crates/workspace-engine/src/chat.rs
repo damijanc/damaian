@@ -2621,6 +2621,16 @@ impl ChatOrchestrator {
                     &pending.task,
                     &census,
                 );
+                // Spec 55 requirement 6: the summary's approval digest is read
+                // from the log, and a shell-command decision is not otherwise
+                // there — the audit log carries it with no session id.
+                self.session_store.record_conversation_approval(
+                    &pending.session.id,
+                    "command",
+                    proposal_id,
+                    "approved",
+                    Some(&command_request.command),
+                )?;
                 // The command the user approved is evidence for the step it
                 // served. The resumed execution is not bracketed by a new
                 // action marker, so the execution's own id is the breadcrumb —
@@ -2645,6 +2655,13 @@ impl ChatOrchestrator {
             } else {
                 self.validation_orchestrator
                     .reject_proposal(proposal_id, approved_by)?;
+                self.session_store.record_conversation_approval(
+                    &pending.session.id,
+                    "command",
+                    proposal_id,
+                    "rejected",
+                    Some(&command_request.command),
+                )?;
                 format!(
                     "The user declined to run `{}`. Do not request it again; answer using what you already know, noting the limitation if it matters.",
                     command_request.command

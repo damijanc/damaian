@@ -675,6 +675,205 @@ impl SessionStore {
         Ok(messages_with_seq(&content))
     }
 
+    /// Appends one conversation compaction (spec 55 §5.3). The full transcript
+    /// stays exactly as it was: this is one more event, and [`Self::read_messages`]
+    /// keeps returning every message.
+    pub fn append_conversation_compaction(
+        &self,
+        session_id: &str,
+        summary: &crate::compaction::ConversationSummary,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(summary).map_err(|error| {
+            crate::error::ClientError::Io(format!("conversation summary serialization: {error}"))
+        })?;
+        self.append_session_event(session_id, "conversation_compacted", &payload)
+    }
+
+    /// Every active compaction, oldest first.
+    ///
+    /// A payload written in a format version this build does not know is
+    /// ignored rather than failing the read: the log is append-only, and an
+    /// unreadable summary must degrade to the older one rather than take the
+    /// conversation with it.
+    pub fn read_conversation_compactions(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::compaction::ConversationSummary>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        let mut summaries = Vec::new();
+        for event in active_events(&content) {
+            if event.event_type != "conversation_compacted" {
+                continue;
+            }
+            let Ok(summary) = serde_json::from_value::<crate::compaction::ConversationSummary>(
+                event.payload.clone(),
+            ) else {
+                continue;
+            };
+            if summary.format_version > crate::compaction::SUMMARY_FORMAT_VERSION {
+                continue;
+            }
+            summaries.push(summary);
+        }
+        Ok(summaries)
+    }
+
+    /// The model's view of the conversation (spec 55 §5.3): the newest active
+    /// summary plus every active message after its `through_seq`.
+    ///
+    /// [`Self::read_messages`] is deliberately unchanged. The pair is
+    /// requirement 2: compaction reduces what is *sent*, never what is stored.
+    pub fn read_conversation(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::compaction::ConversationView> {
+        let messages = self.read_messages_with_seq(session_id)?;
+        let summary = self.read_conversation_compactions(session_id)?.pop();
+        let (summarised_messages, messages) = match &summary {
+            Some(summary) => {
+                let (covered, after): (Vec<_>, Vec<_>) = messages
+                    .into_iter()
+                    .partition(|(seq, _)| *seq <= summary.through_seq);
+                (covered.len(), after.into_iter().map(|(_, message)| message).collect())
+            }
+            None => (0, messages.into_iter().map(|(_, message)| message).collect()),
+        };
+        Ok(crate::compaction::ConversationView {
+            summary,
+            messages,
+            summarised_messages,
+        })
+    }
+
+    /// The highest event `seq` a new compaction may cover today.
+    ///
+    /// Requirement 5 and §5.4: never across a pending decision, and never across
+    /// an action whose outcome is unknown. A turn boundary is normally clear of
+    /// both, but a new prompt can arrive while an older task waits, and a crash
+    /// can leave an action unfinished; the clamp is what makes the guarantee
+    /// independent of those accidents.
+    pub fn compaction_limit(&self, session_id: &str) -> Result<u64> {
+        let messages = self.read_messages_with_seq(session_id)?;
+        let mut limit = messages.last().map(|(seq, _)| *seq).unwrap_or(0);
+        for action in self.dangling_actions(session_id)? {
+            limit = limit.min(action.seq.saturating_sub(1));
+        }
+        let statuses = self.read_task_statuses(session_id)?;
+        for (task_id, status) in statuses {
+            if status != TaskStatus::WaitingForApproval.as_str() {
+                continue;
+            }
+            if self.pending_decision_for(session_id, &task_id)?.is_some()
+                && let Some((seq, _)) = messages
+                    .iter()
+                    .find(|(_, message)| message.task_id.as_deref() == Some(task_id.as_str()))
+            {
+                limit = limit.min(seq.saturating_sub(1));
+            }
+        }
+        Ok(limit)
+    }
+
+    /// Approval decisions recorded at or before `through_seq`, for a summary's
+    /// fact half (spec 55 requirement 6).
+    ///
+    /// Patches and plan approval already live in the session log. Shell-command
+    /// decisions do not — they are audit-log events with no session id — so
+    /// [`Self::record_conversation_approval`] adds one for each decision as it
+    /// happens.
+    pub fn read_conversation_approvals_through(
+        &self,
+        session_id: &str,
+        through_seq: u64,
+    ) -> Result<Vec<crate::compaction::ApprovalDigest>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        let mut approvals = Vec::new();
+        for event in active_events(&content) {
+            if event.seq > through_seq {
+                continue;
+            }
+            match event.event_type.as_str() {
+                "conversation_approval_recorded" => {
+                    let Some(kind) = event.text("kind") else {
+                        continue;
+                    };
+                    let Some(id) = event.text("id") else {
+                        continue;
+                    };
+                    let Some(decision) = event.text("decision") else {
+                        continue;
+                    };
+                    approvals.push(crate::compaction::ApprovalDigest {
+                        kind,
+                        id,
+                        decision,
+                        subject: event.text("subject"),
+                    });
+                }
+                "plan_approved" => {
+                    let Some(task_id) = event.text("taskId") else {
+                        continue;
+                    };
+                    approvals.push(crate::compaction::ApprovalDigest {
+                        kind: "plan".to_string(),
+                        id: task_id,
+                        decision: "approved".to_string(),
+                        subject: None,
+                    });
+                }
+                "patch_file_decided" => {
+                    let Ok(decision) =
+                        serde_json::from_value::<PatchFileDecision>(event.payload.clone())
+                    else {
+                        continue;
+                    };
+                    approvals.push(crate::compaction::ApprovalDigest {
+                        kind: "patch".to_string(),
+                        id: decision.patch_id,
+                        decision: if decision.applied {
+                            "applied".to_string()
+                        } else {
+                            "rejected".to_string()
+                        },
+                        subject: (!decision.paths.is_empty()).then(|| decision.paths.join(", ")),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(approvals)
+    }
+
+    /// Records one approval decision in the conversation log, so a later
+    /// summary can read it rather than ask a model to remember it (spec 55
+    /// requirement 6).
+    pub fn record_conversation_approval(
+        &self,
+        session_id: &str,
+        kind: &str,
+        id: &str,
+        decision: &str,
+        subject: Option<&str>,
+    ) -> Result<()> {
+        let subject = subject
+            .map(|value| format!(",\"subject\":\"{}\"", escape_json(value)))
+            .unwrap_or_default();
+        self.append_session_event(
+            session_id,
+            "conversation_approval_recorded",
+            &format!(
+                "{{\"kind\":\"{}\",\"id\":\"{}\",\"decision\":\"{}\"{subject}}}",
+                escape_json(kind),
+                escape_json(id),
+                escape_json(decision)
+            ),
+        )
+    }
+
     /// The latest recorded status of every task in the session, keyed by task id.
     ///
     /// Tasks are not stored as records but replayed from `task_created` and

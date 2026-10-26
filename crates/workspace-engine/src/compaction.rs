@@ -421,6 +421,155 @@ pub fn bound_objective(first_user_message: &str) -> String {
     bounded
 }
 
+/// Everything a summary needs that the engine can read for itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryFacts {
+    pub objective: String,
+    pub files_changed: Vec<String>,
+    pub plan_steps: Vec<PlanStepDigest>,
+    pub approvals: Vec<ApprovalDigest>,
+    pub validation: Vec<ValidationDigest>,
+    pub message_count: usize,
+}
+
+/// Everything the fact reader is allowed to look at. Passed as one struct so a
+/// source cannot be added without deciding whether it contributes.
+pub struct FactInputs<'a> {
+    /// Active messages with their event `seq`.
+    pub messages: &'a [(u64, crate::session::ChatMessage)],
+    pub plans: &'a std::collections::HashMap<String, crate::plan::TaskPlan>,
+    pub patch_decisions: &'a [crate::session::PatchFileDecision],
+    /// Already bounded to `through_seq` by the session reader.
+    pub approvals: &'a [ApprovalDigest],
+    pub verification: &'a [crate::verification::VerificationEvent],
+    pub findings: &'a [crate::finding::Finding],
+}
+
+/// Reads the fact half of a summary for the span ending at `through_seq`.
+///
+/// `None` means the span has no user message, so there is no objective to quote
+/// and nothing worth summarising. The caller treats that as
+/// `NothingToCompact`.
+pub fn facts_for_span(inputs: FactInputs<'_>, through_seq: u64) -> Option<SummaryFacts> {
+    let covered: Vec<&(u64, crate::session::ChatMessage)> = inputs
+        .messages
+        .iter()
+        .filter(|(seq, _)| *seq <= through_seq)
+        .collect();
+    let objective = covered
+        .iter()
+        .find(|(_, message)| {
+            message.role == "user" && message.kind.as_deref() != Some("plan_reminder")
+        })
+        .map(|(_, message)| bound_objective(&message.content))?;
+    let task_ids: std::collections::HashSet<&str> = covered
+        .iter()
+        .filter_map(|(_, message)| message.task_id.as_deref())
+        .collect();
+
+    let mut files: Vec<String> = inputs
+        .patch_decisions
+        .iter()
+        .filter(|decision| task_ids.contains(decision.task_id.as_str()))
+        .flat_map(|decision| decision.paths.iter().cloned())
+        .collect();
+    files.sort();
+    files.dedup();
+
+    let mut plan_steps = Vec::new();
+    let mut plan_task_ids: Vec<&String> = inputs
+        .plans
+        .keys()
+        .filter(|task_id| task_ids.contains(task_id.as_str()))
+        .collect();
+    plan_task_ids.sort();
+    for task_id in plan_task_ids {
+        if let Some(plan) = inputs.plans.get(task_id) {
+            for step in &plan.steps {
+                plan_steps.push(PlanStepDigest {
+                    id: step.id.clone(),
+                    title: step.title.clone(),
+                    status: step.status,
+                });
+            }
+        }
+    }
+    plan_steps.truncate(50);
+
+    let mut validation: Vec<ValidationDigest> = Vec::new();
+    for event in inputs.verification {
+        let crate::verification::VerificationEvent::Check {
+            task_id,
+            check,
+            outcome,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if !task_ids.contains(task_id.as_str()) {
+            continue;
+        }
+        let outcome = match outcome {
+            crate::verification::CheckOutcome::Ran {
+                exit_code: Some(0), ..
+            } => "passed".to_string(),
+            crate::verification::CheckOutcome::Ran {
+                exit_code: Some(code),
+                ..
+            } => format!("failed (exit {code})"),
+            crate::verification::CheckOutcome::Ran {
+                exit_code: None, ..
+            } => "ran, no exit code".to_string(),
+            crate::verification::CheckOutcome::Skipped(reason) => {
+                format!("skipped: {}", reason.description())
+            }
+        };
+        validation.push(ValidationDigest {
+            label: check.label(),
+            outcome,
+        });
+    }
+    for finding in inputs.findings {
+        if finding.status() != crate::finding::FindingStatus::Open {
+            continue;
+        }
+        if !finding
+            .task_id()
+            .is_some_and(|task_id| task_ids.contains(task_id))
+        {
+            continue;
+        }
+        validation.push(ValidationDigest {
+            label: format!("{:?} finding", finding.source()),
+            outcome: format!(
+                "{:?} (open): {}",
+                finding.severity(),
+                bound_narrative_item(finding.summary())
+            ),
+        });
+    }
+    // The same check can run more than once; the newest outcome wins.
+    let mut latest: Vec<ValidationDigest> = Vec::new();
+    for digest in validation.into_iter().rev() {
+        if latest.iter().any(|kept| kept.label == digest.label) {
+            continue;
+        }
+        latest.push(digest);
+    }
+    latest.reverse();
+    latest.truncate(20);
+
+    Some(SummaryFacts {
+        objective,
+        files_changed: files,
+        plan_steps,
+        approvals: inputs.approvals.to_vec(),
+        validation: latest,
+        message_count: covered.len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +706,137 @@ mod tests {
         let prompt = narrative_prompt("user: and then?", Some(&summary()));
         assert!(prompt.contains("A previous summary covers the earlier part"));
         assert!(prompt.contains("--- begin prior conversation summary"));
+    }
+
+    #[test]
+    fn the_fact_half_is_read_from_the_log_and_not_authored() {
+        use crate::plan::{PlanStep, TaskPlan};
+        use crate::session::{ChatMessage, PatchFileDecision};
+        use crate::verification::{CheckId, CheckOutcome, VerificationEvent};
+        use std::collections::{BTreeMap, HashMap};
+
+        let messages = vec![
+            (
+                2,
+                ChatMessage {
+                    id: "m1".to_string(),
+                    session_id: "s".to_string(),
+                    task_id: Some("task_1".to_string()),
+                    role: "user".to_string(),
+                    content: "Do not touch the public API.".to_string(),
+                    kind: None,
+                    created_at_ms: 1,
+                },
+            ),
+            (
+                4,
+                ChatMessage {
+                    id: "m2".to_string(),
+                    session_id: "s".to_string(),
+                    task_id: Some("task_1".to_string()),
+                    role: "assistant".to_string(),
+                    content: "Working on it.".to_string(),
+                    kind: None,
+                    created_at_ms: 2,
+                },
+            ),
+            (
+                9,
+                ChatMessage {
+                    id: "m3".to_string(),
+                    session_id: "s".to_string(),
+                    task_id: Some("task_2".to_string()),
+                    role: "user".to_string(),
+                    content: "A later request that is still in the window.".to_string(),
+                    kind: None,
+                    created_at_ms: 3,
+                },
+            ),
+        ];
+        let mut plan = TaskPlan::new("task_1", 1);
+        plan.steps.push(PlanStep {
+            id: "step_1".to_string(),
+            title: "Add the parser".to_string(),
+            detail: None,
+            status: StepStatus::Completed,
+            depends_on: Vec::new(),
+            started_at_ms: Some(1),
+            completed_at_ms: Some(2),
+            evidence: Vec::new(),
+        });
+        let plans: HashMap<String, TaskPlan> = [("task_1".to_string(), plan)].into();
+        let decisions = vec![
+            PatchFileDecision {
+                task_id: "task_1".to_string(),
+                patch_id: "patch_1".to_string(),
+                paths: vec!["src/lib.rs".to_string(), "src/a.rs".to_string()],
+                applied: true,
+            },
+            PatchFileDecision {
+                task_id: "task_2".to_string(),
+                patch_id: "patch_2".to_string(),
+                paths: vec!["src/later.rs".to_string()],
+                applied: true,
+            },
+        ];
+        let verification = vec![VerificationEvent::Check {
+            task_id: "task_1".to_string(),
+            check: CheckId::new("", "cargo test"),
+            outcome: CheckOutcome::Ran {
+                exit_code: Some(0),
+                marker_id: "marker_1".to_string(),
+            },
+            file_hashes: BTreeMap::new(),
+        }];
+        let approvals = vec![ApprovalDigest {
+            kind: "command".to_string(),
+            id: "cmd_1".to_string(),
+            decision: "approved".to_string(),
+            subject: None,
+        }];
+
+        let facts = facts_for_span(
+            FactInputs {
+                messages: &messages,
+                plans: &plans,
+                patch_decisions: &decisions,
+                approvals: &approvals,
+                verification: &verification,
+                findings: &[],
+            },
+            4,
+        )
+        .expect("a covered span with a user message");
+
+        assert_eq!(facts.objective, "Do not touch the public API.");
+        assert_eq!(facts.message_count, 2);
+        assert_eq!(facts.files_changed, vec!["src/a.rs", "src/lib.rs"]);
+        assert_eq!(facts.plan_steps.len(), 1);
+        assert_eq!(facts.plan_steps[0].status, StepStatus::Completed);
+        assert_eq!(facts.approvals, approvals);
+        assert_eq!(
+            facts.validation,
+            vec![ValidationDigest {
+                label: "cargo test (repository root)".to_string(),
+                outcome: "passed".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_span_with_no_user_message_has_nothing_to_compact() {
+        let facts = facts_for_span(
+            FactInputs {
+                messages: &[],
+                plans: &std::collections::HashMap::new(),
+                patch_decisions: &[],
+                approvals: &[],
+                verification: &[],
+                findings: &[],
+            },
+            10,
+        );
+        assert!(facts.is_none());
     }
 
     #[test]

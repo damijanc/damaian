@@ -13,7 +13,7 @@ disagree.
 |---|---|---|
 | 1 · Folder, records, links, status | In progress | Splitting the flat spec into a folder and rewriting the links. |
 | 2 · Summary types and rendering | Done 2026-10-26 | New `compaction.rs`: `ConversationSummary` and its digests, `format_version`, delimited model rendering with quoted narrative, the summarisation prompt and a JSON narrative parser. Ten unit tests pin the markers, the quoting, the data-not-instruction sentence, the version, redaction/bounding, and that a malformed reply yields no narrative. Scoped `cargo nextest -p workspace-engine --lib compaction` passed (10 tests) and crate clippy was clean. |
-| 3 · Session log and the two readers | Not started | |
+| 3 · Session log and the two readers | Done 2026-10-26 | `conversation_compacted` append/read; `read_conversation` returns the newest active summary plus only messages after `through_seq`; `read_messages` unchanged; `compaction_limit` clamps to pending approvals, pending questions and dangling actions; command decisions append `conversation_approval_recorded`; `facts_for_span` reads objective/files/steps/approvals/validation. Tests: 8 in `tests/compaction.rs` (append-only, model view, rewind, compounding, unknown version, two guards, approval event) and 2 fact unit tests. Scoped nextest and crate clippy passed. |
 | 4 · Config keys | Not started | |
 | 5 · The compaction engine | Not started | |
 | 6 · The prompt window | Not started | |
@@ -241,7 +241,7 @@ beside this track while they are in flight.
 **Files:** `crates/workspace-engine/src/session.rs`, `compaction.rs`,
 `tests/compaction.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `a_compaction_is_appended_and_never_rewrites_a_message` — append 12
     messages, compact through message 8; `read_messages` returns all 12 and the
     log length only grew;
@@ -259,8 +259,8 @@ beside this track while they are in flight.
     helper returns a `through_seq` strictly below the guarded marker;
   - `a_command_decision_is_recorded_in_the_session_log` — the new
     `conversation_approval_recorded` event round-trips into the approval digest.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Implement.**
   - `append_conversation_compaction` writes one `conversation_compacted` event
     with `summaryId`, `throughSeq`, `formatVersion`, `messageCount` and the
     summary JSON.
@@ -276,13 +276,13 @@ beside this track while they are in flight.
     and call it at the two command decision points in `chat.rs` (approve and
     reject), and include `plan_approved` and `patch_file_decided` in the fact
     reader.
-- [ ] **Step 4: Falsify.** Delete the `through_seq` filter → test 2 fails;
+- [x] **Step 4: Falsify.** Delete the `through_seq` filter → test 2 fails;
   rewrite a message instead of appending → test 1 fails; ignore the rewind
   marker → test 3 fails; drop the dangling-action clamp → its test fails.
   Restore.
-- [ ] **Step 5: Scoped checks.** `cargo nextest run -p workspace-engine --test
+- [x] **Step 5: Scoped checks.** `cargo nextest run -p workspace-engine --test
   compaction --lib session`, clippy for `workspace-engine`, fast five.
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Append conversation summaries without rewriting the transcript`.
 
 ## Task 4: Config keys
