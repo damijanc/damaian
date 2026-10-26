@@ -16,7 +16,7 @@ disagree.
 | 3 · Session log and the two readers | Done 2026-10-26 | `conversation_compacted` append/read; `read_conversation` returns the newest active summary plus only messages after `through_seq`; `read_messages` unchanged; `compaction_limit` clamps to pending approvals, pending questions and dangling actions; command decisions append `conversation_approval_recorded`; `facts_for_span` reads objective/files/steps/approvals/validation. Tests: 8 in `tests/compaction.rs` (append-only, model view, rewind, compounding, unknown version, two guards, approval event) and 2 fact unit tests. Scoped nextest and crate clippy passed. |
 | 4 · Config keys | Done 2026-10-26 | `conversation_auto_compact` (default true, Forbidden to repository and profile) and `conversation_window_share` (decimal → basis points, default 0.25, restrict-only lower-wins). Wired through `Config`, `ConfigOverlay`, parse, `apply_overlay_scoped`, both policy-text writers, `overlay_field_kinds`, `split_profile_keys`, `equals_base_limit` and `rule_label`. Tests in `permission_profiles.rs` (repository refusal both values, lower applies, profile split, labels/kinds) and the 78-test suite passed; `repository_config_trust` (52) too. Fast five passed after `cargo fmt`. |
 | 5 · The compaction engine | Done 2026-10-26 | `ChatOrchestrator::compact_conversation` + `conversation_window_tokens` + the automatic trigger before the current user message is appended. Facts read from the log (objective, patch decisions, plan steps, approvals incl. the new command event, verification checks, open findings); only narrative is parsed from the call. Failure produces a facts-only summary; cancel appends nothing; a log/append failure is audited and never fails the turn. Usage is recorded under `compaction_<id>` with `conversation_compaction`, so it is in session totals and in no turn ceiling. Tests (6 new in `tests/compaction.rs`): stubbed model still has every fact, byte-identical objective, failure → facts-only + later turn runs, pending approval is a no-op with no model call, accounting, auto-off makes no call, auto runs before assembly and never swallows the current request. Existing `context_assembly`/`foundation`/`plan_turn`/`turn_notes` (291) passed after moving compaction before the append. Crate clippy and the fast five passed. |
-| 6 · The prompt window | Not started | |
+| 6 · The prompt window | Done 2026-10-26 | `build_model_prompt` takes a window token budget and an optional summary; `window_slice` accumulates newest-first by `TokenEstimate::Prose`, always keeps the newest message, and the elision notice counts only messages neither the summary nor the window carries. Summary renders between markers inside `Recent conversation:`, never in the system prompt. Tests: three inline chat tests (short vs long budget, exact omission count, summary boundary/system-prompt exclusion) and two integration tests (summary + window sent while `read_messages` returns all 32; a fact the model omitted is still in the next request). 627 lib+scoped tests passed; crate clippy and fast five passed. |
 | 7 · Shell and UI | Not started | |
 | 8 · Eval harness | Not started | |
 | 9 · Docs, acceptance walk, close | Not started | |
@@ -382,7 +382,7 @@ added in Task 3), `tests/compaction.rs`.
 **Requirements:** 1, 2, 4, 6, 9. **Context:** D2, D8.
 **Files:** `chat.rs`, `compaction.rs`, `tests/compaction.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `a_compacted_session_sends_the_summary_and_the_window_and_read_messages_still_has_everything`
     — one test asserting both halves of requirement 2;
   - `a_short_conversation_keeps_more_turns_than_a_long_one` — with the same
@@ -395,20 +395,20 @@ added in Task 3), `tests/compaction.rs`.
     message excludes every summary string;
   - `a_fact_that_the_model_omitted_is_still_in_the_next_request` — the
     facts-only summary's files/checks are present in the following request.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Implement.** Replace the `.take(8)` selection with a
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Implement.** Replace the `.take(8)` selection with a
   token-budgeted backward scan using `TokenEstimate::Prose`; pass the summary
   to `build_model_prompt`; render it between the delimiters before the window;
   add the elision notice with its count when `omitted > 0`; keep the
   2,000-character cut; update the two direct `build_model_prompt` tests at
   `chat.rs:13362` and `:13429`.
-- [ ] **Step 4: Falsify.** Restore `.take(8)` → the short/long test fails; drop
+- [x] **Step 4: Falsify.** Restore `.take(8)` → the short/long test fails; drop
   the notice → the elision test fails; put the summary in the system prompt →
   that test fails; let the summary count as "sent" → the no-double-notice test
   fails.
-- [ ] **Step 5: Scoped checks.** `cargo nextest run -p workspace-engine --test
+- [x] **Step 5: Scoped checks.** `cargo nextest run -p workspace-engine --test
   compaction --lib chat`, clippy, fast five.
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Budget the conversation window and send the summary instead of a cliff`.
 
 ## Task 7: Shell and UI

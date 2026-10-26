@@ -700,3 +700,78 @@ fn auto_compaction_makes_no_model_call_when_switched_off() {
             .is_empty()
     );
 }
+
+#[test]
+fn a_compacted_session_sends_the_summary_and_the_window_and_read_messages_still_has_everything() {
+    let repo = temp_repo("both-halves");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Both halves");
+    seed_facts(&engine, &session, &task);
+    seed_long_conversation(&engine, &session, &task, "Do not touch the public API.");
+
+    let mut adapter = MockModelAdapter::new(
+        r#"{"constraints":["do not touch the public API"],"decisions":[],"failed_approaches":[],"uncertainty":[]}"#,
+    );
+    engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut adapter, &cancel())
+        .unwrap();
+
+    let mut adapter = MockModelAdapter::new("Done.");
+    ask(
+        &engine,
+        &repo,
+        "What next?",
+        Some(&session.id),
+        &mut adapter,
+    );
+    let sent = &adapter.requests[0].messages[1].content;
+
+    assert!(sent.contains("--- begin prior conversation summary"));
+    assert!(sent.contains("do not touch the public API"));
+    assert!(sent.contains("What next?"), "the request is still sent");
+    assert!(
+        sent.contains("message 29"),
+        "the newest messages are sent verbatim"
+    );
+
+    let stored = engine.session_store.read_messages(&session.id).unwrap();
+    assert_eq!(
+        stored.len(),
+        32,
+        "30 seeded + the new request and answer, all still readable"
+    );
+    assert_eq!(stored[0].content, "Do not touch the public API.");
+}
+
+#[test]
+fn a_fact_the_model_omitted_is_still_in_the_next_request() {
+    let repo = temp_repo("facts-only-request");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Facts only request");
+    seed_facts(&engine, &session, &task);
+    seed_long_conversation(&engine, &session, &task, "Keep the public API stable.");
+
+    // A reply that is not a narrative: the model wrote nothing.
+    let mut adapter = MockModelAdapter::new("no record available");
+    engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut adapter, &cancel())
+        .unwrap();
+
+    let mut adapter = MockModelAdapter::new("Done.");
+    ask(
+        &engine,
+        &repo,
+        "What next?",
+        Some(&session.id),
+        &mut adapter,
+    );
+    let sent = &adapter.requests[0].messages[1].content;
+    assert!(
+        sent.contains("Files changed (from Damaian's patch records): src/lib.rs"),
+        "a fact the model did not write is still sent: {sent}"
+    );
+    assert!(sent.contains("cargo test (repository root): passed"));
+    assert!(sent.contains("no model-written narrative was recorded for this span"));
+}

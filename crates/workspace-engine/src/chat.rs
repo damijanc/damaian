@@ -1191,6 +1191,7 @@ impl ChatOrchestrator {
             &context,
             &conversation.messages,
             conversation.summary.as_ref(),
+            self.conversation_window_tokens(),
             &self.scanner,
             None,
         );
@@ -2177,6 +2178,7 @@ impl ChatOrchestrator {
                 &context,
                 &conversation.messages,
                 conversation.summary.as_ref(),
+                self.conversation_window_tokens(),
                 &self.scanner,
                 None,
             )),
@@ -8654,6 +8656,7 @@ fn build_model_prompt(
     plan: &ContextPlan,
     prior_messages: &[ChatMessage],
     summary: Option<&ConversationSummary>,
+    window_tokens: usize,
     scanner: &SecretScanner,
     command_context: Option<&str>,
 ) -> String {
@@ -8676,15 +8679,14 @@ fn build_model_prompt(
     // A plan reminder is the engine's nudge, not the user's words: seeding a
     // later turn with it would present an instruction as something the user
     // said (spec 66 `context.md` D10).
-    let recent_messages = prior_messages
+    let conversation_messages = prior_messages
         .iter()
         .filter(|message| message.kind.as_deref() != Some("plan_reminder"))
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
         .collect::<Vec<_>>();
+    // Spec 55 §5.1: the window is a token budget, not eight messages, so a
+    // conversation of short messages keeps more turns than one of long ones.
+    let recent_messages = window_slice(&conversation_messages, window_tokens);
+    let omitted = conversation_messages.len() - recent_messages.len();
     if summary.is_some() || !recent_messages.is_empty() {
         output.push('\n');
         output.push_str(PromptSectionName::RecentConversation.heading());
@@ -8695,6 +8697,18 @@ fn build_model_prompt(
         if let Some(summary) = summary {
             output.push_str(&summary.render_for_model());
             output.push('\n');
+        }
+        // §5.5: with no active summary covering the omitted messages, the loss
+        // is stated rather than left silent. Messages the summary covers are
+        // not in `prior_messages` at all, so `omitted` counts only those
+        // outside both the summary and the window.
+        if omitted > 0 {
+            output.push_str(&format!(
+                "[Damaian: {omitted} earlier message{} in this conversation were not sent to you \
+                 and were not summarised. The full transcript is still stored in the session and \
+                 is readable in the app.]\n",
+                if omitted == 1 { "" } else { "s" }
+            ));
         }
         for message in recent_messages {
             output.push_str(&message.role);
@@ -10787,6 +10801,31 @@ fn sandbox_command_context(execution: &CommandExecution) -> String {
     output.push_str("\n\nSTDERR:\n");
     output.push_str(&truncate_for_prompt(&execution.stderr, 4_000));
     output
+}
+
+/// The messages that fit the conversation window, newest first accumulated
+/// until the token budget is spent, returned in log order.
+///
+/// The newest message is always kept, even if it alone exceeds the budget: it
+/// is the user's current position, and a window that dropped it would answer a
+/// question it could not see.
+fn window_slice<'a>(messages: &[&'a ChatMessage], window_tokens: usize) -> Vec<&'a ChatMessage> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+    let newest = messages.len() - 1;
+    let mut used = 0usize;
+    let mut kept = Vec::new();
+    for (index, message) in messages.iter().enumerate().rev() {
+        let cost = crate::context_manager::TokenEstimate::Prose.tokens(&message.content);
+        if index != newest && used + cost > window_tokens {
+            break;
+        }
+        used += cost;
+        kept.push(*message);
+    }
+    kept.reverse();
+    kept
 }
 
 fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
@@ -13650,6 +13689,7 @@ mod approval_prompt_wording_tests {
             &plan,
             &[],
             None,
+            usize::MAX,
             &SecretScanner::default(),
             Some("Command: pwd\n"),
         );
@@ -13718,6 +13758,7 @@ mod approval_prompt_wording_tests {
             &plan,
             &[reminder, ordinary],
             None,
+            usize::MAX,
             &SecretScanner::default(),
             None,
         );
@@ -13728,6 +13769,150 @@ mod approval_prompt_wording_tests {
         assert!(
             prompt.contains("the user's own words"),
             "the negative control: an ordinary message still seeds it: {prompt}"
+        );
+    }
+
+    fn prompt_plan() -> crate::context_manager::ContextPlan {
+        crate::context_manager::ContextPlan {
+            repository_id: "repo".to_string(),
+            task_id: "task".to_string(),
+            token_estimate: 2,
+            items: vec![crate::context_manager::ContextItem {
+                category: crate::context_manager::ContextCategory::Required,
+                kind: crate::context_manager::ContextKind::UserPrompt,
+                path: None,
+                range: None,
+                content: "Question".to_string(),
+                tokens: 2,
+                redaction_status: "clean".to_string(),
+                provenance: None,
+                root_path: None,
+            }],
+            files: Vec::new(),
+            manifest: crate::context_manager::ContextManifest {
+                repository_id: "repo".to_string(),
+                task_id: "task".to_string(),
+                assembled_at_ms: 0,
+                limit: crate::context_manager::EffectiveLimit::declared(2),
+                total_tokens: 2,
+                categories: Vec::new(),
+                included: Vec::new(),
+                excluded: Vec::new(),
+            },
+        }
+    }
+
+    fn conversation_message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: create_id("msg"),
+            session_id: "session".to_string(),
+            task_id: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            kind: None,
+            created_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_short_conversation_keeps_more_messages_than_a_long_one_in_the_same_budget() {
+        let short = (0..6)
+            .map(|index| conversation_message("user", &format!("short {index}")))
+            .collect::<Vec<_>>();
+        let long = (0..6)
+            .map(|index| conversation_message("user", &format!("long {index} {}", "x".repeat(400))))
+            .collect::<Vec<_>>();
+        let plan = prompt_plan();
+        let scanner = SecretScanner::default();
+        let short_prompt = build_model_prompt(&plan, &short, None, 100, &scanner, None);
+        let long_prompt = build_model_prompt(&plan, &long, None, 100, &scanner, None);
+
+        assert!(
+            short_prompt.contains("short 0"),
+            "short messages all fit: {short_prompt}"
+        );
+        assert!(
+            !long_prompt.contains("long 0"),
+            "long messages fall outside the same budget: {long_prompt}"
+        );
+        assert!(long_prompt.contains("long 5"), "the newest is always kept");
+    }
+
+    #[test]
+    fn an_uncompacted_conversation_states_how_many_messages_were_not_sent() {
+        let messages = (0..4)
+            .map(|index| conversation_message("user", &format!("item {index} {}", "x".repeat(400))))
+            .collect::<Vec<_>>();
+        let prompt = build_model_prompt(
+            &prompt_plan(),
+            &messages,
+            None,
+            100,
+            &SecretScanner::default(),
+            None,
+        );
+        assert!(
+            prompt.contains(
+                "[Damaian: 3 earlier messages in this conversation were not sent to you and were \
+                 not summarised. The full transcript is still stored in the session and is \
+                 readable in the app.]"
+            ),
+            "the loss is stated and counted: {prompt}"
+        );
+    }
+
+    #[test]
+    fn a_summary_covers_only_the_messages_before_its_boundary() {
+        let messages = (0..4)
+            .map(|index| conversation_message("user", &format!("item {index} {}", "x".repeat(400))))
+            .collect::<Vec<_>>();
+        let mut summary = ConversationSummary {
+            id: "summary_1".to_string(),
+            through_seq: 8,
+            format_version: crate::compaction::SUMMARY_FORMAT_VERSION,
+            objective: "Do not touch the public API.".to_string(),
+            files_changed: vec!["src/lib.rs".to_string()],
+            plan_steps: Vec::new(),
+            approvals: Vec::new(),
+            validation: Vec::new(),
+            constraints: vec!["keep the API stable".to_string()],
+            decisions: Vec::new(),
+            failed_approaches: Vec::new(),
+            uncertainty: Vec::new(),
+            model_run_id: None,
+            message_count: 8,
+        };
+        let prompt = build_model_prompt(
+            &prompt_plan(),
+            &messages,
+            Some(&summary),
+            100,
+            &SecretScanner::default(),
+            None,
+        );
+        assert!(prompt.contains("--- begin prior conversation summary"));
+        assert!(
+            prompt.contains("[Damaian: 3 earlier messages in this conversation were not sent"),
+            "the notice counts only what neither the summary nor the window carries: {prompt}"
+        );
+        // A summary that covers part of the span and a window that carries the
+        // rest still never places model-authored text in the system prompt.
+        let system = system_prompt_for_session(SessionMode::Code, false, false, "/bin/zsh");
+        assert!(!system.contains("begin prior conversation summary"));
+        assert!(!system.contains("keep the API stable"));
+
+        summary.through_seq = 0;
+        let prompt = build_model_prompt(
+            &prompt_plan(),
+            &[],
+            Some(&summary),
+            usize::MAX,
+            &SecretScanner::default(),
+            None,
+        );
+        assert!(
+            !prompt.contains("were not sent"),
+            "nothing is omitted when the summary covers everything and no messages remain"
         );
     }
 
