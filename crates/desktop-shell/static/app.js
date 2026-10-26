@@ -1572,6 +1572,14 @@ function showCommitDialog(preparation, repoPath, sessionId) {
 
   const selectedCandidates = () =>
     preparation.candidates.filter((candidate) => selected.has(candidate.path));
+  // A rename is one change in two paths. The checkboxes move together; the
+  // engine refuses a half-selection anyway, so this is the visible half of the
+  // same rule.
+  const syncCheckboxes = () => {
+    list.querySelectorAll('input[type="checkbox"][data-path]').forEach((input) => {
+      input.checked = selected.has(input.dataset.path);
+    });
+  };
   const warningsFor = (candidates) =>
     candidates.flatMap((candidate) =>
       (candidate.secretWarnings || []).map((warning) => ({ ...warning, path: candidate.path })),
@@ -1627,12 +1635,19 @@ function showCommitDialog(preparation, repoPath, sessionId) {
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.checked = selected.has(candidate.path);
+    checkbox.dataset.path = candidate.path;
     // A submodule or nested repository has no file bytes this flow can
     // compose; the server refuses it, and the checkbox says so by staying off.
     checkbox.disabled = candidate.source === "unsupported";
     checkbox.addEventListener("change", () => {
       if (checkbox.checked) selected.add(candidate.path);
       else selected.delete(candidate.path);
+      const pair = candidate.renamedFrom || candidate.renamedTo;
+      if (pair) {
+        if (checkbox.checked) selected.add(pair);
+        else selected.delete(pair);
+      }
+      syncCheckboxes();
       refresh();
     });
     const path = document.createElement("code");

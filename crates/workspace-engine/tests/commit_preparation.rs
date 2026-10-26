@@ -61,6 +61,10 @@ impl Fixture {
         self.git(&["config", "commit.gpgsign", "false"]);
         self.git(&["config", "gc.auto", "0"]);
         self.git(&["config", "maintenance.auto", "false"]);
+        // The mode tests need Git to report the executable bit. It is the
+        // macOS default; setting it explicitly makes the fixture independent
+        // of the machine's Git configuration.
+        self.git(&["config", "core.fileMode", "true"]);
     }
 
     fn git(&self, args: &[&str]) -> String {
@@ -1568,6 +1572,202 @@ fn a_same_size_hook_edit_after_the_report_is_refused() {
             outcome,
             Err(CommitError::Refused {
                 code: "commit_hooks_changed",
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(fixture.head(), before);
+    fixture.cleanup();
+}
+
+#[test]
+fn a_staged_rename_is_prepared_as_a_pair_and_committed_as_one() {
+    let fixture = Fixture::new("rename");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    fixture.git(&["mv", "a.txt", "b.txt"]);
+    let (session, _task) = fixture.session();
+
+    let preparation = fixture.prepare(&session);
+    let target = preparation
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path == "b.txt")
+        .expect("the rename target is a candidate");
+    assert_eq!(target.renamed_from.as_deref(), Some("a.txt"));
+    assert_eq!(target.copied_from, None);
+    let source = preparation
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path == "a.txt")
+        .expect("the rename source is a deletion candidate");
+    assert_eq!(source.status, "deleted");
+    assert_eq!(source.renamed_to.as_deref(), Some("b.txt"));
+    assert!(!source.selected_by_default);
+
+    let before = fixture.head();
+    let half = fixture.commit(
+        &session,
+        &preparation,
+        &["b.txt".to_string()],
+        "Rename a to b",
+        false,
+    );
+    assert!(
+        matches!(
+            half,
+            Err(CommitError::Refused {
+                code: "commit_rename_incomplete",
+                ..
+            })
+        ),
+        "{half:?}"
+    );
+    assert_eq!(fixture.head(), before);
+
+    fixture
+        .commit(
+            &session,
+            &preparation,
+            &["a.txt".to_string(), "b.txt".to_string()],
+            "Rename a to b",
+            false,
+        )
+        .unwrap();
+    assert_eq!(fixture.tree_paths(), vec!["b.txt".to_string()]);
+    assert_eq!(fixture.show("b.txt"), "original\n");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_hook_that_stages_a_fix_keeps_it_out_of_the_commit_and_says_so() {
+    let fixture = Fixture::new("hook-stages");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    fixture.write_hook(
+        "pre-commit",
+        "#!/bin/sh\nprintf 'hook edit\\n' >> a.txt\ngit add a.txt\nexit 0\n",
+        true,
+    );
+    let preparation = fixture.prepare(&session);
+    let outcome = fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            "Commit a",
+            false,
+        )
+        .unwrap();
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("pre-commit")
+                && warning.contains("remain uncommitted")),
+        "{:?}",
+        outcome.warnings
+    );
+    assert_eq!(fixture.show("a.txt"), "damaian\n");
+    assert_eq!(fixture.read("a.txt"), "damaian\nhook edit\n");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_chmod_only_change_is_a_candidate_and_commits_the_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("chmod");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let full = fixture.repository.join("a.txt");
+    let mut permissions = fs::metadata(&full).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&full, permissions).unwrap();
+    let (session, _task) = fixture.session();
+    let preparation = fixture.prepare(&session);
+    let candidate = preparation
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path == "a.txt")
+        .expect("a chmod-only change is a candidate");
+    assert_eq!(candidate.mode.as_deref(), Some("100755"));
+    fixture
+        .commit(
+            &session,
+            &preparation,
+            &["a.txt".to_string()],
+            "Make a executable",
+            false,
+        )
+        .unwrap();
+    let entry = fixture.git(&["ls-tree", "HEAD", "a.txt"]);
+    assert!(entry.starts_with("100755 blob "), "{entry}");
+    assert_eq!(fixture.show("a.txt"), "original\n");
+    fixture.cleanup();
+}
+
+#[test]
+fn replacing_a_file_with_a_symlink_commits_mode_120000() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new("symlink");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    fs::remove_file(fixture.repository.join("a.txt")).unwrap();
+    symlink("target", fixture.repository.join("a.txt")).unwrap();
+    let (session, _task) = fixture.session();
+    let preparation = fixture.prepare(&session);
+    let candidate = preparation
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path == "a.txt")
+        .expect("the type change is a candidate");
+    assert_eq!(candidate.mode.as_deref(), Some("120000"));
+    fixture
+        .commit(
+            &session,
+            &preparation,
+            &["a.txt".to_string()],
+            "Replace a with a link",
+            false,
+        )
+        .unwrap();
+    let entry = fixture.git(&["ls-tree", "HEAD", "a.txt"]);
+    assert!(entry.starts_with("120000 blob "), "{entry}");
+    assert_eq!(fixture.show("a.txt"), "target");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_chmod_after_preparation_is_refused_as_content_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("chmod-after");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    let preparation = fixture.prepare(&session);
+    let full = fixture.repository.join("a.txt");
+    let mut permissions = fs::metadata(&full).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&full, permissions).unwrap();
+    let before = fixture.head();
+    let outcome = fixture.commit(
+        &session,
+        &preparation,
+        &fixture.default_paths(&preparation),
+        "Commit a",
+        false,
+    );
+    assert!(
+        matches!(
+            outcome,
+            Err(CommitError::Refused {
+                code: "commit_content_changed",
                 ..
             })
         ),

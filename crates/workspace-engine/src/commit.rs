@@ -25,7 +25,7 @@ use crate::command_runner::{CommandRunOptions, CommandRunner};
 use crate::config::Config;
 use crate::diff::diff_file;
 use crate::error::{ClientError, Result};
-use crate::git_service::{DiffOptions, GitService};
+use crate::git_service::{DiffOptions, GitFileStatus, GitService};
 use crate::hash::{create_id, now_millis, repository_id_for_root};
 use crate::mode::SessionMode;
 use crate::patch_engine::GeneratedSecretWarning;
@@ -134,6 +134,19 @@ pub struct CommitCandidate {
     pub diff: String,
     /// The hunk ids the user accepted for this path, when recorded.
     pub accepted_hunks: Vec<String>,
+    /// The source path of a rename. Selecting this path without also selecting
+    /// the source deletion is refused, because committing only the new path
+    /// would leave the old one behind (spec 35 §5.3).
+    #[serde(default)]
+    pub renamed_from: Option<String>,
+    /// The target of a rename, on the synthesized source deletion. The pair
+    /// moves together.
+    #[serde(default)]
+    pub renamed_to: Option<String>,
+    /// The source path of a copy. A copy leaves its source in place, so there
+    /// is no deletion to carry.
+    #[serde(default)]
+    pub copied_from: Option<String>,
 }
 
 /// One Git hook as the preparation reports it. The body is never summarised:
@@ -150,6 +163,7 @@ pub struct GitHookInfo {
     /// A content identity for the hook file (Git's blob id), so a same-size
     /// edit between the report and the commit is still a change. `None` when
     /// no file is there.
+    #[serde(default)]
     pub content_hash: Option<String>,
     pub interpreter: Option<String>,
     /// Whether Damaian would run it: exists, is a file and has an execute bit.
@@ -606,12 +620,22 @@ impl CommitEngine {
         }
         let selected = self.selected_candidates(&record, &request.selected_paths)?;
         for candidate in &selected {
-            if self
-                .path_policy
-                .resolve_for_write(root, &candidate.path)
-                .is_err()
-                || self.path_is_restricted(&candidate.path)
-            {
+            // A symlink's blob is its target string; the commit never reads the
+            // target, so containment is judged on the link path rather than on
+            // where the link points. Everything else must resolve inside the
+            // checkout.
+            let symlink = fs::symlink_metadata(root.join(&candidate.path))
+                .ok()
+                .is_some_and(|metadata| metadata.file_type().is_symlink());
+            let contained = if symlink {
+                !candidate.path.starts_with('/')
+                    && !candidate.path.split('/').any(|part| part == "..")
+            } else {
+                self.path_policy
+                    .resolve_for_write(root, &candidate.path)
+                    .is_ok()
+            };
+            if !contained || self.path_is_restricted(&candidate.path) {
                 return Err(CommitError::refused(
                     "commit_restricted_path",
                     format!(
@@ -669,9 +693,10 @@ impl CommitEngine {
         let mut fresh = Vec::new();
         let mut secret_warnings = Vec::new();
         let mut unscanned = Vec::new();
+        let file_mode = self.file_mode_enabled(root).map_err(CommitError::from)?;
         for candidate in &selected {
             let blob = self
-                .blob_info(root, &candidate.path)
+                .blob_info(root, &candidate.path, file_mode)
                 .map_err(CommitError::from)?;
             let matches = match (&blob, &candidate.blob_oid, &candidate.mode) {
                 (None, None, None) => true,
@@ -859,6 +884,7 @@ impl CommitEngine {
                     "generatedSecretOverride",
                     outcome.generated_secret_override.to_string(),
                 ),
+                ("warningCount", outcome.warnings.len().to_string()),
             ],
         );
         Ok(outcome)
@@ -929,20 +955,7 @@ impl CommitEngine {
                 }
             }
         }
-        let tree = {
-            let mut command = git(root, Some(&index));
-            command.arg("write-tree");
-            let output = command
-                .output()
-                .map_err(|error| CommitError::Engine(error.to_string()))?;
-            if !output.status.success() {
-                return Err(CommitError::Engine(format!(
-                    "write-tree failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        };
+        let tree = write_tree(root, &index)?;
         // Requirement 1 proved against the commit's tree, not the working
         // tree: the tree contains exactly the expected entries.
         let actual = self
@@ -957,6 +970,7 @@ impl CommitEngine {
         let message_path = private.join("COMMIT_EDITMSG");
         fs::write(&message_path, format!("{message}\n"))
             .map_err(|error| CommitError::Engine(error.to_string()))?;
+        let mut warnings = Vec::new();
         let hooks = self
             .run_hooks(root, &index, &message_path, cancel, record)
             .map_err(CommitError::from)?;
@@ -977,6 +991,37 @@ impl CommitEngine {
                 stdout: failure.stdout.clone(),
                 stderr: failure.stderr.clone(),
             });
+        }
+        // `git commit` would use the index a hook just changed. This flow
+        // deliberately commits the bytes the user reviewed, so a hook that
+        // reformats and stages (lint-staged) must not lose its work silently:
+        // the commit keeps the reviewed bytes and the warning says where the
+        // hook's changes are. A hook that leaves the private index unreadable
+        // is a warning too, not a failed commit.
+        match write_tree(root, &index) {
+            Ok(after) if after != tree => {
+                let names = outcomes
+                    .iter()
+                    .filter(|hook| hook.name != "post-commit" && hook.outcome == "ok")
+                    .map(|hook| hook.name.as_str())
+                    .collect::<Vec<_>>();
+                let who = if names.is_empty() {
+                    "A Git hook".to_string()
+                } else {
+                    names.join(", ")
+                };
+                warnings.push(format!(
+                    "{who} changed the index while committing. The commit contains the bytes \
+                     you reviewed; the hook's staged changes remain uncommitted in the working \
+                     tree."
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => warnings.push(
+                "A Git hook left the private index unreadable, so its staged changes could \
+                 not be checked. The commit contains the bytes you reviewed."
+                    .to_string(),
+            ),
         }
         let mut command = git(root, Some(&index));
         command.args(["commit-tree", &tree]);
@@ -1025,7 +1070,6 @@ impl CommitEngine {
                 ),
             ));
         }
-        let mut warnings = Vec::new();
         let head_now = self
             .git_line(root, &["rev-parse", "HEAD"])
             .map_err(CommitError::from)?
@@ -1109,6 +1153,37 @@ impl CommitEngine {
                 ));
             }
             selected.push(candidate.clone());
+        }
+        // A rename is one change in two paths. Selecting only the target would
+        // commit the new path and leave the old one behind — exactly the copy
+        // the old status parser produced — so both halves are required.
+        let selected_paths = selected
+            .iter()
+            .map(|candidate| candidate.path.as_str())
+            .collect::<BTreeSet<_>>();
+        for candidate in &selected {
+            if let Some(source) = &candidate.renamed_from
+                && !selected_paths.contains(source.as_str())
+            {
+                return Err(CommitError::refused(
+                    "commit_rename_incomplete",
+                    format!(
+                        "{} is the target of a rename from {source}. Select the deletion of                          {source} too, or neither; committing only the target would leave the                          old path behind.",
+                        candidate.path
+                    ),
+                ));
+            }
+            if let Some(target) = &candidate.renamed_to
+                && !selected_paths.contains(target.as_str())
+            {
+                return Err(CommitError::refused(
+                    "commit_rename_incomplete",
+                    format!(
+                        "{} is the source of a rename to {target}. Select {target} too, or                          neither.",
+                        candidate.path
+                    ),
+                ));
+            }
         }
         Ok(selected)
     }
@@ -1259,6 +1334,7 @@ impl CommitEngine {
             }
         }
         let checkpoint = self.checkpoint_paths(root, session_id)?;
+        let file_mode = self.file_mode_enabled(root)?;
         let mut candidates = Vec::new();
         for change in changes {
             let path = change.path.clone();
@@ -1280,15 +1356,22 @@ impl CommitEngine {
                     secret_warnings: Vec::new(),
                     diff: String::new(),
                     accepted_hunks: Vec::new(),
+                    renamed_from: None,
+                    renamed_to: None,
+                    copied_from: None,
                 });
                 continue;
             }
-            let blob = self.blob_info(root, &path)?;
+            let blob = self.blob_info(root, &path, file_mode)?;
             // Nothing in the working tree differs from HEAD: there is nothing
             // to commit at this path, whatever the index may say. The user's
-            // staged copy is deliberately not the commit's base.
+            // staged copy is deliberately not the commit's base. Mode is part
+            // of the comparison, or a chmod-only change — same blob id, new
+            // mode — would be dropped here and never committable.
             if let Some(blob) = &blob
-                && self.blob_at_head(root, &path)?.as_deref() == Some(blob.oid.as_str())
+                && let Some((head_mode, head_oid)) = self.head_entry(root, &path)?
+                && head_mode == blob.mode
+                && head_oid == blob.oid
             {
                 continue;
             }
@@ -1371,16 +1454,43 @@ impl CommitEngine {
             let hunks = acceptance
                 .map(|acceptance| acceptance.hunks.clone())
                 .unwrap_or_default();
+            let mut copied_from = change.copied_from.clone();
+            let mut renamed_source = None;
+            if carries_rename_source(&change)
+                && let Some(original) = &change.renamed_from
+            {
+                let source_absent = fs::symlink_metadata(root.join(original)).is_err();
+                let source_in_head = self.head_entry(root, original)?.is_some();
+                if source_absent && source_in_head {
+                    renamed_source = Some(original.clone());
+                } else if source_absent {
+                    // Renamed from a path HEAD never had (a staged new file):
+                    // the net change is only the target, so there is no
+                    // deletion to carry.
+                    renamed_source = None;
+                } else {
+                    // Git called it a rename but the source is still there;
+                    // treat it as a copy rather than deleting a live path.
+                    copied_from = Some(original.clone());
+                }
+            }
+            let selected_by_default = source.selected_by_default();
+            let mut label = source.label().to_string();
+            if let Some(original) = &renamed_source {
+                label = format!("Renamed from {original} — {label}");
+            } else if let Some(original) = &copied_from {
+                label = format!("Copied from {original} — {label}");
+            }
             candidates.push(CommitCandidate {
-                path,
+                path: path.clone(),
                 status: if change.conflicted {
                     "conflicted".to_string()
                 } else {
                     status.to_string()
                 },
                 source,
-                label: source.label().to_string(),
-                selected_by_default: source.selected_by_default(),
+                label,
+                selected_by_default,
                 blob_oid: blob.as_ref().map(|blob| blob.oid.clone()),
                 content_sha256,
                 mode: blob.as_ref().map(|blob| blob.mode.clone()),
@@ -1394,10 +1504,46 @@ impl CommitEngine {
                 secret_warnings: warnings,
                 diff: String::new(),
                 accepted_hunks: hunks,
+                renamed_from: renamed_source.clone(),
+                renamed_to: None,
+                copied_from,
             });
+            if let Some(source_path) = renamed_source
+                && !candidates
+                    .iter()
+                    .any(|candidate| candidate.path == source_path)
+            {
+                candidates.push(CommitCandidate {
+                    path: source_path.clone(),
+                    status: "deleted".to_string(),
+                    source: CommitCandidateSource::External,
+                    label: format!("Rename source for {path} — moves with the target"),
+                    selected_by_default,
+                    blob_oid: None,
+                    content_sha256: None,
+                    mode: None,
+                    size: 0,
+                    unscanned: false,
+                    secret_warnings: Vec::new(),
+                    diff: String::new(),
+                    accepted_hunks: Vec::new(),
+                    renamed_from: None,
+                    renamed_to: Some(path.clone()),
+                    copied_from: None,
+                });
+            }
         }
         candidates.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(candidates)
+    }
+
+    /// Whether Git tracks the executable bit for this repository. The default
+    /// is true on Unix; `core.fileMode=false` means a chmod is not a change.
+    fn file_mode_enabled(&self, root: &Path) -> Result<bool> {
+        Ok(self
+            .git_line(root, &["config", "--bool", "core.fileMode"])?
+            .as_deref()
+            != Some("false"))
     }
 
     fn path_is_restricted(&self, path: &str) -> bool {
@@ -1526,6 +1672,19 @@ impl CommitEngine {
     }
 
     fn diff_for(&self, root: &Path, path: &str, status: &str, has_head: bool) -> Result<String> {
+        if status != "deleted" {
+            let full = root.join(path);
+            if fs::symlink_metadata(&full)
+                .ok()
+                .is_some_and(|metadata| metadata.file_type().is_symlink())
+            {
+                let target = fs::read_link(&full)?;
+                return Ok(format!(
+                    "[Symlink: {path} -> {}]\n",
+                    target.to_string_lossy()
+                ));
+            }
+        }
         if has_head {
             let diff = self.git.diff_in(
                 root,
@@ -1864,7 +2023,7 @@ impl CommitEngine {
 
     /// A file's blob identity without writing anything. A symlink's blob is
     /// its target, not the file it points at.
-    fn blob_info(&self, root: &Path, path: &str) -> Result<Option<BlobInfo>> {
+    fn blob_info(&self, root: &Path, path: &str, file_mode: bool) -> Result<Option<BlobInfo>> {
         let full = root.join(path);
         let metadata = match fs::symlink_metadata(&full) {
             Ok(metadata) => metadata,
@@ -1885,16 +2044,24 @@ impl CommitEngine {
         } else {
             (self.hash_object_path(root, path, false)?, None)
         };
-        let mode = match self.head_entry(root, path)? {
-            Some((mode, _)) => mode,
-            None if symlink => "120000".to_string(),
-            None => {
-                if metadata.permissions().mode() & 0o111 != 0 {
-                    "100755".to_string()
-                } else {
-                    "100644".to_string()
-                }
+        // The mode is the working tree's, not HEAD's: a chmod-only change has
+        // the same blob id, and a file replaced by a symlink must become a
+        // 120000 entry rather than its target's bytes under HEAD's mode. A
+        // repository with `core.fileMode=false` ignores the executable bit, so
+        // there the mode is HEAD's rather than inventing a change Git would not
+        // report.
+        let mode = if symlink {
+            "120000".to_string()
+        } else if file_mode {
+            if metadata.permissions().mode() & 0o111 != 0 {
+                "100755".to_string()
+            } else {
+                "100644".to_string()
             }
+        } else {
+            self.head_entry(root, path)?
+                .map(|(mode, _)| mode)
+                .unwrap_or_else(|| "100644".to_string())
         };
         Ok(Some(BlobInfo {
             oid,
@@ -1992,10 +2159,6 @@ impl CommitEngine {
         Ok(self.head_entry(root, path)?.is_some())
     }
 
-    fn blob_at_head(&self, root: &Path, path: &str) -> Result<Option<String>> {
-        Ok(self.head_entry(root, path)?.map(|(_, oid)| oid))
-    }
-
     fn tree_entries(
         &self,
         root: &Path,
@@ -2070,6 +2233,13 @@ struct PendingAcceptance {
     hunks: Vec<String>,
 }
 
+/// A rename carries a source deletion; a copy does not, because its source
+/// stays in place. Kept as a function so the copy case is testable without
+/// depending on a Git version that reports `C` records.
+fn carries_rename_source(change: &GitFileStatus) -> bool {
+    change.renamed_from.is_some() && change.copied_from.is_none()
+}
+
 fn verification_summary(report: &VerificationReport) -> String {
     if report.due {
         return "Verification is due and has not run.".to_string();
@@ -2123,6 +2293,21 @@ fn expect_success(mut command: Command, step: &str) -> std::result::Result<(), C
     }
 }
 
+fn write_tree(root: &Path, index: &Path) -> std::result::Result<String, CommitError> {
+    let mut command = git(root, Some(index));
+    command.arg("write-tree");
+    let output = command
+        .output()
+        .map_err(|error| CommitError::Engine(error.to_string()))?;
+    if !output.status.success() {
+        return Err(CommitError::Engine(format!(
+            "write-tree failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn git_spawn_error(error: std::io::Error) -> CommitError {
     CommitError::Engine(format!("git could not start: {error}"))
 }
@@ -2156,6 +2341,28 @@ mod tests {
         let path = private_index_path(Path::new("/data"), "commit_x");
         assert_eq!(path, Path::new("/data/commits/commit_x/index"));
         assert!(!path.starts_with(".git"));
+    }
+
+    #[test]
+    fn a_copy_record_carries_no_rename_source() {
+        let copy = GitFileStatus {
+            path: "c.txt".to_string(),
+            raw: String::new(),
+            staged: true,
+            worktree: false,
+            untracked: false,
+            conflicted: false,
+            renamed_from: None,
+            copied_from: Some("a.txt".to_string()),
+        };
+        assert!(!carries_rename_source(&copy));
+        let rename = GitFileStatus {
+            path: "b.txt".to_string(),
+            renamed_from: Some("a.txt".to_string()),
+            copied_from: None,
+            ..copy
+        };
+        assert!(carries_rename_source(&rename));
     }
 
     #[test]
