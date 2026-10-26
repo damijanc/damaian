@@ -2333,7 +2333,7 @@ function contextCategoryRow(manifest, category) {
       row.append(contextPathButton(item.path, item.lineRange));
     } else {
       const name = document.createElement("span");
-      name.textContent = item.kind || category;
+      name.textContent = item.kind === "user_prompt" ? "Your message" : item.kind || category;
       row.append(name);
     }
     const meta = document.createElement("span");
