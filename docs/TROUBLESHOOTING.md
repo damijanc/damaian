@@ -408,6 +408,27 @@ over-share. A repository with no commit and no remote falls to the path hash,
 and the failure mode there is isolation, not sharing. The UI reports the tier
 rather than the raw key.
 
+**Why a memory was not created.** A proposal that is not in the card list was
+refused before it could be shown, not lost. The audit log has the reason:
+
+| Audit event | Meaning |
+|---|---|
+| `memory_proposal_created` | The candidate became a card. It is still not an entry. |
+| `memory_proposal_refused` | No card was shown. `reason` is `secret`, `instruction_shaped`, `evidence_restricted`, `evidence_ignored`, `evidence_not_relative`, `statement_too_long` or `suggestion_cap_reached`. A `path` field is present only when the candidate cited evidence. |
+| `memory_proposal_confirmed` | You pressed Remember and the entry was written. |
+| `memory_proposal_dismissed` | You dismissed the card. Nothing was written. |
+| `memory_proposal_failed` | The proposal could not be recorded at all; the turn continued. |
+
+A non-user suggestion is capped at three per task. The fourth produces
+`reason=suggestion_cap_reached` rather than a card. An explicit "remember that…"
+from you is not capped.
+
+The pending cards themselves are session-log events, `memory_proposal_proposed`
+and `memory_proposal_decided`, so a reload or restart shows what is still
+undecided and a dismissed proposal stays visible in the log as history. A
+proposal never enters the memory files and never enters the model's
+conversation.
+
 **A refused secret write.** A statement (or an evidence path) that the secret
 scanner recognises is refused with *"That looks like a credential; Damaian will
 not store it."* Nothing is written — not even a `[REDACTED_…]` placeholder,

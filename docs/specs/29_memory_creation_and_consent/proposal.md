@@ -1,6 +1,8 @@
 # Feature Spec: Memory Creation, Consent, and Scope
 
-Status: In progress
+Status: Done 2026-10-26 (planned and built on 2026-10-26; Tasks 1–9;
+**CI outstanding** — the scoped checks passed and the seven-check gate runs
+after the user pushes).
 Order: 29 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 2 (Must). That directory is local-only and not committed, so the
@@ -509,12 +511,103 @@ add a round trip and a chance to misremember it. See §5.2.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+**The constructor barrier, honestly.** `MemoryEntry` is `#[non_exhaustive]` and
+`MemoryEntry::new` no longer exists. Another crate cannot write a struct
+literal, and the only conversions inside the crate are
+`MemoryProposal::confirm` and deserialization. `MemoryStore::insert` stays
+public because #28's tests and the transition methods call it, but it can only
+be handed one of those values. This is an API-surface barrier: a deliberate
+in-process caller can still deserialize a record, because the store itself must.
+No `#[doc(hidden)]` or `#[cfg(test)]` constructor was added; a test-only bypass
+must not compile into the app. #28's tests that need an invalid record for the
+store to refuse deserialize one, which is the second documented path.
 
-- The imperative-statement patterns used in §5.3, and the false-positive rate
-  observed on real repository files. A high rate is acceptable and expected; a
-  single false *negative* found in testing is a defect to fix before shipping.
-- The suggestion cap chosen, and how often suggestions were confirmed versus
-  dismissed in real use. A dismissal rate near 100% means suggestions are noise
-  and the feature should offer fewer, not that users are wrong.
-- The `statement` length ceiling.
+**Identity and scope.** `confirm` takes a `MemoryProposalGate` built by
+`MemoryStore::proposal_gate`, never by a route. The gate carries the repository
+root, the resolved `ProjectIdentity`, the scanner, the path policy and the ignore
+patterns. The confirm route supplies only a proposal id and an optional scope;
+the server resolves the identity and mints the `UserConfirmation`. A user-scope
+proposal may be confirmed as project scope while user scope is off; it may not
+enable the scope.
+
+**External content and provenance.** There is no fourth provenance variant.
+Confirming an `ExternalContent` proposal produces
+`MemoryProvenance::SuggestedAndConfirmed`, using the proposal's `task_id`, and
+the source stays on the proposal and in the confirmation audit. A
+`RepositoryObservation` produces `RepositoryEvidence` with the evidence paths
+and hashes and `EvidenceCurrent`. No source is silently dropped.
+
+**The instruction patterns.** The check is a lowercased, whitespace-normalized
+match. Refused prefixes: `always`, `never`, `you must`, `you should`, `you may`,
+`you can`, `you are allowed`, `you have permission`, `do not`, `don't`,
+`ignore`, `disregard`, `approve`, `pre-approve`, `auto-approve`, `skip`,
+`bypass`, `ensure`, `ensure that`, `make sure`, `remember to`, `run`, `use`.
+Refused phrases: `pre-approved`, `preapproved`, `pre approval`,
+`without asking`, `without approval`, `without confirmation`,
+`without a prompt`, `skip approval`, `skip the approval`, `bypass approval`,
+`approve all`, `all commands are approved`, `commands are approved`,
+`commands are pre-approved`, `approval is not required`,
+`no approval is required`, `approval is disabled`, `ignore the previous`,
+`ignore previous`, `disregard the previous`, `disregard previous`,
+`treat this as`, `from now on`.
+
+**The check runs on every non-user origin**, including `ModelSuggestion`, so a
+poisoned repository file cannot be laundered into a trusted-looking card by
+omitting the tool's `source`. The branch is "user request or not", not "which
+untrusted label was chosen". The six eval scenarios and the inline table are the
+arbiter. The `run ` and `use ` prefixes are broad on purpose; a legitimate
+convention phrased that way is refused from a suggestion, and the user can state
+it themselves as a trusted request.
+
+**Measured false positives and negatives.** The inline table has seven refused
+instruction-shaped statements and four benign conventions, all classified as
+intended. The eval fixture's poisoned `AGENTS.md` and `CONTRIBUTING.md` produce
+no proposal. The false-positive rate on real repository files was **not**
+measured: that needs real use across several repositories, and this branch has
+only the fixture and unit table. No false negative was found in testing.
+
+**Cap and ceiling.** The per-task suggestion cap is three
+(`MAX_SUGGESTIONS_PER_TASK`), counted from the session log so a resumed turn
+does not reset it; explicit user requests are uncapped. The statement ceiling is
+280 characters (`STATEMENT_MAX_CHARS`), enforced at proposal and confirmation and
+again at the store; an over-long candidate is rejected, not truncated. A real-use
+confirm/dismiss rate was **not** measured — no user has run this build yet.
+
+**Where a pending proposal lives.** Proposed and decided events are appended to
+the session log through `pub(crate)` `SessionStore` methods; `append_session_event`
+stays private. A proposal dies with its session, survives a reload and a
+restart, and never becomes an entry by being read. The pending list is proposed
+minus decided. A dismissed proposal leaves its proposal event, its dismissal
+event and an audit line, and no entry.
+
+**The suggestion trigger.** `propose_memory` is a model tool dispatched during
+the turn, not a post-task extraction and not a second model round trip. It
+cannot store. `evidence_path` selects `RepositoryObservation` and makes Damaian
+hash the file; `source` without evidence selects `ExternalContent`; otherwise
+the origin is `ModelSuggestion`. The explicit path is parsed from the user's own
+message at turn start and is never capped.
+
+**Surface deviation.** The confirmation cards are a stack below the
+conversation's messages, not transcript messages. Making them transcript
+messages would have put model-authored statements into the prompt window, which
+is retrieval before #30 and an instruction channel besides. The stack is
+re-read from the session log after a load, after a turn and after each decision.
+A user-scope proposal while the scope is off defaults to project scope and
+explains that enabling user scope is separate.
+
+**What was not verified.** The manual UI walk was **not** performed in this
+slice: the shell-level routes and the DOM-independent behaviour are tested, but
+the Tauri window was not opened and no real model call was made. The eval
+scenarios are deterministic only, as specified. `evals/baseline.json` was **not**
+regenerated — observation #40 records that it is already stale for reasons
+outside this spec, and no test compares it automatically. The dismissal rate and
+false-positive rate need real use. Every other acceptance criterion has a test
+or scenario named in `tasks.md`.
+
+**Checks.** Scoped local checks passed: `scripts/quality-gate.sh fmt node lint
+typos deny`, scoped clippy for `workspace-engine`, `desktop-shell` and
+`eval-harness` with `-D warnings`, `cargo nextest` for the memory suite and the
+new shell/eval tests, and the whole deterministic eval tier. The workspace
+clippy and test suite are left to CI, so this spec's status is Done with **CI
+outstanding**.
+

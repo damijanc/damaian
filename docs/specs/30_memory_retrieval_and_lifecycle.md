@@ -7,7 +7,8 @@ Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#28](28_memory_model_and_storage/proposal.md) (the store) — built
 (Done 2026-10-26);
-[#29](29_memory_creation_and_consent/proposal.md) (the consent gate) — **not built**.
+[#29](29_memory_creation_and_consent/proposal.md) (the consent gate) — built
+(Done 2026-10-26).
 Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.9 (context assembly). Related implementation

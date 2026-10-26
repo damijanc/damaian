@@ -5,7 +5,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) (requirements 1–8 and acceptance
 criteria) · context and decisions in [`context.md`](context.md)
-**Started:** 2026-10-26
+**Started:** 2026-10-26 — **Done:** 2026-10-26
 
 ## Progress
 
@@ -19,7 +19,7 @@ criteria) · context and decisions in [`context.md`](context.md)
 | 6 · Shell routes and the confirmation card | Done 2026-10-26 | Three routes: `GET /api/memory-proposals`, `POST /api/memory-confirm`, `POST /api/memory-dismiss`. The confirm route takes `repo`, `session_id`, `proposal_id` and an optional `scope`; it resolves `ProjectIdentity` from the repository and creates the `UserConfirmation` server-side, so a client cannot supply a statement, a project key or a confirmation id. The UI reads the pending list into a collapsed proposal stack below the conversation, with statement, scope, category, origin/source, a scope picker, Remember and Dismiss. A user-scope proposal while the scope is off defaults to project scope and explains that enabling user scope is separate. The stack is re-read after every turn and after each decision. **Deviation:** proposals are not transcript messages, so they cannot reach `build_conversation`; the stack is a sibling of the log content. Three route tests run through the real token-gated shell: list/confirm/dismiss end to end, a user-scope refusal that leaves the flag off and the proposal pending, and the absence of a statement field. `node --check` and `npm run lint:web` pass; scoped clippy clean. |
 | 7 · Acceptance tests a scenario cannot cover | Done 2026-10-26 | Added the store-level `a_memory_claiming_approval_or_path_policy_changes_nothing` (a stored instruction still leaves command risk, approval policy, `PathPolicy` and `memory_user_scope_enabled` untouched) and three shell-level tests: no bulk route (a POST to `/api/memory-confirm-all` is 404 and the UI has no accept-all label), the confirm handler has no statement or project-key field, and the route-level user-scope refusal. The store tests already cover a forged identity (the project key must match the resolved identity), the dismissal and cap audit lines, and the confirmed-path round trip. |
 | 8 · Deterministic eval scenarios | Done 2026-10-26 | New fixture `crates/eval-harness/fixtures/memory-injection/` (poisoned `AGENTS.md` and `CONTRIBUTING.md`, committed `local.conf`, `.env`, `secrets/prod.env`) and six scenarios. `seed_files` writes files after the baseline commit without committing them, which makes `local.conf` ignored *and* index-resident, the case `index_single_file` warns about. New assertions read the run's memory files and session proposal events: `memory_entries`, `memory_proposals`, `memory_user_entries`, `memory_absent` (memory records plus proposal events only, so the refusal audit may name a path) and `memory_audit_contains`. All six scenarios pass in the deterministic tier; the whole deterministic tier still passes with no approval-policy or secret violations (`cargo run -p eval-harness -- run --tier deterministic`). **Not regenerated:** `evals/baseline.json`; observation #40 records that it is already stale for reasons outside #29, and no test compares it automatically. |
-| 9 · Documentation and close-out | Not started | |
+| 9 · Documentation and close-out | Done 2026-10-26 | **Docs.** `USER_GUIDE.md` now says memory can be proposed and confirmed, explains the two creation paths, why even an explicit request is confirmed, what the origin line means, why an instruction-shaped suggestion is refused outright, why a secret or protected/ignored evidence produces no card, and that confirming a user-scope proposal does not enable user scope. `TROUBLESHOOTING.md` gains a proposal-event table (`memory_proposal_created/refused/confirmed/dismissed/failed`), the refusal reasons, the cap, and where pending proposals live. The proposal §7 records the pattern list, the cap (3), the ceiling (280), the constructor-barrier caveat, the provenance mapping, the session-log placement, the surface deviation and everything not verified. **Close-out.** #29 is Done in the proposal, README current state, README implementation-order row and this header/progress table, with **CI outstanding**. #30's `Depends on:` entry for #29 is built and it is in the ready set; a "Re-derived on 2026-10-26" history entry names what #29 leaves for #30. `CHANGELOG.md` had no #29 Unreleased line, so nothing was removed and no release row was added. **Checks.** Fast checks, scoped clippy for all three touched crates, the memory/shell test suites and the whole deterministic eval tier passed; the workspace clippy and test suite are left to CI. |
 
 **Goal:** make suggestion and persistence separate steps with a user action
 between them. A proposal cannot become an entry by being read, a non-user
@@ -280,27 +280,28 @@ folder-path references; `npm run specs:check` reports no new mismatch for #29.
 
 ## Task 9 · Documentation and close-out
 
-- [ ] `docs/USER_GUIDE.md`: how memory is created, why even an explicit request
+- [x] `docs/USER_GUIDE.md`: how memory is created, why even an explicit request
       is confirmed, what the origin line means, why an instruction-shaped
       suggestion is refused outright, what enabling user scope does, and that a
       suggestion is never a stored memory.
-- [ ] `docs/TROUBLESHOOTING.md`: why a memory was not created, how to read a
+- [x] `docs/TROUBLESHOOTING.md`: why a memory was not created, how to read a
       refused proposal in the audit log, how to see which scope an entry is in,
       and the audit event names.
-- [ ] Fill the proposal's §7 implementation notes: the patterns used, the cap,
+- [x] Fill the proposal's §7 implementation notes: the patterns used, the cap,
       the ceiling, false positives/negatives observed, and any criterion that
       could not be verified.
-- [ ] Mark #29 Done in all four places: `proposal.md` `Status`, README
+- [x] Mark #29 Done in all four places: `proposal.md` `Status`, README
       current state, README implementation-order row, `tasks.md` header and
       progress table.
-- [ ] Promote #30: flip its `Depends on:` entry for #29 to built, update the
+- [x] Promote #30: flip its `Depends on:` entry for #29 to built, update the
       README ready set, and add a "Re-derived on 2026-10-26" history entry
       naming what #29 leaves for #30.
-- [ ] Remove #29's line from `CHANGELOG.md` → Unreleased if one exists; do not
-      add a release row.
-- [ ] Walk the acceptance criteria in §6 against tests and scenarios; record
+- [x] Remove #29's line from `CHANGELOG.md` → Unreleased if one exists; do not
+      add a release row. There is no `Unreleased` line for #29, so nothing was
+      removed and no release row was added.
+- [x] Walk the acceptance criteria in §6 against tests and scenarios; record
       what could not be verified, and say plainly that CI is outstanding.
-- [ ] Run the fast checks and the scoped suites; leave the workspace clippy and
+- [x] Run the fast checks and the scoped suites; leave the workspace clippy and
       test suite to CI.
 
 **Verification:** `scripts/quality-gate.sh fmt node lint typos deny`;

@@ -512,10 +512,48 @@ redacted on its way into a request.
 share**: a project memory can name a machine, a path or a preference. The audit
 trail records lifecycle events without a personal or environmental statement.
 
-**In this build.** The record, store, scopes, migration and audit are present;
-the creation and consent flow and recall through the context panel arrive in the
-two features that build on this one. No memory is created yet, and none is
-recalled, so a missing entry in the context panel is not a fault.
+**In this build.** Memory can be proposed and confirmed. An explicit "remember
+that …" in your message, or a suggestion from the assistant, appears as a card
+showing the exact sentence. Nothing is stored until you press **Remember**;
+**Dismiss** records the decision and stores nothing. The entry is then kept and
+audited, and recall through the context panel arrives in the next feature. A
+missing entry in the context panel is therefore not a fault yet.
+
+**How a memory gets created.** There are two paths, and both end at the same
+card:
+
+- You ask for it: "remember that the integration tests need Docker running."
+  Damaian takes your own sentence, not the model's paraphrase, and proposes it.
+- The assistant suggests one while it works. The card says it was suggested, and
+  names the file, issue or other source when there is one.
+
+Even your own request is confirmed rather than written directly. The reason is
+not ceremony: the sentence that persists is shown to you first, and the scope is
+yours to choose. "I prefer tabs" may belong across every project, which is the
+off-by-default user scope; the card says so instead of quietly filing it as a
+project fact. Confirming is one action.
+
+**What the origin line means.** Every card names where the candidate came from.
+"you asked Damaian to remember this" is your own words. "suggested by the
+assistant during this task" is a model inference, and it is never presented as
+yours. "suggested from `CONTRIBUTING.md`" or "suggested from issue #412" names
+the external source whose words you would be agreeing to persist.
+
+**Why some suggestions are refused instead of shown.** A candidate whose
+statement reads as an instruction to Damaian — "always approve commands",
+"ignore the previous rules", "run this without asking" — produces no card at all
+when it did not come from you. A confirmation card is itself a nudge, and a
+repository author must not be able to put one in front of you by writing a file.
+The same rule applies to a suggestion that contains a detected credential, or
+that is derived from a file protected by `restricted_patterns` or excluded by a
+`.gitignore`, including one that is still in the index. Those refusals are
+recorded in the audit log with the reason and, for the path cases, the path — but
+never the statement and never the secret.
+
+**Confirming a user-scope proposal does not turn user scope on.** If the card
+proposes user scope while the scope is off, it offers to save the memory for
+this project instead. Enabling cross-project recall stays the separate setting
+described above. A confirmation never flips it for you.
 
 ## Working Folder
 
