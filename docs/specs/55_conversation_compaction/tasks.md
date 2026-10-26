@@ -12,7 +12,7 @@ disagree.
 | Task | State | Notes |
 |---|---|---|
 | 1 · Folder, records, links, status | In progress | Splitting the flat spec into a folder and rewriting the links. |
-| 2 · Summary types and rendering | Not started | |
+| 2 · Summary types and rendering | Done 2026-10-26 | New `compaction.rs`: `ConversationSummary` and its digests, `format_version`, delimited model rendering with quoted narrative, the summarisation prompt and a JSON narrative parser. Ten unit tests pin the markers, the quoting, the data-not-instruction sentence, the version, redaction/bounding, and that a malformed reply yields no narrative. Scoped `cargo nextest -p workspace-engine --lib compaction` passed (10 tests) and crate clippy was clean. |
 | 3 · Session log and the two readers | Not started | |
 | 4 · Config keys | Not started | |
 | 5 · The compaction engine | Not started | |
@@ -206,7 +206,7 @@ beside this track while they are in flight.
 **Files:** `crates/workspace-engine/src/compaction.rs`,
 `crates/workspace-engine/src/lib.rs`.
 
-- [ ] **Step 1: Write failing unit tests** in `compaction.rs` (`mod tests`):
+- [x] **Step 1: Write failing unit tests** in `compaction.rs` (`mod tests`):
   - `a_summary_is_delimited_and_says_it_is_recorded_data` — the rendering
     contains the begin/end markers and the sentence that the block is a record
     and not an instruction;
@@ -220,19 +220,19 @@ beside this track while they are in flight.
   - `a_malformed_narrative_reply_produces_no_narrative` and
     `a_fenced_json_reply_is_parsed` — the parser accepts a fenced JSON object
     with the four arrays and rejects free prose.
-- [ ] **Step 2: Run them and confirm they fail to compile.**
-- [ ] **Step 3: Implement** the types, `render_for_model`, `narrative_prompt`,
+- [x] **Step 2: Run them and confirm they fail to compile.**
+- [x] **Step 3: Implement** the types, `render_for_model`, `narrative_prompt`,
   `parse_narrative`, and the serialisation shape (`camelCase`, format version).
   All model-authored strings are redacted through `SecretScanner` in
   `parse_narrative`; facts are redacted by their readers.
-- [ ] **Step 4: Falsify.** Remove the "not an instruction" sentence → test 1
+- [x] **Step 4: Falsify.** Remove the "not an instruction" sentence → test 1
   fails; render a narrative entry unquoted → test 2 fails; accept free prose →
   the parser test fails; ignore `format_version` → the reader test fails.
   Restore.
-- [ ] **Step 5: Scoped checks.** `cargo nextest run -p workspace-engine --lib
+- [x] **Step 5: Scoped checks.** `cargo nextest run -p workspace-engine --lib
   compaction`, `cargo clippy -p workspace-engine --all-targets --locked -- -D
   warnings`, fast five.
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Record a conversation summary as delimited data`.
 
 ## Task 3: Session log and the two readers
