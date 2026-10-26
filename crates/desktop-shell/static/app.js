@@ -498,6 +498,7 @@ function ensureAppDialog() {
     <div class="app-dialog" role="dialog" aria-modal="true">
       <p class="app-dialog-title"></p>
       <p class="app-dialog-message" hidden></p>
+      <pre class="app-dialog-detail" tabindex="0" hidden></pre>
       <input type="text" class="app-dialog-input" hidden />
       <div class="app-dialog-actions">
         <button type="button" class="app-dialog-btn app-dialog-cancel">Cancel</button>
@@ -515,6 +516,7 @@ function ensureAppDialog() {
 function showAppDialog({
   title,
   message = "",
+  detail = "",
   inputValue = null,
   confirmLabel = "OK",
   danger = false,
@@ -522,8 +524,10 @@ function showAppDialog({
 }) {
   return new Promise((resolve) => {
     const backdrop = ensureAppDialog();
+    const dialog = backdrop.querySelector(".app-dialog");
     const titleEl = backdrop.querySelector(".app-dialog-title");
     const messageEl = backdrop.querySelector(".app-dialog-message");
+    const detailEl = backdrop.querySelector(".app-dialog-detail");
     const inputEl = backdrop.querySelector(".app-dialog-input");
     const confirmBtn = backdrop.querySelector(".app-dialog-confirm");
     const cancelBtn = backdrop.querySelector(".app-dialog-cancel");
@@ -532,6 +536,12 @@ function showAppDialog({
     titleEl.textContent = title;
     messageEl.hidden = !message;
     messageEl.textContent = message;
+    // A detail is content the user must review before deciding — the exact
+    // repair prompt, for example. It widens the dialog and scrolls; the dialog
+    // itself never grows with it.
+    detailEl.hidden = !detail;
+    detailEl.textContent = detail;
+    dialog.classList.toggle("app-dialog-preview", Boolean(detail));
     inputEl.hidden = !usesInput;
     inputEl.value = usesInput ? inputValue : "";
     confirmBtn.textContent = confirmLabel;
@@ -5562,6 +5572,57 @@ function wireFileReferences(container, chatRepo) {
   });
 }
 
+// The structural pair for an Activity row: an assistant summary immediately
+// followed by the tool result it describes. The turn's last assistant is not
+// grouped — the answer, plan panel, usage and stop marks belong on it.
+function isGroupableAction(message, endsTheTurn) {
+  return (
+    message.role === "assistant" &&
+    Boolean(message.taskId) &&
+    message.kind !== "plan_reminder" &&
+    !message.content.includes("worker-prompt") &&
+    !endsTheTurn(message)
+  );
+}
+
+// One collapsed run of action/result pairs. The result is kept as preformatted
+// text: tool output is not Markdown, and the exact bytes matter to a diff.
+function renderActivityGroup(pairs) {
+  const article = document.createElement("article");
+  article.className = "message activity";
+  const label = document.createElement("div");
+  label.className = "visually-hidden";
+  label.textContent = "Activity";
+  const body = document.createElement("div");
+  body.className = "activity-body";
+  const detail = document.createElement("div");
+  detail.className = "activity-detail";
+  detail.tabIndex = 0;
+  detail.setAttribute("aria-label", "Activity detail");
+  pairs.forEach(({ action, result }) => {
+    const step = document.createElement("section");
+    step.className = "activity-step";
+    const title = document.createElement("div");
+    title.className = "activity-step-title";
+    title.innerHTML = renderMarkdown(action.content);
+    wireFileReferences(title, repo());
+    const output = document.createElement("pre");
+    output.className = "activity-step-result";
+    output.textContent = result.content;
+    step.append(title, output);
+    detail.append(step);
+  });
+  const count = pairs.length;
+  body.append(
+    createDisclosure(`Activity (${count} step${count === 1 ? "" : "s"})`, detail),
+    detail,
+  );
+  article.append(label, body);
+  $("chat-log").append(article);
+  $("chat-log").scrollTop = $("chat-log").scrollHeight;
+  return { message: article, body };
+}
+
 // `tasks` carries each task's final status so a stopped turn stays marked as
 // one on reload. Without it a truncated answer renders as a complete short one.
 // Returns each message with its bubble, in order, for entries placed between
@@ -5627,77 +5688,114 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
   const usageByTask = new Map(
     tasks.filter((task) => typeof task.inputTokens === "number").map((task) => [task.id, task]),
   );
-  const rendered = messages.map((message, index) => {
-    drawBoundaryBefore(message);
-    // The engine's one plan reminder is a user-role message in the request but
-    // not something the user typed. Render it as a system line, and not as an
-    // answer, a rewind anchor, or a question (spec 66 `context.md` D10).
-    if (message.kind === "plan_reminder") {
-      const bubble = appendChatMessage("system", message.content);
-      if (message.seq) bubble.message.dataset.seq = message.seq;
-      return { message, bubble };
+  // A turn's intermediate work is written as an assistant summary followed by
+  // its tool result. Draw each consecutive run of those pairs as one collapsed
+  // Activity instead of one full bubble per action. This is structural, so it
+  // works on every log already written, and the last assistant of a task is
+  // excluded: the answer, plan, usage and stop marks stay on their own message.
+  const activityGroupByStart = new Map();
+  const groupedMessageIds = new Set();
+  for (let index = 0; index < messages.length; index += 1) {
+    const first = messages[index];
+    if (!isGroupableAction(first, endsTheTurn)) continue;
+    const pairs = [];
+    let cursor = index;
+    while (cursor + 1 < messages.length) {
+      const action = messages[cursor];
+      const result = messages[cursor + 1];
+      if (!isGroupableAction(action, endsTheTurn)) break;
+      if (result.role !== "tool" || result.taskId !== action.taskId) break;
+      pairs.push({ action, result });
+      groupedMessageIds.add(action.id);
+      groupedMessageIds.add(result.id);
+      cursor += 2;
     }
-    if (message.role === "question") {
-      // The answer event immediately follows its question in the log, so the
-      // next message is what settles this card. Options ride on the question
-      // message from `/api/session`; without them a reload could show the text
-      // but could not answer it.
-      const next = messages[index + 1];
-      const answered =
-        next && next.role === "answer" && next.taskId === message.taskId ? next.content : null;
-      const article = document.createElement("article");
-      article.className = "message question";
-      if (message.seq) article.dataset.seq = message.seq;
-      const label = document.createElement("div");
-      label.className = "visually-hidden";
-      label.textContent = "Assistant question";
-      const card = createQuestionCard(
-        {
-          questionId: message.id,
-          question: message.content,
-          options: message.options || [],
-          allowFreeText: message.allowFreeText === true,
-        },
-        repo(),
-        { answered },
-      );
-      article.append(label, card);
-      $("chat-log").append(article);
-      return { message, bubble: { message: article, body: card } };
+    if (pairs.length) {
+      activityGroupByStart.set(first.id, pairs);
+      index = cursor - 1;
     }
-    const bubble = appendChatMessage(message.role, message.content);
-    if (message.seq) bubble.message.dataset.seq = message.seq;
-    if (message.role === "user") {
-      const checkpoint = sessionCheckpoints.find((entry) => entry.userMessageId === message.id);
-      if (checkpoint) markMessageRewindable(bubble, checkpoint);
-    }
-    if (message.role === "assistant") {
-      // The context link is added after the markdown render, because
-      // `finalizeChatMessage` replaces the body's children.
-      const finalized = finalizeChatMessage(bubble, message.content);
-      if (message.taskId && endsTheTurn(message)) {
-        if (cancelledTasks.has(message.taskId)) {
-          markMessageStopped(bubble);
-        } else if (toolBudgetExhaustedTasks.has(message.taskId)) {
-          markMessageToolBudgetExhausted(bubble, message.sessionId, message.taskId);
-        } else if (tokenBudgetExhaustedTasks.has(message.taskId)) {
-          markMessageTokenBudgetExhausted(bubble);
-        }
-        if (planByTask.has(message.taskId)) {
-          renderPlanPanel(bubble, planByTask.get(message.taskId));
-        }
-        (diagnosticsByTask.get(message.taskId) || []).forEach((record) => {
-          renderWebDiagnosticCard(bubble, record);
-        });
-        appendTurnNotes(bubble.body, notesByTask.get(message.taskId));
-        void finalized.then(() =>
-          appendContextLink(bubble.body, contextByTask.get(message.taskId)),
-        );
+  }
+  const rendered = messages
+    .map((message, index) => {
+      const activity = activityGroupByStart.get(message.id);
+      if (activity) {
+        drawBoundaryBefore(message);
+        const bubble = renderActivityGroup(activity);
+        if (message.seq) bubble.message.dataset.seq = message.seq;
+        return { message, bubble };
       }
-      if (message.taskId) markMessageUsage(bubble, usageByTask.get(message.taskId));
-    }
-    return { message, bubble };
-  });
+      if (groupedMessageIds.has(message.id)) return null;
+      drawBoundaryBefore(message);
+      // The engine's one plan reminder is a user-role message in the request but
+      // not something the user typed. Render it as a system line, and not as an
+      // answer, a rewind anchor, or a question (spec 66 `context.md` D10).
+      if (message.kind === "plan_reminder") {
+        const bubble = appendChatMessage("system", message.content);
+        if (message.seq) bubble.message.dataset.seq = message.seq;
+        return { message, bubble };
+      }
+      if (message.role === "question") {
+        // The answer event immediately follows its question in the log, so the
+        // next message is what settles this card. Options ride on the question
+        // message from `/api/session`; without them a reload could show the text
+        // but could not answer it.
+        const next = messages[index + 1];
+        const answered =
+          next && next.role === "answer" && next.taskId === message.taskId ? next.content : null;
+        const article = document.createElement("article");
+        article.className = "message question";
+        if (message.seq) article.dataset.seq = message.seq;
+        const label = document.createElement("div");
+        label.className = "visually-hidden";
+        label.textContent = "Assistant question";
+        const card = createQuestionCard(
+          {
+            questionId: message.id,
+            question: message.content,
+            options: message.options || [],
+            allowFreeText: message.allowFreeText === true,
+          },
+          repo(),
+          { answered },
+        );
+        article.append(label, card);
+        $("chat-log").append(article);
+        return { message, bubble: { message: article, body: card } };
+      }
+      const bubble = appendChatMessage(message.role, message.content);
+      if (message.seq) bubble.message.dataset.seq = message.seq;
+      if (message.role === "user") {
+        const checkpoint = sessionCheckpoints.find((entry) => entry.userMessageId === message.id);
+        if (checkpoint) markMessageRewindable(bubble, checkpoint);
+      }
+      if (message.role === "assistant") {
+        // The context link is added after the markdown render, because
+        // `finalizeChatMessage` replaces the body's children.
+        const finalized = finalizeChatMessage(bubble, message.content);
+        if (message.taskId && endsTheTurn(message)) {
+          if (cancelledTasks.has(message.taskId)) {
+            markMessageStopped(bubble);
+          } else if (toolBudgetExhaustedTasks.has(message.taskId)) {
+            markMessageToolBudgetExhausted(bubble, message.sessionId, message.taskId);
+          } else if (tokenBudgetExhaustedTasks.has(message.taskId)) {
+            markMessageTokenBudgetExhausted(bubble);
+          }
+          if (planByTask.has(message.taskId)) {
+            renderPlanPanel(bubble, planByTask.get(message.taskId));
+          }
+          (diagnosticsByTask.get(message.taskId) || []).forEach((record) => {
+            renderWebDiagnosticCard(bubble, record);
+          });
+          appendTurnNotes(bubble.body, notesByTask.get(message.taskId));
+          void finalized.then(() =>
+            appendContextLink(bubble.body, contextByTask.get(message.taskId)),
+          );
+        }
+        if (message.taskId) markMessageUsage(bubble, usageByTask.get(message.taskId));
+      }
+      return { message, bubble };
+    })
+    .filter(Boolean);
   if (!boundaryDrawn && boundary) {
     // The summary covers everything (or the log predates `seq`): the boundary
     // is the top of the thread, not the bottom of it.
@@ -8861,7 +8959,8 @@ function renderPlanPanel(message, plan) {
     }
     list.append(item);
   });
-  panel.append(list);
+  const steps = createDisclosure(`Steps (${plan.steps.length})`, list);
+  panel.append(steps, list);
 
   const existing = message.body.parentElement?.querySelector('[data-plan-panel="true"]');
   if (existing) {
@@ -9513,6 +9612,21 @@ async function repairFindings(ids) {
       await refreshFindings();
       return;
     }
+    // The exact prompt is the thing being authorized. Show it before sending:
+    // a generic command finding is often an environment/PATH failure, and
+    // "Fix 1 error" must not turn that into a code change the user never saw.
+    const kept = payload.request?.findings || [];
+    const environmentOnly =
+      kept.length > 0 && kept.every((finding) => finding.source === "command" && !finding.range);
+    const send = await showAppDialog({
+      title: `Fix ${ids.length} finding${ids.length === 1 ? "" : "s"}?`,
+      message: environmentOnly
+        ? "This is a command that could not run, which is often an environment or PATH problem rather than a code defect. Review the prompt; Cancel if the fix belongs outside the repository."
+        : "This sends the prompt below as a new turn. Review it before sending.",
+      detail: payload.prompt,
+      confirmLabel: "Send",
+    });
+    if (!send) return;
     findingsSelection.clear();
     // `sendChatPrompt` sets `chatSubmitting` before its first await, which
     // keeps the buttons disabled from here.

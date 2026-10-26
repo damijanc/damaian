@@ -969,6 +969,104 @@ The cause enum is fed by the classifier in validation.rs.</pre>
     </section>
 
     <section class="sg-section">
+      <h2>Conversation activity</h2>
+      <p class="sg-hint">
+        A turn's intermediate steps fold into one collapsed row; the answer stays its own
+        message, and the plan's steps fold into their own row. The expanded body scrolls at a
+        cap, and tool output stays preformatted because it is not Markdown. Spec 67.
+      </p>
+      <div class="sg-card">
+        <div class="message activity">
+          <div class="visually-hidden">Activity</div>
+          <div class="activity-body">
+            <button type="button" class="disclosure" aria-expanded="false">
+              <span class="disclosure-caret" aria-hidden="true"></span> Activity (3 steps)
+            </button>
+            <div class="activity-detail" hidden>
+              <section class="activity-step">
+                <div class="activity-step-title">Read <code>upload.rs</code></div>
+                <pre class="activity-step-result">fn upload() {
+    todo!()
+}</pre>
+              </section>
+              <section class="activity-step">
+                <div class="activity-step-title">Ran <code>cargo test</code></div>
+                <pre class="activity-step-result">test result: FAILED. 0 passed; 1 failed; 0 ignored</pre>
+              </section>
+            </div>
+          </div>
+        </div>
+        <p class="sg-note">Collapsed — the common case.</p>
+        <div class="message activity">
+          <div class="visually-hidden">Activity</div>
+          <div class="activity-body">
+            <button type="button" class="disclosure" aria-expanded="true">
+              <span class="disclosure-caret" aria-hidden="true"></span> Activity (3 steps)
+            </button>
+            <div class="activity-detail">
+              <section class="activity-step">
+                <div class="activity-step-title">Read <code>upload.rs</code></div>
+                <pre class="activity-step-result">fn upload() {
+    todo!()
+}</pre>
+              </section>
+              <section class="activity-step">
+                <div class="activity-step-title">Ran <code>cargo test</code></div>
+                <pre class="activity-step-result">test result: FAILED. 0 passed; 1 failed; 0 ignored</pre>
+              </section>
+            </div>
+          </div>
+        </div>
+        <p class="sg-note">Expanded; the detail scrolls at 420px and each result at 240px.</p>
+      </div>
+      <div class="sg-card">
+        <div class="plan-panel">
+          <div class="plan-panel-header">
+            <strong>Plan</strong>
+            <span class="plan-panel-summary">2 complete, 1 blocked.</span>
+          </div>
+          <button type="button" class="disclosure" aria-expanded="false">
+            <span class="disclosure-caret" aria-hidden="true"></span> Steps (3)
+          </button>
+          <ol class="plan-step-list" hidden>
+            <li class="plan-step" data-status="completed" data-outcome="verified">
+              <span class="plan-step-title">Read the upload client</span>
+              <span class="plan-step-outcome">confirmed</span>
+            </li>
+            <li class="plan-step" data-status="blocked" data-outcome="blocked">
+              <span class="plan-step-title">Run the tests</span>
+              <span class="plan-step-outcome">blocked</span>
+            </li>
+            <li class="plan-step" data-status="pending" data-outcome="outstanding">
+              <span class="plan-step-title">Report the finding</span>
+            </li>
+          </ol>
+        </div>
+        <p class="sg-note">
+          The summary stays visible; the step list is one quiet disclosure row.
+        </p>
+      </div>
+      <div class="sg-card">
+        <div class="app-dialog app-dialog-wide app-dialog-preview">
+          <p class="app-dialog-title">Fix 1 finding?</p>
+          <p class="app-dialog-message">
+            This is a command that could not run, which is often an environment or PATH problem
+            rather than a code defect. Review the prompt; Cancel if the fix belongs outside the
+            repository.
+          </p>
+          <pre class="app-dialog-detail">Fix the 1 finding below, which checks reported in this session. Change only what each one needs, and say which you fixed by its id.
+
+1. command error: node scripts/check-spec-status.mjs: zsh:1: command not found: node</pre>
+          <div class="app-dialog-actions">
+            <button type="button" class="app-dialog-btn app-dialog-cancel">Cancel</button>
+            <button type="button" class="app-dialog-btn app-dialog-confirm">Send</button>
+          </div>
+        </div>
+        <p class="sg-note">The exact repair prompt is reviewed before sending.</p>
+      </div>
+    </section>
+
+    <section class="sg-section">
       <h2>Patch header</h2>
       <div class="sg-card">
         <div class="patch-preview-header">

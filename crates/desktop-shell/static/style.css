@@ -3702,6 +3702,36 @@ code.command-approval-command {
   width: min(520px, calc(100vw - 32px));
 }
 
+/* A confirmation that carries content the user must read before deciding —
+   the exact finding-repair prompt (spec 67). The prompt scrolls so the dialog
+   never grows with it. */
+.app-dialog-preview {
+  width: min(640px, calc(100vw - 32px));
+}
+
+.app-dialog-detail {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f6f7f7;
+  color: var(--ink);
+  font-size: 11px;
+  padding: 9px 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.app-dialog-detail[hidden] {
+  display: none;
+}
+
+.app-dialog-detail:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* One row per checkpoint in the Settings > Checkpoints list. */
 .checkpoint-row {
   display: flex;
@@ -4830,6 +4860,78 @@ body.worker-view #chat-model-menu {
 
 .plan-step-evidence[hidden] {
   display: none;
+}
+
+/* The step list sets `display: grid`, so the UA `[hidden]` rule loses
+   without this. Spec 67 §5.2. */
+.plan-step-list[hidden] {
+  display: none;
+}
+
+/* One collapsed run of intermediate actions and their results (spec 67 §5.1).
+   It is a quiet row when closed; the expanded body scrolls at a cap so one
+   long tool result cannot take the conversation column. */
+.message.activity {
+  align-self: stretch;
+}
+
+.activity-body {
+  display: grid;
+  gap: 6px;
+}
+
+.activity-detail {
+  display: grid;
+  gap: 12px;
+  max-height: 420px;
+  overflow: auto;
+  border-left: 2px solid var(--line);
+  padding-left: 10px;
+}
+
+.activity-detail[hidden] {
+  display: none;
+}
+
+.activity-detail:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.activity-step {
+  display: grid;
+  gap: 5px;
+}
+
+.activity-step-title {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.activity-step-title p {
+  margin: 0;
+}
+
+.activity-step-title code {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #f6f7f7;
+  font-size: 11px;
+  padding: 0 4px;
+}
+
+.activity-step-result {
+  max-height: 240px;
+  overflow: auto;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f6f7f7;
+  color: var(--ink);
+  font-size: 11px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* The browser diagnostic card. Spec 12 §5.3. A secondary surface under the

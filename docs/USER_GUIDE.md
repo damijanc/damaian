@@ -647,6 +647,13 @@ A turn that reaches its action-round limit (`agent_max_tool_rounds`, 8 by defaul
 
 A turn that ends any other way leaves a mark on its message: **Stopped by you**, **Tool budget exhausted** (after **Answer now**; the reply names the action and read-only rounds it had used, and **Ask again** starts a new turn from the stopped task's own request, carrying its plan forward), **Token budget exhausted**, **Stopped before finishing**, or the error itself when the request failed. The stop and budget marks are still there when you reopen the session. **Stopped before finishing** and a failure's error are shown only in the window where the turn ran; after a reload, a stopped turn reads **Stopped by you** and a failed one has no mark.
 
+### Intermediate steps and the answer
+
+A turn records each action it takes — a file read, a search, a command, a note — as an assistant summary followed by its result. Those consecutive steps are folded into one collapsed **Activity (N steps)** row rather than left as a full bubble per action. Open it to see each action and its exact tool result; the content scrolls at a cap, and the answer stays its own message at the end of the turn. This is the same on reload: the activities are rebuilt from the session log, not stored as a second record.
+
+The plan panel keeps its summary visible and puts its steps behind a collapsed **Steps (N)** row. Open it when you want the full plan, each step's outcome, and the evidence behind it; leave it closed when you only need the answer. See [The Plan Panel](#the-plan-panel).
+
+
 ### Agent tools for reading and navigating
 
 With [native tool-calling](#native-tool-calling) enabled, Damaian offers the assistant tools that need
@@ -852,8 +859,10 @@ A rewind never rewrites history you can audit. The conversation moves back by ap
 ## The Plan Panel
 
 When a request needs more than one piece of work, the assistant writes a plan
-before starting and a panel appears under its answer showing every step and
-what became of it.
+before starting and a panel appears under its answer. Its one-line summary is
+always visible; the steps are behind a collapsed **Steps (N)** row, so a long
+plan does not push the answer off the screen. Open that row to see every step
+and what became of it.
 
 Short requests get no plan. A question answered by reading one file is a single
 step, and gets no panel.
@@ -1843,6 +1852,14 @@ and re-run the check.
 Only **open** findings are sent. A stale, dismissed or fixed finding in the
 selection is left out, and a note says how many were left out and why. If
 nothing is left, nothing is sent.
+
+Both **Fix selected** and the repo bar's **Fix N errors** show the exact repair
+prompt in a confirmation before sending. **Send** starts the turn; **Cancel**
+sends nothing and leaves your selection. The prompt is the whole request: the
+finding ids, their summaries and the excerpts the assistant will see. If every
+selected finding is a generic command failure with no file location, the
+confirmation says it is likely an environment or `PATH` problem rather than a
+code defect, so a missing tool is not turned into a code change by accident.
 
 ### What stale means
 

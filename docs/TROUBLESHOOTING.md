@@ -1355,6 +1355,13 @@ and nothing else is. Its summary names the command and its first output line,
 and its details are the last 40 lines of stderr then stdout. A cancelled check
 gets no generic finding, because it never reached a verdict.
 
+**A generic command finding is not always a code defect.** It often means the
+command could not run at all — a missing tool, a `PATH` difference between your
+shell and the app (see [The app does not see your shell's environment](#the-app-does-not-see-your-shells-environment)),
+or a timeout. When every finding you ask to repair is a `command` finding with
+no location, the repair confirmation says so before sending. Read the prompt
+and cancel if the fix belongs to your environment rather than the repository.
+
 **A failed command recorded no finding.** Its purpose was **exploration** — a
 search, a listing, a text read, or a git read, including pipelines of those.
 `grep` exits 1 when nothing matches and `ls -d` exits 1 for a path that does

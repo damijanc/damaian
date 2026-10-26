@@ -7910,6 +7910,7 @@ mod tests {
             recorded_web_diagnostic_session(&engine, &repository_id, &data_dir);
         let legacy_session = legacy_web_diagnostic_session(&engine, &repository_id, &data_dir);
         let findings_session = findings_to_review_session(&engine, &repository_id, &repo);
+        let activity_session = activity_and_plan_session(&engine, &repository_id);
 
         let options = ShellOptions {
             port: 4899,
@@ -7927,8 +7928,99 @@ mod tests {
         println!(
             "  findings session (the composer's repo bar should offer \"Fix 2 errors\") = {findings_session}"
         );
+        println!(
+            "  activity + plan session (collapsed Activity and Steps disclosures) = {activity_session}"
+        );
         println!("  data_dir = {}", data_dir.display());
         run_server(options).expect("serve the UI");
+    }
+
+    /// A finished turn with a plan and a run of intermediate action/result
+    /// pairs, so the collapsed Activity disclosure and the collapsed plan
+    /// steps (spec 67) can be inspected. Returns the session id.
+    fn activity_and_plan_session(engine: &WorkspaceEngine, repository_id: &str) -> String {
+        let store = &engine.session_store;
+        let session = store
+            .create_session(repository_id, "Investigate the upload client")
+            .unwrap();
+        let task = store
+            .create_task(&session.id, "investigate the upload client", "mock", "mock")
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                "user",
+                "Investigate the upload client and report.",
+            )
+            .unwrap();
+        for (action, result) in [
+            ("Read `upload.rs`", "fn upload() {\n    todo!()\n}\n"),
+            ("Searched for `retry`", "0 matches across 1 file\n"),
+            (
+                "Ran `cargo test`",
+                "test result: FAILED. 0 passed; 1 failed; 0 ignored\n",
+            ),
+        ] {
+            store
+                .append_message(&session.id, Some(&task.id), "assistant", action)
+                .unwrap();
+            store
+                .append_message(&session.id, Some(&task.id), "tool", result)
+                .unwrap();
+        }
+        let plan = workspace_engine::TaskPlan {
+            task_id: task.id.clone(),
+            created_at_ms: 1,
+            steps: vec![
+                workspace_engine::PlanStep {
+                    id: "step_1".to_string(),
+                    title: "Read the upload client".to_string(),
+                    detail: None,
+                    status: workspace_engine::StepStatus::Completed,
+                    depends_on: Vec::new(),
+                    started_at_ms: Some(1),
+                    completed_at_ms: Some(2),
+                    evidence: vec![workspace_engine::Evidence::FileRead {
+                        path: "upload.rs".to_string(),
+                        hash: "sha256:0".to_string(),
+                    }],
+                },
+                workspace_engine::PlanStep {
+                    id: "step_2".to_string(),
+                    title: "Run the tests".to_string(),
+                    detail: None,
+                    status: workspace_engine::StepStatus::Blocked,
+                    depends_on: Vec::new(),
+                    started_at_ms: Some(2),
+                    completed_at_ms: Some(3),
+                    evidence: Vec::new(),
+                },
+                workspace_engine::PlanStep {
+                    id: "step_3".to_string(),
+                    title: "Report the finding".to_string(),
+                    detail: None,
+                    status: workspace_engine::StepStatus::Pending,
+                    depends_on: Vec::new(),
+                    started_at_ms: None,
+                    completed_at_ms: None,
+                    evidence: Vec::new(),
+                },
+            ],
+        };
+        store.create_plan(&task, &plan).unwrap();
+        store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                "assistant",
+                "## Finding\n\n`upload` never retries. The test suite fails before it can prove the fix.",
+            )
+            .unwrap();
+        store
+            .update_task_status(&task, workspace_engine::TaskStatus::Complete, None)
+            .unwrap();
+        session.id
     }
 
     /// A browser diagnostic turn as spec 12 Task 3 records it: the tool
