@@ -17,15 +17,16 @@ use workspace_engine::{
     ChatMessage, ChatTurnOptions, ChatTurnResult, CommitError, Config, ContextDecision,
     ContextManifest, CostEstimate, CurlModelTransport, DataSchemaOutcome, EffectivePolicy,
     ExportFormat, GeneratedSecretWarning, HookActivation, HookEvent, LanguageServerStatus,
-    LineRange, McpClient, McpServerConfig, McpTokenResolver, McpTransport, ModelAdapter,
-    ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
-    ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState, RepositoryConfigReport,
-    ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus,
-    SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink,
-    VerificationReport, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
-    allow_always_eligible, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
-    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
+    LineRange, McpClient, McpServerConfig, McpTokenResolver, McpTransport, MemoryScope,
+    ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns,
+    PlanRevisionStep, ProcessRegistry, ProfileId, ProjectIdentity, ProposedFilePatch,
+    QuestionState, RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision,
+    SearchOptions, Session, SessionMode, StepStatus, SymbolRef, TaskPlan, TaskUsage, TokenUsage,
+    TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationReport,
+    WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
+    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
+    import_profile, normalize_mcp_server_id, normalize_model_provider,
     normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
     profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
     select_profile,
@@ -337,6 +338,11 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/context-remove") => handle_context_remove(stream, &request),
         ("POST", "/api/context-remove-summary") => handle_context_remove_summary(stream, &request),
         ("POST", "/api/resume-context-stream") => handle_resume_context_stream(stream, &request),
+        // Spec 29: the pending proposals and the two user actions. There is no
+        // accept-all route and no route that takes a statement.
+        ("GET", "/api/memory-proposals") => handle_memory_proposals(stream, &request),
+        ("POST", "/api/memory-confirm") => handle_memory_confirm(stream, &request),
+        ("POST", "/api/memory-dismiss") => handle_memory_dismiss(stream, &request),
         // Spec 22 Task 10. Each findings route is its own function, so the
         // engine it builds lives in that frame rather than this one: every
         // arm's locals share `handle_connection`'s frame, and inlining three
@@ -660,6 +666,125 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
             conversation_json(&engine, &session_id),
             serde_json::to_string(&context_pins).unwrap_or_else(|_| "[]".to_string()),
             serde_json::to_string(&context_restriction).unwrap_or_else(|_| "null".to_string())
+        ),
+    )
+}
+
+/// `GET /api/memory-proposals`: what is still waiting for a decision in this
+/// session, with the origin line the card shows. Read from the session log, so
+/// a reload or a restart shows the same list.
+fn handle_memory_proposals(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let session_id = required_param(request, "session_id")?;
+    let engine = default_engine()?;
+    if engine
+        .session_store
+        .read_session(&session_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err(format!("Unknown session: {session_id}"));
+    }
+    let pending = engine
+        .memory_store
+        .pending_proposals(&session_id)
+        .map_err(|error| error.to_string())?;
+    let mut proposals = Vec::new();
+    for proposal in pending {
+        let mut value = serde_json::to_value(&proposal).map_err(|error| error.to_string())?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "sourceLabel".to_string(),
+                serde_json::json!(proposal.source_label()),
+            );
+            object.insert(
+                "originKind".to_string(),
+                serde_json::json!(proposal.origin.kind()),
+            );
+        }
+        proposals.push(value);
+    }
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"proposals\":{},\"userScopeEnabled\":{}}}",
+            serde_json::to_string(&proposals).map_err(|error| error.to_string())?,
+            engine.config.memory_user_scope_enabled
+        ),
+    )
+}
+
+fn parse_memory_scope(value: &str) -> Result<MemoryScope, String> {
+    match value {
+        "session" => Ok(MemoryScope::Session),
+        "project" => Ok(MemoryScope::Project),
+        "user" => Ok(MemoryScope::User),
+        other => Err(format!("unknown memory scope: {other}")),
+    }
+}
+
+/// `POST /api/memory-confirm`: one proposal id, never a statement. The route
+/// reloads the stored proposal and the server resolves the project identity;
+/// a client cannot choose either. The confirmation is recorded here because
+/// this route is the user action.
+fn handle_memory_confirm(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let proposal_id = required_form(&form, "proposal_id")?;
+    let engine = engine_for_repo(&repo)?;
+    let identity = ProjectIdentity::resolve_for_root(Path::new(&repo), &engine.git)
+        .map_err(|error| error.to_string())?;
+    let mut confirmation = UserConfirmation::new(&proposal_id);
+    if let Some(scope) = form.get("scope").filter(|value| !value.is_empty()) {
+        confirmation = confirmation.with_scope(parse_memory_scope(scope)?);
+    }
+    let entry = engine
+        .memory_store
+        .confirm_proposal(
+            Path::new(&repo),
+            Some(&identity),
+            &session_id,
+            &proposal_id,
+            confirmation,
+        )
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"proposalId\":{},\"entry\":{}}}",
+            serde_json::to_string(&proposal_id).map_err(|error| error.to_string())?,
+            serde_json::to_string(&entry).map_err(|error| error.to_string())?
+        ),
+    )
+}
+
+/// `POST /api/memory-dismiss`: one proposal id. A dismissal is a decision, not
+/// a deletion: the proposal and the dismissal stay in the session log, and no
+/// entry is written.
+fn handle_memory_dismiss(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let proposal_id = required_form(&form, "proposal_id")?;
+    let engine = engine_for_repo(&repo)?;
+    engine
+        .memory_store
+        .dismiss_proposal(&session_id, &proposal_id)
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"proposalId\":{},\"dismissed\":true}}",
+            serde_json::to_string(&proposal_id).map_err(|error| error.to_string())?
         ),
     )
 }
@@ -14596,5 +14721,303 @@ mod conversation_compaction_tests {
         let error = run_compact_request(&repo.to_string_lossy(), "session_that_does_not_exist")
             .expect_err("an unknown session is an error");
         assert!(error.contains("Unknown session"), "{error}");
+    }
+}
+
+/// Spec 29 Task 6: the proposal list and the two decisions, through the same
+/// token-gated routes the UI calls. There is deliberately no accept-all route
+/// and no route that takes a statement.
+#[cfg(test)]
+mod memory_route_tests {
+    use super::*;
+    use std::process::Command;
+    use std::sync::OnceLock;
+    use workspace_engine::{
+        MemoryCategory, MemoryProposal, MemoryScope, ProposalOrigin, SessionStore,
+    };
+
+    fn isolated_data_dir() -> &'static Path {
+        static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+        DATA_DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "damaian-memory-route-data-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            unsafe { std::env::set_var("DAMAIAN_DATA_DIR", &dir) };
+            dir
+        })
+    }
+
+    fn repo_fixture(name: &str) -> PathBuf {
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-memory-route-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("README.md"), "# Memory route fixture\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "route@example.invalid"],
+            vec!["config", "user.name", "Route"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "fixture"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        repo
+    }
+
+    fn serve() -> (u16, String) {
+        let options = ShellOptions::new(0, None);
+        let token = options.api_token.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        spawn_with_shell_stack("memory-route-shell", move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                if let Err(error) = handle_connection(&mut stream, &options) {
+                    let _ = write_basic_response(
+                        &mut stream,
+                        500,
+                        "application/json",
+                        &json_error(&error),
+                    );
+                }
+            }
+        })
+        .expect("spawn shell");
+        (port, token)
+    }
+
+    fn encode(value: &str) -> String {
+        value
+            .bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (byte as char).to_string()
+                }
+                b' ' => "+".to_string(),
+                other => format!("%{other:02X}"),
+            })
+            .collect()
+    }
+
+    fn post(port: u16, token: &str, path: &str, fields: &[(&str, &str)]) -> String {
+        let body = fields
+            .iter()
+            .map(|(key, value)| format!("{key}={}", encode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/x-www-form-urlencoded\r\nx-damaian-api-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn get(port: u16, token: &str, path: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn body_json(response: &str) -> serde_json::Value {
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or(response);
+        serde_json::from_str(body).unwrap_or_else(|error| panic!("{error}: {body}"))
+    }
+
+    fn fixture_proposal(
+        session_id: &str,
+        task_id: &str,
+        scope: MemoryScope,
+        statement: &str,
+    ) -> MemoryProposal {
+        MemoryProposal::new(
+            scope,
+            MemoryCategory::Convention,
+            statement,
+            ProposalOrigin::ModelSuggestion {
+                session_id: session_id.to_string(),
+                task_id: task_id.to_string(),
+            },
+            Vec::new(),
+            Some(task_id.to_string()),
+        )
+    }
+
+    fn engine(data_dir: &Path) -> WorkspaceEngine {
+        WorkspaceEngine::new(Config {
+            data_dir: data_dir.to_path_buf(),
+            enable_index_watcher: false,
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn the_route_lists_confirms_and_dismisses_exactly_one_proposal_at_a_time() {
+        let data_dir = isolated_data_dir();
+        let repo = repo_fixture("decisions");
+        let sessions = SessionStore::new(data_dir);
+        let session = sessions
+            .create_session("repo_fixture", "memory route")
+            .unwrap();
+        let store = engine(data_dir);
+        let first = fixture_proposal(
+            &session.id,
+            "task_1",
+            MemoryScope::Project,
+            "Integration tests use nextest.",
+        );
+        let first = store.memory_store.propose(&repo, first).unwrap().unwrap();
+        let second = fixture_proposal(
+            &session.id,
+            "task_1",
+            MemoryScope::Project,
+            "Release tags are created on Friday.",
+        );
+        let second = store.memory_store.propose(&repo, second).unwrap().unwrap();
+
+        let (port, token) = serve();
+        let list = get(
+            port,
+            &token,
+            &format!("/api/memory-proposals?session_id={}", session.id),
+        );
+        assert!(list.starts_with("HTTP/1.1 200"), "{list}");
+        let listed = body_json(&list);
+        assert_eq!(listed["proposals"].as_array().unwrap().len(), 2);
+        assert!(listed["proposals"][0]["sourceLabel"].as_str().is_some());
+
+        let confirmed = post(
+            port,
+            &token,
+            "/api/memory-confirm",
+            &[
+                ("repo", &repo.to_string_lossy()),
+                ("session_id", &session.id),
+                ("proposal_id", &first.id),
+                ("scope", "project"),
+            ],
+        );
+        assert!(confirmed.starts_with("HTTP/1.1 200"), "{confirmed}");
+        let dismissed = post(
+            port,
+            &token,
+            "/api/memory-dismiss",
+            &[
+                ("repo", &repo.to_string_lossy()),
+                ("session_id", &session.id),
+                ("proposal_id", &second.id),
+            ],
+        );
+        assert!(dismissed.starts_with("HTTP/1.1 200"), "{dismissed}");
+
+        let list = get(
+            port,
+            &token,
+            &format!("/api/memory-proposals?session_id={}", session.id),
+        );
+        assert_eq!(body_json(&list)["proposals"].as_array().unwrap().len(), 0);
+        let project_files = fs::read_dir(data_dir.join("memory").join("project"))
+            .unwrap()
+            .flatten()
+            .count();
+        assert_eq!(project_files, 1, "exactly the confirmed entry is stored");
+    }
+
+    #[test]
+    fn a_user_scope_confirmation_while_disabled_is_refused_and_does_not_enable_it() {
+        let data_dir = isolated_data_dir();
+        let repo = repo_fixture("user-scope");
+        let sessions = SessionStore::new(data_dir);
+        let session = sessions
+            .create_session("repo_fixture", "memory user scope")
+            .unwrap();
+        let store = engine(data_dir);
+        let proposal = fixture_proposal(
+            &session.id,
+            "task_user",
+            MemoryScope::User,
+            "The user prefers tab indentation.",
+        );
+        let proposal = store
+            .memory_store
+            .propose(&repo, proposal)
+            .unwrap()
+            .unwrap();
+
+        let (port, token) = serve();
+        let refused = post(
+            port,
+            &token,
+            "/api/memory-confirm",
+            &[
+                ("repo", &repo.to_string_lossy()),
+                ("session_id", &session.id),
+                ("proposal_id", &proposal.id),
+                ("scope", "user"),
+            ],
+        );
+        assert!(refused.starts_with("HTTP/1.1 500"), "{refused}");
+        assert!(
+            refused.contains("User-scope memory is turned off"),
+            "{refused}"
+        );
+        assert!(!data_dir.join("memory").join("user.jsonl").exists());
+        let list = get(
+            port,
+            &token,
+            &format!("/api/memory-proposals?session_id={}", session.id),
+        );
+        assert_eq!(
+            body_json(&list)["proposals"].as_array().unwrap().len(),
+            1,
+            "a refused confirmation leaves the proposal pending"
+        );
+    }
+
+    /// The confirm route takes an id and re-reads the stored proposal; a
+    /// client-supplied statement has nowhere to go. This is the API shape, not
+    /// a runtime check the route could forget.
+    #[test]
+    fn the_confirm_route_has_no_statement_field() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("fn handle_memory_confirm"));
+        assert!(!source.contains("statement = required_form(&form, \\\"statement\\\")"));
     }
 }

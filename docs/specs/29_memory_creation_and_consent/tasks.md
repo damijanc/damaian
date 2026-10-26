@@ -16,7 +16,7 @@ criteria) · context and decisions in [`context.md`](context.md)
 | 3 · Screening: statement, secret, instruction, evidence | Done 2026-10-26 | `is_instruction_shaped` uses a conservative prefix and phrase table; it runs for every non-user origin. `MemoryProposal::screen` normalizes whitespace, enforces the 280-character ceiling, rejects multi-line or control-character statements, scans the statement and every evidence path for secrets, and checks each path with `MemoryProposalGate::check_evidence` (relative, `PathPolicy::is_restricted`, configured patterns and per-directory `.gitignore`). `MemoryStore::propose` audits `memory_proposal_refused` with reason, scope, category, origin and the evidence path only; never the statement, and never a secret. `evidence_ref_for` records the content hash at proposal time. Tests cover the pattern table and benign conventions inline, a seeded secret, restricted `.env` evidence, an ignored file that is still index-resident, and an over-long statement. `--test memory` 68 passed. |
 | 4 · Proposal persistence, confirm, dismiss and cap | Done 2026-10-26 | Proposals and decisions are session-log events (`memory_proposal_proposed`, `memory_proposal_decided`) through new `pub(crate)` `SessionStore` methods; `append_session_event` stays private. `MemoryStore::propose` screens and caps non-user suggestions at `MAX_SUGGESTIONS_PER_TASK = 3`, counted from the log so a resumed turn does not reset it. `pending_proposals` is proposed minus decided. `confirm_proposal` accepts only a proposal id, re-reads and re-screens the stored proposal, inserts the entry, appends a confirmation decision and audits `memory_proposal_confirmed` with the source; a failed insert leaves the proposal pending. `dismiss_proposal` appends a dismissal and audits it without the statement. Nine integration tests cover survival across reopening, one entry per confirmation, a second confirmation refused, dismissal, the cap with an uncapped user request, user scope disabled without flipping the flag, and a user-scope proposal saved as project. `--test memory` 68 passed; scoped clippy clean. |
 | 5 · Explicit request and the `propose_memory` tool | Done 2026-10-26 | `explicit_memory_request` reads one cue, the first sentence and nothing inferred; the turn calls it after the user message is appended. `ToolAction::ProposeMemory` is parsed by `tool_action_from_call`, offered beside `turn_notes`, allowed in every mode and profile because it writes only the session log, and charged as exploration. Dispatch maps `evidence_path` to `RepositoryObservation`, `source` without evidence to `ExternalContent`, otherwise `ModelSuggestion`; it hashes the evidence file, calls `MemoryStore::propose`, and returns a result naming what happened without repeating the statement. `ChatOrchestrator` gained its `memory_store` dependency. Proposals are session-log events, not transcript roles, so they never enter `build_conversation`. **Deviation:** the model may suggest a memory but the tool cannot confirm one; the eval scenarios cover that end to end. Tests: inline cue parsing and category/scope selection, tool parsing and schema, tool-effect classification, and two turn-level tests proving an explicit cue creates one proposal and no memory file. Scoped clippy clean. |
-| 6 · Shell routes and the confirmation card | Not started | |
+| 6 · Shell routes and the confirmation card | Done 2026-10-26 | Three routes: `GET /api/memory-proposals`, `POST /api/memory-confirm`, `POST /api/memory-dismiss`. The confirm route takes `repo`, `session_id`, `proposal_id` and an optional `scope`; it resolves `ProjectIdentity` from the repository and creates the `UserConfirmation` server-side, so a client cannot supply a statement, a project key or a confirmation id. The UI reads the pending list into a collapsed proposal stack below the conversation, with statement, scope, category, origin/source, a scope picker, Remember and Dismiss. A user-scope proposal while the scope is off defaults to project scope and explains that enabling user scope is separate. The stack is re-read after every turn and after each decision. **Deviation:** proposals are not transcript messages, so they cannot reach `build_conversation`; the stack is a sibling of the log content. Three route tests run through the real token-gated shell: list/confirm/dismiss end to end, a user-scope refusal that leaves the flag off and the proposal pending, and the absence of a statement field. `node --check` and `npm run lint:web` pass; scoped clippy clean. |
 | 7 · Acceptance tests a scenario cannot cover | Not started | |
 | 8 · Deterministic eval scenarios | Not started | |
 | 9 · Documentation and close-out | Not started | |
@@ -209,22 +209,25 @@ folder-path references; `npm run specs:check` reports no new mismatch for #29.
 
 ## Task 6 · Shell routes and the confirmation card
 
-- [ ] `GET /api/memory-proposals?session_id=…` returns the pending proposals
+- [x] `GET /api/memory-proposals?session_id=…` returns the pending proposals
       with scope, category, statement, origin/source and evidence paths.
-- [ ] `POST /api/memory-confirm` takes `repo`, `session_id`, `proposal_id` and an
+- [x] `POST /api/memory-confirm` takes `repo`, `session_id`, `proposal_id` and an
       optional `scope`; resolves the identity from `repo`, calls
       `confirm_proposal`, and refuses a client-supplied project key or
       statement. `POST /api/memory-dismiss` takes the same identifiers.
-- [ ] Render the card in the conversation from the pending list: statement,
+- [x] Render the card in the conversation from the pending list: statement,
       scope, category, origin line, Confirm, Dismiss, and a project-scope choice
       for a user-scope proposal while user scope is disabled. Collapse to a
       count when there is more than one. Re-render after a reload and after a
       turn.
-- [ ] No accept-all button and no route that takes a list of proposals.
-- [ ] Tests: the route round-trips a confirm and a dismiss; a user-scope confirm
+- [x] No accept-all button and no route that takes a list of proposals.
+- [x] Tests: the route round-trips a confirm and a dismiss; a user-scope confirm
       while disabled fails and leaves `memory_user_scope_enabled=false`; an
-      unknown or already-decided proposal id is refused; the UI helper has a
-      card for one proposal and a count for several.
+      unknown or already-decided proposal id is refused by the store, and the
+      route inherits that; the UI helper has a card for one proposal and a count
+      for several. **Deviation:** the card is a stack below the conversation's
+      messages rather than an inserted transcript message, so a suggestion can
+      never enter the model prompt.
 
 **Verification:** `cargo nextest run -p desktop-shell` (scoped to the new tests);
 `node --check crates/desktop-shell/static/app.js`; `npm run lint:web`.

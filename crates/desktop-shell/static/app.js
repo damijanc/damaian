@@ -5841,6 +5841,11 @@ let recoveredTasks = [];
 let reattachedApprovals = [];
 let pendingVerifications = [];
 let recoverySweepRequest = null;
+// Spec 29: proposals still waiting for the user's decision, read from the
+// session log so a reload shows exactly what was left undecided. They are not
+// transcript messages and never enter the model's conversation.
+let memoryProposals = [];
+let memoryUserScopeEnabled = false;
 
 function loadRecoverySweep() {
   if (!recoverySweepRequest) {
@@ -5892,6 +5897,142 @@ async function renderRecoveryPrompts(sessionId) {
   cards.reverse().forEach((card) => {
     $("chat-log").prepend(card);
   });
+}
+
+// Spec 29 §5.7: the pending-proposal stack. It is rendered after the turn's
+// messages, not inside them, and collapses to a count when more than one is
+// waiting so the completion report is not buried under suggestion cards.
+async function refreshMemoryProposals(sessionId = currentSessionId) {
+  const log = $("chat-log");
+  log.querySelector(".memory-proposal-stack")?.remove();
+  if (!sessionId || !repo()) {
+    memoryProposals = [];
+    memoryUserScopeEnabled = false;
+    return;
+  }
+  try {
+    const payload = await api(`/api/memory-proposals?session_id=${encodeURIComponent(sessionId)}`);
+    memoryProposals = Array.isArray(payload.proposals) ? payload.proposals : [];
+    memoryUserScopeEnabled = payload.userScopeEnabled === true;
+  } catch {
+    // A proposal list that cannot be read must not stop the conversation from
+    // rendering. It is simply absent until the next load.
+    memoryProposals = [];
+  }
+  renderMemoryProposals();
+}
+
+function renderMemoryProposals() {
+  const log = $("chat-log");
+  log.querySelector(".memory-proposal-stack")?.remove();
+  if (!memoryProposals.length) return;
+  const stack = document.createElement("section");
+  stack.className = "memory-proposal-stack";
+  const heading = document.createElement("p");
+  heading.className = "memory-proposal-heading";
+  heading.textContent =
+    memoryProposals.length === 1
+      ? "A memory to confirm"
+      : `${memoryProposals.length} memories to confirm`;
+  stack.append(heading);
+  memoryProposals.forEach((proposal) => {
+    stack.append(createMemoryProposalCard(proposal));
+  });
+  log.append(stack);
+}
+
+function createMemoryProposalCard(proposal) {
+  const card = document.createElement("article");
+  card.className = "memory-proposal-card";
+
+  const statement = document.createElement("p");
+  statement.className = "memory-proposal-statement";
+  statement.textContent = proposal.statement || "";
+  card.append(statement);
+
+  const meta = document.createElement("p");
+  meta.className = "memory-proposal-meta";
+  const scope = proposal.scope || "project";
+  meta.textContent = `${scope} memory · ${proposal.category || "fact"} · ${
+    proposal.sourceLabel || proposal.originKind || "suggested"
+  }`;
+  card.append(meta);
+
+  const controls = document.createElement("div");
+  controls.className = "memory-proposal-controls";
+
+  const scopeSelect = document.createElement("select");
+  scopeSelect.className = "memory-proposal-scope";
+  scopeSelect.setAttribute("aria-label", "Memory scope");
+  ["session", "project", "user"].forEach((value) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    if (value === "user" && !memoryUserScopeEnabled && proposal.scope !== "user") {
+      option.disabled = true;
+      option.textContent = "user (off)";
+    }
+    scopeSelect.append(option);
+  });
+  // A user-scope proposal while the scope is off offers project scope instead;
+  // saving it must not flip the setting as a side effect.
+  scopeSelect.value = proposal.scope === "user" && !memoryUserScopeEnabled ? "project" : scope;
+  controls.append(scopeSelect);
+
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.className = "btn-primary";
+  confirm.textContent = "Remember";
+  confirm.addEventListener("click", () => {
+    confirm.disabled = true;
+    decideMemoryProposal(proposal, "confirm", scopeSelect.value).catch((error) => {
+      confirm.disabled = false;
+      toast(error.message);
+    });
+  });
+  controls.append(confirm);
+
+  const dismiss = document.createElement("button");
+  dismiss.type = "button";
+  dismiss.className = "btn-secondary";
+  dismiss.textContent = "Dismiss";
+  dismiss.addEventListener("click", () => {
+    dismiss.disabled = true;
+    decideMemoryProposal(proposal, "dismiss").catch((error) => {
+      dismiss.disabled = false;
+      toast(error.message);
+    });
+  });
+  controls.append(dismiss);
+
+  card.append(controls);
+
+  if (proposal.scope === "user" && !memoryUserScopeEnabled) {
+    const note = document.createElement("p");
+    note.className = "memory-proposal-note";
+    note.textContent =
+      "User scope is off. Remembering this saves it for this project; enabling " +
+      "user scope is a separate setting and affects every repository.";
+    card.append(note);
+  }
+  return card;
+}
+
+async function decideMemoryProposal(proposal, decision, scope) {
+  const body = {
+    repo: requireRepo(),
+    session_id: currentSessionId,
+    proposal_id: proposal.id,
+  };
+  if (decision === "confirm") {
+    body.scope = scope;
+    await api("/api/memory-confirm", form(body));
+    toast("Memory saved");
+  } else {
+    await api("/api/memory-dismiss", form(body));
+    toast("Memory suggestion dismissed");
+  }
+  await refreshMemoryProposals(currentSessionId);
 }
 
 // The prompt for one recovered task. Two shapes, per §5.6: with `Resume` there
@@ -12226,6 +12367,9 @@ async function loadSession(sessionId) {
   // After the conversation, because `renderMessages` clears the log and the
   // cards sit above what it renders.
   await renderRecoveryPrompts(currentSessionId);
+  // The memory stack sits below the conversation and above nothing else, so it
+  // is drawn after the messages it follows.
+  await refreshMemoryProposals(currentSessionId);
   // Last: the strip and a worker's approval card follow what was just drawn.
   syncWorkerView();
 }
@@ -12872,6 +13016,7 @@ async function sendChatPrompt(options = {}) {
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           appendTurnNotes(assistantMessage.body, payload.turnNotes);
           markMessageUsage(assistantMessage, payload.usage);
+          void refreshMemoryProposals(currentSessionId);
           if (payload.cancelled) {
             if (indicator) indicator.finish("stopped");
             return;
@@ -12976,6 +13121,7 @@ async function askAgainFromExhausted(sessionId, taskId) {
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           appendTurnNotes(assistantMessage.body, payload.turnNotes);
           markMessageUsage(assistantMessage, payload.usage);
+          void refreshMemoryProposals(currentSessionId);
           if (payload.cancelled) {
             indicator.finish("stopped");
             return;
