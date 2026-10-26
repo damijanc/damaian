@@ -198,6 +198,12 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             Reported("data_dir"),
         ),
         case(
+            "pause_for_context_review",
+            "",
+            "pause_for_context_review=true\n",
+            Reported("pause_for_context_review"),
+        ),
+        case(
             "allowed_roots",
             "allowed_roots=/Users/tester/code\n",
             "allowed_roots=/\n",
@@ -3676,6 +3682,51 @@ fn a_repository_cannot_set_the_conversation_auto_compact_off_switch_either_way()
             "a repository setting {value} must be reported as forbidden"
         );
     }
+}
+
+#[test]
+fn pause_for_context_review_is_off_by_default_and_user_only() {
+    assert!(!Config::default().pause_for_context_review);
+
+    let (user, _) = load("pause-review-user", "pause_for_context_review=true\n", "");
+    assert!(user.pause_for_context_review);
+
+    for value in ["true", "false"] {
+        let (config, report) = load(
+            "pause-review-repo",
+            "",
+            &format!("pause_for_context_review={value}\n"),
+        );
+        assert!(
+            !config.pause_for_context_review,
+            "a repository may not set the review pause either way"
+        );
+        assert!(
+            report.rejected_keys.iter().any(|rejected| {
+                rejected.key == "pause_for_context_review"
+                    && rejected.class == RepositoryKeyClass::Forbidden
+            }),
+            "a repository setting {value} must be reported as forbidden"
+        );
+    }
+
+    let overlay = ConfigOverlay {
+        pause_for_context_review: Some(true),
+        ..ConfigOverlay::default()
+    };
+    let (carried, refused) = split_profile_keys(overlay);
+    assert!(carried.pause_for_context_review.is_none());
+    assert!(
+        refused
+            .iter()
+            .any(|rejected| rejected.key == "pause_for_context_review"
+                && rejected.class == RepositoryKeyClass::Forbidden),
+        "{refused:?}"
+    );
+    assert_eq!(
+        workspace_engine::rule_label("pause_for_context_review").as_deref(),
+        Some("Pause before sending to review context")
+    );
 }
 
 #[test]

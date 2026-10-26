@@ -14,7 +14,7 @@ the resolved §7 open question in [`context.md`](context.md)
 | 2 · Session-scoped pins and restrictions | Done 2026-10-26 | `ContextPin` and the seven methods in `session.rs` append/replay `context_pin_added` / `context_pin_removed` / `context_pins_cleared` / `context_restriction_set` / `context_restriction_cleared`. Readers use `parsed_events` (a rewind does not clear the controls); pins match on `(path, range)`; an empty restriction is `Some([])`. **Deviation:** the five tests are inline in `session.rs` rather than the new integration file, because they need only a `SessionStore` and a temp dir; the integration file starts at Task 3. **Falsified:** dropping the `context_pin_removed` arm left the removed range in the list and the test failed. Scoped checks: fast five passed; scoped clippy passed; the filtered lib nextest run passed 7 tests. |
 | 3 · Manifest extensions and collection controls | Done 2026-10-26 | `ContextManifest` gained `conversationSummary` (from the #55 summary, measured redacted) and `symbolProvenance` (`total`/`languageServer`/`heuristic`, counted over the lines the renderer showed); `ExclusionReason` gained `UserRemoved`, `PathNotSelected`, `Missing`. `ContextRequest` gained `pinned`, `restriction` and `conversationSummary`; pins are collected through `add_file` (policy applies, a deleted pin is `Missing`), the restriction filters explicit/mention/search/project-rule/pin sources and exempts `AgentInstruction`. New `tests/context_inspector.rs` (13 tests at this point). **Falsified:** filtering instructions too made `a_restriction_does_not_remove_agent_instructions` fail. Scoped: fast five passed, scoped clippy passed, `context_inspector` 13/13, the five affected suites (context_assembly, prompt_cache, hooks, repository_map, symbol_index) 277 passed / 5 skipped. |
 | 4 · `PreparedContext` and removal | Done 2026-10-26 | `PreparedContext` (`from_plan`/`into_plan`/`files`/`sections`) and `remove_optional`/`remove_summary` landed with Task 3's commit; this task added `removing_by_index_twice_uses_the_new_indices`. `Required` is refused before any mutation; category use, `items`, `total_tokens` and `included` are recomputed, `allocated` is left alone. **Falsified:** moving the `Required` check after the removal made the test see one fewer item and fail. Scoped: `context_inspector` 14/14, scoped clippy passed. |
-| 5 · `pause_for_context_review` config | Not started | |
+| 5 · `pause_for_context_review` config | Done 2026-10-26 | `Config.pause_for_context_review` (default `false`) and its `ConfigOverlay` field are classified `Capability`, applied through `scoped(..., forbidden, ...)`, printed by both `to_policy_text` functions, labelled in `effective_policy`, and refused by `split_profile_keys`. Added a `weakening_cases` entry and `pause_for_context_review_is_off_by_default_and_user_only`. Scoped: fast five passed, scoped clippy passed, `permission_profiles` 79 passed / 1 skipped. |
 | 6 · The pre-send pause and send gate | Not started | |
 | 7 · Post-send record and past turns | Not started | |
 | 8 · Shell routes, JSON and SSE | Not started | |
@@ -473,15 +473,15 @@ flat file; `docs/specs/README.md`.
 **Files:** `config.rs`, `profile.rs`, `effective_policy.rs`,
 `tests/permission_profiles.rs`.
 
-- [ ] **Step 1: Write the failing tests** in `tests/permission_profiles.rs`:
+- [x] **Step 1: Write the failing tests** in `tests/permission_profiles.rs`:
   - `pause_for_context_review_is_off_by_default_and_user_only`: default
     `Config` is false; a user overlay setting `true` applies; a repository
     overlay in either direction is `Forbidden` and the default holds; a profile
     overlay is refused by `split_profile_keys` with class `forbidden`.
   - Add the key to `conversation_keys_have_human_names_and_capability_kinds`
     (or a sibling) asserting kind `Capability` and a `rule_label`.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Implement.**
   - `Config.pause_for_context_review: bool` with a doc comment saying why it is
     user-only: it decides whether every turn waits for a human, which is neither
     a restriction nor a repository's business.
@@ -492,10 +492,10 @@ flat file; `docs/specs/README.md`.
     `to_policy_text` (always printed, so an off value is visible);
     `rule_label`; `split_profile_keys`'s forbidden list.
   - Do not add a `context_budget.*` key; the restriction is session state.
-- [ ] **Step 4: Falsify.** Remove the key from `split_profile_keys` → the
+- [x] **Step 4: Falsify.** Remove the key from `split_profile_keys` → the
   agreement test fails. Remove it from the exhaustive destructure → the crate
   does not compile, which is the guard. Restore.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -503,7 +503,7 @@ flat file; `docs/specs/README.md`.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test permission_profiles
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit.
+- [x] **Step 6: Update the Progress row** and commit.
   Subject: `Add the pause-before-send context setting`.
 
 ---
