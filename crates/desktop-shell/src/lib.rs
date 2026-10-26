@@ -15012,12 +15012,29 @@ mod memory_route_tests {
     }
 
     /// The confirm route takes an id and re-reads the stored proposal; a
-    /// client-supplied statement has nowhere to go. This is the API shape, not
-    /// a runtime check the route could forget.
+    /// client-supplied statement or project key has nowhere to go. This is the
+    /// API shape, not a runtime check the route could forget.
     #[test]
-    fn the_confirm_route_has_no_statement_field() {
+    fn the_confirm_route_has_no_statement_or_project_key_field() {
         let source = include_str!("lib.rs");
-        assert!(source.contains("fn handle_memory_confirm"));
-        assert!(!source.contains("statement = required_form(&form, \\\"statement\\\")"));
+        let handler = source
+            .split("fn handle_memory_confirm")
+            .nth(1)
+            .and_then(|rest| rest.split("fn handle_memory_dismiss").next())
+            .expect("the confirm handler");
+        assert!(!handler.contains("required_form(&form, \"statement\")"));
+        assert!(!handler.contains("required_form(&form, \"project_key\")"));
+    }
+
+    /// Spec 29 §5.4: consent is one proposal at a time. There is no route that
+    /// accepts a list and no accept-all label in the UI.
+    #[test]
+    fn there_is_no_bulk_confirmation_route_or_button() {
+        let (port, token) = serve();
+        let refused = post(port, &token, "/api/memory-confirm-all", &[("repo", "/tmp")]);
+        assert!(refused.starts_with("HTTP/1.1 404"), "{refused}");
+        let app = include_str!("../static/app.js").to_lowercase();
+        assert!(!app.contains("accept all"));
+        assert!(!app.contains("accept-all"));
     }
 }
