@@ -287,3 +287,416 @@ fn a_command_decision_is_recorded_in_the_session_log() {
     assert_eq!(approvals[0].decision, "approved");
     assert_eq!(approvals[0].subject.as_deref(), Some("cargo test"));
 }
+
+// ---------------------------------------------------------------------------
+// The compaction engine (Task 5)
+// ---------------------------------------------------------------------------
+
+use workspace_engine::plan::{PlanStep, StepStatus, TaskPlan};
+use workspace_engine::verification::{CheckId, CheckOutcome, VerificationEvent};
+use workspace_engine::{
+    CancelToken, ChatTurnResult, ClientError, Config, MockModelAdapter, ModelAdapter, ModelRequest,
+    ModelRun, PatchFileDecision, Session, Task, TurnProgress, TurnSink, WorkspaceEngine,
+};
+
+fn temp_repo(name: &str) -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should work")
+        .as_nanos();
+    let repo = std::env::temp_dir().join(format!(
+        "damaian-compaction-engine-{name}-{now}-{}",
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(repo.join("src")).expect("repository should be created");
+    fs::write(repo.join("src/lib.rs"), "pub fn one() {}\n").expect("a file");
+    repo
+}
+
+/// A window of 1% of the default 16,000-token budget, so a few seeded turns
+/// fall outside it. Automatic compaction is the caller's choice.
+fn engine(repo: &Path, auto: bool) -> WorkspaceEngine {
+    let config = Config {
+        data_dir: repo.join(".damaian"),
+        conversation_auto_compact: auto,
+        conversation_window_share: 100,
+        enable_index_watcher: false,
+        ..Config::default()
+    };
+    WorkspaceEngine::new(config)
+}
+
+fn seed_session(engine: &WorkspaceEngine, repo: &Path, name: &str) -> (Session, Task) {
+    let repository_id = engine
+        .indexer
+        .repository_id_for_path(repo)
+        .expect("repository id");
+    let session = engine
+        .session_store
+        .create_session(&repository_id, name)
+        .unwrap();
+    let task = engine
+        .session_store
+        .create_task(&session.id, "do the work", "openai", "gpt-4.1")
+        .unwrap();
+    (session, task)
+}
+
+fn seed_long_conversation(
+    engine: &WorkspaceEngine,
+    session: &Session,
+    task: &Task,
+    objective: &str,
+) {
+    let messages = (0..30)
+        .map(|index| {
+            let role = if index % 2 == 0 { "user" } else { "assistant" };
+            let content = if index == 0 {
+                objective.to_string()
+            } else {
+                format!("{role} message {index} {}", "x".repeat(180))
+            };
+            (role, content)
+        })
+        .collect::<Vec<_>>();
+    for (role, content) in messages {
+        engine
+            .session_store
+            .append_message(&session.id, Some(&task.id), role, &content)
+            .unwrap();
+    }
+}
+
+fn seed_facts(engine: &WorkspaceEngine, session: &Session, task: &Task) {
+    let mut plan = TaskPlan::new(&task.id, 1);
+    plan.steps.push(PlanStep {
+        id: "step_1".to_string(),
+        title: "Add the parser".to_string(),
+        detail: None,
+        status: StepStatus::Completed,
+        depends_on: Vec::new(),
+        started_at_ms: Some(1),
+        completed_at_ms: Some(2),
+        evidence: Vec::new(),
+    });
+    engine.session_store.create_plan(task, &plan).unwrap();
+    engine
+        .session_store
+        .record_conversation_approval(
+            &session.id,
+            "command",
+            "cmd_1",
+            "approved",
+            Some("cargo test"),
+        )
+        .unwrap();
+    engine
+        .session_store
+        .append_patch_file_decision(
+            &session.id,
+            &PatchFileDecision {
+                task_id: task.id.clone(),
+                patch_id: "patch_1".to_string(),
+                paths: vec!["src/lib.rs".to_string()],
+                applied: true,
+            },
+        )
+        .unwrap();
+    engine
+        .session_store
+        .append_verification_event(
+            &session.id,
+            &VerificationEvent::Check {
+                task_id: task.id.clone(),
+                check: CheckId::new("", "cargo test"),
+                outcome: CheckOutcome::Ran {
+                    exit_code: Some(0),
+                    marker_id: "marker_1".to_string(),
+                },
+                file_hashes: std::collections::BTreeMap::new(),
+            },
+        )
+        .unwrap();
+}
+
+fn cancel() -> CancelToken {
+    CancelToken::new()
+}
+
+#[test]
+fn compaction_with_the_model_stubbed_out_still_has_every_fact() {
+    let repo = temp_repo("facts");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Facts");
+    let objective = "Keep the 2021 edition and do not touch the public API.";
+    // Facts are recorded during the span, so they precede the messages they
+    // describe in this fixture.
+    seed_facts(&engine, &session, &task);
+    seed_long_conversation(&engine, &session, &task, objective);
+
+    // The reply is not a narrative: the model half contributes nothing.
+    let mut adapter = MockModelAdapter::new("The agent worked on the parser.");
+    let outcome = engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut adapter, &cancel())
+        .unwrap();
+    let summary = outcome.summary().expect("compacted");
+
+    assert_eq!(summary.objective, objective, "quoted, not paraphrased");
+    assert_eq!(summary.files_changed, vec!["src/lib.rs"]);
+    assert_eq!(summary.plan_steps.len(), 1);
+    assert_eq!(summary.plan_steps[0].title, "Add the parser");
+    assert!(
+        summary
+            .approvals
+            .iter()
+            .any(|approval| approval.kind == "command"
+                && approval.id == "cmd_1"
+                && approval.decision == "approved")
+    );
+    assert!(summary.validation.iter().any(|validation| {
+        validation.label == "cargo test (repository root)" && validation.outcome == "passed"
+    }));
+    assert!(summary.is_facts_only(), "the model wrote no narrative");
+    assert!(
+        summary.message_count > 0,
+        "the summary covers messages, not a token count"
+    );
+    assert!(
+        summary.model_run_id.is_some(),
+        "the call is still accounted"
+    );
+}
+
+struct FailingAdapter;
+
+impl ModelAdapter for FailingAdapter {
+    fn stream_response(
+        &mut self,
+        _request: &ModelRequest,
+        _cancel: &CancelToken,
+        _on_token: &mut dyn FnMut(&str),
+        _on_wait: &mut dyn FnMut(u64),
+    ) -> workspace_engine::Result<ModelRun> {
+        Err(ClientError::Provider(
+            workspace_engine::ProviderRefusal::Unknown,
+            "provider refused the call".to_string(),
+        ))
+    }
+}
+
+#[test]
+fn a_failed_summarisation_call_produces_a_facts_only_summary_and_no_turn_error() {
+    let repo = temp_repo("failure");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Failure");
+    seed_facts(&engine, &session, &task);
+    seed_long_conversation(&engine, &session, &task, "Keep the public API stable.");
+
+    let mut adapter = FailingAdapter;
+    let outcome = engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut adapter, &cancel())
+        .unwrap();
+    let summary = outcome.summary().expect("a facts-only summary is taken");
+    assert!(summary.is_facts_only());
+    assert!(summary.constraints.is_empty());
+    assert_eq!(summary.files_changed, vec!["src/lib.rs"]);
+    assert_eq!(
+        engine
+            .session_store
+            .read_conversation(&session.id)
+            .unwrap()
+            .summary
+            .as_ref()
+            .unwrap()
+            .id,
+        summary.id
+    );
+
+    // The following turn still runs on the same engine.
+    let mut adapter = MockModelAdapter::new("Done.");
+    let result = ask(
+        &engine,
+        &repo,
+        "What next?",
+        Some(&session.id),
+        &mut adapter,
+    );
+    assert_eq!(result.response, "Done.");
+}
+
+#[test]
+fn a_compaction_that_would_cross_a_pending_approval_is_a_no_op() {
+    let repo = temp_repo("pending-engine");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Pending");
+    engine
+        .session_store
+        .append_message(&session.id, Some(&task.id), "user", "first")
+        .unwrap();
+    engine
+        .session_store
+        .append_message(&session.id, Some(&task.id), "assistant", "working")
+        .unwrap();
+    engine
+        .session_store
+        .await_approval(
+            &task,
+            &PendingApprovalRef {
+                kind: "command".to_string(),
+                proposal_id: "proposal_1".to_string(),
+            },
+        )
+        .unwrap();
+
+    let mut adapter = MockModelAdapter::new("{}");
+    let outcome = engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut adapter, &cancel())
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        workspace_engine::compaction::CompactionOutcome::NothingToCompact
+    ));
+    assert!(
+        engine
+            .session_store
+            .read_conversation_compactions(&session.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        adapter.requests.is_empty(),
+        "a refused span must not spend a model call"
+    );
+}
+
+#[test]
+fn the_summarisation_call_is_in_session_totals_but_not_a_turn_ceiling() {
+    let repo = temp_repo("accounting");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Accounting");
+    seed_long_conversation(&engine, &session, &task, "Keep it.");
+    let mut adapter = MockModelAdapter::new(
+        r#"{"constraints":["keep it"],"decisions":[],"failed_approaches":[],"uncertainty":[]}"#,
+    );
+    let outcome = engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut adapter, &cancel())
+        .unwrap();
+    let summary = outcome.summary().expect("compacted");
+
+    let totals = engine.session_store.read_task_usage(&session.id).unwrap();
+    assert!(
+        totals.keys().any(|id| id.starts_with("compaction_")),
+        "the call appears in the session's totals"
+    );
+    assert!(
+        !totals.contains_key(&task.id),
+        "the summarisation call is not charged to the turn"
+    );
+    assert!(summary.model_run_id.is_some());
+}
+
+#[test]
+fn automatic_compaction_runs_before_the_request_is_assembled() {
+    let repo = temp_repo("automatic");
+    let engine = engine(&repo, true);
+    let (session, task) = seed_session(&engine, &repo, "Automatic");
+    seed_long_conversation(&engine, &session, &task, "Do not touch the public API.");
+
+    let mut adapter = MockModelAdapter::new_sequence(vec![
+        r#"{"constraints":["do not touch the public API"],"decisions":[],"failed_approaches":[],"uncertainty":[]}"#.to_string(),
+        "Done.".to_string(),
+    ]);
+    let result = ask(
+        &engine,
+        &repo,
+        "What next?",
+        Some(&session.id),
+        &mut adapter,
+    );
+    assert_eq!(result.response, "Done.");
+
+    assert_eq!(
+        engine
+            .session_store
+            .read_conversation_compactions(&session.id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        adapter.requests[0].messages[0]
+            .content
+            .contains("You are recording what happened"),
+        "the first call is the summarisation"
+    );
+    assert!(
+        adapter.requests[1].messages[1]
+            .content
+            .contains("--- begin prior conversation summary"),
+        "the turn's request carries the summary"
+    );
+    assert!(
+        adapter.requests[1].messages[1]
+            .content
+            .contains("What next?"),
+        "the current request is never compacted away"
+    );
+}
+
+fn ask(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    prompt: &str,
+    session_id: Option<&str>,
+    adapter: &mut MockModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .ask_with_session(repo, prompt, &[], session_id, adapter, &mut sink)
+        .expect("the turn should run")
+}
+
+#[test]
+fn auto_compaction_makes_no_model_call_when_switched_off() {
+    let repo = temp_repo("off");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Off");
+    seed_long_conversation(&engine, &session, &task, "Do not touch the public API.");
+
+    let mut adapter = MockModelAdapter::new("Done.");
+    let result = ask(
+        &engine,
+        &repo,
+        "What next?",
+        Some(&session.id),
+        &mut adapter,
+    );
+    assert_eq!(result.response, "Done.");
+    assert_eq!(adapter.requests.len(), 1, "only the turn's own call");
+    assert!(
+        !adapter.requests[0].messages[0]
+            .content
+            .contains("You are recording what happened"),
+        "no summarisation call was made"
+    );
+    assert!(
+        engine
+            .session_store
+            .read_conversation_compactions(&session.id)
+            .unwrap()
+            .is_empty()
+    );
+}

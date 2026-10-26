@@ -20,6 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::context_manager::TokenEstimate;
 use crate::plan::StepStatus;
 use crate::secret_scanner::SecretScanner;
 
@@ -418,13 +419,90 @@ pub fn transcript_for_summary(messages: &[(String, String)]) -> String {
 /// The objective is quoted, so it is the first user message of the covered span
 /// byte for byte, bounded but never paraphrased.
 pub fn bound_objective(first_user_message: &str) -> String {
-    let trimmed = first_user_message.trim();
-    if trimmed.chars().count() <= OBJECTIVE_MAX_CHARS {
-        return trimmed.to_string();
+    if first_user_message.chars().count() <= OBJECTIVE_MAX_CHARS {
+        return first_user_message.to_string();
     }
-    let mut bounded: String = trimmed.chars().take(OBJECTIVE_MAX_CHARS).collect();
+    let mut bounded: String = first_user_message
+        .chars()
+        .take(OBJECTIVE_MAX_CHARS)
+        .collect();
     bounded.push('…');
     bounded
+}
+
+/// What one compaction attempt came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionOutcome {
+    Compacted(Box<ConversationSummary>),
+    /// Nothing outside the window, or nothing with an objective to quote.
+    NothingToCompact,
+    /// The facts or the log write failed. The turn continues; the reason is
+    /// audited by the caller.
+    Failed(String),
+}
+
+impl CompactionOutcome {
+    pub fn summary(&self) -> Option<&ConversationSummary> {
+        match self {
+            Self::Compacted(summary) => Some(summary.as_ref()),
+            Self::NothingToCompact | Self::Failed(_) => None,
+        }
+    }
+}
+
+/// The estimated size of the conversation block a request would carry: the
+/// summary's rendering plus every message that is actually sent.
+pub fn conversation_tokens(view: &ConversationView) -> usize {
+    let summary = view
+        .summary
+        .as_ref()
+        .map(|summary| TokenEstimate::Prose.tokens(&summary.render_for_model()))
+        .unwrap_or(0);
+    let messages = view
+        .messages
+        .iter()
+        .filter(|message| message.kind.as_deref() != Some("plan_reminder"))
+        .map(|message| TokenEstimate::Prose.tokens(&message.content))
+        .sum::<usize>();
+    summary + messages
+}
+
+/// The highest event `seq` that belongs outside the recency window, or `None`
+/// when the whole conversation fits.
+///
+/// The newest message is always kept, even when it alone exceeds the budget:
+/// it is the user's current request, and a compaction that swallowed it would
+/// answer a question nobody could see. Messages at or below
+/// `previous_through` are already represented by a summary and are ignored.
+pub fn window_start(
+    messages: &[(u64, crate::session::ChatMessage)],
+    previous_through: u64,
+    budget_tokens: usize,
+) -> Option<u64> {
+    let candidates: Vec<&(u64, crate::session::ChatMessage)> = messages
+        .iter()
+        .filter(|(seq, message)| {
+            *seq > previous_through && message.kind.as_deref() != Some("plan_reminder")
+        })
+        .collect();
+    if candidates.len() <= 1 {
+        return None;
+    }
+    let newest = candidates.len() - 1;
+    let mut used = 0usize;
+    let mut keep_from = candidates.len();
+    for (index, (_, message)) in candidates.iter().enumerate().rev() {
+        let cost = TokenEstimate::Prose.tokens(&message.content);
+        if index != newest && used + cost > budget_tokens {
+            break;
+        }
+        used += cost;
+        keep_from = index;
+    }
+    if keep_from == 0 {
+        return None;
+    }
+    Some(candidates[keep_from - 1].0)
 }
 
 /// Everything a summary needs that the engine can read for itself.
@@ -847,7 +925,7 @@ mod tests {
 
     #[test]
     fn the_objective_is_bounded_but_not_paraphrased() {
-        assert_eq!(bound_objective("  keep it  "), "keep it");
+        assert_eq!(bound_objective("  keep  it\n"), "  keep  it\n");
         let long = "x".repeat(OBJECTIVE_MAX_CHARS + 10);
         let bounded = bound_objective(&long);
         assert!(bounded.starts_with(&"x".repeat(OBJECTIVE_MAX_CHARS)));

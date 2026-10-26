@@ -15,7 +15,7 @@ disagree.
 | 2 · Summary types and rendering | Done 2026-10-26 | New `compaction.rs`: `ConversationSummary` and its digests, `format_version`, delimited model rendering with quoted narrative, the summarisation prompt and a JSON narrative parser. Ten unit tests pin the markers, the quoting, the data-not-instruction sentence, the version, redaction/bounding, and that a malformed reply yields no narrative. Scoped `cargo nextest -p workspace-engine --lib compaction` passed (10 tests) and crate clippy was clean. |
 | 3 · Session log and the two readers | Done 2026-10-26 | `conversation_compacted` append/read; `read_conversation` returns the newest active summary plus only messages after `through_seq`; `read_messages` unchanged; `compaction_limit` clamps to pending approvals, pending questions and dangling actions; command decisions append `conversation_approval_recorded`; `facts_for_span` reads objective/files/steps/approvals/validation. Tests: 8 in `tests/compaction.rs` (append-only, model view, rewind, compounding, unknown version, two guards, approval event) and 2 fact unit tests. Scoped nextest and crate clippy passed. |
 | 4 · Config keys | Done 2026-10-26 | `conversation_auto_compact` (default true, Forbidden to repository and profile) and `conversation_window_share` (decimal → basis points, default 0.25, restrict-only lower-wins). Wired through `Config`, `ConfigOverlay`, parse, `apply_overlay_scoped`, both policy-text writers, `overlay_field_kinds`, `split_profile_keys`, `equals_base_limit` and `rule_label`. Tests in `permission_profiles.rs` (repository refusal both values, lower applies, profile split, labels/kinds) and the 78-test suite passed; `repository_config_trust` (52) too. Fast five passed after `cargo fmt`. |
-| 5 · The compaction engine | Not started | |
+| 5 · The compaction engine | Done 2026-10-26 | `ChatOrchestrator::compact_conversation` + `conversation_window_tokens` + the automatic trigger before the current user message is appended. Facts read from the log (objective, patch decisions, plan steps, approvals incl. the new command event, verification checks, open findings); only narrative is parsed from the call. Failure produces a facts-only summary; cancel appends nothing; a log/append failure is audited and never fails the turn. Usage is recorded under `compaction_<id>` with `conversation_compaction`, so it is in session totals and in no turn ceiling. Tests (6 new in `tests/compaction.rs`): stubbed model still has every fact, byte-identical objective, failure → facts-only + later turn runs, pending approval is a no-op with no model call, accounting, auto-off makes no call, auto runs before assembly and never swallows the current request. Existing `context_assembly`/`foundation`/`plan_turn`/`turn_notes` (291) passed after moving compaction before the append. Crate clippy and the fast five passed. |
 | 6 · The prompt window | Not started | |
 | 7 · Shell and UI | Not started | |
 | 8 · Eval harness | Not started | |
@@ -327,7 +327,7 @@ beside this track while they are in flight.
 **Files:** `chat.rs`, `compaction.rs`, `session.rs` (only the approval event
 added in Task 3), `tests/compaction.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `compaction_with_the_model_stubbed_out_still_has_every_fact` — a session
     with a patch decision, a two-step plan, a plan approval, a command decision
     and a verification check; call compaction with a mock adapter whose reply
@@ -350,8 +350,8 @@ added in Task 3), `tests/compaction.rs`.
   - `automatic_compaction_runs_before_the_request_is_assembled` — a projected
     conversation above the window produces one compaction event before the
     first `model_request_prepared`.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Implement.**
   - `CompactionOutcome { Compacted(ConversationSummary), NothingToCompact,
     Failed(String) }`.
   - `ChatOrchestrator::compact_conversation` reads the conversation, computes
@@ -367,14 +367,14 @@ added in Task 3), `tests/compaction.rs`.
     for compaction.
   - Read the model view (`read_conversation`) instead of `prior_messages` for
     the request.
-- [ ] **Step 4: Falsify.** Let the model write `files_changed` → the facts test
+- [x] **Step 4: Falsify.** Let the model write `files_changed` → the facts test
   fails; return `Err` from compaction on model failure → the turn-failure test
   fails; account against the turn's task id → the ceiling test fails; ignore
   the pending approval → the guard test fails; call compaction inside the loop
   → the ordering test fails.
-- [ ] **Step 5: Scoped checks.** `cargo nextest run -p workspace-engine --test
+- [x] **Step 5: Scoped checks.** `cargo nextest run -p workspace-engine --test
   compaction`, clippy, fast five.
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Compact a long conversation at the turn boundary`.
 
 ## Task 6: The prompt window

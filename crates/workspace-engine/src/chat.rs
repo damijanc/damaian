@@ -12,6 +12,7 @@ use crate::command_policy::{
 };
 use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
+use crate::compaction::ConversationSummary;
 use crate::config::{Config, CostEstimate, McpTransport};
 use crate::context_manager::{ContextManager, ContextPlan, ContextRequest, PromptSectionName};
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
@@ -956,7 +957,7 @@ impl ChatOrchestrator {
         // context: `build_context_with_hooks` redacts it and charges it to the
         // turn's budget like every other item.
         let mut hook_context: Vec<(String, String)> = Vec::new();
-        let (session, prior_messages) = if let Some(session_id) = session_id {
+        let session = if let Some(session_id) = session_id {
             let Some(session) = self.session_store.read_session(session_id)? else {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown session: {session_id}"
@@ -967,8 +968,7 @@ impl ChatOrchestrator {
                     "Session belongs to a different repository".to_string(),
                 ));
             }
-            let messages = self.session_store.read_messages(&session.id)?;
-            (session, messages)
+            session
         } else {
             // Spec 32 `context.md` §3: the event runs before the session
             // exists, so the envelope carries no session id and there is no
@@ -994,7 +994,7 @@ impl ChatOrchestrator {
             for finding in &session_start_findings {
                 let _ = self.session_store.record_finding(&session.id, finding);
             }
-            (session, Vec::new())
+            session
         };
         // Captured before the turn's own events, so rewinding this checkpoint
         // takes the user's prompt with it rather than leaving a question the
@@ -1032,6 +1032,49 @@ impl ChatOrchestrator {
         // carried. Read from the active log, so a rewind carries the notes of
         // the turn before the rewound one with no second ordering rule.
         let turn_notes = self.carry_notes_from_the_previous_turn(&session.id, &task)?;
+        // Spec 55 §5.5: compaction runs at the turn boundary, before the request
+        // is assembled and never between tool rounds. It runs *before* this
+        // turn's user message is appended, so the current request cannot be
+        // inside the summarised span even if it alone exceeds the window. A
+        // failure never fails the turn; it is audited and the request uses the
+        // recency window instead.
+        let mut conversation = self.session_store.read_conversation(&session.id)?;
+        if self.config.conversation_auto_compact
+            && crate::compaction::conversation_tokens(&conversation)
+                > self.conversation_window_tokens()
+        {
+            match self.compact_conversation(
+                repository_root,
+                &session.id,
+                model_adapter,
+                sink.cancel,
+            ) {
+                Ok(crate::compaction::CompactionOutcome::Compacted(_)) => {
+                    conversation = self.session_store.read_conversation(&session.id)?;
+                }
+                Ok(crate::compaction::CompactionOutcome::NothingToCompact) => {}
+                Ok(crate::compaction::CompactionOutcome::Failed(reason)) => {
+                    let _ = self.audit_log.record(
+                        "conversation_compaction_failed",
+                        &[
+                            ("actor", "system".to_string()),
+                            ("sessionId", session.id.clone()),
+                            ("reason", reason),
+                        ],
+                    );
+                }
+                Err(error) => {
+                    let _ = self.audit_log.record(
+                        "conversation_compaction_failed",
+                        &[
+                            ("actor", "system".to_string()),
+                            ("sessionId", session.id.clone()),
+                            ("reason", error.to_string()),
+                        ],
+                    );
+                }
+            }
+        }
         let user_message =
             self.session_store
                 .append_message(&session.id, Some(&task.id), "user", prompt)?;
@@ -1144,7 +1187,13 @@ impl ChatOrchestrator {
         context_fields.extend(context.manifest.audit_fields());
         self.audit_log
             .record("context_assembled", &context_fields)?;
-        let model_prompt = build_model_prompt(&context, &prior_messages, &self.scanner, None);
+        let model_prompt = build_model_prompt(
+            &context,
+            &conversation.messages,
+            conversation.summary.as_ref(),
+            &self.scanner,
+            None,
+        );
         let mode = self.session_store.session_mode(&session.id);
         // A worker is never invited to hand off further work (spec 57 §5.0).
         let offer_handoffs = self.config.enable_worker_sessions
@@ -2114,6 +2163,9 @@ impl ChatOrchestrator {
         ];
         fields.extend(context.manifest.audit_fields());
         self.audit_log.record("context_assembled", &fields)?;
+        // The repair continuation sees the same conversation the turn does,
+        // including any active summary (spec 55 §5.3).
+        let conversation = self.session_store.read_conversation(&session.id)?;
         let messages = vec![
             ModelMessage::system(system_prompt_for_session(
                 SessionMode::Code,
@@ -2121,7 +2173,13 @@ impl ChatOrchestrator {
                 false,
                 &self.config.shell,
             )),
-            ModelMessage::user(build_model_prompt(&context, &[], &self.scanner, None)),
+            ModelMessage::user(build_model_prompt(
+                &context,
+                &conversation.messages,
+                conversation.summary.as_ref(),
+                &self.scanner,
+                None,
+            )),
         ];
         // Notes carry across the continuation as they do for any new task
         // (spec 65 §5.5); the repair turn starts with no accrued step evidence
@@ -4011,6 +4069,210 @@ impl ChatOrchestrator {
             .map(|usage| usage.input_tokens + usage.output_tokens)
             .unwrap_or(0);
         Ok(Some((ceiling, spent)))
+    }
+
+    /// The conversation window in tokens: `conversation_window_share` of the
+    /// effective context budget (spec 55 §5.1). The same number is the
+    /// automatic threshold, so a compaction that triggers leaves a conversation
+    /// that fits (context.md D2).
+    pub fn conversation_window_tokens(&self) -> usize {
+        self.config.context_token_budget() * usize::from(self.config.conversation_window_share)
+            / 10_000
+    }
+
+    /// Summarises the conversation outside the recency window, appending one
+    /// `conversation_compacted` event (spec 55).
+    ///
+    /// Never fails a turn: a model failure produces a facts-only summary, and
+    /// only an unreadable log or a failed append returns `Err`, which the
+    /// turn-boundary caller treats as "compaction did not run". The
+    /// summarisation call is recorded against a synthetic task id so it appears
+    /// in the session's totals without reducing any turn's ceiling (§5.5).
+    pub fn compact_conversation(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        cancel: &CancelToken,
+    ) -> Result<crate::compaction::CompactionOutcome> {
+        if cancel.is_cancelled() {
+            return Ok(crate::compaction::CompactionOutcome::Failed(
+                "cancelled".to_string(),
+            ));
+        }
+        let view = self.session_store.read_conversation(session_id)?;
+        let previous_through = view
+            .summary
+            .as_ref()
+            .map(|summary| summary.through_seq)
+            .unwrap_or(0);
+        let messages = self.session_store.read_messages_with_seq(session_id)?;
+        let window = self.conversation_window_tokens();
+        let Some(outside) = crate::compaction::window_start(&messages, previous_through, window)
+        else {
+            return Ok(crate::compaction::CompactionOutcome::NothingToCompact);
+        };
+        // Requirement 5 and §5.4: never across a pending decision or an action
+        // whose outcome is not known.
+        let through_seq = outside.min(self.session_store.compaction_limit(session_id)?);
+        if through_seq <= previous_through {
+            return Ok(crate::compaction::CompactionOutcome::NothingToCompact);
+        }
+
+        let plans = self.session_store.read_session_plans(session_id)?;
+        let patch_decisions = self
+            .session_store
+            .read_all_patch_file_decisions(session_id)?;
+        let approvals = self
+            .session_store
+            .read_conversation_approvals_through(session_id, through_seq)?;
+        let verification = self
+            .session_store
+            .read_verification_events(session_id, &[])?;
+        let findings = self
+            .session_store
+            .read_findings(session_id, repository_root)?;
+        let Some(facts) = crate::compaction::facts_for_span(
+            crate::compaction::FactInputs {
+                messages: &messages,
+                plans: &plans,
+                patch_decisions: &patch_decisions,
+                approvals: &approvals,
+                verification: &verification,
+                findings: &findings,
+            },
+            through_seq,
+        ) else {
+            return Ok(crate::compaction::CompactionOutcome::NothingToCompact);
+        };
+
+        // Only the covered span is material. The previous summary travels
+        // separately as an input to the next one (proposal §5.3).
+        let transcript_messages: Vec<(String, String)> = messages
+            .iter()
+            .filter(|(seq, _)| *seq > previous_through && *seq <= through_seq)
+            .map(|(_, message)| (message.role.clone(), message.content.clone()))
+            .collect();
+        let transcript = crate::compaction::transcript_for_summary(&transcript_messages);
+        let prompt = crate::compaction::narrative_prompt(&transcript, view.summary.as_ref());
+        if cancel.is_cancelled() {
+            return Ok(crate::compaction::CompactionOutcome::Failed(
+                "cancelled".to_string(),
+            ));
+        }
+        let mut on_token = |_token: &str| {};
+        let mut on_wait = |_millis: u64| {};
+        let request = ModelRequest {
+            provider: self.config.model_provider.clone(),
+            model: self.config.model_name.clone(),
+            messages: vec![ModelMessage::user(prompt)],
+            temperature: None,
+            reasoning_level: None,
+            stream: false,
+            tools: None,
+            max_tokens: self
+                .config
+                .model_provider_config(&self.config.model_provider)
+                .and_then(|provider| provider.max_output_tokens),
+            request_usage: true,
+            emit_cache_breakpoints: false,
+        };
+        let run = model_adapter.stream_response(&request, cancel, &mut on_token, &mut on_wait);
+        if cancel.is_cancelled() {
+            return Ok(crate::compaction::CompactionOutcome::Failed(
+                "cancelled".to_string(),
+            ));
+        }
+        let narrative = match &run {
+            Ok(run) => {
+                crate::compaction::parse_narrative(&run.content, &self.scanner).unwrap_or_default()
+            }
+            Err(error) => {
+                let _ = self.audit_log.record(
+                    "conversation_compaction_narrative_failed",
+                    &[
+                        ("actor", "system".to_string()),
+                        ("sessionId", session_id.to_string()),
+                        ("reason", error.to_string()),
+                        ("throughSeq", through_seq.to_string()),
+                    ],
+                );
+                crate::compaction::Narrative::default()
+            }
+        };
+        let model_run_id = run.as_ref().ok().map(|run| run.run_id.clone());
+        let summary = crate::compaction::ConversationSummary {
+            id: create_id("summary"),
+            through_seq,
+            format_version: crate::compaction::SUMMARY_FORMAT_VERSION,
+            objective: facts.objective,
+            files_changed: facts.files_changed,
+            plan_steps: facts.plan_steps,
+            approvals: facts.approvals,
+            validation: facts.validation,
+            constraints: narrative.constraints,
+            decisions: narrative.decisions,
+            failed_approaches: narrative.failed_approaches,
+            uncertainty: narrative.uncertainty,
+            model_run_id: model_run_id.clone(),
+            message_count: facts.message_count,
+        };
+
+        if let Ok(run) = &run {
+            // A synthetic task id keeps the call in the session's totals while
+            // keeping it out of every turn's ceiling: the mechanism for
+            // continuing a long task must not make the ceiling arrive sooner
+            // (proposal §5.5).
+            let _ = self.session_store.record_task_usage_for_task_id(
+                session_id,
+                &format!("compaction_{}", summary.id),
+                &run.run_id,
+                None,
+                run.usage,
+                run.reported_cost,
+                Some("conversation_compaction"),
+            );
+        }
+        if let Err(error) = self
+            .session_store
+            .append_conversation_compaction(session_id, &summary)
+        {
+            return Ok(crate::compaction::CompactionOutcome::Failed(
+                error.to_string(),
+            ));
+        }
+        let usage = run.as_ref().ok().map(|run| run.usage);
+        self.audit_log.record(
+            "conversation_compacted",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("summaryId", summary.id.clone()),
+                ("throughSeq", through_seq.to_string()),
+                ("formatVersion", summary.format_version.to_string()),
+                ("messageCount", summary.message_count.to_string()),
+                (
+                    "modelRunId",
+                    model_run_id.clone().unwrap_or_else(|| "none".to_string()),
+                ),
+                ("factsOnly", summary.is_facts_only().to_string()),
+                (
+                    "inputTokens",
+                    usage
+                        .map(|usage| usage.input_tokens.to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                ),
+                (
+                    "outputTokens",
+                    usage
+                        .map(|usage| usage.output_tokens.to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                ),
+            ],
+        )?;
+        Ok(crate::compaction::CompactionOutcome::Compacted(Box::new(
+            summary,
+        )))
     }
 
     /// The reminder to send at a completion point, and how many steps are open,
@@ -8391,6 +8653,7 @@ fn command_envelope_paragraph_read_only(shell: &str) -> String {
 fn build_model_prompt(
     plan: &ContextPlan,
     prior_messages: &[ChatMessage],
+    summary: Option<&ConversationSummary>,
     scanner: &SecretScanner,
     command_context: Option<&str>,
 ) -> String {
@@ -8422,10 +8685,17 @@ fn build_model_prompt(
         .into_iter()
         .rev()
         .collect::<Vec<_>>();
-    if !recent_messages.is_empty() {
+    if summary.is_some() || !recent_messages.is_empty() {
         output.push('\n');
         output.push_str(PromptSectionName::RecentConversation.heading());
         output.push('\n');
+        // Spec 55 §5.6: the summary is delimited recorded data, inside the
+        // conversation block. It is never merged into the system prompt and
+        // never placed where repository instructions live.
+        if let Some(summary) = summary {
+            output.push_str(&summary.render_for_model());
+            output.push('\n');
+        }
         for message in recent_messages {
             output.push_str(&message.role);
             output.push_str(": ");
@@ -13379,6 +13649,7 @@ mod approval_prompt_wording_tests {
         let with_result = build_model_prompt(
             &plan,
             &[],
+            None,
             &SecretScanner::default(),
             Some("Command: pwd\n"),
         );
@@ -13446,6 +13717,7 @@ mod approval_prompt_wording_tests {
         let prompt = build_model_prompt(
             &plan,
             &[reminder, ordinary],
+            None,
             &SecretScanner::default(),
             None,
         );
