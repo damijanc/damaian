@@ -14,7 +14,7 @@ disagree.
 | 1 · Folder, records, links, status | In progress | Splitting the flat spec into a folder and rewriting the links. |
 | 2 · Summary types and rendering | Done 2026-10-26 | New `compaction.rs`: `ConversationSummary` and its digests, `format_version`, delimited model rendering with quoted narrative, the summarisation prompt and a JSON narrative parser. Ten unit tests pin the markers, the quoting, the data-not-instruction sentence, the version, redaction/bounding, and that a malformed reply yields no narrative. Scoped `cargo nextest -p workspace-engine --lib compaction` passed (10 tests) and crate clippy was clean. |
 | 3 · Session log and the two readers | Done 2026-10-26 | `conversation_compacted` append/read; `read_conversation` returns the newest active summary plus only messages after `through_seq`; `read_messages` unchanged; `compaction_limit` clamps to pending approvals, pending questions and dangling actions; command decisions append `conversation_approval_recorded`; `facts_for_span` reads objective/files/steps/approvals/validation. Tests: 8 in `tests/compaction.rs` (append-only, model view, rewind, compounding, unknown version, two guards, approval event) and 2 fact unit tests. Scoped nextest and crate clippy passed. |
-| 4 · Config keys | Not started | |
+| 4 · Config keys | Done 2026-10-26 | `conversation_auto_compact` (default true, Forbidden to repository and profile) and `conversation_window_share` (decimal → basis points, default 0.25, restrict-only lower-wins). Wired through `Config`, `ConfigOverlay`, parse, `apply_overlay_scoped`, both policy-text writers, `overlay_field_kinds`, `split_profile_keys`, `equals_base_limit` and `rule_label`. Tests in `permission_profiles.rs` (repository refusal both values, lower applies, profile split, labels/kinds) and the 78-test suite passed; `repository_config_trust` (52) too. Fast five passed after `cargo fmt`. |
 | 5 · The compaction engine | Not started | |
 | 6 · The prompt window | Not started | |
 | 7 · Shell and UI | Not started | |
@@ -291,7 +291,7 @@ beside this track while they are in flight.
 **Files:** `config.rs`, `profile.rs`, `effective_policy.rs`,
 `tests/permission_profiles.rs`, `tests/repository_config_trust.rs`.
 
-- [ ] **Step 1: Write failing tests.**
+- [x] **Step 1: Write failing tests.**
   - `conversation_auto_compact_defaults_to_true_and_a_repository_cannot_set_it`
     — a repository `conversation_auto_compact=false` is rejected as `forbidden`
     whichever value it carries;
@@ -301,8 +301,8 @@ beside this track while they are in flight.
   - `a_profile_may_lower_the_window_and_cannot_carry_auto_compact` — through
     `split_profile_keys`;
   - the policy text and `rule_label` name both keys.
-- [ ] **Step 2: Run them and confirm they fail** (unknown key).
-- [ ] **Step 3: Implement.** Add `Config::conversation_auto_compact: bool` and
+- [x] **Step 2: Run them and confirm they fail** (unknown key).
+- [x] **Step 3: Implement.** Add `Config::conversation_auto_compact: bool` and
   `Config::conversation_window_share: u16` (basis points); their
   `ConfigOverlay` fields; parse (`parse_bool`, `parse_basis_points` with a
   non-zero lower bound), apply in `apply_overlay_scoped` (`scoped(..., forbidden)`
@@ -311,14 +311,14 @@ beside this track while they are in flight.
   `conversation_window_share => Capability`); `split_profile_keys` (refuse
   auto-compact as Forbidden, carry the window);
   `equals_base_limit`; `effective_policy::rule_label`.
-- [ ] **Step 4: Falsify.** Make the repository value trusted → the rejection
+- [x] **Step 4: Falsify.** Make the repository value trusted → the rejection
   test fails; use `restrict_only_minimum` for the window → the raise test fails;
   forget `split_profile_keys` → the compilation fails (exhaustive destructure),
   which is the guard.
-- [ ] **Step 5: Scoped checks.** `cargo nextest run -p workspace-engine --test
+- [x] **Step 5: Scoped checks.** `cargo nextest run -p workspace-engine --test
   permission_profiles --test repository_config_trust --lib config`, clippy,
   fast five.
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Make conversation compaction configurable and restrict-only`.
 
 ## Task 5: The compaction engine

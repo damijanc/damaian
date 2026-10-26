@@ -120,12 +120,7 @@ fn the_model_view_is_the_summary_plus_later_messages() {
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>(),
-        vec![
-            "message 8",
-            "message 9",
-            "message 10",
-            "message 11"
-        ]
+        vec!["message 8", "message 9", "message 10", "message 11"]
     );
     assert_eq!(
         store.read_messages(&session.id).unwrap().len(),
@@ -146,7 +141,10 @@ fn rewinding_before_a_compaction_restores_the_full_model_view() {
     store.rewind_conversation(&session.id, seqs[11]).unwrap();
 
     let view = store.read_conversation(&session.id).unwrap();
-    assert!(view.summary.is_none(), "the compaction left the conversation");
+    assert!(
+        view.summary.is_none(),
+        "the compaction left the conversation"
+    );
     assert_eq!(view.messages.len(), 12);
     assert_eq!(view.summarised_messages, 0);
 }

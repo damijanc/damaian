@@ -76,12 +76,12 @@ pub use command_policy::{
     allow_always_eligible,
 };
 pub use command_purpose::{CommandPurpose, command_purpose};
+pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
 pub use compaction::{
     ApprovalDigest, ConversationBoundary, ConversationSummary, ConversationView, Narrative,
     PlanStepDigest, ValidationDigest, bound_objective, narrative_prompt, parse_narrative,
     transcript_for_summary,
 };
-pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
 pub use config::{
     AppliedKey, CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, CostEstimate,
     DEFAULT_CONTEXT_TOKEN_BUDGET, HookConfig, HookConfigOverlay, HookEvent, HookMode, HookReview,

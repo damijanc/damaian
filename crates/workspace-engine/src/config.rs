@@ -239,6 +239,21 @@ pub struct Config {
     /// `repository_map_max_tokens`: it bounds how much of the repository's
     /// declarations leaves the machine per turn.
     pub symbol_context_max_tokens: usize,
+    /// Whether a turn boundary may summarise older conversation automatically
+    /// (spec 55 §5.5). Forbidden to repository and profile config: on, a clone
+    /// spends the user's money on calls the user switched off; off, it lowers
+    /// what the model sees in the user's sessions to suit the repository's
+    /// author. Neither direction is a restriction. The user can still compact
+    /// by hand.
+    pub conversation_auto_compact: bool,
+    /// The recency window as a share of `context_token_budget`, in basis
+    /// points (spec 55 §5.1). The same number is the automatic threshold: a
+    /// conversation above it is compacted, and the result fits it.
+    ///
+    /// Restrict-only lower-wins: a smaller window sends less of the user's
+    /// conversation to the provider, so a repository may lower it and never
+    /// raise it.
+    pub conversation_window_share: u16,
     /// Per-category shares of the context limit and the observed-window safety
     /// margin (spec 26 §5.2, §5.7). Restrict-only: a repository may lower a
     /// share and raise the margin, never the reverse.
@@ -1108,6 +1123,8 @@ impl Config {
             max_match_line_chars,
             repository_map_max_tokens,
             symbol_context_max_tokens,
+            conversation_auto_compact,
+            conversation_window_share,
             context_budget_instructions,
             context_budget_hook_context,
             context_budget_pinned,
@@ -1682,6 +1699,31 @@ impl Config {
             {
                 outcome.record(scope, key, None, loosened);
             }
+        }
+
+        // Spec 55 §5.5: the off switch decides whether a clone can spend the
+        // user's money on a summarisation call, and neither direction is a
+        // restriction, so repository and profile config may not set it.
+        if let Some(value) = scoped(
+            conversation_auto_compact,
+            "conversation_auto_compact",
+            trusted,
+            forbidden,
+            rejected,
+        ) {
+            self.conversation_auto_compact = value;
+            outcome.record(scope, "conversation_auto_compact", None, false);
+        }
+        if let Some(value) = conversation_window_share
+            && let Some(loosened) = restrict_only_share(
+                &mut self.conversation_window_share,
+                value,
+                "conversation_window_share",
+                trusted,
+                rejected,
+            )
+        {
+            outcome.record(scope, "conversation_window_share", None, loosened);
         }
 
         // Spec 26 §5.2: each category share is restrict-only and lower-wins —
@@ -2492,6 +2534,20 @@ impl Config {
             "symbol_context_max_tokens",
             &self.symbol_context_max_tokens.to_string(),
         );
+        push_line(
+            &mut output,
+            "conversation_auto_compact",
+            if self.conversation_auto_compact {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        push_line(
+            &mut output,
+            "conversation_window_share",
+            &format_basis_points(self.conversation_window_share),
+        );
         for (key, value) in context_budget_policy_lines(&self.context_budget) {
             push_line(&mut output, key, &format_basis_points(value));
         }
@@ -2715,6 +2771,8 @@ impl Default for Config {
             // Spec 26's planned 10% share of the same budget (spec 25
             // `context.md` §9).
             symbol_context_max_tokens: 1_600,
+            conversation_auto_compact: true,
+            conversation_window_share: crate::compaction::DEFAULT_WINDOW_SHARE_BPS,
             context_budget: ContextBudget::default(),
             max_command_output_bytes: 1024 * 1024,
             command_timeout_secs: 600,
@@ -2797,6 +2855,10 @@ pub struct ConfigOverlay {
     pub max_match_line_chars: Option<usize>,
     pub repository_map_max_tokens: Option<usize>,
     pub symbol_context_max_tokens: Option<usize>,
+    /// Spec 55 §5.5: forbidden to repository and profile config.
+    pub conversation_auto_compact: Option<bool>,
+    /// Spec 55 §5.1: a share of `context_token_budget`, restrict-only lower-wins.
+    pub conversation_window_share: Option<u16>,
     /// `context_budget.*` shares, in basis points. Each is its own field so the
     /// overlay macro classifies it and a repository raise is refused by name.
     pub context_budget_instructions: Option<u16>,
@@ -2944,6 +3006,11 @@ classify_overlay_fields! {
     max_match_line_chars => Capability,
     repository_map_max_tokens => Capability,
     symbol_context_max_tokens => Capability,
+    // Spec 55: the off switch decides model traffic and the window bounds how
+    // much of the user's conversation leaves the machine, so both are
+    // capabilities rather than preferences.
+    conversation_auto_compact => Capability,
+    conversation_window_share => Capability,
     // Spec 26 §5.2: a share steers model traffic toward or away from a
     // repository's own content, so a clone may lower one but never raise it.
     // The safety margin is the reverse direction (higher is restrictive).
@@ -3153,6 +3220,20 @@ impl ConfigOverlay {
             // `0` is valid here too: it leaves the `symbols` item out.
             "symbol_context_max_tokens" => {
                 self.symbol_context_max_tokens = Some(parse_u64(key, value)? as usize)
+            }
+            "conversation_auto_compact" => {
+                self.conversation_auto_compact = Some(parse_bool(key, value)?)
+            }
+            // A zero window would compact on every turn; a window above the
+            // whole budget would leave nothing to compact against.
+            "conversation_window_share" => {
+                let share = parse_basis_points(key, value)?;
+                if !(1..=10_000).contains(&share) {
+                    return Err(ClientError::InvalidInput(format!(
+                        "{key} must be a decimal between 0.0001 and 1"
+                    )));
+                }
+                self.conversation_window_share = Some(share);
             }
             // Spec 26 §5.2: decimals parsed into integer basis points.
             "context_budget.instructions" => {
@@ -3583,6 +3664,8 @@ impl ConfigOverlay {
             max_match_line_chars,
             repository_map_max_tokens,
             symbol_context_max_tokens,
+            conversation_auto_compact,
+            conversation_window_share,
             context_budget_instructions,
             context_budget_hook_context,
             context_budget_pinned,
@@ -3664,6 +3747,20 @@ impl ConfigOverlay {
         }
         if let Some(value) = symbol_context_max_tokens {
             push_line(&mut output, "symbol_context_max_tokens", &value.to_string());
+        }
+        if let Some(value) = conversation_auto_compact {
+            push_line(
+                &mut output,
+                "conversation_auto_compact",
+                if *value { "true" } else { "false" },
+            );
+        }
+        if let Some(value) = conversation_window_share {
+            push_line(
+                &mut output,
+                "conversation_window_share",
+                &format_basis_points(*value),
+            );
         }
         for (key, value) in [
             ("context_budget.instructions", context_budget_instructions),

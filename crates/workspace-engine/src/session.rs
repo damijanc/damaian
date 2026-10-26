@@ -736,9 +736,15 @@ impl SessionStore {
                 let (covered, after): (Vec<_>, Vec<_>) = messages
                     .into_iter()
                     .partition(|(seq, _)| *seq <= summary.through_seq);
-                (covered.len(), after.into_iter().map(|(_, message)| message).collect())
+                (
+                    covered.len(),
+                    after.into_iter().map(|(_, message)| message).collect(),
+                )
             }
-            None => (0, messages.into_iter().map(|(_, message)| message).collect()),
+            None => (
+                0,
+                messages.into_iter().map(|(_, message)| message).collect(),
+            ),
         };
         Ok(crate::compaction::ConversationView {
             summary,
