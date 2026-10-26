@@ -1,6 +1,6 @@
 # Feature Spec: Memory Model and Storage
 
-Status: In progress
+Status: Done
 Order: 28 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -488,12 +488,55 @@ note about session files.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+**Tiers observed.** Fixtures with a commit resolve at tier 1 (`root_<sha>`),
+including a clone of them; a clone and its origin therefore share a key while
+their `repository_id`s differ. Fixtures with no commit and an `origin` resolve at
+tier 2 (`remote_<sha256[..16]>`); two checkouts naming the same remote share, and
+different remotes do not. A repository with neither resolves at tier 3
+(`path_repo_<hex>`), and a directory that is not a Git repository at all resolves
+there without failing. No fixture fell through unexpectedly: tier 1 fails only
+with no history, and tier 2 only when the URL has no portable host (a local
+filesystem path is treated that way deliberately, rather than pretending a
+machine-local path is portable).
 
-- Which `project_key` tier resolved for each repository tested, and whether any
-  repository fell through to the path-hash fallback unexpectedly.
-- Whether the fork-sharing consequence in §5.2 caused any surprise in real use.
-  If a fork inheriting upstream memory proves wrong, the fix is a per-project
-  opt-out, not a change to the resolution order — record the case first.
-- The measured cost of resolving `project_key` on repository open, since it runs
-  a Git command on a path that may be large or on a slow filesystem.
+**Fork sharing.** A fork shares its upstream's root commit and so its key; the
+test asserts it as a stated decision. No real-use surprise has been recorded yet,
+because nothing recalls memory in this slice (#30). If a fork inheriting upstream
+memory proves wrong, record the case before changing anything: the fix in §5.2 is
+a per-project opt-out, not a change to the resolution order.
+
+**Cost.** Tier 1 is one `git rev-list` process. Measured on the development Mac
+on 2026-10-26: 20 iterations took 0.246 s, about 12 ms each, dominated by process
+launch rather than by repository size. Tier 2 is one `git config` process; tier
+3 runs no Git process at all. Nothing calls resolution per turn in this slice;
+#29 and #30 should resolve once when a repository is opened and reuse the
+identity.
+
+**What changed from the written design.**
+
+- `MemoryProvenance`'s variant fields carry explicit camelCase renames. The
+  proposal's `rename_all = "camelCase"` on the enum renames variants only, which
+  would have left `session_id` in the JSON while every other field is camelCase.
+- Session writes reach the log through two `pub(crate)` methods on
+  `SessionStore`, `append_memory_record` and `memory_records`. Making
+  `append_session_event` public would have let a future caller write a memory
+  around the store's checks; this keeps §5.4's single write path literal.
+- `MemoryExpiry` was undefined in the proposal. It is a struct with an optional
+  `expires_at_ms` and a `revalidate_on_evidence_change` flag, because #30 needs
+  the time case and the evidence case independently.
+- Version 0 is "JSONL files with no marker", the adoption case `data_schema`
+  already handles. Migration appends a normalized record per reusable entry
+  (deriving `sensitivity`, defaulting `state` to `Active`) and leaves every
+  pre-migration line in place.
+- The store refuses an evidence path that is `./`-prefixed as well as an
+  absolute or `..` path. Evidence should be stored normalized; the refusal costs
+  a caller nothing and keeps one representation in the file.
+
+**Acceptance criteria not verifiable in this slice.** "A credential that no
+pattern detects is still redacted before it is sent" belongs to #30: it needs a
+memory to be recalled into a `ContextItem` and a rendered request, and #28 does
+not touch `chat.rs` or `context_manager.rs`. The layer that makes it true is
+unchanged — context assembly redacts every item — and #30's test should assert
+it end to end. "Every quality-gate command passes" is CI's: the scoped local
+checks are recorded in [`tasks.md`](tasks.md), and the workspace clippy and test
+suite are left to CI.

@@ -1209,3 +1209,144 @@ fn the_engine_exposes_a_memory_store_that_follows_config() {
         .unwrap();
     assert_eq!(engine.memory_store.user_entries().unwrap().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end isolation at each identity tier (acceptance criteria).
+// ---------------------------------------------------------------------------
+
+fn shared_identity(repo: &Path, data_root: &Path) -> ProjectIdentity {
+    let config = Config {
+        data_dir: data_root.join(".damaian"),
+        enable_index_watcher: false,
+        ..Config::default()
+    };
+    ProjectIdentity::resolve_for_root(repo, &git_service(&config)).unwrap()
+}
+
+#[test]
+fn project_memory_written_in_one_repository_is_invisible_in_another() {
+    let data_root = temp_dir("isolation-root-commits");
+    let first = repo_with_a_commit("isolation-first");
+    let second = repo_with_a_commit("isolation-second");
+    let first_identity = shared_identity(&first, &data_root);
+    let second_identity = shared_identity(&second, &data_root);
+    let store = memory_store(&data_root, false);
+
+    let stored = store
+        .insert(
+            &first,
+            Some(&first_identity),
+            project_entry(&first_identity.key, "Integration tests need Docker."),
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.project_entries(&first_identity).unwrap(),
+        vec![stored]
+    );
+    assert!(store.project_entries(&second_identity).unwrap().is_empty());
+}
+
+#[test]
+fn project_memory_is_isolated_at_the_remote_and_path_tiers_too() {
+    let data_root = temp_dir("isolation-weak-tiers");
+    let store = memory_store(&data_root, false);
+
+    // Remote tier: no history, different remotes.
+    let remote_first = temp_dir("isolation-remote-first");
+    let remote_second = temp_dir("isolation-remote-second");
+    for (root, remote) in [
+        (&remote_first, "git@github.com:owner/first.git"),
+        (&remote_second, "git@github.com:owner/second.git"),
+    ] {
+        init_repo(root);
+        git(root, &["remote", "add", "origin", remote]);
+    }
+    let first = shared_identity(&remote_first, &data_root);
+    let second = shared_identity(&remote_second, &data_root);
+    assert_eq!(first.source, ProjectKeySource::RemoteUrl);
+    store
+        .insert(
+            &remote_first,
+            Some(&first),
+            project_entry(&first.key, "Remote-tier fact."),
+        )
+        .unwrap();
+    assert!(store.project_entries(&second).unwrap().is_empty());
+
+    // Path tier: neither history nor a remote.
+    let path_first = temp_dir("isolation-path-first");
+    let path_second = temp_dir("isolation-path-second");
+    init_repo(&path_first);
+    init_repo(&path_second);
+    let first = shared_identity(&path_first, &data_root);
+    let second = shared_identity(&path_second, &data_root);
+    assert_eq!(first.source, ProjectKeySource::RepositoryId);
+    store
+        .insert(
+            &path_first,
+            Some(&first),
+            project_entry(&first.key, "Path-tier fact."),
+        )
+        .unwrap();
+    assert!(store.project_entries(&second).unwrap().is_empty());
+}
+
+#[test]
+fn two_checkouts_share_project_memory_through_the_store() {
+    let data_root = temp_dir("isolation-shared-clone");
+    let origin = repo_with_a_commit("isolation-origin");
+    let clone = temp_dir("isolation-clone-target");
+    assert!(
+        Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&origin)
+            .arg(&clone)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let store = memory_store(&data_root, false);
+    let origin_identity = shared_identity(&origin, &data_root);
+    let clone_identity = shared_identity(&clone, &data_root);
+
+    let stored = store
+        .insert(
+            &origin,
+            Some(&origin_identity),
+            project_entry(&origin_identity.key, "Integration tests need Docker."),
+        )
+        .unwrap();
+
+    assert_eq!(clone_identity.key, origin_identity.key);
+    assert_eq!(
+        store.project_entries(&clone_identity).unwrap(),
+        vec![stored],
+        "the clone reads the same project memory"
+    );
+}
+
+#[test]
+fn a_renamed_checkout_retains_its_project_memory() {
+    let data_root = temp_dir("isolation-renamed");
+    let repo = repo_with_a_commit("isolation-renamed-repo");
+    let store = memory_store(&data_root, false);
+    let before = shared_identity(&repo, &data_root);
+    let stored = store
+        .insert(
+            &repo,
+            Some(&before),
+            project_entry(&before.key, "A fact that survives a rename."),
+        )
+        .unwrap();
+
+    let renamed = repo.with_file_name(format!(
+        "{}-moved",
+        repo.file_name().unwrap().to_string_lossy()
+    ));
+    fs::rename(&repo, &renamed).unwrap();
+    let after = shared_identity(&renamed, &data_root);
+
+    assert_eq!(after.key, before.key);
+    assert_eq!(store.project_entries(&after).unwrap(), vec![stored]);
+}

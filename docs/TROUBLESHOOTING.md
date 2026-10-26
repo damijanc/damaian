@@ -50,6 +50,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | `Refused by hook …`, or a hook blocked, warned, timed out or did not run | [A hook refused, blocked, or did not run](#a-hook-refused-blocked-or-did-not-run) |
 | A command that used to run unasked now asks | [A command that used to run unasked now asks](#a-command-that-used-to-run-unasked-now-asks) |
 | A setting will not stick, or a repository config key has no effect | [Configuration layers](#configuration-layers), [Why a rule is in force](#why-a-rule-is-in-force) |
+| Memory will not save, a project's memory is missing, or the store was refused | [Memory](#memory) |
 | A permission profile key has no effect | [A permission profile key had no effect](#a-permission-profile-key-had-no-effect) |
 | A file read or search result was cut short | [A file read or search result was truncated](#a-file-read-or-search-result-was-truncated) |
 | A file is missing from the model's context | [A file the model should see is missing from context](#a-file-the-model-should-see-is-missing-from-context) |
@@ -174,7 +175,10 @@ isolated tree — that is the intended way to test without touching real data.
 | `config/user.conf` | User-scope config overlay | `Config::user_config_path` ([config.rs](../crates/workspace-engine/src/config.rs)) |
 | `config/admin.conf` | Admin-scope overlay (highest precedence) | `Config::admin_config_path` ([config.rs](../crates/workspace-engine/src/config.rs)) |
 | `audit/events.jsonl` | Append-only audit trail, secret-redacted | `AuditLog::record` ([audit.rs](../crates/workspace-engine/src/audit.rs)) |
-| `sessions/<session-id>.jsonl` | Per-conversation event log: sessions, tasks, messages | `SessionStore` ([session.rs](../crates/workspace-engine/src/session.rs)) |
+| `sessions/<session-id>.jsonl` | Per-conversation event log: sessions, tasks, messages, and session-scope memory (`memory_recorded`) | `SessionStore` ([session.rs](../crates/workspace-engine/src/session.rs)) |
+| `memory/schema.conf` | The memory store's own schema version (`schema_version=1`), separate from the data-directory marker | `MemoryStore` ([memory.rs](../crates/workspace-engine/src/memory.rs)) |
+| `memory/project/<project-key>.jsonl` | Append-only project memory, one record per line. **Not safe to share** | `MemoryStore` ([memory.rs](../crates/workspace-engine/src/memory.rs)) |
+| `memory/user.jsonl` | User-scope memory, present only after the scope is enabled. **Not safe to share** | `MemoryStore` ([memory.rs](../crates/workspace-engine/src/memory.rs)) |
 | `patches/pending/` | Proposed patches awaiting approval | `PatchStore::save` ([edit.rs](../crates/workspace-engine/src/edit.rs)) |
 | `patches/rejected/` | Rejected patches, kept for inspection | `PatchStore::mark_rejected` ([edit.rs](../crates/workspace-engine/src/edit.rs)) |
 | `rollback/<patch-id>/` | Pre-edit file copies backing patch rollback, **unredacted** | `PatchEngine::apply_patch` ([patch_engine.rs](../crates/workspace-engine/src/patch_engine.rs)) |
@@ -349,6 +353,83 @@ cargo run -p damaian-cli -- config-allowlist-keep /path/to/repo "cargo test"
 ```
 
 Either way the repository's own file is left exactly as it is.
+
+### Memory
+
+Memory is a small, local, append-only store of confirmed one-sentence facts. It
+lives under `<data dir>/memory/`, and the directory and its `project/`
+subdirectory are mode `0700`.
+
+```text
+memory/schema.conf                  schema_version=1
+memory/project/<project-key>.jsonl  project scope
+memory/user.jsonl                   user scope, only after enabling it
+```
+
+Session-scope memory is not here: it is `memory_recorded` events in that
+session's log, so it is deleted with the session.
+
+**Read one.** Each line is a complete record; the last record for an `id` wins,
+which is how an edit, supersession, expiry or deletion is represented without
+rewriting the file. A torn final line is ignored on read. To see the current
+project entries:
+
+```bash
+jq -r 'select(.state=="active") | "\(.category)\t\(.created_at_ms)\t\(.statement)"' \
+  "$DATA_DIR"/memory/project/*.jsonl | sort -t $'\t' -k2
+```
+
+The fields are the entry `id`, `scope`, `project_key`, `session_id`, `category`,
+`statement`, `provenance`, `verification`, `sensitivity`, `state`,
+`created_at_ms`, `updated_at_ms`, `supersedes` and `expiry`. `provenance` is
+one of `userRequest`, `suggestedAndConfirmed` or `repositoryEvidence`; there is
+no provenance for an unconfirmed model inference, so one cannot be stored.
+
+**Which project a file belongs to.** The file name is the `project_key`, and its
+prefix names the tier that produced it:
+
+| Prefix | Resolved from | Survives |
+|---|---|---|
+| `root_<40-hex>` | `git rev-list --max-parents=0 HEAD` | clone, move, rename, remote change, fork |
+| `remote_<16-hex>` | normalized `origin` URL (host + path) hashed | clone, move; not a remote rename |
+| `path_repo_<16-hex>` | the existing path-derived `repository_id` | nothing; per-checkout fallback |
+
+The root commit is preferred because it belongs to the repository's history
+rather than to where it sits. A fork shares its upstream's root commit and
+therefore its memory — deliberate, since the conventions usually still apply; a
+repository with no commit and no remote falls to the path hash, and the failure
+mode there is isolation, not sharing. The UI reports the tier rather than the
+raw key.
+
+**A refused secret write.** A statement (or an evidence path) that the secret
+scanner recognises is refused with *"That looks like a credential; Damaian will
+not store it."* Nothing is written — not even a `[REDACTED_…]` placeholder,
+because a redacted memory is recalled forever and records that a credential
+exists. The same path refuses evidence under `restricted_patterns` or excluded
+by a `.gitignore`, with a message naming which of the two applied but not the
+protected path.
+
+Pattern matching cannot see every credential. That is why the confirmation step
+shows the exact sentence that will persist, and why memory is redacted again on
+its way into a request.
+
+**A newer schema.** Opening a store written by a newer build fails with the
+marker path and both versions and changes nothing. Upgrade Damaian, or point
+`DAMAIAN_DATA_DIR` somewhere else. An older store (files with no marker) is
+migrated by appending normalized records and then writing the marker; the
+pre-migration lines stay for audit.
+
+**Lifecycle events** appear in `audit/events.jsonl` as `memory_created`,
+`memory_confirmed`, `memory_recalled`, `memory_edited`, `memory_superseded`,
+`memory_expired`, `memory_deleted` and `memory_state_changed`, plus
+`memory_schema_migrated` for the version boundary. They carry the entry id,
+scope, category, provenance type, sensitivity and the state transition. The
+statement appears only for `Ordinary` sensitivity: a personal or environmental
+statement in a retained audit line is the exposure this rule prevents.
+
+**Memory files are not safe to share.** They can name a machine, a path, a port
+or a personal preference, exactly like a session log. Do not attach them to a
+bug report or a shared diagnostic bundle.
 
 ### Secrets
 

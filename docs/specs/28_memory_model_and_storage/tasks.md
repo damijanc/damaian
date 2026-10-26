@@ -4,7 +4,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) (requirements 1-6 and acceptance
 criteria) · corrections and planning decisions in [`context.md`](context.md)
-**Started:** 2026-10-26 — **Done:** in progress
+**Started:** 2026-10-26 — **Done:** 2026-10-26
 
 ## Progress
 
@@ -17,7 +17,7 @@ criteria) · corrections and planning decisions in [`context.md`](context.md)
 | 5 · Refusal path: secrets, evidence, scopes | Done 2026-10-26 | `MemoryStore::insert(root, identity, entry)` is the single write path and runs shape/scope, secret, evidence, sensitivity and persistence in that order. Secrets are refused with a category and never redacted; the statement and every evidence path are scanned. Evidence must be repository-relative (absolute, `..` and `./` refused), not `PathPolicy::is_restricted`, and not ignored by configured patterns or any per-directory `.gitignore` from the root down. Project writes require the resolved identity and a matching key; session writes require an existing session and reach the log only through `SessionStore::append_memory_record`/`memory_records` (`pub(crate)`, leaving `append_session_event` private); user writes refuse while disabled and reads return nothing without opening `user.jsonl`. Sensitivity is stored as `max(supplied, derived)`, so it can be raised but never lowered. Fourteen new integration tests (33 total) pass, including a session-scope write carrying a seeded fake AWS key that leaves no `memory_recorded` event and no secret in the log. Scoped clippy clean. |
 | 6 · Lifecycle transitions and audit | Done 2026-10-26 | `MemoryTarget { Project, Session, User }` and append-only transitions: `edit_statement` (re-runs shape, secret, evidence and sensitivity checks; refuses a non-active entry), `mark_state` (Superseded/Expired/Deleted/Active, idempotent on the same state), `supersede` (inserts the replacement first and only then retires the old entry), and `record_recall` (one event per entry). `AuditLog::record` gets `memory_created`, `memory_confirmed` (for `SuggestedAndConfirmed`), `memory_recalled`, `memory_edited`, `memory_superseded`, `memory_expired`, `memory_deleted`, and `memory_state_changed` for reactivation; recall has no state fields, so the log does not claim a transition. Fields are `entryId`, `scope`, `category`, `provenance`, `sensitivity` and `fromState`/`toState`, plus `statement` only when sensitivity is `Ordinary`. Six new tests (39 total) cover the full walk, confirmation, sensitivity absence from the whole audit file, a disabled audit log writing nothing, a refused edit leaving the old statement active, and the supersede link. Scoped clippy clean. |
 | 7 · User-scope config key and engine wiring | Done 2026-10-26 | `memory_user_scope_enabled` (default `false`) added to `Config`/`ConfigOverlay` and carried through every exhaustive site named in `context.md` §5: apply (Forbidden), policy text, parse, `classify_overlay_fields!` (Capability), `split_profile_keys` (refused), and the rule label "Remember facts across projects". `WorkspaceEngine` now builds one `MemoryStore` from the resolved config (data dir, flag, ignore patterns) and exposes it as `memory_store`; `lib.rs` exports the record, store and identity types. The capability partition test required a new `weakening_cases()` entry, and a focused test covers default-off, user-on, repository-refused in both directions, profile-split refusal and the label. Scoped runs: `--test permission_profiles` 80 passed (1 ignored), `--test repository_config_trust` 50, lib `config::` 2, `--test memory` 40 (including an engine-wiring test); scoped clippy clean. |
-| 8 · Documentation and close-out | Not started | |
+| 8 · Documentation and close-out | Done 2026-10-26 | **Docs.** `USER_GUIDE.md` gains a **Memory** section (what it is, the three scopes, user scope off and how to enable it in user config, the repository-config refusal, precedence below `AGENTS.md` and a current instruction, secret refusal, not safe to share, and that creation/recall land in #29/#30 so no memory is created yet). `TROUBLESHOOTING.md` gains three state-table rows, a **Memory** section (layout, how to read one with `jq`, the `root_`/`remote_`/`path_` tier prefixes, a refused secret write, a newer-schema refusal, the lifecycle audit events, not-safe-to-share) and a symptom-index row. Proposal §7 records the tiers observed, fork sharing, the measured ~12 ms tier-1 cost, the deviations (camelCase provenance fields, `pub(crate)` session methods, `MemoryExpiry` shape, version 0 adoption, `./` evidence refusal) and the one acceptance criterion deferred to #30. **Close-out.** #29's `Depends on:` line flipped to built (Done 2026-10-26), #30's #28 entry likewise; README ready set promotes #29 and leaves #30 blocked on it, the current-state bullets and priority row are updated, #28's row is Done, and a "Re-derived on 2026-10-26" history entry records what #28 leaves. #28's line is gone from `CHANGELOG.md` Unreleased; no release row added. **Checks.** `scripts/quality-gate.sh fmt node lint typos deny` passed (fmt 1.09 s, node 0.32 s, lint 2.12 s, typos 0.39 s, deny 1.43 s). `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` passed. `cargo nextest -p workspace-engine --test memory` 44 passed; `--test permission_profiles` 80 passed (1 ignored); `--test repository_config_trust` 50 passed; lib `config::` 2 passed. `npm run specs:check` reports 0 dependency disagreements. **CI outstanding:** the full seven-check gate (workspace clippy and the whole nextest suite) is left to CI, so the spec is Done with CI green still to be recorded when the branch is pushed. **Not verified in this slice:** the undetectable-credential redaction criterion, which needs #30's recalled item and rendered request. |
 
 **Goal:** Give Damaian a local, versioned, per-project memory store whose record
 shape makes #29's consent gate and #30's retrieval possible — with a project
@@ -253,25 +253,25 @@ permission_profiles` (the two partition tests plus the new case) and
 
 ## Task 8 · Documentation and close-out
 
-- [ ] `docs/USER_GUIDE.md`: what memory is, the three scopes, why user scope is
+- [x] `docs/USER_GUIDE.md`: what memory is, the three scopes, why user scope is
       off by default and how to enable it, and that memory never outranks
       `AGENTS.md` or a current instruction.
-- [ ] `docs/TROUBLESHOOTING.md`: where memory lives, how to read a file, how the
+- [x] `docs/TROUBLESHOOTING.md`: where memory lives, how to read a file, how the
       `project_key` tier is read from the filename prefix, what a refused secret
       write looks like, and that memory files are **not** safe to share.
-- [ ] Fill the proposal's §7 implementation notes: tier resolved per fixture,
+- [x] Fill the proposal's §7 implementation notes: tier resolved per fixture,
       fork-sharing observations, and measured `project_key` resolution cost.
-- [ ] Mark the spec Done in all four places: `proposal.md` `Status`, README
+- [x] Mark the spec Done in all four places: `proposal.md` `Status`, README
       current state, README implementation-order row, `tasks.md` header and
       progress table.
-- [ ] Promote #29: flip its `Depends on:` line to built, update the README ready
+- [x] Promote #29: flip its `Depends on:` line to built, update the README ready
       set, and add a "Re-derived on 2026-10-26" history entry naming what #28
       leaves for #29 and #30.
-- [ ] Remove #28's line from `CHANGELOG.md` → Unreleased. Do not add a release
+- [x] Remove #28's line from `CHANGELOG.md` → Unreleased. Do not add a release
       row.
-- [ ] Walk the acceptance criteria in proposal §6 against the tests and record
+- [x] Walk the acceptance criteria in proposal §6 against the tests and record
       any that could not be verified.
-- [ ] Run the fast checks and scoped suites; say plainly that the workspace
+- [x] Run the fast checks and scoped suites; say plainly that the workspace
       clippy and test suite are left to CI.
 
 **Verification:** `scripts/quality-gate.sh fmt node lint typos deny`;

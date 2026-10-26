@@ -5,7 +5,8 @@ Order: 30 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#28](28_memory_model_and_storage/proposal.md) (the store) — **not built**;
+Depends on: [#28](28_memory_model_and_storage/proposal.md) (the store) — built
+(Done 2026-10-26);
 [#29](29_memory_creation_and_consent.md) (the consent gate) — **not built**.
 Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path

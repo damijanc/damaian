@@ -92,17 +92,17 @@ merged into `main` or finished on their branch. #23 and #26 both finished on
 40323902715). #27 finished on 2026-10-26, and the full seven-check gate passed in
 CI on 2026-10-26 (Quality run 40340511717).
 
-- **In progress:** #28 memory model — started 2026-10-26; the record and store
-  land before #29's consent gate. #49 prompt cache — the accounting slice is done
+- **In progress:** #49 prompt cache — the accounting slice is done
   and the reuse slice (requirement 4) is the only unbuilt requirement. #26's
   ordering exists, and #55 replaced the eight-message sliding window on
   2026-10-26, so the reuse slice is no longer blocked by either. The spec's own
   `Depends on:` line still names Phase 1 WP3 (provider capability validation) as
   unspecified, so it is not in the ready set.
-- **Ready, not started:** #33 MCP management; #36 branch and
-  worktree delivery (#35 finished on 2026-10-26; Phase 2 WP4 is optional and the
-  spec is written to work without it); #51 external reference retrieval.
-- **Blocked:** #29 on #28; #30 on #28 and #29; #37 on #33 and #36; #52 on #33;
+- **Ready, not started:** #29 memory creation and consent (promoted by #28 on
+  2026-10-26); #33 MCP management; #36 branch and worktree delivery (#35
+  finished on 2026-10-26; Phase 2 WP4 is optional and the spec is written to
+  work without it); #51 external reference retrieval.
+- **Blocked:** #30 on #29; #37 on #33 and #36; #52 on #33;
   #39 on #38; #40 on #38 and #39; #54 on Phase 1 WP3 (provider capability
   validation), which is unspecified.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
@@ -375,7 +375,7 @@ nothing is promoted by their completion.
 | 1 | #23 verification | Ready now that #22 is done, and the next priority with #65 finished; the last thing in front of #35. Its loop lives in `chat.rs` |
 | 2 | #55 compaction | **Done 2026-10-26.** Replaced the eight-message window with a token budget plus an append-only summary, so #49's reuse slice now has a stable conversation block to measure |
 | 3 | #28, #33, #51 | The fan-out #26 unblocked. **#27 is Done (2026-10-26)** and promoted #28 |
-| 4 | #28 → #29 → #30 | Memory, strictly serial behind #27. **#28 started 2026-10-26**; #29 waits on it |
+| 4 | #29 → #30 | Memory, strictly serial behind #27. **#28 is Done (2026-10-26)** and promoted #29; #30 still waits on #29 |
 | 5 | #36/#37; #33 → #52 | Delivery and extensibility clusters. #35 is Done (2026-10-26) and promoted #36 |
 | 6 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not". #38 is deferred; #57 is done, so its stage 1 is due for re-evaluation |
 
@@ -550,6 +550,22 @@ API. #27 also became the first production `LineRange` producer through session
 pins, so #26's note that no collection source yields a range now refers to
 automatic collection only.
 
+Re-derived on 2026-10-26, when
+[#28](28_memory_model_and_storage/proposal.md) finished. Two `Depends on:` lines
+named #28 not built: [#29](29_memory_creation_and_consent.md) and
+[#30](30_memory_retrieval_and_lifecycle.md). **One is promoted:** #29, whose only
+dependency #28 satisfied; #30 remains blocked on #29. #28 leaves the ready and
+in-progress sets. No `chat.rs` pairing constraint ends with it, because #28 did
+not touch `chat.rs`; #30 will be a solo `chat.rs` track when it starts. What #28
+leaves for the next two specs: `MemoryStore` is the single write path with the
+secret, evidence, scope and sensitivity checks, `MemoryTarget` gives #29 and #30
+append-only transitions and recall auditing, `ProjectIdentity::source_of_key`
+reads the tier back for the inspector, and the `Memory` context category
+deliberately does not exist yet — adding it is #30's task, together with the
+end-to-end assertion that an undetectable credential stored directly in the file
+is still redacted before it is sent. The scoped local checks passed; the full
+seven-check gate is left to CI, so #28's status is Done with **CI outstanding**.
+
 ### Parallel work
 
 Two specs may be built at once, which is a **deliberate exception to the
@@ -620,8 +636,8 @@ is ready.
 | 25 | [25_symbol_and_relationship_index/](25_symbol_and_relationship_index/proposal.md) | **Done 2026-10-23 (started 2026-10-13).** Split into a folder and planned 2026-10-09, re-checked against `main` 2026-10-12, built in eleven tasks. [`context.md`](25_symbol_and_relationship_index/context.md) records where the code contradicted the design: spec 46's registry is built, LSP framing is not MCP's, sessions have no close event, and restricted files are indexed. The three pieces that need `chat.rs` remain deferred (§12): an agent-facing symbol tool, task attribution for diagnostics, and symbols in `search_codebase` output. Roadmap Phase 3 WP3. A rescope, not greenfield: `FileRecord.symbols`/`imports` already existed as prefix heuristics. Adds locations, kinds, relationships, a `symbols` context item, on-demand references, and a `Provenance` label separating language-server fact from heuristic guess. Satisfies Phase 2's deferred LSP dependency. A Task 11 follow-up wired the eager definition pass to the first symbol search, so language-server definitions and diagnostics are reachable in the app; the Tauri app's exit path still relies on EOF and the next launch's sweep, as Task 5 recorded. |
 | 26 | [26_context_assembly/proposal.md](26_context_assembly/proposal.md) | **Done 2026-10-25** (planned 2026-10-24; Tasks 1–6 on 2026-10-25, Task 7 closing the same day). Roadmap Phase 3 WP4. Replaced the single first-come-first-served budget with per-category allocation whose shares a repository may lower but never raise, range deduplication with ranged reads outside the tool line cap, exclusion records naming why content was dropped or shortened, and a content-free manifest recorded as `context_assembled` (spec 27 later moved the chat record to the send). Also fixed a security hole planning found: the user's prompt and replayed earlier turns now pass through the secret scanner, where both used to reach the provider in cleartext. The estimator is content-aware and calibrated against a live provider measurement (prose 4 B/token, code 3.6, structured 2.4). Its [`context.md`](26_context_assembly/context.md) records the pre-implementation pipeline; [`tasks.md`](26_context_assembly/tasks.md) holds the corrections and the seven tasks. Two open points in its §7 are inherited rather than fixed: no collection source yields a `LineRange` yet, so range merging is implemented and unit-tested but inert, and no Observed capability profile exists, so every limit is `Declared`. |
 | 27 | [27_context_inspector/](27_context_inspector/proposal.md) | **Done 2026-10-26** (planned and built 2026-10-26; Tasks 1–10; the manual browser walk is in its §7; seven-check gate green in CI, Quality run 40340511717). Roadmap Phase 3 WP5. Renders #26's manifest pre- and post-send, and adds session pins and a path restriction. The view sees `ContextManifest` and never item content; removal is available only on a paused pre-send review, and `Required` is refused at the API. Its `chat.rs` work was a solo track. Its manual walk exercised the pre-send pause, a Required refusal, an item removed before send (74 → 67 tokens), the post-send Context link, pins and the restriction. It promoted #28. Makes "the user can see what context the agent uses" true; Phase 3b's memory arrives as one more category in this view. |
-| 28 | [28_memory_model_and_storage/](28_memory_model_and_storage/proposal.md) | **In progress, started 2026-10-26.** Roadmap Phase 3b WP1. The memory record and store, with a `project_key` resolved from the repository's root commit — because `repository_id` is a path hash and cannot give the sharing property the roadmap asks for. Memory refuses secrets rather than redacting them. The record shape is fixed first because #29's consent gate and #30's retrieval are only expressible if provenance, state, scope and evidence are present. |
-| 29 | [29_memory_creation_and_consent.md](29_memory_creation_and_consent.md) | **Not started.** Roadmap Phase 3b WP2. The consent gate: `MemoryProposal` and `MemoryEntry` are separate types with one conversion requiring a user confirmation, so unconfirmed persistence is unrepresentable. Instruction-shaped candidates from untrusted origins get no proposal at all. |
+| 28 | [28_memory_model_and_storage/](28_memory_model_and_storage/proposal.md) | **Done 2026-10-26** (planned and built 2026-10-26; Tasks 1–8). Roadmap Phase 3b WP1. The memory record and store: a `project_key` resolved from the root commit, then a normalized origin, then the path hash — because `repository_id` is a path hash and cannot give the sharing property the roadmap asks for — and append-only JSONL under `<data dir>/memory/` with its own schema marker. Memory refuses detected secrets rather than storing a redaction, checks evidence against `restricted_patterns` and per-directory `.gitignore` on the write path, derives `Sensitivity` by rule (raise-only), and audits every lifecycle transition without a personal or environmental statement. Session scope lives in the session log through a `pub(crate)` `SessionStore` path; user scope is off by default and enforced on read and write. Its [`context.md`](28_memory_model_and_storage/context.md) records the pre-implementation state and the drifted line references; [`tasks.md`](28_memory_model_and_storage/tasks.md) holds the eight tasks and 44 integration tests. The project identity and the secret-refusal path are the parts to review first. |
+| 29 | [29_memory_creation_and_consent.md](29_memory_creation_and_consent.md) | **Not started** (ready: #28 built 2026-10-26). Roadmap Phase 3b WP2. The consent gate: `MemoryProposal` and `MemoryEntry` are separate types with one conversion requiring a user confirmation, so unconfirmed persistence is unrepresentable. Instruction-shaped candidates from untrusted origins get no proposal at all. |
 | 30 | [30_memory_retrieval_and_lifecycle.md](30_memory_retrieval_and_lifecycle.md) | **Not started.** Roadmap Phase 3b WP4. Memory reaches the model only as a `ContextItem` in the lowest-priority category, is visible and removable in #27, and is marked stale by hash comparison against its evidence. Proven by prompt-injection evals, not design argument. |
 | 31 | [31_permission_profiles/](31_permission_profiles/proposal.md) | **Done (2026-10-06).** Roadmap Phase 4 WP3, built in nine tasks on top of #34's security subset. Four built-in profiles (Read-only, Safe local, Full, Offline private) plus imported custom ones are applied last and can only narrow; `profile ∩ mode` is checked at every refusal point. Two documented limits: `local` is a command-name heuristic, not a sandbox, and Offline private does not stop model traffic. |
 | 32 | [32_hooks/](32_hooks/proposal.md) | **Done 2026-10-24** (started 2026-10-07; Tasks 1–10, the last on 2026-10-24; see its `tasks.md`). Roadmap Phase 4 WP2. Nine lifecycle events, hooks as external programs returning a verdict — `deny`/`request_approval`/`warn`/`allow`, with no `approve`, so widening is unrepresentable. A repository may define a hook that stays inactive until reviewed at a hash, and may never touch a user hook. The workspace gate is left to CI; its own §7.1 records one criterion (the context inspector) as met by #27's `HookContext` category row. |

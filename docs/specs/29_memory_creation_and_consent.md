@@ -6,8 +6,8 @@ Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#28](28_memory_model_and_storage/proposal.md) (the memory record and store)
-— **not built**. Everything else named below is a cross-reference, not a
-prerequisite.
+— built (Done 2026-10-26). Everything else named below is a cross-reference, not
+a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.8 (risk classification and approval), section 7.10
 (secret detection). Related implementation specs:

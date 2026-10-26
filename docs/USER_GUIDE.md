@@ -35,6 +35,7 @@ This build is a developer preview. Release builds are Developer ID signed and no
 - [Commits](#commits)
 - [Rewind](#rewind)
 - [The Plan Panel](#the-plan-panel)
+- [Memory](#memory)
 - [Search and Export](#search-and-export)
 - [Symbol Search and Language Servers](#symbol-search-and-language-servers)
 - [After a Crash](#after-a-crash)
@@ -458,6 +459,63 @@ instructions live; model-written lines are quoted. An injection evaluation
 covers this rather than the paragraph alone.
 
 **When your message alone does not fit.** The request is never truncated and never sent without your message. If your message is larger than the whole context budget, the turn fails with `Required context needs N tokens but the context budget is M` and no request is sent. Raise **Context budget** in the **Provider details** panel above, or send a shorter message.
+
+## Memory
+
+Memory is how Damaian keeps a fact you confirmed about a project across
+sessions — that this repository's integration tests need Docker running, or that
+the team decided against a runtime dependency — instead of making you explain it
+again. It is a local store of short, confirmed sentences. It is not a transcript,
+a file cache, or a set of instructions.
+
+**Three scopes, and only two are on by default.**
+
+| Scope | What it means | Default |
+|---|---|---|
+| Session | Applies to one conversation and is deleted with it. Stored in that session's event log. | On |
+| Project | Applies to this repository, in every checkout of it. Two clones of one repository share it; two different repositories never share it. | On |
+| User | Applies to every project you open. | **Off** |
+
+User scope is off because it is the one scope where a fact learned in one
+repository is recalled in another. Turning it on is a separate, explicit
+decision, not a side effect of using memory. Until you set it, Damaian will
+neither write a user-scope memory nor read one that was written before you
+turned it off. Set it in your user config, not in the repository:
+
+```text
+# ~/Library/Application Support/DamaianClient/config/user.conf
+memory_user_scope_enabled=true
+```
+
+A repository's `.damaian/config.conf` cannot set this key in either direction. A
+clone that could enable cross-project recall would let one repository's content
+become a statement recalled in every other repository.
+
+**Memory never outranks instructions.** An applicable `AGENTS.md`, a current
+instruction from you, the active mode and the permission profile all take
+precedence over anything remembered. Memory is delivered as the
+lowest-priority context category, after file content and plan state, and a
+remembered sentence is shown to the model as a dated claim with its provenance —
+never as an instruction. Removing an entry in the context panel removes it from
+that turn, not from the store.
+
+**A secret is refused, not redacted.** If a candidate statement contains
+something the secret scanner recognises, Damaian refuses it and says so. It does
+not store a placeholder: "the database password is `[REDACTED]`" would be
+recalled forever, cost context every turn, and record that a credential exists.
+Pattern matching cannot recognise every credential, which is why confirmation
+shows you the exact sentence that will persist, and why a stored memory is still
+redacted on its way into a request.
+
+**Where it lives.** `<data dir>/memory/` — see
+[Troubleshooting](TROUBLESHOOTING.md#memory). Memory files are **not safe to
+share**: a project memory can name a machine, a path or a preference. The audit
+trail records lifecycle events without a personal or environmental statement.
+
+**In this build.** The record, store, scopes, migration and audit are present;
+the creation and consent flow and recall through the context panel arrive in the
+two features that build on this one. No memory is created yet, and none is
+recalled, so a missing entry in the context panel is not a fault.
 
 ## Working Folder
 

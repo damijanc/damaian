@@ -1325,8 +1325,10 @@ impl MemoryStore {
 
     fn ensure_memory_dir(&self) -> MemoryResult<()> {
         let directory = self.memory_dir();
-        fs::create_dir_all(directory.join(PROJECT_DIRECTORY))?;
+        let projects = directory.join(PROJECT_DIRECTORY);
+        fs::create_dir_all(&projects)?;
         set_private_directory(&directory)?;
+        set_private_directory(&projects)?;
         Ok(())
     }
 
