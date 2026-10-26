@@ -117,6 +117,9 @@ impl ProfileId {
                 command_access: Some(CommandAccess::None),
                 allow_browser_diagnostics: Some(false),
                 allow_mutating_mcp_tools: Some(false),
+                // A commit writes to the repository, which a read-only
+                // checkout does not permit (spec 35 §5.8).
+                allow_git_commits: Some(false),
                 ..ConfigOverlay::default()
             },
             ProfileId::SafeLocal => ConfigOverlay {
@@ -167,6 +170,8 @@ pub struct ProfileCapabilities {
     pub command_access: CommandAccess,
     pub allow_browser_diagnostics: bool,
     pub allow_mutating_mcp_tools: bool,
+    /// Spec 35 §5.8: whether this checkout may create commits.
+    pub allow_git_commits: bool,
     pub mcp_enabled: bool,
 }
 
@@ -357,6 +362,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         command_access,
         allow_browser_diagnostics,
         allow_mutating_mcp_tools,
+        allow_git_commits,
         block_generated_secrets,
         audit_enabled,
         audit_retention_days,
@@ -562,6 +568,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         command_access,
         allow_browser_diagnostics,
         allow_mutating_mcp_tools,
+        allow_git_commits,
         audit_retention_days,
         checkpoint_retention_days,
         agent_max_task_tokens,

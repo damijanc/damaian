@@ -278,6 +278,10 @@ pub struct Config {
     pub command_access: CommandAccess,
     pub allow_browser_diagnostics: bool,
     pub allow_mutating_mcp_tools: bool,
+    /// Whether this checkout may create commits at all (spec 35 §5.8). A
+    /// commit is the first write to the user's repository, so it is a
+    /// capability like file edits, and a repository may turn it down.
+    pub allow_git_commits: bool,
     pub block_generated_secrets: bool,
     pub audit_enabled: bool,
     pub audit_retention_days: u64,
@@ -1136,6 +1140,7 @@ impl Config {
             command_access,
             allow_browser_diagnostics,
             allow_mutating_mcp_tools,
+            allow_git_commits,
             block_generated_secrets,
             audit_enabled,
             audit_retention_days,
@@ -1442,6 +1447,12 @@ impl Config {
                 "allow_mutating_mcp_tools",
                 &mut self.allow_mutating_mcp_tools,
                 allow_mutating_mcp_tools,
+                false,
+            ),
+            (
+                "allow_git_commits",
+                &mut self.allow_git_commits,
+                allow_git_commits,
                 false,
             ),
             ("mcp_enabled", &mut self.mcp_enabled, mcp_enabled, false),
@@ -2450,6 +2461,7 @@ impl Config {
             command_access: self.command_access,
             allow_browser_diagnostics: self.allow_browser_diagnostics,
             allow_mutating_mcp_tools: self.allow_mutating_mcp_tools,
+            allow_git_commits: self.allow_git_commits,
             mcp_enabled: self.mcp_enabled,
         }
     }
@@ -2569,6 +2581,11 @@ impl Config {
             &mut output,
             "allow_mutating_mcp_tools",
             &self.allow_mutating_mcp_tools.to_string(),
+        );
+        push_line(
+            &mut output,
+            "allow_git_commits",
+            &self.allow_git_commits.to_string(),
         );
         push_line(
             &mut output,
@@ -2739,6 +2756,7 @@ impl Default for Config {
             command_access: CommandAccess::All,
             allow_browser_diagnostics: true,
             allow_mutating_mcp_tools: true,
+            allow_git_commits: true,
             block_generated_secrets: true,
             audit_enabled: true,
             audit_retention_days: 90,
@@ -2829,6 +2847,7 @@ pub struct ConfigOverlay {
     pub command_access: Option<CommandAccess>,
     pub allow_browser_diagnostics: Option<bool>,
     pub allow_mutating_mcp_tools: Option<bool>,
+    pub allow_git_commits: Option<bool>,
     pub block_generated_secrets: Option<bool>,
     pub audit_enabled: Option<bool>,
     pub audit_retention_days: Option<u64>,
@@ -2976,6 +2995,9 @@ classify_overlay_fields! {
     command_access => Capability,
     allow_browser_diagnostics => Capability,
     allow_mutating_mcp_tools => Capability,
+    // Spec 35: a commit is the first write to the user's repository, so a
+    // clone may refuse it and may never grant it.
+    allow_git_commits => Capability,
     block_generated_secrets => Capability,
     audit_enabled => Capability,
     // Free at repository scope in spec 34, so a preference here. Whether a
@@ -3223,6 +3245,7 @@ impl ConfigOverlay {
             "allow_mutating_mcp_tools" => {
                 self.allow_mutating_mcp_tools = Some(parse_bool(key, value)?)
             }
+            "allow_git_commits" => self.allow_git_commits = Some(parse_bool(key, value)?),
             "block_generated_secrets" => {
                 self.block_generated_secrets = Some(parse_bool(key, value)?)
             }
@@ -3611,6 +3634,7 @@ impl ConfigOverlay {
             command_access,
             allow_browser_diagnostics,
             allow_mutating_mcp_tools,
+            allow_git_commits,
             block_generated_secrets,
             audit_enabled,
             audit_retention_days,
@@ -3764,6 +3788,9 @@ impl ConfigOverlay {
         }
         if let Some(value) = allow_mutating_mcp_tools {
             push_line(&mut output, "allow_mutating_mcp_tools", &value.to_string());
+        }
+        if let Some(value) = allow_git_commits {
+            push_line(&mut output, "allow_git_commits", &value.to_string());
         }
         if let Some(value) = block_generated_secrets {
             push_line(&mut output, "block_generated_secrets", &value.to_string());

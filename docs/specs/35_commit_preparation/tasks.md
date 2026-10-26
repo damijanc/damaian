@@ -11,7 +11,7 @@ pre-implementation state in [`context.md`](context.md)
 | Task | State | Notes |
 |---|---|---|
 | 1 · Folder, links, plan | Done 2026-10-26 | Converted the single file to `proposal.md`, added `context.md` (fifteen corrections, decisions D1–D10) and this plan, updated every link that named the old path (README, #36, #37, #38, #52, #57, #58), and set `In progress` in the proposal, the README current-state bullet, the README implementation-order row and this header. `npm run specs:check` passed: 66 specs, dependency lines and status records agree. Fast checks passed: `scripts/quality-gate.sh fmt node lint typos deny`; `npm ci` was needed first because the worktree had no `node_modules`. |
-| 2 · The `allow_git_commits` capability | Not started | |
+| 2 · The `allow_git_commits` capability | Done 2026-10-26 | Added the sixth capability key beside `allow_file_edits`: `Config` default `true`, `ConfigOverlay` parse/serialise, an explicit capability classification, a restrict-only merge case, `ProfileCapabilities.allow_git_commits`, `ReadOnly` turns it off, the effective-policy label "Git commits allowed", and `Config::profile_capabilities`. The weakening case in `tests/permission_profiles.rs` proves a repository can only refuse it; `each_built_in_profile_resolves_to_its_table_row` now expects Read-only `false`. Scoped `cargo nextest -p workspace-engine --test permission_profiles` passed (74 passed, 1 skipped); clippy clean; fast checks clean after `cargo fmt`. |
 | 3 · Durable acceptance detail and the commit engine | Not started | |
 | 4 · Git hooks: detect, report, run, never bypass | Not started | |
 | 5 · Exact bytes, the secret check and the per-commit override | Not started | |
