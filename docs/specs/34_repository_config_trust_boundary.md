@@ -283,7 +283,7 @@ The key is the existing `repository_id` (`indexer.rs:382-385`,
 because it is per checkout: an approval granted for a repository at one path
 should not silently transfer to a different checkout the user has not looked at.
 (This is the opposite of the requirement in
-[spec 28](28_memory_model_and_storage.md) §5.2, where memory wants identity to
+[spec 28](28_memory_model_and_storage/proposal.md) §5.2, where memory wants identity to
 survive a move — worth noting so the difference reads as deliberate.)
 
 Consequences:

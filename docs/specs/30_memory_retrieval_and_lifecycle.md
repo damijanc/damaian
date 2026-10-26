@@ -5,7 +5,7 @@ Order: 30 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#28](28_memory_model_and_storage.md) (the store) — **not built**;
+Depends on: [#28](28_memory_model_and_storage/proposal.md) (the store) — **not built**;
 [#29](29_memory_creation_and_consent.md) (the consent gate) — **not built**.
 Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
@@ -14,7 +14,7 @@ specs: [`11_agents_md_support.md`](11_agents_md_support.md),
 [`20_working_modes/proposal.md`](20_working_modes/proposal.md),
 [`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (the only delivery path),
 [`27_context_inspector.md`](27_context_inspector/proposal.md) (where recall is visible
-and removable), [`28_memory_model_and_storage.md`](28_memory_model_and_storage.md),
+and removable), [`28_memory_model_and_storage/proposal.md`](28_memory_model_and_storage/proposal.md),
 [`29_memory_creation_and_consent.md`](29_memory_creation_and_consent.md).
 See also [`SECURITY.md`](../../SECURITY.md).
 
@@ -23,7 +23,7 @@ See also [`SECURITY.md`](../../SECURITY.md).
 This is the work package where memory either becomes safe or becomes the hidden
 instruction channel the product direction rejects.
 
-[Spec 28](28_memory_model_and_storage.md) gives memory a shape with provenance
+[Spec 28](28_memory_model_and_storage/proposal.md) gives memory a shape with provenance
 and state. [Spec 29](29_memory_creation_and_consent.md) ensures nothing enters
 without the user agreeing. Neither prevents the remaining failure: a store full
 of legitimately confirmed entries, delivered invisibly, growing stale, quietly
@@ -51,7 +51,7 @@ mechanisms below are what make the slow failure detectable.
 
 ## 2. Current State
 
-- **No memory exists.** [Spec 28](28_memory_model_and_storage.md) defines the
+- **No memory exists.** [Spec 28](28_memory_model_and_storage/proposal.md) defines the
   store; [spec 29](29_memory_creation_and_consent.md) the creation gate. This
   spec is the read side.
 - **Context assembly is category-budgeted with a manifest.**
@@ -63,7 +63,7 @@ mechanisms below are what make the slow failure detectable.
   optional items ([spec 27](27_context_inspector/proposal.md) §5.2, §5.4), with
   `ContextCategory::Required` non-removable by API.
 - **Verification distinguishes evidence staleness.**
-  [Spec 28](28_memory_model_and_storage.md) §5.1 defines
+  [Spec 28](28_memory_model_and_storage/proposal.md) §5.1 defines
   `Verification::{UserConfirmed, EvidenceCurrent, EvidenceStale}`, and
   `EvidenceRef { path, content_hash }` (§5.5) is what makes the transition
   detectable.
@@ -76,10 +76,10 @@ mechanisms below are what make the slow failure detectable.
   the same comparison drives staleness here.
 - **Project isolation is keyed by `project_key`**, resolved from the root commit,
   then the remote, then the path hash
-  ([spec 28](28_memory_model_and_storage.md) §5.2) — not by `repository_id`,
+  ([spec 28](28_memory_model_and_storage/proposal.md) §5.2) — not by `repository_id`,
   which is path-derived (`indexer.rs:382-385`).
 - **`memory_user_scope_enabled` gates user scope on read as well as write**
-  ([spec 28](28_memory_model_and_storage.md) §5.6).
+  ([spec 28](28_memory_model_and_storage/proposal.md) §5.6).
 
 ## 3. Requirements
 
@@ -252,7 +252,7 @@ questionable.
 
 Requirement 7. An entry with `MemoryProvenance::RepositoryEvidence` carries
 `EvidenceRef { path, content_hash }`
-([spec 28](28_memory_model_and_storage.md) §5.5).
+([spec 28](28_memory_model_and_storage/proposal.md) §5.5).
 
 Revalidation is a hash comparison, the same mechanism as `patch_engine.rs:291`:
 
@@ -296,7 +296,7 @@ restriction gets the memory back and one who wants it gone can delete it
 deliberately. Deleting on a policy change would destroy user-confirmed knowledge
 as a side effect of tightening a pattern.
 
-Transitions are audited ([spec 28](28_memory_model_and_storage.md) §5.8), so a
+Transitions are audited ([spec 28](28_memory_model_and_storage/proposal.md) §5.8), so a
 user can see when an entry went stale and why.
 
 ### 5.6 Retention and complete deletion
@@ -307,7 +307,7 @@ does not become false because it is old, and time-based deletion of user-confirm
 knowledge would be a surprising default.
 
 An entry may carry its own `MemoryExpiry`
-([spec 28](28_memory_model_and_storage.md) §5.1) when the user sets one — useful
+([spec 28](28_memory_model_and_storage/proposal.md) §5.1) when the user sets one — useful
 for `Environment` facts like "the staging URL is X during the migration".
 
 **Complete deletion** is the part with a trap. Requirement 8 and the roadmap's
@@ -324,7 +324,7 @@ derived copies do exist and must be handled:
   written against behaviour — a deleted entry never reappears — so a cache added
   later without invalidation fails it.
 
-Deletion appends a `Deleted`-state record ([spec 28](28_memory_model_and_storage.md)
+Deletion appends a `Deleted`-state record ([spec 28](28_memory_model_and_storage/proposal.md)
 §5.3's append-only JSONL) rather than removing the line, which preserves the
 audit trail. A `Deleted` entry is filtered at step 2 of §5.3 and can never be
 recalled. Purging the historical lines entirely is a separate explicit action —
@@ -333,7 +333,7 @@ recalled. Purging the historical lines entirely is a separate explicit action �
 ### 5.7 Scope isolation
 
 Requirement 5. Project retrieval filters on `project_key`
-([spec 28](28_memory_model_and_storage.md) §5.2), and the store is a
+([spec 28](28_memory_model_and_storage/proposal.md) §5.2), and the store is a
 per-`project_key` file, so isolation is a consequence of the layout as well as
 the filter.
 
@@ -344,7 +344,7 @@ continuing quietly would be a cross-repository leak — the single worst outcome
 this phase.
 
 The isolation test runs at each `project_key` resolution tier, per
-[spec 28](28_memory_model_and_storage.md)'s acceptance criteria.
+[spec 28](28_memory_model_and_storage/proposal.md)'s acceptance criteria.
 
 ### 5.8 Evals
 

@@ -93,7 +93,7 @@ storage, not new storage.
   index is a second persisted artifact that can disagree with the log.
 - **Cross-session context.** Search finds a session; it does not feed one
   session's content into another's context. That is memory
-  ([spec 28](../28_memory_model_and_storage.md) onward) with its own consent rules.
+  ([spec 28](../28_memory_model_and_storage/proposal.md) onward) with its own consent rules.
 - **Sharing, uploading, or publishing.** Export writes a file the user chose.
   There is no link, no service and no account.
 - **Editing a transcript.** The log is append-only and stays that way; a rewind

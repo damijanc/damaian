@@ -5,7 +5,7 @@ Order: 29 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#28](28_memory_model_and_storage.md) (the memory record and store)
+Depends on: [#28](28_memory_model_and_storage/proposal.md) (the memory record and store)
 — **not built**. Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
@@ -14,7 +14,7 @@ and secret policy), section 7.8 (risk classification and approval), section 7.10
 [`11_agents_md_support.md`](11_agents_md_support.md) (instruction precedence
 memory sits below), [`20_working_modes/proposal.md`](20_working_modes/proposal.md) (mode is a
 capability boundary memory cannot widen),
-[`28_memory_model_and_storage.md`](28_memory_model_and_storage.md) (the record
+[`28_memory_model_and_storage/proposal.md`](28_memory_model_and_storage/proposal.md) (the record
 this spec creates), [`30_memory_retrieval_and_lifecycle.md`](30_memory_retrieval_and_lifecycle.md).
 See also [`SECURITY.md`](../../SECURITY.md).
 
@@ -45,19 +45,19 @@ them.**
 ## 2. Current State
 
 - **No memory exists**, so there is no current creation path.
-  [Spec 28](28_memory_model_and_storage.md) defines the record and the store.
+  [Spec 28](28_memory_model_and_storage/proposal.md) defines the record and the store.
 - **`MemoryProvenance` has no model-inference variant**
-  ([spec 28](28_memory_model_and_storage.md) §5.1). Its three variants each
+  ([spec 28](28_memory_model_and_storage/proposal.md) §5.1). Its three variants each
   require a session and message, a confirmed suggestion, or repository evidence,
   so an unconfirmed inference has nowhere to be recorded. This spec's
   requirement 2 is partly enforced by that type already.
 - **Secret refusal is available.** `SecretScanner::contains_secrets`
   (`crates/workspace-engine/src/secret_scanner.rs:65`) and `scan`
   (`secret_scanner.rs:27`) return findings without transforming;
-  [spec 28](28_memory_model_and_storage.md) §5.4 puts refusal on the store's
+  [spec 28](28_memory_model_and_storage/proposal.md) §5.4 puts refusal on the store's
   write path.
 - **User scope is off by default and enforced on both read and write**
-  ([spec 28](28_memory_model_and_storage.md) §5.6), gated by
+  ([spec 28](28_memory_model_and_storage/proposal.md) §5.6), gated by
   `memory_user_scope_enabled`.
 - **Instruction precedence is established.**
   [Spec 11](11_agents_md_support.md) defines how `AGENTS.md` orders against user
@@ -252,7 +252,7 @@ suggestion can stop being offered.
 ### 5.5 Secret refusal at the proposal stage
 
 Requirement 4's enforcement lives on the store's write path
-([spec 28](28_memory_model_and_storage.md) §5.4), and it is applied again here,
+([spec 28](28_memory_model_and_storage/proposal.md) §5.4), and it is applied again here,
 earlier: a proposal whose statement contains a detected secret is never shown.
 
 Both checks are deliberate. The store's check is the guarantee; the proposal
@@ -266,14 +266,14 @@ store it" — and the refusal itself is audited without the statement.
 "Unnecessary file content" in requirement 4 is bounded structurally rather than
 by judgement: a `statement` is a single normalized sentence with a length
 ceiling, and `EvidenceRef` holds a path and a hash
-([spec 28](28_memory_model_and_storage.md) §5.5), never an excerpt. A proposal
+([spec 28](28_memory_model_and_storage/proposal.md) §5.5), never an excerpt. A proposal
 whose statement exceeds the ceiling is rejected rather than truncated, since a
 truncated sentence is a misleading memory.
 
 ### 5.5a Eligible evidence: protected and ignored files are off limits
 
 Requirement 8's second half. A `RepositoryObservation` proposal
-([spec 28](28_memory_model_and_storage.md) §5.1) derives a statement from
+([spec 28](28_memory_model_and_storage/proposal.md) §5.1) derives a statement from
 repository content, and some repository content is content the user has already
 told Damaian to stay out of. A memory derived from it would launder that content
 into a permanent, cross-session store — the one place it is hardest to notice

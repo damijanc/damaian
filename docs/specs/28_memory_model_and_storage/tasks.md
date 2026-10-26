@@ -1,0 +1,279 @@
+# Memory Model and Storage — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Implements:** [`proposal.md`](proposal.md) (requirements 1-6 and acceptance
+criteria) · corrections and planning decisions in [`context.md`](context.md)
+**Started:** 2026-10-26 — **Done:** in progress
+
+## Progress
+
+| Task | State | Notes |
+|---|---|---|
+| 1 · Folder conversion, status and links | Done 2026-10-26 | `git mv` of the flat spec; `proposal.md` keeps §1 and §3-§7 with its `§5.x` numbering intact, `context.md` holds the former §2 plus a corrections table for every drifted line reference, and `tasks.md` is new. Status In progress in the proposal, the README current-state bullets and both implementation-order rows. Every link naming the flat file in specs 27, 29, 30, 34, 50, 53, 55 and the README now names `28_memory_model_and_storage/proposal.md`. A relative-link scan over `docs/**/*.md` found no broken link in this folder; the one failure it reported is pre-existing in spec 66. `npm run specs:check` was not run (it needs `node_modules`); scoped docs-only change, no Rust touched. |
+| 2 · Record types and sensitivity by rule | Not started | |
+| 3 · Project identity resolution | Not started | |
+| 4 · Store layout, schema version and migration | Not started | |
+| 5 · Refusal path: secrets, evidence, scopes | Not started | |
+| 6 · Lifecycle transitions and audit | Not started | |
+| 7 · User-scope config key and engine wiring | Not started | |
+| 8 · Documentation and close-out | Not started | |
+
+**Goal:** Give Damaian a local, versioned, per-project memory store whose record
+shape makes #29's consent gate and #30's retrieval possible — with a project
+identity that survives moves and clone paths, a secret path that refuses rather
+than redacts, and no way to persist an unconfirmed model inference.
+
+**Architecture:** A new `memory` module in `workspace-engine` holds the record
+types, the project identity resolver, and `MemoryStore`. Project and user entries
+are append-only JSONL under `<data_dir>/memory/`; session entries are appended to
+the existing session log through a narrow `SessionStore` method. `MemoryStore` is
+the single write path, so the secret check, evidence-eligibility check, scope
+check and sensitivity derivation cannot be bypassed by a future caller.
+`WorkspaceEngine` exposes one store; nothing in `chat.rs` or `context_manager.rs`
+changes.
+
+**Tech Stack:** Rust 2024, existing `serde`/`serde_json`, existing `SecretScanner`,
+`AuditLog`, `PathPolicy`, `SessionStore`, `GitService`, the existing JSONL and
+schema-marker conventions. No new dependencies. No JavaScript.
+
+## Global Constraints
+
+Every task's requirements implicitly include this section.
+
+- **Read [`context.md`](context.md) first.** Its decisions override the
+  proposal where they differ:
+  - D1: `project_key` is `root_…`, `remote_…` or `path_…`; the prefix names the
+    tier and the suffix is filesystem-safe.
+  - D2: schema version 0 is "files with no marker"; migration to 1 appends
+    normalized records and then writes the marker.
+  - D3: `MemoryExpiry` is a struct with an optional timestamp and a
+    revalidation flag.
+  - D4: session-scope writes use `SessionStore`'s `pub(crate)` memory methods;
+    `append_session_event` stays private.
+  - D5: evidence paths must be repository-relative; absolute paths and `..` are
+    refused before any policy check.
+- **One write path.** `MemoryStore::insert` (and its transition methods) run the
+  secret check, evidence check, scope check and sensitivity derivation for
+  **every** scope. Nothing may write a memory by another route.
+- **Secrets are refused, never redacted.** Use `SecretScanner::scan` (or
+  `contains_secrets`); never `redact` on a write. A refusal names no content and
+  no secret.
+- **Memory is data, never instruction.** `MemoryProvenance` has exactly three
+  variants; do not add a model-inference variant. Do not add instruction parsing,
+  allow-list changes, mode effects, or a path that persists an unconfirmed
+  candidate. #29 owns proposals and consent.
+- **`repository_id` and every store keyed by it stay unchanged.**
+- **Do not edit `chat.rs` or `context_manager.rs`.** #30 owns retrieval and the
+  memory context category.
+- **Repository config is untrusted.** `memory_user_scope_enabled` is Forbidden at
+  repository and profile scope, and the classification must go through the
+  existing exhaustive machinery — no wildcard.
+- **No security boundary is weakened:** redaction, path policy, command policy,
+  patch hashes, questions-are-not-approvals, repository-config trust.
+- **Audit without content.** Audit fields are entry id, scope, category,
+  provenance type, state transition, and — only for `Ordinary` sensitivity — the
+  statement. `Personal` and `Environmental` statements never appear in an audit
+  field.
+- **Fixtures** use throwaway data directories, `enable_index_watcher: false`,
+  real local Git repositories where identity is under test, and no credentials.
+  Never take port 4765 and never kill a process by name.
+- **Scoped checks only.** `scripts/quality-gate.sh fmt node lint typos deny`,
+  `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`, and
+  the scoped nextest suites. The full workspace gate is CI's job.
+
+## Task 1 · Folder conversion, status and links
+
+- [x] `git mv docs/specs/28_memory_model_and_storage.md
+      docs/specs/28_memory_model_and_storage/proposal.md`.
+- [x] Move the pre-implementation state out of the proposal into
+      `context.md`, with every line reference re-verified and a corrections
+      table.
+- [x] Write this `tasks.md` with Global Constraints, tasks, progress table and
+      verification.
+- [x] Set `Status: In progress` in `proposal.md`; update the README current-state
+      paragraph and the implementation-order row.
+- [x] Repoint every link that named `28_memory_model_and_storage.md`, in specs
+      29, 30, 34, 50, 53, 55, the README and this spec's neighbours.
+- [x] Confirm no relative link in the new folder is broken and no stale flat
+      path remains (`grep -rn "28_memory_model_and_storage.md" docs/`). The only
+      matches left are this task's own record.
+
+**Verification:** `git status` shows the rename; the grep above finds only
+intentional folder-path references (e.g. a link to `proposal.md` inside the
+folder); `npm run specs:check` reports no new mismatch for #28.
+
+## Task 2 · Record types and sensitivity by rule
+
+- [ ] Add `crates/workspace-engine/src/memory.rs` and export it from `lib.rs`.
+- [ ] Define `MemoryScope`, `MemoryCategory`, `MemoryState`, `Verification`,
+      `Sensitivity`, `MemoryProvenance`, `EvidenceRef`, `MemoryExpiry` and
+      `MemoryEntry` exactly as the proposal's §5.1 and §5.5 shapes require,
+      with `serde(rename_all = "camelCase")` on the structs and
+      `serde(rename_all = "snake_case")` on the enums.
+- [ ] Give `Sensitivity` a total restrictiveness order
+      (`Ordinary < Environmental < Personal`) and derive it by rule, in the
+      proposal's order: an environmental marker anywhere, then a `Preference`
+      category or `User` scope, else `Ordinary`; the most restrictive match wins.
+- [ ] Implement environmental-marker detection: absolute path, `~/` path,
+      hostname (including `localhost`, `.local`, dotted names), `host:port` /
+      `:port`, IPv4, and the local user name from `USER`/`LOGNAME`/`HOME`.
+- [ ] Add `MemoryEntry::effective_sensitivity()` returning the maximum of the
+      stored value and the derived one, plus `with_sensitivity_raised_to_derived`.
+- [ ] Unit tests for each derivation row, for the restriction order, and for a
+      lowering attempt being raised.
+
+**Verification:** `cargo nextest run -p workspace-engine --lib memory::` passes;
+`cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`.
+
+## Task 3 · Project identity resolution
+
+- [ ] Add read-only identity helpers to `git_service.rs`: the first root commit
+      (`git rev-list --max-parents=0 HEAD`, first line) and the `origin` URL
+      (`git config --get remote.origin.url`). Neither is audited, matching
+      `head_commit`.
+- [ ] Add `ProjectKeySource { RootCommit, RemoteUrl, RepositoryId }` and
+      `ProjectIdentity { key, source, repository_id }` to `memory.rs`.
+- [ ] `ProjectIdentity::resolve(root, repository_id, &GitService)` resolves in
+      order: root commit → `root_<sha>`; normalized origin URL →
+      `remote_<sha256[..16]>`; `repository_id` → `path_<repository_id>`.
+- [ ] Normalize a remote URL: strip scheme, credentials, port and a trailing
+      `.git`, lowercase the host, keep host and path; handle `git@host:owner/repo`
+      scp syntax. Return `None` for a URL with no host or path.
+- [ ] Test each tier, including two checkouts of one repository sharing a key
+      (clone), a renamed checkout keeping its key, two unrelated repositories
+      differing at every tier, and a fork sharing the root commit deliberately.
+- [ ] Record the measured cost of resolution (a `git` process per tier) in the
+      progress row and in the proposal's §7.
+
+**Verification:** `cargo nextest run -p workspace-engine --test memory
+project_identity`; scoped clippy.
+
+## Task 4 · Store layout, schema version and migration
+
+- [ ] `MemoryStore` over `<data_dir>/memory/`:
+      `schema.conf`, `project/<project_key>.jsonl`, `user.jsonl`; create the
+      directory with mode `0700`.
+- [ ] Append one complete JSON record per `\n`-terminated line; replay by id with
+      the last record winning; discard a torn final line; skip and count an
+      unparsable middle line rather than failing the whole store.
+- [ ] Read/write the flat `schema_version=1` marker. Equal proceeds; older
+      migrates; newer or unparsable refuses with the path and both versions and
+      changes nothing.
+- [ ] Migration from 0 (no marker): for each project and user file, append a
+      normalized record for every parseable entry — derive `sensitivity`, default
+      a missing `state` to `Active`, keep the original line — then write the
+      marker. Audit `memory_schema_migrated` with `from`/`to` only.
+- [ ] Tests: round-trip every field; append-only growth (a rewrite never
+      truncates); torn final line; a v0 directory read after upgrade with the
+      marker now 1 and the pre-migration line still present; a newer and an
+      unparsable version each refusing and leaving bytes untouched.
+- [ ] Test `DAMAIAN_DATA_DIR` is honoured by constructing the store from
+      `Config::default_data_dir`.
+
+**Verification:** `cargo nextest run -p workspace-engine --test memory store_`;
+scoped clippy.
+
+## Task 5 · Refusal path: secrets, evidence, scopes
+
+- [ ] Define `MemoryError`/`MemoryRefusal` with stable variants for a detected
+      secret, ineligible evidence (restricted / ignored / not-relative), a
+      disabled scope, an invalid shape and an unsupported schema. Implement
+      `Display` with the stated sentences and `From<MemoryError> for ClientError`.
+- [ ] `MemoryStore::insert(root, entry)` validates scope/key consistency: Project
+      requires `project_key` equal to the root's resolved key and no session id;
+      Session requires a session id and no project key; User requires neither.
+- [ ] Secret refusal: scan the statement and every evidence path with
+      `SecretScanner::scan`; any finding refuses the write. Never call `redact`.
+- [ ] Evidence eligibility: refuse an absolute path or one containing `..`; then
+      `PathPolicy::is_restricted(path, false)`; then ignore rules accumulated
+      from configured `ignore_patterns` plus per-directory `.gitignore` files
+      from the root down.
+- [ ] Scope enforcement: a User write refuses when
+      `memory_user_scope_enabled=false`; a User read returns nothing without
+      opening `user.jsonl` when false.
+- [ ] Session writes append through `SessionStore::append_memory_record`
+      (`pub(crate)`), never by calling `append_session_event`; reads go through
+      `memory_records`. A session entry is invisible from another session and
+      disappears with `delete_session`.
+- [ ] Sensitivity is applied on the write path: the stored value is the maximum
+      of what the caller supplied and the derived rule, so a caller cannot lower
+      it.
+- [ ] Tests: session-scope write carrying a seeded fake secret is refused and
+      nothing reaches the session log; a project entry citing a
+      `restricted_patterns` path is refused when calling the store directly; the
+      same for a per-directory `.gitignore` path; user scope refused on write and
+      unread on read while disabled; session isolation and deletion.
+
+**Verification:** `cargo nextest run -p workspace-engine --test memory refusal`
+and `memory::session`; scoped clippy.
+
+## Task 6 · Lifecycle transitions and audit
+
+- [ ] Implement transitions as appended records, never rewrites: edit statement,
+      mark state (`Superseded`, `Expired`, `Deleted`, back to `Active`), and
+      supersede (new entry carries `supersedes`; old entry becomes `Superseded`).
+      Re-run the secret, evidence, sensitivity and scope checks whenever the
+      statement or scope changes.
+- [ ] `record_recall(entries)` appends one `memory_recalled` event per entry,
+      with ids only plus the statement when `Ordinary`.
+- [ ] Audit every transition through `AuditLog::record`: `memory_created`,
+      `memory_confirmed` (when provenance is `SuggestedAndConfirmed`),
+      `memory_recalled`, `memory_edited`, `memory_superseded`, `memory_expired`,
+      `memory_deleted`. Fields: `entryId`, `scope`, `category`, `provenance`,
+      `fromState`, `toState`, and `statement` only when sensitivity is
+      `Ordinary`.
+- [ ] Tests: one lifecycle walk asserting one event per transition; a
+      `Personal` statement and an `Environmental` statement each absent from the
+      whole audit file; an `Ordinary` statement present; a disabled audit log
+      returns the event JSON but writes nothing.
+
+**Verification:** `cargo nextest run -p workspace-engine --test memory audit`;
+scoped clippy.
+
+## Task 7 · User-scope config key and engine wiring
+
+- [ ] Add `memory_user_scope_enabled: bool` (default `false`) to `Config` and
+      `ConfigOverlay`, and carry it through every exhaustive destructure listed
+      in `context.md` §5: overlay apply (Forbidden), policy text, parse line,
+      `classify_overlay_fields!` (Capability), `split_profile_keys` (refused),
+      and `effective_policy::rule_label` ("Remember facts across projects").
+- [ ] Add a `weakening_cases()` entry in `tests/permission_profiles.rs` proving a
+      repository cannot set the key either way, and that the profile split
+      refuses it.
+- [ ] Construct `MemoryStore` in `WorkspaceEngine::build` and expose
+      `pub memory_store: MemoryStore`; export the module and record types from
+      `lib.rs`. Nothing else consumes it yet.
+- [ ] Test: default is false; user config true enables it; repository config
+      cannot set it in either direction; profile export does not carry it.
+
+**Verification:** `cargo nextest run -p workspace-engine --test
+permission_profiles` (the two partition tests plus the new case) and
+`cargo nextest run -p workspace-engine --lib config::`; scoped clippy.
+
+## Task 8 · Documentation and close-out
+
+- [ ] `docs/USER_GUIDE.md`: what memory is, the three scopes, why user scope is
+      off by default and how to enable it, and that memory never outranks
+      `AGENTS.md` or a current instruction.
+- [ ] `docs/TROUBLESHOOTING.md`: where memory lives, how to read a file, how the
+      `project_key` tier is read from the filename prefix, what a refused secret
+      write looks like, and that memory files are **not** safe to share.
+- [ ] Fill the proposal's §7 implementation notes: tier resolved per fixture,
+      fork-sharing observations, and measured `project_key` resolution cost.
+- [ ] Mark the spec Done in all four places: `proposal.md` `Status`, README
+      current state, README implementation-order row, `tasks.md` header and
+      progress table.
+- [ ] Promote #29: flip its `Depends on:` line to built, update the README ready
+      set, and add a "Re-derived on 2026-10-26" history entry naming what #28
+      leaves for #29 and #30.
+- [ ] Remove #28's line from `CHANGELOG.md` → Unreleased. Do not add a release
+      row.
+- [ ] Walk the acceptance criteria in proposal §6 against the tests and record
+      any that could not be verified.
+- [ ] Run the fast checks and scoped suites; say plainly that the workspace
+      clippy and test suite are left to CI.
+
+**Verification:** `scripts/quality-gate.sh fmt node lint typos deny`;
+`cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`;
+`cargo nextest run -p workspace-engine --test memory`; `npm run specs:check`.

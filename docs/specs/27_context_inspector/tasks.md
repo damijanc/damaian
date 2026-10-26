@@ -788,7 +788,7 @@ the pause matrix test lives there.
 **Requirements:** §5.7, all acceptance criteria. **Context:** §10.
 
 **Files:** `docs/USER_GUIDE.md`, `docs/TROUBLESHOOTING.md`, `CHANGELOG.md`,
-`docs/specs/README.md`, `docs/specs/28_memory_model_and_storage.md`,
+`docs/specs/README.md`, `docs/specs/28_memory_model_and_storage/proposal.md`,
 `docs/specs/32_hooks/proposal.md`, `proposal.md`, this file.
 
 - [x] **Step 1: Documentation.**

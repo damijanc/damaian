@@ -127,7 +127,7 @@ costs the turn.
   ([spec 04](../04_hunk_level_patch_apply.md)), and routing it through a question
   would bypass the review surface.
 - **Remembering answers across turns or sessions.** That is memory
-  ([spec 28](../28_memory_model_and_storage.md) onward) and has its own consent
+  ([spec 28](../28_memory_model_and_storage/proposal.md) onward) and has its own consent
   rules.
 - **A timeout that answers for the user.** A question with no answer waits. An
   engine that picked a default after thirty seconds would be guessing with extra

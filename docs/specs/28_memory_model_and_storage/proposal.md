@@ -1,25 +1,32 @@
 # Feature Spec: Memory Model and Storage
 
-Status: Not started
+Status: In progress
 Order: 28 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 1 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#26](26_context_assembly/proposal.md) (context assembly) — built
+Depends on: [#26](../26_context_assembly/proposal.md) (context assembly) — built
 (Done 2026-10-25);
-[#27](27_context_inspector/proposal.md) (the inspector memory appears in) — built
+[#27](../27_context_inspector/proposal.md) (the inspector memory appears in) — built
 (Done 2026-10-26). Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.10 (secret detection). Related implementation
-specs: [`11_agents_md_support.md`](11_agents_md_support.md) (the inspectable,
+specs: [`11_agents_md_support.md`](../11_agents_md_support.md) (the inspectable,
 user-owned model memory should imitate),
-[`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) and
-[`27_context_inspector.md`](27_context_inspector/proposal.md) (memory is delivered and
-inspected through these, never around them),
-[`29_memory_creation_and_consent.md`](29_memory_creation_and_consent.md),
-[`30_memory_retrieval_and_lifecycle.md`](30_memory_retrieval_and_lifecycle.md).
-See also [`SECURITY.md`](../../SECURITY.md).
+[`26_context_assembly/proposal.md`](../26_context_assembly/proposal.md) and
+[`27_context_inspector/proposal.md`](../27_context_inspector/proposal.md) (memory
+is delivered and inspected through these, never around them),
+[`29_memory_creation_and_consent.md`](../29_memory_creation_and_consent.md),
+[`30_memory_retrieval_and_lifecycle.md`](../30_memory_retrieval_and_lifecycle.md).
+See also [`SECURITY.md`](../../../SECURITY.md).
+
+The pre-implementation state this proposal was written against, including where
+its line references had drifted by 2026-10-26, is in [`context.md`](context.md).
+The original flat spec's "Current State" section moved there; the remaining
+section numbers are unchanged so every existing `§5.x` cross-reference in specs
+29 and 30 keeps resolving. Task order and verification are in
+[`tasks.md`](tasks.md).
 
 ## 1. Motivation
 
@@ -29,13 +36,13 @@ against adding a runtime dependency, explains it again today.
 
 `AGENTS.md` is the current substitute and is the right model to imitate: a file
 the user owns, can read, can edit, and whose precedence is documented
-([spec 11](11_agents_md_support.md)). Memory should be at least as inspectable as
+([spec 11](../11_agents_md_support.md)). Memory should be at least as inspectable as
 that — not less.
 
 This work package is the storage layer only, and it is deliberately the first of
 three because the shape of the record determines whether the safety properties in
-[spec 29](29_memory_creation_and_consent.md) and
-[spec 30](30_memory_retrieval_and_lifecycle.md) are expressible at all. A record
+[spec 29](../29_memory_creation_and_consent.md) and
+[spec 30](../30_memory_retrieval_and_lifecycle.md) are expressible at all. A record
 with no provenance cannot be attributed; one with no state cannot be superseded;
 one with no scope cannot be isolated. Those fields are not bookkeeping, they are
 the mechanism.
@@ -45,42 +52,6 @@ feature in this product either constrains the agent or gives it better evidence.
 Memory gives it persistent, invisible, cross-session influence, which is the
 hidden-instruction behaviour the product direction rejects. The storage design is
 where that either becomes controllable or does not.
-
-## 2. Current State
-
-- **No persistent memory exists.** `SessionStore`
-  (`crates/workspace-engine/src/session.rs:68`) persists sessions, tasks, and
-  messages as an append-only event log. Nothing carries knowledge between
-  sessions.
-- **`repository_id` is derived from the absolute path.**
-  `repository_id_for_root` (`crates/workspace-engine/src/indexer.rs:382-385`) is
-  `sha256(canonicalized path)[..16]`, prefixed `repo_`, reached through
-  `ProjectIndexer::repository_id_for_path` (`indexer.rs:191-194`), which
-  canonicalizes first. **This matters: see §5.2.**
-- **`repository_id` keys almost everything.** It appears in `indexer.rs`,
-  `context_manager.rs`, `session.rs`, `index_cache.rs`, `chat.rs`,
-  `vector_index.rs`, `edit.rs`, and `file_access.rs` — the keyword index, the
-  vector index, sessions, and (per this roadmap) checkpoints and the repository
-  map. Changing how it is computed invalidates all of it.
-- **The secret scanner already supports refusal, not only redaction.**
-  `SecretScanner::scan(text) -> Vec<SecretFinding>`
-  (`crates/workspace-engine/src/secret_scanner.rs:27`),
-  `contains_secrets(text) -> bool` (`secret_scanner.rs:65`), and
-  `redact(text) -> Redaction` (`secret_scanner.rs:42`). `SecretFinding` carries
-  `{ category, start, end, placeholder }` (`secret_scanner.rs:4-10`).
-- **The audit log takes arbitrary redacted fields.**
-  `AuditLog::record(event_type, fields)`
-  (`crates/workspace-engine/src/audit.rs:42`), redacting every field value on
-  the way in (`audit.rs:50`), with retention via `audit_retention_days`.
-- **`DAMAIAN_DATA_DIR`** (`crates/workspace-engine/src/config.rs:192`) redirects
-  all app data.
-- **Per-repository persistence has a working precedent**:
-  `<data_dir>/vector-index/<repository_id>.bin`
-  (`crates/workspace-engine/src/vector_index.rs:149-152`), with `load`/`save`
-  and **no schema version** — an omission this spec does not copy.
-- **`git_service.rs` is read-only and narrow**: `status`, `diff`,
-  `suggest_commit_message` (`git_service.rs:37`, `:77`, `:110`). There is no
-  helper for repository identity.
 
 ## 3. Requirements
 
@@ -102,9 +73,9 @@ where that either becomes controllable or does not.
 ## 4. Non-goals
 
 - Cloud, cross-device, or cross-user memory synchronization.
-- Deciding what to remember — [spec 29](29_memory_creation_and_consent.md).
+- Deciding what to remember — [spec 29](../29_memory_creation_and_consent.md).
 - Retrieval, ranking, or staleness detection —
-  [spec 30](30_memory_retrieval_and_lifecycle.md).
+  [spec 30](../30_memory_retrieval_and_lifecycle.md).
 - A management UI, export, or import — Phase 3b WP3, Should-tier and outside
   this phase's minimum slice.
 - Contradiction detection — also WP3.
@@ -197,13 +168,13 @@ Two shapes are worth their reasoning:
 identifiers needed to answer "why does this exist?" — and there is deliberately
 **no variant for a model-inferred memory with no user action.** A model
 suggestion that the user has not confirmed is not a `MemoryEntry` at all; it is a
-proposal ([spec 29](29_memory_creation_and_consent.md)). Requirement 1 of that
+proposal ([spec 29](../29_memory_creation_and_consent.md)). Requirement 1 of that
 spec is enforced by this type having nowhere to put an unconfirmed entry.
 
 **`Verification` folds confidence and staleness into one enum** rather than a
 float plus a boolean. A stale evidence-derived memory and a user-confirmed one
 are categorically different, not different by degree, and
-[spec 30](30_memory_retrieval_and_lifecycle.md) needs exactly this distinction to
+[spec 30](../30_memory_retrieval_and_lifecycle.md) needs exactly this distinction to
 decide what to label as uncertain. A numeric confidence would invite arithmetic
 that means nothing.
 
@@ -269,12 +240,12 @@ asserted by test at each resolution tier.
 Session-scope memory is **not** a separate store: it lives in the session event
 log alongside everything else session-scoped, following the pattern
 `browser_diagnostics_allowed_for_session` (`session.rs:261-291`) and
-[spec 20](20_working_modes/proposal.md) §5.4 already use. A session-scoped fact dies with
+[spec 20](../20_working_modes/proposal.md) §5.4 already use. A session-scoped fact dies with
 its session, so a store that outlives the session would be a leak to clean up
 rather than a feature.
 
 Files are append-only JSONL with the same discipline
-[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2 establishes: one
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.2 establishes: one
 complete record per line, terminated with `\n`, replayed newest-state-wins by
 `id`, and a torn final line discarded on read. This gives supersession and
 deletion history for free — requirement 4's audit trail is the file itself —
@@ -324,17 +295,17 @@ accepted. Requirement 4's "never stored" is therefore delivered by three layers,
 and the second is the one that actually covers the undetectable case:
 
 1. **Pattern refusal**, on the store's write path and again at proposal time
-   ([spec 29](29_memory_creation_and_consent.md) §5.5) — catches
+   ([spec 29](../29_memory_creation_and_consent.md) §5.5) — catches
    recognisable credentials.
 2. **User confirmation.** No entry exists that the user did not confirm
-   ([spec 29](29_memory_creation_and_consent.md)), and confirmation shows the
+   ([spec 29](../29_memory_creation_and_consent.md)), and confirmation shows the
    exact sentence that will persist. A human looking at "the deploy token is
    hunter2" will not confirm it. This is why the consent gate is a
    confidentiality control and not only a consent control.
 3. **Redaction on the way out.** Memory reaches the model only as a
-   `ContextItem` ([spec 30](30_memory_retrieval_and_lifecycle.md) §5.1), and
+   `ContextItem` ([spec 30](../30_memory_retrieval_and_lifecycle.md) §5.1), and
    context assembly redacts every item before measuring or storing it
-   ([spec 26](26_context_assembly/proposal.md) §5.6). So a credential that somehow got
+   ([spec 26](../26_context_assembly/proposal.md) §5.6). So a credential that somehow got
    stored — written before a scanner pattern existed, say — is still redacted
    before it is sent anywhere.
 
@@ -354,7 +325,7 @@ pub struct EvidenceRef {
 ```
 
 The hash is what makes staleness detectable
-([spec 30](30_memory_retrieval_and_lifecycle.md) §5.5): a memory derived from
+([spec 30](../30_memory_retrieval_and_lifecycle.md) §5.5): a memory derived from
 `docker-compose.yml` is `EvidenceStale` once that file's hash changes. This is
 the same hash-comparison mechanism `patch_engine.rs:291` uses for conflict
 detection, reused rather than reinvented.
@@ -365,7 +336,7 @@ requirement 6's "concise normalized statement" doing real work: it bounds what a
 memory store can accumulate.
 
 **An evidence path must be eligible, and the store enforces it.**
-[Spec 29](29_memory_creation_and_consent.md) §5.5a prevents a proposal from ever
+[Spec 29](../29_memory_creation_and_consent.md) §5.5a prevents a proposal from ever
 being generated for a protected or ignored file. `MemoryStore::insert` checks the
 same two conditions again — `PathPolicy::is_restricted` (`path_policy.rs:138`)
 and `is_ignored_by_rules` (`ignore.rs:44`) with per-directory `.gitignore` rules
@@ -416,7 +387,7 @@ stop growing.
 
 Enabling it is a separate explicit action with its own explanation, per Phase 3b
 WP2 requirement 7 — the explanation belongs to
-[spec 29](29_memory_creation_and_consent.md), the enforcement belongs here.
+[spec 29](../29_memory_creation_and_consent.md), the enforcement belongs here.
 
 ### 5.7 Schema version and migration
 
@@ -424,11 +395,11 @@ WP2 requirement 7 — the explanation belongs to
 `key=value` format as `config/user.conf`, so no new parser is needed.
 
 This is the memory store's own version, separate from the data-directory version
-in [spec 15](15_install_and_update_verification.md) §5.2 — the two evolve
+in [spec 15](../15_install_and_update_verification.md) §5.2 — the two evolve
 independently, and a memory schema change should not require a data-directory
 version bump.
 
-Behaviour mirrors [spec 15](15_install_and_update_verification.md)'s rules: an
+Behaviour mirrors [spec 15](../15_install_and_update_verification.md)'s rules: an
 older version migrates, an equal version proceeds, and a **newer or unparsable
 version refuses** — reporting the path and both versions, and leaving the files
 untouched. Refusing to read is the right failure for memory specifically: a
@@ -493,7 +464,7 @@ note about session files.
 - An entry whose `EvidenceRef` cites a `restricted_patterns` path or a path
   excluded by a per-directory `.gitignore` is refused by
   `MemoryStore::insert`, independently of the proposal-stage check in
-  [spec 29](29_memory_creation_and_consent.md) §5.5a — asserted by calling the
+  [spec 29](../29_memory_creation_and_consent.md) §5.5a — asserted by calling the
   store directly.
 - `Sensitivity` is derived by rule and cannot be set from model output. A
   statement containing a path or hostname derives `Environmental`, a
