@@ -466,8 +466,11 @@ note about session files.
 - Project memory written in repository A is not readable from repository B —
   asserted at each `project_key` resolution tier: two repositories with
   different root commits, two with different remotes, and two with neither.
-- Two checkouts of the same repository at different paths share project memory —
-  the requirement that fails with `repository_id_for_path`, asserted directly.
+- Two full checkouts of the same repository at different paths share project
+  memory — the requirement that fails with `repository_id_for_path`, asserted
+  directly. A shallow clone has no true root, so it shares through its remote
+  instead and does not share with a full checkout until it is unshallowed
+  (§5.2), which the branch's tests assert.
 - A repository moved or renamed retains its project memory when a root commit or
   remote is available.
 - `project_key` records which resolution tier produced it, and the UI can report
@@ -496,8 +499,9 @@ note about session files.
 - With `memory_user_scope_enabled=false`, no user-scope entry can be written,
   **and** no existing user-scope entry is read.
 - Session-scope memory does not outlive its session.
-- A torn final line in a memory file is discarded and the rest replays
-  correctly.
+- A torn final line in a memory file is discarded, the rest replays correctly,
+  and the next append is separated from the fragment rather than swallowed by
+  it (§5.3).
 - A schema change migrates existing entries without loss, appending rather than
   rewriting.
 - A newer or unparsable `schema_version` refuses to load, reports both versions,
@@ -538,13 +542,14 @@ because nothing recalls memory in this slice (#30). If a fork inheriting upstrea
 memory proves wrong, record the case before changing anything: the fix in §5.2 is
 a per-project opt-out, not a change to the resolution order.
 
-**Cost.** Each tier costs one Git process, and the shallow check adds one:
-tier 1 is `rev-parse --is-shallow-repository` then `rev-list --max-parents=0`,
-tier 2 (and a shallow clone) is the check then `config --get remote.origin.url`,
-and tier 3 runs both checks but no identity lookup. Measured on the development
-Mac on 2026-10-26: 20 `rev-list` iterations took 0.246 s, about 12 ms each,
-dominated by process launch rather than by repository size. Nothing calls
-resolution per turn in this slice; #29 and #30 should resolve once when a
+**Cost.** Every resolution starts with `rev-parse --is-shallow-repository`.
+Tier 1 adds `rev-list --max-parents=0` (two processes); a shallow clone skips
+that and adds `config --get remote.origin.url` (two); a repository with no
+history also runs the root lookup before the remote one (three); one with
+neither runs all three lookups and falls to the path hash. Measured on the
+development Mac on 2026-10-26: 20 `rev-list` iterations took 0.246 s, about
+12 ms each, dominated by process launch rather than by repository size. Nothing
+calls resolution per turn in this slice; #29 and #30 should resolve once when a
 repository is opened and reuse the identity.
 
 **What changed from the written design.**
