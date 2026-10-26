@@ -465,6 +465,13 @@ impl MemoryProposal {
         if !self.origin.is_user_request() && is_instruction_shaped(&statement) {
             return Err(MemoryError::Refused(MemoryRefusal::InstructionShaped));
         }
+        if matches!(self.origin, ProposalOrigin::RepositoryObservation { .. })
+            && self.evidence.is_empty()
+        {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "a repository observation needs the file it came from".to_string(),
+            )));
+        }
         if let Some(finding) = gate.scanner.scan(&statement).into_iter().next() {
             return Err(MemoryError::Refused(MemoryRefusal::Secret {
                 category: finding.category,
