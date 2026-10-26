@@ -1,8 +1,8 @@
 # Feature Spec: Context Inspector
 
 Status: Done 2026-10-26 (planned and built on 2026-10-26; Tasks 1–10; the
-manual browser walk is recorded in §7, and **CI is outstanding** — the
-seven-check gate runs after the user pushes). Split into a folder and planned
+manual browser walk is recorded in §7, and the full seven-check gate passed in
+CI on 2026-10-26, Quality run 40340511717). Split into a folder and planned
 from [#26](../26_context_assembly/proposal.md)'s shipped manifest.
 [`context.md`](context.md) records the pre-implementation code, the corrections
 planning found, and the resolved §7 open question (whether separating assembly
@@ -541,5 +541,6 @@ What was walked, and what was seen:
   bounded or per-session index belongs with a future audit-retention change
   rather than here. The repository's local planning notes carry it as a
   follow-up when they are present.
-- **CI is outstanding.** The seven-check gate runs after the user pushes; scoped
-  local checks are recorded in [`tasks.md`](tasks.md)'s Task 10 row.
+- **The full seven-check gate passed in CI on 2026-10-26** (Quality run
+  40340511717); scoped local checks are recorded in
+  [`tasks.md`](tasks.md)'s Task 10 row.
