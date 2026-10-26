@@ -138,6 +138,82 @@ pub fn evaluate(
             );
         }
 
+        if let Some(wanted) = &asserts.response_excludes {
+            let present: Vec<&String> = wanted
+                .iter()
+                .filter(|needle| run.response.contains(needle.as_str()))
+                .collect();
+            push(
+                "response_excludes",
+                present.is_empty(),
+                format!("{wanted:?} absent"),
+                format!("response: {:?}, present: {present:?}", run.response),
+            );
+        }
+
+        let compacted = run.compacted_request.as_deref().unwrap_or_default();
+        if let Some(wanted) = &asserts.compacted_request_contains {
+            let missing: Vec<&String> = wanted
+                .iter()
+                .filter(|needle| !compacted.contains(needle.as_str()))
+                .collect();
+            push(
+                "compacted_request_contains",
+                !compacted.is_empty() && missing.is_empty(),
+                format!("{wanted:?}"),
+                if compacted.is_empty() {
+                    "no compacted request was recorded".to_string()
+                } else {
+                    format!("missing: {missing:?}")
+                },
+            );
+        }
+
+        if let Some(unwanted) = &asserts.compacted_request_excludes {
+            let present: Vec<&String> = unwanted
+                .iter()
+                .filter(|needle| compacted.contains(needle.as_str()))
+                .collect();
+            push(
+                "compacted_request_excludes",
+                !compacted.is_empty() && present.is_empty(),
+                format!("{unwanted:?} absent"),
+                format!("present: {present:?}"),
+            );
+        }
+
+        if let Some(unwanted) = &asserts.compacted_system_excludes {
+            let system = run.compacted_system_prompt.as_deref().unwrap_or_default();
+            let present: Vec<&String> = unwanted
+                .iter()
+                .filter(|needle| system.contains(needle.as_str()))
+                .collect();
+            push(
+                "compacted_system_excludes",
+                !system.is_empty() && present.is_empty(),
+                format!("{unwanted:?} absent from the system prompt"),
+                format!("present: {present:?}"),
+            );
+        }
+
+        if let Some(expected) = asserts.conversation_compactions {
+            push(
+                "conversation_compactions",
+                run.conversation_compactions == expected,
+                expected.to_string(),
+                run.conversation_compactions.to_string(),
+            );
+        }
+
+        if let Some(expected) = asserts.compaction_facts_only {
+            push(
+                "compaction_facts_only",
+                run.compaction_facts_only == expected,
+                expected.to_string(),
+                run.compaction_facts_only.to_string(),
+            );
+        }
+
         if let Some((wanted, limit)) = &asserts.context_ranks_within {
             let rank = run
                 .context_files

@@ -12,6 +12,7 @@ use crate::command_policy::{
 };
 use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
+use crate::compaction::ConversationSummary;
 use crate::config::{Config, CostEstimate, McpTransport};
 use crate::context_manager::{ContextManager, ContextPlan, ContextRequest, PromptSectionName};
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
@@ -956,7 +957,7 @@ impl ChatOrchestrator {
         // context: `build_context_with_hooks` redacts it and charges it to the
         // turn's budget like every other item.
         let mut hook_context: Vec<(String, String)> = Vec::new();
-        let (session, prior_messages) = if let Some(session_id) = session_id {
+        let session = if let Some(session_id) = session_id {
             let Some(session) = self.session_store.read_session(session_id)? else {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown session: {session_id}"
@@ -967,8 +968,7 @@ impl ChatOrchestrator {
                     "Session belongs to a different repository".to_string(),
                 ));
             }
-            let messages = self.session_store.read_messages(&session.id)?;
-            (session, messages)
+            session
         } else {
             // Spec 32 `context.md` §3: the event runs before the session
             // exists, so the envelope carries no session id and there is no
@@ -994,7 +994,7 @@ impl ChatOrchestrator {
             for finding in &session_start_findings {
                 let _ = self.session_store.record_finding(&session.id, finding);
             }
-            (session, Vec::new())
+            session
         };
         // Captured before the turn's own events, so rewinding this checkpoint
         // takes the user's prompt with it rather than leaving a question the
@@ -1032,6 +1032,38 @@ impl ChatOrchestrator {
         // carried. Read from the active log, so a rewind carries the notes of
         // the turn before the rewound one with no second ordering rule.
         let turn_notes = self.carry_notes_from_the_previous_turn(&session.id, &task)?;
+        // Spec 55 §5.5: compaction runs at the turn boundary, before the request
+        // is assembled and never between tool rounds. It runs *before* this
+        // turn's user message is appended, so the current request cannot be
+        // inside the summarised span even if it alone exceeds the window. A
+        // failure never fails the turn; it is audited and the request uses the
+        // recency window instead.
+        let mut conversation = self.session_store.read_conversation(&session.id)?;
+        if self.config.conversation_auto_compact
+            && crate::compaction::conversation_tokens(&conversation)
+                > self.conversation_window_tokens()
+        {
+            match self.compact_conversation(
+                repository_root,
+                &session.id,
+                model_adapter,
+                sink.cancel,
+            ) {
+                Ok(crate::compaction::CompactionOutcome::Compacted(_)) => {
+                    conversation = self.session_store.read_conversation(&session.id)?;
+                }
+                Ok(crate::compaction::CompactionOutcome::NothingToCompact) => {}
+                // Stopping a turn is not a compaction failure: no durable
+                // notice, because the user already knows they stopped it.
+                Ok(crate::compaction::CompactionOutcome::Cancelled) => {}
+                Ok(crate::compaction::CompactionOutcome::Failed(reason)) => {
+                    self.note_compaction_failure(&session.id, &reason);
+                }
+                Err(error) => {
+                    self.note_compaction_failure(&session.id, &error.to_string());
+                }
+            }
+        }
         let user_message =
             self.session_store
                 .append_message(&session.id, Some(&task.id), "user", prompt)?;
@@ -1144,7 +1176,14 @@ impl ChatOrchestrator {
         context_fields.extend(context.manifest.audit_fields());
         self.audit_log
             .record("context_assembled", &context_fields)?;
-        let model_prompt = build_model_prompt(&context, &prior_messages, &self.scanner, None);
+        let model_prompt = build_model_prompt(
+            &context,
+            &conversation.messages,
+            conversation.summary.as_ref(),
+            self.conversation_window_tokens(),
+            &self.scanner,
+            None,
+        );
         let mode = self.session_store.session_mode(&session.id);
         // A worker is never invited to hand off further work (spec 57 §5.0).
         let offer_handoffs = self.config.enable_worker_sessions
@@ -2114,6 +2153,9 @@ impl ChatOrchestrator {
         ];
         fields.extend(context.manifest.audit_fields());
         self.audit_log.record("context_assembled", &fields)?;
+        // The repair continuation sees the same conversation the turn does,
+        // including any active summary (spec 55 §5.3).
+        let conversation = self.session_store.read_conversation(&session.id)?;
         let messages = vec![
             ModelMessage::system(system_prompt_for_session(
                 SessionMode::Code,
@@ -2121,7 +2163,14 @@ impl ChatOrchestrator {
                 false,
                 &self.config.shell,
             )),
-            ModelMessage::user(build_model_prompt(&context, &[], &self.scanner, None)),
+            ModelMessage::user(build_model_prompt(
+                &context,
+                &conversation.messages,
+                conversation.summary.as_ref(),
+                self.conversation_window_tokens(),
+                &self.scanner,
+                None,
+            )),
         ];
         // Notes carry across the continuation as they do for any new task
         // (spec 65 §5.5); the repair turn starts with no accrued step evidence
@@ -2621,6 +2670,16 @@ impl ChatOrchestrator {
                     &pending.task,
                     &census,
                 );
+                // Spec 55 requirement 6: the summary's approval digest is read
+                // from the log, and a shell-command decision is not otherwise
+                // there — the audit log carries it with no session id.
+                self.session_store.record_conversation_approval(
+                    &pending.session.id,
+                    "command",
+                    proposal_id,
+                    "approved",
+                    Some(&command_request.command),
+                )?;
                 // The command the user approved is evidence for the step it
                 // served. The resumed execution is not bracketed by a new
                 // action marker, so the execution's own id is the breadcrumb —
@@ -2645,6 +2704,13 @@ impl ChatOrchestrator {
             } else {
                 self.validation_orchestrator
                     .reject_proposal(proposal_id, approved_by)?;
+                self.session_store.record_conversation_approval(
+                    &pending.session.id,
+                    "command",
+                    proposal_id,
+                    "rejected",
+                    Some(&command_request.command),
+                )?;
                 format!(
                     "The user declined to run `{}`. Do not request it again; answer using what you already know, noting the limitation if it matters.",
                     command_request.command
@@ -3994,6 +4060,236 @@ impl ChatOrchestrator {
             .map(|usage| usage.input_tokens + usage.output_tokens)
             .unwrap_or(0);
         Ok(Some((ceiling, spent)))
+    }
+
+    /// Audits and records a compaction that did not run, so the user is told
+    /// on the next session load and the audit trail says why. Never fails the
+    /// turn: a diagnostics write that itself fails is still not a turn error.
+    fn note_compaction_failure(&self, session_id: &str, reason: &str) {
+        let _ = self.audit_log.record(
+            "conversation_compaction_failed",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("reason", reason.to_string()),
+            ],
+        );
+        let _ = self
+            .session_store
+            .record_conversation_compaction_failure(session_id, &self.scanner.redact(reason).text);
+    }
+
+    /// The conversation window in tokens: `conversation_window_share` of the
+    /// effective context budget (spec 55 §5.1). The same number is the
+    /// automatic threshold, so a compaction that triggers leaves a conversation
+    /// that fits (context.md D2).
+    pub fn conversation_window_tokens(&self) -> usize {
+        self.config.context_token_budget() * usize::from(self.config.conversation_window_share)
+            / 10_000
+    }
+
+    /// Summarises the conversation outside the recency window, appending one
+    /// `conversation_compacted` event (spec 55).
+    ///
+    /// Never fails a turn: a model failure produces a facts-only summary, and
+    /// only an unreadable log or a failed append returns `Err`, which the
+    /// turn-boundary caller treats as "compaction did not run". The
+    /// summarisation call is recorded against a synthetic task id so it appears
+    /// in the session's totals without reducing any turn's ceiling (§5.5).
+    pub fn compact_conversation(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        cancel: &CancelToken,
+    ) -> Result<crate::compaction::CompactionOutcome> {
+        if cancel.is_cancelled() {
+            return Ok(crate::compaction::CompactionOutcome::Cancelled);
+        }
+        let view = self.session_store.read_conversation(session_id)?;
+        let previous_through = view
+            .summary
+            .as_ref()
+            .map(|summary| summary.through_seq)
+            .unwrap_or(0);
+        let messages = self.session_store.read_messages_with_seq(session_id)?;
+        let window = self.conversation_window_tokens();
+        let Some(outside) = crate::compaction::window_start(&messages, previous_through, window)
+        else {
+            return Ok(crate::compaction::CompactionOutcome::NothingToCompact);
+        };
+        // Requirement 5 and §5.4: never across a pending decision or an action
+        // whose outcome is not known.
+        let through_seq = outside.min(self.session_store.compaction_limit(session_id)?);
+        if through_seq <= previous_through {
+            return Ok(crate::compaction::CompactionOutcome::NothingToCompact);
+        }
+
+        let plans = self.session_store.read_session_plans(session_id)?;
+        let patch_decisions = self
+            .session_store
+            .read_all_patch_file_decisions(session_id)?;
+        let approvals = self
+            .session_store
+            .read_conversation_approvals_through(session_id, through_seq)?;
+        let verification = self
+            .session_store
+            .read_verification_events(session_id, &[])?;
+        let findings = self
+            .session_store
+            .read_findings(session_id, repository_root)?;
+        let Some(facts) = crate::compaction::facts_for_span(
+            crate::compaction::FactInputs {
+                messages: &messages,
+                plans: &plans,
+                patch_decisions: &patch_decisions,
+                approvals: &approvals,
+                verification: &verification,
+                findings: &findings,
+            },
+            through_seq,
+        ) else {
+            return Ok(crate::compaction::CompactionOutcome::NothingToCompact);
+        };
+        // A second summary describes the whole conversation, not only the span
+        // since the first boundary: the original objective and every earlier
+        // fact are carried forward (§5.3).
+        let facts = match view.summary.as_ref() {
+            Some(previous) => crate::compaction::merge_summary_facts(previous, facts),
+            None => facts,
+        };
+
+        // Only the covered span is material. The previous summary travels
+        // separately as an input to the next one (proposal §5.3).
+        let transcript_messages: Vec<(String, String)> = messages
+            .iter()
+            .filter(|(seq, _)| *seq > previous_through && *seq <= through_seq)
+            .map(|(_, message)| (message.role.clone(), message.content.clone()))
+            .collect();
+        let transcript = crate::compaction::transcript_for_summary(&transcript_messages);
+        // The transcript and the previous summary are stored verbatim; the
+        // summarisation call is another boundary they must cross redacted.
+        let prompt = self
+            .scanner
+            .redact(&crate::compaction::narrative_prompt(
+                &transcript,
+                view.summary.as_ref(),
+            ))
+            .text;
+        if cancel.is_cancelled() {
+            return Ok(crate::compaction::CompactionOutcome::Cancelled);
+        }
+        let mut on_token = |_token: &str| {};
+        let mut on_wait = |_millis: u64| {};
+        let request = ModelRequest {
+            provider: self.config.model_provider.clone(),
+            model: self.config.model_name.clone(),
+            messages: vec![ModelMessage::user(prompt)],
+            temperature: None,
+            reasoning_level: None,
+            stream: false,
+            tools: None,
+            max_tokens: self
+                .config
+                .model_provider_config(&self.config.model_provider)
+                .and_then(|provider| provider.max_output_tokens),
+            request_usage: true,
+            emit_cache_breakpoints: false,
+        };
+        let run = model_adapter.stream_response(&request, cancel, &mut on_token, &mut on_wait);
+        if cancel.is_cancelled() {
+            return Ok(crate::compaction::CompactionOutcome::Cancelled);
+        }
+        let narrative = match &run {
+            Ok(run) => {
+                crate::compaction::parse_narrative(&run.content, &self.scanner).unwrap_or_default()
+            }
+            Err(error) => {
+                let _ = self.audit_log.record(
+                    "conversation_compaction_narrative_failed",
+                    &[
+                        ("actor", "system".to_string()),
+                        ("sessionId", session_id.to_string()),
+                        ("reason", error.to_string()),
+                        ("throughSeq", through_seq.to_string()),
+                    ],
+                );
+                crate::compaction::Narrative::default()
+            }
+        };
+        let model_run_id = run.as_ref().ok().map(|run| run.run_id.clone());
+        let summary = crate::compaction::ConversationSummary {
+            id: create_id("summary"),
+            through_seq,
+            format_version: crate::compaction::SUMMARY_FORMAT_VERSION,
+            objective: facts.objective,
+            files_changed: facts.files_changed,
+            plan_steps: facts.plan_steps,
+            approvals: facts.approvals,
+            validation: facts.validation,
+            constraints: narrative.constraints,
+            decisions: narrative.decisions,
+            failed_approaches: narrative.failed_approaches,
+            uncertainty: narrative.uncertainty,
+            model_run_id: model_run_id.clone(),
+            message_count: facts.message_count,
+        };
+
+        if let Ok(run) = &run {
+            // A synthetic task id keeps the call in the session's totals while
+            // keeping it out of every turn's ceiling: the mechanism for
+            // continuing a long task must not make the ceiling arrive sooner
+            // (proposal §5.5).
+            let _ = self.session_store.record_task_usage_for_task_id(
+                session_id,
+                &format!("compaction_{}", summary.id),
+                &run.run_id,
+                None,
+                run.usage,
+                run.reported_cost,
+                Some("conversation_compaction"),
+            );
+        }
+        if let Err(error) = self
+            .session_store
+            .append_conversation_compaction(session_id, &summary)
+        {
+            return Ok(crate::compaction::CompactionOutcome::Failed(
+                error.to_string(),
+            ));
+        }
+        let usage = run.as_ref().ok().map(|run| run.usage);
+        self.audit_log.record(
+            "conversation_compacted",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("summaryId", summary.id.clone()),
+                ("throughSeq", through_seq.to_string()),
+                ("formatVersion", summary.format_version.to_string()),
+                ("messageCount", summary.message_count.to_string()),
+                (
+                    "modelRunId",
+                    model_run_id.clone().unwrap_or_else(|| "none".to_string()),
+                ),
+                ("factsOnly", summary.is_facts_only().to_string()),
+                (
+                    "inputTokens",
+                    usage
+                        .map(|usage| usage.input_tokens.to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                ),
+                (
+                    "outputTokens",
+                    usage
+                        .map(|usage| usage.output_tokens.to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                ),
+            ],
+        )?;
+        Ok(crate::compaction::CompactionOutcome::Compacted(Box::new(
+            summary,
+        )))
     }
 
     /// The reminder to send at a completion point, and how many steps are open,
@@ -8374,6 +8670,8 @@ fn command_envelope_paragraph_read_only(shell: &str) -> String {
 fn build_model_prompt(
     plan: &ContextPlan,
     prior_messages: &[ChatMessage],
+    summary: Option<&ConversationSummary>,
+    window_tokens: usize,
     scanner: &SecretScanner,
     command_context: Option<&str>,
 ) -> String {
@@ -8396,19 +8694,39 @@ fn build_model_prompt(
     // A plan reminder is the engine's nudge, not the user's words: seeding a
     // later turn with it would present an instruction as something the user
     // said (spec 66 `context.md` D10).
-    let recent_messages = prior_messages
-        .iter()
-        .filter(|message| message.kind.as_deref() != Some("plan_reminder"))
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
-    if !recent_messages.is_empty() {
+    let conversation_messages =
+        crate::compaction::sendable_messages(&prior_messages.iter().collect::<Vec<_>>());
+    // Spec 55 §5.1: the window is a token budget, not eight messages, so a
+    // conversation of short messages keeps more turns than one of long ones.
+    let recent_messages = crate::compaction::window_slice(&conversation_messages, window_tokens);
+    let omitted = conversation_messages.len() - recent_messages.len();
+    if summary.is_some() || !recent_messages.is_empty() {
         output.push('\n');
         output.push_str(PromptSectionName::RecentConversation.heading());
         output.push('\n');
+        // Spec 55 §5.6: the summary is delimited recorded data, inside the
+        // conversation block. It is never merged into the system prompt and
+        // never placed where repository instructions live.
+        if let Some(summary) = summary {
+            // A stored summary is local data, like the transcript; the
+            // objective is quoted byte for byte in it. Redact at the boundary
+            // so a secret in an earlier message cannot leave the machine
+            // through the summary after being caught in the message itself.
+            output.push_str(&scanner.redact(&summary.render_for_model()).text);
+            output.push('\n');
+        }
+        // §5.5: with no active summary covering the omitted messages, the loss
+        // is stated rather than left silent. Messages the summary covers are
+        // not in `prior_messages` at all, so `omitted` counts only those
+        // outside both the summary and the window.
+        if omitted > 0 {
+            output.push_str(&format!(
+                "[Damaian: {omitted} earlier message{} in this conversation were not sent to you \
+                 and were not summarised. The full transcript is still stored in the session and \
+                 is readable in the app.]\n",
+                if omitted == 1 { "" } else { "s" }
+            ));
+        }
         for message in recent_messages {
             output.push_str(&message.role);
             output.push_str(": ");
@@ -13362,6 +13680,8 @@ mod approval_prompt_wording_tests {
         let with_result = build_model_prompt(
             &plan,
             &[],
+            None,
+            usize::MAX,
             &SecretScanner::default(),
             Some("Command: pwd\n"),
         );
@@ -13429,6 +13749,8 @@ mod approval_prompt_wording_tests {
         let prompt = build_model_prompt(
             &plan,
             &[reminder, ordinary],
+            None,
+            usize::MAX,
             &SecretScanner::default(),
             None,
         );
@@ -13439,6 +13761,150 @@ mod approval_prompt_wording_tests {
         assert!(
             prompt.contains("the user's own words"),
             "the negative control: an ordinary message still seeds it: {prompt}"
+        );
+    }
+
+    fn prompt_plan() -> crate::context_manager::ContextPlan {
+        crate::context_manager::ContextPlan {
+            repository_id: "repo".to_string(),
+            task_id: "task".to_string(),
+            token_estimate: 2,
+            items: vec![crate::context_manager::ContextItem {
+                category: crate::context_manager::ContextCategory::Required,
+                kind: crate::context_manager::ContextKind::UserPrompt,
+                path: None,
+                range: None,
+                content: "Question".to_string(),
+                tokens: 2,
+                redaction_status: "clean".to_string(),
+                provenance: None,
+                root_path: None,
+            }],
+            files: Vec::new(),
+            manifest: crate::context_manager::ContextManifest {
+                repository_id: "repo".to_string(),
+                task_id: "task".to_string(),
+                assembled_at_ms: 0,
+                limit: crate::context_manager::EffectiveLimit::declared(2),
+                total_tokens: 2,
+                categories: Vec::new(),
+                included: Vec::new(),
+                excluded: Vec::new(),
+            },
+        }
+    }
+
+    fn conversation_message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: create_id("msg"),
+            session_id: "session".to_string(),
+            task_id: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            kind: None,
+            created_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_short_conversation_keeps_more_messages_than_a_long_one_in_the_same_budget() {
+        let short = (0..6)
+            .map(|index| conversation_message("user", &format!("short {index}")))
+            .collect::<Vec<_>>();
+        let long = (0..6)
+            .map(|index| conversation_message("user", &format!("long {index} {}", "x".repeat(400))))
+            .collect::<Vec<_>>();
+        let plan = prompt_plan();
+        let scanner = SecretScanner::default();
+        let short_prompt = build_model_prompt(&plan, &short, None, 100, &scanner, None);
+        let long_prompt = build_model_prompt(&plan, &long, None, 100, &scanner, None);
+
+        assert!(
+            short_prompt.contains("short 0"),
+            "short messages all fit: {short_prompt}"
+        );
+        assert!(
+            !long_prompt.contains("long 0"),
+            "long messages fall outside the same budget: {long_prompt}"
+        );
+        assert!(long_prompt.contains("long 5"), "the newest is always kept");
+    }
+
+    #[test]
+    fn an_uncompacted_conversation_states_how_many_messages_were_not_sent() {
+        let messages = (0..4)
+            .map(|index| conversation_message("user", &format!("item {index} {}", "x".repeat(400))))
+            .collect::<Vec<_>>();
+        let prompt = build_model_prompt(
+            &prompt_plan(),
+            &messages,
+            None,
+            100,
+            &SecretScanner::default(),
+            None,
+        );
+        assert!(
+            prompt.contains(
+                "[Damaian: 3 earlier messages in this conversation were not sent to you and were \
+                 not summarised. The full transcript is still stored in the session and is \
+                 readable in the app.]"
+            ),
+            "the loss is stated and counted: {prompt}"
+        );
+    }
+
+    #[test]
+    fn a_summary_covers_only_the_messages_before_its_boundary() {
+        let messages = (0..4)
+            .map(|index| conversation_message("user", &format!("item {index} {}", "x".repeat(400))))
+            .collect::<Vec<_>>();
+        let mut summary = ConversationSummary {
+            id: "summary_1".to_string(),
+            through_seq: 8,
+            format_version: crate::compaction::SUMMARY_FORMAT_VERSION,
+            objective: "Do not touch the public API.".to_string(),
+            files_changed: vec!["src/lib.rs".to_string()],
+            plan_steps: Vec::new(),
+            approvals: Vec::new(),
+            validation: Vec::new(),
+            constraints: vec!["keep the API stable".to_string()],
+            decisions: Vec::new(),
+            failed_approaches: Vec::new(),
+            uncertainty: Vec::new(),
+            model_run_id: None,
+            message_count: 8,
+        };
+        let prompt = build_model_prompt(
+            &prompt_plan(),
+            &messages,
+            Some(&summary),
+            100,
+            &SecretScanner::default(),
+            None,
+        );
+        assert!(prompt.contains("--- begin prior conversation summary"));
+        assert!(
+            prompt.contains("[Damaian: 3 earlier messages in this conversation were not sent"),
+            "the notice counts only what neither the summary nor the window carries: {prompt}"
+        );
+        // A summary that covers part of the span and a window that carries the
+        // rest still never places model-authored text in the system prompt.
+        let system = system_prompt_for_session(SessionMode::Code, false, false, "/bin/zsh");
+        assert!(!system.contains("begin prior conversation summary"));
+        assert!(!system.contains("keep the API stable"));
+
+        summary.through_seq = 0;
+        let prompt = build_model_prompt(
+            &prompt_plan(),
+            &[],
+            Some(&summary),
+            usize::MAX,
+            &SecretScanner::default(),
+            None,
+        );
+        assert!(
+            !prompt.contains("were not sent"),
+            "nothing is omitted when the summary covers everything and no messages remain"
         );
     }
 

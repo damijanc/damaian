@@ -71,7 +71,7 @@ The question does not need answering; requirement 6 uses what exists.
 
 ### 2.5 `OBSERVATIONS.md` entry 6 names this spec
 
-Recorded 2026-09-15, found while writing [#55](../55_conversation_compaction.md):
+Recorded 2026-09-15, found while writing [#55](../55_conversation_compaction/proposal.md):
 within a turn the message array grows without bound — an assistant message and
 a tool result per round, and a tool result can be a whole file. The entry says
 this, not conversation length, is what reaches #21's per-turn ceiling, and

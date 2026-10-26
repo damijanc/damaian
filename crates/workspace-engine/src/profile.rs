@@ -334,6 +334,8 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         max_match_line_chars,
         repository_map_max_tokens,
         symbol_context_max_tokens,
+        conversation_auto_compact,
+        conversation_window_share,
         context_budget_instructions,
         context_budget_hook_context,
         context_budget_pinned,
@@ -409,6 +411,12 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         ("block_generated_secrets", block_generated_secrets.is_some()),
         ("audit_enabled", audit_enabled.is_some()),
         ("enable_worker_sessions", enable_worker_sessions.is_some()),
+        // Spec 55 §5.5: neither direction is a restriction, so a profile may
+        // not decide whether the user's money is spent on a summarisation call.
+        (
+            "conversation_auto_compact",
+            conversation_auto_compact.is_some(),
+        ),
         ("shell", shell.is_some()),
         ("model_provider", model_provider.is_some()),
         ("model_name", model_name.is_some()),
@@ -546,6 +554,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         max_match_line_chars,
         repository_map_max_tokens,
         symbol_context_max_tokens,
+        conversation_window_share,
         context_budget_instructions,
         context_budget_hook_context,
         context_budget_pinned,
@@ -702,6 +711,9 @@ fn equals_base_limit(key: &str, carried: &ConfigOverlay, base: &Config) -> bool 
         }
         "symbol_context_max_tokens" => {
             carried.symbol_context_max_tokens == Some(base.symbol_context_max_tokens)
+        }
+        "conversation_window_share" => {
+            carried.conversation_window_share == Some(base.conversation_window_share)
         }
         "command_timeout_secs" => carried.command_timeout_secs == Some(base.command_timeout_secs),
         "agent_max_turn_messages" => {

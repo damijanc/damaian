@@ -84,7 +84,7 @@ Two things follow that the proposal now owns:
   token budget twice as well.
 - The sections are in volatile-to-stable order, the reverse of what a prompt
   cache wants ([`49_prompt_cache_accounting_and_reuse/context.md`](../49_prompt_cache_accounting_and_reuse/context.md)
-  §3.2; [`55_conversation_compaction.md`](../55_conversation_compaction.md) §2;
+  §3.2; [`55_conversation_compaction/proposal.md`](../55_conversation_compaction/proposal.md) §2;
   `docs/PLAN/OBSERVATIONS.md` entry 5, which assigns the decision to #26 or
   #49).
 

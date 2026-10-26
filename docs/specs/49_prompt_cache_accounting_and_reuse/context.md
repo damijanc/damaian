@@ -81,7 +81,7 @@ The stable part is last and the most volatile part is first, so the cacheable
 prefix ends at the end of the system prompt. Everything the feature exists to
 cache sits behind two volatile sections.
 
-**This was already recorded by [#55](../55_conversation_compaction.md) §2**,
+**This was already recorded by [#55](../55_conversation_compaction/proposal.md) §2**,
 which found it while surveying the same function and explicitly assigned
 resolving it to this spec or [#26](../26_context_assembly/proposal.md). Two specs
 arriving at it independently is worth noting: it is a real property of the code,

@@ -51,6 +51,17 @@ pub struct Run {
     /// the response and the post-reminder reply follows it (spec 66 `context.md`
     /// D4). `None` when the turn wrote no assistant message.
     pub last_assistant_message: Option<String>,
+    /// The first model request after the run's `conversation_compacted` audit
+    /// event, flattened (spec 55 §5.9). `None` when the run did not compact or
+    /// when the live tier has no recorded request.
+    pub compacted_request: Option<String>,
+    /// The system message of that same request, kept separately so an
+    /// assertion can prove a summary never becomes an instruction.
+    pub compacted_system_prompt: Option<String>,
+    /// How many `conversation_compacted` events the run appended.
+    pub conversation_compactions: u64,
+    /// Whether the newest summary is facts-only.
+    pub compaction_facts_only: bool,
     pub trace: Trace,
 }
 
@@ -124,6 +135,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     // its next call, so the calls before it are the pre-pause ones.
     run.continuation_request = continuation_request(&run.trace, &adapter.requests);
     run.answer_request = answer_request(&run.trace, &adapter.requests);
+    (run.compacted_request, run.compacted_system_prompt) = compacted_requests(&adapter.requests);
     Ok(run)
 }
 
@@ -158,6 +170,32 @@ fn answer_request(trace: &Trace, requests: &[ModelRequest]) -> Option<String> {
         .filter(|event| event.event_type == "model_request_prepared")
         .count();
     requests.get(index).map(flattened_request)
+}
+
+/// The first request after the summarisation call, and its system message.
+///
+/// The summarisation call is not preceded by a `model_request_prepared` audit
+/// event (it is not a turn request), so it is located by its own prompt text
+/// rather than by counting trace events. `None` when the run never compacted.
+fn compacted_requests(requests: &[ModelRequest]) -> (Option<String>, Option<String>) {
+    let Some(index) = requests.iter().position(|request| {
+        request.messages.iter().any(|message| {
+            message
+                .content
+                .contains("You are recording what happened in an earlier part of a coding session")
+        })
+    }) else {
+        return (None, None);
+    };
+    let Some(next) = requests.get(index + 1) else {
+        return (None, None);
+    };
+    let system = next
+        .messages
+        .iter()
+        .find(|message| message.role == "system")
+        .map(|message| message.content.clone());
+    (Some(flattened_request(next)), system)
 }
 
 /// One request's message contents, joined for substring assertions.
@@ -312,6 +350,10 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
         answer_request: None,
         verification: None,
         last_assistant_message: None,
+        compacted_request: None,
+        compacted_system_prompt: None,
+        conversation_compactions: 0,
+        compaction_facts_only: false,
         trace: Trace::default(),
     })
 }
@@ -380,11 +422,44 @@ fn drive(
         cancel: &never_cancelled,
         steering: None,
     };
+    // Spec 55 §5.9: a seeded conversation lets a deterministic scenario start
+    // long enough to compact, and `compact_before_prompt` runs the public
+    // manual path before the ask. The compaction consumes the first scripted
+    // turn, which a scenario therefore writes as its narrative reply.
+    let seeded_session = if !scenario.seed_conversation.is_empty() || scenario.compact_before_prompt
+    {
+        let repository_id = engine
+            .indexer
+            .repository_id_for_path(&materialized.root)
+            .map_err(|error| ClientError::Io(error.to_string()))?;
+        let session = engine
+            .session_store
+            .create_session(&repository_id, &scenario.prompt)?;
+        for message in &scenario.seed_conversation {
+            engine.session_store.append_message(
+                &session.id,
+                None,
+                &message.role,
+                &message.content,
+            )?;
+        }
+        if scenario.compact_before_prompt {
+            engine.chat_orchestrator.compact_conversation(
+                &materialized.root,
+                &session.id,
+                adapter,
+                &CancelToken::new(),
+            )?;
+        }
+        Some(session.id)
+    } else {
+        None
+    };
     let outcome = engine.chat_orchestrator.ask_with_session_with_options(
         &materialized.root,
         &scenario.prompt,
         &[],
-        None,
+        seeded_session.as_deref(),
         adapter,
         &mut sink,
         turn_options(scenario),
@@ -942,6 +1017,26 @@ fn drive(
     });
     run_record.sanitize(scanner);
 
+    // Read from the log rather than from the scripted replies: a scenario that
+    // claims a compaction happened is checked against what the engine wrote.
+    let conversation_compactions = match seeded_session.as_deref() {
+        Some(session_id) => engine
+            .session_store
+            .read_conversation_compactions(session_id)
+            .map(|summaries| summaries.len() as u64)
+            .unwrap_or(0),
+        None => 0,
+    };
+    let compaction_facts_only = seeded_session
+        .as_deref()
+        .and_then(|session_id| {
+            engine
+                .session_store
+                .read_conversation_compactions(session_id)
+                .ok()
+        })
+        .and_then(|summaries| summaries.last().map(|summary| summary.is_facts_only()))
+        .unwrap_or(false);
     Ok(Run {
         record: run_record,
         repo_root: materialized.root.clone(),
@@ -957,6 +1052,10 @@ fn drive(
         answer_request: None,
         verification,
         last_assistant_message,
+        compacted_request: None,
+        compacted_system_prompt: None,
+        conversation_compactions,
+        compaction_facts_only,
         trace,
     })
 }

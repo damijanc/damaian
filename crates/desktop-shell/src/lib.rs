@@ -340,6 +340,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/finding-status") => handle_finding_status(stream, &request),
         ("POST", "/api/findings-repair") => handle_findings_repair(stream, &request),
         ("POST", "/api/session-delete") => handle_session_delete(stream, &request),
+        ("POST", "/api/compact") => handle_compact(stream, &request),
         ("POST", "/api/open-vscode") => handle_open_vscode(stream, &request),
         ("POST", "/api/reveal-in-finder") => handle_reveal_in_finder(stream, &request),
         // Spec 58: takes `repo` only and opens the URL derived from `origin`.
@@ -623,7 +624,7 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         200,
         "application/json",
         &format!(
-            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}]}}",
+            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}],\"conversationView\":{}}}",
             session_json(&session, engine.session_store.session_mode(&session.id)),
             messages_json(&messages, &question_states),
             task_states_json(
@@ -634,9 +635,167 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
                 &task_web_diagnostics,
                 &task_notes,
                 &engine.config
-            )
+            ),
+            conversation_json(&engine, &session_id)
         ),
     )
+}
+
+/// The display half of conversation compaction (spec 55 §5.9): every active
+/// summary, and where the model's view begins.
+///
+/// The transcript itself is unchanged — `messages_json` above still carries
+/// every message — so the marker sits *between* messages and the originals are
+/// below it.
+fn conversation_json(engine: &WorkspaceEngine, session_id: &str) -> String {
+    let compactions = engine
+        .session_store
+        .read_conversation_compactions(session_id)
+        .unwrap_or_default();
+    let conversation = engine
+        .session_store
+        .read_conversation(session_id)
+        .unwrap_or_default();
+    let sequenced = engine
+        .session_store
+        .read_messages_with_seq(session_id)
+        .unwrap_or_default();
+    let previous_through = conversation
+        .summary
+        .as_ref()
+        .map(|summary| summary.through_seq)
+        .unwrap_or(0);
+    // The prompt filters the engine's own plan reminder before slicing, so the
+    // counts here must use the same definition; otherwise the marker reports a
+    // window the model never had.
+    let window_tokens = engine.chat_orchestrator.conversation_window_tokens();
+    let after_summary_sendable = sequenced
+        .iter()
+        .filter(|(seq, _)| *seq > previous_through)
+        .map(|(_, message)| message)
+        .collect::<Vec<_>>();
+    let sendable = workspace_engine::compaction::sendable_messages(&after_summary_sendable);
+    let window_len = workspace_engine::compaction::window_slice(&sendable, window_tokens).len();
+    let outside =
+        workspace_engine::compaction::window_start(&sequenced, previous_through, window_tokens);
+    let (kind, through_seq, omitted) = if let Some(summary) = &conversation.summary {
+        (
+            "summary",
+            summary.through_seq,
+            conversation.summarised_messages + (sendable.len() - window_len),
+        )
+    } else if outside.is_some() {
+        (
+            "elision",
+            outside.unwrap_or(0),
+            sendable.len().saturating_sub(window_len),
+        )
+    } else {
+        ("none", 0, 0)
+    };
+    serde_json::json!({
+        "compactions": compactions,
+        "conversation": {
+            "kind": kind,
+            "throughSeq": through_seq,
+            "omittedMessages": omitted,
+            "windowMessages": window_len,
+            "autoCompact": engine.config.conversation_auto_compact,
+            "windowShare": engine.config.conversation_window_share,
+            "canCompact": outside.is_some(),
+            "lastFailure": engine
+                .session_store
+                .read_conversation_compaction_failure(session_id)
+                .ok()
+                .flatten()
+        }
+    })
+    .to_string()
+}
+
+/// `POST /api/compact` — the manual control (spec 55 requirement 4).
+///
+/// It takes no approval and touches no file. The engine appends one event or
+/// nothing; the response says which, so the UI can report it.
+fn handle_compact(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let body = run_compact_request(&repo, &session_id)?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// The body of the manual compaction route, split out so the refusal path is
+/// testable without a stream.
+fn run_compact_request(repo: &str, session_id: &str) -> Result<String, String> {
+    let engine = engine_for_repo(repo)?;
+    compact_session(&engine, repo, session_id)
+}
+
+/// The manual compaction against an already-built engine, so the refusal paths
+/// are testable without a stream or a re-loaded config.
+fn compact_session(
+    engine: &WorkspaceEngine,
+    repo: &str,
+    session_id: &str,
+) -> Result<String, String> {
+    let Some(session) = engine
+        .session_store
+        .read_session(session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Err(format!("Unknown session: {session_id}"));
+    };
+    let repository_id = engine
+        .indexer
+        .repository_id_for_path(repo)
+        .map_err(|error| error.to_string())?;
+    if session.repository_id != repository_id {
+        return Err("Session belongs to a different repository".to_string());
+    }
+    // Compaction runs at a turn boundary. A manual click during a turn would
+    // land inside an action span, so it waits; automatic compaction is already
+    // before the request by construction.
+    let statuses = engine
+        .session_store
+        .read_task_statuses(session_id)
+        .map_err(|error| error.to_string())?;
+    if statuses.values().any(|status| {
+        workspace_engine::TaskStatus::parse(status).is_some_and(|status| status.is_active())
+    }) {
+        return Err("A turn is running in this session; compact after it finishes.".to_string());
+    }
+    let mut adapter = chat_model_adapter(&engine.config, || {
+        resolve_shell_model_api_key(&engine.config)
+    })?;
+    let cancel = CancelToken::new();
+    let body = match engine.chat_orchestrator.compact_conversation(
+        Path::new(repo),
+        session_id,
+        adapter.as_mut(),
+        &cancel,
+    ) {
+        Ok(workspace_engine::compaction::CompactionOutcome::Compacted(summary)) => {
+            serde_json::json!({
+                "kind": "compacted",
+                "summaryId": summary.id,
+                "throughSeq": summary.through_seq,
+                "messageCount": summary.message_count,
+                "factsOnly": summary.is_facts_only(),
+            })
+        }
+        Ok(workspace_engine::compaction::CompactionOutcome::NothingToCompact) => {
+            serde_json::json!({"kind": "nothing"})
+        }
+        Ok(workspace_engine::compaction::CompactionOutcome::Cancelled) => {
+            serde_json::json!({"kind": "cancelled"})
+        }
+        Ok(workspace_engine::compaction::CompactionOutcome::Failed(reason)) => {
+            serde_json::json!({"kind": "failed", "reason": reason})
+        }
+        Err(error) => serde_json::json!({"kind": "failed", "reason": error.to_string()}),
+    };
+    Ok(body.to_string())
 }
 
 fn handle_session_rename(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
@@ -13671,5 +13830,251 @@ mod commit_message_tests {
             Some(("feat: x".to_string(), "Body".to_string()))
         );
         assert_eq!(parse_commit_draft("   \n\n"), None);
+    }
+}
+
+/// The display side of spec 55: the marker's data and the manual route.
+#[cfg(test)]
+mod conversation_compaction_tests {
+    use super::{conversation_json, run_compact_request};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use workspace_engine::compaction::{
+        ApprovalDigest, ConversationSummary, PlanStepDigest, SUMMARY_FORMAT_VERSION,
+        ValidationDigest,
+    };
+    use workspace_engine::{
+        CancelToken, Config, MockModelAdapter, Task, TurnProgress, TurnSink, WorkspaceEngine,
+    };
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_repo() -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-shell-compaction-{now}-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(repo.join("src")).expect("repository");
+        repo
+    }
+
+    fn engine(repo: &Path) -> WorkspaceEngine {
+        WorkspaceEngine::new(Config {
+            data_dir: repo.join(".damaian"),
+            conversation_window_share: 100,
+            enable_index_watcher: false,
+            ..Config::default()
+        })
+    }
+
+    fn seeded(engine: &WorkspaceEngine, repo: &Path) -> (String, Task) {
+        let repository_id = engine.indexer.repository_id_for_path(repo).unwrap();
+        let session = engine
+            .session_store
+            .create_session(&repository_id, "Compacted")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "work", "openai", "gpt-4.1")
+            .unwrap();
+        for index in 0..12 {
+            engine
+                .session_store
+                .append_message(
+                    &session.id,
+                    Some(&task.id),
+                    if index % 2 == 0 { "user" } else { "assistant" },
+                    &format!("message {index} {}", "x".repeat(200)),
+                )
+                .unwrap();
+        }
+        (session.id, task)
+    }
+
+    fn summary(id: &str, through_seq: u64) -> ConversationSummary {
+        ConversationSummary {
+            id: id.to_string(),
+            through_seq,
+            format_version: SUMMARY_FORMAT_VERSION,
+            objective: "Do not touch the public API.".to_string(),
+            files_changed: vec!["src/lib.rs".to_string()],
+            plan_steps: vec![PlanStepDigest {
+                id: "step_1".to_string(),
+                title: "Add the parser".to_string(),
+                status: workspace_engine::plan::StepStatus::Completed,
+            }],
+            approvals: vec![ApprovalDigest {
+                kind: "command".to_string(),
+                id: "cmd_1".to_string(),
+                decision: "approved".to_string(),
+                subject: Some("cargo test".to_string()),
+            }],
+            validation: vec![ValidationDigest {
+                label: "cargo test (repository root)".to_string(),
+                outcome: "passed".to_string(),
+            }],
+            constraints: vec!["keep the API stable".to_string()],
+            decisions: Vec::new(),
+            failed_approaches: Vec::new(),
+            uncertainty: Vec::new(),
+            model_run_id: Some("modelrun_1".to_string()),
+            message_count: 8,
+        }
+    }
+
+    #[test]
+    fn the_session_payload_carries_its_compactions_and_boundary() {
+        let repo = temp_repo();
+        let engine = engine(&repo);
+        let (session_id, _) = seeded(&engine, &repo);
+        let messages = engine
+            .session_store
+            .read_messages_with_seq(&session_id)
+            .unwrap();
+        let through = messages[7].0;
+        engine
+            .session_store
+            .append_conversation_compaction(&session_id, &summary("summary_1", through))
+            .unwrap();
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&conversation_json(&engine, &session_id)).expect("JSON");
+        assert_eq!(payload["compactions"][0]["id"], "summary_1");
+        assert_eq!(payload["compactions"][0]["formatVersion"], 1);
+        assert_eq!(payload["compactions"][0]["messageCount"], 8);
+        assert_eq!(payload["conversation"]["kind"], "summary");
+        assert_eq!(payload["conversation"]["throughSeq"], through);
+        assert_eq!(payload["conversation"]["autoCompact"], true);
+        assert!(
+            payload["conversation"]["omittedMessages"].as_u64().unwrap() >= 8,
+            "the covered messages are counted as omitted from the request"
+        );
+        assert!(
+            payload["conversation"]["canCompact"].as_bool().unwrap(),
+            "the messages after the summary still exceed the window"
+        );
+        assert_eq!(
+            engine
+                .session_store
+                .read_messages(&session_id)
+                .unwrap()
+                .len(),
+            12,
+            "the display reader still has every message"
+        );
+    }
+
+    #[test]
+    fn the_boundary_counts_match_the_prompt_when_a_plan_reminder_is_present() {
+        let repo = temp_repo();
+        let engine = WorkspaceEngine::new(Config {
+            data_dir: repo.join(".damaian"),
+            // 0.5% of 16,000 tokens: 80, so a 12-message seed is only partly in
+            // view and the notice has something to count. Automatic
+            // compaction is off so the first request is the ask, not a summary
+            // call.
+            conversation_window_share: 50,
+            conversation_auto_compact: false,
+            enable_index_watcher: false,
+            ..Config::default()
+        });
+        let (session_id, _) = seeded(&engine, &repo);
+        // The engine's own reminder is a user-role message in storage but not
+        // a sendable one; if it consumed the window the marker would disagree
+        // with the request.
+        engine
+            .session_store
+            .append_message_with_kind(
+                &session_id,
+                None,
+                "user",
+                &"r".repeat(4_000),
+                Some("plan_reminder"),
+            )
+            .unwrap();
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&conversation_json(&engine, &session_id)).expect("JSON");
+        let conversation = &payload["conversation"];
+        let omitted = conversation["omittedMessages"].as_u64().unwrap();
+        let window = conversation["windowMessages"].as_u64().unwrap();
+        assert_eq!(
+            window + omitted,
+            12,
+            "the 12 sendable messages split into the window and the notice; the reminder is neither"
+        );
+
+        let mut adapter = MockModelAdapter::new("Done.");
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        engine
+            .chat_orchestrator
+            .ask_with_session(
+                &repo,
+                "What next?",
+                &[],
+                Some(&session_id),
+                &mut adapter,
+                &mut sink,
+            )
+            .expect("the turn runs");
+        let prompt = &adapter.requests[0].messages[1].content;
+        let notice = prompt
+            .split("[Damaian: ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|count| count.parse::<u64>().ok())
+            .expect("the request states how many messages were not sent");
+        assert_eq!(
+            notice, omitted,
+            "the marker and the request must count the same messages: {prompt}"
+        );
+    }
+
+    #[test]
+    fn the_session_payload_reports_an_uncompacted_boundary_as_elision() {
+        let repo = temp_repo();
+        let engine = engine(&repo);
+        let (session_id, _) = seeded(&engine, &repo);
+        let payload: serde_json::Value =
+            serde_json::from_str(&conversation_json(&engine, &session_id)).expect("JSON");
+        assert_eq!(payload["conversation"]["kind"], "elision");
+        assert!(payload["conversation"]["omittedMessages"].as_u64().unwrap() > 0);
+        assert!(payload["conversation"]["canCompact"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn the_compact_route_refuses_while_a_turn_is_running() {
+        let repo = temp_repo();
+        let engine = engine(&repo);
+        let (session_id, task) = seeded(&engine, &repo);
+        engine
+            .session_store
+            .update_task_status(&task, workspace_engine::TaskStatus::RunningTool, None)
+            .unwrap();
+        let error = super::compact_session(&engine, &repo.to_string_lossy(), &session_id)
+            .expect_err("a running turn is not a boundary");
+        assert!(error.contains("A turn is running"), "{error}");
+    }
+
+    #[test]
+    fn the_compact_route_refuses_a_repository_without_a_session() {
+        let repo = temp_repo();
+        let error = run_compact_request(&repo.to_string_lossy(), "session_that_does_not_exist")
+            .expect_err("an unknown session is an error");
+        assert!(error.contains("Unknown session"), "{error}");
     }
 }

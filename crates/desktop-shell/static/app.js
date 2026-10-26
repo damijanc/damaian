@@ -4499,6 +4499,7 @@ async function loadConfigFile() {
   // The toggle writes through the editor's content, so it stays off until
   // that content is the file's: saving an empty editor would empty the file.
   $("worker-sessions-input").disabled = false;
+  void refreshConversationAutoCompact();
   void refreshModelKeyStatus().catch((error) => setModelKeyStatus(error.message, "error"));
   return payload;
 }
@@ -5072,8 +5073,20 @@ function wireFileReferences(container, chatRepo) {
 // one on reload. Without it a truncated answer renders as a complete short one.
 // Returns each message with its bubble, in order, for entries placed between
 // them afterwards.
-function renderMessages(messages, tasks = []) {
+function renderMessages(messages, tasks = [], compactions = [], conversation = null) {
   $("chat-log").innerHTML = "";
+  // Spec 55 §5.9: the boundary marker says where the model's view begins. The
+  // original messages stay below it — nothing was deleted, only not sent.
+  const boundary = conversationBoundaryMarker(compactions, conversation);
+  let boundaryDrawn = false;
+  const drawBoundaryBefore = (message) => {
+    if (boundaryDrawn || !boundary) return;
+    if (!message.seq || !conversation || conversation.kind === "none") return;
+    if (message.seq > conversation.throughSeq) {
+      $("chat-log").append(boundary);
+      boundaryDrawn = true;
+    }
+  };
   const cancelledTasks = new Set(
     tasks.filter((task) => task.status === "cancelled").map((task) => task.id),
   );
@@ -5116,7 +5129,8 @@ function renderMessages(messages, tasks = []) {
   const usageByTask = new Map(
     tasks.filter((task) => typeof task.inputTokens === "number").map((task) => [task.id, task]),
   );
-  return messages.map((message, index) => {
+  const rendered = messages.map((message, index) => {
+    drawBoundaryBefore(message);
     // The engine's one plan reminder is a user-role message in the request but
     // not something the user typed. Render it as a system line, and not as an
     // answer, a rewind anchor, or a question (spec 66 `context.md` D10).
@@ -5181,6 +5195,114 @@ function renderMessages(messages, tasks = []) {
     }
     return { message, bubble };
   });
+  if (!boundaryDrawn && boundary) {
+    // The summary covers everything (or the log predates `seq`): the boundary
+    // is the top of the thread, not the bottom of it.
+    $("chat-log").prepend(boundary);
+  }
+  return rendered;
+}
+
+// The marker is data from `/api/session`; it names how many messages the model
+// no longer sees and, when a summary exists, lets the user read it.
+function conversationBoundaryMarker(compactions, conversation) {
+  if (!conversation) return null;
+  if (conversation.kind === "none" && !conversation.lastFailure) return null;
+  const article = document.createElement("article");
+  article.className = "message system compaction-boundary";
+  const body = document.createElement("div");
+  body.className = "message-body";
+  const details = document.createElement("details");
+  const summaryLine = document.createElement("summary");
+  const omitted = conversation.omittedMessages || 0;
+  if (conversation.kind === "none" && conversation.lastFailure) {
+    summaryLine.textContent = `Compaction could not run: ${conversation.lastFailure}`;
+    details.append(summaryLine);
+  } else if (conversation.kind === "elision") {
+    summaryLine.textContent = `${omitted} earlier message${omitted === 1 ? "" : "s"} were not sent to the model and were not summarised. The full transcript is still here.`;
+    details.append(summaryLine);
+  } else {
+    const summary = compactions[compactions.length - 1] || {};
+    summaryLine.textContent = `${omitted} earlier message${omitted === 1 ? "" : "s"} are represented by a summary the model receives instead. The full transcript is below.`;
+    details.append(summaryLine);
+    details.append(summaryBody(summary));
+  }
+  body.append(details);
+  if (conversation.lastFailure && conversation.kind !== "none") {
+    const failure = document.createElement("p");
+    failure.className = "compaction-failure";
+    failure.textContent = `The last compaction could not run: ${conversation.lastFailure}`;
+    body.append(failure);
+  }
+  if (conversation.canCompact) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn-quiet compaction-now";
+    button.textContent = "Compact now";
+    button.addEventListener("click", () => void compactConversationNow());
+    body.append(button);
+  }
+  article.append(body);
+  return article;
+}
+
+function summaryBody(summary) {
+  const container = document.createElement("div");
+  container.className = "compaction-summary";
+  const section = (heading, lines) => {
+    if (!lines || lines.length === 0) return;
+    const title = document.createElement("p");
+    title.className = "compaction-summary-heading";
+    title.textContent = heading;
+    container.append(title);
+    const list = document.createElement("ul");
+    lines.forEach((line) => {
+      const item = document.createElement("li");
+      item.textContent = line;
+      list.append(item);
+    });
+    container.append(list);
+  };
+  if (summary.objective) section("Objective", [summary.objective]);
+  section("Requirements and constraints", summary.constraints);
+  section("Decisions", summary.decisions);
+  section("Failed approaches", summary.failedApproaches);
+  section("Remaining uncertainty", summary.uncertainty);
+  section("Files changed", summary.filesChanged);
+  section(
+    "Plan steps",
+    (summary.planSteps || []).map((step) => `${step.title} — ${step.status.replaceAll("_", " ")}`),
+  );
+  section(
+    "Approvals",
+    (summary.approvals || []).map(
+      (approval) => `${approval.kind} ${approval.id}: ${approval.decision}`,
+    ),
+  );
+  section(
+    "Validation",
+    (summary.validation || []).map((item) => `${item.label}: ${item.outcome}`),
+  );
+  return container;
+}
+
+async function compactConversationNow() {
+  if (!currentSessionId || !repo()) return;
+  try {
+    const payload = await api("/api/compact", form({ repo: repo(), session_id: currentSessionId }));
+    if (payload.kind === "compacted") {
+      toast("Conversation compacted. The full transcript is still here.");
+    } else if (payload.kind === "nothing") {
+      toast("Nothing older than the conversation window to compact.");
+    } else if (payload.kind === "cancelled") {
+      toast("Compaction stopped.");
+    } else {
+      toast(`Compaction did not run: ${payload.reason || "unknown reason"}`);
+    }
+    await loadSession(currentSessionId);
+  } catch (error) {
+    toast(errorMessage(error));
+  }
 }
 
 // Checkpoints for the open session, newest first. Loaded with the session so
@@ -6003,6 +6125,23 @@ async function saveWorkerSessionsSetting(enabled) {
   await saveConfigFile();
   if (workersEnabled !== enabled) {
     throw new Error("Saved, but another configuration file overrides Worker sessions.");
+  }
+}
+
+// Spec 55 §5.5: read the *effective* value, so an absent key shows as checked
+// (the default) and a rejected repository value never looks applied.
+async function refreshConversationAutoCompact() {
+  const input = $("conversation-auto-compact-input");
+  try {
+    const payload = await api(`/api/effective-policy?repo=${encodeURIComponent(repo() || "")}`);
+    const rule = (payload.rules || []).find((entry) => entry.key === "conversation_auto_compact");
+    input.checked = rule?.value !== "false";
+    input.disabled = false;
+  } catch {
+    // Unknown reads as unchecked and disabled: a control must not appear to
+    // hold a setting it could not read.
+    input.checked = false;
+    input.disabled = true;
   }
 }
 
@@ -11388,7 +11527,12 @@ async function loadSession(sessionId) {
   // Before rendering: the messages' *Start worker* actions depend on it.
   await refreshWorkerIndex();
   renderThreadHeader();
-  const rendered = renderMessages(payload.messages, payload.tasks || []);
+  const rendered = renderMessages(
+    payload.messages,
+    payload.tasks || [],
+    payload.conversationView?.compactions || [],
+    payload.conversationView?.conversation || null,
+  );
   renderSpawnedWorkerEntries(rendered, currentSessionId);
   await refreshFindings();
   // After the conversation, because `renderMessages` clears the log and the
@@ -12283,6 +12427,23 @@ $("config-save-btn").addEventListener("click", async () => {
     toast(payload.path);
   } catch (error) {
     toast(error.message);
+  }
+});
+
+$("conversation-auto-compact-input").addEventListener("change", async (event) => {
+  const enabled = event.target.checked;
+  try {
+    await api(
+      "/api/config-set",
+      form({ key: "conversation_auto_compact", value: enabled ? "true" : "false" }),
+    );
+    // The editor is authoritative for everything else; reload it so its next
+    // Save cannot write the old value back.
+    await loadConfigFile();
+    await refreshConversationAutoCompact();
+  } catch (error) {
+    toast(errorMessage(error));
+    await refreshConversationAutoCompact();
   }
 });
 

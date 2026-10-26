@@ -1407,6 +1407,55 @@ jq -r 'select(.eventType=="plan_resumed") | "\(.payload.taskId) resumed from \(.
 If no `plan_resumed` appears, the previous task either had no plan or had
 nothing outstanding — a plan whose steps all finished has nothing to resume.
 
+### The assistant seems to have forgotten something you said earlier
+
+Damaian no longer clips a conversation to its last eight messages silently. When
+a conversation grows past its **conversation window**, older messages are
+represented by a summary (or, with automatic compaction off, left out with an
+explicit notice). Two things can make the assistant lose a constraint:
+
+1. **The summary does not mention it.** The transcript shows a boundary marker
+   where the model's view begins — *"N earlier messages are represented by a
+   summary the model receives instead"*. Open it and read the **Requirements and
+   constraints** and **Decisions** sections. If the constraint is missing, the
+   summarisation call did not record it; restate the constraint in your next
+   message. The summary is a record, not an authority over what you say now.
+2. **Automatic compaction is off.** The marker says the earlier messages were
+   **not sent and not summarised**. The request also carries an
+   `[Damaian: … earlier messages … were not sent …]` line. Compact by hand from
+   the marker's **Compact now** button, or turn automatic compaction back on in
+   **Settings › General › Conversation**.
+
+Find out what happened from the session log. `$SESSION_FILE` is resolved at the
+top of this document:
+
+```bash
+# Every compaction boundary, newest last.
+jq -r 'select(.eventType=="conversation_compacted") | "seq \(.seq): through \(.payload.throughSeq), \(.payload.messageCount) messages, format v\(.payload.formatVersion), run \(.payload.modelRunId // "none")"' "$SESSION_FILE"
+
+# A compaction that could not run, and why.
+jq -r 'select(.eventType=="conversation_compaction_failed") | "seq \(.seq): \(.payload.reason)"' "$SESSION_FILE"
+```
+
+The same events appear in the audit log as `conversation_compacted` (ids,
+counts, the run id, token figures and whether the summary is facts-only) and
+`conversation_compaction_failed` (the reason). The audit log never holds the
+summary's text.
+
+**The facts in a summary are not the model's recollection.** Files changed, plan
+steps, approval decisions and validation results are read from the session log;
+if one of those is wrong, the log is the authority and the summary is a rendering
+of it. Check the plan panel, the approvals in the transcript, or
+`.damaian/chat/` for the stored proposal.
+
+**A compaction failure never blocks a turn.** If the summarisation call is
+refused or fails, Damaian keeps a facts-only summary and leaves the
+model-written half empty; the marker shows the summary with no narrative. If even
+the fact half cannot be written, the request uses the window with the elision
+notice. Nothing is lost from storage in either case — the full transcript is
+still in the session, and rewinding past the boundary restores the model's view
+of every message.
+
 ### After a crash: what recovery decided
 
 A task that was mid-action when the process died leaves an `action_started`

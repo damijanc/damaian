@@ -28,7 +28,7 @@ use workspace_engine::{
     ProfileCapabilities, ProfileId, RefusedBy, RefusedRequest, RepositoryConfigReport,
     RepositoryKeyClass, RepositoryTrustStore, SecretScanner, SessionMode, SourceKind, ToolCall,
     TurnProgress, TurnSink, WorkspaceEngine, overlay_field_kinds, repository_id_for_root,
-    review_profile_rejections, select_profile,
+    review_profile_rejections, select_profile, split_profile_keys,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -559,6 +559,23 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "",
             "context_budget.safety_margin=0.00\n",
             Reported("context_budget.safety_margin"),
+        ),
+        // Spec 55 §5.5: neither direction of the off switch is a restriction,
+        // so a repository cannot decide whether the user's money is spent on a
+        // summarisation call.
+        case(
+            "conversation_auto_compact",
+            "",
+            "conversation_auto_compact=false\n",
+            Reported("conversation_auto_compact"),
+        ),
+        // Spec 55 §5.1: a smaller window sends less of the user's conversation,
+        // so a raise is refused and a lower value applies.
+        case(
+            "conversation_window_share",
+            "",
+            "conversation_window_share=1.00\n",
+            Reported("conversation_window_share"),
         ),
     ]
 }
@@ -3609,4 +3626,89 @@ fn a_repository_may_lower_the_symbol_context_ceiling_but_not_raise_it() {
 
     let (config, _) = load("symbol-ceiling-off", "", "symbol_context_max_tokens=0\n");
     assert_eq!(config.symbol_context_max_tokens, 0);
+}
+
+#[test]
+fn conversation_compaction_defaults_and_restrict_only_direction() {
+    let base = Config::default();
+    assert!(
+        base.conversation_auto_compact,
+        "automatic compaction defaults on"
+    );
+    assert_eq!(
+        base.conversation_window_share,
+        workspace_engine::compaction::DEFAULT_WINDOW_SHARE_BPS
+    );
+
+    let (lowered, _) = load(
+        "conversation-window-lower",
+        "",
+        "conversation_window_share=0.10\n",
+    );
+    assert_eq!(lowered.conversation_window_share, 1_000);
+
+    let (raised, _) = load(
+        "conversation-window-raise",
+        "conversation_window_share=0.10\n",
+        "conversation_window_share=0.50\n",
+    );
+    assert_eq!(
+        raised.conversation_window_share, 1_000,
+        "a repository may lower the window, never raise it"
+    );
+}
+
+#[test]
+fn a_repository_cannot_set_the_conversation_auto_compact_off_switch_either_way() {
+    for value in ["true", "false"] {
+        let (config, report) = load(
+            "conversation-auto",
+            "",
+            &format!("conversation_auto_compact={value}\n"),
+        );
+        assert!(config.conversation_auto_compact, "the default holds");
+        assert!(
+            report
+                .rejected_keys
+                .iter()
+                .any(|rejected| rejected.key == "conversation_auto_compact"
+                    && rejected.class == RepositoryKeyClass::Forbidden),
+            "a repository setting {value} must be reported as forbidden"
+        );
+    }
+}
+
+#[test]
+fn conversation_keys_have_human_names_and_capability_kinds() {
+    let kind_of = |name: &str| {
+        overlay_field_kinds()
+            .into_iter()
+            .find(|(field, _)| *field == name)
+            .map(|(_, kind)| kind)
+    };
+    for key in ["conversation_auto_compact", "conversation_window_share"] {
+        assert_eq!(kind_of(key), Some(ConfigKeyKind::Capability));
+        assert!(
+            workspace_engine::rule_label(key).is_some(),
+            "{key} has a label"
+        );
+    }
+}
+
+#[test]
+fn a_profile_cannot_carry_the_auto_compact_switch_but_may_lower_the_window() {
+    let overlay = ConfigOverlay {
+        conversation_auto_compact: Some(false),
+        conversation_window_share: Some(1_000),
+        ..ConfigOverlay::default()
+    };
+    let (carried, refused) = split_profile_keys(overlay);
+    assert!(carried.conversation_auto_compact.is_none());
+    assert_eq!(carried.conversation_window_share, Some(1_000));
+    assert!(
+        refused
+            .iter()
+            .any(|rejected| rejected.key == "conversation_auto_compact"
+                && rejected.class == RepositoryKeyClass::Forbidden)
+    );
 }

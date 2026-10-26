@@ -18,7 +18,7 @@ budget, the plan and its carry-over) — built;
 continuation this completes) — built. Everything else named below is a
 cross-reference, not a prerequisite.
 Related implementation specs:
-[`55_conversation_compaction.md`](../55_conversation_compaction.md) (keeps the
+[`55_conversation_compaction/proposal.md`](../55_conversation_compaction/proposal.md) (keeps the
 objective across turns; explicitly not the in-turn array, §4),
 [`57_worker_sessions`](../57_worker_sessions/proposal.md) (a worker answers
 approvals in its own process),
@@ -105,7 +105,7 @@ which sets none, the cliff is still there.
 ## 4. Non-goals
 
 - Keeping the objective across separate turns in general. That is
-  [#55](../55_conversation_compaction.md); this spec keeps one turn alive instead
+  [#55](../55_conversation_compaction/proposal.md); this spec keeps one turn alive instead
   of replacing it.
 - Changing what counts as a round ([#59](../59_exploration_round_allowance/proposal.md))
   or the default `agent_max_tool_rounds`.
