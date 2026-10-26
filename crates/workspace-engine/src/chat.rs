@@ -1338,6 +1338,7 @@ impl ChatOrchestrator {
                 conversation,
                 summary,
                 summary_removed: false,
+                changed: false,
             }),
         })?;
         self.note_pending_approvals(
@@ -1532,16 +1533,19 @@ impl ChatOrchestrator {
             TaskStatus::PreparingContext,
             None,
         )?;
-        // The amended manifest is what the resumed turn sends, so it is the
-        // second (and newest) `context_assembled` record for the task.
-        let mut context_fields = vec![
-            ("actor", "system".to_string()),
-            ("sessionId", pending.session.id.clone()),
-        ];
-        context_fields.extend(plan.manifest.audit_fields());
-        self.audit_log
-            .record("context_assembled", &context_fields)?;
-        sink.context(&plan.manifest);
+        // An unchanged turn already has its `context_assembled` record from
+        // the pause; only a changed plan adds a newer one, so the post-send
+        // view reads what was actually sent.
+        if review.changed {
+            let mut context_fields = vec![
+                ("actor", "system".to_string()),
+                ("sessionId", pending.session.id.clone()),
+            ];
+            context_fields.extend(plan.manifest.audit_fields());
+            self.audit_log
+                .record("context_assembled", &context_fields)?;
+            sink.context(&plan.manifest);
+        }
 
         self.run_agentic_turn(
             &PathBuf::from(&pending.repository_root),
@@ -1573,6 +1577,7 @@ impl ChatOrchestrator {
             ClientError::InvalidInput(format!("{proposal_id} is not a context review"))
         })?;
         let record = review.prepared.remove_optional(index)?;
+        review.changed = true;
         self.audit_log.record(
             "context_item_removed",
             &[
@@ -1595,7 +1600,6 @@ impl ChatOrchestrator {
             ],
         )?;
         self.save_context_review(&pending, review.clone())?;
-        self.record_context_review_manifest(&pending, &review.prepared.manifest)?;
         Ok(review.prepared.manifest)
     }
 
@@ -1609,6 +1613,7 @@ impl ChatOrchestrator {
         })?;
         let record = review.prepared.remove_summary()?;
         review.summary_removed = true;
+        review.changed = true;
         self.audit_log.record(
             "context_summary_removed",
             &[
@@ -1620,7 +1625,6 @@ impl ChatOrchestrator {
             ],
         )?;
         self.save_context_review(&pending, review.clone())?;
-        self.record_context_review_manifest(&pending, &review.prepared.manifest)?;
         Ok(review.prepared.manifest)
     }
 
@@ -1632,22 +1636,6 @@ impl ChatOrchestrator {
         let mut updated = pending.clone();
         updated.context_review = Some(review);
         self.pending_commands.save(&updated)
-    }
-
-    /// The amended manifest is a newer `context_assembled` record for the task,
-    /// so the post-send view reads what will actually be sent.
-    fn record_context_review_manifest(
-        &self,
-        pending: &PendingChatTurn,
-        manifest: &ContextManifest,
-    ) -> Result<()> {
-        let mut fields = vec![
-            ("actor", "system".to_string()),
-            ("sessionId", pending.session.id.clone()),
-        ];
-        fields.extend(manifest.audit_fields());
-        self.audit_log.record("context_assembled", &fields)?;
-        Ok(())
     }
 
     /// Runs the verification that a settled Code-mode patch made due (spec 23).
@@ -8772,6 +8760,12 @@ struct PendingContextReview {
     conversation: PromptConversation,
     summary: Option<ConversationSummary>,
     summary_removed: bool,
+    /// Whether the user changed the prepared plan. The initial assembly is
+    /// already the audit record of an unchanged turn, so a resume records a
+    /// second `context_assembled` only when it will actually send something
+    /// else (spec 27 §5.3).
+    #[serde(default)]
+    changed: bool,
 }
 
 /// The persisted half of a round-budget pause (spec 61). `rounds_granted` is

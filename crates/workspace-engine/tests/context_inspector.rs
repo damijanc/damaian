@@ -1058,3 +1058,61 @@ fn an_edit_from_a_session_honours_its_pins_and_restriction() {
         manifest.included
     );
 }
+
+fn context_events_for(engine: &WorkspaceEngine, task_id: &str) -> usize {
+    let path = engine.config.data_dir.join("audit").join("events.jsonl");
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["eventType"] == "context_assembled")
+        .filter(|event| event["taskId"] == task_id)
+        .count()
+}
+
+#[test]
+fn an_unchanged_review_is_recorded_once_and_a_changed_one_twice() {
+    let repo = fixture_repo("review-record-count");
+    let engine = WorkspaceEngine::new(pause_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let (first, _) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+    let first_review = first.context_review.expect("the review is present");
+    assert_eq!(context_events_for(&engine, &first.task.id), 1);
+    let sent = resume_context(
+        &engine,
+        &first_review.id,
+        ContextDecision::Send,
+        &mut adapter,
+    )
+    .expect("an unchanged review sends");
+    assert_eq!(
+        context_events_for(&engine, &sent.task.id),
+        1,
+        "an unchanged turn must not record a second assembly"
+    );
+
+    let second = ask_with_again(&engine, &repo, &sent.session.id, "And now?", &mut adapter);
+    let second_review = second.context_review.expect("the review is present");
+    let index = second_review
+        .manifest
+        .included
+        .iter()
+        .position(|included| included.category == ContextCategory::RepositoryMap)
+        .expect("the map is included");
+    engine
+        .chat_orchestrator
+        .remove_context_item(&second_review.id, index)
+        .expect("the map is removable");
+    let sent = resume_context(
+        &engine,
+        &second_review.id,
+        ContextDecision::Send,
+        &mut adapter,
+    )
+    .expect("the amended review sends");
+    assert_eq!(
+        context_events_for(&engine, &sent.task.id),
+        2,
+        "a changed turn records the amended assembly as the newest"
+    );
+}
