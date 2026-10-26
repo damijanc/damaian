@@ -11,7 +11,7 @@ the resolved §7 open question in [`context.md`](context.md)
 | Task | State | Notes |
 |---|---|---|
 | 1 · Folder split, context map and links | Done 2026-10-26 | `git mv` to `27_context_inspector/proposal.md`; added this plan and `context.md`; every link to `27_context_inspector.md` repointed (28, 29, 30, 32 ×2, 24, 54, 51, 42 ×2, 26 ×4, 55 ×2, README); Status moved to In progress and README current state/row updated. No code. `npm run specs:check` passes (66 specs; it initially flagged the Progress rows until their State cells used the checker's three words). |
-| 2 · Session-scoped pins and restrictions | Not started | |
+| 2 · Session-scoped pins and restrictions | Done 2026-10-26 | `ContextPin` and the seven methods in `session.rs` append/replay `context_pin_added` / `context_pin_removed` / `context_pins_cleared` / `context_restriction_set` / `context_restriction_cleared`. Readers use `parsed_events` (a rewind does not clear the controls); pins match on `(path, range)`; an empty restriction is `Some([])`. **Deviation:** the five tests are inline in `session.rs` rather than the new integration file, because they need only a `SessionStore` and a temp dir; the integration file starts at Task 3. **Falsified:** dropping the `context_pin_removed` arm left the removed range in the list and the test failed. Scoped checks: fast five passed; scoped clippy passed; the filtered lib nextest run passed 7 tests. |
 | 3 · Manifest extensions and collection controls | Not started | |
 | 4 · `PreparedContext` and removal | Not started | |
 | 5 · `pause_for_context_review` config | Not started | |
@@ -282,7 +282,7 @@ flat file; `docs/specs/README.md`.
 
 **Files:** `session.rs`; new `tests/context_inspector.rs`.
 
-- [ ] **Step 1: Write the failing tests** in `tests/context_inspector.rs`
+- [x] **Step 1: Write the failing tests** in `tests/context_inspector.rs`
   (build a `SessionStore` with `test_config`-style `data_dir` and a real
   session; the session helpers live in `tests/foundation.rs`):
   - `pins_are_appended_events_and_replay_newest_wins`: add a whole-file pin and
@@ -301,10 +301,10 @@ flat file; `docs/specs/README.md`.
   - `a_line_containing_a_pin_event_name_is_not_a_pin`: write a `chat_message`
     event with the text `context_pin_added` and assert it is ignored — the
     reader matches parsed `eventType`, not substrings.
-- [ ] **Step 2: Run them and confirm they fail to compile** on the missing
+- [x] **Step 2: Run them and confirm they fail to compile** on the missing
   methods: `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine
   --test context_inspector`.
-- [ ] **Step 3: Implement.** Add `ContextPin` and the seven methods beside
+- [x] **Step 3: Implement.** Add `ContextPin` and the seven methods beside
   `allow_browser_diagnostics_for_session` (`session.rs:1063`). Every write uses
   `append_session_event`; every read uses `parsed_events`, never
   `active_events`: a rewind discards conversation, not the user's control of
@@ -313,12 +313,12 @@ flat file; `docs/specs/README.md`.
   path is stored trimmed and non-empty; an empty entry is dropped. Do not
   normalise paths here — the assembler owns path normalisation, and doing it in
   two places is how the two disagree.
-- [ ] **Step 4: Falsify.** Make `context_pins` use `active_events` after a
+- [x] **Step 4: Falsify.** Make `context_pins` use `active_events` after a
   rewind → the round-trip test still passes but a new rewind test fails; add one
   assert to the round-trip test that a rewind does not clear pins. Make pin
   removal match only the path → the ranged-pin test's second range disappears.
   Restore both.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -326,7 +326,7 @@ flat file; `docs/specs/README.md`.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test context_inspector
   ```
 
-- [ ] **Step 6: Update the Progress row** (what landed, checks, mutations) and
+- [x] **Step 6: Update the Progress row** (what landed, checks, mutations) and
   commit. Subject: `Store context pins and path restrictions per session`.
 
 ---
