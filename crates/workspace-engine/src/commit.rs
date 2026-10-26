@@ -37,7 +37,7 @@ use crate::verification::{VerificationReport, fold_verification};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -147,8 +147,9 @@ pub struct GitHookInfo {
     pub exists: bool,
     pub executable: bool,
     pub size: u64,
-    /// SHA-256 of the hook file, so a same-size edit between the report and the
-    /// commit is still a change. `None` when no file is there.
+    /// A content identity for the hook file (Git's blob id), so a same-size
+    /// edit between the report and the commit is still a change. `None` when
+    /// no file is there.
     pub content_hash: Option<String>,
     pub interpreter: Option<String>,
     /// Whether Damaian would run it: exists, is a file and has an execute bit.
@@ -1578,18 +1579,32 @@ impl CommitEngine {
                 .as_ref()
                 .is_some_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
             let size = metadata.as_ref().map(|meta| meta.len()).unwrap_or(0);
-            let bytes = if is_file { fs::read(&path).ok() } else { None };
-            let content_hash = bytes.as_deref().map(crate::hash::sha256);
-            let interpreter = bytes.and_then(|bytes| {
-                let first = bytes
-                    .split(|&byte| byte == b'\n')
-                    .next()
-                    .map(String::from_utf8_lossy)
-                    .map(|line| line.trim().to_string());
-                first
-                    .filter(|line| line.starts_with("#!"))
-                    .map(|line| line.chars().take(120).collect::<String>())
-            });
+            // A clone controls `.git/hooks`, so neither the hash nor the
+            // interpreter read may load an arbitrarily large file into memory.
+            // `hash-object` streams; the interpreter is read from the first
+            // 8 KiB, where a shebang lives.
+            let content_hash = if is_file {
+                self.hash_object_path(root, &path.to_string_lossy(), false)
+                    .ok()
+            } else {
+                None
+            };
+            let interpreter = if is_file {
+                fs::File::open(&path).ok().and_then(|file| {
+                    let mut buffer = Vec::new();
+                    file.take(8 * 1024).read_to_end(&mut buffer).ok()?;
+                    let first = buffer
+                        .split(|&byte| byte == b'\n')
+                        .next()
+                        .map(String::from_utf8_lossy)
+                        .map(|line| line.trim().to_string());
+                    first
+                        .filter(|line| line.starts_with("#!"))
+                        .map(|line| line.chars().take(120).collect::<String>())
+                })
+            } else {
+                None
+            };
             let runs = exists && is_file && executable;
             let skipped_reason = if exists && !is_file {
                 Some("not a file".to_string())
