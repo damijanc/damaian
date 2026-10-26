@@ -425,7 +425,7 @@ kind, not a new pipeline.** The answer in full is `context.md` §4. In summary:
   sends the amended plan through the same `run_agentic_turn` a non-paused turn
   uses.
 - What else the work touched: `ChatTurnResult` (one field), `PendingChatTurn`
-  (one field and seven literals), `TurnProgress`/`TurnEvent` (one boxed
+  (one field and nine literals), `TurnProgress`/`TurnEvent` (one boxed
   manifest), the shell's result and session JSON, five routes, the panel and
   review card, and recovery's reattachment table. It did not touch
   `run_agentic_turn`'s loop, tool dispatch, round budgets or the model adapter.

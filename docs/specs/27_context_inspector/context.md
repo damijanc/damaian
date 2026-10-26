@@ -131,7 +131,7 @@ implementation takes:
    re-reading the conversation.
 5. **What else it touches.** `ChatTurnResult` (one new field), the `done`
    serialisation in the shell (one new key), `PendingChatTurn` (one new field and
-   one new literal in all seven existing constructors — the compiler finds them),
+   one new literal in all nine existing constructors — the compiler finds them),
    `PausedFor`/`paused_for` (one variant and one tuple position),
    `TurnProgress`/`TurnEvent` (one boxed manifest variant), and the tests that
    assert the pause matrix. It does **not** touch `run_agentic_turn`'s loop,
