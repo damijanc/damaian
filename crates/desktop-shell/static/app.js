@@ -4800,7 +4800,9 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
     return { message, bubble };
   });
   if (!boundaryDrawn && boundary) {
-    $("chat-log").append(boundary);
+    // The summary covers everything (or the log predates `seq`): the boundary
+    // is the top of the thread, not the bottom of it.
+    $("chat-log").prepend(boundary);
   }
   return rendered;
 }

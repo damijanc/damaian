@@ -4150,6 +4150,13 @@ impl ChatOrchestrator {
         ) else {
             return Ok(crate::compaction::CompactionOutcome::NothingToCompact);
         };
+        // A second summary describes the whole conversation, not only the span
+        // since the first boundary: the original objective and every earlier
+        // fact are carried forward (§5.3).
+        let facts = match view.summary.as_ref() {
+            Some(previous) => crate::compaction::merge_summary_facts(previous, facts),
+            None => facts,
+        };
 
         // Only the covered span is material. The previous summary travels
         // separately as an input to the next one (proposal §5.3).

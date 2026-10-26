@@ -558,8 +558,12 @@ inferred.
   a measurement of real sessions, and it is recorded as such.
 - **Fidelity under repeated compaction:** not measured against a real model,
   because the live tier was not run. What is proved structurally is that each
-  summary is an input to the next
-  (`a_second_compaction_summarises_the_first_one_plus_what_followed`). The
+  summary is an input to the next, that the fact half accumulates rather than
+  shrinking — objective, files changed, plan steps, approvals and validation
+  carry forward, and the later record wins on a conflict
+  (`a_second_compaction_summarises_the_first_one_plus_what_followed`,
+  `a_merge_carries_earlier_facts_and_lets_the_new_span_win`) — and that the
+  covered-message count accumulates. The
   question §7 asks — how far a third or fourth summary drifts — remains open and
   is the first thing a live tier should measure. Nothing is lost to make that
   possible: the original messages stay in the log, so a future change can

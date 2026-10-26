@@ -726,13 +726,19 @@ fn handle_compact(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
 /// testable without a stream.
 fn run_compact_request(repo: &str, session_id: &str) -> Result<String, String> {
     let engine = engine_for_repo(repo)?;
-    if engine
+    let Some(session) = engine
         .session_store
         .read_session(session_id)
         .map_err(|error| error.to_string())?
-        .is_none()
-    {
+    else {
         return Err(format!("Unknown session: {session_id}"));
+    };
+    let repository_id = engine
+        .indexer
+        .repository_id_for_path(repo)
+        .map_err(|error| error.to_string())?;
+    if session.repository_id != repository_id {
+        return Err("Session belongs to a different repository".to_string());
     }
     let mut adapter = chat_model_adapter(&engine.config, || {
         resolve_shell_model_api_key(&engine.config)

@@ -58,17 +58,6 @@ pub struct ConversationView {
     pub summarised_messages: usize,
 }
 
-/// A boundary the app can draw and the request builder can use.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConversationBoundary {
-    /// `"summary"`, `"elision"` or `"none"`.
-    pub kind: &'static str,
-    /// The highest message `seq` the model no longer sees verbatim.
-    pub through_seq: u64,
-    pub covered_messages: usize,
-    pub summary_id: Option<String>,
-}
-
 /// One plan step, as the plan records hold it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -544,6 +533,52 @@ pub struct SummaryFacts {
     pub message_count: usize,
 }
 
+/// Carries a previous summary's facts forward into the next one.
+///
+/// §5.3 makes each summary an input to the next, and the fact half must not
+/// shrink when it does: a file changed before the first boundary is still
+/// changed, an approval already made is still an approval, and the original
+/// objective is the one sentence the session is judged against. The new span
+/// wins on a conflict — a step whose status changed, a check rerun, a patch
+/// re-decided — because it is the later record.
+pub fn merge_summary_facts(
+    previous: &ConversationSummary,
+    mut facts: SummaryFacts,
+) -> SummaryFacts {
+    facts.objective = previous.objective.clone();
+    for file in &previous.files_changed {
+        if !facts.files_changed.contains(file) {
+            facts.files_changed.push(file.clone());
+        }
+    }
+    facts.files_changed.sort();
+    for step in &previous.plan_steps {
+        if !facts.plan_steps.iter().any(|kept| kept.id == step.id) {
+            facts.plan_steps.push(step.clone());
+        }
+    }
+    for approval in &previous.approvals {
+        if !facts
+            .approvals
+            .iter()
+            .any(|kept| kept.kind == approval.kind && kept.id == approval.id)
+        {
+            facts.approvals.push(approval.clone());
+        }
+    }
+    for validation in &previous.validation {
+        if !facts
+            .validation
+            .iter()
+            .any(|kept| kept.label == validation.label)
+        {
+            facts.validation.push(validation.clone());
+        }
+    }
+    facts.message_count += previous.message_count;
+    facts
+}
+
 /// Everything the fact reader is allowed to look at. Passed as one struct so a
 /// source cannot be added without deciding whether it contributes.
 pub struct FactInputs<'a> {
@@ -818,6 +853,64 @@ mod tests {
         let prompt = narrative_prompt("user: and then?", Some(&summary()));
         assert!(prompt.contains("A previous summary covers the earlier part"));
         assert!(prompt.contains("--- begin prior conversation summary"));
+    }
+
+    #[test]
+    fn a_merge_carries_earlier_facts_and_lets_the_new_span_win() {
+        let previous = ConversationSummary {
+            objective: "the original objective".to_string(),
+            files_changed: vec!["src/old.rs".to_string()],
+            plan_steps: vec![PlanStepDigest {
+                id: "step_1".to_string(),
+                title: "First".to_string(),
+                status: StepStatus::InProgress,
+            }],
+            approvals: vec![ApprovalDigest {
+                kind: "command".to_string(),
+                id: "cmd_1".to_string(),
+                decision: "approved".to_string(),
+                subject: None,
+            }],
+            validation: vec![ValidationDigest {
+                label: "cargo test".to_string(),
+                outcome: "passed".to_string(),
+            }],
+            message_count: 8,
+            ..summary()
+        };
+        let facts = SummaryFacts {
+            objective: "a later request".to_string(),
+            files_changed: vec!["src/new.rs".to_string()],
+            plan_steps: vec![PlanStepDigest {
+                id: "step_1".to_string(),
+                title: "First".to_string(),
+                status: StepStatus::Completed,
+            }],
+            approvals: Vec::new(),
+            validation: vec![ValidationDigest {
+                label: "cargo test".to_string(),
+                outcome: "failed (exit 1)".to_string(),
+            }],
+            message_count: 4,
+        };
+        let merged = merge_summary_facts(&previous, facts);
+        assert_eq!(merged.objective, "the original objective");
+        assert_eq!(
+            merged.files_changed,
+            vec!["src/new.rs", "src/old.rs"],
+            "both spans' files are kept, sorted"
+        );
+        assert_eq!(
+            merged.plan_steps[0].status,
+            StepStatus::Completed,
+            "the later status wins"
+        );
+        assert_eq!(merged.approvals.len(), 1);
+        assert_eq!(
+            merged.validation[0].outcome, "failed (exit 1)",
+            "the later check result wins"
+        );
+        assert_eq!(merged.message_count, 12);
     }
 
     #[test]

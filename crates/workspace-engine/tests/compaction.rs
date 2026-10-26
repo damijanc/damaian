@@ -827,6 +827,7 @@ fn a_second_compaction_summarises_the_first_one_plus_what_followed() {
     let repo = temp_repo("compound");
     let engine = engine(&repo, false);
     let (session, task) = seed_session(&engine, &repo, "Compound");
+    seed_facts(&engine, &session, &task);
     seed_long_conversation(&engine, &session, &task, "Do not touch the public API.");
 
     let mut first = MockModelAdapter::new(
@@ -867,13 +868,38 @@ fn a_second_compaction_summarises_the_first_one_plus_what_followed() {
         "the first summary is rendered into the call"
     );
     assert!(prompt.contains("kept the parser"));
+    let summaries = engine
+        .session_store
+        .read_conversation_compactions(&session.id)
+        .unwrap();
+    assert_eq!(summaries.len(), 2);
+    let second_summary = summaries.last().unwrap();
     assert_eq!(
-        engine
-            .session_store
-            .read_conversation_compactions(&session.id)
-            .unwrap()
-            .len(),
-        2
+        second_summary.objective, "Do not touch the public API.",
+        "the original objective survives a second summary"
+    );
+    assert_eq!(
+        second_summary.files_changed,
+        vec!["src/lib.rs"],
+        "a file changed before the first boundary is still in the record"
+    );
+    assert!(
+        second_summary
+            .approvals
+            .iter()
+            .any(|approval| approval.id == "cmd_1"),
+        "an approval before the first boundary is still in the record"
+    );
+    assert!(
+        second_summary
+            .validation
+            .iter()
+            .any(|validation| validation.label == "cargo test (repository root)"),
+        "validation before the first boundary is still in the record"
+    );
+    assert!(
+        second_summary.message_count > summaries[0].message_count,
+        "the covered-message count accumulates"
     );
 }
 
