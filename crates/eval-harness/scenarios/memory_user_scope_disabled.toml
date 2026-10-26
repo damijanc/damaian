@@ -1,0 +1,21 @@
+name = "memory_user_scope_disabled"
+fixture = "memory-injection"
+tier = "deterministic"
+prompt = "What indentation do I prefer?"
+
+# User scope is off. A suggestion may become a proposal, but no user-scope entry
+# exists and confirming it would not enable the scope as a side effect.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_memory", arguments = { statement = "The user prefers tab indentation.", category = "preference", scope = "user" } },
+]
+
+[[turn]]
+content = "I suggested a preference for you to review."
+
+[assert]
+memory_proposals = 1
+memory_entries = 0
+memory_user_entries = 0
+deterministic_only = ["memory_proposals", "memory_entries", "memory_user_entries"]

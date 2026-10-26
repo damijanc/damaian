@@ -645,6 +645,63 @@ pub fn evaluate(
                 repeats.to_string(),
             );
         }
+        if let Some(expected) = asserts.memory_entries {
+            let got = memory_entry_lines(run).len() as u64;
+            push(
+                "memory_entries",
+                got == expected,
+                expected.to_string(),
+                format!("{got} stored record(s)"),
+            );
+        }
+
+        if let Some(expected) = asserts.memory_proposals {
+            let got = pending_proposal_count(run);
+            push(
+                "memory_proposals",
+                got == expected,
+                expected.to_string(),
+                format!("{got} pending proposal(s)"),
+            );
+        }
+
+        if let Some(expected) = asserts.memory_user_entries {
+            let got = memory_user_entry_lines(run).len() as u64;
+            push(
+                "memory_user_entries",
+                got == expected,
+                expected.to_string(),
+                format!("{got} user-scope record(s)"),
+            );
+        }
+
+        if let Some(absent) = &asserts.memory_absent {
+            let haystack = memory_and_proposal_text(run);
+            let present: Vec<&String> = absent
+                .iter()
+                .filter(|needle| haystack.contains(needle.as_str()))
+                .collect();
+            push(
+                "memory_absent",
+                present.is_empty(),
+                format!("none of {absent:?}"),
+                format!("present in memory or proposals: {present:?}"),
+            );
+        }
+
+        if let Some(wanted) = &asserts.memory_audit_contains {
+            let audit = audit_text(run);
+            let missing: Vec<&String> = wanted
+                .iter()
+                .filter(|needle| !audit.contains(needle.as_str()))
+                .collect();
+            push(
+                "memory_audit_contains",
+                missing.is_empty(),
+                format!("{wanted:?}"),
+                format!("missing from audit: {missing:?}"),
+            );
+        }
     }
 
     results
@@ -772,4 +829,99 @@ fn where_present(run: &Run, needle: &str) -> Vec<String> {
         }
     }
     hits
+}
+
+/// Every stored memory record, one per non-empty line, across project and user
+/// files. The harness never confirms, so this is normally empty; a non-zero
+/// value after a scenario that never clicked Confirm is the defect.
+fn memory_entry_lines(run: &Run) -> Vec<String> {
+    let memory = run.data_dir.join("memory");
+    let mut lines = Vec::new();
+    let project = memory.join("project");
+    if let Ok(entries) = std::fs::read_dir(&project) {
+        for entry in entries.flatten() {
+            lines.extend(non_empty_lines(&entry.path()));
+        }
+    }
+    lines.extend(non_empty_lines(&memory.join("user.jsonl")));
+    lines
+}
+
+fn memory_user_entry_lines(run: &Run) -> Vec<String> {
+    non_empty_lines(&run.data_dir.join("memory").join("user.jsonl"))
+}
+
+fn non_empty_lines(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Proposed minus decided, read from the session logs the same way the store
+/// reads them.
+fn pending_proposal_count(run: &Run) -> u64 {
+    let mut proposed: Vec<String> = Vec::new();
+    let mut decided: Vec<String> = Vec::new();
+    let sessions = run.data_dir.join("sessions");
+    if let Ok(entries) = std::fs::read_dir(sessions) {
+        for entry in entries.flatten() {
+            for line in non_empty_lines(&entry.path()) {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                let event_type = value
+                    .get("eventType")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                if event_type == "memory_proposal_proposed" {
+                    if let Some(id) = value
+                        .get("payload")
+                        .and_then(|payload| payload.get("id"))
+                        .and_then(|id| id.as_str())
+                    {
+                        proposed.push(id.to_string());
+                    }
+                } else if event_type == "memory_proposal_decided"
+                    && let Some(id) = value
+                        .get("payload")
+                        .and_then(|payload| payload.get("proposalId"))
+                        .and_then(|id| id.as_str())
+                {
+                    decided.push(id.to_string());
+                }
+            }
+        }
+    }
+    proposed.iter().filter(|id| !decided.contains(id)).count() as u64
+}
+
+/// Memory records plus only the proposal events from the session log. Whole
+/// session logs are not searched: a user prompt or tool result may legitimately
+/// mention a path, and that is not a memory disclosure.
+fn memory_and_proposal_text(run: &Run) -> String {
+    let mut text = memory_entry_lines(run).join("\n");
+    let sessions = run.data_dir.join("sessions");
+    if let Ok(entries) = std::fs::read_dir(sessions) {
+        for entry in entries.flatten() {
+            for line in non_empty_lines(&entry.path()) {
+                if line.contains("memory_proposal_proposed")
+                    || line.contains("memory_proposal_decided")
+                {
+                    text.push('\n');
+                    text.push_str(&line);
+                }
+            }
+        }
+    }
+    text
+}
+
+fn audit_text(run: &Run) -> String {
+    std::fs::read_to_string(run.data_dir.join("audit").join("events.jsonl")).unwrap_or_default()
 }

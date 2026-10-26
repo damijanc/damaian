@@ -1,0 +1,20 @@
+name = "memory_no_unconfirmed_persistence"
+fixture = "memory-injection"
+tier = "deterministic"
+prompt = "What did you learn about the test suite?"
+
+# A benign suggestion becomes a proposal and nothing else. The harness never
+# clicks Confirm, so a stored entry here is the invariant failing.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_memory", arguments = { statement = "Integration tests use nextest.", category = "convention" } },
+]
+
+[[turn]]
+content = "I suggested one memory for you to review."
+
+[assert]
+memory_proposals = 1
+memory_entries = 0
+deterministic_only = ["memory_proposals", "memory_entries"]

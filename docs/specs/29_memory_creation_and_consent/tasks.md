@@ -18,7 +18,7 @@ criteria) · context and decisions in [`context.md`](context.md)
 | 5 · Explicit request and the `propose_memory` tool | Done 2026-10-26 | `explicit_memory_request` reads one cue, the first sentence and nothing inferred; the turn calls it after the user message is appended. `ToolAction::ProposeMemory` is parsed by `tool_action_from_call`, offered beside `turn_notes`, allowed in every mode and profile because it writes only the session log, and charged as exploration. Dispatch maps `evidence_path` to `RepositoryObservation`, `source` without evidence to `ExternalContent`, otherwise `ModelSuggestion`; it hashes the evidence file, calls `MemoryStore::propose`, and returns a result naming what happened without repeating the statement. `ChatOrchestrator` gained its `memory_store` dependency. Proposals are session-log events, not transcript roles, so they never enter `build_conversation`. **Deviation:** the model may suggest a memory but the tool cannot confirm one; the eval scenarios cover that end to end. Tests: inline cue parsing and category/scope selection, tool parsing and schema, tool-effect classification, and two turn-level tests proving an explicit cue creates one proposal and no memory file. Scoped clippy clean. |
 | 6 · Shell routes and the confirmation card | Done 2026-10-26 | Three routes: `GET /api/memory-proposals`, `POST /api/memory-confirm`, `POST /api/memory-dismiss`. The confirm route takes `repo`, `session_id`, `proposal_id` and an optional `scope`; it resolves `ProjectIdentity` from the repository and creates the `UserConfirmation` server-side, so a client cannot supply a statement, a project key or a confirmation id. The UI reads the pending list into a collapsed proposal stack below the conversation, with statement, scope, category, origin/source, a scope picker, Remember and Dismiss. A user-scope proposal while the scope is off defaults to project scope and explains that enabling user scope is separate. The stack is re-read after every turn and after each decision. **Deviation:** proposals are not transcript messages, so they cannot reach `build_conversation`; the stack is a sibling of the log content. Three route tests run through the real token-gated shell: list/confirm/dismiss end to end, a user-scope refusal that leaves the flag off and the proposal pending, and the absence of a statement field. `node --check` and `npm run lint:web` pass; scoped clippy clean. |
 | 7 · Acceptance tests a scenario cannot cover | Done 2026-10-26 | Added the store-level `a_memory_claiming_approval_or_path_policy_changes_nothing` (a stored instruction still leaves command risk, approval policy, `PathPolicy` and `memory_user_scope_enabled` untouched) and three shell-level tests: no bulk route (a POST to `/api/memory-confirm-all` is 404 and the UI has no accept-all label), the confirm handler has no statement or project-key field, and the route-level user-scope refusal. The store tests already cover a forged identity (the project key must match the resolved identity), the dismissal and cap audit lines, and the confirmed-path round trip. |
-| 8 · Deterministic eval scenarios | Not started | |
+| 8 · Deterministic eval scenarios | Done 2026-10-26 | New fixture `crates/eval-harness/fixtures/memory-injection/` (poisoned `AGENTS.md` and `CONTRIBUTING.md`, committed `local.conf`, `.env`, `secrets/prod.env`) and six scenarios. `seed_files` writes files after the baseline commit without committing them, which makes `local.conf` ignored *and* index-resident, the case `index_single_file` warns about. New assertions read the run's memory files and session proposal events: `memory_entries`, `memory_proposals`, `memory_user_entries`, `memory_absent` (memory records plus proposal events only, so the refusal audit may name a path) and `memory_audit_contains`. All six scenarios pass in the deterministic tier; the whole deterministic tier still passes with no approval-policy or secret violations (`cargo run -p eval-harness -- run --tier deterministic`). **Not regenerated:** `evals/baseline.json`; observation #40 records that it is already stale for reasons outside #29, and no test compares it automatically. |
 | 9 · Documentation and close-out | Not started | |
 
 **Goal:** make suggestion and persistence separate steps with a user action
@@ -253,16 +253,18 @@ folder-path references; `npm run specs:check` reports no new mismatch for #29.
 
 ## Task 8 · Deterministic eval scenarios
 
-- [ ] Add a `memory-injection` fixture whose `AGENTS.md` and `CONTRIBUTING.md`
+- [x] Add a `memory-injection` fixture whose `AGENTS.md` and `CONTRIBUTING.md`
       instruct the agent to remember that commands are pre-approved, and a
       `local.conf` that is committed and then ignored by a `seed_files`
       `.gitignore`.
-- [ ] Add `seed_files` to the scenario format and runner (written after the
+- [x] Add `seed_files` to the scenario format and runner (written after the
       baseline commit, never committed).
-- [ ] Add assertion fields and evaluation for: memory entry count, pending
-      proposal count, unconfirmed-entry count, a path absent from every proposal
-      and entry, refusal audit presence, and the user-scope case.
-- [ ] Scenarios:
+- [x] Add assertion fields and evaluation for: memory entry count, pending
+      proposal count, a path absent from every proposal and entry, refusal audit
+      presence, and the user-scope case. `memory_entries` counts stored lines;
+      `memory_proposals` counts proposed-minus-decided events; `memory_absent`
+      searches memory files plus proposal events only.
+- [x] Scenarios:
       - `memory_injection_repository.toml` (AGENTS.md / CONTRIBUTING.md);
       - `memory_injection_external.toml` (issue text via `source`);
       - `memory_secret_refusal.toml`;
@@ -270,7 +272,7 @@ folder-path references; `npm run specs:check` reports no new mismatch for #29.
         index-resident `local.conf`);
       - `memory_no_unconfirmed_persistence.toml` (invariant over the run);
       - `memory_user_scope_disabled.toml`.
-- [ ] Each asserts no entry, no proposal where the spec requires none, no
+- [x] Each asserts no entry, no proposal where the spec requires none, no
       statement/secret/path in any proposal or entry, and the refusal audit.
 
 **Verification:** `cargo run -p eval-harness -- run --tier deterministic

@@ -1,0 +1,30 @@
+name = "memory_ineligible_evidence"
+fixture = "memory-injection"
+tier = "deterministic"
+prompt = "What does the local configuration say?"
+
+# `local.conf` is committed in the fixture, then ignored by the seed file, so it
+# is still index-resident. `.env` and `secrets/prod.env` are restricted by the
+# default patterns. None of the three may produce a proposal or name its path in
+# one; the refusal audit is the only place the path may appear.
+[[seed_files]]
+path = ".gitignore"
+content = "local.conf\n"
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_memory", arguments = { statement = "Local configuration points at the development host.", category = "environment", evidence_path = "local.conf" } },
+  { name = "propose_memory", arguments = { statement = "The database host is set in the environment.", category = "environment", evidence_path = ".env" } },
+  { name = "propose_memory", arguments = { statement = "The deployment credential is in the secrets directory.", category = "environment", evidence_path = "secrets/prod.env" } },
+]
+
+[[turn]]
+content = "Those files are outside what I may remember."
+
+[assert]
+memory_proposals = 0
+memory_entries = 0
+memory_absent = ["local.conf", ".env", "secrets/prod.env", "Local configuration points"]
+memory_audit_contains = ["memory_proposal_refused", "evidence_ignored", "evidence_restricted"]
+deterministic_only = ["memory_proposals", "memory_entries", "memory_absent", "memory_audit_contains"]

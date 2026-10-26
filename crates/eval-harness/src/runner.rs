@@ -106,6 +106,20 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     }
 
     let materialized = fixture::materialize(&scenario.fixture)?;
+    for file in &scenario.seed_files {
+        let path = materialized.root.join(&file.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                workspace_engine::ClientError::Io(format!(
+                    "{}: seed file parent: {error}",
+                    path.display()
+                ))
+            })?;
+        }
+        std::fs::write(&path, &file.content).map_err(|error| {
+            workspace_engine::ClientError::Io(format!("{}: seed file: {error}", path.display()))
+        })?;
+    }
     let mut config = base_config(&materialized);
     apply_scenario_config(&mut config, scenario);
     config.model_provider = "mock".to_string();

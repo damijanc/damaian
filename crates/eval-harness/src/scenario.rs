@@ -49,6 +49,16 @@ pub struct SeedMessage {
     pub content: String,
 }
 
+/// One file written into the fixture after its baseline commit. Not committed,
+/// so the index keeps whatever the fixture already tracked — which is exactly
+/// the "still index-resident but now ignored" case the memory gate must refuse.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct SeedFile {
+    pub path: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Asserts {
@@ -171,6 +181,22 @@ pub struct Asserts {
     /// Whether the newest summary is facts-only (the model half failed or was
     /// unusable). `Some(false)` means a narrative was recorded.
     pub compaction_facts_only: Option<bool>,
+    /// Spec 29 §5.8: how many stored memory entries the run left behind. The
+    /// harness never clicks Confirm, so an injection or refusal scenario
+    /// expects zero, and the value is read from the memory files rather than
+    /// inferred from the model's answer.
+    pub memory_entries: Option<u64>,
+    /// How many proposals are still pending in the run's session logs.
+    pub memory_proposals: Option<u64>,
+    /// How many entries are in the user-scope file. User scope is off by
+    /// default, so this is zero unless a scenario enables it.
+    pub memory_user_entries: Option<u64>,
+    /// Strings that must not appear in any memory record or pending-proposal
+    /// event. The refusal audit is excluded on purpose: a refused path may be
+    /// named there, as §5.5a says.
+    pub memory_absent: Option<Vec<String>>,
+    /// Strings the audit log must contain, such as a refusal reason.
+    pub memory_audit_contains: Option<Vec<String>>,
     #[serde(default)]
     pub deterministic_only: Vec<String>,
 }
@@ -221,6 +247,10 @@ pub struct Scenario {
     pub follow_up_prompt: Option<String>,
     /// Messages written before the first ask (spec 55 §5.9).
     pub seed_conversation: Vec<SeedMessage>,
+    /// Files written after the fixture's baseline commit, without committing
+    /// them (spec 29 §5.8). This is how a committed file can become ignored
+    /// while staying index-resident.
+    pub seed_files: Vec<SeedFile>,
     /// Whether to compact the seeded conversation before the ask.
     pub compact_before_prompt: bool,
     /// Config this run needs beyond the defaults, in the same `key=value` form
@@ -273,6 +303,9 @@ struct RawScenario {
     /// conversation long enough to compact (spec 55 §5.9).
     #[serde(default)]
     seed_conversation: Vec<SeedMessage>,
+    /// Files written after the baseline commit, never committed.
+    #[serde(default)]
+    seed_files: Vec<SeedFile>,
     /// Compact the seeded conversation before the first ask, through the same
     /// public path the manual control uses. The compaction consumes the first
     /// scripted `[[turn]]`, which is therefore its narrative reply.
@@ -420,6 +453,7 @@ pub fn load(path: &Path) -> Result<Scenario> {
         answers: raw.answers,
         follow_up_prompt: raw.follow_up_prompt,
         seed_conversation: raw.seed_conversation,
+        seed_files: raw.seed_files,
         compact_before_prompt: raw.compact_before_prompt,
         config_overlay: match raw.config_overlay {
             Some(text) => Some(ConfigOverlay::parse(&text).map_err(|error| {
