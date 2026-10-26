@@ -1276,14 +1276,6 @@ mod tests {
             ),
         )
         .unwrap();
-        eprintln!(
-            "PENDING: {}",
-            fs::read_to_string(pending.join("contextreview_1.json")).unwrap()
-        );
-        eprintln!(
-            "READER: {:?}",
-            workspace_engine::PausedTurns::new(&dir).context_review_manifest("contextreview_1")
-        );
         engine
             .session_store
             .await_approval(
