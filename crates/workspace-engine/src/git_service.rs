@@ -1011,6 +1011,13 @@ impl GitService {
         capped
     }
 
+    /// The full `HEAD` SHA, or `None` on an unborn branch. Used by commit
+    /// recovery to answer whether an interrupted commit landed (spec 35 §5.7).
+    /// Not audited: the sweep that reads it records its own findings.
+    pub fn head_commit(&self, root_path: impl AsRef<Path>) -> Result<Option<String>> {
+        git_line(root_path.as_ref(), &["rev-parse", "--verify", "-q", "HEAD"])
+    }
+
     pub fn suggest_commit_message(&self, summary: &str, changed_files: &[String]) -> String {
         let normalized = summary.trim().trim_end_matches(['.', '!', '?']);
         if normalized.is_empty() {

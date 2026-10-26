@@ -31,7 +31,7 @@ use crate::mode::SessionMode;
 use crate::patch_engine::GeneratedSecretWarning;
 use crate::plan::TaskPlan;
 use crate::secret_scanner::SecretScanner;
-use crate::session::{ChangeEvent, SessionStore};
+use crate::session::{ChangeEvent, SessionStore, TaskStatus};
 use crate::verification::{VerificationReport, fold_verification};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -344,6 +344,14 @@ pub struct CommitRecord {
     pub prepare_id: String,
     pub repository_root: String,
     pub session_id: String,
+    /// The synthetic task the marker belongs to. `None` for a record written
+    /// before markers existed.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// The paths the user actually approved, which may be a subset of the
+    /// candidates.
+    #[serde(default)]
+    pub selected_paths: Vec<String>,
     pub branch: Option<String>,
     pub expected_old: Option<String>,
     pub candidates: Vec<CommitCandidate>,
@@ -474,6 +482,8 @@ impl CommitEngine {
             prepare_id: prepare_id.clone(),
             repository_root: root.to_string_lossy().to_string(),
             session_id: session_id.to_string(),
+            task_id: None,
+            selected_paths: Vec::new(),
             branch: state.branch,
             expected_old: state.head,
             candidates,
@@ -697,10 +707,37 @@ impl CommitEngine {
                     .map_err(CommitError::from)?;
             }
         }
+        // A commit is a side-effecting action with an unknown-outcome window
+        // (spec 17). The synthetic task exists so a crash between the markers
+        // classifies as `unknown_external_outcome` instead of being invisible;
+        // it carries no plan and no model call.
+        let task = self
+            .session_store
+            .create_task(
+                &request.session_id,
+                "Commit prepared changes",
+                &self.config.model_provider,
+                &self.config.model_name,
+            )
+            .map_err(CommitError::from)?;
+        let task = self
+            .session_store
+            .update_task_status(&task, TaskStatus::RunningTool, None)
+            .map_err(CommitError::from)?;
+        let marker = self
+            .session_store
+            .start_action(&task, "commit", &record.prepare_id, true)
+            .map_err(CommitError::from)?;
+        record.task_id = Some(task.id.clone());
+        record.selected_paths = selected
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect();
+        let _ = self.save_record(&record);
         let private = self.private_dir(&record.prepare_id)?;
         let outcome = self.compose_and_commit(
             root,
-            &record,
+            &mut record,
             &selected,
             &fresh,
             &message,
@@ -710,6 +747,30 @@ impl CommitEngine {
             !secret_warnings.is_empty(),
         );
         let _ = fs::remove_dir_all(&private);
+        match &outcome {
+            Ok(_) => {
+                let _ = self
+                    .session_store
+                    .update_task_status(&task, TaskStatus::Complete, None);
+                let _ = self.session_store.finish_action(marker, "ok");
+            }
+            Err(error) => {
+                // A rewritten message or a failed hook is a review outcome,
+                // not a dead preparation: the user fixes it and approves the
+                // same record again. Only an engine failure may have left the
+                // repository in an unknown state, so only that retires it.
+                if matches!(error, CommitError::Engine(_)) {
+                    record.state = "failed".to_string();
+                    let _ = self.save_record(&record);
+                }
+                let _ = self.session_store.update_task_status(
+                    &task,
+                    TaskStatus::Failed,
+                    Some(&error.message()),
+                );
+                let _ = self.session_store.finish_action(marker, "failed");
+            }
+        }
         let outcome = outcome?;
         record.state = "created".to_string();
         record.prepared_commit = Some(outcome.commit_sha.clone());
@@ -721,7 +782,7 @@ impl CommitEngine {
         let _ = self.session_store.append_commit_created(
             &request.session_id,
             &crate::session::CommitSessionEvent {
-                task_id: String::new(),
+                task_id: task.id.clone(),
                 prepare_id: record.prepare_id.clone(),
                 commit_sha: outcome.commit_sha.clone(),
                 paths: selected
@@ -762,7 +823,7 @@ impl CommitEngine {
     fn compose_and_commit(
         &self,
         root: &Path,
-        record: &CommitRecord,
+        record: &mut CommitRecord,
         selected: &[CommitCandidate],
         fresh: &[(CommitCandidate, Option<BlobInfo>)],
         message: &str,
@@ -772,7 +833,8 @@ impl CommitEngine {
         generated_secret_override: bool,
     ) -> std::result::Result<CommitOutcome, CommitError> {
         let index = private.join("index");
-        let head = record.expected_old.as_deref();
+        let expected_old = record.expected_old.clone();
+        let head = expected_old.as_deref();
         let mut command = git(root, Some(&index));
         command.args(["read-tree"]);
         command.arg(if head.is_some() { "HEAD" } else { "--empty" });
@@ -887,6 +949,11 @@ impl CommitEngine {
             )));
         }
         let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Recorded before the ref moves, so a crash in this window can still
+        // be inspected: the prepared commit and the expected old are both on
+        // disk (spec 35 §5.7).
+        record.prepared_commit = Some(commit.clone());
+        let _ = self.save_record(record);
         let now = self.git_state(root).map_err(CommitError::from)?;
         if now.head != record.expected_old {
             return Err(CommitError::refused(
@@ -913,18 +980,20 @@ impl CommitEngine {
                 ),
             ));
         }
+        let mut warnings = Vec::new();
         let head_now = self
             .git_line(root, &["rev-parse", "HEAD"])
             .map_err(CommitError::from)?
             .unwrap_or_default();
         if head_now != commit {
-            return Err(CommitError::Engine(
-                "The ref did not move to the created commit.".to_string(),
+            // update-ref succeeded, so the commit exists; failing here would
+            // report a false negative for a commit that is real.
+            warnings.push(format!(
+                "The commit was created as {commit}, but HEAD did not read back as it.                  Check the repository before relying on it."
             ));
         }
         // post-commit runs after the ref moves. A failure is a warning: the
         // commit is real, and pretending otherwise would be worse.
-        let mut warnings = Vec::new();
         if let Some(post) = self.run_post_commit(root, &index, cancel, record)? {
             outcomes.push(post.clone());
             if post.outcome == "failed" {

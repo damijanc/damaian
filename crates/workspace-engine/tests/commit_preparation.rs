@@ -1235,3 +1235,137 @@ fn the_recorded_diff_is_redacted_and_the_record_holds_no_secret() {
     );
     fixture.cleanup();
 }
+
+#[test]
+fn a_commit_is_bracketed_by_a_side_effecting_marker() {
+    let fixture = Fixture::new("marker");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    let preparation = fixture.prepare(&session);
+    let outcome = fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            "Commit a",
+            false,
+        )
+        .unwrap();
+    let log = fs::read_to_string(
+        fixture
+            .data_dir
+            .join("sessions")
+            .join(format!("{}.jsonl", session.id)),
+    )
+    .unwrap();
+    assert!(
+        log.contains(r#""action":"commit""#) && log.contains(r#""sideEffecting":true"#),
+        "{log}"
+    );
+    assert!(log.contains(r#""action_finished""#), "{log}");
+    assert!(log.contains(r#""outcome":"ok""#), "{log}");
+    assert!(log.contains(r#""commit_created""#), "{log}");
+    assert!(log.contains(&format!(r#""commitSha":"{}""#, outcome.commit_sha)));
+    assert!(log.contains(r#""paths":["a.txt"]"#), "{log}");
+    assert!(
+        log.contains(r#""status":"complete""#),
+        "the synthetic task is completed: {log}"
+    );
+    let record = fixture
+        .engine
+        .commit
+        .load_record(&preparation.prepare_id)
+        .unwrap();
+    assert_eq!(record.task_id, Some(record_task_id(&log)));
+    assert_eq!(record.selected_paths, vec!["a.txt".to_string()]);
+    assert_eq!(
+        record.prepared_commit.as_deref(),
+        Some(outcome.commit_sha.as_str())
+    );
+    assert_eq!(
+        record.head_after.as_deref(),
+        Some(outcome.commit_sha.as_str())
+    );
+    fixture.cleanup();
+}
+
+fn record_task_id(log: &str) -> String {
+    // The marker's task id is the first `taskId` beside `"action":"commit"`.
+    let start = log.find(r#""action":"commit""#).expect("a commit marker");
+    let prefix = &log[..start];
+    let at = prefix.rfind(r#""taskId":""#).expect("a task id");
+    let rest = &prefix[at + r#""taskId":""#.len()..];
+    rest.split('"').next().unwrap().to_string()
+}
+
+#[test]
+fn a_crash_between_the_markers_is_an_unknown_outcome() {
+    let fixture = Fixture::new("crash");
+    let (session, task) = fixture.session();
+    let task_id = task.id.clone();
+    let task = fixture
+        .engine
+        .session_store
+        .update_task_status(&task, workspace_engine::TaskStatus::RunningTool, None)
+        .unwrap();
+    let _marker = fixture
+        .engine
+        .session_store
+        .start_action(&task, "commit", "commit_crashed", true)
+        .unwrap();
+    let recovered = workspace_engine::classify_session(
+        &fixture.engine.session_store,
+        &fixture.engine.audit_log,
+        &session.id,
+    )
+    .unwrap();
+    let commit = recovered
+        .iter()
+        .find(|recovered| recovered.task_id == task_id)
+        .expect("the commit task is recovered");
+    assert_eq!(
+        commit.classification,
+        workspace_engine::TaskStatus::UnknownExternalOutcome
+    );
+    assert!(!workspace_engine::resume_allowed(commit));
+    fixture.cleanup();
+}
+
+#[test]
+fn the_commit_is_audited_with_counts_and_no_secret_text() {
+    let fixture = Fixture::new("audit");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    let content = format!("token = {FAKE_AWS_KEY}\n");
+    fixture.write("a.txt", &content);
+    fixture.apply_with(&session, &task, &[("a.txt", &content)], None, None, true);
+    let preparation = fixture.prepare(&session);
+    let outcome = fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            &format!("Commit a\n\n{FAKE_AWS_KEY}"),
+            true,
+        )
+        .unwrap();
+    let audit = fs::read_to_string(fixture.data_dir.join("audit/events.jsonl")).unwrap();
+    assert!(audit.contains(r#""eventType":"commit_created""#), "{audit}");
+    assert!(audit.contains(r#""pathCount":"1""#), "{audit}");
+    assert!(audit.contains(r#""messageLength":"#), "{audit}");
+    assert!(audit.contains(&format!(r#""commitSha":"{}""#, outcome.commit_sha)));
+    assert!(
+        audit.contains(r#""generatedSecretOverride":"true""#),
+        "{audit}"
+    );
+    assert!(audit.contains(r#""hooks":""#), "{audit}");
+    assert!(
+        !audit.contains(FAKE_AWS_KEY),
+        "the audit leaked the message's key"
+    );
+    fixture.cleanup();
+}

@@ -18,6 +18,19 @@ use workspace_engine::{
 
 use crate::{escape_json, patch_files_json, plan_json};
 
+/// What an interrupted commit can be inspected against: the expected old
+/// `HEAD`, the commit object that may have been created, and where `HEAD` is
+/// now. `landed` is `Some(true)` only when `HEAD` is the prepared commit,
+/// `Some(false)` only when it is still the expected old one, and `None` when it
+/// moved somewhere else.
+struct CommitRecovery {
+    expected_old: Option<String>,
+    prepared_commit: Option<String>,
+    head_now: Option<String>,
+    landed: Option<bool>,
+    selected_paths: Vec<String>,
+}
+
 /// One recovered task, with everything the card needs already resolved.
 struct Recovered {
     session_id: String,
@@ -38,6 +51,10 @@ struct Recovered {
     /// for a command — the card says which of the two it is.
     files: Vec<String>,
     checkpoint_id: Option<String>,
+    /// The interrupted commit's durable record, when the dangling action is
+    /// `commit`. Rendered by `Inspect`; the comparison is information, not an
+    /// automatic resolution (spec 35 §5.7).
+    commit: Option<CommitRecovery>,
     /// What this task spent, as `task_usage_json` fields spliced into the
     /// entry — the same shape a turn's own response sends, so the frontend
     /// reads both with one piece of code. Empty when nothing was recorded,
@@ -485,6 +502,44 @@ fn describe(
                 .map(|manifest| manifest.checkpoint_id)
         });
 
+    // A commit's record is its own evidence: the marker's reference names it.
+    // The comparison is offered for inspection and changes nothing, so a crash
+    // is never resolved automatically.
+    let commit = dangling
+        .filter(|action| action.action == "commit")
+        .and_then(|action| engine.commit.load_record(&action.reference).ok())
+        .map(|record| {
+            let head_now = engine
+                .git
+                .head_commit(&record.repository_root)
+                .ok()
+                .flatten();
+            let landed = match (&record.prepared_commit, &head_now) {
+                (Some(prepared), Some(head)) if prepared == head => Some(true),
+                (_, Some(head)) if record.expected_old.as_deref() == Some(head.as_str()) => {
+                    Some(false)
+                }
+                _ => None,
+            };
+            let selected_paths = if record.selected_paths.is_empty() {
+                record
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.selected_by_default)
+                    .map(|candidate| candidate.path.clone())
+                    .collect()
+            } else {
+                record.selected_paths
+            };
+            CommitRecovery {
+                expected_old: record.expected_old,
+                prepared_commit: record.prepared_commit,
+                head_now,
+                landed,
+                selected_paths,
+            }
+        });
+
     let prompt = facts.tasks.get(&task.task_id).cloned().unwrap_or_default();
     // Two separate ways for `Resume` to be unavailable, each with its own
     // reason. §5.6 leaves the card with no primary action either way, so the
@@ -517,8 +572,16 @@ fn describe(
         resume_blocked_reason: blocked_reason,
         auto_resumed,
         prompt,
-        files,
+        files: if files.is_empty() {
+            commit
+                .as_ref()
+                .map(|commit| commit.selected_paths.clone())
+                .unwrap_or_default()
+        } else {
+            files
+        },
         checkpoint_id,
+        commit,
         usage_fields,
         includes_lost_call,
     })
@@ -723,9 +786,25 @@ fn task_prompt(
         .unwrap_or_default())
 }
 
+fn commit_json(commit: Option<&CommitRecovery>) -> String {
+    match commit {
+        None => "null".to_string(),
+        Some(commit) => format!(
+            "{{\"expectedOld\":{},\"preparedCommit\":{},\"headNow\":{},\"landed\":{}}}",
+            json_optional(commit.expected_old.as_deref()),
+            json_optional(commit.prepared_commit.as_deref()),
+            json_optional(commit.head_now.as_deref()),
+            match commit.landed {
+                Some(landed) => landed.to_string(),
+                None => "null".to_string(),
+            },
+        ),
+    }
+}
+
 fn recovered_json(task: &Recovered) -> String {
     format!(
-        "{{\"sessionId\":\"{}\",\"taskId\":\"{}\",\"headline\":\"{}\",\"classification\":\"{}\",\"previousStatus\":\"{}\",\"danglingAction\":{},\"danglingRef\":{},\"danglingSeq\":{},\"resumeAllowed\":{},\"resumeBlockedReason\":{},\"autoResumed\":{},\"prompt\":\"{}\",\"files\":[{}],\"checkpointId\":{},\"includesLostCall\":{}{}}}",
+        "{{\"sessionId\":\"{}\",\"taskId\":\"{}\",\"headline\":\"{}\",\"classification\":\"{}\",\"previousStatus\":\"{}\",\"danglingAction\":{},\"danglingRef\":{},\"danglingSeq\":{},\"resumeAllowed\":{},\"resumeBlockedReason\":{},\"autoResumed\":{},\"prompt\":\"{}\",\"files\":[{}],\"checkpointId\":{},\"includesLostCall\":{},\"commit\":{}{}}}",
         escape_json(&task.session_id),
         escape_json(&task.task_id),
         escape_json(&task.headline),
@@ -747,6 +826,7 @@ fn recovered_json(task: &Recovered) -> String {
             .join(","),
         json_optional(task.checkpoint_id.as_deref()),
         task.includes_lost_call,
+        commit_json(task.commit.as_ref()),
         task.usage_fields
     )
 }
@@ -849,6 +929,73 @@ mod tests {
 
     fn audit_text(data_dir: &Path) -> String {
         fs::read_to_string(data_dir.join("audit").join("events.jsonl")).unwrap_or_default()
+    }
+
+    fn git_repository(name: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-shell-recovery-repo-{name}-{now}-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.email", "test@damaian.local"]);
+        git(&["config", "user.name", "Damaian Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        repo
+    }
+
+    /// Spec 35 §5.7: an interrupted commit is recoverable evidence. The card
+    /// is offered the prepared commit and where HEAD is now, and nothing is
+    /// resolved automatically.
+    #[test]
+    fn an_interrupted_commit_reports_the_prepared_commit_and_the_current_head() {
+        let (engine, _dir) = engine("commit-dangling");
+        let repo = git_repository("commit-dangling");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Recovery")
+            .unwrap();
+        let preparation = engine
+            .commit
+            .prepare(&repo, &session.id)
+            .expect("preparation reads the repository");
+        task_left_in(
+            &engine,
+            &session.id,
+            "Commit prepared changes",
+            TaskStatus::RunningTool,
+            Some(("commit", &preparation.prepare_id, true)),
+        );
+
+        let (_, payload) = sweep(&engine);
+        assert!(
+            payload.contains(r#""danglingAction":"commit""#),
+            "{payload}"
+        );
+        assert!(payload.contains(r#""commit":{"expectedOld":"#), "{payload}");
+        assert!(payload.contains(r#""preparedCommit":null"#), "{payload}");
+        assert!(payload.contains(r#""landed":false"#), "{payload}");
+        let _ = fs::remove_dir_all(&repo);
     }
 
     /// Requirements 1 and 2 as the card actually receives them: the specific

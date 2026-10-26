@@ -5073,6 +5073,24 @@ function createRecoveryDetail(task) {
       : `None recorded. The turn's last recorded state was "${task.previousStatus}".`,
   );
 
+  // A commit that was in flight is not a file-edit question: the record says
+  // exactly which commit object may exist and where HEAD is now. The comparison
+  // is shown, never applied (spec 35 §5.7).
+  if (task.commit) {
+    const short = (sha) => (sha ? sha.slice(0, 8) : "no commit");
+    const outcome =
+      task.commit.landed === true
+        ? "It landed."
+        : task.commit.landed === false
+          ? "It did not land."
+          : "HEAD is somewhere else, so whether it landed cannot be decided from here.";
+    row(
+      "Commit in flight",
+      `Prepared ${short(task.commit.preparedCommit)} on top of ${short(task.commit.expectedOld)}. ` +
+        `HEAD is now ${short(task.commit.headNow)}. ${outcome}`,
+    );
+  }
+
   const files = Array.isArray(task.files) ? task.files : [];
   if (files.length) {
     const list = document.createElement("ul");

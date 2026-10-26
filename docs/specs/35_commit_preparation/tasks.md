@@ -16,7 +16,7 @@ pre-implementation state in [`context.md`](context.md)
 | 4 · Git hooks: detect, report, run, never bypass | Done 2026-10-26 | Detection honours `core.hooksPath` (relative to the root) and otherwise `git rev-parse --git-path hooks`; the report names path, existence, execute bit, size, interpreter, whether it runs, and why not. `prepare-commit-msg`, `commit-msg` and `post-commit` run in Git order through `CommandRunner::run_at_with_env`, which adds `GIT_INDEX_FILE`, `GIT_DIR` and `GIT_WORK_TREE` to the existing timeout/truncation/redaction/PID path. A rewrite of the approved message is a typed refusal with the final text and no commit; a non-zero or timed-out pre-commit/prepare-commit-msg/commit-msg aborts; a failing post-commit is a warning after the ref moved. A hook report changed between prepare and commit is refused. Tests (10 new): report metadata including `core.hooksPath`, failing pre-commit, commit-msg rewrite then a second approval, prepare-commit-msg rewrite, post-commit warning, private index seen by `git diff --cached`, timeout, truncation plus redaction of a seeded fake AWS key, no `--no-verify` code path, and PID registration while a hook sleeps. All 19 `commit_preparation` tests pass. Deviation from the plan’s wording: `prepare-commit-msg` is run as well as detected, because not running it would silently defeat a hook Git itself would run; recorded in context D4. |
 | 5 · Exact bytes, the secret check and the per-commit override | Done 2026-10-26 | `commit` recomputes each selected path’s Git blob id and mode and refuses `commit_content_changed` when either differs from the record, before composing anything; restoring the reviewed bytes lets the same preparation commit. The secret scan runs on the bytes that would become blobs, reports categories/counts through `GeneratedSecretWarning` (now `Serialize`/`Deserialize`), treats a file over `max_file_bytes` as `unscanned` but still hashes it so an accepted large file is not mislabelled as hand-edited, and requires the separate `allow_generated_secrets` request field. The override writes `commit_secret_override` with categories/counts and no text, and `commit_created` records `generatedSecretOverride`; the prepared record stores only the redacted diff. Five tests: content changed then the same preparation commits the restored bytes, seeded fake AWS key warning with no text in the serialized preparation, override refused then accepted with a clean audit, unscannable file, and a record that contains neither the key nor an unredacted copy. All 24 `commit_preparation` tests pass. |
 | 6 · Message drafting with the deterministic fallback | Done 2026-10-26 | `POST /api/commit-message` loads the prepared record, takes the selected paths (or the default selection), and calls `draft_commit_message_with`. The prompt carries the task prompt, the latest plan’s step titles, the selected paths and the **redacted** diffs (capped at 20k characters). The model answer is parsed tolerantly (fences, `Subject:`, `Body:`) into a subject and body; a missing adapter, a thrown error, an empty answer or an unparsable one returns `record.message` — the existing `GitService::suggest_commit_message` template — with `source:"fallback"` and a notice. Five tests: model subject/body, empty answer fallback, no adapter fallback, the request contains the redacted diff and plan titles and not the seeded key, and fenced/prefixed parsing. The dialog’s *Draft with model* button is Task 8; nothing calls the model on prepare, so opening the dialog is free. |
-| 7 · Durable action markers, audit and crash inspection | Not started | |
+| 7 · Durable action markers, audit and crash inspection | Done 2026-10-26 | Each attempt creates a synthetic `Commit prepared changes` task in `RunningTool`, starts a `commit` marker with `sideEffecting: true` before `read-tree`, and records the selected paths and task id on the record. The prepared commit is written to the record **before** `update-ref`, so a crash in that window is inspectable; the same record’s expected old and prepared commit let `Inspect` decide whether HEAD is the commit, still the old value, or somewhere else, without resolving anything. A known outcome sets the task terminal and finishes the marker; a rewritten message or failed hook leaves the record usable so the user can approve again. `GitService::head_commit` is the full-SHA read. `commit_created` audits SHA, branch, path/hunk counts, message length, hook outcomes and the override flag, and the audit carries no content. `desktop-shell/src/recovery.rs` adds the `commit` object and the record’s paths to the recovered JSON; `app.js`’s Inspect shows the comparison. Tests: marker pair with `sideEffecting:true` and `outcome:"ok"`, dangling commit marker → `UnknownExternalOutcome` with no resume, audit counts/override with no seeded key anywhere, and the recovery payload’s `expectedOld`/`preparedCommit`/`landed`. 27 commit-preparation tests and 14 recovery tests pass. |
 | 8 · Shell routes and the *Commit…* dialog | Not started | |
 | 9 · Docs, acceptance walk, close-out | Not started | |
 
@@ -452,7 +452,7 @@ D1–D3.
 **Files:** `commit.rs`, `crates/desktop-shell/src/recovery.rs`,
 `tests/commit_preparation.rs`, `tests/crash_recovery.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   1. `a_commit_is_bracketed_by_a_side_effecting_marker` — a successful commit's
      session log has `action_started` with `action:"commit"` and
      `sideEffecting:true`, then `action_finished` with `outcome:"ok"`; the finish
@@ -466,8 +466,8 @@ D1–D3.
   4. `recovery_reports_the_prepared_commit_and_the_current_head` — the shell's
      recovered JSON for a dangling `commit` has the record's paths, expected old
      and prepared commit; `Inspect` can state whether HEAD moved to it.
-- [ ] **Step 2: Confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Confirm they fail.**
+- [x] **Step 3: Implement.**
   - At commit: create a synthetic task ("Commit prepared changes") in
     `RunningTool`, start `commit` with `sideEffecting: true`, and on a known
     outcome set the task terminal and finish the marker with `ok`/`failed`. A
@@ -484,11 +484,11 @@ D1–D3.
     with `expectedOld`, `preparedCommit`, `headNow`, `landed`. `app.js`'s
     `createRecoveryDetail` shows it; the comparison is information, not an
     automatic resolution.
-- [ ] **Step 4: Falsify.** Start the marker after the ref moves → the crash test
+- [x] **Step 4: Falsify.** Start the marker after the ref moves → the crash test
   classifies `Interrupted`. Record the bare message in the audit → the secret
   text assertion fails (use a message containing a fake token). Remove the task
   status write → the dangling task is auto-resumable.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -498,7 +498,7 @@ D1–D3.
   CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo nextest run -p desktop-shell --lib
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Record a commit as a side-effecting action recovery can inspect`.
 
 ## Task 8: Shell routes and the *Commit…* dialog
