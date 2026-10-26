@@ -238,7 +238,7 @@ fn repositories_with_no_history_and_no_remote_fall_to_the_path_hash() {
     assert_ne!(first_identity.key, second_identity.key);
     assert_eq!(
         first_identity.key,
-        format!("path_{}", repository_id_for_root(&first))
+        format!("path_{}", repository_id_for_root(&first).replace(':', "_"))
     );
 }
 
@@ -793,6 +793,7 @@ fn evidence_citing_a_restricted_path_is_refused_by_the_store() {
     entry.provenance = MemoryProvenance::RepositoryEvidence {
         paths: vec![EvidenceRef::new("secrets/prod.env", "sha256:abc")],
     };
+    entry.verification = Verification::EvidenceCurrent;
 
     let error = store.insert(&root, Some(&identity), entry).unwrap_err();
     assert!(matches!(
@@ -818,6 +819,7 @@ fn evidence_excluded_by_a_per_directory_gitignore_is_refused() {
     entry.provenance = MemoryProvenance::RepositoryEvidence {
         paths: vec![EvidenceRef::new("nested/scratch.tmp", "sha256:abc")],
     };
+    entry.verification = Verification::EvidenceCurrent;
     let error = store.insert(&root, Some(&identity), entry).unwrap_err();
     assert!(matches!(
         error,
@@ -830,6 +832,7 @@ fn evidence_excluded_by_a_per_directory_gitignore_is_refused() {
     allowed.provenance = MemoryProvenance::RepositoryEvidence {
         paths: vec![EvidenceRef::new("nested/kept.txt", "sha256:abc")],
     };
+    allowed.verification = Verification::EvidenceCurrent;
     assert!(store.insert(&root, Some(&identity), allowed).is_ok());
 }
 
@@ -844,6 +847,7 @@ fn evidence_must_be_repository_relative() {
         entry.provenance = MemoryProvenance::RepositoryEvidence {
             paths: vec![EvidenceRef::new(path, "sha256:abc")],
         };
+        entry.verification = Verification::EvidenceCurrent;
         let error = store.insert(&root, Some(&identity), entry).unwrap_err();
         assert!(
             matches!(
@@ -869,6 +873,7 @@ fn a_secret_in_an_evidence_path_is_refused() {
             "sha256:abc",
         )],
     };
+    entry.verification = Verification::EvidenceCurrent;
     let error = store.insert(&root, Some(&identity), entry).unwrap_err();
     assert!(matches!(
         error,
@@ -1349,4 +1354,304 @@ fn a_renamed_checkout_retains_its_project_memory() {
 
     assert_eq!(after.key, before.key);
     assert_eq!(store.project_entries(&after).unwrap(), vec![stored]);
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes: torn-tail repair, provenance agreement, key shape, shallow
+// clones, same-session supersession and duplicate ids.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_torn_tail_does_not_swallow_the_next_record() {
+    let root = temp_dir("torn-after-crash");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_torn_after_crash");
+    store.ensure_schema().unwrap();
+
+    let first = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "The first fact."),
+        )
+        .unwrap();
+    let path = store.project_path(&identity.key);
+    let mut torn = fs::read_to_string(&path).unwrap();
+    torn.push_str("{\"id\":\"mem_torn\",\"scope\":\"proj");
+    fs::write(&path, &torn).unwrap();
+
+    let second = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "The second fact."),
+        )
+        .unwrap();
+
+    let loaded = store.project_entries(&identity).unwrap();
+    assert_eq!(loaded.len(), 2, "{loaded:?}");
+    assert!(loaded.iter().any(|entry| entry.id == first.id));
+    assert!(loaded.iter().any(|entry| entry.id == second.id));
+
+    let after = fs::read_to_string(&path).unwrap();
+    assert!(
+        after.contains("mem_torn"),
+        "the torn fragment is retained as evidence"
+    );
+    assert!(
+        after.contains("\n{\"id\":\"mem_torn\"") || after.contains("mem_torn\",\"scope\":\"proj\n"),
+        "a newline separates the fragment from the next record"
+    );
+}
+
+#[test]
+fn provenance_and_verification_must_agree() {
+    let root = temp_dir("provenance-verification");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_provenance_verification");
+
+    let mut repository_labelled_user = project_entry(&identity.key, "Docker is required.");
+    repository_labelled_user.provenance = MemoryProvenance::RepositoryEvidence {
+        paths: vec![EvidenceRef::new("README.md", "sha256:abc")],
+    };
+    repository_labelled_user.verification = Verification::UserConfirmed;
+    let error = store
+        .insert(&root, Some(&identity), repository_labelled_user)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::InvalidShape(_))
+    ));
+
+    let mut user_labelled_evidence = project_entry(&identity.key, "Docker is required.");
+    user_labelled_evidence.verification = Verification::EvidenceCurrent;
+    let error = store
+        .insert(&root, Some(&identity), user_labelled_evidence)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::InvalidShape(_))
+    ));
+
+    for (provenance, verification) in [
+        (
+            MemoryProvenance::UserRequest {
+                session_id: "session_1".to_string(),
+                message_id: "message_1".to_string(),
+            },
+            Verification::UserConfirmed,
+        ),
+        (
+            MemoryProvenance::SuggestedAndConfirmed {
+                session_id: "session_1".to_string(),
+                task_id: "task_1".to_string(),
+            },
+            Verification::UserConfirmed,
+        ),
+        (
+            MemoryProvenance::RepositoryEvidence {
+                paths: vec![EvidenceRef::new("README.md", "sha256:abc")],
+            },
+            Verification::EvidenceCurrent,
+        ),
+        (
+            MemoryProvenance::RepositoryEvidence {
+                paths: vec![EvidenceRef::new("README.md", "sha256:abc")],
+            },
+            Verification::EvidenceStale,
+        ),
+    ] {
+        let mut entry = project_entry(&identity.key, "A valid pair.");
+        entry.provenance = provenance;
+        entry.verification = verification;
+        assert!(store.insert(&root, Some(&identity), entry).is_ok());
+    }
+}
+
+#[test]
+fn a_project_key_shape_cannot_escape_the_project_directory() {
+    let root = temp_dir("project-key-shape");
+    let store = memory_store(&root, false);
+    for key in ["../escape", "root_../x", "root_", "root_has.dot"] {
+        let identity = project_identity(key);
+        let error = store
+            .insert(&root, Some(&identity), project_entry(key, "A fact."))
+            .unwrap_err();
+        assert!(
+            matches!(error, MemoryError::Refused(MemoryRefusal::InvalidShape(_))),
+            "{key} was not refused"
+        );
+        assert!(
+            matches!(
+                store.project_entries(&identity),
+                Err(MemoryError::Refused(MemoryRefusal::InvalidShape(_)))
+            ),
+            "{key} was readable"
+        );
+    }
+    assert!(
+        !root.join("escape.jsonl").exists()
+            && !root
+                .join(".damaian")
+                .join("memory")
+                .join("escape.jsonl")
+                .exists(),
+        "nothing was created outside memory/project/"
+    );
+}
+
+#[test]
+fn a_session_replacement_cannot_cross_sessions() {
+    let root = temp_dir("supersede-cross-session");
+    let store = memory_store(&root, false);
+    let sessions = SessionStore::new(root.join(".damaian"));
+    let first = sessions.create_session("repo_fixture", "first").unwrap();
+    let second = sessions.create_session("repo_fixture", "second").unwrap();
+
+    let entry = store
+        .insert(&root, None, session_entry(&first.id, "A session fact."))
+        .unwrap();
+    let error = store
+        .supersede(
+            &root,
+            MemoryTarget::Session(&first.id),
+            &entry.id,
+            session_entry(&second.id, "A replacement in the wrong session."),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::InvalidShape(_))
+    ));
+    assert_eq!(
+        store.session_entries(&first.id).unwrap(),
+        vec![entry.clone()]
+    );
+    assert_eq!(
+        store.session_entries(&first.id).unwrap()[0].state,
+        MemoryState::Active
+    );
+    assert!(store.session_entries(&second.id).unwrap().is_empty());
+}
+
+#[test]
+fn insert_refuses_an_id_that_already_exists() {
+    let root = temp_dir("insert-duplicate-id");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_insert_duplicate");
+    let entry = project_entry(&identity.key, "The original fact.");
+    let first = store.insert(&root, Some(&identity), entry.clone()).unwrap();
+
+    let error = store.insert(&root, Some(&identity), entry).unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::InvalidShape(_))
+    ));
+    assert!(error.to_string().contains("edit or supersede"));
+    let stored = store.project_entries(&identity).unwrap();
+    assert_eq!(stored, vec![first]);
+    assert_eq!(
+        fs::read_to_string(store.project_path(&identity.key))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "the refused insert appended nothing"
+    );
+}
+
+#[test]
+fn a_stored_statement_is_trimmed() {
+    let root = temp_dir("statement-trim");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_statement_trim");
+    let stored = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "   A trimmed fact.   "),
+        )
+        .unwrap();
+    assert_eq!(stored.statement, "A trimmed fact.");
+    assert_eq!(
+        store.project_entries(&identity).unwrap()[0].statement,
+        "A trimmed fact."
+    );
+}
+
+#[test]
+fn a_project_record_with_the_wrong_scope_is_refused_on_read() {
+    let root = temp_dir("cross-scope-read");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_cross_scope");
+    store.ensure_schema().unwrap();
+    let mut value = serde_json::to_value(full_entry(&identity.key)).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("scope".to_string(), serde_json::json!("user"));
+    write_lines(
+        &store.project_path(&identity.key),
+        &[serde_json::to_string(&value).unwrap()],
+    );
+
+    let error = store.project_entries(&identity).unwrap_err();
+    assert!(matches!(error, MemoryError::Invalid(_)));
+    assert!(error.to_string().contains("cross a project boundary"));
+}
+
+#[test]
+fn shallow_clones_share_through_the_remote_and_stop_using_the_graft() {
+    let data_root = temp_dir("shallow-data");
+    let origin = repo_with_a_commit("shallow-origin");
+    commit(&origin, "second.txt", "second\n");
+
+    let shallow_a = temp_dir("shallow-a");
+    let shallow_b = temp_dir("shallow-b");
+    let full = temp_dir("shallow-full");
+    for (target, depth) in [(&shallow_a, true), (&shallow_b, true), (&full, false)] {
+        let mut command = Command::new("git");
+        command.args(["clone", "-q", "--no-local"]);
+        if depth {
+            command.args(["--depth", "1"]);
+        }
+        command.arg(&origin).arg(target);
+        assert!(command.status().unwrap().success());
+    }
+
+    let config = Config {
+        data_dir: data_root.join(".damaian"),
+        enable_index_watcher: false,
+        ..Config::default()
+    };
+    let service = git_service(&config);
+    assert!(service.is_shallow_repository(&shallow_a).unwrap());
+    assert!(!service.is_shallow_repository(&full).unwrap());
+
+    // A local path remote has no portable host, so give both shallow clones
+    // the same real-looking origin. This is the common CI/review case.
+    let shared_remote = "git@github.com:owner/shallow-fixture.git";
+    for clone in [&shallow_a, &shallow_b, &full] {
+        git(clone, &["remote", "set-url", "origin", shared_remote]);
+    }
+    let a = shared_identity(&shallow_a, &data_root);
+    let b = shared_identity(&shallow_b, &data_root);
+    let full_identity = shared_identity(&full, &data_root);
+    assert_eq!(a.source, ProjectKeySource::RemoteUrl);
+    assert_eq!(b.source, ProjectKeySource::RemoteUrl);
+    assert_eq!(a.key, b.key, "two shallow clones share through the remote");
+    assert_eq!(full_identity.source, ProjectKeySource::RootCommit);
+    assert_ne!(a.key, full_identity.key);
+
+    // Fetching the missing history turns the graft into the real root.
+    git(
+        &shallow_a,
+        &["remote", "set-url", "origin", origin.to_str().unwrap()],
+    );
+    git(&shallow_a, &["fetch", "-q", "--unshallow"]);
+    git(&shallow_a, &["remote", "set-url", "origin", shared_remote]);
+    assert!(!service.is_shallow_repository(&shallow_a).unwrap());
+    let unshallowed = shared_identity(&shallow_a, &data_root);
+    assert_eq!(unshallowed.source, ProjectKeySource::RootCommit);
+    assert_eq!(unshallowed.key, full_identity.key);
 }

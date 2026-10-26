@@ -1,6 +1,8 @@
 # Feature Spec: Memory Model and Storage
 
-Status: Done
+Status: Done 2026-10-26 (planned and built on 2026-10-26; Tasks 1–8;
+**CI outstanding** — the scoped checks passed and the seven-check gate runs
+after the user pushes).
 Order: 28 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -178,6 +180,14 @@ are categorically different, not different by degree, and
 decide what to label as uncertain. A numeric confidence would invite arithmetic
 that means nothing.
 
+The two are not independent, and the write path enforces the total mapping:
+`UserRequest` and `SuggestedAndConfirmed` require `UserConfirmed`, while
+`RepositoryEvidence` requires `EvidenceCurrent` or `EvidenceStale`. A repository
+observation labelled user-confirmed would present file content as user trust,
+and a user statement labelled evidence-current would present it as a stale file
+observation — either is a hidden-influence label in the inspector, so a pair
+outside the mapping is refused before anything is stored.
+
 ### 5.2 Project identity: the roadmap's key does not work
 
 **Requirement 2 is unsatisfiable using `repository_id_for_path`, and this is the
@@ -229,6 +239,16 @@ Requirement 2's second half — "two different repositories cannot share memory"
 holds at every level, and is the half that carries the security weight. It is
 asserted by test at each resolution tier.
 
+**Tier 1 is skipped in a shallow clone.** `git rev-list --max-parents=0 HEAD`
+reports the grafted boundary commit there, which changes with `--depth` and
+changes again on `git fetch --unshallow`; using it would make a fetch-depth
+artifact the identity. A shallow clone therefore resolves at tier 2, so two
+shallow clones of one repository share through their remote. The remaining
+limit: a shallow clone with no portable remote falls to the path hash and does
+not share, which is over-isolation rather than over-sharing. A `file:` remote
+is a local path with no portable host and also returns no tier-2 identity, for
+the same reason — two unrelated repositories can share a path tail.
+
 ### 5.3 Layout
 
 ```text
@@ -247,9 +267,12 @@ rather than a feature.
 Files are append-only JSONL with the same discipline
 [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.2 establishes: one
 complete record per line, terminated with `\n`, replayed newest-state-wins by
-`id`, and a torn final line discarded on read. This gives supersession and
-deletion history for free — requirement 4's audit trail is the file itself —
-and means no update ever rewrites a file.
+`id`, and a torn final line discarded on read. A write after a crash first
+appends a lone newline when the file does not end in one, so the torn fragment
+becomes a skipped middle line instead of swallowing the next record; the
+fragment itself is retained. This gives supersession and deletion history for
+free — requirement 4's audit trail is the file itself — and means no update ever
+rewrites a file.
 
 Mode `0700` on the directory, consistent with the rest of the data directory.
 
@@ -493,11 +516,21 @@ including a clone of them; a clone and its origin therefore share a key while
 their `repository_id`s differ. Fixtures with no commit and an `origin` resolve at
 tier 2 (`remote_<sha256[..16]>`); two checkouts naming the same remote share, and
 different remotes do not. A repository with neither resolves at tier 3
-(`path_repo_<hex>`), and a directory that is not a Git repository at all resolves
-there without failing. No fixture fell through unexpectedly: tier 1 fails only
-with no history, and tier 2 only when the URL has no portable host (a local
-filesystem path is treated that way deliberately, rather than pretending a
-machine-local path is portable).
+(`path_repo_sha256_<hex>`), and a directory that is not a Git repository at all resolves
+there without failing, keyed as `path_` plus the sanitized path hash. No fixture
+fell through unexpectedly: tier 1 fails only with no history or a shallow
+clone, and tier 2 only when the URL has no portable host (a local filesystem
+path, including `file://…`, is treated that way deliberately, rather than
+pretending a machine-local path is portable).
+
+**Shallow clones.** Verified with two `git clone --no-local --depth 1` clones
+and one full clone of the same repository, all naming the same origin: both
+shallow clones resolved `RemoteUrl` with the same key, the full clone resolved
+`RootCommit` with a different key, and `git fetch --unshallow` in one clone
+moved it to `RootCommit` with the full clone's key. Skipping tier 1 was chosen
+over using the graft because the graft is not a property of the repository —
+its value depends on fetch depth and changes without the user doing anything to
+the repository.
 
 **Fork sharing.** A fork shares its upstream's root commit and so its key; the
 test asserts it as a stated decision. No real-use surprise has been recorded yet,
@@ -505,12 +538,14 @@ because nothing recalls memory in this slice (#30). If a fork inheriting upstrea
 memory proves wrong, record the case before changing anything: the fix in §5.2 is
 a per-project opt-out, not a change to the resolution order.
 
-**Cost.** Tier 1 is one `git rev-list` process. Measured on the development Mac
-on 2026-10-26: 20 iterations took 0.246 s, about 12 ms each, dominated by process
-launch rather than by repository size. Tier 2 is one `git config` process; tier
-3 runs no Git process at all. Nothing calls resolution per turn in this slice;
-#29 and #30 should resolve once when a repository is opened and reuse the
-identity.
+**Cost.** Each tier costs one Git process, and the shallow check adds one:
+tier 1 is `rev-parse --is-shallow-repository` then `rev-list --max-parents=0`,
+tier 2 (and a shallow clone) is the check then `config --get remote.origin.url`,
+and tier 3 runs both checks but no identity lookup. Measured on the development
+Mac on 2026-10-26: 20 `rev-list` iterations took 0.246 s, about 12 ms each,
+dominated by process launch rather than by repository size. Nothing calls
+resolution per turn in this slice; #29 and #30 should resolve once when a
+repository is opened and reuse the identity.
 
 **What changed from the written design.**
 
@@ -531,6 +566,20 @@ identity.
 - The store refuses an evidence path that is `./`-prefixed as well as an
   absolute or `..` path. Evidence should be stored normalized; the refusal costs
   a caller nothing and keeps one representation in the file.
+- `insert` refuses an id that already exists in the target scope. Replay is
+  last-wins, so a second creation with the same id would replace the first while
+  the audit said `memory_created`; transitions are the only path that appends a
+  second record for one id.
+- The path-tier key replaces the colon inside `repository_id` with `_`, and the
+  key shape is enforced on write and read. This was found while enforcing the
+  shape: the existing `repository_id` is `repo_` plus the first 16 characters
+  of `sha256:…`, so it contains the algorithm's colon.
+- `append_entry_line` separates a crash-torn tail with a lone newline before
+  appending. Without it the next record joined the fragment and both were
+  skipped — the torn-tail property held only until the first write after the
+  crash.
+- Provenance and verification are checked against each other on the write path;
+  the mapping is in §5.1.
 
 **Acceptance criteria not verifiable in this slice.** "A credential that no
 pattern detects is still redacted before it is sent" belongs to #30: it needs a

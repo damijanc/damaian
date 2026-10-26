@@ -486,7 +486,13 @@ impl ProjectIdentity {
         let root = root.as_ref();
         let repository_id = repository_id.into();
 
-        if let Some(commit) = git.root_commit(root)?
+        // A shallow clone has no true root: `rev-list --max-parents=0` reports
+        // the grafted boundary and a different depth reports another, so a
+        // fetch-depth artifact would become identity. Fall to the remote, which
+        // two shallow clones of one repository share.
+        let shallow = git.is_shallow_repository(root)?;
+        if !shallow
+            && let Some(commit) = git.root_commit(root)?
             && !commit.is_empty()
         {
             return Ok(Self {
@@ -507,7 +513,7 @@ impl ProjectIdentity {
         }
 
         Ok(Self {
-            key: format!("path_{repository_id}"),
+            key: path_project_key(&repository_id),
             source: ProjectKeySource::RepositoryId,
             repository_id,
         })
@@ -534,6 +540,46 @@ impl ProjectIdentity {
     }
 }
 
+/// The path-tier key: the existing `repository_id` with any character a key
+/// may not hold replaced by `_`.
+///
+/// `repository_id` is `repo_` plus the first 16 characters of
+/// `sha256(canonical path)`, which includes the algorithm's colon. A colon is
+/// legal on macOS but reads as a path separator in Finder, so it is mapped
+/// rather than allowed through. The mapping is injective for this fixed shape.
+fn path_project_key(repository_id: &str) -> String {
+    let suffix: String = repository_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("path_{suffix}")
+}
+
+/// The only key shapes [`ProjectIdentity`] writes: a tier prefix and a
+/// non-empty suffix of ASCII alphanumerics, `_` or `-`.
+///
+/// The key becomes a file name, so the shape is enforced where it is used as a
+/// path, not merely produced by [`ProjectIdentity::resolve`]. A public struct
+/// field could otherwise be set to `../user` and escape `memory/project/`.
+pub fn is_valid_project_key(key: &str) -> bool {
+    let suffix = key
+        .strip_prefix("root_")
+        .or_else(|| key.strip_prefix("remote_"))
+        .or_else(|| key.strip_prefix("path_"));
+    suffix.is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+    })
+}
+
 /// Normalizes an `origin` URL to `host/path`, stripping the scheme, any
 /// credentials, a port and a trailing `.git`.
 ///
@@ -544,6 +590,16 @@ impl ProjectIdentity {
 pub fn normalize_remote_url(url: &str) -> Option<String> {
     let url = url.trim();
     if url.is_empty() {
+        return None;
+    }
+    // A `file:` remote is a local filesystem path. Its path tail can coincide
+    // for unrelated repositories (`file:///home/a/srv/repo` and
+    // `file:///home/b/srv/repo`), so treating it as host/path would share
+    // memory between them — the unsafe direction.
+    if url
+        .get(.."file:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
         return None;
     }
 
@@ -786,6 +842,10 @@ impl MemoryStore {
         self.config.data_dir.join(MEMORY_DIRECTORY)
     }
 
+    /// The file a project key names, for a caller that already holds a
+    /// [`ProjectIdentity`]. The shape is enforced by [`Self::validate_shape`] on
+    /// write and [`Self::project_entries`] on read before this is reached; this
+    /// function only formats a path.
     pub fn project_path(&self, project_key: &str) -> PathBuf {
         self.memory_dir()
             .join(PROJECT_DIRECTORY)
@@ -854,6 +914,11 @@ impl MemoryStore {
     /// a filtered-out row: a mismatch means the store or the resolution is
     /// wrong, and continuing quietly would be a cross-repository leak.
     pub fn project_entries(&self, identity: &ProjectIdentity) -> MemoryResult<Vec<MemoryEntry>> {
+        if !is_valid_project_key(&identity.key) {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "the project key is not a shape Damaian writes".to_string(),
+            )));
+        }
         self.ensure_if_present()?;
         let entries = read_entries(&self.project_path(&identity.key))?.0;
         for entry in &entries {
@@ -917,11 +982,6 @@ impl MemoryStore {
         // confirmation showed, with no surrounding whitespace.
         entry.statement = entry.statement.trim().to_string();
         self.validate_shape(identity, &entry)?;
-        self.refuse_secrets(&entry)?;
-        self.refuse_ineligible_evidence(root, &entry)?;
-        entry.sensitivity = entry.effective_sensitivity();
-        entry.updated_at_ms = entry.updated_at_ms.max(entry.created_at_ms);
-
         let target = match entry.scope {
             MemoryScope::Project => {
                 MemoryTarget::Project(identity.expect("validate_shape required a project identity"))
@@ -934,6 +994,22 @@ impl MemoryStore {
             ),
             MemoryScope::User => MemoryTarget::User,
         };
+        // `insert` is the creation path. A second record with an existing id
+        // would replay as last-wins, silently replacing the first while the
+        // audit said `memory_created` — an un-audited edit.
+        if self
+            .target_entries(target)?
+            .iter()
+            .any(|existing| existing.id == entry.id)
+        {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "that memory already exists; edit or supersede it".to_string(),
+            )));
+        }
+        self.refuse_secrets(&entry)?;
+        self.refuse_ineligible_evidence(root, &entry)?;
+        entry.sensitivity = entry.effective_sensitivity();
+        entry.updated_at_ms = entry.updated_at_ms.max(entry.created_at_ms);
         self.append_to_target(target, &entry)?;
 
         self.audit_memory("memory_created", &entry, None, Some(entry.state))?;
@@ -1033,6 +1109,13 @@ impl MemoryStore {
                 "a replacement must stay in the same project".to_string(),
             )));
         }
+        if replacement.scope == MemoryScope::Session
+            && replacement.session_id != previous.session_id
+        {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "a replacement must stay in the same session".to_string(),
+            )));
+        }
         replacement.supersedes = Some(previous_id.to_string());
         let identity = match target {
             MemoryTarget::Project(identity) => Some(identity),
@@ -1126,6 +1209,27 @@ impl MemoryStore {
                 "a memory statement is one line, not an excerpt".to_string(),
             )));
         }
+        // `Verification` is the trust label #27 and #30 show, so a repository
+        // observation labelled user-confirmed would present file content as user
+        // trust, and a user statement labelled evidence-current would present it
+        // as a stale observation. The mapping is total, and the store enforces it.
+        let verification_agrees = match &entry.provenance {
+            MemoryProvenance::UserRequest { .. }
+            | MemoryProvenance::SuggestedAndConfirmed { .. } => {
+                entry.verification == Verification::UserConfirmed
+            }
+            MemoryProvenance::RepositoryEvidence { .. } => matches!(
+                entry.verification,
+                Verification::EvidenceCurrent | Verification::EvidenceStale
+            ),
+        };
+        if !verification_agrees {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(format!(
+                "a {} memory cannot carry {} verification",
+                entry.provenance.kind(),
+                entry.verification.as_str()
+            ))));
+        }
 
         match entry.scope {
             MemoryScope::Project => {
@@ -1144,6 +1248,11 @@ impl MemoryStore {
                         "the project identity for this repository was not supplied".to_string(),
                     )));
                 };
+                if !is_valid_project_key(key) {
+                    return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                        "the project key is not a shape Damaian writes".to_string(),
+                    )));
+                }
                 if key != identity.key {
                     return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
                         "the project key does not match this repository's identity".to_string(),
@@ -1530,8 +1639,35 @@ fn append_entry_line(path: &Path, entry: &MemoryEntry) -> MemoryResult<()> {
     let mut line = serde_json::to_string(entry)
         .map_err(|error| MemoryError::Invalid(format!("Failed to serialize memory: {error}")))?;
     line.push('\n');
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    ensure_trailing_newline(&mut file)?;
     file.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+/// Separates a crash-torn final record from the one about to be appended.
+///
+/// A torn tail is retained as evidence, so the file is never truncated or
+/// rewritten. Without a separating newline, though, the next record is appended
+/// onto the fragment, the joined line is invalid JSON, and `read_entries` skips
+/// both — which would mean the torn-tail property held only until the first
+/// write after the crash.
+fn ensure_trailing_newline(file: &mut fs::File) -> MemoryResult<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(length - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] != b'\n' {
+        file.write_all(b"\n")?;
+    }
     Ok(())
 }
 
@@ -1724,6 +1860,42 @@ mod tests {
         assert_eq!(normalize_remote_url("../repo.git"), None);
         assert_eq!(normalize_remote_url("https://github.com"), None);
         assert_eq!(normalize_remote_url(""), None);
+    }
+
+    #[test]
+    fn a_file_remote_never_becomes_a_host_and_path() {
+        // Two unrelated repositories whose absolute paths share a tail would
+        // otherwise collide: /home/a/srv/repo and /home/b/srv/repo.
+        assert_eq!(normalize_remote_url("file:///home/a/srv/git/repo"), None);
+        assert_eq!(
+            normalize_remote_url("FILE:///home/b/srv/git/repo.git"),
+            None
+        );
+        assert_eq!(normalize_remote_url("file:/srv/git/repo.git"), None);
+    }
+
+    #[test]
+    fn only_the_keys_damaian_writes_are_valid_project_keys() {
+        for key in [
+            "root_0123456789abcdef0123456789abcdef01234567",
+            "remote_0123456789abcdef",
+            "path_repo_0123456789abcdef",
+        ] {
+            assert!(is_valid_project_key(key), "{key}");
+        }
+        for key in [
+            "",
+            "root_",
+            "remote_",
+            "path_",
+            "root_../escape",
+            "root_root_1/x",
+            "root_has.dot",
+            "mem_0123456789abcdef",
+            "other_0123",
+        ] {
+            assert!(!is_valid_project_key(key), "{key}");
+        }
     }
 
     #[test]

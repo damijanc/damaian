@@ -1019,6 +1019,21 @@ impl GitService {
             .map(str::to_string))
     }
 
+    /// Whether this checkout is a shallow clone.
+    ///
+    /// A shallow clone's `rev-list --max-parents=0` reports the grafted
+    /// boundary commit, which changes with fetch depth and with
+    /// `fetch --unshallow`. Memory identity uses this to skip its root-commit
+    /// tier rather than treating a fetch-depth artifact as the repository's
+    /// identity (spec 28 §5.2). Not audited; a non-repository reads `false`.
+    pub fn is_shallow_repository(&self, root_path: impl AsRef<Path>) -> Result<bool> {
+        Ok(git_line(
+            root_path.as_ref(),
+            &["rev-parse", "--is-shallow-repository"],
+        )?
+        .is_some_and(|value| value == "true"))
+    }
+
     /// The configured `origin` URL, if there is one. Tier 2 of spec 28 §5.2's
     /// project identity; not audited for the same reason as
     /// [`Self::root_commit`].

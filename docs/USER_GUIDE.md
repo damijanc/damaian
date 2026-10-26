@@ -473,7 +473,7 @@ a file cache, or a set of instructions.
 | Scope | What it means | Default |
 |---|---|---|
 | Session | Applies to one conversation and is deleted with it. Stored in that session's event log. | On |
-| Project | Applies to this repository, in every checkout of it. Two clones of one repository share it; two different repositories never share it. | On |
+| Project | Applies to this repository, in every checkout of it. Two full clones of one repository share it; two different repositories never share it. A shallow clone (CI's `--depth 1`) has no stable root, so it shares through its remote instead; a shallow clone with no portable remote does not share. | On |
 | User | Applies to every project you open. | **Off** |
 
 User scope is off because it is the one scope where a fact learned in one

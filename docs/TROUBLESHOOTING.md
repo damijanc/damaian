@@ -50,7 +50,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | `Refused by hook …`, or a hook blocked, warned, timed out or did not run | [A hook refused, blocked, or did not run](#a-hook-refused-blocked-or-did-not-run) |
 | A command that used to run unasked now asks | [A command that used to run unasked now asks](#a-command-that-used-to-run-unasked-now-asks) |
 | A setting will not stick, or a repository config key has no effect | [Configuration layers](#configuration-layers), [Why a rule is in force](#why-a-rule-is-in-force) |
-| Memory will not save, a project's memory is missing, or the store was refused | [Memory](#memory) |
+| Memory will not save, a project's memory is missing (including a shallow clone), or the store was refused | [Memory](#memory) |
 | A permission profile key has no effect | [A permission profile key had no effect](#a-permission-profile-key-had-no-effect) |
 | A file read or search result was cut short | [A file read or search result was truncated](#a-file-read-or-search-result-was-truncated) |
 | A file is missing from the model's context | [A file the model should see is missing from context](#a-file-the-model-should-see-is-missing-from-context) |
@@ -392,14 +392,21 @@ prefix names the tier that produced it:
 |---|---|---|
 | `root_<40-hex>` | `git rev-list --max-parents=0 HEAD` | clone, move, rename, remote change, fork |
 | `remote_<16-hex>` | normalized `origin` URL (host + path) hashed | clone, move; not a remote rename |
-| `path_repo_<16-hex>` | the existing path-derived `repository_id` | nothing; per-checkout fallback |
+| `path_repo_sha256_<hex>` | the existing path-derived `repository_id`, with its colon mapped to `_` | nothing; per-checkout fallback |
 
 The root commit is preferred because it belongs to the repository's history
 rather than to where it sits. A fork shares its upstream's root commit and
-therefore its memory — deliberate, since the conventions usually still apply; a
-repository with no commit and no remote falls to the path hash, and the failure
-mode there is isolation, not sharing. The UI reports the tier rather than the
-raw key.
+therefore its memory — deliberate, since the conventions usually still apply. A
+**shallow clone** (`git clone --depth 1`) has no true root: Git reports the
+grafted boundary, whose value depends on the depth and changes on
+`git fetch --unshallow`, so the root-commit tier is skipped and the remote is
+used. Two shallow clones of one repository therefore share through `origin`,
+and a shallow clone with no portable remote falls to the path hash. A `file:`
+remote is a local path with no portable host and also falls through — two
+unrelated repositories can share a path tail, so treating it as identity would
+over-share. A repository with no commit and no remote falls to the path hash,
+and the failure mode there is isolation, not sharing. The UI reports the tier
+rather than the raw key.
 
 **A refused secret write.** A statement (or an evidence path) that the secret
 scanner recognises is refused with *"That looks like a credential; Damaian will

@@ -2,14 +2,16 @@
 
 Background for [`tasks.md`](tasks.md). Read this before Task 1, with
 [`proposal.md`](proposal.md) §5 beside it. Everything below was checked against
-the tree on 2026-10-26, after #26, #27 and #66 landed. Line numbers drift:
+re-checked against the finished spec-28 branch on the same date. The numbers in
+§2 are final-branch positions, not pre-change numbering. Line numbers drift:
 re-read the function before editing near it.
 
 ## 1. What exists, and what does not
 
-No memory exists. There is no `memory` module, no store, no record type, no
-audit event, and no config key. `WorkspaceEngine` (`workspace_engine.rs:38`)
-holds no memory field. The proposal's record is entirely new code.
+No memory existed before this branch. There was no `memory` module, no store, no
+record type, no audit event, and no config key. `WorkspaceEngine`
+(`workspace_engine.rs:40`) held no memory field; the finished branch adds
+`memory_store`. The proposal's record was entirely new code.
 
 What #28 can build on is real and was verified:
 
@@ -21,9 +23,9 @@ What #28 can build on is real and was verified:
   value on the way in, and is disabled cleanly when `audit_enabled` is false.
 - `SessionStore` (`session.rs:460`) is a cloneable handle over
   `<data_dir>/sessions/<session_id>.jsonl`, with append-only events replayed by
-  `active_events` (`session.rs:3276`). `append_session_event`
-  (`session.rs:3071`) is **private** to the module.
-- `PathPolicy::is_restricted` (`path_policy.rs:138`) applies
+  `active_events` (`session.rs:3300`). `append_session_event`
+  (`session.rs:3095`) is **private** to the module.
+- `PathPolicy::is_restricted` (`path_policy.rs:149`) applies
   `restricted_patterns`; `is_ignored_by_rules` (`ignore.rs:44`) applies parsed
   ignore rules; `tree_walk.rs:57-64` shows how per-directory `.gitignore` files
   are accumulated (`parse_ignore_patterns` with the directory as base).
@@ -38,18 +40,20 @@ What #28 can build on is real and was verified:
 ## 2. Corrections to the proposal's line references
 
 The proposal was written against an earlier tree. Every reference below was
-re-checked; use the current location.
+re-checked against the finished branch; use the current location. Anything this
+branch added after Task 1 moved some of these numbers, which is why they were
+re-read after the last code change rather than copied forward.
 
 | Proposal says | Current location | Note |
 |---|---|---|
 | `SessionStore` `session.rs:68` | `session.rs:460` | The struct moved behind the event/record types. |
 | `repository_id_for_root` `indexer.rs:382-385` | `hash.rs:113-118` | Moved out of the indexer; still `sha256(canonicalized path)[..16]` prefixed `repo_`. |
 | `repository_id_for_path` `indexer.rs:191-194` | `indexer.rs:215-218` | Now canonicalizes then calls `repository_id_for_root`. |
-| `DAMAIAN_DATA_DIR` `config.rs:192` | `config.rs:930-934` | `Config::default_data_dir`. |
-| vector-index path `vector_index.rs:149-152` | `vector_index.rs:149-152` is `semantic_search`; the path helper is `vector_index.rs:144-148` | Still no schema version. |
-| `git_service.rs:37`, `:77`, `:110` (status, diff, suggest) | `:326` (`status`), `:507` (`diff`), `:999` (`suggest_commit_message`) | The module is no longer narrow: it now has worktree, log, commit and summary reads. There is still **no** repository-identity helper. |
-| `path_policy.rs:138` | unchanged | `is_restricted`. |
-| `ignore.rs:44` | unchanged | `is_ignored_by_rules`. |
+| `DAMAIAN_DATA_DIR` `config.rs:192` | `config.rs:936-940` | `Config::default_data_dir`. |
+| vector-index path `vector_index.rs:149-152` | `vector_index.rs:164` is `semantic_search`; the path helper is `vector_index.rs:149-153` | Still no schema version. |
+| `git_service.rs:37`, `:77`, `:110` (status, diff, suggest) | `:326` (`status`), `:507` (`diff`), `:1047` (`suggest_commit_message`) | The module is no longer narrow: it now has worktree, log, commit and summary reads. The identity helpers this branch added are `root_commit` (`:1010`), `is_shallow_repository` (`:1029`) and `origin_url` (`:1040`). |
+| `path_policy.rs:138` | `path_policy.rs:149` | `is_restricted`. |
+| `ignore.rs:44` | `ignore.rs:44` | `is_ignored_by_rules`. |
 | `patch_engine.rs:291` for hash comparison | `patch_engine.rs:334-335` | `sha256(current) != file.base_hash`; the mechanism is the same. |
 | `session.rs:261-291` for session-scoped approval | `session.rs:1077-1108` | `allow_browser_diagnostics_for_session` / `browser_diagnostics_allowed_for_session`. |
 | `context_manager.rs:260` redaction | `context_manager.rs:2252` (and `:1298`) | Redaction happens on the way into the item/request, not at the line the proposal names. |
@@ -115,11 +119,16 @@ partition together.
 
 **D1 — `project_key` encodes its tier in the string.** The record has no
 `source` field (the proposal's shape is fixed), yet the acceptance criteria
-require the tier to be reportable. Keys are therefore
-`root_<40-hex>`, `remote_<16-hex>` and `path_<repository_id>`. The prefix is the
-tier, the suffix is filesystem-safe, and two checkouts of one repository
-produce the identical string at tier 1. A remote URL is hashed rather than
-embedded so a credential-bearing or unusual URL cannot become a path.
+require the tier to be reportable. Keys are therefore `root_<40-hex>`,
+`remote_<16-hex>` and `path_<sanitized repository id>`. The prefix is the tier
+and two checkouts of one repository produce the identical string at tier 1. A
+remote URL is hashed rather than embedded so a credential-bearing or unusual
+URL cannot become a path. The suffix is an **enforced** shape — ASCII
+alphanumerics, `_` or `-`, non-empty — not merely produced that way:
+`project_key` becomes a file name, so `validate_shape` refuses a write and
+`project_entries` refuses a read when the key does not match. The path tier maps
+the colon inside `repository_id` (`repo_sha256:…`) to `_`, because a colon reads
+as a path separator in Finder.
 
 **D2 — "previous schema version" is 0, files without a marker.** The store is
 new, so there is no shipped v1 to migrate from. Version 0 is a `memory/`
@@ -144,6 +153,15 @@ write a memory into the session log without the store's checks. #28 adds
 **D5 — evidence paths must be repository-relative.** An absolute path or one
 containing `..` is refused before either the policy check or the ignore check
 runs, so the checks cannot be pointed outside the root.
+
+**D6 — a shallow clone skips the root-commit tier.** In a shallow clone,
+`git rev-list --max-parents=0 HEAD` reports the grafted boundary commit, which
+changes with fetch depth and silently changes again on `git fetch --unshallow`.
+Using it would make a fetch-depth artifact the repository's identity. Tier 1 is
+therefore skipped when `git rev-parse --is-shallow-repository` says `true`, and
+the remote tier is used instead, which two shallow clones of one repository
+share. A shallow clone with no portable remote falls to the path tier, so it
+does not share — the safe direction, and stated in the user guide.
 
 ## 7. Test fixtures
 
