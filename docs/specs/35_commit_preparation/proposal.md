@@ -1,7 +1,7 @@
 # Feature Spec: Commit Preparation
 
-Status: Done (2026-10-26). CI outstanding: the seven-check gate runs after the
-user pushes; agents never push.
+Status: Done (2026-10-26). The full seven-check gate passed in CI on 2026-10-26
+(Quality run 40323902715); scoped checks passed locally: see `tasks.md`.
 Order: 35 of 37
 Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -626,7 +626,7 @@ named without a path are in
 | Committing is refused in Ask, Plan and Review and under a profile that denies it | `committing_is_refused_outside_code_mode_and_without_the_profile_capability` (all three modes), `a_commit_is_refused_in_ask_mode` at the route |
 | Repository config cannot enable committing | `every_capability_key_resists_weakening_from_repository_scope` |
 | No amend, reset or history rewrite | `the_commit_module_has_no_history_rewriting_operation` |
-| Every quality-gate command passes and the baseline shows no regression | CI outstanding; locally `scripts/quality-gate.sh fmt node lint typos deny`, scoped clippy for `workspace-engine` and `desktop-shell`, `cargo nextest -p workspace-engine --test commit_preparation` (37), `--test permission_profiles` (74 passed, 1 skipped), `--test foundation` (171), `-p desktop-shell --lib` (193 passed, 5 skipped), and the deterministic eval tier |
+| Every quality-gate command passes and the baseline shows no regression | The full seven-check gate passed in CI on 2026-10-26 (Quality run 40323902715); locally `scripts/quality-gate.sh fmt node lint typos deny`, scoped clippy for `workspace-engine` and `desktop-shell`, `cargo nextest -p workspace-engine --test commit_preparation` (37), `--test permission_profiles` (74 passed, 1 skipped), `--test foundation` (171), `-p desktop-shell --lib` (193 passed, 5 skipped), and the deterministic eval tier |
 
 The one manual gap is the dialog walk: the web UI bootstraps through Tauri
 (`damaian_desktop_bootstrap`), and no browser harness was available in this

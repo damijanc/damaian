@@ -1,7 +1,7 @@
 # Feature Spec: Conversation Compaction
 
-Status: Done 2026-10-26 (implementation and scoped checks; **CI outstanding** —
-the seven-check gate runs after the user pushes, and agents never push). Split
+Status: Done 2026-10-26. The full seven-check gate passed in CI on 2026-10-26
+(Quality run 40323902715). Split
 into a folder and planned the same day; the pre-implementation state and the
 corrections to this text are in [`context.md`](context.md), the task breakdown
 and results are in [`tasks.md`](tasks.md), and §7 below walks every acceptance
@@ -518,11 +518,11 @@ compacted and how to restate it.
 
 ## 7. Implementation Notes
 
-Built on 2026-10-26. Scoped tests and clippy passed locally; the full seven-check
-gate is left to CI, and **CI is outstanding** at hand-off. The live-tier injection
-twin was run against DeepSeek on 2026-10-26 (below). Repeated-compaction
-fidelity and the manual browser walk remain unmeasured, and both are stated as
-such rather than inferred.
+Built on 2026-10-26. Scoped tests and clippy passed locally, and the full
+seven-check gate passed in CI on 2026-10-26 (Quality run 40323902715). The
+live-tier injection twin was run against DeepSeek on 2026-10-26 (below).
+Repeated-compaction fidelity and the manual browser walk remain unmeasured, and
+both are stated as such rather than inferred.
 
 ### Acceptance walk
 
@@ -544,7 +544,7 @@ such rather than inferred.
 | Settings shows the checkbox checked when the key is absent; unchecking writes user config and reloads the editor | Implemented in `index.html` and `app.js` (`refreshConversationAutoCompact`, the change handler calls `/api/config-set` then `loadConfigFile`). **The browser walk was not performed** in this session; the effective-value read and the JSON payload are covered by tests, and the walk is left for the reviewer. |
 | Transcript marker and inspector | `conversation_json` + `renderMessages` marker (expandable summary, originals below, *Compact now*). The inspector is #27, still unbuilt; as the proposal says, the marker carries the requirement until it lands. |
 | Two compactions compound | `a_second_compaction_summarises_the_first_one_plus_what_followed` (the second call receives the first summary) |
-| Every quality-gate command passes | Fast five and scoped clippy/tests passed locally; the workspace gate and the seven checks run in CI after the user pushes. **CI outstanding.** |
+| Every quality-gate command passes | The full seven-check gate passed in CI on 2026-10-26 (Quality run 40323902715); fast five and scoped clippy/tests passed locally. |
 
 ### Measurements and decisions
 
