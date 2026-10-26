@@ -661,31 +661,30 @@ fn conversation_json(engine: &WorkspaceEngine, session_id: &str) -> String {
         .as_ref()
         .map(|summary| summary.through_seq)
         .unwrap_or(0);
-    let message_refs = sequenced
+    // The prompt filters the engine's own plan reminder before slicing, so the
+    // counts here must use the same definition; otherwise the marker reports a
+    // window the model never had.
+    let window_tokens = engine.chat_orchestrator.conversation_window_tokens();
+    let after_summary_sendable = sequenced
         .iter()
+        .filter(|(seq, _)| *seq > previous_through)
         .map(|(_, message)| message)
         .collect::<Vec<_>>();
-    let window_len = workspace_engine::compaction::window_slice(
-        &message_refs,
-        engine.chat_orchestrator.conversation_window_tokens(),
-    )
-    .len();
-    let outside = workspace_engine::compaction::window_start(
-        &sequenced,
-        previous_through,
-        engine.chat_orchestrator.conversation_window_tokens(),
-    );
+    let sendable = workspace_engine::compaction::sendable_messages(&after_summary_sendable);
+    let window_len = workspace_engine::compaction::window_slice(&sendable, window_tokens).len();
+    let outside =
+        workspace_engine::compaction::window_start(&sequenced, previous_through, window_tokens);
     let (kind, through_seq, omitted) = if let Some(summary) = &conversation.summary {
         (
             "summary",
             summary.through_seq,
-            conversation.summarised_messages + (conversation.messages.len() - window_len),
+            conversation.summarised_messages + (sendable.len() - window_len),
         )
     } else if outside.is_some() {
         (
             "elision",
             outside.unwrap_or(0),
-            conversation.messages.len().saturating_sub(window_len),
+            sendable.len().saturating_sub(window_len),
         )
     } else {
         ("none", 0, 0)
@@ -783,6 +782,9 @@ fn compact_session(
         }
         Ok(workspace_engine::compaction::CompactionOutcome::NothingToCompact) => {
             serde_json::json!({"kind": "nothing"})
+        }
+        Ok(workspace_engine::compaction::CompactionOutcome::Cancelled) => {
+            serde_json::json!({"kind": "cancelled"})
         }
         Ok(workspace_engine::compaction::CompactionOutcome::Failed(reason)) => {
             serde_json::json!({"kind": "failed", "reason": reason})
@@ -12988,7 +12990,9 @@ mod conversation_compaction_tests {
         ApprovalDigest, ConversationSummary, PlanStepDigest, SUMMARY_FORMAT_VERSION,
         ValidationDigest,
     };
-    use workspace_engine::{Config, Task, WorkspaceEngine};
+    use workspace_engine::{
+        CancelToken, Config, MockModelAdapter, Task, TurnProgress, TurnSink, WorkspaceEngine,
+    };
 
     static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -13108,6 +13112,80 @@ mod conversation_compaction_tests {
                 .len(),
             12,
             "the display reader still has every message"
+        );
+    }
+
+    #[test]
+    fn the_boundary_counts_match_the_prompt_when_a_plan_reminder_is_present() {
+        let repo = temp_repo();
+        let engine = WorkspaceEngine::new(Config {
+            data_dir: repo.join(".damaian"),
+            // 0.5% of 16,000 tokens: 80, so a 12-message seed is only partly in
+            // view and the notice has something to count. Automatic
+            // compaction is off so the first request is the ask, not a summary
+            // call.
+            conversation_window_share: 50,
+            conversation_auto_compact: false,
+            enable_index_watcher: false,
+            ..Config::default()
+        });
+        let (session_id, _) = seeded(&engine, &repo);
+        // The engine's own reminder is a user-role message in storage but not
+        // a sendable one; if it consumed the window the marker would disagree
+        // with the request.
+        engine
+            .session_store
+            .append_message_with_kind(
+                &session_id,
+                None,
+                "user",
+                &"r".repeat(4_000),
+                Some("plan_reminder"),
+            )
+            .unwrap();
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&conversation_json(&engine, &session_id)).expect("JSON");
+        let conversation = &payload["conversation"];
+        let omitted = conversation["omittedMessages"].as_u64().unwrap();
+        let window = conversation["windowMessages"].as_u64().unwrap();
+        assert_eq!(
+            window + omitted,
+            12,
+            "the 12 sendable messages split into the window and the notice; the reminder is neither"
+        );
+
+        let mut adapter = MockModelAdapter::new("Done.");
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        engine
+            .chat_orchestrator
+            .ask_with_session(
+                &repo,
+                "What next?",
+                &[],
+                Some(&session_id),
+                &mut adapter,
+                &mut sink,
+            )
+            .expect("the turn runs");
+        let prompt = &adapter.requests[0].messages[1].content;
+        let notice = prompt
+            .split("[Damaian: ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|count| count.parse::<u64>().ok())
+            .expect("the request states how many messages were not sent");
+        assert_eq!(
+            notice, omitted,
+            "the marker and the request must count the same messages: {prompt}"
         );
     }
 

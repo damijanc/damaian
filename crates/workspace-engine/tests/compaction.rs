@@ -402,6 +402,20 @@ fn seed_facts(engine: &WorkspaceEngine, session: &Session, task: &Task) {
             },
         )
         .unwrap();
+    // A rejected patch is a decision, not a change. It must appear in the
+    // approvals digest and never in `files_changed`.
+    engine
+        .session_store
+        .append_patch_file_decision(
+            &session.id,
+            &PatchFileDecision {
+                task_id: task.id.clone(),
+                patch_id: "patch_2".to_string(),
+                paths: vec!["src/rejected.rs".to_string()],
+                applied: false,
+            },
+        )
+        .unwrap();
     engine
         .session_store
         .append_verification_event(
@@ -443,7 +457,21 @@ fn compaction_with_the_model_stubbed_out_still_has_every_fact() {
     let summary = outcome.summary().expect("compacted");
 
     assert_eq!(summary.objective, objective, "quoted, not paraphrased");
-    assert_eq!(summary.files_changed, vec!["src/lib.rs"]);
+    assert_eq!(
+        summary.files_changed,
+        vec!["src/lib.rs"],
+        "a rejected patch did not change a file"
+    );
+    assert!(
+        summary
+            .approvals
+            .iter()
+            .any(|approval| approval.kind == "patch"
+                && approval.id == "patch_2"
+                && approval.decision == "rejected"
+                && approval.subject.as_deref() == Some("src/rejected.rs")),
+        "the rejection is still a recorded decision"
+    );
     assert_eq!(summary.plan_steps.len(), 1);
     assert_eq!(summary.plan_steps[0].title, "Add the parser");
     assert!(
@@ -976,4 +1004,40 @@ fn a_secret_in_the_conversation_never_leaves_through_the_summary_or_its_call() {
             .contains("AKIAIOSFODNN7EXAMPLE"),
         "the summary reaches the model redacted"
     );
+}
+
+#[test]
+fn a_cancelled_compaction_leaves_no_failure_notice() {
+    let repo = temp_repo("cancelled");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Cancelled");
+    seed_long_conversation(&engine, &session, &task, "Do not touch the public API.");
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let mut adapter = MockModelAdapter::new("{}");
+    let outcome = engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut adapter, &cancel)
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        workspace_engine::compaction::CompactionOutcome::Cancelled
+    ));
+    assert!(
+        engine
+            .session_store
+            .read_conversation_compactions(&session.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        engine
+            .session_store
+            .read_conversation_compaction_failure(&session.id)
+            .unwrap()
+            .is_none(),
+        "stopping a turn must not leave a permanent failure notice"
+    );
+    assert!(adapter.requests.is_empty(), "no call is made after a stop");
 }

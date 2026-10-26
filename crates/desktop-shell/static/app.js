@@ -4898,6 +4898,8 @@ async function compactConversationNow() {
       toast("Conversation compacted. The full transcript is still here.");
     } else if (payload.kind === "nothing") {
       toast("Nothing older than the conversation window to compact.");
+    } else if (payload.kind === "cancelled") {
+      toast("Compaction stopped.");
     } else {
       toast(`Compaction did not run: ${payload.reason || "unknown reason"}`);
     }

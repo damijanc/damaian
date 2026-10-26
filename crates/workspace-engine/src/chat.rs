@@ -1053,6 +1053,9 @@ impl ChatOrchestrator {
                     conversation = self.session_store.read_conversation(&session.id)?;
                 }
                 Ok(crate::compaction::CompactionOutcome::NothingToCompact) => {}
+                // Stopping a turn is not a compaction failure: no durable
+                // notice, because the user already knows they stopped it.
+                Ok(crate::compaction::CompactionOutcome::Cancelled) => {}
                 Ok(crate::compaction::CompactionOutcome::Failed(reason)) => {
                     self.note_compaction_failure(&session.id, &reason);
                 }
@@ -4101,9 +4104,7 @@ impl ChatOrchestrator {
         cancel: &CancelToken,
     ) -> Result<crate::compaction::CompactionOutcome> {
         if cancel.is_cancelled() {
-            return Ok(crate::compaction::CompactionOutcome::Failed(
-                "cancelled".to_string(),
-            ));
+            return Ok(crate::compaction::CompactionOutcome::Cancelled);
         }
         let view = self.session_store.read_conversation(session_id)?;
         let previous_through = view
@@ -4176,9 +4177,7 @@ impl ChatOrchestrator {
             ))
             .text;
         if cancel.is_cancelled() {
-            return Ok(crate::compaction::CompactionOutcome::Failed(
-                "cancelled".to_string(),
-            ));
+            return Ok(crate::compaction::CompactionOutcome::Cancelled);
         }
         let mut on_token = |_token: &str| {};
         let mut on_wait = |_millis: u64| {};
@@ -4199,9 +4198,7 @@ impl ChatOrchestrator {
         };
         let run = model_adapter.stream_response(&request, cancel, &mut on_token, &mut on_wait);
         if cancel.is_cancelled() {
-            return Ok(crate::compaction::CompactionOutcome::Failed(
-                "cancelled".to_string(),
-            ));
+            return Ok(crate::compaction::CompactionOutcome::Cancelled);
         }
         let narrative = match &run {
             Ok(run) => {
@@ -8697,10 +8694,8 @@ fn build_model_prompt(
     // A plan reminder is the engine's nudge, not the user's words: seeding a
     // later turn with it would present an instruction as something the user
     // said (spec 66 `context.md` D10).
-    let conversation_messages = prior_messages
-        .iter()
-        .filter(|message| message.kind.as_deref() != Some("plan_reminder"))
-        .collect::<Vec<_>>();
+    let conversation_messages =
+        crate::compaction::sendable_messages(&prior_messages.iter().collect::<Vec<_>>());
     // Spec 55 §5.1: the window is a token budget, not eight messages, so a
     // conversation of short messages keeps more turns than one of long ones.
     let recent_messages = crate::compaction::window_slice(&conversation_messages, window_tokens);

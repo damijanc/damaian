@@ -207,7 +207,7 @@ Requirement 1's nine fields are not one kind of thing:
 
 | Field | Source | Why |
 |---|---|---|
-| Files changed | Patch records | The engine applied them. It knows. |
+| Files changed | Applied patch records | The engine applied them. It knows. A rejected decision is not a change and stays only in the approvals digest. |
 | Completed and pending plan steps | [Spec 21](../21_task_plan_progress_and_budget/proposal.md) plan state | Already structured, already carries evidence |
 | Approval decisions | Session log | Recorded at the moment of the decision |
 | Validation status | Command runs and findings | Exit codes, not recollection |
@@ -600,3 +600,31 @@ inferred.
 - **A failure is recorded twice:** an audit event for the trail and a
   `conversation_compaction_failed` session event so the marker can tell the user
   on a reload. It is a diagnostic, not a summary; no message is touched.
+
+### Review corrections (2026-10-26)
+
+Three defects found in review, fixed before hand-off:
+
+- **A rejected patch was recorded as a changed file.** `facts_for_span` collected
+  every `PatchFileDecision` for a covered task, and
+  `read_all_patch_file_decisions` returns rejections too, so a patch the user
+  declined appeared under *Files changed* and was re-sent on every later turn.
+  Only `applied: true` contributes now; a rejected patch remains in the
+  approvals digest as `patch …: rejected`. Covered by
+  `the_fact_half_is_read_from_the_log_and_not_authored` (a rejected decision is
+  in the fixture and not in `files_changed`) and by the engine facts test, which
+  also asserts both decisions are in the approvals digest.
+- **A cancellation left a permanent failure notice.** A stop during the
+  summarisation call returned `Failed("cancelled")`, and the turn boundary
+  recorded a durable `conversation_compaction_failed` event that the marker then
+  showed after reload. `CompactionOutcome::Cancelled` is now its own outcome:
+  no event, no notice, no model call. A real read/append failure still records
+  one and is still shown. Covered by `a_cancelled_compaction_leaves_no_failure_notice`.
+- **The marker's window count included plan reminders.** `conversation_json`
+  sliced every stored message while the prompt filtered `plan_reminder` first,
+  so the marker reported fewer messages in view and more omitted than the model
+  actually had. `compaction::sendable_messages` is now the one definition, used
+  by both `build_model_prompt` and the shell. Covered by
+  `the_boundary_counts_match_the_prompt_when_a_plan_reminder_is_present`, which
+  compares the payload's `omittedMessages` with the count in the request's
+  elision notice.

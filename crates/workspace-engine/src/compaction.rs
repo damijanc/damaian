@@ -425,6 +425,10 @@ pub enum CompactionOutcome {
     Compacted(Box<ConversationSummary>),
     /// Nothing outside the window, or nothing with an objective to quote.
     NothingToCompact,
+    /// The user stopped the turn while the summary call was in flight. Not a
+    /// failure: no summary and no failure notice, because stopping a turn is
+    /// not something wrong with compaction.
+    Cancelled,
     /// The facts or the log write failed. The turn continues; the reason is
     /// audited by the caller.
     Failed(String),
@@ -434,7 +438,7 @@ impl CompactionOutcome {
     pub fn summary(&self) -> Option<&ConversationSummary> {
         match self {
             Self::Compacted(summary) => Some(summary.as_ref()),
-            Self::NothingToCompact | Self::Failed(_) => None,
+            Self::NothingToCompact | Self::Cancelled | Self::Failed(_) => None,
         }
     }
 }
@@ -454,6 +458,22 @@ pub fn conversation_tokens(view: &ConversationView) -> usize {
         .map(|message| TokenEstimate::Prose.tokens(&message.content))
         .sum::<usize>();
     summary + messages
+}
+
+/// The messages a request may send from the conversation: everything except
+/// the engine's own plan reminder, which is a nudge rather than the user's
+/// words (spec 66 `context.md` D10).
+///
+/// One definition, used by the prompt and by the shell's boundary counts, so
+/// the marker cannot report a different window from the one the model got.
+pub fn sendable_messages<'a>(
+    messages: &[&'a crate::session::ChatMessage],
+) -> Vec<&'a crate::session::ChatMessage> {
+    messages
+        .iter()
+        .filter(|message| message.kind.as_deref() != Some("plan_reminder"))
+        .copied()
+        .collect()
 }
 
 /// The messages that fit the conversation window, newest first accumulated
@@ -614,9 +634,14 @@ pub fn facts_for_span(inputs: FactInputs<'_>, through_seq: u64) -> Option<Summar
         .filter_map(|(_, message)| message.task_id.as_deref())
         .collect();
 
+    // Only an applied patch changed a file. A rejected decision is still a
+    // record — it appears in the approvals digest — but it must never become a
+    // "file changed" fact, which is the exact false fact requirement 6 exists
+    // to prevent.
     let mut files: Vec<String> = inputs
         .patch_decisions
         .iter()
+        .filter(|decision| decision.applied)
         .filter(|decision| task_ids.contains(decision.task_id.as_str()))
         .flat_map(|decision| decision.paths.iter().cloned())
         .collect();
@@ -983,6 +1008,12 @@ mod tests {
                 paths: vec!["src/later.rs".to_string()],
                 applied: true,
             },
+            PatchFileDecision {
+                task_id: "task_1".to_string(),
+                patch_id: "patch_3".to_string(),
+                paths: vec!["src/rejected.rs".to_string()],
+                applied: false,
+            },
         ];
         let verification = vec![VerificationEvent::Check {
             task_id: "task_1".to_string(),
@@ -1015,7 +1046,11 @@ mod tests {
 
         assert_eq!(facts.objective, "Do not touch the public API.");
         assert_eq!(facts.message_count, 2);
-        assert_eq!(facts.files_changed, vec!["src/a.rs", "src/lib.rs"]);
+        assert_eq!(
+            facts.files_changed,
+            vec!["src/a.rs", "src/lib.rs"],
+            "only applied patches changed files"
+        );
         assert_eq!(facts.plan_steps.len(), 1);
         assert_eq!(facts.plan_steps[0].status, StepStatus::Completed);
         assert_eq!(facts.approvals, approvals);
