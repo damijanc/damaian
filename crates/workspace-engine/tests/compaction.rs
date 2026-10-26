@@ -775,3 +775,131 @@ fn a_fact_the_model_omitted_is_still_in_the_next_request() {
     assert!(sent.contains("cargo test (repository root): passed"));
     assert!(sent.contains("no model-written narrative was recorded for this span"));
 }
+
+#[test]
+fn switching_auto_off_still_states_the_loss_and_leaves_manual_compaction_working() {
+    let repo = temp_repo("off-manual");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Off manual");
+    seed_long_conversation(&engine, &session, &task, "Do not touch the public API.");
+
+    // Auto off: no call, and the request says what was left out.
+    let mut adapter = MockModelAdapter::new("Done.");
+    ask(
+        &engine,
+        &repo,
+        "What next?",
+        Some(&session.id),
+        &mut adapter,
+    );
+    let sent = &adapter.requests[0].messages[1].content;
+    assert!(
+        sent.contains("earlier message") && sent.contains("were not sent to you"),
+        "the omission is stated: {sent}"
+    );
+    assert!(
+        sent.contains("were not summarised"),
+        "and the user is told it was not summarised: {sent}"
+    );
+    assert_eq!(adapter.requests.len(), 1);
+
+    // Manual compaction still works with the automatic half off.
+    let mut adapter = MockModelAdapter::new(
+        r#"{"constraints":[],"decisions":[],"failed_approaches":[],"uncertainty":[]}"#,
+    );
+    let outcome = engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut adapter, &cancel())
+        .unwrap();
+    assert!(outcome.summary().is_some());
+    assert_eq!(
+        engine
+            .session_store
+            .read_conversation_compactions(&session.id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_second_compaction_summarises_the_first_one_plus_what_followed() {
+    let repo = temp_repo("compound");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Compound");
+    seed_long_conversation(&engine, &session, &task, "Do not touch the public API.");
+
+    let mut first = MockModelAdapter::new(
+        r#"{"constraints":["do not touch the public API"],"decisions":["kept the parser"],"failed_approaches":[],"uncertainty":[]}"#,
+    );
+    engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut first, &cancel())
+        .unwrap();
+
+    // More conversation after the first boundary.
+    for index in 0..8 {
+        engine
+            .session_store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("later {index} {}", "y".repeat(200)),
+            )
+            .unwrap();
+    }
+    let mut second = MockModelAdapter::new(
+        r#"{"constraints":["do not touch the public API"],"decisions":[],"failed_approaches":[],"uncertainty":[]}"#,
+    );
+    engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut second, &cancel())
+        .unwrap();
+
+    let prompt = &second.requests[0].messages[0].content;
+    assert!(
+        prompt.contains("A previous summary covers the earlier part"),
+        "the second summary is asked for with the first as input"
+    );
+    assert!(
+        prompt.contains("--- begin prior conversation summary"),
+        "the first summary is rendered into the call"
+    );
+    assert!(prompt.contains("kept the parser"));
+    assert_eq!(
+        engine
+            .session_store
+            .read_conversation_compactions(&session.id)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn a_failed_compaction_is_recorded_for_the_user_and_not_only_in_the_audit_log() {
+    let data_dir = temp_data_dir("failure-note");
+    let store = SessionStore::new(&data_dir);
+    let session = store.create_session("repo_1", "Note").unwrap();
+    assert!(
+        store
+            .read_conversation_compaction_failure(&session.id)
+            .unwrap()
+            .is_none()
+    );
+    store
+        .record_conversation_compaction_failure(&session.id, "provider refused")
+        .unwrap();
+    assert_eq!(
+        store
+            .read_conversation_compaction_failure(&session.id)
+            .unwrap()
+            .as_deref(),
+        Some("provider refused")
+    );
+    assert!(
+        store.read_messages(&session.id).unwrap().is_empty(),
+        "a failure event is not a message"
+    );
+}

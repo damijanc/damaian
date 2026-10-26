@@ -4808,7 +4808,8 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
 // The marker is data from `/api/session`; it names how many messages the model
 // no longer sees and, when a summary exists, lets the user read it.
 function conversationBoundaryMarker(compactions, conversation) {
-  if (!conversation || conversation.kind === "none") return null;
+  if (!conversation) return null;
+  if (conversation.kind === "none" && !conversation.lastFailure) return null;
   const article = document.createElement("article");
   article.className = "message system compaction-boundary";
   const body = document.createElement("div");
@@ -4816,7 +4817,10 @@ function conversationBoundaryMarker(compactions, conversation) {
   const details = document.createElement("details");
   const summaryLine = document.createElement("summary");
   const omitted = conversation.omittedMessages || 0;
-  if (conversation.kind === "elision") {
+  if (conversation.kind === "none" && conversation.lastFailure) {
+    summaryLine.textContent = `Compaction could not run: ${conversation.lastFailure}`;
+    details.append(summaryLine);
+  } else if (conversation.kind === "elision") {
     summaryLine.textContent = `${omitted} earlier message${omitted === 1 ? "" : "s"} were not sent to the model and were not summarised. The full transcript is still here.`;
     details.append(summaryLine);
   } else {
@@ -4826,6 +4830,12 @@ function conversationBoundaryMarker(compactions, conversation) {
     details.append(summaryBody(summary));
   }
   body.append(details);
+  if (conversation.lastFailure && conversation.kind !== "none") {
+    const failure = document.createElement("p");
+    failure.className = "compaction-failure";
+    failure.textContent = `The last compaction could not run: ${conversation.lastFailure}`;
+    body.append(failure);
+  }
   if (conversation.canCompact) {
     const button = document.createElement("button");
     button.type = "button";

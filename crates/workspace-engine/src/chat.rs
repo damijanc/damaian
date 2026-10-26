@@ -1054,24 +1054,10 @@ impl ChatOrchestrator {
                 }
                 Ok(crate::compaction::CompactionOutcome::NothingToCompact) => {}
                 Ok(crate::compaction::CompactionOutcome::Failed(reason)) => {
-                    let _ = self.audit_log.record(
-                        "conversation_compaction_failed",
-                        &[
-                            ("actor", "system".to_string()),
-                            ("sessionId", session.id.clone()),
-                            ("reason", reason),
-                        ],
-                    );
+                    self.note_compaction_failure(&session.id, &reason);
                 }
                 Err(error) => {
-                    let _ = self.audit_log.record(
-                        "conversation_compaction_failed",
-                        &[
-                            ("actor", "system".to_string()),
-                            ("sessionId", session.id.clone()),
-                            ("reason", error.to_string()),
-                        ],
-                    );
+                    self.note_compaction_failure(&session.id, &error.to_string());
                 }
             }
         }
@@ -4071,6 +4057,23 @@ impl ChatOrchestrator {
             .map(|usage| usage.input_tokens + usage.output_tokens)
             .unwrap_or(0);
         Ok(Some((ceiling, spent)))
+    }
+
+    /// Audits and records a compaction that did not run, so the user is told
+    /// on the next session load and the audit trail says why. Never fails the
+    /// turn: a diagnostics write that itself fails is still not a turn error.
+    fn note_compaction_failure(&self, session_id: &str, reason: &str) {
+        let _ = self.audit_log.record(
+            "conversation_compaction_failed",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("reason", reason.to_string()),
+            ],
+        );
+        let _ = self
+            .session_store
+            .record_conversation_compaction_failure(session_id, reason);
     }
 
     /// The conversation window in tokens: `conversation_window_share` of the

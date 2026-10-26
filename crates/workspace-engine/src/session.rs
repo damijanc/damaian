@@ -753,6 +753,47 @@ impl SessionStore {
         })
     }
 
+    /// Records that a compaction attempt did not run. A diagnostic, not a
+    /// compaction: no summary is appended and the transcript is untouched. It
+    /// is durable so a user reopening the session can be told why the model's
+    /// view begins where it does (spec 55 §5.7).
+    pub fn record_conversation_compaction_failure(
+        &self,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "conversation_compaction_failed",
+            &format!("{{\"reason\":\"{}\"}}", escape_json(reason)),
+        )
+    }
+
+    /// The newest recorded compaction failure, if any *since the last
+    /// successful compaction*. A failure before a later success is history; the
+    /// marker must describe the state the user is looking at.
+    pub fn read_conversation_compaction_failure(&self, session_id: &str) -> Result<Option<String>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        let mut failure: Option<(u64, String)> = None;
+        let mut last_compaction = 0u64;
+        for event in active_events(&content) {
+            match event.event_type.as_str() {
+                "conversation_compacted" => last_compaction = event.seq,
+                "conversation_compaction_failed" => {
+                    if let Some(reason) = event.text("reason") {
+                        failure = Some((event.seq, reason));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(failure
+            .filter(|(seq, _)| *seq > last_compaction)
+            .map(|(_, reason)| reason))
+    }
+
     /// The highest event `seq` a new compaction may cover today.
     ///
     /// Requirement 5 and §5.4: never across a pending decision, and never across

@@ -699,7 +699,12 @@ fn conversation_json(engine: &WorkspaceEngine, session_id: &str) -> String {
             "windowMessages": window_len,
             "autoCompact": engine.config.conversation_auto_compact,
             "windowShare": engine.config.conversation_window_share,
-            "canCompact": outside.is_some()
+            "canCompact": outside.is_some(),
+            "lastFailure": engine
+                .session_store
+                .read_conversation_compaction_failure(session_id)
+                .ok()
+                .flatten()
         }
     })
     .to_string()
