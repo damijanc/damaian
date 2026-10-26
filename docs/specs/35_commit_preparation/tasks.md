@@ -13,7 +13,7 @@ pre-implementation state in [`context.md`](context.md)
 | 1 · Folder, links, plan | Done 2026-10-26 | Converted the single file to `proposal.md`, added `context.md` (fifteen corrections, decisions D1–D10) and this plan, updated every link that named the old path (README, #36, #37, #38, #52, #57, #58), and set `In progress` in the proposal, the README current-state bullet, the README implementation-order row and this header. `npm run specs:check` passed: 66 specs, dependency lines and status records agree. Fast checks passed: `scripts/quality-gate.sh fmt node lint typos deny`; `npm ci` was needed first because the worktree had no `node_modules`. |
 | 2 · The `allow_git_commits` capability | Done 2026-10-26 | Added the sixth capability key beside `allow_file_edits`: `Config` default `true`, `ConfigOverlay` parse/serialise, an explicit capability classification, a restrict-only merge case, `ProfileCapabilities.allow_git_commits`, `ReadOnly` turns it off, the effective-policy label "Git commits allowed", and `Config::profile_capabilities`. The weakening case in `tests/permission_profiles.rs` proves a repository can only refuse it; `each_built_in_profile_resolves_to_its_table_row` now expects Read-only `false`. Scoped `cargo nextest -p workspace-engine --test permission_profiles` passed (74 passed, 1 skipped); clippy clean; fast checks clean after `cargo fmt`. |
 | 3 · Durable acceptance detail and the commit engine | Done 2026-10-26 | `PatchFileDecision` gained `applied_hashes` and `accepted_hunks` (both `#[serde(default)]`); `apply_stored_patch` fills them from `PatchApplyResult::applied` and `hunk_selection`, reject paths leave them empty. `SessionStore` gained `append_commit_created` and `read_change_timeline`, which walks applied decisions and commits in log order. New `workspace-engine/src/commit.rs`: candidate set from that timeline plus checkpoint origins, redacted per-path diffs, deterministic message, verification summary, and `prepare`/`commit` through a private `GIT_INDEX_FILE` with `read-tree`/`hash-object`/`update-index`/`write-tree`/`ls-tree` verification/`commit-tree`/`update-ref <new> <old>`; the record is saved under `<data_dir>/commits/`. `GitService::changes` lists untracked files with `-uall` and `-z`, filtered by the same restricted-path rule. Hooks and the secret scan are implemented in the same module; their tests land in Tasks 4 and 5. Nine tests in `tests/commit_preparation.rs` pass (accepted subset, hunk-level, hand edit, command effect, index untouched, HEAD moved, detached/merge, mode+profile gate, invalid selection); `--test foundation` passed (171). Scoped clippy and the fast checks are clean. Deviations: `prepare` saves a record under the data dir (Damaian state, not the repository); the tree is verified against a full expected map, not only the selected paths; `GitService::changes` is new rather than widening `status`, because `status` collapses untracked directories. |
-| 4 · Git hooks: detect, report, run, never bypass | Not started | |
+| 4 · Git hooks: detect, report, run, never bypass | Done 2026-10-26 | Detection honours `core.hooksPath` (relative to the root) and otherwise `git rev-parse --git-path hooks`; the report names path, existence, execute bit, size, interpreter, whether it runs, and why not. `prepare-commit-msg`, `commit-msg` and `post-commit` run in Git order through `CommandRunner::run_at_with_env`, which adds `GIT_INDEX_FILE`, `GIT_DIR` and `GIT_WORK_TREE` to the existing timeout/truncation/redaction/PID path. A rewrite of the approved message is a typed refusal with the final text and no commit; a non-zero or timed-out pre-commit/prepare-commit-msg/commit-msg aborts; a failing post-commit is a warning after the ref moved. A hook report changed between prepare and commit is refused. Tests (10 new): report metadata including `core.hooksPath`, failing pre-commit, commit-msg rewrite then a second approval, prepare-commit-msg rewrite, post-commit warning, private index seen by `git diff --cached`, timeout, truncation plus redaction of a seeded fake AWS key, no `--no-verify` code path, and PID registration while a hook sleeps. All 19 `commit_preparation` tests pass. Deviation from the plan’s wording: `prepare-commit-msg` is run as well as detected, because not running it would silently defeat a hook Git itself would run; recorded in context D4. |
 | 5 · Exact bytes, the secret check and the per-commit override | Not started | |
 | 6 · Message drafting with the deterministic fallback | Not started | |
 | 7 · Durable action markers, audit and crash inspection | Not started | |
@@ -290,7 +290,7 @@ D1–D3.
 
 **Files:** `commit.rs`, `command_runner.rs`, `tests/commit_preparation.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   1. `hooks_are_reported_with_path_executable_size_and_interpreter` — write
      `.git/hooks/pre-commit` with `#!/bin/sh`; the report names it, executable,
      its size and `#!/bin/sh`; a non-executable `commit-msg` is reported and
@@ -316,8 +316,8 @@ D1–D3.
      `include_str!("../src/command_runner.rs")` contain no `--no-verify`, and no
      public hook-running function takes a skip flag.
   9. `prepare_commit_msg_runs_too` — its rewrite is treated like commit-msg.
-- [ ] **Step 2: Confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Confirm they fail.**
+- [x] **Step 3: Implement.**
   - `CommandRunner::run_at_with_env` (or equivalent) with `.envs(...)`; `run` and
     `run_at` delegate with `&[]`. No behaviour change for existing callers.
   - Hook directory: `git config --get core.hooksPath` (relative to the
@@ -331,11 +331,11 @@ D1–D3.
     truncated output.
   - Register the hook's PID through the runner's existing `ProcessKind::Command`
     registration.
-- [ ] **Step 4: Falsify.** Run the hook before `read-tree` → test 5's file is
+- [x] **Step 4: Falsify.** Run the hook before `read-tree` → test 5's file is
   empty/the user's staging appears. Drop the executable check → test 1's
   non-executable case runs. Ignore the rewrite → test 3 commits on the first
   attempt. Remove the timeout → test 6 hangs (use a nextest timeout).
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -343,7 +343,7 @@ D1–D3.
   CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo nextest run -p workspace-engine --test commit_preparation --test command_lifecycle
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Run a repository's Git hooks for a commit instead of skipping them`.
 
 ## Task 5: Exact bytes, the secret check and the per-commit override

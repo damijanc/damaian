@@ -216,6 +216,26 @@ impl Fixture {
         fs::read(self.repository.join(".git/index")).unwrap_or_default()
     }
 
+    fn rebuild(&mut self, change: impl FnOnce(&mut Config)) {
+        let mut config = Config {
+            data_dir: self.data_dir.clone(),
+            enable_index_watcher: false,
+            ..Config::default()
+        };
+        change(&mut config);
+        self.engine = WorkspaceEngine::new(config);
+    }
+
+    fn write_hook(&self, name: &str, body: &str, executable: bool) {
+        let path = self.repository.join(".git/hooks").join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(if executable { 0o755 } else { 0o644 });
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+
     fn cleanup(&self) {
         let _ = fs::remove_dir_all(&self.base);
     }
@@ -639,5 +659,385 @@ fn the_selected_candidate_must_be_part_of_the_preparation() {
             ..
         })
     ));
+    fixture.cleanup();
+}
+
+#[test]
+fn hooks_are_reported_with_path_executable_size_and_interpreter() {
+    let fixture = Fixture::new("hooks-report");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    fixture.write_hook("pre-commit", "#!/bin/sh\nexit 0\n", true);
+    fixture.write_hook("commit-msg", "#!/bin/sh\nexit 0\n", false);
+    let (session, _task) = fixture.session();
+
+    let preparation = fixture.prepare(&session);
+    let pre = preparation
+        .hooks
+        .hooks
+        .iter()
+        .find(|hook| hook.name == "pre-commit")
+        .unwrap();
+    assert!(pre.exists);
+    assert!(pre.executable);
+    assert!(pre.runs);
+    assert!(pre.size > 0);
+    assert_eq!(pre.interpreter.as_deref(), Some("#!/bin/sh"));
+    assert!(pre.path.ends_with(".git/hooks/pre-commit"));
+    let commit_msg = preparation
+        .hooks
+        .hooks
+        .iter()
+        .find(|hook| hook.name == "commit-msg")
+        .unwrap();
+    assert!(commit_msg.exists);
+    assert!(!commit_msg.executable);
+    assert!(!commit_msg.runs);
+    assert!(commit_msg.skipped_reason.is_some());
+
+    fixture.git(&["config", "core.hooksPath", ".githooks"]);
+    let hook = fixture.repository.join(".githooks/pre-commit");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&hook).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o755);
+    fs::set_permissions(&hook, permissions).unwrap();
+    let preparation = fixture.prepare(&session);
+    assert_eq!(preparation.hooks.source, "core.hooksPath");
+    assert!(preparation.hooks.directory.ends_with(".githooks"));
+    assert!(
+        preparation
+            .hooks
+            .hooks
+            .iter()
+            .find(|hook| hook.name == "pre-commit")
+            .unwrap()
+            .runs
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_failing_pre_commit_aborts_and_reports_its_output() {
+    let fixture = Fixture::new("pre-commit-fail");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    fixture.write_hook(
+        "pre-commit",
+        "#!/bin/sh\necho 'no commit today'\nexit 1\n",
+        true,
+    );
+    let before = fixture.head();
+    let preparation = fixture.prepare(&session);
+    let outcome = fixture.commit(
+        &session,
+        &preparation,
+        &fixture.default_paths(&preparation),
+        "Commit a",
+        false,
+    );
+    match outcome {
+        Err(CommitError::HookFailed {
+            name,
+            stdout,
+            exit_code,
+            ..
+        }) => {
+            assert_eq!(name, "pre-commit");
+            assert_eq!(exit_code, Some(1));
+            assert!(stdout.contains("no commit today"), "{stdout}");
+        }
+        other => panic!("expected a hook failure, got {other:?}"),
+    }
+    assert_eq!(fixture.head(), before, "no commit was created");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_commit_msg_hook_that_rewrites_the_message_is_shown_before_the_commit() {
+    let fixture = Fixture::new("commit-msg-rewrite");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    fixture.write_hook(
+        "commit-msg",
+        "#!/bin/sh\ngrep -q '^Reviewed-by: Test$' \"$1\" || printf '\\nReviewed-by: Test\\n' >> \"$1\"\n",
+        true,
+    );
+    let before = fixture.head();
+    let preparation = fixture.prepare(&session);
+    let first = fixture.commit(
+        &session,
+        &preparation,
+        &fixture.default_paths(&preparation),
+        "Commit a",
+        false,
+    );
+    let rewritten = match first {
+        Err(CommitError::MessageRewritten { message }) => message,
+        other => panic!("expected a rewritten message, got {other:?}"),
+    };
+    assert!(rewritten.contains("Reviewed-by: Test"));
+    assert_eq!(
+        fixture.head(),
+        before,
+        "nothing was committed on the first try"
+    );
+
+    fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            &rewritten,
+            false,
+        )
+        .expect("the second approval commits the shown message");
+    assert!(
+        fixture
+            .git(&["log", "-1", "--pretty=%B"])
+            .contains("Reviewed-by: Test")
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_prepare_commit_msg_hook_is_run_and_its_rewrite_is_shown() {
+    let fixture = Fixture::new("prepare-msg-rewrite");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    fixture.write_hook(
+        "prepare-commit-msg",
+        "#!/bin/sh\ngrep -q 'Ticket: 35' \"$1\" || printf '\\nTicket: 35\\n' >> \"$1\"\n",
+        true,
+    );
+    let preparation = fixture.prepare(&session);
+    let outcome = fixture.commit(
+        &session,
+        &preparation,
+        &fixture.default_paths(&preparation),
+        "Commit a",
+        false,
+    );
+    match outcome {
+        Err(CommitError::MessageRewritten { message }) => {
+            assert!(message.contains("Ticket: 35"));
+        }
+        other => panic!("expected a rewritten message, got {other:?}"),
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn a_failing_post_commit_hook_is_a_warning_and_the_commit_stays() {
+    let fixture = Fixture::new("post-commit-fail");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    fixture.write_hook("post-commit", "#!/bin/sh\nexit 3\n", true);
+    let before = fixture.head();
+    let preparation = fixture.prepare(&session);
+    let outcome = fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            "Commit a",
+            false,
+        )
+        .unwrap();
+    assert_ne!(fixture.head(), before);
+    assert!(!outcome.warnings.is_empty());
+    assert!(outcome.warnings[0].contains("post-commit"));
+    fixture.cleanup();
+}
+
+#[test]
+fn hooks_run_with_the_private_index() {
+    let fixture = Fixture::new("hook-index");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    fixture.write("staged.txt", "the user staged this\n");
+    fixture.git(&["add", "staged.txt"]);
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    fixture.write_hook(
+        "pre-commit",
+        "#!/bin/sh\ngit diff --cached --name-only > hook-index.txt\n",
+        true,
+    );
+    let preparation = fixture.prepare(&session);
+    fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            "Commit a",
+            false,
+        )
+        .unwrap();
+    let seen = fs::read_to_string(fixture.repository.join("hook-index.txt")).unwrap();
+    assert!(seen.contains("a.txt"), "{seen}");
+    assert!(
+        !seen.contains("staged.txt"),
+        "the hook saw the user's index: {seen}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_hanging_hook_times_out() {
+    let mut fixture = Fixture::new("hook-timeout");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    fixture.rebuild(|config| config.command_timeout_secs = 1);
+    fixture.write_hook("pre-commit", "#!/bin/sh\nsleep 5\nexit 0\n", true);
+    let preparation = fixture.prepare(&session);
+    let outcome = fixture.commit(
+        &session,
+        &preparation,
+        &fixture.default_paths(&preparation),
+        "Commit a",
+        false,
+    );
+    match outcome {
+        Err(CommitError::HookFailed { termination, .. }) => {
+            assert_eq!(termination, "timed_out");
+        }
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn hook_output_is_truncated_and_redacted() {
+    let mut fixture = Fixture::new("hook-output");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    fixture.rebuild(|config| config.max_command_output_bytes = 200);
+    fixture.write_hook(
+        "pre-commit",
+        "#!/bin/sh\nprintf '%0.sx' $(seq 1 100)\nprintf 'AKIAIOSFODNN7EXAMPLE'\nprintf '%0.sy' $(seq 1 100)\nexit 1\n",
+        true,
+    );
+    let preparation = fixture.prepare(&session);
+    let outcome = fixture.commit(
+        &session,
+        &preparation,
+        &fixture.default_paths(&preparation),
+        "Commit a",
+        false,
+    );
+    match outcome {
+        Err(CommitError::HookFailed { stdout, stderr, .. }) => {
+            assert!(!stdout.contains("AKIAIOSFODNN7EXAMPLE"), "{stdout}");
+            assert!(!stderr.contains("AKIAIOSFODNN7EXAMPLE"), "{stderr}");
+            // Redaction can replace a short match with a longer marker, so the
+            // bound is on the raw output plus that expansion, not exactly 200.
+            assert!(stdout.len() <= 400, "{} bytes", stdout.len());
+        }
+        other => panic!("expected a hook failure, got {other:?}"),
+    }
+    fixture.cleanup();
+}
+
+#[test]
+fn there_is_no_hook_bypass() {
+    let commit = include_str!("../src/commit.rs");
+    let runner = include_str!("../src/command_runner.rs");
+    for source in [commit, runner] {
+        for line in source.lines() {
+            let code = line.trim();
+            if code.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !code.contains("--no-verify"),
+                "a code path passes --no-verify: {code}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_running_hook_is_registered_with_the_process_registry() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    let fixture = Fixture::new("hook-pid");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    fixture.write_hook(
+        "pre-commit",
+        "#!/bin/sh\nprintf '%s %s\\n' \"$$\" \"$PPID\" > hook-pids.txt\nsleep 2\nexit 0\n",
+        true,
+    );
+    let preparation = fixture.prepare(&session);
+    let seen = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let seen = Arc::clone(&seen);
+        let data_dir = fixture.data_dir.clone();
+        let repository = fixture.repository.clone();
+        std::thread::spawn(move || {
+            for _ in 0..80 {
+                let pids = fs::read_to_string(repository.join("hook-pids.txt")).unwrap_or_default();
+                let pids = pids
+                    .split_whitespace()
+                    .filter_map(|pid| pid.parse::<u32>().ok())
+                    .collect::<Vec<_>>();
+                if !pids.is_empty()
+                    && let Ok(registry) = workspace_engine::ProcessRegistry::open(&data_dir)
+                        .and_then(|r| {
+                            r.entries().map(|entries| {
+                                entries
+                                    .into_iter()
+                                    .filter_map(|(_, entry)| entry)
+                                    .map(|entry| entry.pid)
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                    && pids.iter().any(|pid| registry.contains(pid))
+                {
+                    seen.store(true, AtomicOrdering::SeqCst);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+    };
+    fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            "Commit a",
+            false,
+        )
+        .unwrap();
+    watcher.join().unwrap();
+    assert!(
+        seen.load(AtomicOrdering::SeqCst),
+        "the running hook's pid was never registered"
+    );
     fixture.cleanup();
 }

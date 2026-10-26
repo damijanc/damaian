@@ -862,7 +862,7 @@ impl CommitEngine {
             });
         }
         let mut outcomes = hooks;
-        if let Some(failure) = outcomes.iter().find(|hook| hook.outcome == "failed") {
+        if let Some(failure) = outcomes.iter().find(|hook| hook.outcome != "ok") {
             return Err(CommitError::HookFailed {
                 name: failure.name.clone(),
                 exit_code: failure.exit_code,
@@ -1528,7 +1528,7 @@ impl CommitEngine {
                 cancel,
                 &record.prepare_id,
             )?;
-            let failed = outcome.outcome == "failed";
+            let failed = outcome.outcome != "ok";
             outcomes.push(outcome);
             if failed {
                 // Return now: the caller turns the last `failed` outcome into
