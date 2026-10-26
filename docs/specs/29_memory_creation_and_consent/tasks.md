@@ -13,7 +13,7 @@ criteria) · context and decisions in [`context.md`](context.md)
 |---|---|---|
 | 1 · Folder conversion, status and links | Done 2026-10-26 | The flat spec moved to `proposal.md` with `git mv`; `context.md` holds the former Current State with re-checked references and decisions D-a–D-f; this file is new. Status In progress in the proposal, the README current-state paragraph and the implementation-order row. Every link naming the flat file in specs 28, 30, 50, 51 and the README now names `29_memory_creation_and_consent/proposal.md`; specs 28 and 50 use `../` because they are folder specs. `npm run specs:check` passed (66 specs). A relative-link scan over `docs/**/*.md` found three pre-existing broken links (spec 01's `url`, spec 31's code-span, spec 66's `65_exploration_memory_within_a_turn.md`) and nothing new. Docs-only change; no Rust touched. |
 | 2 · Constructor barrier and proposal types | Done 2026-10-26 | `MemoryEntry` is `#[non_exhaustive]`, `MemoryEntry::new` is gone, and `MemoryProposal::confirm(confirmation, gate)` is the only conversion; the module docs state plainly that this is an API-surface barrier and that serde deserialization remains a deliberate second path. `ProposalOrigin` has four variants, `MemoryProposal` carries `task_id` for #28's `SuggestedAndConfirmed`, `UserConfirmation` records the action and optional scope, and `MemoryProposalGate` is built only by `MemoryStore::proposal_gate`. Confirmation normalizes the statement, enforces the 280-character ceiling, scans for secrets, applies the instruction check to every non-user origin, checks evidence eligibility, and maps origins to #28's three provenance variants. **Deviation:** fields stay public for reading; `#[non_exhaustive]` supplies the construction barrier. #28's tests now build a proposal and confirm it; tests that need an invalid record for the store to refuse deserialize one, which is the documented second path. `--test memory` 56 passed; inline `memory::` 18 passed; scoped clippy clean. |
-| 3 · Screening: statement, secret, instruction, evidence | Done 2026-10-26 | `is_instruction_shaped` uses a conservative prefix and phrase table; it runs for every non-user origin. `MemoryProposal::screen` normalizes whitespace, enforces the 280-character ceiling, rejects multi-line or control-character statements, scans the statement and every evidence path for secrets, and checks each path with `MemoryProposalGate::check_evidence` (relative, `PathPolicy::is_restricted`, configured patterns and per-directory `.gitignore`). `MemoryStore::propose` audits `memory_proposal_refused` with reason, scope, category, origin and the evidence path only; never the statement, and never a secret. `evidence_ref_for` records the content hash at proposal time. Tests cover the pattern table and benign conventions inline, a seeded secret, restricted `.env` evidence, an ignored file that is still index-resident, and an over-long statement. `--test memory` 68 passed. |
+| 3 · Screening: statement, secret, instruction, evidence | Done 2026-10-26 | `is_instruction_shaped` uses a conservative prefix and phrase table; it runs for every non-user origin. `MemoryProposal::screen` normalizes whitespace, enforces the 280-character ceiling, rejects multi-line or control-character statements, scans the statement and every evidence path for secrets, and checks each path with `MemoryProposalGate::check_evidence` (relative, `PathPolicy::is_restricted`, configured patterns and per-directory `.gitignore`). `MemoryStore::propose` audits `memory_proposal_refused` with reason, scope, category, origin and the evidence path only; never the statement, and never a secret. `evidence_ref_for` records the content hash at proposal time. Tests cover the pattern table and benign conventions inline, a seeded secret, restricted `.env` evidence, an ignored file that is still index-resident, and an over-long statement. `--test memory` 70 passed by the end of the branch. |
 | 4 · Proposal persistence, confirm, dismiss and cap | Done 2026-10-26 | Proposals and decisions are session-log events (`memory_proposal_proposed`, `memory_proposal_decided`) through new `pub(crate)` `SessionStore` methods; `append_session_event` stays private. `MemoryStore::propose` screens and caps non-user suggestions at `MAX_SUGGESTIONS_PER_TASK = 3`, counted from the log so a resumed turn does not reset it. `pending_proposals` is proposed minus decided. `confirm_proposal` accepts only a proposal id, re-reads and re-screens the stored proposal, inserts the entry, appends a confirmation decision and audits `memory_proposal_confirmed` with the source; a failed insert leaves the proposal pending. `dismiss_proposal` appends a dismissal and audits it without the statement. Nine integration tests cover survival across reopening, one entry per confirmation, a second confirmation refused, dismissal, the cap with an uncapped user request, user scope disabled without flipping the flag, and a user-scope proposal saved as project. `--test memory` 68 passed; scoped clippy clean. |
 | 5 · Explicit request and the `propose_memory` tool | Done 2026-10-26 | `explicit_memory_request` reads one cue, the first sentence and nothing inferred; the turn calls it after the user message is appended. `ToolAction::ProposeMemory` is parsed by `tool_action_from_call`, offered beside `turn_notes`, allowed in every mode and profile because it writes only the session log, and charged as exploration. Dispatch maps `evidence_path` to `RepositoryObservation`, `source` without evidence to `ExternalContent`, otherwise `ModelSuggestion`; it hashes the evidence file, calls `MemoryStore::propose`, and returns a result naming what happened without repeating the statement. `ChatOrchestrator` gained its `memory_store` dependency. Proposals are session-log events, not transcript roles, so they never enter `build_conversation`. **Deviation:** the model may suggest a memory but the tool cannot confirm one; the eval scenarios cover that end to end. Tests: inline cue parsing and category/scope selection, tool parsing and schema, tool-effect classification, and two turn-level tests proving an explicit cue creates one proposal and no memory file. Scoped clippy clean. |
 | 6 · Shell routes and the confirmation card | Done 2026-10-26 | Three routes: `GET /api/memory-proposals`, `POST /api/memory-confirm`, `POST /api/memory-dismiss`. The confirm route takes `repo`, `session_id`, `proposal_id` and an optional `scope`; it resolves `ProjectIdentity` from the repository and creates the `UserConfirmation` server-side, so a client cannot supply a statement, a project key or a confirmation id. The UI reads the pending list into a collapsed proposal stack below the conversation, with statement, scope, category, origin/source, a scope picker, Remember and Dismiss. A user-scope proposal while the scope is off defaults to project scope and explains that enabling user scope is separate. The stack is re-read after every turn and after each decision. **Deviation:** proposals are not transcript messages, so they cannot reach `build_conversation`; the stack is a sibling of the log content. Three route tests run through the real token-gated shell: list/confirm/dismiss end to end, a user-scope refusal that leaves the flag off and the proposal pending, and the absence of a statement field. `node --check` and `npm run lint:web` pass; scoped clippy clean. |
@@ -139,18 +139,18 @@ folder-path references; `npm run specs:check` reports no new mismatch for #29.
 
 ## Task 3 · Screening: statement, secret, instruction, evidence
 
-- [ ] Implement `is_instruction_shaped` with the conservative patterns in §7;
+- [x] Implement `is_instruction_shaped` with the conservative patterns in §7;
       run it for every non-user origin (D-d).
-- [ ] Implement proposal screening for an over-long or multi-line statement,
+- [x] Implement proposal screening for an over-long or multi-line statement,
       a detected secret, and every ineligible evidence path (not relative,
       restricted, or ignored by configured patterns or per-directory
       `.gitignore`).
-- [ ] Compute an evidence `content_hash` at proposal time. Never read the file's
+- [x] Compute an evidence `content_hash` at proposal time. Never read the file's
       content into the statement.
-- [ ] Audit `memory_proposal_refused` with origin, reason, scope, category and —
+- [x] Audit `memory_proposal_refused` with origin, reason, scope, category and —
       only when the candidate carried one — the refused path. No statement, no
       secret.
-- [ ] Tests: every instruction pattern and a table of benign conventions; a
+- [x] Tests: every instruction pattern and a table of benign conventions; a
       seeded AWS key in a statement and in a path; `.env` restricted; a
       per-directory `.gitignore` case while the file is index-resident; a
       user-typed sentence naming `.env` with no evidence is accepted.
@@ -159,21 +159,21 @@ folder-path references; `npm run specs:check` reports no new mismatch for #29.
 
 ## Task 4 · Proposal persistence, confirm, dismiss and cap
 
-- [ ] Add `pub(crate)` `SessionStore` methods for appending and reading memory
+- [x] Add `pub(crate)` `SessionStore` methods for appending and reading memory
       proposal events and decisions; keep `append_session_event` private.
-- [ ] `MemoryStore::propose(root, session_id, task_id, proposal)` screens, caps
+- [x] `MemoryStore::propose(root, session_id, task_id, proposal)` screens, caps
       non-user suggestions at three per task (read from the log), appends the
       proposal event, audits creation, and returns `None` for a refusal.
-- [ ] `MemoryStore::pending_proposals(session_id)` returns proposed events minus
+- [x] `MemoryStore::pending_proposals(session_id)` returns proposed events minus
       decided ones, newest last.
-- [ ] `MemoryStore::confirm_proposal(root, identity, session_id, proposal_id,
+- [x] `MemoryStore::confirm_proposal(root, identity, session_id, proposal_id,
       confirmation)` re-reads the stored proposal, re-runs the gate, inserts the
       entry, appends a confirmation event and audits
       `memory_proposal_confirmed` with the proposal id, entry id, confirmation
       id, origin and source. A failed insert leaves the proposal pending.
-- [ ] `MemoryStore::dismiss_proposal(session_id, proposal_id)` appends a
+- [x] `MemoryStore::dismiss_proposal(session_id, proposal_id)` appends a
       dismissal event and audits it without the statement.
-- [ ] Tests: a proposal survives reopening the session store; a second confirm
+- [x] Tests: a proposal survives reopening the session store; a second confirm
       is refused; a dismissed proposal creates no entry and stays recorded; the
       cap holds across a resumed task; a user-scope confirm while disabled fails
       without enabling the scope; confirming with project scope creates the
