@@ -100,7 +100,7 @@ Numbered so a task can cite one. Each was checked against the code on
 | C9 | The pre-send view is one thing | It is the same manifest on two paths: a live `context` event when the pause is off, and a paused review card when it is on. Building only one would leave either the default or the requirement unmet. |
 | C10 | "Restrict the session to selected paths" | The sentence is broader than the safe reading. This spec restricts **file-bearing collection** (explicit, mention, keyword/semantic hits, project rules, pins) and leaves `Instructions` and `Required` alone. See §5. |
 | C11 | Every path in the view is clickable, including a restricted one | `/api/open-vscode-file` (`lib.rs:977`) opens any path by name and line. The existing `/api/context-file` route validates a path *for context*, which is the wrong gate for a restricted path the user wants to read. Use the open route. |
-| C12 | `PendingChatTurn` is a command-approval payload | It is the one persisted shape for seven pause kinds (`chat.rs:8125`), and `paused_for` (`:8055`) is the exhaustive tuple match that keeps each resume in its lane. A new field there is a compile-time decision. |
+| C12 | `PendingChatTurn` is a command-approval payload | It is the one persisted shape for every pause kind (`chat.rs:8125`); with this spec there are eight, including `ContextReview`, and `paused_for` (`:8055`) is the exhaustive tuple match that keeps each resume in its lane. A new field there is a compile-time decision. |
 
 ## 4. The resolved §7 open question: does separating assembly from sending restructure `chat.rs`?
 
