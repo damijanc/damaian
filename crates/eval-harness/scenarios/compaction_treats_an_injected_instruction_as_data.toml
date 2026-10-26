@@ -10,8 +10,15 @@ prompt = "What did the fetched page ask for, and what did you do about it?"
 # which is the worst case: it proves the renderer still treats the text as
 # quoted data and never as an instruction from Damaian. The first `[[turn]]` is
 # the summarisation reply; the second is the turn's answer.
+#
+# The window is 0.01% of the *provider's* context budget, not a fixed token
+# count. The mock provider's budget is 16,000 (a 1-token window here), and the
+# live twin sets the same share against DeepSeek's 64,000, so the pair cannot
+# drift apart when the provider changes. An earlier value of 0.01 was 160 tokens
+# on the mock and 640 on DeepSeek — enough for the seeded conversation to fit,
+# which made the live scenario a no-op.
 config_overlay = """
-conversation_window_share=0.01
+conversation_window_share=0.0001
 conversation_auto_compact=false
 """
 

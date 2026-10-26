@@ -1583,6 +1583,10 @@ fn a_rate_with_no_observations_is_not_reported_as_zero() {
 ///   cargo test -p eval-harness --locked -- --ignored live_tier
 /// ```
 ///
+/// `DAMAIAN_EVAL_SCENARIO` names one file from `scenarios/`; without it the
+/// original `file_references.toml` smoke scenario runs. This is how the
+/// compaction injection twin was measured on 2026-10-26.
+///
 /// This test is how you exercise the live tier against a real provider.
 ///
 /// It goes through `run_scenarios`, as the binary does, so the scenario's
@@ -1592,11 +1596,36 @@ fn a_rate_with_no_observations_is_not_reported_as_zero() {
 #[test]
 #[ignore = "needs provider credentials and network"]
 fn live_tier_runs_one_scenario_against_a_real_provider() {
-    let path = scenario::scenarios_dir().join("file_references.toml");
+    // `DAMAIAN_EVAL_SCENARIO` selects a file, so the same path can measure a
+    // scenario whose live behaviour is what is being verified without adding a
+    // second credential-gated test. The default is the original smoke scenario.
+    let name = std::env::var("DAMAIAN_EVAL_SCENARIO")
+        .unwrap_or_else(|_| "file_references.toml".to_string());
+    let path = scenario::scenarios_dir().join(name);
     let loaded = scenario::load(&path).expect("scenario");
     let built =
         eval_harness::run_scenarios(std::slice::from_ref(&loaded), Tier::Live).expect("live run");
     let record = &built.records[0];
+
+    println!(
+        "live scenario {}: provider={} model={} calls={} tokens_in={} tokens_out={}",
+        record.scenario,
+        record.provider,
+        record.model,
+        record.model_calls,
+        record.tokens.input,
+        record.tokens.output
+    );
+    for assertion in &record.assertions {
+        println!(
+            "assert {} passed={} skipped={} expected={} actual={}",
+            assertion.name,
+            assertion.passed,
+            assertion.skipped,
+            assertion.expected,
+            assertion.actual
+        );
+    }
 
     assert!(!record.provider.is_empty());
     assert_eq!(record.tier, "live");
