@@ -903,3 +903,51 @@ fn a_failed_compaction_is_recorded_for_the_user_and_not_only_in_the_audit_log() 
         "a failure event is not a message"
     );
 }
+
+#[test]
+fn a_secret_in_the_conversation_never_leaves_through_the_summary_or_its_call() {
+    let repo = temp_repo("secret");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Secret");
+    let objective = "Never print the key AKIAIOSFODNN7EXAMPLE in an answer.";
+    seed_long_conversation(&engine, &session, &task, objective);
+
+    let mut adapter = MockModelAdapter::new(
+        r#"{"constraints":[],"decisions":[],"failed_approaches":[],"uncertainty":[]}"#,
+    );
+    engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut adapter, &cancel())
+        .unwrap();
+    assert!(
+        !adapter.requests[0].messages[0]
+            .content
+            .contains("AKIAIOSFODNN7EXAMPLE"),
+        "the summarisation call is redacted before it leaves the machine"
+    );
+
+    // The stored objective is still the user's own words, exactly.
+    let summary = engine
+        .session_store
+        .read_conversation(&session.id)
+        .unwrap()
+        .summary
+        .expect("a summary");
+    assert!(summary.objective.contains("AKIAIOSFODNN7EXAMPLE"));
+
+    // The next request renders the summary, and the boundary redacts it.
+    let mut adapter = MockModelAdapter::new("Done.");
+    ask(
+        &engine,
+        &repo,
+        "What did I ask?",
+        Some(&session.id),
+        &mut adapter,
+    );
+    assert!(
+        !adapter.requests[0].messages[1]
+            .content
+            .contains("AKIAIOSFODNN7EXAMPLE"),
+        "the summary reaches the model redacted"
+    );
+}

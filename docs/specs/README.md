@@ -620,7 +620,7 @@ Two rules follow, and the second is the one worth enforcing:
   (#1–#13, #34, #41–#47), they come from its own stated ordering.
 - **A dependency marked *not built* must be answered in the design.** Either the
   spec states what to do until it lands — as [#55](55_conversation_compaction/proposal.md)
-  §5.1 does for the context budget, [#49](49_prompt_cache_accounting_and_reuse/proposal.md)
+  §5.1 did for the context budget, [#49](49_prompt_cache_accounting_and_reuse/proposal.md)
   §5.3 for its prefix test, and [#31](31_permission_profiles/proposal.md) §7 for #34 — or
   it says plainly that the work is blocked. The pattern
   [#18](18_local_evaluation_harness/proposal.md) established is the model:

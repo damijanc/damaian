@@ -4073,7 +4073,7 @@ impl ChatOrchestrator {
         );
         let _ = self
             .session_store
-            .record_conversation_compaction_failure(session_id, reason);
+            .record_conversation_compaction_failure(session_id, &self.scanner.redact(reason).text);
     }
 
     /// The conversation window in tokens: `conversation_window_share` of the
@@ -4159,7 +4159,15 @@ impl ChatOrchestrator {
             .map(|(_, message)| (message.role.clone(), message.content.clone()))
             .collect();
         let transcript = crate::compaction::transcript_for_summary(&transcript_messages);
-        let prompt = crate::compaction::narrative_prompt(&transcript, view.summary.as_ref());
+        // The transcript and the previous summary are stored verbatim; the
+        // summarisation call is another boundary they must cross redacted.
+        let prompt = self
+            .scanner
+            .redact(&crate::compaction::narrative_prompt(
+                &transcript,
+                view.summary.as_ref(),
+            ))
+            .text;
         if cancel.is_cancelled() {
             return Ok(crate::compaction::CompactionOutcome::Failed(
                 "cancelled".to_string(),
@@ -8698,7 +8706,11 @@ fn build_model_prompt(
         // conversation block. It is never merged into the system prompt and
         // never placed where repository instructions live.
         if let Some(summary) = summary {
-            output.push_str(&summary.render_for_model());
+            // A stored summary is local data, like the transcript; the
+            // objective is quoted byte for byte in it. Redact at the boundary
+            // so a secret in an earlier message cannot leave the machine
+            // through the summary after being caught in the message itself.
+            output.push_str(&scanner.redact(&summary.render_for_model()).text);
             output.push('\n');
         }
         // §5.5: with no active summary covering the omitted messages, the loss

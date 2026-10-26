@@ -587,6 +587,12 @@ inferred.
   rendered inside the conversation block, which is not assembled by
   `ContextManager`. The reserved category therefore stays unused and its share
   is still released; moving it would be a #26-shaped change, not this one.
+- **The summary is a second redaction boundary.** Stored messages are verbatim
+  by spec 16, and the objective is quoted byte for byte, so the summary can
+  carry a secret the transcript already holds. Both the summarisation call's
+  input and the summary's rendering in a later request pass through
+  `SecretScanner`; the stored objective stays the user's own words
+  (`a_secret_in_the_conversation_never_leaves_through_the_summary_or_its_call`).
 - **A failure is recorded twice:** an audit event for the trail and a
   `conversation_compaction_failed` session event so the marker can tell the user
   on a reload. It is a diagnostic, not a summary; no message is touched.
