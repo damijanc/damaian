@@ -938,3 +938,254 @@ fn a_project_write_without_an_identity_is_refused() {
         MemoryError::Refused(MemoryRefusal::InvalidShape(_))
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Lifecycle transitions and audit (Task 6).
+// ---------------------------------------------------------------------------
+
+use workspace_engine::MemoryTarget;
+
+fn audit_events(root: &Path) -> Vec<serde_json::Value> {
+    let path = root.join(".damaian").join("audit").join("events.jsonl");
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn audit_event_types(root: &Path) -> Vec<String> {
+    audit_events(root)
+        .iter()
+        .filter_map(|event| event.get("eventType").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn every_lifecycle_transition_records_one_audit_event() {
+    let root = temp_dir("audit-lifecycle");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_audit_lifecycle");
+    let target = MemoryTarget::Project(&identity);
+
+    let created = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Builds use Cargo."),
+        )
+        .unwrap();
+    let edited = store
+        .edit_statement(&root, target, &created.id, "Builds use Cargo and nextest.")
+        .unwrap();
+    let replacement = store
+        .supersede(
+            &root,
+            target,
+            &edited.id,
+            project_entry(&identity.key, "Builds use Cargo and the nextest runner."),
+        )
+        .unwrap();
+    store
+        .mark_state(target, &replacement.id, MemoryState::Expired)
+        .unwrap();
+    store
+        .mark_state(target, &replacement.id, MemoryState::Deleted)
+        .unwrap();
+    store
+        .record_recall(std::slice::from_ref(&replacement))
+        .unwrap();
+
+    let events = audit_event_types(&root);
+    for expected in [
+        "memory_created",
+        "memory_edited",
+        "memory_superseded",
+        "memory_expired",
+        "memory_deleted",
+        "memory_recalled",
+    ] {
+        assert!(
+            events.iter().any(|event| event == expected),
+            "{expected} missing from {events:?}"
+        );
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| *event == "memory_created")
+            .count(),
+        2,
+        "the replacement is a creation too"
+    );
+
+    let states: Vec<_> = store.project_entries(&identity).unwrap();
+    let replacement_record = states
+        .iter()
+        .find(|entry| entry.id == replacement.id)
+        .unwrap();
+    assert_eq!(replacement_record.state, MemoryState::Deleted);
+    let superseded = states.iter().find(|entry| entry.id == edited.id).unwrap();
+    assert_eq!(superseded.state, MemoryState::Superseded);
+}
+
+#[test]
+fn confirming_a_suggestion_is_audited_as_a_confirmation() {
+    let root = temp_dir("audit-confirmation");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_audit_confirmation");
+    let mut entry = project_entry(&identity.key, "Prefer nextest over cargo test.");
+    entry.provenance = MemoryProvenance::SuggestedAndConfirmed {
+        session_id: "session_fixture".to_string(),
+        task_id: "task_fixture".to_string(),
+    };
+    store.insert(&root, Some(&identity), entry).unwrap();
+
+    let events = audit_event_types(&root);
+    assert!(events.contains(&"memory_created".to_string()));
+    assert!(events.contains(&"memory_confirmed".to_string()));
+}
+
+#[test]
+fn personal_and_environmental_statements_never_reach_the_audit_log() {
+    let root = temp_dir("audit-sensitivity");
+    let store = memory_store(&root, true);
+    let identity = project_identity("root_audit_sensitivity");
+    let environmental = "Logs live under /var/log/damaian and rotate weekly.";
+    let personal = "Prefer very short commit subjects.";
+    let ordinary = "Builds use Cargo.";
+
+    let environmental_entry = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, environmental),
+        )
+        .unwrap();
+    assert_eq!(environmental_entry.sensitivity, Sensitivity::Environmental);
+    let personal_entry = store.insert(&root, None, user_entry(personal)).unwrap();
+    assert_eq!(personal_entry.sensitivity, Sensitivity::Personal);
+    store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, ordinary),
+        )
+        .unwrap();
+
+    store
+        .mark_state(
+            MemoryTarget::Project(&identity),
+            &environmental_entry.id,
+            MemoryState::Deleted,
+        )
+        .unwrap();
+    store
+        .record_recall(&[environmental_entry, personal_entry])
+        .unwrap();
+
+    let content =
+        fs::read_to_string(root.join(".damaian").join("audit").join("events.jsonl")).unwrap();
+    assert!(
+        !content.contains(environmental),
+        "environmental statement leaked"
+    );
+    assert!(!content.contains(personal), "personal statement leaked");
+    assert!(
+        content.contains(ordinary),
+        "an ordinary statement is useful in the log"
+    );
+}
+
+#[test]
+fn a_disabled_audit_log_writes_no_memory_events() {
+    let root = temp_dir("audit-disabled");
+    let config = test_config(&root);
+    let scanner = SecretScanner::new(Vec::new());
+    let audit = AuditLog::new(&config.data_dir, false, scanner.clone());
+    let store = MemoryStore::new(
+        MemoryStoreConfig {
+            data_dir: config.data_dir.clone(),
+            user_scope_enabled: false,
+            ignore_patterns: config.ignore_patterns.clone(),
+        },
+        audit,
+        scanner,
+        workspace_engine::PathPolicy::new(&config),
+        SessionStore::new(&config.data_dir),
+    );
+    let identity = project_identity("root_audit_disabled");
+    store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Builds use Cargo."),
+        )
+        .unwrap();
+    assert!(
+        !root
+            .join(".damaian")
+            .join("audit")
+            .join("events.jsonl")
+            .exists()
+    );
+}
+
+#[test]
+fn editing_a_refused_statement_leaves_the_old_one_active() {
+    let root = temp_dir("audit-refused-edit");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_refused_edit");
+    let target = MemoryTarget::Project(&identity);
+    let entry = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Builds use Cargo."),
+        )
+        .unwrap();
+
+    let error = store
+        .edit_statement(
+            &root,
+            target,
+            &entry.id,
+            &format!("The token is {SEEDED_SECRET}."),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::Secret { .. })
+    ));
+    let stored = store.project_entries(&identity).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].statement, "Builds use Cargo.");
+    assert_eq!(stored[0].state, MemoryState::Active);
+}
+
+#[test]
+fn a_superseded_entry_keeps_the_link_to_its_replacement() {
+    let root = temp_dir("audit-supersede-link");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_supersede_link");
+    let target = MemoryTarget::Project(&identity);
+    let first = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Tests need Docker."),
+        )
+        .unwrap();
+    let second = store
+        .supersede(
+            &root,
+            target,
+            &first.id,
+            project_entry(&identity.key, "Tests need Docker Compose v2."),
+        )
+        .unwrap();
+    assert_eq!(second.supersedes.as_deref(), Some(first.id.as_str()));
+}

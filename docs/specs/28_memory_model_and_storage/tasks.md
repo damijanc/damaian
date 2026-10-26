@@ -15,7 +15,7 @@ criteria) · corrections and planning decisions in [`context.md`](context.md)
 | 3 · Project identity resolution | Done 2026-10-26 | `GitService::root_commit` (`rev-list --max-parents=0 HEAD`, first line) and `origin_url` are unaudited read helpers beside `head_commit`. `ProjectIdentity::resolve` takes the root commit first, then a normalized origin, then the path hash, and keys are `root_<sha>`, `remote_<sha256[..16]>`, `path_<repository_id>`; `source_of_key` reads the tier back. Remote normalization strips scheme, credentials, port and `.git`, lowercases the host, handles scp syntax, and returns `None` for a local path so identity falls to the path tier rather than pretending a machine path is portable. Nine integration tests cover: two clones sharing (with different `repository_id`s), a rename keeping the key, different root commits not sharing, a fork sharing deliberately, remotes without history (different and same), neither falling to the path hash, a non-repository, and no credential or slash in a key. **Measured cost:** about 12 ms per tier-1 resolution on this machine (20 iterations, 0.246 s total), dominated by process launch. |
 | 4 · Store layout, schema version and migration | Done 2026-10-26 | `MemoryStore` + `MemoryStoreConfig` write `<data_dir>/memory/{schema.conf,project/<key>.jsonl,user.jsonl}` with the directory at `0700`. Append-only JSONL: one complete record per line, last record per id wins, first appearance fixes order, a torn final line is discarded, and an unparsable middle line is counted and skipped so one bad record cannot make the store unreadable. The flat marker mirrors `data_schema`: absent means version 0 if files exist (migrate) or fresh (initialise), equal proceeds, newer/unparsable/0 refuses with path and versions. Version-0 migration appends a complete record for every parseable legacy line — deriving sensitivity, defaulting `state` to `Active` — keeps the old line, writes the marker, and audits `memory_schema_migrated`. A project entry whose `project_key` differs from its file's is a hard error, not a filtered row. Reads do not create the directory; writes will. `DAMAIAN_DATA_DIR` is honoured through `Config::default_data_dir` (asserted with nextest's per-test process isolation). Ten new integration tests (19 in the file) pass; scoped clippy clean. |
 | 5 · Refusal path: secrets, evidence, scopes | Done 2026-10-26 | `MemoryStore::insert(root, identity, entry)` is the single write path and runs shape/scope, secret, evidence, sensitivity and persistence in that order. Secrets are refused with a category and never redacted; the statement and every evidence path are scanned. Evidence must be repository-relative (absolute, `..` and `./` refused), not `PathPolicy::is_restricted`, and not ignored by configured patterns or any per-directory `.gitignore` from the root down. Project writes require the resolved identity and a matching key; session writes require an existing session and reach the log only through `SessionStore::append_memory_record`/`memory_records` (`pub(crate)`, leaving `append_session_event` private); user writes refuse while disabled and reads return nothing without opening `user.jsonl`. Sensitivity is stored as `max(supplied, derived)`, so it can be raised but never lowered. Fourteen new integration tests (33 total) pass, including a session-scope write carrying a seeded fake AWS key that leaves no `memory_recorded` event and no secret in the log. Scoped clippy clean. |
-| 6 · Lifecycle transitions and audit | Not started | |
+| 6 · Lifecycle transitions and audit | Done 2026-10-26 | `MemoryTarget { Project, Session, User }` and append-only transitions: `edit_statement` (re-runs shape, secret, evidence and sensitivity checks; refuses a non-active entry), `mark_state` (Superseded/Expired/Deleted/Active, idempotent on the same state), `supersede` (inserts the replacement first and only then retires the old entry), and `record_recall` (one event per entry). `AuditLog::record` gets `memory_created`, `memory_confirmed` (for `SuggestedAndConfirmed`), `memory_recalled`, `memory_edited`, `memory_superseded`, `memory_expired`, `memory_deleted`, and `memory_state_changed` for reactivation; recall has no state fields, so the log does not claim a transition. Fields are `entryId`, `scope`, `category`, `provenance`, `sensitivity` and `fromState`/`toState`, plus `statement` only when sensitivity is `Ordinary`. Six new tests (39 total) cover the full walk, confirmation, sensitivity absence from the whole audit file, a disabled audit log writing nothing, a refused edit leaving the old statement active, and the supersede link. Scoped clippy clean. |
 | 7 · User-scope config key and engine wiring | Not started | |
 | 8 · Documentation and close-out | Not started | |
 
@@ -210,20 +210,20 @@ and `memory::session`; scoped clippy.
 
 ## Task 6 · Lifecycle transitions and audit
 
-- [ ] Implement transitions as appended records, never rewrites: edit statement,
+- [x] Implement transitions as appended records, never rewrites: edit statement,
       mark state (`Superseded`, `Expired`, `Deleted`, back to `Active`), and
       supersede (new entry carries `supersedes`; old entry becomes `Superseded`).
       Re-run the secret, evidence, sensitivity and scope checks whenever the
       statement or scope changes.
-- [ ] `record_recall(entries)` appends one `memory_recalled` event per entry,
+- [x] `record_recall(entries)` appends one `memory_recalled` event per entry,
       with ids only plus the statement when `Ordinary`.
-- [ ] Audit every transition through `AuditLog::record`: `memory_created`,
+- [x] Audit every transition through `AuditLog::record`: `memory_created`,
       `memory_confirmed` (when provenance is `SuggestedAndConfirmed`),
       `memory_recalled`, `memory_edited`, `memory_superseded`, `memory_expired`,
       `memory_deleted`. Fields: `entryId`, `scope`, `category`, `provenance`,
       `fromState`, `toState`, and `statement` only when sensitivity is
       `Ordinary`.
-- [ ] Tests: one lifecycle walk asserting one event per transition; a
+- [x] Tests: one lifecycle walk asserting one event per transition; a
       `Personal` statement and an `Environmental` statement each absent from the
       whole audit file; an `Ordinary` statement present; a disabled audit log
       returns the event JSON but writes nothing.

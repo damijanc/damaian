@@ -741,6 +741,14 @@ pub struct MemoryStoreConfig {
     pub ignore_patterns: Vec<String>,
 }
 
+/// Which stored scope a transition operates on.
+#[derive(Debug, Clone, Copy)]
+pub enum MemoryTarget<'a> {
+    Project(&'a ProjectIdentity),
+    Session(&'a str),
+    User,
+}
+
 /// The single writer for every memory scope.
 ///
 /// Project and user entries are append-only JSONL under the data directory;
@@ -902,36 +910,181 @@ impl MemoryStore {
         entry.sensitivity = entry.effective_sensitivity();
         entry.updated_at_ms = entry.updated_at_ms.max(entry.created_at_ms);
 
-        match entry.scope {
+        let target = match entry.scope {
             MemoryScope::Project => {
-                self.ensure_schema()?;
-                append_entry_line(
-                    &self.project_path(&entry.project_key.clone().unwrap()),
-                    &entry,
-                )?;
+                MemoryTarget::Project(identity.expect("validate_shape required a project identity"))
             }
-            MemoryScope::User => {
-                self.ensure_schema()?;
-                append_entry_line(&self.user_path(), &entry)?;
-            }
-            MemoryScope::Session => {
-                let session_id = entry.session_id.clone().unwrap();
-                let record = serde_json::to_string(&entry).map_err(|error| {
-                    MemoryError::Invalid(format!("Failed to serialize memory: {error}"))
-                })?;
-                self.session_store
-                    .append_memory_record(&session_id, &record)?;
-            }
-        }
+            MemoryScope::Session => MemoryTarget::Session(
+                entry
+                    .session_id
+                    .as_deref()
+                    .expect("validate_shape required a session id"),
+            ),
+            MemoryScope::User => MemoryTarget::User,
+        };
+        self.append_to_target(target, &entry)?;
 
-        self.audit_transition("memory_created", &entry, None, entry.state)?;
+        self.audit_memory("memory_created", &entry, None, Some(entry.state))?;
         if matches!(
             entry.provenance,
             MemoryProvenance::SuggestedAndConfirmed { .. }
         ) {
-            self.audit_transition("memory_confirmed", &entry, None, MemoryState::Active)?;
+            self.audit_memory("memory_confirmed", &entry, None, Some(MemoryState::Active))?;
         }
         Ok(entry)
+    }
+
+    /// Replaces an active entry's statement. The edited record is appended;
+    /// the old line stays. Secret, evidence and sensitivity checks run again
+    /// because the new sentence can contain something the old one did not.
+    pub fn edit_statement(
+        &self,
+        root: &Path,
+        target: MemoryTarget<'_>,
+        id: &str,
+        statement: &str,
+    ) -> MemoryResult<MemoryEntry> {
+        let mut entry = self.find_entry(target, id)?;
+        if entry.state != MemoryState::Active {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "only an active memory can be edited".to_string(),
+            )));
+        }
+        entry.statement = statement.trim().to_string();
+        entry.updated_at_ms = now_millis();
+        let identity = match target {
+            MemoryTarget::Project(identity) => Some(identity),
+            MemoryTarget::Session(_) | MemoryTarget::User => None,
+        };
+        self.validate_shape(identity, &entry)?;
+        self.refuse_secrets(&entry)?;
+        self.refuse_ineligible_evidence(root, &entry)?;
+        entry.sensitivity = entry.effective_sensitivity();
+        self.append_to_target(target, &entry)?;
+        self.audit_memory(
+            "memory_edited",
+            &entry,
+            Some(MemoryState::Active),
+            Some(MemoryState::Active),
+        )?;
+        Ok(entry)
+    }
+
+    /// Moves an entry to another state by appending a new record. Deleting is
+    /// a `Deleted` record, not a removed line, so the audit trail survives.
+    pub fn mark_state(
+        &self,
+        target: MemoryTarget<'_>,
+        id: &str,
+        state: MemoryState,
+    ) -> MemoryResult<MemoryEntry> {
+        let mut entry = self.find_entry(target, id)?;
+        if entry.state == state {
+            return Ok(entry);
+        }
+        let previous = entry.state;
+        entry.state = state;
+        entry.updated_at_ms = now_millis();
+        self.append_to_target(target, &entry)?;
+        let event = match state {
+            MemoryState::Superseded => "memory_superseded",
+            MemoryState::Expired => "memory_expired",
+            MemoryState::Deleted => "memory_deleted",
+            MemoryState::Active => "memory_state_changed",
+        };
+        self.audit_memory(event, &entry, Some(previous), Some(state))?;
+        Ok(entry)
+    }
+
+    /// Creates a replacement and marks the previous entry superseded.
+    ///
+    /// The replacement is inserted first: if the new statement is refused, the
+    /// old entry must remain active rather than be retired in favour of
+    /// something that was never stored.
+    pub fn supersede(
+        &self,
+        root: &Path,
+        target: MemoryTarget<'_>,
+        previous_id: &str,
+        mut replacement: MemoryEntry,
+    ) -> MemoryResult<MemoryEntry> {
+        let previous = self.find_entry(target, previous_id)?;
+        if replacement.scope != previous.scope {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "a replacement must have the same scope as the entry it replaces".to_string(),
+            )));
+        }
+        if replacement.scope == MemoryScope::Project
+            && replacement.project_key != previous.project_key
+        {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "a replacement must stay in the same project".to_string(),
+            )));
+        }
+        replacement.supersedes = Some(previous_id.to_string());
+        let identity = match target {
+            MemoryTarget::Project(identity) => Some(identity),
+            MemoryTarget::Session(_) | MemoryTarget::User => None,
+        };
+        let stored = self.insert(root, identity, replacement)?;
+        self.mark_state(target, previous_id, MemoryState::Superseded)?;
+        Ok(stored)
+    }
+
+    /// Records that entries were recalled into a turn, which is what makes
+    /// "when was this last used?" answerable later. One event per entry; no
+    /// content beyond the statement rule in [`Self::audit_memory`].
+    pub fn record_recall(&self, entries: &[MemoryEntry]) -> MemoryResult<()> {
+        for entry in entries {
+            self.audit_memory("memory_recalled", entry, None, None)?;
+        }
+        Ok(())
+    }
+
+    fn find_entry(&self, target: MemoryTarget<'_>, id: &str) -> MemoryResult<MemoryEntry> {
+        self.target_entries(target)?
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| {
+                MemoryError::Invalid(format!("No memory entry {id} exists in that scope"))
+            })
+    }
+
+    fn target_entries(&self, target: MemoryTarget<'_>) -> MemoryResult<Vec<MemoryEntry>> {
+        match target {
+            MemoryTarget::Project(identity) => self.project_entries(identity),
+            MemoryTarget::Session(session_id) => self.session_entries(session_id),
+            MemoryTarget::User => self.user_entries(),
+        }
+    }
+
+    fn append_to_target(&self, target: MemoryTarget<'_>, entry: &MemoryEntry) -> MemoryResult<()> {
+        match target {
+            MemoryTarget::Project(identity) => {
+                self.ensure_schema()?;
+                append_entry_line(&self.project_path(&identity.key), entry)
+            }
+            MemoryTarget::Session(session_id) => {
+                if self.session_store.read_session(session_id)?.is_none() {
+                    return Err(MemoryError::Invalid(format!(
+                        "Session {session_id} no longer exists; its memory went with it"
+                    )));
+                }
+                let record = serde_json::to_string(entry).map_err(|error| {
+                    MemoryError::Invalid(format!("Failed to serialize memory: {error}"))
+                })?;
+                self.session_store
+                    .append_memory_record(session_id, &record)?;
+                Ok(())
+            }
+            MemoryTarget::User => {
+                if !self.config.user_scope_enabled {
+                    return Err(MemoryError::Refused(MemoryRefusal::UserScopeDisabled));
+                }
+                self.ensure_schema()?;
+                append_entry_line(&self.user_path(), entry)
+            }
+        }
     }
 
     fn validate_shape(
@@ -1127,17 +1280,21 @@ impl MemoryStore {
         Ok(entries)
     }
 
-    /// Records a lifecycle transition. Fields are the ids and classifications
-    /// needed to answer "what happened"; the statement is included only for
-    /// `Ordinary` sensitivity, because a personal or environmental statement
-    /// copied into an append-only retained log is exactly the exposure §5.8
-    /// forbids.
-    fn audit_transition(
+    /// Records a memory lifecycle event. Fields are the ids and
+    /// classifications needed to answer "what happened"; the statement is
+    /// included only for `Ordinary` sensitivity, because a personal or
+    /// environmental statement copied into an append-only retained log is
+    /// exactly the exposure §5.8 forbids.
+    ///
+    /// `from`/`to` are omitted for an event that is not a state transition —
+    /// recall has none — so the log does not claim a transition that did not
+    /// happen.
+    fn audit_memory(
         &self,
         event: &str,
         entry: &MemoryEntry,
         from: Option<MemoryState>,
-        to: MemoryState,
+        to: Option<MemoryState>,
     ) -> MemoryResult<()> {
         let mut fields = vec![
             ("entryId", entry.id.clone()),
@@ -1145,12 +1302,13 @@ impl MemoryStore {
             ("category", entry.category.as_str().to_string()),
             ("provenance", entry.provenance.kind().to_string()),
             ("sensitivity", entry.sensitivity.as_str().to_string()),
-            (
-                "fromState",
-                from.map(MemoryState::as_str).unwrap_or("none").to_string(),
-            ),
-            ("toState", to.as_str().to_string()),
         ];
+        if let Some(from) = from {
+            fields.push(("fromState", from.as_str().to_string()));
+        }
+        if let Some(to) = to {
+            fields.push(("toState", to.as_str().to_string()));
+        }
         if entry.sensitivity == Sensitivity::Ordinary {
             fields.push(("statement", entry.statement.clone()));
         }

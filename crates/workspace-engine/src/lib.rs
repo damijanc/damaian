@@ -144,7 +144,7 @@ pub use mcp::{
 pub use memory::{
     EvidenceRef, EvidenceRefusal, MEMORY_SCHEMA_VERSION, MemoryCategory, MemoryEntry, MemoryError,
     MemoryExpiry, MemoryProvenance, MemoryRefusal, MemoryResult, MemorySchemaOutcome, MemoryScope,
-    MemoryState, MemoryStore, MemoryStoreConfig, ProjectIdentity, ProjectKeySource,
+    MemoryState, MemoryStore, MemoryStoreConfig, MemoryTarget, ProjectIdentity, ProjectKeySource,
     STATEMENT_MAX_CHARS, Sensitivity, Verification, normalize_remote_url,
 };
 pub use mode::SessionMode;
