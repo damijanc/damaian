@@ -736,6 +736,7 @@ fn hooks_are_reported_with_path_executable_size_and_interpreter() {
     assert!(pre.executable);
     assert!(pre.runs);
     assert!(pre.size > 0);
+    assert!(pre.content_hash.is_some());
     assert_eq!(pre.interpreter.as_deref(), Some("#!/bin/sh"));
     assert!(pre.path.ends_with(".git/hooks/pre-commit"));
     let commit_msg = preparation
@@ -1539,5 +1540,39 @@ fn a_nested_repository_is_shown_and_can_never_be_selected() {
         ),
         "{outcome:?}"
     );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_same_size_hook_edit_after_the_report_is_refused() {
+    let fixture = Fixture::new("hook-edited");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    fixture.write_hook("pre-commit", "#!/bin/sh\nexit 0\n", true);
+    let preparation = fixture.prepare(&session);
+    // Same length, different behaviour: a size-only report would miss it.
+    fixture.write_hook("pre-commit", "#!/bin/sh\nexit 1\n", true);
+    let before = fixture.head();
+    let outcome = fixture.commit(
+        &session,
+        &preparation,
+        &fixture.default_paths(&preparation),
+        "Commit a",
+        false,
+    );
+    assert!(
+        matches!(
+            outcome,
+            Err(CommitError::Refused {
+                code: "commit_hooks_changed",
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(fixture.head(), before);
     fixture.cleanup();
 }

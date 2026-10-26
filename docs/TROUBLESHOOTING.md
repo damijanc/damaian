@@ -1513,7 +1513,7 @@ code, and nothing was committed unless the commit object is reported as created:
 
 - **`commit_head_moved`** — `HEAD` moved after the preview. Nothing was committed; prepare the commit again. The same code covers a branch switch and a ref change during the commit.
 - **`commit_content_changed`** — a selected file no longer has the bytes you reviewed. Nothing was committed. Look at what changed the file (a formatter, a command, another editor), prepare again, and review the new diff.
-- **`commit_hooks_changed`** — a Git hook was added or edited after the preview. Prepare again so the hooks you approve are the hooks that run.
+- **`commit_hooks_changed`** — a Git hook was added or edited after the preview, including a same-length edit: the report stores each hook file's SHA-256. Prepare again so the hooks you approve are the hooks that run.
 - **`commit_hook_failed`** — the named hook exited non-zero; the response carries its redacted, truncated output. A failing `pre-commit`, `prepare-commit-msg` or `commit-msg` aborts before a commit object exists. A failing `post-commit` does **not** undo the commit; the SHA is reported with a warning.
 - **`commit_message_rewritten`** — a message hook changed your text. The rewritten text is returned and prefilled; review it and approve again. Nothing was committed on the first attempt.
 - **`commit_secrets_require_override`** — the real bytes contain something the scanner flags. The displayed diff is redacted, so the match may not be visible; review the file and tick the override to commit it anyway. The override applies to that one commit and is audited.

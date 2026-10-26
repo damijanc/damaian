@@ -147,6 +147,9 @@ pub struct GitHookInfo {
     pub exists: bool,
     pub executable: bool,
     pub size: u64,
+    /// SHA-256 of the hook file, so a same-size edit between the report and the
+    /// commit is still a change. `None` when no file is there.
+    pub content_hash: Option<String>,
     pub interpreter: Option<String>,
     /// Whether Damaian would run it: exists, is a file and has an execute bit.
     pub runs: bool,
@@ -1575,20 +1578,18 @@ impl CommitEngine {
                 .as_ref()
                 .is_some_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
             let size = metadata.as_ref().map(|meta| meta.len()).unwrap_or(0);
-            let interpreter = if is_file {
-                fs::read(&path).ok().and_then(|bytes| {
-                    let first = bytes
-                        .split(|&byte| byte == b'\n')
-                        .next()
-                        .map(String::from_utf8_lossy)
-                        .map(|line| line.trim().to_string());
-                    first
-                        .filter(|line| line.starts_with("#!"))
-                        .map(|line| line.chars().take(120).collect::<String>())
-                })
-            } else {
-                None
-            };
+            let bytes = if is_file { fs::read(&path).ok() } else { None };
+            let content_hash = bytes.as_deref().map(crate::hash::sha256);
+            let interpreter = bytes.and_then(|bytes| {
+                let first = bytes
+                    .split(|&byte| byte == b'\n')
+                    .next()
+                    .map(String::from_utf8_lossy)
+                    .map(|line| line.trim().to_string());
+                first
+                    .filter(|line| line.starts_with("#!"))
+                    .map(|line| line.chars().take(120).collect::<String>())
+            });
             let runs = exists && is_file && executable;
             let skipped_reason = if exists && !is_file {
                 Some("not a file".to_string())
@@ -1603,6 +1604,7 @@ impl CommitEngine {
                 exists,
                 executable,
                 size,
+                content_hash,
                 interpreter,
                 runs,
                 skipped_reason,
@@ -1620,7 +1622,14 @@ impl CommitEngine {
             .git_line(root, &["config", "--get", "core.hooksPath"])?
             .filter(|value| !value.trim().is_empty());
         if let Some(configured) = configured {
-            let path = PathBuf::from(&configured);
+            let path = if let Some(rest) = configured.strip_prefix("~/") {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(rest))
+                    .unwrap_or_else(|| PathBuf::from(&configured))
+            } else {
+                PathBuf::from(&configured)
+            };
             let path = if path.is_absolute() {
                 path
             } else {
