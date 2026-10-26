@@ -175,6 +175,7 @@ impl WorkspaceEngine {
             indexer.clone(),
             context_manager.clone(),
             session_store.clone(),
+            memory_store.clone(),
             validation_orchestrator.clone(),
             command_store.clone(),
             file_access.clone(),

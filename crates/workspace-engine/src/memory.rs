@@ -659,6 +659,92 @@ impl MemoryProposalGate<'_> {
     }
 }
 
+/// A user's own "remember that…" request, already normalized for a proposal.
+/// Trusted because the user wrote it; still confirmed before storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitMemoryRequest {
+    pub statement: String,
+    pub category: MemoryCategory,
+    pub scope: MemoryScope,
+}
+
+/// Reads one explicit remember-this request from the user's message.
+///
+/// Deliberately narrow: the first recognized cue, the first sentence after it,
+/// and nothing inferred. The statement is the user's words rather than a
+/// model's paraphrase, and the confirmation card still shows it before it can
+/// become an entry.
+pub fn explicit_memory_request(prompt: &str) -> Option<ExplicitMemoryRequest> {
+    let lowered = prompt.to_lowercase();
+    const CUES: &[&str] = &[
+        "please remember that ",
+        "please remember ",
+        "don't forget that ",
+        "do not forget that ",
+        "remember that ",
+        "remember: ",
+        "remember to ",
+    ];
+    let (index, cue) = {
+        let mut chosen: Option<(usize, &str)> = None;
+        for cue in CUES {
+            let Some(index) = lowered.find(cue) else {
+                continue;
+            };
+            chosen = match chosen {
+                None => Some((index, *cue)),
+                Some((best_index, best_cue))
+                    if index < best_index
+                        || (index == best_index && cue.len() > best_cue.len()) =>
+                {
+                    Some((index, *cue))
+                }
+                other => other,
+            };
+        }
+        chosen?
+    };
+    let start = index + cue.len();
+    let rest = &prompt[start..];
+    let line = rest.lines().next().unwrap_or_default();
+    let end = line
+        .find(['.', '!', '?'])
+        .map(|index| index + 1)
+        .unwrap_or(line.len());
+    let statement = line[..end].trim();
+    if statement.is_empty() {
+        return None;
+    }
+    let normalized = normalize_statement(statement);
+    if normalized.is_empty() || normalized.chars().count() > STATEMENT_MAX_CHARS {
+        return None;
+    }
+    let lower = normalized.to_lowercase();
+    let category =
+        if lower.starts_with("prefer") || lower.starts_with("i prefer") || lower.contains("i like")
+        {
+            MemoryCategory::Preference
+        } else if lower.contains("command") || lower.starts_with("run ") || cue == "remember to " {
+            MemoryCategory::Convention
+        } else {
+            MemoryCategory::Fact
+        };
+    let scope = if lower.contains("across projects")
+        || lower.contains("in every project")
+        || lower.contains("all projects")
+        || lower.contains("every repository")
+    {
+        MemoryScope::User
+    } else {
+        MemoryScope::Project
+    };
+    Some(ExplicitMemoryRequest {
+        statement: normalized,
+        category,
+        scope,
+    })
+}
+
 /// Collapse whitespace runs and trim. A stored statement is the sentence the
 /// confirmation showed, so normalization happens before it is seen.
 pub fn normalize_statement(statement: &str) -> String {
@@ -2690,5 +2776,30 @@ mod tests {
             source: "issue #412".to_string(),
         };
         assert_eq!(external.source_label(), "suggested from issue #412");
+    }
+
+    #[test]
+    fn an_explicit_remember_request_is_read_from_the_users_own_sentence() {
+        let request =
+            explicit_memory_request("Please remember that integration tests need Docker running.")
+                .expect("a request");
+        assert_eq!(request.statement, "integration tests need Docker running.");
+        assert_eq!(request.scope, MemoryScope::Project);
+        assert_eq!(request.category, MemoryCategory::Fact);
+
+        let preference =
+            explicit_memory_request("Remember: I prefer tabs in Rust.").expect("a preference");
+        assert_eq!(preference.category, MemoryCategory::Preference);
+
+        let across = explicit_memory_request(
+            "Remember that I prefer four-space indentation across projects.",
+        )
+        .expect("a cross-project preference");
+        assert_eq!(across.scope, MemoryScope::User);
+
+        let command =
+            explicit_memory_request("Remember to run make fmt before committing.").expect("a cue");
+        assert_eq!(command.category, MemoryCategory::Convention);
+        assert!(explicit_memory_request("What does this function do?").is_none());
     }
 }

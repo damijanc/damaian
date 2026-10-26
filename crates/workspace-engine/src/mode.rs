@@ -175,7 +175,8 @@ pub(crate) fn profile_permits(
         // repository state, writes anything outside the session log, nor
         // authorises anything.
         | ToolAction::AskUser(_)
-        | ToolAction::TurnNotes { .. } => None,
+        | ToolAction::TurnNotes { .. }
+        | ToolAction::ProposeMemory { .. } => None,
         ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
             (!capabilities.allow_file_edits).then_some(ProfileLimit::FileEdits)
         }
@@ -254,7 +255,9 @@ pub(crate) fn mode_permits(
         // narrows the offer in `chat.rs`; it never widens a mode.
         // Spec 65: writing notes is allowed in every mode, beside the reads it
         // records findings from. It writes only the turn's own notes.
-        ToolAction::AskUser(_) | ToolAction::TurnNotes { .. } => Permission::Allowed,
+        ToolAction::AskUser(_)
+        | ToolAction::TurnNotes { .. }
+        | ToolAction::ProposeMemory { .. } => Permission::Allowed,
 
         ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
             if mode == Code {

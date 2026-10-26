@@ -31,6 +31,10 @@ use crate::hooks::{HookContext, HookDispatcher, HookEvent, HookOutcome, Verdict}
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::language::detect_language;
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
+use crate::memory::{
+    MemoryCategory, MemoryProposal, MemoryScope, MemoryStore, ProposalOrigin, evidence_ref_for,
+    explicit_memory_request,
+};
 use crate::mode::{Permission, SessionMode, permits, refusal_message};
 use crate::model::{
     ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsage, ToolCall, ToolDefinition,
@@ -679,6 +683,7 @@ pub struct ChatOrchestrator {
     indexer: ProjectIndexer,
     context_manager: ContextManager,
     session_store: SessionStore,
+    memory_store: MemoryStore,
     validation_orchestrator: ValidationOrchestrator,
     command_store: CommandStore,
     pending_commands: PendingCommandStore,
@@ -706,6 +711,7 @@ impl ChatOrchestrator {
         indexer: ProjectIndexer,
         context_manager: ContextManager,
         session_store: SessionStore,
+        memory_store: MemoryStore,
         validation_orchestrator: ValidationOrchestrator,
         command_store: CommandStore,
         file_access: FileAccessController,
@@ -725,6 +731,7 @@ impl ChatOrchestrator {
             indexer,
             context_manager,
             session_store,
+            memory_store,
             validation_orchestrator,
             command_store,
             pending_commands,
@@ -751,6 +758,45 @@ impl ChatOrchestrator {
 
     pub fn set_web_diagnostics_runner(&mut self, runner: WebDiagnosticsRunnerHandle) {
         self.web_diagnostics_runner = Some(runner);
+    }
+
+    /// Turns the user's own "remember that…" into a proposal. The statement is
+    /// the user's sentence, not a model paraphrase, and the store still
+    /// screens and caps it. A refused request is audited by the store and does
+    /// not fail the turn.
+    fn propose_explicit_memory(
+        &self,
+        root: &Path,
+        session_id: &str,
+        message_id: &str,
+        prompt: &str,
+    ) -> Result<()> {
+        let Some(request) = explicit_memory_request(prompt) else {
+            return Ok(());
+        };
+        let proposal = MemoryProposal::new(
+            request.scope,
+            request.category,
+            request.statement,
+            ProposalOrigin::UserRequest {
+                session_id: session_id.to_string(),
+                message_id: message_id.to_string(),
+            },
+            Vec::new(),
+            None,
+        );
+        if let Err(error) = self.memory_store.propose(root, proposal) {
+            // A failure here is the store refusing or the log refusing the
+            // write. Neither is a reason to fail the user's turn.
+            self.audit_log.record(
+                "memory_proposal_failed",
+                &[
+                    ("sessionId", session_id.to_string()),
+                    ("reason", error.to_string()),
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     fn default_tool_round_limit(&self) -> u32 {
@@ -1103,6 +1149,10 @@ impl ChatOrchestrator {
         let user_message =
             self.session_store
                 .append_message(&session.id, Some(&task.id), "user", prompt)?;
+        // Spec 29 §5.2: an explicit request is still a proposal. The user's own
+        // sentence is the statement, so no model paraphrase or extra round trip
+        // sits between what they asked and what the card will show.
+        self.propose_explicit_memory(repository_root, &session.id, &user_message.id, prompt)?;
         self.take_turn_checkpoint(
             repository_root,
             &session,
@@ -5051,6 +5101,15 @@ impl ChatOrchestrator {
             {
                 tools.push(turn_notes_tool_definition());
             }
+            if offered(&ToolAction::ProposeMemory {
+                statement: String::new(),
+                category: MemoryCategory::Fact,
+                scope: None,
+                source: None,
+                evidence_path: None,
+            }) {
+                tools.push(propose_memory_tool_definition());
+            }
             if self.web_diagnostics_runner.is_some()
                 && offered(&ToolAction::WebDiagnostic(WebDiagnosticCall {
                     kind: WebDiagnosticKind::Inspect,
@@ -6995,6 +7054,76 @@ impl ChatOrchestrator {
                                         ActionOutcome::Ok,
                                     )
                                 }
+                            }
+                        }
+                        // Spec 29 §5.11: a suggestion is a proposal at most.
+                        // The gate screens it; the user confirms through a
+                        // separate route. A refusal here is not an error the
+                        // model can fix by rephrasing a credential.
+                        ToolAction::ProposeMemory {
+                            statement,
+                            category,
+                            scope,
+                            source,
+                            evidence_path,
+                        } => 'propose: {
+                            let origin = if evidence_path.is_some() {
+                                ProposalOrigin::RepositoryObservation {
+                                    session_id: session.id.clone(),
+                                }
+                            } else if let Some(source) = source {
+                                ProposalOrigin::ExternalContent {
+                                    session_id: session.id.clone(),
+                                    source,
+                                }
+                            } else {
+                                ProposalOrigin::ModelSuggestion {
+                                    session_id: session.id.clone(),
+                                    task_id: task.id.clone(),
+                                }
+                            };
+                            let evidence =
+                                match evidence_path.as_deref() {
+                                    Some(path) => match evidence_ref_for(repository_root, path) {
+                                        Ok(evidence) => vec![evidence],
+                                        Err(_) => break 'propose (
+                                            "Attempted to suggest a memory.".to_string(),
+                                            "A memory was not proposed: that evidence path could \
+                                         not be read."
+                                                .to_string(),
+                                            ActionOutcome::Failed,
+                                        ),
+                                    },
+                                    None => Vec::new(),
+                                };
+                            let proposal = MemoryProposal::new(
+                                scope.unwrap_or(MemoryScope::Project),
+                                category,
+                                statement,
+                                origin,
+                                evidence,
+                                Some(task.id.clone()),
+                            );
+                            match self.memory_store.propose(repository_root, proposal) {
+                                Ok(Some(_)) => (
+                                    "Suggested a memory.".to_string(),
+                                    "A memory proposal was created for the user to confirm. It \
+                                     is not stored until they confirm it."
+                                        .to_string(),
+                                    ActionOutcome::Ok,
+                                ),
+                                Ok(None) => (
+                                    "Attempted to suggest a memory.".to_string(),
+                                    "Damaian did not propose that memory: the memory policy \
+                                     refused it, so the user sees no card."
+                                        .to_string(),
+                                    ActionOutcome::Failed,
+                                ),
+                                Err(error) => (
+                                    "Attempted to suggest a memory.".to_string(),
+                                    format!("The proposal could not be recorded: {error}"),
+                                    ActionOutcome::Failed,
+                                ),
                             }
                         }
                         ToolAction::AskUser(input) => {
@@ -9777,6 +9906,16 @@ pub(crate) enum ToolAction {
         text: String,
         replace: bool,
     },
+    /// A candidate memory the model suggests (spec 29). It cannot store: the
+    /// dispatch screens it and at most appends a proposal, which the user must
+    /// confirm through a separate route.
+    ProposeMemory {
+        statement: String,
+        category: MemoryCategory,
+        scope: Option<MemoryScope>,
+        source: Option<String>,
+        evidence_path: Option<String>,
+    },
 }
 
 /// What dispatching a tool can change beyond its own result.
@@ -9831,7 +9970,10 @@ fn action_effect(action: &ToolAction) -> ActionEffect {
         | ToolAction::ReadGitDiff { .. }
         | ToolAction::ListWorktrees { .. }
         | ToolAction::ReadGitLog { .. } => ActionEffect::ReadOnly,
-        ToolAction::TurnNotes { .. } => ActionEffect::Notes,
+        // A proposal writes only the session log and waits for a separate user
+        // action. It is charged like notes so a round of reads plus one
+        // suggestion is exploration, not an action round.
+        ToolAction::TurnNotes { .. } | ToolAction::ProposeMemory { .. } => ActionEffect::Notes,
     }
 }
 
@@ -9945,6 +10087,7 @@ fn tool_event_payload(
         ToolAction::CompleteStep => ("complete_step", Vec::new()),
         ToolAction::AskUser(_) => ("ask_user", Vec::new()),
         ToolAction::TurnNotes { .. } => ("turn_notes", Vec::new()),
+        ToolAction::ProposeMemory { .. } => ("propose_memory", Vec::new()),
         ToolAction::Command(_) => ("run_command", Vec::new()),
         ToolAction::WebDiagnostic(_) => ("web_diagnostic", Vec::new()),
         ToolAction::McpCall { .. } => ("mcp_call", Vec::new()),
@@ -10049,6 +10192,9 @@ fn tool_action_marker_unscoped(
         // The reference stays empty: the question is model-authored and not
         // yet redacted when the marker is written.
         ToolAction::AskUser(_) => ("ask_user", String::new(), side_effecting),
+        // The statement is model-authored and may contain a secret the gate
+        // will refuse; the marker carries no reference for it.
+        ToolAction::ProposeMemory { .. } => ("propose_memory", String::new(), side_effecting),
         // Only the size: the notes themselves are in the session log, and a
         // reference must not leak model-written text into the action log.
         ToolAction::TurnNotes { text, .. } => (
@@ -10264,6 +10410,7 @@ fn tool_action_label(action: &ToolAction) -> String {
         ToolAction::ProposePlan(steps) => format!("Planning {} steps", steps.len()),
         ToolAction::CompleteStep => "Finishing a step".to_string(),
         ToolAction::AskUser(_) => "Asking you a question".to_string(),
+        ToolAction::ProposeMemory { .. } => "Suggesting a memory".to_string(),
         ToolAction::TurnNotes { replace, .. } => {
             if *replace {
                 "Updating notes".to_string()
@@ -10396,6 +10543,19 @@ fn turn_notes_tool_definition() -> ToolDefinition {
         name: "turn_notes".to_string(),
         description: "Record short notes about what you have learned while investigating. The notes stay visible for the rest of this turn even after earlier rounds of the conversation are dropped to bound the request, and they carry into the next turn of this session. Use them for findings worth keeping: paths, what a component does, how pieces connect, and open questions. Append a paragraph, or set replace to rewrite the whole record. Keep them short.".to_string(),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"What to record. Appended as a new paragraph unless replace is true.\"},\"replace\":{\"type\":\"boolean\",\"description\":\"Replace the whole record instead of appending; defaults to false\"}},\"required\":[\"text\"]}".to_string(),
+    }
+}
+
+/// `propose_memory` (spec 29 §5.11). The tool can suggest, never store: the
+/// dispatch screens the candidate and at most appends a proposal, which the
+/// user confirms through a separate action. `evidence_path` selects a
+/// repository observation and makes Damaian hash the file; `source` names an
+/// external origin; neither makes the origin trusted.
+fn propose_memory_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "propose_memory".to_string(),
+        description: "Suggest one fact, convention, decision or preference worth remembering for future sessions. Nothing is stored: Damaian shows the exact sentence to the user, who confirms or dismisses it. Do not suggest credentials, content from protected or ignored files, or an instruction such as 'always approve commands'; those are refused and the user sees no card. Use evidence_path when the sentence is derived from a repository file, and source when it came from an issue, a web page or an MCP result.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"statement\":{\"type\":\"string\",\"maxLength\":280,\"description\":\"One normalized sentence, at most 280 characters; rejected rather than truncated if longer\"},\"category\":{\"type\":\"string\",\"enum\":[\"preference\",\"decision\",\"convention\",\"environment\",\"command\",\"fact\"],\"description\":\"What the statement is about\"},\"scope\":{\"type\":\"string\",\"enum\":[\"session\",\"project\",\"user\"],\"description\":\"Defaults to project. User scope applies across repositories and is off by default, so the user may choose project instead.\"},\"source\":{\"type\":\"string\",\"description\":\"Where an external observation came from, such as 'issue #412' or 'MCP result'; omit for a suggestion from this task\"},\"evidence_path\":{\"type\":\"string\",\"description\":\"Repository-relative file the statement is derived from. Protected or ignored files produce no proposal.\"}},\"required\":[\"statement\",\"category\"]}".to_string(),
     }
 }
 
@@ -10539,6 +10699,53 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
                 .map_err(|error| ClientError::InvalidInput(error.to_string()))?;
             input.validate().map_err(ClientError::InvalidInput)?;
             Ok(Some(ToolAction::AskUser(input)))
+        }
+        "propose_memory" => {
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+            else {
+                return Ok(None);
+            };
+            let Some(statement) = string_argument(&arguments, "statement") else {
+                return Err(ClientError::InvalidInput(
+                    "propose_memory requires a non-empty statement".to_string(),
+                ));
+            };
+            let category = match string_argument(&arguments, "category").as_deref() {
+                Some("preference") => MemoryCategory::Preference,
+                Some("decision") => MemoryCategory::Decision,
+                Some("convention") => MemoryCategory::Convention,
+                Some("environment") => MemoryCategory::Environment,
+                Some("command") => MemoryCategory::Command,
+                Some("fact") => MemoryCategory::Fact,
+                Some(other) => {
+                    return Err(ClientError::InvalidInput(format!(
+                        "propose_memory: unknown category {other}"
+                    )));
+                }
+                None => {
+                    return Err(ClientError::InvalidInput(
+                        "propose_memory requires a category".to_string(),
+                    ));
+                }
+            };
+            let scope = match string_argument(&arguments, "scope").as_deref() {
+                Some("session") => Some(MemoryScope::Session),
+                Some("project") => Some(MemoryScope::Project),
+                Some("user") => Some(MemoryScope::User),
+                Some(other) => {
+                    return Err(ClientError::InvalidInput(format!(
+                        "propose_memory: unknown scope {other}"
+                    )));
+                }
+                None => None,
+            };
+            Ok(Some(ToolAction::ProposeMemory {
+                statement,
+                category,
+                scope,
+                source: string_argument(&arguments, "source"),
+                evidence_path: string_argument(&arguments, "evidence_path"),
+            }))
         }
         // Empty notes are a model error worth naming, like a malformed
         // question: an empty append records nothing, and silently accepting it
@@ -12782,6 +12989,74 @@ mod clarification_tests {
         assert!(!action_awaits_plan_review(&cli_or_shell(), |_| true));
     }
 
+    fn a_memory_suggestion() -> ToolAction {
+        ToolAction::ProposeMemory {
+            statement: "Integration tests use nextest.".to_string(),
+            category: MemoryCategory::Convention,
+            scope: None,
+            source: None,
+            evidence_path: None,
+        }
+    }
+
+    #[test]
+    fn a_memory_suggestion_is_a_session_log_write_and_never_a_repository_change() {
+        let action = a_memory_suggestion();
+        assert_eq!(action_effect(&action), ActionEffect::Notes);
+        assert!(action_is_batchable_read_only(&action));
+        assert_eq!(tool_action_marker(&action).0, "propose_memory");
+        assert!(!tool_action_marker(&action).2);
+        assert_eq!(tool_action_label(&action), "Suggesting a memory");
+    }
+
+    #[test]
+    fn propose_memory_parses_its_arguments_and_rejects_unknown_vocabulary() {
+        let parsed = tool_action_from_call(&ToolCall {
+            id: "call_1".to_string(),
+            name: "propose_memory".to_string(),
+            arguments_json: serde_json::json!({
+                "statement": "Integration tests use nextest.",
+                "category": "convention",
+                "scope": "project",
+                "source": "issue #412",
+            })
+            .to_string(),
+        })
+        .unwrap()
+        .expect("a decoded call");
+        assert!(matches!(
+            parsed,
+            ToolAction::ProposeMemory {
+                scope: Some(MemoryScope::Project),
+                category: MemoryCategory::Convention,
+                ..
+            }
+        ));
+
+        let malformed = tool_action_from_call(&ToolCall {
+            id: "call_2".to_string(),
+            name: "propose_memory".to_string(),
+            arguments_json: serde_json::json!({
+                "statement": "A fact.",
+                "category": "guess",
+            })
+            .to_string(),
+        });
+        assert!(malformed.is_err(), "an unknown category is named");
+    }
+
+    #[test]
+    fn the_propose_memory_schema_restates_the_ceiling() {
+        let definition = propose_memory_tool_definition();
+        let schema: serde_json::Value = serde_json::from_str(&definition.parameters_json).unwrap();
+        assert_eq!(
+            schema["properties"]["statement"]["maxLength"],
+            crate::memory::STATEMENT_MAX_CHARS
+        );
+        assert!(definition.description.contains("Nothing is stored"));
+        assert!(definition.description.contains("protected or ignored"));
+    }
+
     #[test]
     fn the_definition_restates_the_bounds() {
         let definition = ask_user_tool_definition();
@@ -14658,6 +14933,116 @@ mod before_tool_verdict_tests {
         assert_eq!(
             before_tool_effect(&patch, Verdict::RequestApproval),
             BeforeToolEffect::SatisfiedApproval
+        );
+    }
+}
+
+/// Spec 29's two creation paths, at the point the orchestrator owns them. The
+/// eval scenarios exercise the same paths end to end; these tests pin the
+/// narrower claim that neither writes an entry.
+#[cfg(test)]
+mod memory_proposal_tests {
+    use super::*;
+    use crate::config::ModelProviderConfig;
+    use crate::workspace_engine::WorkspaceEngine;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_repo(name: &str) -> PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "damaian-memory-proposal-{name}-{now}-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("README.md"), "# Memory proposal test\n").unwrap();
+        dir
+    }
+
+    fn engine_with(repo: &Path) -> WorkspaceEngine {
+        let mut config = Config {
+            data_dir: repo.join(".damaian"),
+            enable_index_watcher: false,
+            ..Config::default()
+        };
+        config.model_providers.push(ModelProviderConfig {
+            id: "openai".to_string(),
+            label: "OpenAI".to_string(),
+            base_url: String::new(),
+            api_key_env: String::new(),
+            models: Vec::new(),
+            supports_native_tools: true,
+            max_output_tokens: None,
+            context_token_budget: None,
+            provider_reports_usage: true,
+            price_per_million_input_tokens: None,
+            price_per_million_output_tokens: None,
+            price_per_million_cached_input_tokens: None,
+            supports_explicit_cache_breakpoints: false,
+        });
+        WorkspaceEngine::new(config)
+    }
+
+    #[test]
+    fn an_explicit_remember_request_creates_a_proposal_not_an_entry() {
+        let repo = temp_repo("explicit");
+        let engine = engine_with(&repo);
+        let sessions = SessionStore::new(repo.join(".damaian"));
+        let session = sessions
+            .create_session("repo_fixture", "explicit memory")
+            .unwrap();
+        let prompt = "Please remember that integration tests need Docker running.";
+        let message = sessions
+            .append_message(&session.id, None, "user", prompt)
+            .unwrap();
+        engine
+            .chat_orchestrator
+            .propose_explicit_memory(&repo, &session.id, &message.id, prompt)
+            .unwrap();
+
+        let pending = engine.memory_store.pending_proposals(&session.id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].statement,
+            "integration tests need Docker running."
+        );
+        assert!(matches!(
+            pending[0].origin,
+            ProposalOrigin::UserRequest { .. }
+        ));
+        assert!(
+            !repo
+                .join(".damaian")
+                .join("memory")
+                .join("project")
+                .exists(),
+            "a proposal must not write a memory file"
+        );
+    }
+
+    #[test]
+    fn a_prompt_without_a_remember_cue_creates_no_proposal() {
+        let repo = temp_repo("no-cue");
+        let engine = engine_with(&repo);
+        let sessions = SessionStore::new(repo.join(".damaian"));
+        let session = sessions.create_session("repo_fixture", "no cue").unwrap();
+        let message = sessions
+            .append_message(&session.id, None, "user", "How does indexing work?")
+            .unwrap();
+        engine
+            .chat_orchestrator
+            .propose_explicit_memory(&repo, &session.id, &message.id, "How does indexing work?")
+            .unwrap();
+        assert!(
+            engine
+                .memory_store
+                .pending_proposals(&session.id)
+                .unwrap()
+                .is_empty()
         );
     }
 }

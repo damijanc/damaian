@@ -15,7 +15,7 @@ criteria) · context and decisions in [`context.md`](context.md)
 | 2 · Constructor barrier and proposal types | Done 2026-10-26 | `MemoryEntry` is `#[non_exhaustive]`, `MemoryEntry::new` is gone, and `MemoryProposal::confirm(confirmation, gate)` is the only conversion; the module docs state plainly that this is an API-surface barrier and that serde deserialization remains a deliberate second path. `ProposalOrigin` has four variants, `MemoryProposal` carries `task_id` for #28's `SuggestedAndConfirmed`, `UserConfirmation` records the action and optional scope, and `MemoryProposalGate` is built only by `MemoryStore::proposal_gate`. Confirmation normalizes the statement, enforces the 280-character ceiling, scans for secrets, applies the instruction check to every non-user origin, checks evidence eligibility, and maps origins to #28's three provenance variants. **Deviation:** fields stay public for reading; `#[non_exhaustive]` supplies the construction barrier. #28's tests now build a proposal and confirm it; tests that need an invalid record for the store to refuse deserialize one, which is the documented second path. `--test memory` 56 passed; inline `memory::` 18 passed; scoped clippy clean. |
 | 3 · Screening: statement, secret, instruction, evidence | Done 2026-10-26 | `is_instruction_shaped` uses a conservative prefix and phrase table; it runs for every non-user origin. `MemoryProposal::screen` normalizes whitespace, enforces the 280-character ceiling, rejects multi-line or control-character statements, scans the statement and every evidence path for secrets, and checks each path with `MemoryProposalGate::check_evidence` (relative, `PathPolicy::is_restricted`, configured patterns and per-directory `.gitignore`). `MemoryStore::propose` audits `memory_proposal_refused` with reason, scope, category, origin and the evidence path only; never the statement, and never a secret. `evidence_ref_for` records the content hash at proposal time. Tests cover the pattern table and benign conventions inline, a seeded secret, restricted `.env` evidence, an ignored file that is still index-resident, and an over-long statement. `--test memory` 68 passed. |
 | 4 · Proposal persistence, confirm, dismiss and cap | Done 2026-10-26 | Proposals and decisions are session-log events (`memory_proposal_proposed`, `memory_proposal_decided`) through new `pub(crate)` `SessionStore` methods; `append_session_event` stays private. `MemoryStore::propose` screens and caps non-user suggestions at `MAX_SUGGESTIONS_PER_TASK = 3`, counted from the log so a resumed turn does not reset it. `pending_proposals` is proposed minus decided. `confirm_proposal` accepts only a proposal id, re-reads and re-screens the stored proposal, inserts the entry, appends a confirmation decision and audits `memory_proposal_confirmed` with the source; a failed insert leaves the proposal pending. `dismiss_proposal` appends a dismissal and audits it without the statement. Nine integration tests cover survival across reopening, one entry per confirmation, a second confirmation refused, dismissal, the cap with an uncapped user request, user scope disabled without flipping the flag, and a user-scope proposal saved as project. `--test memory` 68 passed; scoped clippy clean. |
-| 5 · Explicit request and the `propose_memory` tool | Not started | |
+| 5 · Explicit request and the `propose_memory` tool | Done 2026-10-26 | `explicit_memory_request` reads one cue, the first sentence and nothing inferred; the turn calls it after the user message is appended. `ToolAction::ProposeMemory` is parsed by `tool_action_from_call`, offered beside `turn_notes`, allowed in every mode and profile because it writes only the session log, and charged as exploration. Dispatch maps `evidence_path` to `RepositoryObservation`, `source` without evidence to `ExternalContent`, otherwise `ModelSuggestion`; it hashes the evidence file, calls `MemoryStore::propose`, and returns a result naming what happened without repeating the statement. `ChatOrchestrator` gained its `memory_store` dependency. Proposals are session-log events, not transcript roles, so they never enter `build_conversation`. **Deviation:** the model may suggest a memory but the tool cannot confirm one; the eval scenarios cover that end to end. Tests: inline cue parsing and category/scope selection, tool parsing and schema, tool-effect classification, and two turn-level tests proving an explicit cue creates one proposal and no memory file. Scoped clippy clean. |
 | 6 · Shell routes and the confirmation card | Not started | |
 | 7 · Acceptance tests a scenario cannot cover | Not started | |
 | 8 · Deterministic eval scenarios | Not started | |
@@ -183,24 +183,26 @@ folder-path references; `npm run specs:check` reports no new mismatch for #29.
 
 ## Task 5 · Explicit request and the `propose_memory` tool
 
-- [ ] Add `explicit_memory_request(prompt)` and call it at turn start, after the
+- [x] Add `explicit_memory_request(prompt)` and call it at turn start, after the
       user message is appended, to create a `UserRequest` proposal with that
       message id.
-- [ ] Add `ToolAction::ProposeMemory`, parse `propose_memory`
+- [x] Add `ToolAction::ProposeMemory`, parse `propose_memory`
       (`statement`, `category`, optional `scope`, `source`, `evidence_path`),
       offer it wherever `turn_notes` is offered, and classify it as session-log
       only in `mode.rs` and `action_effect`.
-- [ ] Wire `ChatOrchestrator::memory_store` (constructor change) and dispatch the
+- [x] Wire `ChatOrchestrator::memory_store` (constructor change) and dispatch the
       tool: `evidence_path` selects `RepositoryObservation`, `source` without
       evidence selects `ExternalContent`, otherwise `ModelSuggestion`. Return a
       result naming what happened, never the stored statement.
-- [ ] Make sure a proposal statement never reaches the model prompt: proposals
+- [x] Make sure a proposal statement never reaches the model prompt: proposals
       are not transcript messages.
-- [ ] Tests: a prompt with "remember that …" creates exactly one proposal whose
+- [x] Tests: a prompt with "remember that …" creates exactly one proposal whose
       statement is the confirmed sentence; a scripted `propose_memory` tool call
-      creates at most a proposal and no entry; the fourth suggestion in one task
-      is refused; the tool is not offered when the mode/profile does not allow
-      it.
+      creates at most a proposal and no entry (covered by the eval scenarios);
+      the fourth suggestion in one task is refused; the tool is not offered when
+      the mode/profile does not allow it (the `permits` arm allows it in every
+      mode, like `ask_user` and `turn_notes`, because it writes only the session
+      log and authorises nothing).
 
 **Verification:** `cargo nextest run -p workspace-engine --lib chat::`;
 `cargo nextest run -p workspace-engine --test memory`.
