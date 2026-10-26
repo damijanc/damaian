@@ -254,12 +254,16 @@ The manifest is recorded per turn (already the case, via
 session, not only the most recent. A user debugging a bad answer three turns ago
 can see what that turn was given.
 
-The reader takes the **newest `context_assembled` event per task**. That is what
-makes "what was actually sent" true after a removal: the pause records the first
-assembly, and a removal appends a second `context_assembled` with the amended
-manifest before the resumed turn sends anything. An unchanged turn has exactly
-one event. `/api/session` joins the newest manifest onto each task, and each
-assistant message offers the panel for its own task.
+The event is written when the turn is **committed to sending**, not at assembly.
+A paused review records nothing until it is sent, a declined review records
+nothing, and both an unchanged and an amended send write exactly one
+`context_assembled` with the manifest they actually send. Recording at assembly
+instead would put "what this turn was sent" on a task that sent nothing, which is
+what a declined turn's cancelled assistant message would then claim. The reader
+still keeps the **newest** `context_assembled` per task, so an amended send wins
+over any earlier record, including one written by a version that recorded at
+assembly. `/api/session` joins that manifest onto each task, and each assistant
+message offers the panel for its own task.
 
 Post-send is a record and is read-only.
 
@@ -270,7 +274,7 @@ Post-send is a record and is read-only.
 | Pin file or range | Enters the `Pinned` category on every subsequent turn | Session |
 | Unpin / clear pins | Removes them | Session |
 | Remove optional item | Excluded from this turn, reason `UserRemoved` | This turn |
-| Restrict session to paths | Only these paths are eligible for context | Session |
+| Restrict session to paths | Only these paths' file content is eligible for context; the symbols row is still looked up across the repository | Session |
 | Open referenced content | Opens in app or configured editor | — |
 
 Pins and restrictions persist as appended session events, following the
@@ -306,9 +310,14 @@ does not filter `Instructions`: the `AGENTS.md` hierarchy is the repository's
 policy and `Required` content is the user's own message, and silently ignoring a
 repository's rules because the user narrowed *content* would be a surprising and
 unsafe reading of "restrict to these paths". Both are still listed in the panel,
-and an instruction may still be removed for a turn. This is recorded again in
-`context.md` §4 because the sentence "only these paths are eligible for context"
-could be read more broadly.
+and an instruction may still be removed for a turn. Nor does it filter the
+**symbols block**: that is one path-less item built from the identifiers in the
+prompt, not file content, so a match may still name a symbol and location in a
+file outside the selection. The panel says so beside the restriction, and
+`a_restriction_narrows_file_content_but_not_the_symbols_block` pins the
+exemption, so changing it is a deliberate decision rather than a silent
+regression. This is recorded again in `context.md` §5 because the sentence "only
+these paths are eligible for context" could be read more broadly.
 
 A pinned file that later becomes restricted, or is deleted, is reported in the
 excluded list with the reason rather than silently dropped from the pin list:
@@ -470,6 +479,14 @@ What was walked, and what was seen:
    Studio Code (the button is present and calls `/api/open-vscode-file`; the
    environment has no editor to open). The path button was exercised through the
    route in the handler tests instead.
+8. **The default path, re-walked after review (2026-10-26).** With the pause
+   **off**, the live `context` event arrived before the first `token` event with
+   the composer still submitting; the header read `123 / 16.0k` and the panel
+   listed Required 6, Repository map 63, Symbols 43 and File ranges 11 while the
+   answer streamed. No reload happened between the send and the panel. Applying
+   a restriction and then reloading the session showed the path back in the
+   textarea; an empty Apply was refused and left the restriction in place, and
+   **Clear paths** removed it.
 
 ### The two product questions the spec asked
 
@@ -495,9 +512,10 @@ What was walked, and what was seen:
   said no collection source yields a `LineRange`; a pinned range does, and #26's
   note and test name were corrected on the same day. Automatic collection is
   still whole-file.
-- The session restriction filters file-bearing collection only; `AGENTS.md` and
-  `Required` are exempt (`context.md` C10). That was a planning decision, not an
-  oversight, and the user guide states it.
+- The session restriction filters file-bearing collection only; `AGENTS.md`,
+  `Required` and the path-less symbols lookup are exempt (`context.md` C10). That
+  was a planning decision, not an oversight, and the user guide and the panel
+  both state it.
 
 ### Known gaps
 
@@ -513,5 +531,15 @@ What was walked, and what was seen:
 - **Composer chips are still per-request attachments.** They are deliberately
   not session pins; the panel labels the two differently. Unifying them is a
   later product decision, not a missing piece of this spec.
+- **`/api/session` reads the whole global audit log and attaches a full manifest
+  to every task.** `read_session_context_manifests` parses
+  `<data_dir>/audit/events.jsonl` from the beginning on every session load — the
+  audit trail is global, not per-session — and the response carries a manifest
+  per task. Long sessions therefore grow both the scan and the payload, and
+  there is no bounded reader, pagination or index. This is acceptable at the
+  scale the walk exercised and is a known limitation, not a correctness bug: a
+  bounded or per-session index belongs with a future audit-retention change
+  rather than here. The repository's local planning notes carry it as a
+  follow-up when they are present.
 - **CI is outstanding.** The seven-check gate runs after the user pushes; scoped
   local checks are recorded in [`tasks.md`](tasks.md)'s Task 10 row.

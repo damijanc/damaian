@@ -360,13 +360,17 @@ the **+** composer chips: a chip is an attachment for the request you are typing
 and is not carried into later turns.
 
 **Path restriction.** Enter one path per line and choose **Apply paths** to make
-only those files eligible for context in this session. The restriction narrows;
-it never widens. `restricted_patterns` and the path policy still apply on top, so
+only those files eligible for context in this session. The field shows the
+session's current restriction when the panel opens. The restriction narrows; it
+never widens. `restricted_patterns` and the path policy still apply on top, so
 selecting a restricted path does not include it. The `AGENTS.md` hierarchy and
 your own message are still included: repository instructions are policy rather
 than one of the content files you are choosing between, and your message is
-required. An empty list is a restriction that admits no file content, which is
-why **Clear paths** is a separate button.
+required. The **symbols** row is not filtered either: it is a lookup from the
+identifiers in your message, not file content, so it can still name a symbol in
+a file outside your selection. An empty list is a restriction that admits no
+file content, not "no restriction": applying an empty field is refused, and
+**Clear paths** removes the restriction.
 
 **Reviewing before sending.** By default a turn sends as soon as its context is
 assembled; the panel shows the manifest while the turn runs. Turn on **Pause

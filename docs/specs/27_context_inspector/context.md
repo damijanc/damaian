@@ -98,7 +98,7 @@ Numbered so a task can cite one. Each was checked against the code on
 | C7 | `ExclusionReason` covers the acceptance list | It does not cover `UserRemoved`, a path outside a session restriction, or a deleted pinned file. The first two are this spec's own controls; the third is required by its acceptance criteria. |
 | C8 | The pre-send/mid-turn state can live in a `PreparedContext` alone | A pause must also carry the request messages, the conversation block and the summary, because a removal has to re-render the user message before sending. `PreparedContext` is the plan half; `PendingContextReview` is the persistence half (§4). |
 | C9 | The pre-send view is one thing | It is the same manifest on two paths: a live `context` event when the pause is off, and a paused review card when it is on. Building only one would leave either the default or the requirement unmet. |
-| C10 | "Restrict the session to selected paths" | The sentence is broader than the safe reading. This spec restricts **file-bearing collection** (explicit, mention, keyword/semantic hits, project rules, pins) and leaves `Instructions` and `Required` alone. See §5. |
+| C10 | "Restrict the session to selected paths" | The sentence is broader than the safe reading. This spec restricts **file-bearing collection** (explicit, mention, keyword/semantic hits, project rules, pins) and leaves `Instructions` and `Required` alone. The symbols block is not filtered either: it is one path-less item built from the prompt's own identifiers, so a match can still name a symbol and location outside the selection. See §5. |
 | C11 | Every path in the view is clickable, including a restricted one | `/api/open-vscode-file` (`lib.rs:977`) opens any path by name and line. The existing `/api/context-file` route validates a path *for context*, which is the wrong gate for a restricted path the user wants to read. Use the open route. |
 | C12 | `PendingChatTurn` is a command-approval payload | It is the one persisted shape for every pause kind (`chat.rs:8125`); with this spec there are eight, including `ContextReview`, and `paused_for` (`:8055`) is the exhaustive tuple match that keeps each resume in its lane. A new field there is a compile-time decision. |
 
@@ -161,15 +161,20 @@ later turns" and the current turn's manifest stays truthful.
 - **The restriction is an intersection, and it is read at assembly.** It filters
   explicit paths, mentions, keyword and semantic hits, project rules and pins.
   `Instructions` (the `AGENTS.md` hierarchy) and `Required` are not filtered
-  (C10). The filter runs after normalisation, so `./src/x` and `src/x` cannot
-  disagree.
+  (C10). The symbols block is not filtered either: it is a path-less index
+  lookup built from the prompt's own identifiers, not file content, so a
+  restriction narrows which files are sent but a symbol match can still name a
+  location outside the selection. The panel says so beside the restriction
+  rather than leaving it implicit. The filter runs after normalisation, so
+  `./src/x` and `src/x` cannot disagree.
 - **Removal is only available on a paused review.** `remove_context_item` loads
   the pending turn, refuses anything that is not `PausedFor::ContextReview`, and
   then refuses a `Required` item. It removes the item, appends a `UserRemoved`
   exclusion, recomputes category use, `total_tokens` and `files`, saves the
-  pending turn again, appends a new `context_assembled` event, and returns the
-  amended manifest. `Instructions` removal is therefore a per-turn action with no
-  effect on #11's precedence.
+  pending turn again, and returns the amended manifest. It does **not** append a
+  `context_assembled` event: a removal is not a send, and the resume records the
+  amended manifest when the turn is sent. `Instructions` removal is therefore a
+  per-turn action with no effect on #11's precedence.
 - **The summary is removable, but it is not an item.** `context_remove_summary`
   sets a flag on the pending review; the resumed request passes `summary: None`
   and the conversation block states that the user removed a summary covering N

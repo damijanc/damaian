@@ -510,9 +510,12 @@ redacts field values on the way in — a second safety net over a structure that
 should contain nothing to redact. The caller records it because
 `ContextManager` has no audit log (`context_manager.rs:43-51`) and the two
 orchestrators already do; adding one to the manager would be a second audit path
-for one event. One `context_assembled` event per assembly, with the manifest as
-one JSON field beside `repositoryId`, `taskId` and `tokenEstimate`, next to the
-existing `model_request_prepared` (`chat.rs:2927-2944`).
+for one event. One `context_assembled` event per turn that sends, with the
+manifest as one JSON field beside `repositoryId`, `taskId` and `tokenEstimate`,
+next to the existing `model_request_prepared` (`chat.rs:2927-2944`). Spec 27's
+pre-send pause moved the chat record from assembly to the send: a paused review
+records nothing until **Send**, and a declined turn records nothing, so a
+cancelled task never claims a manifest it did not send.
 
 In #26 the enum carries the reasons the pipeline can actually produce:
 `RestrictedPath`, `DeduplicatedIntoRange`, `CategoryBudgetExhausted`, `Truncated`,
