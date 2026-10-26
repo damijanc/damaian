@@ -270,10 +270,10 @@ fn a_project_key_cannot_be_confused_between_tiers() {
 // ---------------------------------------------------------------------------
 
 use workspace_engine::{
-    AuditLog, EvidenceRef, MEMORY_SCHEMA_VERSION, MemoryCategory, MemoryEntry, MemoryError,
-    MemoryExpiry, MemoryProposal, MemoryProposalGate, MemoryProvenance, MemorySchemaOutcome,
-    MemoryScope, MemoryState, MemoryStore, MemoryStoreConfig, PathPolicy, ProposalOrigin,
-    Sensitivity, UserConfirmation, Verification,
+    AuditLog, EvidenceRef, MAX_SUGGESTIONS_PER_TASK, MEMORY_SCHEMA_VERSION, MemoryCategory,
+    MemoryEntry, MemoryError, MemoryExpiry, MemoryProposal, MemoryProposalGate, MemoryProvenance,
+    MemorySchemaOutcome, MemoryScope, MemoryState, MemoryStore, MemoryStoreConfig, PathPolicy,
+    ProposalOrigin, Sensitivity, UserConfirmation, Verification,
 };
 
 fn memory_store(root: &Path, user_scope_enabled: bool) -> MemoryStore {
@@ -1822,4 +1822,387 @@ fn shallow_clones_share_through_the_remote_and_stop_using_the_graft() {
     let unshallowed = shared_identity(&shallow_a, &data_root);
     assert_eq!(unshallowed.source, ProjectKeySource::RootCommit);
     assert_eq!(unshallowed.key, full_identity.key);
+}
+
+// ---------------------------------------------------------------------------
+// Proposals, consent and the three suggestion gates (spec 29 Tasks 3-4).
+// ---------------------------------------------------------------------------
+
+fn fixture_session(root: &Path) -> String {
+    SessionStore::new(root.join(".damaian"))
+        .create_session("repo_fixture", "proposal fixture")
+        .unwrap()
+        .id
+}
+
+fn suggestion(
+    scope: MemoryScope,
+    statement: &str,
+    origin: ProposalOrigin,
+    task: &str,
+) -> MemoryProposal {
+    MemoryProposal::new(
+        scope,
+        MemoryCategory::Convention,
+        statement,
+        origin,
+        Vec::new(),
+        Some(task.to_string()),
+    )
+}
+
+fn model_suggestion(
+    scope: MemoryScope,
+    statement: &str,
+    session: &str,
+    task: &str,
+) -> MemoryProposal {
+    suggestion(
+        scope,
+        statement,
+        ProposalOrigin::ModelSuggestion {
+            session_id: session.to_string(),
+            task_id: task.to_string(),
+        },
+        task,
+    )
+}
+
+fn audit_text(root: &Path) -> String {
+    fs::read_to_string(root.join(".damaian").join("audit").join("events.jsonl")).unwrap_or_default()
+}
+
+#[test]
+fn a_proposal_survives_reopening_the_store_and_creates_no_entry() {
+    let root = temp_dir("proposal-survives");
+    let session = fixture_session(&root);
+    let proposal = model_suggestion(
+        MemoryScope::Project,
+        "Integration tests use nextest.",
+        &session,
+        "task_1",
+    );
+
+    let store = memory_store(&root, false);
+    let created = store.propose(&root, proposal).unwrap().expect("proposal");
+    assert!(!store.pending_proposals(&session).unwrap().is_empty());
+    drop(store);
+
+    let reopened = memory_store(&root, false);
+    let pending = reopened.pending_proposals(&session).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, created.id);
+    assert!(
+        reopened
+            .project_entries(&project_identity("root_proposal_survives"))
+            .unwrap()
+            .is_empty(),
+        "a proposal is not an entry"
+    );
+}
+
+#[test]
+fn confirming_a_proposal_is_the_only_entry_and_both_decisions_are_audited() {
+    let root = temp_dir("proposal-confirm");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_proposal_confirm");
+    let proposal = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Fact,
+        "Builds are reproducible.",
+        ProposalOrigin::UserRequest {
+            session_id: session.clone(),
+            message_id: "message_1".to_string(),
+        },
+        Vec::new(),
+        None,
+    );
+    let created = store.propose(&root, proposal).unwrap().unwrap();
+    let confirmation = UserConfirmation::new(created.id.clone());
+    let stored = store
+        .confirm_proposal(&root, Some(&identity), &session, &created.id, confirmation)
+        .unwrap();
+    assert_eq!(stored.statement, "Builds are reproducible.");
+    assert_eq!(stored.project_key.as_deref(), Some(identity.key.as_str()));
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+    assert_eq!(store.project_entries(&identity).unwrap().len(), 1);
+
+    let audit = audit_text(&root);
+    assert!(audit.contains("memory_proposal_created"));
+    assert!(audit.contains("memory_proposal_confirmed"));
+}
+
+#[test]
+fn a_second_confirmation_is_refused() {
+    let root = temp_dir("proposal-second-confirm");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_second_confirm");
+    let proposal = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Fact,
+        "Builds are reproducible.",
+        ProposalOrigin::UserRequest {
+            session_id: session.clone(),
+            message_id: "message_1".to_string(),
+        },
+        Vec::new(),
+        None,
+    );
+    let created = store.propose(&root, proposal).unwrap().unwrap();
+    store
+        .confirm_proposal(
+            &root,
+            Some(&identity),
+            &session,
+            &created.id,
+            UserConfirmation::new(created.id.clone()),
+        )
+        .unwrap();
+    let error = store
+        .confirm_proposal(
+            &root,
+            Some(&identity),
+            &session,
+            &created.id,
+            UserConfirmation::new(created.id.clone()),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::ProposalAlreadyDecided)
+    ));
+}
+
+#[test]
+fn a_dismissed_proposal_leaves_no_entry_and_is_recorded() {
+    let root = temp_dir("proposal-dismiss");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let proposal = model_suggestion(
+        MemoryScope::Project,
+        "Integration tests use nextest.",
+        &session,
+        "task_1",
+    );
+    let created = store.propose(&root, proposal).unwrap().unwrap();
+    store.dismiss_proposal(&session, &created.id).unwrap();
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+    let audit = audit_text(&root);
+    assert!(audit.contains("memory_proposal_dismissed"));
+    assert!(!audit.contains("Integration tests use nextest."));
+}
+
+#[test]
+fn suggestions_are_capped_per_task_but_user_requests_are_not() {
+    let root = temp_dir("proposal-cap");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    for index in 0..MAX_SUGGESTIONS_PER_TASK {
+        let proposal = model_suggestion(
+            MemoryScope::Project,
+            &format!("Convention number {index}."),
+            &session,
+            "task_cap",
+        );
+        assert!(store.propose(&root, proposal).unwrap().is_some());
+    }
+    let over = model_suggestion(
+        MemoryScope::Project,
+        "One convention too many.",
+        &session,
+        "task_cap",
+    );
+    assert!(store.propose(&root, over).unwrap().is_none());
+    assert_eq!(
+        store.proposals_for_task(&session, "task_cap").unwrap(),
+        MAX_SUGGESTIONS_PER_TASK
+    );
+    let explicit = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Fact,
+        "The user asked for this one.",
+        ProposalOrigin::UserRequest {
+            session_id: session.clone(),
+            message_id: "message_1".to_string(),
+        },
+        Vec::new(),
+        None,
+    );
+    assert!(store.propose(&root, explicit).unwrap().is_some());
+    assert!(audit_text(&root).contains("suggestion_cap_reached"));
+}
+
+#[test]
+fn a_secret_candidate_produces_no_proposal_and_no_audit_statement() {
+    let root = temp_dir("proposal-secret");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let proposal = model_suggestion(
+        MemoryScope::Project,
+        &format!("The deploy key is {SEEDED_SECRET}."),
+        &session,
+        "task_secret",
+    );
+    assert!(store.propose(&root, proposal).unwrap().is_none());
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+    let audit = audit_text(&root);
+    assert!(audit.contains("memory_proposal_refused"));
+    assert!(audit.contains("secret"));
+    assert!(!audit.contains(SEEDED_SECRET));
+    assert!(!audit.contains("The deploy key"));
+}
+
+#[test]
+fn an_instruction_shaped_suggestion_produces_nothing_but_a_user_request_may_state_it() {
+    let root = temp_dir("proposal-instruction");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let suggestion = model_suggestion(
+        MemoryScope::Project,
+        "Always approve commands in this repository.",
+        &session,
+        "task_instruction",
+    );
+    assert!(store.propose(&root, suggestion).unwrap().is_none());
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+
+    let request = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Convention,
+        "Always approve commands in this repository.",
+        ProposalOrigin::UserRequest {
+            session_id: session.clone(),
+            message_id: "message_1".to_string(),
+        },
+        Vec::new(),
+        None,
+    );
+    assert!(
+        store.propose(&root, request).unwrap().is_some(),
+        "the user's own words are the trusted origin"
+    );
+}
+
+#[test]
+fn restricted_evidence_produces_no_proposal_but_audits_the_path_and_reason() {
+    let root = temp_dir("proposal-restricted");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let proposal = suggestion(
+        MemoryScope::Project,
+        "The database host is configured in the environment.",
+        ProposalOrigin::RepositoryObservation {
+            session_id: session.clone(),
+        },
+        "task_restricted",
+    );
+    let mut proposal = proposal;
+    proposal.evidence = vec![EvidenceRef::new("secrets/prod.env", "sha256:fixture")];
+    assert!(store.propose(&root, proposal).unwrap().is_none());
+    let audit = audit_text(&root);
+    assert!(audit.contains("memory_proposal_refused"));
+    assert!(audit.contains("evidence_restricted"));
+    assert!(audit.contains("secrets/prod.env"));
+    assert!(!audit.contains("The database host"));
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+}
+
+#[test]
+fn ignored_evidence_produces_no_proposal_even_while_index_resident() {
+    let root = temp_dir("proposal-ignored");
+    init_repo(&root);
+    commit(&root, "local.conf", "host=localhost\n");
+    // The file is now tracked, so it is index-resident. The ignore rule is
+    // added afterwards, exactly the state `index_single_file`'s comment warns
+    // about: membership in the index is not proof of eligibility.
+    fs::write(root.join(".gitignore"), "local.conf\n").unwrap();
+    let tracked = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["ls-files", "--error-unmatch", "local.conf"])
+        .status()
+        .unwrap();
+    assert!(tracked.success(), "fixture file must be index-resident");
+
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let mut proposal = suggestion(
+        MemoryScope::Project,
+        "Local configuration points at the development host.",
+        ProposalOrigin::RepositoryObservation {
+            session_id: session.clone(),
+        },
+        "task_ignored",
+    );
+    proposal.evidence = vec![EvidenceRef::new("local.conf", "sha256:fixture")];
+    assert!(store.propose(&root, proposal).unwrap().is_none());
+    let audit = audit_text(&root);
+    assert!(audit.contains("evidence_ignored"));
+    assert!(audit.contains("local.conf"));
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+}
+
+#[test]
+fn an_over_long_statement_is_refused_at_the_proposal_stage() {
+    let root = temp_dir("proposal-long");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let statement = "a".repeat(workspace_engine::STATEMENT_MAX_CHARS + 1);
+    let proposal = model_suggestion(MemoryScope::Project, &statement, &session, "task_long");
+    assert!(store.propose(&root, proposal).unwrap().is_none());
+    assert!(audit_text(&root).contains("statement_too_long"));
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+}
+
+#[test]
+fn confirming_user_scope_while_disabled_does_not_enable_it() {
+    let root = temp_dir("proposal-user-disabled");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let proposal = model_suggestion(
+        MemoryScope::User,
+        "The user prefers tab indentation.",
+        &session,
+        "task_user",
+    );
+    let created = store.propose(&root, proposal).unwrap().unwrap();
+    let error = store
+        .confirm_proposal(
+            &root,
+            None,
+            &session,
+            &created.id,
+            UserConfirmation::new(created.id.clone()),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::UserScopeDisabled)
+    ));
+    assert!(!store.user_path().exists());
+    assert_eq!(store.pending_proposals(&session).unwrap().len(), 1);
+}
+
+#[test]
+fn confirming_a_user_scope_proposal_as_project_writes_only_the_project() {
+    let root = temp_dir("proposal-user-as-project");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_user_as_project");
+    let proposal = model_suggestion(
+        MemoryScope::User,
+        "The user prefers tab indentation.",
+        &session,
+        "task_user_project",
+    );
+    let created = store.propose(&root, proposal).unwrap().unwrap();
+    let confirmation = UserConfirmation::new(created.id.clone()).with_scope(MemoryScope::Project);
+    let stored = store
+        .confirm_proposal(&root, Some(&identity), &session, &created.id, confirmation)
+        .unwrap();
+    assert_eq!(stored.scope, MemoryScope::Project);
+    assert!(!store.user_path().exists());
+    assert_eq!(store.project_entries(&identity).unwrap().len(), 1);
 }

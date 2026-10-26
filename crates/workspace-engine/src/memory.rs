@@ -19,7 +19,7 @@ use crate::audit::AuditLog;
 use crate::config::DEFAULT_IGNORE_PATTERNS;
 use crate::error::{ClientError, Result};
 use crate::git_service::GitService;
-use crate::hash::{create_id, now_millis, repository_id_for_root, sha256_hex};
+use crate::hash::{create_id, file_hash, now_millis, repository_id_for_root, sha256_hex};
 use crate::ignore::{is_ignored_by_rules, parse_ignore_patterns};
 use crate::path_policy::PathPolicy;
 use crate::secret_scanner::SecretScanner;
@@ -258,6 +258,11 @@ pub struct MemoryEntry {
 /// rather than truncated (spec 29 §5.5): a cut sentence is a misleading one.
 pub const STATEMENT_MAX_CHARS: usize = 280;
 
+/// How many suggestions one task may produce. A small cap is the difference
+/// between reading three proposals and dismissing twelve; explicit user
+/// requests are not capped (spec 29 §5.4).
+pub const MAX_SUGGESTIONS_PER_TASK: usize = 3;
+
 impl MemoryEntry {
     pub fn in_project(mut self, project_key: impl Into<String>) -> Self {
         self.project_key = Some(project_key.into());
@@ -429,20 +434,12 @@ impl MemoryProposal {
         }
     }
 
-    /// The only conversion from a proposal to a storable record.
+    /// The gate every proposal passes before it can be shown or confirmed.
     ///
-    /// Re-checks the statement, a detected secret, the instruction-shape rule
-    /// for non-user origins and every evidence path. The store checks the same
-    /// things again on `insert`; this is the gate that stops a bad candidate
-    /// being shown as a card.
-    pub fn confirm(
-        self,
-        confirmation: UserConfirmation,
-        gate: MemoryProposalGate<'_>,
-    ) -> MemoryResult<MemoryEntry> {
-        if confirmation.proposal_id != self.id {
-            return Err(MemoryError::Refused(MemoryRefusal::ConfirmationMismatch));
-        }
+    /// Refusal happens here, not merely as a flag on a card: a secret, an
+    /// instruction-shaped non-user candidate, or ineligible evidence produces
+    /// no proposal at all.
+    pub fn screen(&self, gate: &MemoryProposalGate<'_>) -> MemoryResult<()> {
         let statement = normalize_statement(&self.statement);
         if statement.is_empty() {
             return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
@@ -460,11 +457,6 @@ impl MemoryProposal {
         if !self.origin.is_user_request() && is_instruction_shaped(&statement) {
             return Err(MemoryError::Refused(MemoryRefusal::InstructionShaped));
         }
-        if gate.scanner.contains_secrets(&statement) {
-            return Err(MemoryError::Refused(MemoryRefusal::Secret {
-                category: "detected".to_string(),
-            }));
-        }
         if let Some(finding) = gate.scanner.scan(&statement).into_iter().next() {
             return Err(MemoryError::Refused(MemoryRefusal::Secret {
                 category: finding.category,
@@ -473,6 +465,25 @@ impl MemoryProposal {
         for evidence in &self.evidence {
             gate.check_evidence(&evidence.path)?;
         }
+        Ok(())
+    }
+
+    /// The only conversion from a proposal to a storable record.
+    ///
+    /// Re-checks the statement, a detected secret, the instruction-shape rule
+    /// for non-user origins and every evidence path. The store checks the same
+    /// things again on `insert`; this is the gate that stops a bad candidate
+    /// being shown as a card.
+    pub fn confirm(
+        self,
+        confirmation: UserConfirmation,
+        gate: MemoryProposalGate<'_>,
+    ) -> MemoryResult<MemoryEntry> {
+        if confirmation.proposal_id != self.id {
+            return Err(MemoryError::Refused(MemoryRefusal::ConfirmationMismatch));
+        }
+        self.screen(&gate)?;
+        let statement = normalize_statement(&self.statement);
 
         let scope = confirmation.scope.unwrap_or(self.scope);
         let scope_allowed = matches!(
@@ -652,6 +663,13 @@ impl MemoryProposalGate<'_> {
 /// confirmation showed, so normalization happens before it is seen.
 pub fn normalize_statement(statement: &str) -> String {
     statement.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The evidence reference for a repository-relative file: the path as given and
+/// the file's hash at proposal time. The hash is recorded, never the content.
+pub fn evidence_ref_for(root: &Path, path: &str) -> MemoryResult<EvidenceRef> {
+    let hash = file_hash(root.join(path)).map_err(|error| MemoryError::Io(error.to_string()))?;
+    Ok(EvidenceRef::new(path, hash))
 }
 
 /// Conservative instruction-shape detection for non-user origins (spec 29
@@ -1519,6 +1537,204 @@ impl MemoryStore {
             self.audit_memory("memory_confirmed", &entry, None, Some(MemoryState::Active))?;
         }
         Ok(entry)
+    }
+
+    /// Screen and persist a proposal, or refuse it without showing a card.
+    ///
+    /// A refusal is audited with the reason and, when the candidate carried
+    /// one, the evidence path; the statement is never an audit field. The
+    /// candidate itself is not written to the session log, so there is nothing
+    /// for a user to dismiss.
+    pub fn propose(
+        &self,
+        root: &Path,
+        proposal: MemoryProposal,
+    ) -> MemoryResult<Option<MemoryProposal>> {
+        let gate = self.proposal_gate(root, None);
+        if let Err(error) = proposal.screen(&gate) {
+            self.audit_proposal_refused(&proposal, &error)?;
+            return Ok(None);
+        }
+        if !proposal.origin.is_user_request()
+            && let Some(task_id) = proposal.task_id.as_deref()
+            && self.proposals_for_task(proposal.origin.session_id(), task_id)?
+                >= MAX_SUGGESTIONS_PER_TASK
+        {
+            let error = MemoryError::Refused(MemoryRefusal::SuggestionCapReached);
+            self.audit_proposal_refused(&proposal, &error)?;
+            return Ok(None);
+        }
+        let encoded = serde_json::to_string(&proposal)
+            .map_err(|error| MemoryError::Invalid(error.to_string()))?;
+        self.session_store
+            .append_memory_proposal(proposal.origin.session_id(), &encoded)?;
+        self.audit_proposal_created(&proposal)?;
+        Ok(Some(proposal))
+    }
+
+    /// The proposals still awaiting a decision in a session, oldest first.
+    pub fn pending_proposals(&self, session_id: &str) -> MemoryResult<Vec<MemoryProposal>> {
+        let proposed = self
+            .session_store
+            .memory_proposal_records(session_id, "memory_proposal_proposed")?;
+        let decided = self.decided_proposal_ids(session_id)?;
+        Ok(proposed
+            .iter()
+            .filter_map(|payload| serde_json::from_str::<MemoryProposal>(payload).ok())
+            .filter(|proposal| !decided.contains(&proposal.id))
+            .collect())
+    }
+
+    /// How many proposals a task has already produced, including decided ones.
+    /// Read from the log, so a resumed turn counts what it already suggested.
+    pub fn proposals_for_task(&self, session_id: &str, task_id: &str) -> MemoryResult<usize> {
+        let proposed = self
+            .session_store
+            .memory_proposal_records(session_id, "memory_proposal_proposed")?;
+        Ok(proposed
+            .iter()
+            .filter_map(|payload| serde_json::from_str::<MemoryProposal>(payload).ok())
+            .filter(|proposal| proposal.task_id.as_deref() == Some(task_id))
+            .count())
+    }
+
+    /// Confirm a stored proposal. The caller supplies an id, never a
+    /// statement: the proposal is re-read and re-screened before conversion.
+    pub fn confirm_proposal(
+        &self,
+        root: &Path,
+        identity: Option<&ProjectIdentity>,
+        session_id: &str,
+        proposal_id: &str,
+        confirmation: UserConfirmation,
+    ) -> MemoryResult<MemoryEntry> {
+        if confirmation.proposal_id != proposal_id {
+            return Err(MemoryError::Refused(MemoryRefusal::ConfirmationMismatch));
+        }
+        if self
+            .decided_proposal_ids(session_id)?
+            .iter()
+            .any(|id| id == proposal_id)
+        {
+            return Err(MemoryError::Refused(MemoryRefusal::ProposalAlreadyDecided));
+        }
+        let proposal = self
+            .pending_proposals(session_id)?
+            .into_iter()
+            .find(|proposal| proposal.id == proposal_id)
+            .ok_or(MemoryError::Refused(MemoryRefusal::UnknownProposal))?;
+        let entry = proposal
+            .clone()
+            .confirm(confirmation.clone(), self.proposal_gate(root, identity))?;
+        let stored = self.insert(root, identity, entry)?;
+        let decision = serde_json::json!({
+            "proposalId": proposal_id,
+            "decision": "confirmed",
+            "entryId": stored.id,
+            "confirmationId": confirmation.id,
+            "scope": stored.scope.as_str(),
+            "category": stored.category.as_str(),
+            "origin": stored.provenance.kind(),
+            "source": proposal.source_label(),
+            "decidedAtMs": now_millis(),
+        });
+        self.session_store
+            .append_memory_proposal_decision(session_id, &decision.to_string())?;
+        self.audit_proposal_decision("memory_proposal_confirmed", &proposal, "confirmed")?;
+        Ok(stored)
+    }
+
+    /// Dismiss a pending proposal. No entry is created; the proposal and its
+    /// dismissal stay in the session log so a later reader can see both.
+    pub fn dismiss_proposal(&self, session_id: &str, proposal_id: &str) -> MemoryResult<()> {
+        if self
+            .decided_proposal_ids(session_id)?
+            .iter()
+            .any(|id| id == proposal_id)
+        {
+            return Err(MemoryError::Refused(MemoryRefusal::ProposalAlreadyDecided));
+        }
+        let proposal = self
+            .pending_proposals(session_id)?
+            .into_iter()
+            .find(|proposal| proposal.id == proposal_id)
+            .ok_or(MemoryError::Refused(MemoryRefusal::UnknownProposal))?;
+        let decision = serde_json::json!({
+            "proposalId": proposal_id,
+            "decision": "dismissed",
+            "decidedAtMs": now_millis(),
+        });
+        self.session_store
+            .append_memory_proposal_decision(session_id, &decision.to_string())?;
+        self.audit_proposal_decision("memory_proposal_dismissed", &proposal, "dismissed")?;
+        Ok(())
+    }
+
+    fn decided_proposal_ids(&self, session_id: &str) -> MemoryResult<Vec<String>> {
+        Ok(self
+            .session_store
+            .memory_proposal_records(session_id, "memory_proposal_decided")?
+            .iter()
+            .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+            .filter_map(|value| {
+                value
+                    .get("proposalId")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            })
+            .collect())
+    }
+
+    fn audit_proposal_created(&self, proposal: &MemoryProposal) -> MemoryResult<()> {
+        let fields = self.proposal_audit_fields(proposal);
+        self.audit_log.record("memory_proposal_created", &fields)?;
+        Ok(())
+    }
+
+    fn audit_proposal_refused(
+        &self,
+        proposal: &MemoryProposal,
+        error: &MemoryError,
+    ) -> MemoryResult<()> {
+        let mut fields = self.proposal_audit_fields(proposal);
+        let reason = match error {
+            MemoryError::Refused(refusal) => refusal.reason_code(),
+            _ => "invalid",
+        };
+        fields.push(("reason", reason.to_string()));
+        if let Some(path) = proposal.evidence.first() {
+            fields.push(("path", path.path.clone()));
+        }
+        self.audit_log.record("memory_proposal_refused", &fields)?;
+        Ok(())
+    }
+
+    fn audit_proposal_decision(
+        &self,
+        event: &str,
+        proposal: &MemoryProposal,
+        decision: &str,
+    ) -> MemoryResult<()> {
+        let mut fields = self.proposal_audit_fields(proposal);
+        fields.push(("decision", decision.to_string()));
+        self.audit_log.record(event, &fields)?;
+        Ok(())
+    }
+
+    fn proposal_audit_fields(&self, proposal: &MemoryProposal) -> Vec<(&'static str, String)> {
+        let mut fields = vec![
+            ("proposalId", proposal.id.clone()),
+            ("scope", proposal.scope.as_str().to_string()),
+            ("category", proposal.category.as_str().to_string()),
+            ("origin", proposal.origin.kind().to_string()),
+        ];
+        if let Some(task_id) = proposal.task_id.as_deref() {
+            fields.push(("taskId", task_id.to_string()));
+        }
+        if let ProposalOrigin::ExternalContent { source, .. } = &proposal.origin {
+            fields.push(("source", source.clone()));
+        }
+        fields
     }
 
     /// Replaces an active entry's statement. The edited record is appended;

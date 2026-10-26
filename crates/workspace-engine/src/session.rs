@@ -1131,6 +1131,44 @@ impl SessionStore {
             .collect())
     }
 
+    /// Appends a proposed memory (spec 29 §5.10).
+    ///
+    /// A proposal is not an entry and never reaches the memory store by being
+    /// read back. It lives in the session log so it survives a reload and a
+    /// restart, and dies with its session. The memory store is the only
+    /// production caller and has already screened the candidate.
+    pub(crate) fn append_memory_proposal(&self, session_id: &str, proposal: &str) -> Result<()> {
+        self.append_session_event(session_id, "memory_proposal_proposed", proposal)
+    }
+
+    /// Appends a proposal decision: confirmed or dismissed.
+    pub(crate) fn append_memory_proposal_decision(
+        &self,
+        session_id: &str,
+        decision: &str,
+    ) -> Result<()> {
+        self.append_session_event(session_id, "memory_proposal_decided", decision)
+    }
+
+    /// Every proposal event in a session log, in append order. The caller
+    /// separates proposed from decided so the pending list is one pass and a
+    /// rewind drops a proposal with the turn it belongs to.
+    pub(crate) fn memory_proposal_records(
+        &self,
+        session_id: &str,
+        event_type: &str,
+    ) -> Result<Vec<String>> {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(Vec::new());
+        };
+        Ok(active_events(&content)
+            .into_iter()
+            .filter(|event| event.event_type == event_type)
+            .map(|event| event.payload.to_string())
+            .collect())
+    }
+
     /// Adds a file or range to the context the session carries into every
     /// turn (spec 27 §5.4). Appends an event; it never rewrites the log.
     pub fn add_context_pin(

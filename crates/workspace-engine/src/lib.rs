@@ -142,12 +142,12 @@ pub use mcp::{
     parse_namespaced_tool_name,
 };
 pub use memory::{
-    EvidenceRef, EvidenceRefusal, MEMORY_SCHEMA_VERSION, MemoryCategory, MemoryEntry, MemoryError,
-    MemoryExpiry, MemoryProposal, MemoryProposalGate, MemoryProvenance, MemoryRefusal,
-    MemoryResult, MemorySchemaOutcome, MemoryScope, MemoryState, MemoryStore, MemoryStoreConfig,
-    MemoryTarget, ProjectIdentity, ProjectKeySource, ProposalOrigin, STATEMENT_MAX_CHARS,
-    Sensitivity, UserConfirmation, Verification, is_instruction_shaped, normalize_remote_url,
-    normalize_statement,
+    EvidenceRef, EvidenceRefusal, MAX_SUGGESTIONS_PER_TASK, MEMORY_SCHEMA_VERSION, MemoryCategory,
+    MemoryEntry, MemoryError, MemoryExpiry, MemoryProposal, MemoryProposalGate, MemoryProvenance,
+    MemoryRefusal, MemoryResult, MemorySchemaOutcome, MemoryScope, MemoryState, MemoryStore,
+    MemoryStoreConfig, MemoryTarget, ProjectIdentity, ProjectKeySource, ProposalOrigin,
+    STATEMENT_MAX_CHARS, Sensitivity, UserConfirmation, Verification, evidence_ref_for,
+    is_instruction_shaped, normalize_remote_url, normalize_statement,
 };
 pub use mode::SessionMode;
 pub use model::{
