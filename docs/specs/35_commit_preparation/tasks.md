@@ -12,7 +12,7 @@ pre-implementation state in [`context.md`](context.md)
 |---|---|---|
 | 1 · Folder, links, plan | Done 2026-10-26 | Converted the single file to `proposal.md`, added `context.md` (fifteen corrections, decisions D1–D10) and this plan, updated every link that named the old path (README, #36, #37, #38, #52, #57, #58), and set `In progress` in the proposal, the README current-state bullet, the README implementation-order row and this header. `npm run specs:check` passed: 66 specs, dependency lines and status records agree. Fast checks passed: `scripts/quality-gate.sh fmt node lint typos deny`; `npm ci` was needed first because the worktree had no `node_modules`. |
 | 2 · The `allow_git_commits` capability | Done 2026-10-26 | Added the sixth capability key beside `allow_file_edits`: `Config` default `true`, `ConfigOverlay` parse/serialise, an explicit capability classification, a restrict-only merge case, `ProfileCapabilities.allow_git_commits`, `ReadOnly` turns it off, the effective-policy label "Git commits allowed", and `Config::profile_capabilities`. The weakening case in `tests/permission_profiles.rs` proves a repository can only refuse it; `each_built_in_profile_resolves_to_its_table_row` now expects Read-only `false`. Scoped `cargo nextest -p workspace-engine --test permission_profiles` passed (74 passed, 1 skipped); clippy clean; fast checks clean after `cargo fmt`. |
-| 3 · Durable acceptance detail and the commit engine | Not started | |
+| 3 · Durable acceptance detail and the commit engine | Done 2026-10-26 | `PatchFileDecision` gained `applied_hashes` and `accepted_hunks` (both `#[serde(default)]`); `apply_stored_patch` fills them from `PatchApplyResult::applied` and `hunk_selection`, reject paths leave them empty. `SessionStore` gained `append_commit_created` and `read_change_timeline`, which walks applied decisions and commits in log order. New `workspace-engine/src/commit.rs`: candidate set from that timeline plus checkpoint origins, redacted per-path diffs, deterministic message, verification summary, and `prepare`/`commit` through a private `GIT_INDEX_FILE` with `read-tree`/`hash-object`/`update-index`/`write-tree`/`ls-tree` verification/`commit-tree`/`update-ref <new> <old>`; the record is saved under `<data_dir>/commits/`. `GitService::changes` lists untracked files with `-uall` and `-z`, filtered by the same restricted-path rule. Hooks and the secret scan are implemented in the same module; their tests land in Tasks 4 and 5. Nine tests in `tests/commit_preparation.rs` pass (accepted subset, hunk-level, hand edit, command effect, index untouched, HEAD moved, detached/merge, mode+profile gate, invalid selection); `--test foundation` passed (171). Scoped clippy and the fast checks are clean. Deviations: `prepare` saves a record under the data dir (Damaian state, not the repository); the tree is verified against a full expected map, not only the selected paths; `GitService::changes` is new rather than widening `status`, because `status` collapses untracked directories. |
 | 4 · Git hooks: detect, report, run, never bypass | Not started | |
 | 5 · Exact bytes, the secret check and the per-commit override | Not started | |
 | 6 · Message drafting with the deterministic fallback | Not started | |
@@ -202,7 +202,7 @@ D1–D3.
 **Files:** `session.rs`, `edit.rs`, `commit.rs` (new), `workspace_engine.rs`,
 `lib.rs`, `tests/commit_preparation.rs` (new).
 
-- [ ] **Step 1: Write the failing tests** in
+- [x] **Step 1: Write the failing tests** in
   `crates/workspace-engine/tests/commit_preparation.rs` with a fixture whose
   data directory is `base/data` and repository is `base/repo`; `git init`,
   identity, `gpgsign=false`, `gc.auto=0`:
@@ -232,8 +232,8 @@ D1–D3.
   8. `the_commit_tree_is_verified_before_the_ref_moves` — a unit test over the
      composition helper: a deliberately wrong expected tree aborts before
      `commit-tree` (no new ref).
-- [ ] **Step 2: Confirm they fail** (the module and types do not exist).
-- [ ] **Step 3: Implement the durable detail.**
+- [x] **Step 2: Confirm they fail** (the module and types do not exist).
+- [x] **Step 3: Implement the durable detail.**
   - `PatchFileDecision` gains `#[serde(default)] applied_hashes:
     BTreeMap<String, String>` and `#[serde(default)] accepted_hunks:
     BTreeMap<String, Vec<String>>`.
@@ -241,7 +241,7 @@ D1–D3.
     `apply_stored_patch` passes `result.applied` and, per path, `hunk_selection`
     or all of the file's hunk ids; reject paths pass empty maps.
   - Keep old logs loadable: both fields default to empty.
-- [ ] **Step 4: Implement the commit engine.**
+- [x] **Step 4: Implement the commit engine.**
   - Types: `CommitCandidate { path, status, source, labels, selected_by_default,
     blob_oid, mode, size, unscanned, diff }`; `CommitPreparation`;
     `CommitStatus`; `CommitRequest`; `CommitOutcome`; `CommitError`;
@@ -268,12 +268,12 @@ D1–D3.
     the audit log.
   - Add `CommitEngine` to `WorkspaceEngine` and re-export the public types from
     `lib.rs`.
-- [ ] **Step 5: Falsify.** Use the user's index instead of the private one → test
+- [x] **Step 5: Falsify.** Use the user's index instead of the private one → test
   5 fails. Drop the hash comparison → test 3 commits after a hand edit. Skip the
   tree verification → the verification test's negative case passes when it
   should refuse. Compare HEAD only before composition → test 6's CAS still
   passes but the pre-check removal is caught by a log assertion; restore.
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -281,7 +281,7 @@ D1–D3.
   CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo nextest run -p workspace-engine --test commit_preparation --test foundation
   ```
 
-- [ ] **Step 7: Update the Progress row** and commit:
+- [x] **Step 7: Update the Progress row** and commit:
   `Commit exactly the accepted changes through a private index`.
 
 ## Task 4: Git hooks: detect, report, run, never bypass

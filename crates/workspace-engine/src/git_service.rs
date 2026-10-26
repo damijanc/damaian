@@ -320,6 +320,72 @@ impl GitService {
         self.status_in(root_path, None)
     }
 
+    /// Every changed and untracked **file**, with no untracked directory
+    /// collapsed, for a commit's candidate set (spec 35 §5.2).
+    ///
+    /// `status` is the read a model sees: it is capped and it collapses an
+    /// untracked directory into one entry, which a commit cannot use because a
+    /// directory is not a blob. This runs `-uall` and `-z`, so a path holding a
+    /// newline or non-ASCII bytes arrives as itself rather than C-quoted, and
+    /// applies the same restricted-path filter. Not capped: a commit that
+    /// silently omitted a candidate would be worse than a long list, and the
+    /// caller's UI is the place to bound presentation.
+    pub fn changes(&self, root_path: impl AsRef<Path>) -> Result<Vec<GitFileStatus>> {
+        let root = root_path.as_ref();
+        let output = git_output(
+            root,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )?;
+        let exit_code = output.status.code().unwrap_or(-1);
+        if exit_code != 0 {
+            return Err(ClientError::Git(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        let mut records = output
+            .stdout
+            .split(|&byte| byte == 0)
+            .filter(|record| !record.is_empty());
+        let mut files = Vec::new();
+        while let Some(record) = records.next() {
+            if record.len() < 4 {
+                continue;
+            }
+            let index_status = record[0];
+            let worktree_status = record[1];
+            // A rename or copy record is followed by the original path; the
+            // target is the first record, which is the one a commit names.
+            if matches!(index_status, b'R' | b'C') || matches!(worktree_status, b'R' | b'C') {
+                let _original = records.next();
+            }
+            let path = String::from_utf8_lossy(&record[3..]).into_owned();
+            if self.path_is_restricted(&path) {
+                continue;
+            }
+            let pair = format!("{}{}", index_status as char, worktree_status as char);
+            files.push(GitFileStatus {
+                path,
+                raw: String::from_utf8_lossy(record).into_owned(),
+                staged: index_status != b' ' && index_status != b'?',
+                worktree: worktree_status != b' ',
+                untracked: index_status == b'?' && worktree_status == b'?',
+                conflicted: ["AA", "DD", "AU", "UD", "UA", "DU", "UU"].contains(&pair.as_str()),
+            });
+        }
+        self.audit_log.record(
+            "git_status_read",
+            &[
+                ("actor", "system".to_string()),
+                ("resourcePath", root.to_string_lossy().to_string()),
+                ("status", "complete".to_string()),
+                ("exitCode", exit_code.to_string()),
+                ("scope", "commit_candidates".to_string()),
+                ("fileCount", files.len().to_string()),
+            ],
+        )?;
+        Ok(files)
+    }
+
     /// [`Self::status`] of a worktree's root, recording `worktree` (its
     /// display path) in the audit record; `None` is the session's own checkout.
     pub fn status_in(

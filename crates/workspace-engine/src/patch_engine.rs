@@ -122,7 +122,8 @@ struct RollbackSnapshot {
 /// Carries only the path, the distinct finding categories, and how many were
 /// found — never the matched text, so surfacing this to the UI or the audit
 /// log cannot leak a real credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GeneratedSecretWarning {
     pub path: String,
     pub categories: Vec<String>,

@@ -76,6 +76,46 @@ pub struct PatchFileDecision {
     /// than an enum because a decision event describes exactly one action and a
     /// third state would be a different event.
     pub applied: bool,
+    /// What Damaian wrote at each applied path, from
+    /// `PatchApplyResult::applied`. Spec 35 uses it to tell an accepted file
+    /// that is still exactly as Damaian left it from one the user edited
+    /// afterwards; without it a commit can only guess.
+    ///
+    /// Empty for a rejection, and for a decision written before spec 35.
+    #[serde(default)]
+    pub applied_hashes: BTreeMap<String, String>,
+    /// The hunk ids accepted for each applied path, for the commit's hunk
+    /// count and for what the preparation shows. Empty means "not recorded",
+    /// which a caller must not read as "no hunks".
+    #[serde(default)]
+    pub accepted_hunks: BTreeMap<String, Vec<String>>,
+}
+
+/// One `commit_created` event, as the change timeline reads it. The commit
+/// SHA and prepare id are for display and inspection; `paths` is what removes
+/// those files from the commit's candidate set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitSessionEvent {
+    pub task_id: String,
+    pub prepare_id: String,
+    pub commit_sha: String,
+    pub paths: Vec<String>,
+}
+
+/// The session's accepted-and-committed history, in log order. Spec 35 walks
+/// it to answer "which accepted changes are not committed yet" without
+/// rewriting any stored patch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeEvent {
+    Applied {
+        paths: Vec<String>,
+        applied_hashes: BTreeMap<String, String>,
+        accepted_hunks: BTreeMap<String, Vec<String>>,
+    },
+    Committed {
+        paths: Vec<String>,
+    },
 }
 
 /// What a task is doing, precisely enough that a crash in it is classifiable.
@@ -1869,6 +1909,61 @@ impl SessionStore {
             .into_iter()
             .filter(|decision| decision.task_id == task_id)
             .collect())
+    }
+
+    /// Appends the record that a commit landed (spec 35 §5.7). The paths leave
+    /// the session's uncommitted accepted set; the SHA is read back by
+    /// inspection and the UI.
+    pub fn append_commit_created(
+        &self,
+        session_id: &str,
+        event: &CommitSessionEvent,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(event).map_err(|error| {
+            crate::error::ClientError::Io(format!("commit session event serialization: {error}"))
+        })?;
+        self.append_session_event(session_id, "commit_created", &payload)
+    }
+
+    /// The session's applied decisions and commits in log order, so a later
+    /// applied change to a committed path is pending again while a commit
+    /// removes its paths from the pending set. Read in one pass: interleaving
+    /// two separate readers would lose the order that answers the question.
+    pub fn read_change_timeline(&self, session_id: &str) -> Result<Vec<ChangeEvent>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        let mut timeline = Vec::new();
+        for event in active_events(&content) {
+            match event.event_type.as_str() {
+                "patch_file_decided" => {
+                    let Ok(decision) =
+                        serde_json::from_value::<PatchFileDecision>(event.payload.clone())
+                    else {
+                        continue;
+                    };
+                    if decision.applied {
+                        timeline.push(ChangeEvent::Applied {
+                            paths: decision.paths,
+                            applied_hashes: decision.applied_hashes,
+                            accepted_hunks: decision.accepted_hunks,
+                        });
+                    }
+                }
+                "commit_created" => {
+                    let Ok(commit) =
+                        serde_json::from_value::<CommitSessionEvent>(event.payload.clone())
+                    else {
+                        continue;
+                    };
+                    timeline.push(ChangeEvent::Committed {
+                        paths: commit.paths,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(timeline)
     }
 
     /// Every patch-file decision in the session, in log order.

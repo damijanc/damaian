@@ -212,6 +212,26 @@ impl CommandRunner {
         reason: &str,
         options: CommandRunOptions<'_>,
     ) -> Result<CommandExecution> {
+        self.run_at_with_env(command, repository_root, cwd, reason, options, &[])
+    }
+
+    /// [`Self::run_at`] with extra environment variables on the child.
+    ///
+    /// Spec 35's Git hooks need `GIT_INDEX_FILE` (the private index),
+    /// `GIT_DIR` and `GIT_WORK_TREE`; a `pre-commit` that runs
+    /// `git diff --cached` must see the commit being prepared, not the user's
+    /// staging area. Every other caller passes none, so the command path's
+    /// policy, timeout, truncation, redaction and PID registration are
+    /// unchanged.
+    pub fn run_at_with_env(
+        &self,
+        command: &str,
+        repository_root: impl AsRef<Path>,
+        cwd: impl AsRef<Path>,
+        reason: &str,
+        options: CommandRunOptions<'_>,
+        env: &[(&str, String)],
+    ) -> Result<CommandExecution> {
         let classification =
             self.command_policy
                 .classify_at(command, repository_root.as_ref(), cwd.as_ref());
@@ -255,6 +275,7 @@ impl CommandRunner {
             .arg("-lc")
             .arg(command)
             .current_dir(cwd.as_ref())
+            .envs(env.iter().map(|(key, value)| (*key, value.as_str())))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)

@@ -20,7 +20,7 @@ use crate::patch_engine::{
 use crate::secret_scanner::SecretScanner;
 use crate::session::{PatchFileDecision, Session, SessionStore, Task, TaskStatus};
 use crate::verification::{VerificationEvent, fold_verification};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -873,7 +873,33 @@ impl EditOrchestrator {
         // mark verification due when that settles the patch. After the
         // `PatchApplied` evidence above, whose applied hashes are what the loop
         // later compares against.
-        self.record_patch_file_decision(&patch, &result.applied_files, true)?;
+        let applied_hashes = result
+            .applied
+            .iter()
+            .map(|file| (file.path.clone(), file.applied_hash.clone()))
+            .collect::<BTreeMap<_, _>>();
+        // A partial-hunk accept has to record which hunks were taken: the
+        // commit's candidate set is the accepted content, and the audit's
+        // hunk count is not derivable from the file list alone.
+        let accepted_hunks = patch
+            .files
+            .iter()
+            .filter(|file| result.applied_files.contains(&file.path))
+            .map(|file| {
+                let ids = hunk_selection
+                    .and_then(|selection| selection.get(&file.path))
+                    .cloned()
+                    .unwrap_or_else(|| file.hunks.iter().map(|hunk| hunk.id.clone()).collect());
+                (file.path.clone(), ids)
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.record_patch_file_decision(
+            &patch,
+            &result.applied_files,
+            &applied_hashes,
+            &accepted_hunks,
+            true,
+        )?;
         Ok(result)
     }
 
@@ -889,6 +915,8 @@ impl EditOrchestrator {
         &self,
         patch: &ProposedPatch,
         paths: &[String],
+        applied_hashes: &BTreeMap<String, String>,
+        accepted_hunks: &BTreeMap<String, Vec<String>>,
         applied: bool,
     ) -> Result<()> {
         let (Some(task_id), false) = (patch.task_id.as_deref(), patch.session_id.is_empty()) else {
@@ -904,6 +932,8 @@ impl EditOrchestrator {
                 patch_id: patch.id.clone(),
                 paths: paths.to_vec(),
                 applied,
+                applied_hashes: applied_hashes.clone(),
+                accepted_hunks: accepted_hunks.clone(),
             },
         )?;
         self.record_verification_due_if_settled(patch, task_id)
@@ -1044,7 +1074,7 @@ impl EditOrchestrator {
             ],
         )?;
         let paths: Vec<String> = patch.files.iter().map(|file| file.path.clone()).collect();
-        self.record_patch_file_decision(&patch, &paths, false)?;
+        self.record_patch_file_decision(&patch, &paths, &BTreeMap::new(), &BTreeMap::new(), false)?;
         Ok(path)
     }
 
@@ -1068,7 +1098,13 @@ impl EditOrchestrator {
                 ("resourcePath", path.to_string_lossy().to_string()),
             ],
         )?;
-        self.record_patch_file_decision(&patch, rejected_paths, false)?;
+        self.record_patch_file_decision(
+            &patch,
+            rejected_paths,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+        )?;
         Ok(path)
     }
 }
