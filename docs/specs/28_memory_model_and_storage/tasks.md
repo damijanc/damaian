@@ -13,7 +13,7 @@ criteria) · corrections and planning decisions in [`context.md`](context.md)
 | 1 · Folder conversion, status and links | Done 2026-10-26 | `git mv` of the flat spec; `proposal.md` keeps §1 and §3-§7 with its `§5.x` numbering intact, `context.md` holds the former §2 plus a corrections table for every drifted line reference, and `tasks.md` is new. Status In progress in the proposal, the README current-state bullets and both implementation-order rows. Every link naming the flat file in specs 27, 29, 30, 34, 50, 53, 55 and the README now names `28_memory_model_and_storage/proposal.md`. A relative-link scan over `docs/**/*.md` found no broken link in this folder; the one failure it reported is pre-existing in spec 66. `npm run specs:check` was not run (it needs `node_modules`); scoped docs-only change, no Rust touched. |
 | 2 · Record types and sensitivity by rule | Done 2026-10-26 | `memory.rs` defines the seven enums, `MemoryProvenance` (three variants only), `EvidenceRef`, `MemoryExpiry` and `MemoryEntry`, and exports them from `lib.rs`. `Sensitivity`'s declaration order is its restrictiveness order; `derived_sensitivity` applies the §5.5a table with the most restrictive match winning, and `effective_sensitivity` raises a lower caller value but keeps a higher one. Environmental markers are an absolute path, `~/`, URL, `localhost`, `dot.host.tld`, `host:port` or `:port`, IPv4, and the local `USER`/`LOGNAME`/`HOME` name. **Deviation:** the proposal's `rename_all = "camelCase"` on `MemoryProvenance` renames variants only, so the variant fields carry explicit `sessionId`/`messageId`/`taskId` renames to keep the JSON camelCase throughout. Ten inline tests pass; scoped clippy clean. |
 | 3 · Project identity resolution | Done 2026-10-26 | `GitService::root_commit` (`rev-list --max-parents=0 HEAD`, first line) and `origin_url` are unaudited read helpers beside `head_commit`. `ProjectIdentity::resolve` takes the root commit first, then a normalized origin, then the path hash, and keys are `root_<sha>`, `remote_<sha256[..16]>`, `path_<repository_id>`; `source_of_key` reads the tier back. Remote normalization strips scheme, credentials, port and `.git`, lowercases the host, handles scp syntax, and returns `None` for a local path so identity falls to the path tier rather than pretending a machine path is portable. Nine integration tests cover: two clones sharing (with different `repository_id`s), a rename keeping the key, different root commits not sharing, a fork sharing deliberately, remotes without history (different and same), neither falling to the path hash, a non-repository, and no credential or slash in a key. **Measured cost:** about 12 ms per tier-1 resolution on this machine (20 iterations, 0.246 s total), dominated by process launch. |
-| 4 · Store layout, schema version and migration | Not started | |
+| 4 · Store layout, schema version and migration | Done 2026-10-26 | `MemoryStore` + `MemoryStoreConfig` write `<data_dir>/memory/{schema.conf,project/<key>.jsonl,user.jsonl}` with the directory at `0700`. Append-only JSONL: one complete record per line, last record per id wins, first appearance fixes order, a torn final line is discarded, and an unparsable middle line is counted and skipped so one bad record cannot make the store unreadable. The flat marker mirrors `data_schema`: absent means version 0 if files exist (migrate) or fresh (initialise), equal proceeds, newer/unparsable/0 refuses with path and versions. Version-0 migration appends a complete record for every parseable legacy line — deriving sensitivity, defaulting `state` to `Active` — keeps the old line, writes the marker, and audits `memory_schema_migrated`. A project entry whose `project_key` differs from its file's is a hard error, not a filtered row. Reads do not create the directory; writes will. `DAMAIAN_DATA_DIR` is honoured through `Config::default_data_dir` (asserted with nextest's per-test process isolation). Ten new integration tests (19 in the file) pass; scoped clippy clean. |
 | 5 · Refusal path: secrets, evidence, scopes | Not started | |
 | 6 · Lifecycle transitions and audit | Not started | |
 | 7 · User-scope config key and engine wiring | Not started | |
@@ -151,24 +151,24 @@ project_identity`; scoped clippy.
 
 ## Task 4 · Store layout, schema version and migration
 
-- [ ] `MemoryStore` over `<data_dir>/memory/`:
+- [x] `MemoryStore` over `<data_dir>/memory/`:
       `schema.conf`, `project/<project_key>.jsonl`, `user.jsonl`; create the
       directory with mode `0700`.
-- [ ] Append one complete JSON record per `\n`-terminated line; replay by id with
+- [x] Append one complete JSON record per `\n`-terminated line; replay by id with
       the last record winning; discard a torn final line; skip and count an
       unparsable middle line rather than failing the whole store.
-- [ ] Read/write the flat `schema_version=1` marker. Equal proceeds; older
+- [x] Read/write the flat `schema_version=1` marker. Equal proceeds; older
       migrates; newer or unparsable refuses with the path and both versions and
       changes nothing.
-- [ ] Migration from 0 (no marker): for each project and user file, append a
+- [x] Migration from 0 (no marker): for each project and user file, append a
       normalized record for every parseable entry — derive `sensitivity`, default
       a missing `state` to `Active`, keep the original line — then write the
       marker. Audit `memory_schema_migrated` with `from`/`to` only.
-- [ ] Tests: round-trip every field; append-only growth (a rewrite never
+- [x] Tests: round-trip every field; append-only growth (a rewrite never
       truncates); torn final line; a v0 directory read after upgrade with the
       marker now 1 and the pre-migration line still present; a newer and an
       unparsable version each refusing and leaving bytes untouched.
-- [ ] Test `DAMAIAN_DATA_DIR` is honoured by constructing the store from
+- [x] Test `DAMAIAN_DATA_DIR` is honoured by constructing the store from
       `Config::default_data_dir`.
 
 **Verification:** `cargo nextest run -p workspace-engine --test memory store_`;

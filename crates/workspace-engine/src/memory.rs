@@ -15,11 +15,15 @@
 //!   redacted memory is permanently useless and records that a credential
 //!   exists.
 
-use crate::error::Result;
+use crate::audit::AuditLog;
+use crate::error::{ClientError, Result};
 use crate::git_service::GitService;
 use crate::hash::{create_id, now_millis, repository_id_for_root, sha256_hex};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -577,6 +581,517 @@ pub fn normalize_remote_url(url: &str) -> Option<String> {
         return None;
     }
     Some(format!("{host}/{path}"))
+}
+
+/// The memory store's own schema version. Separate from the data directory's
+/// version ([`crate::data_schema`]): the two evolve independently, and a memory
+/// schema change must not require a data-directory bump.
+pub const MEMORY_SCHEMA_VERSION: u32 = 1;
+
+const MEMORY_DIRECTORY: &str = "memory";
+const MEMORY_SCHEMA_FILE: &str = "schema.conf";
+const MEMORY_SCHEMA_KEY: &str = "schema_version";
+const PROJECT_DIRECTORY: &str = "project";
+const USER_FILE: &str = "user.jsonl";
+
+/// What opening the store found. Mirrors [`crate::data_schema::DataSchemaOutcome`]
+/// so the two version boundaries read the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemorySchemaOutcome {
+    /// No memory directory yet. Normal first run.
+    Initialized,
+    /// The memory directory already reads as this build's version.
+    Current,
+    /// Files existed without a marker (version 0) and were migrated to
+    /// [`MEMORY_SCHEMA_VERSION`].
+    Upgraded { from: u32 },
+}
+
+/// Why a memory write was refused. Each variant is a sentence the user can act
+/// on, and none of them carries the refused content or a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryRefusal {
+    /// The statement or an evidence path trips the secret scanner. Refusal is
+    /// deliberate: a redacted memory persists forever and records *that* a
+    /// credential exists and where.
+    Secret { category: String },
+    /// An evidence path is outside the repository, restricted by policy, or
+    /// excluded by an ignore rule. The path itself is not repeated in the
+    /// message: recording that `secrets/prod.env` exists is the disclosure
+    /// this refusal prevents.
+    IneligibleEvidence { reason: EvidenceRefusal },
+    /// A user-scope write while the scope is disabled.
+    UserScopeDisabled,
+    /// The scope, project key and session id do not agree.
+    InvalidShape(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceRefusal {
+    /// Absolute, or containing `..`. Evidence is repository-relative.
+    NotRelative,
+    /// Matches `restricted_patterns`.
+    Restricted,
+    /// Excluded by configured ignore patterns or a per-directory `.gitignore`.
+    Ignored,
+}
+
+impl EvidenceRefusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRelative => "it is not a repository-relative path",
+            Self::Restricted => "it is protected by policy",
+            Self::Ignored => "it is excluded by an ignore rule",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryError {
+    Refused(MemoryRefusal),
+    /// The store was written by a newer build, or its marker cannot be read as
+    /// a version. Nothing was changed.
+    Schema {
+        path: PathBuf,
+        found: String,
+        supported: u32,
+    },
+    Io(String),
+    Invalid(String),
+}
+
+impl std::fmt::Display for MemoryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(MemoryRefusal::Secret { .. }) => formatter.write_str(
+                "That looks like a credential; Damaian will not store it. \
+                 Memory refuses a detected secret rather than saving a redacted one.",
+            ),
+            Self::Refused(MemoryRefusal::IneligibleEvidence { reason }) => write!(
+                formatter,
+                "Damaian will not store memory about that file because {}.",
+                reason.as_str()
+            ),
+            Self::Refused(MemoryRefusal::UserScopeDisabled) => formatter.write_str(
+                "User-scope memory is turned off. Enable it in Settings before saving \
+                 a memory that applies across projects.",
+            ),
+            Self::Refused(MemoryRefusal::InvalidShape(detail)) => {
+                write!(formatter, "That memory cannot be stored: {detail}")
+            }
+            Self::Schema {
+                path,
+                found,
+                supported,
+            } => write!(
+                formatter,
+                "The memory store at {} declares schema version \"{found}\", and this \
+                 version of Damaian supports version {supported}. Nothing in it was \
+                 changed.",
+                path.display()
+            ),
+            Self::Io(message) | Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for MemoryError {}
+
+impl From<std::io::Error> for MemoryError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
+impl From<ClientError> for MemoryError {
+    fn from(error: ClientError) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
+impl From<MemoryError> for ClientError {
+    fn from(error: MemoryError) -> Self {
+        match error {
+            MemoryError::Refused(_) => ClientError::PolicyBlocked(error.to_string()),
+            MemoryError::Schema { .. } | MemoryError::Io(_) => ClientError::Io(error.to_string()),
+            MemoryError::Invalid(message) => ClientError::InvalidInput(message),
+        }
+    }
+}
+
+pub type MemoryResult<T> = std::result::Result<T, MemoryError>;
+
+/// The store's non-handle state: where it writes and what the user has opted
+/// into. Kept apart from the cloned handles so a caller cannot supply a policy
+/// that disagrees with the engine's.
+#[derive(Debug, Clone)]
+pub struct MemoryStoreConfig {
+    pub data_dir: PathBuf,
+    /// `memory_user_scope_enabled`. Off by default, and enforced on read as
+    /// well as write, because a user who turns the scope off expects it to stop
+    /// influencing their sessions, not merely to stop growing.
+    pub user_scope_enabled: bool,
+    /// `ignore_patterns`, so the store's evidence check sees the same file set
+    /// the index does.
+    pub ignore_patterns: Vec<String>,
+}
+
+/// The single writer for every memory scope.
+///
+/// Project and user entries are append-only JSONL under the data directory;
+/// session entries live in the session log, because a session-scoped fact must
+/// die with its session. Every scope goes through this type, so the secret,
+/// evidence, scope and sensitivity checks cannot be bypassed by a future
+/// caller that writes a file itself.
+#[derive(Debug, Clone)]
+pub struct MemoryStore {
+    config: MemoryStoreConfig,
+    audit_log: AuditLog,
+}
+
+impl MemoryStore {
+    pub fn new(config: MemoryStoreConfig, audit_log: AuditLog) -> Self {
+        Self { config, audit_log }
+    }
+
+    pub fn memory_dir(&self) -> PathBuf {
+        self.config.data_dir.join(MEMORY_DIRECTORY)
+    }
+
+    pub fn project_path(&self, project_key: &str) -> PathBuf {
+        self.memory_dir()
+            .join(PROJECT_DIRECTORY)
+            .join(format!("{project_key}.jsonl"))
+    }
+
+    pub fn user_path(&self) -> PathBuf {
+        self.memory_dir().join(USER_FILE)
+    }
+
+    fn schema_path(&self) -> PathBuf {
+        self.memory_dir().join(MEMORY_SCHEMA_FILE)
+    }
+
+    /// Brings the marker to this build's version, or refuses to read it.
+    ///
+    /// Mirrors spec 15's data-directory rules: older migrates, equal proceeds,
+    /// newer or unparsable refuses and changes nothing. Refusing to read is the
+    /// right failure here specifically — a newer schema misread by an older
+    /// build could recall an entry with the wrong scope or state, and a
+    /// wrongly-scoped recall is the boundary violation this phase exists to
+    /// prevent.
+    pub fn ensure_schema(&self) -> MemoryResult<MemorySchemaOutcome> {
+        let marker = self.schema_path();
+        if !marker.exists() {
+            let adopted = self.has_memory_files();
+            self.ensure_memory_dir()?;
+            if adopted {
+                self.migrate_from_zero()?;
+            }
+            self.write_marker()?;
+            return Ok(if adopted {
+                MemorySchemaOutcome::Upgraded { from: 0 }
+            } else {
+                MemorySchemaOutcome::Initialized
+            });
+        }
+
+        let content = fs::read_to_string(&marker)?;
+        let Some(version) = parse_schema_version(&content) else {
+            return Err(MemoryError::Schema {
+                path: marker,
+                found: recorded_schema_value(&content),
+                supported: MEMORY_SCHEMA_VERSION,
+            });
+        };
+        if version == 0 || version > MEMORY_SCHEMA_VERSION {
+            return Err(MemoryError::Schema {
+                path: marker,
+                found: version.to_string(),
+                supported: MEMORY_SCHEMA_VERSION,
+            });
+        }
+        if version == MEMORY_SCHEMA_VERSION {
+            return Ok(MemorySchemaOutcome::Current);
+        }
+
+        self.migrate_from(version)?;
+        self.write_marker()?;
+        Ok(MemorySchemaOutcome::Upgraded { from: version })
+    }
+
+    /// The entries stored for a project, newest record per id.
+    ///
+    /// A record whose `project_key` is not this project's is a hard error, not
+    /// a filtered-out row: a mismatch means the store or the resolution is
+    /// wrong, and continuing quietly would be a cross-repository leak.
+    pub fn project_entries(&self, identity: &ProjectIdentity) -> MemoryResult<Vec<MemoryEntry>> {
+        self.ensure_if_present()?;
+        let entries = read_entries(&self.project_path(&identity.key))?.0;
+        for entry in &entries {
+            if entry.project_key.as_deref() != Some(identity.key.as_str()) {
+                return Err(MemoryError::Invalid(format!(
+                    "Memory entry {} in the store for project {} declares project key {:?}. \
+                     Refusing to read it; this would cross a project boundary.",
+                    entry.id, identity.key, entry.project_key
+                )));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// User-scope entries. While the scope is disabled this returns nothing and
+    /// does not open the file, so a previously enabled store stops influencing
+    /// sessions as soon as the switch is off.
+    pub fn user_entries(&self) -> MemoryResult<Vec<MemoryEntry>> {
+        if !self.config.user_scope_enabled {
+            return Ok(Vec::new());
+        }
+        self.ensure_if_present()?;
+        let entries = read_entries(&self.user_path())?.0;
+        for entry in &entries {
+            if entry.scope != MemoryScope::User {
+                return Err(MemoryError::Invalid(format!(
+                    "Memory entry {} in the user store is scoped {:?}.",
+                    entry.id, entry.scope
+                )));
+            }
+        }
+        Ok(entries)
+    }
+
+    fn ensure_if_present(&self) -> MemoryResult<()> {
+        if self.memory_dir().exists() {
+            self.ensure_schema()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_memory_dir(&self) -> MemoryResult<()> {
+        let directory = self.memory_dir();
+        fs::create_dir_all(directory.join(PROJECT_DIRECTORY))?;
+        set_private_directory(&directory)?;
+        Ok(())
+    }
+
+    fn has_memory_files(&self) -> bool {
+        let project = self.memory_dir().join(PROJECT_DIRECTORY);
+        let project_has_files = fs::read_dir(project)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "jsonl")
+                })
+            })
+            .unwrap_or(false);
+        project_has_files || self.user_path().exists()
+    }
+
+    fn write_marker(&self) -> MemoryResult<()> {
+        fs::write(
+            self.schema_path(),
+            format!("{MEMORY_SCHEMA_KEY}={MEMORY_SCHEMA_VERSION}\n"),
+        )?;
+        Ok(())
+    }
+
+    /// Version 0 is "files written before the marker existed": the shape a
+    /// writer with no versioning would leave, and the same adoption case
+    /// `data_schema` handles. Migration appends normalized records and leaves
+    /// the old lines for audit; it never rewrites or truncates a file.
+    fn migrate_from_zero(&self) -> MemoryResult<()> {
+        let mut paths = Vec::new();
+        let project = self.memory_dir().join(PROJECT_DIRECTORY);
+        if let Ok(entries) = fs::read_dir(&project) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
+                {
+                    paths.push(path);
+                }
+            }
+        }
+        if self.user_path().exists() {
+            paths.push(self.user_path());
+        }
+        for path in paths {
+            self.append_migrated(&path)?;
+        }
+        self.audit_log.record(
+            "memory_schema_migrated",
+            &[
+                ("fromVersion", "0".to_string()),
+                ("toVersion", MEMORY_SCHEMA_VERSION.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_from(&self, from: u32) -> MemoryResult<()> {
+        // No shipped format has needed a structural migration yet; version 0
+        // adoption is the only boundary that exists. The arm is explicit so
+        // the next schema change has somewhere to go.
+        if from == 0 {
+            return self.migrate_from_zero();
+        }
+        Ok(())
+    }
+
+    fn append_migrated(&self, path: &Path) -> MemoryResult<()> {
+        let bytes = fs::read(path)?;
+        let content = String::from_utf8_lossy(&bytes);
+        let complete = match content.rfind('\n') {
+            Some(last) => &content[..=last],
+            None => return Ok(()),
+        };
+        for line in complete.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(legacy) = serde_json::from_str::<VersionZeroEntry>(line) {
+                append_entry_line(path, &legacy.into_entry().with_derived_sensitivity())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A record written before the marker existed. Its only format difference from
+/// version 1 is that `sensitivity` and `state` may be absent; the migration
+/// derives the first and defaults the second, then appends the complete record.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionZeroEntry {
+    id: String,
+    scope: MemoryScope,
+    project_key: Option<String>,
+    session_id: Option<String>,
+    category: MemoryCategory,
+    statement: String,
+    provenance: MemoryProvenance,
+    verification: Verification,
+    sensitivity: Option<Sensitivity>,
+    state: Option<MemoryState>,
+    created_at_ms: u128,
+    updated_at_ms: u128,
+    supersedes: Option<String>,
+    expiry: Option<MemoryExpiry>,
+}
+
+impl VersionZeroEntry {
+    fn into_entry(self) -> MemoryEntry {
+        MemoryEntry {
+            id: self.id,
+            scope: self.scope,
+            project_key: self.project_key,
+            session_id: self.session_id,
+            category: self.category,
+            statement: self.statement,
+            provenance: self.provenance,
+            verification: self.verification,
+            sensitivity: self.sensitivity.unwrap_or_default(),
+            state: self.state.unwrap_or(MemoryState::Active),
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            supersedes: self.supersedes,
+            expiry: self.expiry,
+        }
+    }
+}
+
+/// Reads a JSONL memory file.
+///
+/// A file is a sequence of complete records, one per `\n`-terminated line; a
+/// torn final line is discarded rather than failing the store, which is what
+/// makes an append-only file safe across a crash. A line in the middle that
+/// cannot be parsed is counted and skipped for the same reason: one bad record
+/// must not make every memory unreadable. The last record for an `id` wins, and
+/// first appearance fixes the order.
+fn read_entries(path: &Path) -> MemoryResult<(Vec<MemoryEntry>, usize)> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(error) => return Err(error.into()),
+    };
+    let content = String::from_utf8_lossy(&bytes);
+    let complete = match content.rfind('\n') {
+        Some(last) => &content[..=last],
+        // No newline at all: every byte is a torn line. Nothing to read.
+        None => "",
+    };
+
+    let mut entries: Vec<MemoryEntry> = Vec::new();
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut skipped = 0;
+    for line in complete.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<MemoryEntry>(line) {
+            Ok(entry) => match positions.get(&entry.id) {
+                Some(index) => entries[*index] = entry,
+                None => {
+                    positions.insert(entry.id.clone(), entries.len());
+                    entries.push(entry);
+                }
+            },
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((entries, skipped))
+}
+
+fn append_entry_line(path: &Path, entry: &MemoryEntry) -> MemoryResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        // The project directory is inside the 0700 memory directory; setting it
+        // again keeps the mode after a directory is recreated.
+        set_private_directory(parent)?;
+    }
+    let mut line = serde_json::to_string(entry)
+        .map_err(|error| MemoryError::Invalid(format!("Failed to serialize memory: {error}")))?;
+    line.push('\n');
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+fn set_private_directory(directory: &Path) -> MemoryResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn parse_schema_version(content: &str) -> Option<u32> {
+    recorded_schema_line(content)?.parse().ok()
+}
+
+fn recorded_schema_value(content: &str) -> String {
+    recorded_schema_line(content)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn recorded_schema_line(content: &str) -> Option<&str> {
+    content.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') {
+            return None;
+        }
+        line.strip_prefix(MEMORY_SCHEMA_KEY)?
+            .trim_start()
+            .strip_prefix('=')
+            .map(str::trim)
+    })
 }
 
 #[cfg(test)]

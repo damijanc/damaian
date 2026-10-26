@@ -264,3 +264,316 @@ fn a_project_key_cannot_be_confused_between_tiers() {
     );
     assert!(!identity.key.contains('/'), "a key is a file name");
 }
+
+// ---------------------------------------------------------------------------
+// Store layout, schema version and migration (Task 4).
+// ---------------------------------------------------------------------------
+
+use workspace_engine::{
+    AuditLog, EvidenceRef, MEMORY_SCHEMA_VERSION, MemoryCategory, MemoryEntry, MemoryError,
+    MemoryExpiry, MemoryProvenance, MemorySchemaOutcome, MemoryScope, MemoryState, MemoryStore,
+    MemoryStoreConfig, Sensitivity, Verification,
+};
+
+fn memory_store(root: &Path, user_scope_enabled: bool) -> MemoryStore {
+    let config = test_config(root);
+    let scanner = SecretScanner::new(Vec::new());
+    let audit = AuditLog::new(&config.data_dir, true, scanner);
+    MemoryStore::new(
+        MemoryStoreConfig {
+            data_dir: config.data_dir,
+            user_scope_enabled,
+            ignore_patterns: Vec::new(),
+        },
+        audit,
+    )
+}
+
+fn full_entry(project_key: &str) -> MemoryEntry {
+    let mut entry = MemoryEntry::new(
+        MemoryScope::Project,
+        MemoryCategory::Environment,
+        "The integration suite needs Docker running.",
+        MemoryProvenance::RepositoryEvidence {
+            paths: vec![EvidenceRef::new("docker-compose.yml", "sha256:abc")],
+        },
+        Verification::EvidenceCurrent,
+    )
+    .in_project(project_key);
+    entry.sensitivity = Sensitivity::Environmental;
+    entry.expiry = Some(MemoryExpiry {
+        expires_at_ms: Some(1_700_000_000_000),
+        revalidate_on_evidence_change: true,
+    });
+    entry.supersedes = Some("mem_previous".to_string());
+    entry.updated_at_ms = entry.created_at_ms + 5;
+    entry
+}
+
+fn write_lines(path: &Path, lines: &[String]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut content = String::new();
+    for line in lines {
+        content.push_str(line);
+        content.push('\n');
+    }
+    fs::write(path, content).unwrap();
+}
+
+#[test]
+fn memory_is_stored_under_the_given_data_directory() {
+    let root = temp_dir("store-layout");
+    let store = memory_store(&root, false);
+    let expected = root.join(".damaian").join("memory");
+    assert_eq!(store.memory_dir(), expected);
+    assert_eq!(
+        store.project_path("root_abc"),
+        expected.join("project").join("root_abc.jsonl")
+    );
+    assert_eq!(store.user_path(), expected.join("user.jsonl"));
+
+    let outcome = store.ensure_schema().unwrap();
+    assert_eq!(outcome, MemorySchemaOutcome::Initialized);
+    let marker = fs::read_to_string(expected.join("schema.conf")).unwrap();
+    assert_eq!(marker, format!("schema_version={MEMORY_SCHEMA_VERSION}\n"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&expected).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "memory directory is private");
+    }
+}
+
+#[test]
+fn a_complete_entry_round_trips_through_the_file() {
+    let root = temp_dir("store-round-trip");
+    let store = memory_store(&root, false);
+    let identity = ProjectIdentity {
+        key: "root_roundtrip".to_string(),
+        source: ProjectKeySource::RootCommit,
+        repository_id: "repo_fixture".to_string(),
+    };
+    store.ensure_schema().unwrap();
+
+    let entry = full_entry(&identity.key);
+    let line = serde_json::to_string(&entry).unwrap();
+    write_lines(&store.project_path(&identity.key), &[line]);
+
+    let loaded = store.project_entries(&identity).unwrap();
+    assert_eq!(loaded, vec![entry]);
+}
+
+#[test]
+fn the_newest_record_for_an_id_wins_without_rewriting_the_file() {
+    let root = temp_dir("store-newest");
+    let store = memory_store(&root, false);
+    let identity = ProjectIdentity {
+        key: "root_newest".to_string(),
+        source: ProjectKeySource::RootCommit,
+        repository_id: "repo_fixture".to_string(),
+    };
+    store.ensure_schema().unwrap();
+
+    let mut entry = full_entry(&identity.key);
+    let first = serde_json::to_string(&entry).unwrap();
+    entry.state = MemoryState::Deleted;
+    let second = serde_json::to_string(&entry).unwrap();
+    let path = store.project_path(&identity.key);
+    write_lines(&path, &[first, second]);
+
+    let loaded = store.project_entries(&identity).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].state, MemoryState::Deleted);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap().lines().count(),
+        2,
+        "appends keep history; nothing was truncated"
+    );
+}
+
+#[test]
+fn a_torn_final_line_is_discarded_and_the_rest_replays() {
+    let root = temp_dir("store-torn");
+    let store = memory_store(&root, false);
+    let identity = ProjectIdentity {
+        key: "root_torn".to_string(),
+        source: ProjectKeySource::RootCommit,
+        repository_id: "repo_fixture".to_string(),
+    };
+    store.ensure_schema().unwrap();
+
+    let entry = full_entry(&identity.key);
+    let complete = serde_json::to_string(&entry).unwrap();
+    let path = store.project_path(&identity.key);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, format!("{complete}\n{{\"id\":\"mem_torn\"")).unwrap();
+
+    let loaded = store.project_entries(&identity).unwrap();
+    assert_eq!(loaded, vec![entry]);
+}
+
+#[test]
+fn an_unparsable_middle_line_is_skipped_without_losing_the_others() {
+    let root = temp_dir("store-middle");
+    let store = memory_store(&root, false);
+    let identity = ProjectIdentity {
+        key: "root_middle".to_string(),
+        source: ProjectKeySource::RootCommit,
+        repository_id: "repo_fixture".to_string(),
+    };
+    store.ensure_schema().unwrap();
+
+    let entry = full_entry(&identity.key);
+    write_lines(
+        &store.project_path(&identity.key),
+        &[
+            "not json at all".to_string(),
+            serde_json::to_string(&entry).unwrap(),
+        ],
+    );
+
+    assert_eq!(store.project_entries(&identity).unwrap(), vec![entry]);
+}
+
+#[test]
+fn a_version_zero_store_is_migrated_by_appending_then_read() {
+    let root = temp_dir("store-migrate-zero");
+    let store = memory_store(&root, false);
+    let identity = ProjectIdentity {
+        key: "root_legacy".to_string(),
+        source: ProjectKeySource::RootCommit,
+        repository_id: "repo_fixture".to_string(),
+    };
+
+    let mut legacy = serde_json::to_value(full_entry(&identity.key)).unwrap();
+    let object = legacy.as_object_mut().unwrap();
+    object.remove("sensitivity");
+    object.remove("state");
+    // The old record's statement names a path, so the derived value must be
+    // Environmental even though no sensitivity was recorded.
+    object.insert(
+        "statement".to_string(),
+        serde_json::Value::String("Builds write into /tmp/damaian-build.".to_string()),
+    );
+    let legacy_line = serde_json::to_string(&legacy).unwrap();
+    let path = store.project_path(&identity.key);
+    write_lines(&path, &[legacy_line]);
+
+    let loaded = store.project_entries(&identity).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].state, MemoryState::Active);
+    assert_eq!(
+        loaded[0].sensitivity,
+        Sensitivity::Environmental,
+        "migration derives sensitivity rather than trusting the old record"
+    );
+    assert_eq!(
+        fs::read_to_string(store.memory_dir().join("schema.conf"))
+            .unwrap()
+            .trim(),
+        format!("schema_version={MEMORY_SCHEMA_VERSION}")
+    );
+    let lines: Vec<String> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines.len(), 2, "the pre-migration line is retained");
+    assert!(lines[0].contains("\"id\""));
+    assert!(!lines[0].contains("sensitivity"));
+}
+
+#[test]
+fn a_newer_schema_refuses_to_load_and_changes_nothing() {
+    let root = temp_dir("store-newer");
+    let store = memory_store(&root, false);
+    let identity = ProjectIdentity {
+        key: "root_newer".to_string(),
+        source: ProjectKeySource::RootCommit,
+        repository_id: "repo_fixture".to_string(),
+    };
+    store.ensure_schema().unwrap();
+    let path = store.project_path(&identity.key);
+    write_lines(
+        &path,
+        &[serde_json::to_string(&full_entry(&identity.key)).unwrap()],
+    );
+    let before = fs::read(&path).unwrap();
+    let marker = store.memory_dir().join("schema.conf");
+    fs::write(&marker, "schema_version=2\n").unwrap();
+
+    let error = store.project_entries(&identity).unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Schema { found, supported, .. }
+            if found == "2" && supported == MEMORY_SCHEMA_VERSION
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "schema_version=2\n");
+}
+
+#[test]
+fn an_unparsable_schema_refuses_and_reports_what_it_found() {
+    let root = temp_dir("store-garbled");
+    let store = memory_store(&root, false);
+    store.ensure_schema().unwrap();
+    let marker = store.memory_dir().join("schema.conf");
+    fs::write(&marker, "schema_version=banana\n").unwrap();
+
+    let error = store.ensure_schema().unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Schema { ref found, .. } if found == "banana"
+    ));
+    assert!(error.to_string().contains("Nothing in it was changed"));
+}
+
+#[test]
+fn a_project_store_claiming_another_project_is_refused() {
+    let root = temp_dir("store-cross-project");
+    let store = memory_store(&root, false);
+    let identity = ProjectIdentity {
+        key: "root_mine".to_string(),
+        source: ProjectKeySource::RootCommit,
+        repository_id: "repo_fixture".to_string(),
+    };
+    store.ensure_schema().unwrap();
+    let entry = full_entry("root_someone_else");
+    write_lines(
+        &store.project_path(&identity.key),
+        &[serde_json::to_string(&entry).unwrap()],
+    );
+
+    let error = store.project_entries(&identity).unwrap_err();
+    assert!(matches!(error, MemoryError::Invalid(_)));
+    assert!(error.to_string().contains("cross a project boundary"));
+}
+
+#[test]
+fn the_store_follows_config_default_data_dir() {
+    let root = temp_dir("store-data-dir-env");
+    let previous = std::env::var_os("DAMAIAN_DATA_DIR");
+    // Nextest runs each test in its own process, so this cannot race another
+    // test; the guard restores the value for a plain threaded `cargo test`.
+    unsafe { std::env::set_var("DAMAIAN_DATA_DIR", root.join("redirected")) };
+    let data_dir = Config::default_data_dir();
+    match previous {
+        Some(value) => unsafe { std::env::set_var("DAMAIAN_DATA_DIR", value) },
+        None => unsafe { std::env::remove_var("DAMAIAN_DATA_DIR") },
+    }
+
+    assert_eq!(data_dir, root.join("redirected"));
+    let scanner = SecretScanner::new(Vec::new());
+    let audit = AuditLog::new(&data_dir, true, scanner);
+    let store = MemoryStore::new(
+        MemoryStoreConfig {
+            data_dir: data_dir.clone(),
+            user_scope_enabled: false,
+            ignore_patterns: Vec::new(),
+        },
+        audit,
+    );
+    store.ensure_schema().unwrap();
+    assert!(data_dir.join("memory").join("schema.conf").exists());
+}

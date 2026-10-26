@@ -142,9 +142,10 @@ pub use mcp::{
     parse_namespaced_tool_name,
 };
 pub use memory::{
-    EvidenceRef, MemoryCategory, MemoryEntry, MemoryExpiry, MemoryProvenance, MemoryScope,
-    MemoryState, ProjectIdentity, ProjectKeySource, Sensitivity, Verification,
-    normalize_remote_url,
+    EvidenceRef, EvidenceRefusal, MEMORY_SCHEMA_VERSION, MemoryCategory, MemoryEntry, MemoryError,
+    MemoryExpiry, MemoryProvenance, MemoryRefusal, MemoryResult, MemorySchemaOutcome, MemoryScope,
+    MemoryState, MemoryStore, MemoryStoreConfig, ProjectIdentity, ProjectKeySource,
+    STATEMENT_MAX_CHARS, Sensitivity, Verification, normalize_remote_url,
 };
 pub use mode::SessionMode;
 pub use model::{
