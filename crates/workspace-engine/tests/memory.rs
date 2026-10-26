@@ -2259,3 +2259,19 @@ fn a_repository_observation_records_the_path_and_the_content_hash() {
         "the hash is the file's content hash, not a timestamp"
     );
 }
+
+#[test]
+fn a_multi_line_candidate_is_refused_rather_than_flattened() {
+    let root = temp_dir("proposal-multiline");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let proposal = model_suggestion(
+        MemoryScope::Project,
+        "The first line.\nThe second line.",
+        &session,
+        "task_multiline",
+    );
+    assert!(store.propose(&root, proposal).unwrap().is_none());
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+    assert!(audit_text(&root).contains("memory_proposal_refused"));
+}

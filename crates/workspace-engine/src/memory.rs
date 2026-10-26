@@ -440,6 +440,14 @@ impl MemoryProposal {
     /// instruction-shaped non-user candidate, or ineligible evidence produces
     /// no proposal at all.
     pub fn screen(&self, gate: &MemoryProposalGate<'_>) -> MemoryResult<()> {
+        // Check the raw candidate before normalization: `split_whitespace`
+        // would turn a multi-line excerpt into a one-line sentence and hide
+        // exactly the shape this rule refuses.
+        if self.statement.contains(['\n', '\r']) || self.statement.chars().any(char::is_control) {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "a memory statement is one line, not an excerpt".to_string(),
+            )));
+        }
         let statement = normalize_statement(&self.statement);
         if statement.is_empty() {
             return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
@@ -449,7 +457,7 @@ impl MemoryProposal {
         if statement.chars().count() > STATEMENT_MAX_CHARS {
             return Err(MemoryError::Refused(MemoryRefusal::StatementTooLong));
         }
-        if statement.contains(['\n', '\r']) || statement.chars().any(char::is_control) {
+        if statement.chars().any(char::is_control) {
             return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
                 "a memory statement is one line, not an excerpt".to_string(),
             )));
