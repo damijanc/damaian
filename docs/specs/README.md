@@ -373,7 +373,7 @@ nothing is promoted by their completion.
 | 2 | #55 compaction | Unblocked by #26; also what makes #49's reuse slice worth measuring |
 | 3 | #27, #33, #51 | The fan-out #26 unblocked. #27 also unblocks #28 |
 | 4 | #28 → #29 → #30 | Memory, strictly serial behind #27 |
-| 5 | #35 → #36/#37; #33 → #52 | Delivery and extensibility clusters |
+| 5 | #36/#37; #33 → #52 | Delivery and extensibility clusters. #35 is Done (2026-10-26) and promoted #36 |
 | 6 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not". #38 is deferred; #57 is done, so its stage 1 is due for re-evaluation |
 
 #54 stays off this table until Phase 1 WP3's provider capability validation is
@@ -391,8 +391,9 @@ for the same reason: every dependency (#17, #20, #46) is built and nothing
 depends on it. It is done (2026-10-16).
 [#58](58_header_repo_bar_and_menus/proposal.md), added on 2026-10-13, is done
 (2026-10-14). Re-derived then: no `Depends on:` line names #58, so nothing is
-promoted. #35 and #37 name it only as a cross-reference: they add *Commit…*
-and *Create PR* to its contextual-action slot when they are built.
+promoted. #35 and #37 name it only as a cross-reference: #35 (built 2026-10-26)
+added *Commit…* to its contextual-action slot, and #37 will add *Create PR*
+when it is built.
 [#49](49_prompt_cache_accounting_and_reuse/proposal.md)'s accounting slice is
 done, off this table for the same reason #56 is: nothing left in it is
 unbuilt. Its reuse slice re-enters this table once #55 replaces the sliding
