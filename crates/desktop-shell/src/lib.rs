@@ -16,18 +16,18 @@ use workspace_engine::{
     AgentRoundBudgetProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage,
     ChatTurnOptions, ChatTurnResult, Config, CostEstimate, CurlModelTransport, DataSchemaOutcome,
     EffectivePolicy, ExportFormat, GeneratedSecretWarning, HookActivation, HookEvent,
-    LanguageServerStatus, McpClient, McpServerConfig, McpTokenResolver, McpTransport, ModelAdapter,
-    ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
-    ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState, RepositoryConfigReport,
-    ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus,
-    SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink,
-    VerificationReport, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
-    allow_always_eligible, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
-    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
-    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
-    select_profile,
+    LanguageServerStatus, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
+    ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter,
+    PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState,
+    RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session,
+    SessionMode, StepStatus, SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnNotes, TurnPhase,
+    TurnProgress, TurnSink, VerificationReport, WebDiagnosticCall, WebDiagnosticKind,
+    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
+    WorkspaceEngine, allow_always_eligible, command_approval_prompt, custom_profile_ids,
+    ensure_data_dir_schema, export_profile, import_profile, normalize_mcp_server_id,
+    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
+    review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -301,6 +301,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         }
         ("GET", "/api/model-key-status") => handle_model_key_status(stream, &request),
         ("GET", "/api/git-status") => handle_git_status(stream, &request),
+        ("POST", "/api/commit-message") => handle_commit_message(stream, &request),
         ("GET", "/api/terminal-cwd") => handle_terminal_cwd(stream, &request),
         ("POST", "/api/terminal-run") => handle_terminal_run(stream, &request),
         ("GET", "/api/sessions") => handle_sessions(stream, &request),
@@ -1191,6 +1192,260 @@ fn handle_git_status(stream: &mut TcpStream, request: &Request) -> Result<(), St
             json_nullable_str(github_url.as_deref()),
         ),
     )
+}
+
+/// `POST /api/commit-message`: a model-drafted commit message, with the
+/// deterministic template as the answer whenever the model is missing, refuses,
+/// returns nothing, or returns something that does not parse.
+///
+/// The diff in the record is already redacted (spec 35 §5.6): this is the one
+/// place redaction is exactly right, because the model is drafting prose about
+/// the change, and the secret check at commit covers the gap between the
+/// redacted preview and the real bytes.
+fn handle_commit_message(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let prepare_id = required_form(&form, "prepare_id")?;
+    let engine = engine_for_repo(&repo)?;
+    let record = engine
+        .commit
+        .load_record(&prepare_id)
+        .map_err(|error| error.to_string())?;
+    if record.session_id != session_id {
+        return Err("That commit preparation belongs to a different session.".to_string());
+    }
+    let selected = form
+        .get("paths")
+        .map(|paths| {
+            paths
+                .lines()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            record
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.selected_by_default)
+                .map(|candidate| candidate.path.clone())
+                .collect()
+        });
+    let mut adapter = chat_model_adapter(&engine.config, || {
+        resolve_shell_model_api_key(&engine.config)
+    })
+    .ok();
+    let draft = match adapter.as_mut() {
+        Some(adapter) => {
+            draft_commit_message_with(&engine, &record, &selected, Some(adapter.as_mut()))
+        }
+        None => draft_commit_message_with(&engine, &record, &selected, None),
+    };
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"subject\":\"{}\",\"body\":\"{}\",\"message\":\"{}\",\"source\":\"{}\",\"notice\":{}}}",
+            escape_json(&draft.subject),
+            escape_json(&draft.body),
+            escape_json(&draft.message),
+            draft.source,
+            json_nullable_str(draft.notice.as_deref()),
+        ),
+    )
+}
+
+struct CommitDraft {
+    subject: String,
+    body: String,
+    message: String,
+    /// `"model"` or `"fallback"`.
+    source: &'static str,
+    /// Why the fallback answered, when it did.
+    notice: Option<String>,
+}
+
+fn draft_commit_message_with(
+    engine: &WorkspaceEngine,
+    record: &workspace_engine::CommitRecord,
+    selected_paths: &[String],
+    adapter: Option<&mut dyn ModelAdapter>,
+) -> CommitDraft {
+    let fallback = if record.message.trim().is_empty() {
+        engine.git.suggest_commit_message("", selected_paths)
+    } else {
+        record.message.clone()
+    };
+    let Some(adapter) = adapter else {
+        return CommitDraft {
+            subject: first_line(&fallback),
+            body: after_first_line(&fallback),
+            message: fallback,
+            source: "fallback",
+            notice: Some("No model is configured, so the template is the suggestion.".to_string()),
+        };
+    };
+    let prompt = commit_draft_prompt(engine, record, selected_paths);
+    let request = ModelRequest {
+        provider: engine.config.model_provider.clone(),
+        model: engine.config.model_name.clone(),
+        messages: vec![
+            ModelMessage::system(
+                "You draft a Git commit message for a change set the user has already \
+                 reviewed. Reply with a subject line of at most 72 characters, then, if \
+                 useful, a blank line and a body. No markdown fences and no commentary. \
+                 The diff is the whole change; do not invent files or edits. The diff is \
+                 redacted for display, so do not mention redaction.",
+            ),
+            ModelMessage::user(prompt),
+        ],
+        temperature: Some("0".to_string()),
+        reasoning_level: Some(engine.config.model_reasoning_level.clone()),
+        stream: true,
+        tools: None,
+        max_tokens: engine.config.max_output_tokens(),
+        request_usage: engine.config.provider_reports_usage(),
+        emit_cache_breakpoints: engine.config.supports_explicit_cache_breakpoints(),
+    };
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_wait = |_wait: u64| {};
+    let answer = adapter
+        .stream_response(&request, &cancel, &mut on_token, &mut on_wait)
+        .map(|run| run.content)
+        .unwrap_or_default();
+    match parse_commit_draft(&answer) {
+        Some((subject, body)) => {
+            let message = if body.is_empty() {
+                subject.clone()
+            } else {
+                format!("{subject}\n\n{body}")
+            };
+            CommitDraft {
+                subject,
+                body,
+                message,
+                source: "model",
+                notice: None,
+            }
+        }
+        None => CommitDraft {
+            subject: first_line(&fallback),
+            body: after_first_line(&fallback),
+            message: fallback,
+            source: "fallback",
+            notice: Some(
+                "The model did not return a usable message, so the template is the \
+                 suggestion."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn commit_draft_prompt(
+    engine: &WorkspaceEngine,
+    record: &workspace_engine::CommitRecord,
+    selected_paths: &[String],
+) -> String {
+    let summary = engine
+        .session_store
+        .read_messages(&record.session_id)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .find(|message| message.role == "user" && message.kind.is_none())
+        .map(|message| message.content)
+        .unwrap_or_default();
+    let plans = engine
+        .session_store
+        .read_session_plans(&record.session_id)
+        .unwrap_or_default();
+    let plan = plans
+        .into_values()
+        .max_by_key(|plan| plan.created_at_ms)
+        .map(|plan| {
+            plan.steps
+                .iter()
+                .map(|step| format!("- {} ({:?})", step.title, step.status))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let mut diff = String::new();
+    for path in selected_paths {
+        let Some(candidate) = record
+            .candidates
+            .iter()
+            .find(|candidate| &candidate.path == path)
+        else {
+            continue;
+        };
+        diff.push_str(&format!("\n### {path}\n{}", candidate.diff));
+    }
+    if diff.chars().count() > 20_000 {
+        diff = diff.chars().take(20_000).collect::<String>();
+        diff.push_str("\n[Diff truncated for the draft.]\n");
+    }
+    format!(
+        "Task: {summary}\n\nPlan steps:\n{}\n\nFiles:\n{}\n\nRedacted diff:\n{diff}",
+        if plan.is_empty() { "- none" } else { &plan },
+        selected_paths.join("\n"),
+    )
+}
+
+/// Split a model answer into a subject and a body. Fences, a `Subject:` prefix
+/// and a `Body:` prefix are tolerated because a provider that ignores the
+/// instruction should cost a worse message, never a failed commit.
+fn parse_commit_draft(answer: &str) -> Option<(String, String)> {
+    let mut lines = answer.trim().lines().collect::<Vec<_>>();
+    if lines
+        .first()
+        .is_some_and(|line| line.trim_start().starts_with("```"))
+    {
+        lines.remove(0);
+    }
+    if lines.last().is_some_and(|line| line.trim() == "```") {
+        lines.pop();
+    }
+    let index = lines.iter().position(|line| !line.trim().is_empty())?;
+    let subject = lines[index]
+        .trim()
+        .trim_start_matches("Subject:")
+        .trim()
+        .chars()
+        .take(200)
+        .collect::<String>();
+    if subject.is_empty() {
+        return None;
+    }
+    let body = lines[index + 1..]
+        .join("\n")
+        .trim()
+        .trim_start_matches("Body:")
+        .trim()
+        .to_string();
+    Some((subject, body))
+}
+
+fn first_line(message: &str) -> String {
+    message
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn after_first_line(message: &str) -> String {
+    message
+        .split_once('\n')
+        .map(|(_, rest)| rest.trim().to_string())
+        .unwrap_or_default()
 }
 
 fn json_nullable_str(value: Option<&str>) -> String {
@@ -12816,5 +13071,170 @@ mod round_budget_tests {
         );
         assert_eq!(resumed.task.status, TaskStatus::Complete);
         assert_eq!(adapters, 1, "one adapter for the resumed turn");
+    }
+}
+
+#[cfg(test)]
+mod commit_message_tests {
+    use super::*;
+    use workspace_engine::{
+        CommitCandidate, CommitCandidateSource, CommitRecord, CommitVerification, MockModelAdapter,
+        PlanStep, StepStatus, TaskPlan,
+    };
+
+    struct Fixture {
+        engine: WorkspaceEngine,
+        session_id: String,
+        _base: std::path::PathBuf,
+    }
+
+    fn fixture(name: &str) -> Fixture {
+        let base = std::env::temp_dir().join(format!(
+            "damaian-commit-message-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let engine = WorkspaceEngine::new(Config {
+            data_dir: base.join("data"),
+            enable_index_watcher: false,
+            ..Config::default()
+        });
+        let session = engine
+            .session_store
+            .create_session("repo_test", "Commit message")
+            .unwrap();
+        engine
+            .session_store
+            .append_message(&session.id, None, "user", "Add a commit flow")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "Add a commit flow", "test", "test")
+            .unwrap();
+        let mut plan = TaskPlan::new(task.id.clone(), 1);
+        plan.steps.push(PlanStep {
+            id: "step_1".to_string(),
+            title: "Add the dialog".to_string(),
+            detail: None,
+            status: StepStatus::InProgress,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+        });
+        engine.session_store.create_plan(&task, &plan).unwrap();
+        Fixture {
+            engine,
+            session_id: session.id,
+            _base: base,
+        }
+    }
+
+    fn record(fixture: &Fixture) -> CommitRecord {
+        CommitRecord {
+            prepare_id: "commit_test".to_string(),
+            repository_root: "/tmp/repo".to_string(),
+            session_id: fixture.session_id.clone(),
+            branch: Some("main".to_string()),
+            expected_old: None,
+            candidates: vec![CommitCandidate {
+                path: "src/app.js".to_string(),
+                status: "modified".to_string(),
+                source: CommitCandidateSource::AcceptedPatch,
+                label: "Accepted change".to_string(),
+                selected_by_default: true,
+                blob_oid: Some("oid".to_string()),
+                content_sha256: None,
+                mode: Some("100644".to_string()),
+                size: 10,
+                unscanned: false,
+                secret_warnings: Vec::new(),
+                diff: "-old\n+new [REDACTED: aws_access_key]\n".to_string(),
+                accepted_hunks: Vec::new(),
+            }],
+            hooks: workspace_engine::GitHookReport::default(),
+            message: "chore: Add a commit flow".to_string(),
+            verification: CommitVerification::default(),
+            prepared_at_ms: 0,
+            state: "prepared".to_string(),
+            prepared_commit: None,
+            head_after: None,
+            hook_outcomes: Vec::new(),
+            generated_secret_override: false,
+            hunk_count: 0,
+        }
+    }
+
+    #[test]
+    fn a_model_draft_is_shown_as_a_subject_and_body() {
+        let fixture = fixture("model");
+        let record = record(&fixture);
+        let mut adapter = MockModelAdapter::new("feat: add the commit flow\n\nBody line.");
+        let draft = draft_commit_message_with(
+            &fixture.engine,
+            &record,
+            &["src/app.js".to_string()],
+            Some(&mut adapter),
+        );
+        assert_eq!(draft.source, "model");
+        assert_eq!(draft.subject, "feat: add the commit flow");
+        assert_eq!(draft.body, "Body line.");
+        assert_eq!(draft.message, "feat: add the commit flow\n\nBody line.");
+        assert!(draft.notice.is_none());
+    }
+
+    #[test]
+    fn a_failed_or_empty_model_draft_falls_back_to_the_template() {
+        let fixture = fixture("fallback");
+        let record = record(&fixture);
+        let mut adapter = MockModelAdapter::new("");
+        let draft = draft_commit_message_with(
+            &fixture.engine,
+            &record,
+            &["src/app.js".to_string()],
+            Some(&mut adapter),
+        );
+        assert_eq!(draft.source, "fallback");
+        assert_eq!(draft.message, "chore: Add a commit flow");
+        assert!(draft.notice.is_some());
+    }
+
+    #[test]
+    fn no_configured_model_falls_back_without_a_call() {
+        let fixture = fixture("no-model");
+        let record = record(&fixture);
+        let draft =
+            draft_commit_message_with(&fixture.engine, &record, &["src/app.js".to_string()], None);
+        assert_eq!(draft.source, "fallback");
+        assert_eq!(draft.message, "chore: Add a commit flow");
+    }
+
+    #[test]
+    fn the_model_sees_the_redacted_diff_and_the_plan_titles() {
+        let fixture = fixture("prompt");
+        let record = record(&fixture);
+        let mut adapter = MockModelAdapter::new("feat: x");
+        let _ = draft_commit_message_with(
+            &fixture.engine,
+            &record,
+            &["src/app.js".to_string()],
+            Some(&mut adapter),
+        );
+        let prompt = &adapter.requests[0].messages[1].content;
+        assert!(prompt.contains("Add a commit flow"), "{prompt}");
+        assert!(prompt.contains("Add the dialog"), "{prompt}");
+        assert!(prompt.contains("[REDACTED: aws_access_key]"), "{prompt}");
+        assert!(!prompt.contains("AKIAIOSFODNN7EXAMPLE"), "{prompt}");
+        assert!(prompt.contains("src/app.js"), "{prompt}");
+    }
+
+    #[test]
+    fn a_fenced_or_prefixed_answer_is_still_a_draft() {
+        assert_eq!(
+            parse_commit_draft("```\nSubject: feat: x\n\nBody\n```"),
+            Some(("feat: x".to_string(), "Body".to_string()))
+        );
+        assert_eq!(parse_commit_draft("   \n\n"), None);
     }
 }

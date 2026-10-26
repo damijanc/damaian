@@ -15,7 +15,7 @@ pre-implementation state in [`context.md`](context.md)
 | 3 · Durable acceptance detail and the commit engine | Done 2026-10-26 | `PatchFileDecision` gained `applied_hashes` and `accepted_hunks` (both `#[serde(default)]`); `apply_stored_patch` fills them from `PatchApplyResult::applied` and `hunk_selection`, reject paths leave them empty. `SessionStore` gained `append_commit_created` and `read_change_timeline`, which walks applied decisions and commits in log order. New `workspace-engine/src/commit.rs`: candidate set from that timeline plus checkpoint origins, redacted per-path diffs, deterministic message, verification summary, and `prepare`/`commit` through a private `GIT_INDEX_FILE` with `read-tree`/`hash-object`/`update-index`/`write-tree`/`ls-tree` verification/`commit-tree`/`update-ref <new> <old>`; the record is saved under `<data_dir>/commits/`. `GitService::changes` lists untracked files with `-uall` and `-z`, filtered by the same restricted-path rule. Hooks and the secret scan are implemented in the same module; their tests land in Tasks 4 and 5. Nine tests in `tests/commit_preparation.rs` pass (accepted subset, hunk-level, hand edit, command effect, index untouched, HEAD moved, detached/merge, mode+profile gate, invalid selection); `--test foundation` passed (171). Scoped clippy and the fast checks are clean. Deviations: `prepare` saves a record under the data dir (Damaian state, not the repository); the tree is verified against a full expected map, not only the selected paths; `GitService::changes` is new rather than widening `status`, because `status` collapses untracked directories. |
 | 4 · Git hooks: detect, report, run, never bypass | Done 2026-10-26 | Detection honours `core.hooksPath` (relative to the root) and otherwise `git rev-parse --git-path hooks`; the report names path, existence, execute bit, size, interpreter, whether it runs, and why not. `prepare-commit-msg`, `commit-msg` and `post-commit` run in Git order through `CommandRunner::run_at_with_env`, which adds `GIT_INDEX_FILE`, `GIT_DIR` and `GIT_WORK_TREE` to the existing timeout/truncation/redaction/PID path. A rewrite of the approved message is a typed refusal with the final text and no commit; a non-zero or timed-out pre-commit/prepare-commit-msg/commit-msg aborts; a failing post-commit is a warning after the ref moved. A hook report changed between prepare and commit is refused. Tests (10 new): report metadata including `core.hooksPath`, failing pre-commit, commit-msg rewrite then a second approval, prepare-commit-msg rewrite, post-commit warning, private index seen by `git diff --cached`, timeout, truncation plus redaction of a seeded fake AWS key, no `--no-verify` code path, and PID registration while a hook sleeps. All 19 `commit_preparation` tests pass. Deviation from the plan’s wording: `prepare-commit-msg` is run as well as detected, because not running it would silently defeat a hook Git itself would run; recorded in context D4. |
 | 5 · Exact bytes, the secret check and the per-commit override | Done 2026-10-26 | `commit` recomputes each selected path’s Git blob id and mode and refuses `commit_content_changed` when either differs from the record, before composing anything; restoring the reviewed bytes lets the same preparation commit. The secret scan runs on the bytes that would become blobs, reports categories/counts through `GeneratedSecretWarning` (now `Serialize`/`Deserialize`), treats a file over `max_file_bytes` as `unscanned` but still hashes it so an accepted large file is not mislabelled as hand-edited, and requires the separate `allow_generated_secrets` request field. The override writes `commit_secret_override` with categories/counts and no text, and `commit_created` records `generatedSecretOverride`; the prepared record stores only the redacted diff. Five tests: content changed then the same preparation commits the restored bytes, seeded fake AWS key warning with no text in the serialized preparation, override refused then accepted with a clean audit, unscannable file, and a record that contains neither the key nor an unredacted copy. All 24 `commit_preparation` tests pass. |
-| 6 · Message drafting with the deterministic fallback | Not started | |
+| 6 · Message drafting with the deterministic fallback | Done 2026-10-26 | `POST /api/commit-message` loads the prepared record, takes the selected paths (or the default selection), and calls `draft_commit_message_with`. The prompt carries the task prompt, the latest plan’s step titles, the selected paths and the **redacted** diffs (capped at 20k characters). The model answer is parsed tolerantly (fences, `Subject:`, `Body:`) into a subject and body; a missing adapter, a thrown error, an empty answer or an unparsable one returns `record.message` — the existing `GitService::suggest_commit_message` template — with `source:"fallback"` and a notice. Five tests: model subject/body, empty answer fallback, no adapter fallback, the request contains the redacted diff and plan titles and not the seeded key, and fenced/prefixed parsing. The dialog’s *Draft with model* button is Task 8; nothing calls the model on prepare, so opening the dialog is free. |
 | 7 · Durable action markers, audit and crash inspection | Not started | |
 | 8 · Shell routes and the *Commit…* dialog | Not started | |
 | 9 · Docs, acceptance walk, close-out | Not started | |
@@ -406,7 +406,7 @@ D1–D3.
 `tests` inline; `git_service.rs` only if the fallback needs a signature change
 (it should not); `commit.rs` for the recorded summary.
 
-- [ ] **Step 1: Write the failing tests** in `desktop-shell/src/lib.rs`:
+- [x] **Step 1: Write the failing tests** in `desktop-shell/src/lib.rs`:
   - `a_model_draft_is_shown_and_can_be_edited_before_commit` — a
     `MockModelAdapter` returns a subject and body; the draft response carries
     them; an edited message is what `commit` receives (the engine test covers
@@ -419,8 +419,8 @@ D1–D3.
   - `the_model_sees_the_redacted_diff_and_the_plan_titles` — the recorded
     request contains `[REDACTED]` for a seeded secret and the plan step titles;
     the raw secret is absent.
-- [ ] **Step 2: Confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Confirm they fail.**
+- [x] **Step 3: Implement.**
   - `POST /api/commit-message` takes `repo`, `session_id`, `prepare_id`; loads
     the prepared record, builds the prompt from the redacted diffs and the
     latest task plan's step titles, calls `chat_model_adapter`, parses the first
@@ -431,10 +431,10 @@ D1–D3.
     task's summary and the selected paths.
   - No new model call happens on prepare; the dialog opens with the fallback and
     the user presses *Draft with model*.
-- [ ] **Step 4: Falsify.** Send an unredacted diff → the redaction assertion
+- [x] **Step 4: Falsify.** Send an unredacted diff → the redaction assertion
   fails. Return `source: "model"` on an empty response → the fallback test
   fails. Drop the plan titles → the request assertion fails.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -442,7 +442,7 @@ D1–D3.
   CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo nextest run -p desktop-shell --lib
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Draft a commit message without making the commit depend on a model`.
 
 ## Task 7: Durable action markers, audit and crash inspection
