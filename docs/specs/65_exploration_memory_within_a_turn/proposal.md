@@ -31,7 +31,7 @@ cross-reference, not a prerequisite.
 Also in this spec: [`context.md`](context.md) (the code map and the collision
 notes a task worker needs), [`tasks.md`](tasks.md) (the implementation plan).
 Related implementation specs:
-[`55_conversation_compaction.md`](../55_conversation_compaction.md) (summarises a
+[`55_conversation_compaction/proposal.md`](../55_conversation_compaction/proposal.md) (summarises a
 whole conversation across turns; this spec carries only the agent's own notes,
 and #55 should read them),
 [`61_continue_the_stopped_turn/`](../61_continue_the_stopped_turn/proposal.md) (a paused

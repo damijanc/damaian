@@ -49,7 +49,7 @@ category), [`../24_repository_map_and_monorepo_boundaries/`](../24_repository_ma
 [`../27_context_inspector.md`](../27_context_inspector.md) (renders the manifest this
 spec produces), [`../49_prompt_cache_accounting_and_reuse/proposal.md`](../49_prompt_cache_accounting_and_reuse/proposal.md)
 (the section order this spec fixes is what its reuse slice needs),
-[`../55_conversation_compaction.md`](../55_conversation_compaction.md) (the
+[`../55_conversation_compaction/proposal.md`](../55_conversation_compaction/proposal.md) (the
 conversation-summary category it will fill).
 
 ## 1. Motivation
@@ -190,7 +190,7 @@ map, including the call sites this section only names.
   ([spec 25](../25_symbol_and_relationship_index/proposal.md)); this spec
   allocates budget among what they return and records what it did.
 - Conversation compaction — Phase 3 WP6, Should-tier
-  ([spec 55](../55_conversation_compaction.md)). The pipeline reserves a
+  ([spec 55](../55_conversation_compaction/proposal.md)). The pipeline reserves a
   category for a conversation summary and tolerates its absence.
 - Model routing — Phase 3 WP7.
 - A tokenizer per model family. §5.8 improves the estimate without adding a
@@ -687,7 +687,7 @@ function:
 2. **Stable-to-volatile order.** The sections become `Repository context:` →
    `Recent conversation:` → `User request:`. The current order is the reverse of
    what a cacheable prefix needs ([spec 49](../49_prompt_cache_accounting_and_reuse/proposal.md)
-   `context.md` §3.2; [spec 55](../55_conversation_compaction.md) §2), and both
+   `context.md` §3.2; [spec 55](../55_conversation_compaction/proposal.md) §2), and both
    specs assign the decision to this one or to #49.
 3. **The request is rendered once, redacted.** `Required` items render under the
    final `User request:` heading, and the `Repository context:` block holds only
@@ -721,7 +721,7 @@ no breakpoints.
 
 `prior_messages` keeps today's shape — the session's last eight messages,
 truncated to 2,000 characters each (`chat.rs:6108-6125`) — because the recency
-window is [spec 55](../55_conversation_compaction.md)'s to replace. This spec
+window is [spec 55](../55_conversation_compaction/proposal.md)'s to replace. This spec
 only decides where that block sits.
 
 ### 5.11 Reserved categories
@@ -730,7 +730,7 @@ Three categories in §5.1 have no collection source yet, and this spec does not
 invent one:
 
 - `Pinned` needs session-scoped storage, which is [spec 27](../27_context_inspector.md).
-- `ConversationSummary` needs [spec 55](../55_conversation_compaction.md) to
+- `ConversationSummary` needs [spec 55](../55_conversation_compaction/proposal.md) to
   produce a summary at all.
 - `Findings` exists in the model (spec 22), but the agent sees only the subset
   the user selects for a repair request. Automatically sending every open finding

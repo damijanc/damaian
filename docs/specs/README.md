@@ -94,10 +94,11 @@ longer in flight.
   now exists, but the spec's own `Depends on:` line still names Phase 1 WP3
   (provider capability validation) as unspecified, and the eight-message
   sliding window it is most sensitive to is #55's to replace, so it is not in
-  the ready set.
+  the ready set. **#55 conversation compaction** is in progress from 2026-10-26
+  in a solo `chat.rs` track; it replaces that window.
 - **Ready, not started:** #27 context inspector; #33 MCP management; #35 commit
   preparation (its last dependency, #23, was built on 2026-10-25); #51 external
-  reference retrieval; #55 conversation compaction.
+  reference retrieval.
 - **Blocked:** #28 on #27; #29 on #28; #30 on #28 and #29; #36 on #35; #37 on
   #33, #35 and #36; #52 on #33; #39 on #38; #40 on #38 and #39; #54 on Phase 1
   WP3 (provider capability validation), which is unspecified.
@@ -579,7 +580,7 @@ is ready.
 | 52 | [52_mcp_server_mode.md](52_mcp_server_mode.md) | **Not started.** Roadmap Phase 4 WP6. #06 and #33 are client-side only, so Damaian's indexed search, redaction and path policy are reachable only from its own window — the alternative being to give another tool raw filesystem access. Exposes a read-only subset over stdio, with the set computed as the intersection of read-only and profile-permitted rather than listed, so a tool added later is excluded until classified. The repository is fixed at launch and unreachable from the wire; a server has no user, therefore no approval, therefore nothing that writes. |
 | 53 | [53_session_search_and_export/proposal.md](53_session_search_and_export/proposal.md) | **Done.** Roadmap Phase 1 WP9. A rescope, not greenfield: listing, renaming and deleting already work end to end, and what is missing is finding anything and getting anything out. A bounded scan through #17's parse-first reader rather than a second index, anchored on `seq` because it survives rewinds. Its sharp edge is inherited from #16: `append_message` stores content verbatim and deliberately does not redact, so that a rewind restores what was actually said — which makes export a display path that writes a file, and redaction on the way out mandatory, with the redaction count stated rather than silently applied. |
 | 54 | [54_image_input.md](54_image_input.md) | **Not started.** Roadmap Phase 3 WP9. Lets a user paste a picture into the composer and lets the model see #12's diagnostic screenshots, which today it receives only as a file reference. Its hard part is that **an image defeats `SecretScanner`** and OCR is rejected, so the guarantee becomes informed consent: no unseen image is ever sent, and no setting can make screenshot inclusion automatic. |
-| 55 | [55_conversation_compaction.md](55_conversation_compaction.md) | **Not started.** Roadmap Phase 3 WP6 (Must, and in that phase's minimum slice). Conversations are silently **clipped to the last eight messages, each cut to 2,000 characters**, so a constraint stated in the first message is gone at the ninth; compaction appends a `conversation_compacted` event rather than rewriting anything. Its load-bearing rule is that **a model never writes a field the engine can compute**: files changed, plan steps, approvals and validation status come from the session log. |
+| 55 | [55_conversation_compaction/](55_conversation_compaction/proposal.md) | **In progress (started 2026-10-26).** Roadmap Phase 3 WP6 (Must, and in that phase's minimum slice). Conversations were silently **clipped to the last eight messages, each cut to 2,000 characters**, so a constraint stated in the first message was gone at the ninth; compaction appends a `conversation_compacted` event rather than rewriting anything and replaces the window with a token budget. Its load-bearing rule is that **a model never writes a field the engine can compute**: files changed, plan steps, approvals and validation status come from the session log. |
 | 56 | [56_provider_fallback_consent/](56_provider_fallback_consent/proposal.md) | **Done** 2026-10-12. A terminal refusal with a qualifying second provider pauses on a one-shot, refused-by-default offer in the desktop app ("Keep it failed" or "Answer with …", no "always"); approval re-issues the refused call through the fallback and records the switch, and decline fails exactly as #48 does. Split out of #48, it depends on #48's classification and `failureKind` and reuses the pending-approval and resume machinery. |
 | 57 | [57_worker_sessions/proposal.md](57_worker_sessions/proposal.md) | **Done 2026-10-16** (Tasks 1–12, started 2026-10-07; acceptance passed with DeepSeek on its re-run, see its §6). Hosts the planner-and-workers workflow behind one user setting, off by default and forbidden to repository config: a *Start worker* button on `worker-prompt` blocks runs the handoff in its own git worktree and process, with a per-project Workers board and pause, resume, stop and steering notes. Its load-bearing rule is that **nothing survives**: a stdin lifeline makes every worker exit when the shell dies, including on `SIGKILL`. |
 | 58 | [58_header_repo_bar_and_menus/](58_header_repo_bar_and_menus/proposal.md) | **Done (2026-10-14).** Every acceptance criterion walked in the running app; the full seven-check gate passed in CI. Usability rework of the desktop shell: every "more actions" control becomes one vertical ⋮ menu, the header keeps only title, terminal and ⋮, and a repo bar above the prompt shows folder, branch, `+N −M` and contextual actions such as *Fix N errors*. `githubUrl` is reconstructed from a parsed `origin`, never opened raw, because the remote is repository-controlled. |
@@ -619,7 +620,7 @@ Two rules follow, and the second is the one worth enforcing:
   a work package, so the two cannot disagree. Where a spec is not a graduation
   (#1–#13, #34, #41–#47), they come from its own stated ordering.
 - **A dependency marked *not built* must be answered in the design.** Either the
-  spec states what to do until it lands — as [#55](55_conversation_compaction.md)
+  spec states what to do until it lands — as [#55](55_conversation_compaction/proposal.md)
   §5.1 does for the context budget, [#49](49_prompt_cache_accounting_and_reuse/proposal.md)
   §5.3 for its prefix test, and [#31](31_permission_profiles/proposal.md) §7 for #34 — or
   it says plainly that the work is blocked. The pattern
