@@ -4,7 +4,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) in full · corrections and the
 pre-implementation state in [`context.md`](context.md)
-**Started:** 2026-10-26
+**Started:** 2026-10-26 — **Done:** 2026-10-26
 
 ## Progress
 
@@ -18,7 +18,7 @@ pre-implementation state in [`context.md`](context.md)
 | 6 · Message drafting with the deterministic fallback | Done 2026-10-26 | `POST /api/commit-message` loads the prepared record, takes the selected paths (or the default selection), and calls `draft_commit_message_with`. The prompt carries the task prompt, the latest plan’s step titles, the selected paths and the **redacted** diffs (capped at 20k characters). The model answer is parsed tolerantly (fences, `Subject:`, `Body:`) into a subject and body; a missing adapter, a thrown error, an empty answer or an unparsable one returns `record.message` — the existing `GitService::suggest_commit_message` template — with `source:"fallback"` and a notice. Five tests: model subject/body, empty answer fallback, no adapter fallback, the request contains the redacted diff and plan titles and not the seeded key, and fenced/prefixed parsing. The dialog’s *Draft with model* button is Task 8; nothing calls the model on prepare, so opening the dialog is free. |
 | 7 · Durable action markers, audit and crash inspection | Done 2026-10-26 | Each attempt creates a synthetic `Commit prepared changes` task in `RunningTool`, starts a `commit` marker with `sideEffecting: true` before `read-tree`, and records the selected paths and task id on the record. The prepared commit is written to the record **before** `update-ref`, so a crash in that window is inspectable; the same record’s expected old and prepared commit let `Inspect` decide whether HEAD is the commit, still the old value, or somewhere else, without resolving anything. A known outcome sets the task terminal and finishes the marker; a rewritten message or failed hook leaves the record usable so the user can approve again. `GitService::head_commit` is the full-SHA read. `commit_created` audits SHA, branch, path/hunk counts, message length, hook outcomes and the override flag, and the audit carries no content. `desktop-shell/src/recovery.rs` adds the `commit` object and the record’s paths to the recovered JSON; `app.js`’s Inspect shows the comparison. Tests: marker pair with `sideEffecting:true` and `outcome:"ok"`, dangling commit marker → `UnknownExternalOutcome` with no resume, audit counts/override with no seeded key anywhere, and the recovery payload’s `expectedOld`/`preparedCommit`/`landed`. 27 commit-preparation tests and 14 recovery tests pass. |
 | 8 · Shell routes and the *Commit…* dialog | Done 2026-10-26 | Four routes: `GET /api/commit-status` (counts + refusal), `GET /api/commit-preparation` (the full record as JSON), `POST /api/commit` (requires `approval=commit`, maps `CommitError` to `{error, code, message}` with hook output or the rewritten message) and the Task 6 `POST /api/commit-message`. The repo bar fetches status beside `/api/git-status` when a session is open, in parallel; `commitAction` appends to `repoActionProviders` and shows when there is a candidate. The dialog lists every candidate with its label and a per-file redacted diff, states that the diff is redacted and the commit is not, requires the secret override when the real bytes are flagged, shows the hook report and “never skips them”, shows the check evidence and any refusal, prefills the deterministic message, offers *Draft with model*, and submits the typed approval with the selected paths. A rewritten message replaces the textarea and asks for approval again; hook output is shown; HEAD/content/hook changes disable the dialog and say to prepare again; success toasts the short SHA and subject and refreshes the bar. `api()` now attaches the parsed payload to errors so the dialog branches on `code`, not prose. Tests (5 route tests + 5 message tests): status/preparation JSON, missing approval → 400 with no ref, Ask mode → 409, a real commit through the route with the SHA and content, and a rewritten message → 409 with the text and no ref; all 193 shell lib tests pass. **Manual UI walk not run:** the web UI is bootstrapped through Tauri (`damaian_desktop_bootstrap`) and no browser harness was available in this session, so the dialog’s interaction was verified by reading, `node --check` and the route tests rather than by clicking it. |
-| 9 · Docs, acceptance walk, close-out | Not started | |
+| 9 · Docs, acceptance walk, close-out | Done 2026-10-26 (CI outstanding) | `proposal.md` §7 records what shipped, the private-index behaviour across normal/unborn/merge/rebase/detached states, the honest limits of the secret-check measurement, `core.hooksPath`, seven deviations and a criterion-to-test table (30 engine tests). `USER_GUIDE.md` gains a Commits section and updates the repo-bar action; `TROUBLESHOOTING.md` adds the `commits/` data files and a refusal/unknown-outcome section; `SECURITY.md` adds the Git Commits guarantees. README current state, history and #35 row are updated and #36 is promoted; #36 and #37 dependency lines now say #35 is built; the CHANGELOG `Unreleased` commit clause is gone. One manual gap is stated plainly: the dialog was not walked in a browser because the web UI bootstraps through Tauri and no harness was available. Local checks: `scripts/quality-gate.sh fmt node lint typos deny` clean; scoped clippy for `workspace-engine` and `desktop-shell` clean; `cargo nextest -p workspace-engine --test commit_preparation --test permission_profiles --test crash_recovery` 145 passed, 3 skipped; `-p desktop-shell --lib` 193 passed, 5 skipped; deterministic eval tier all 28 scenarios pass; `npm run specs:check` passed. The seven-check gate is left to CI after the user pushes. |
 
 **Goal:** A Code-mode session can commit exactly the changes Damaian applied and
 the user accepted, through a private index that never touches the user's staging
@@ -586,13 +586,13 @@ exists).
 `docs/specs/README.md`, `CHANGELOG.md`, `docs/specs/36_branch_and_worktree_delivery.md`,
 `docs/specs/37_pull_request_creation.md`, this file.
 
-- [ ] **Step 1: Walk every acceptance criterion in §6** against the finished
+- [x] **Step 1: Walk every acceptance criterion in §6** against the finished
   tree and record a criterion-to-test table in `proposal.md` §7, naming which
   criteria are manual.
-- [ ] **Step 2: Fill `proposal.md` §7's implementation notes:** the private-index
+- [x] **Step 2: Fill `proposal.md` §7's implementation notes:** the private-index
   behaviour across normal, merge, rebase and detached states; which states are
   refused and why; how often the secret check fired; `core.hooksPath` handling.
-- [ ] **Step 3: Documentation.**
+- [x] **Step 3: Documentation.**
   - `USER_GUIDE.md`: what is included and why hand-edited/command files are
     shown unselected; the hook report; that the diff is redacted while the
     commit is not; that Damaian never skips hooks; Code mode and the profile
@@ -603,13 +603,13 @@ exists).
   - `SECURITY.md`: the first write to the repository, the private index, the
     approval, the typed commit approval, the secret scan and its override, the
     capability, and that repository config can only deny.
-- [ ] **Step 4: Close-out.** README current-state paragraph, #35's row, and
+- [x] **Step 4: Close-out.** README current-state paragraph, #35's row, and
   "What to build next" (#35 leaves the ready set, #36 is promoted). Flip #36's
   `Depends on:` line for #35 to built, and update #37's prose where it now
   correctly says #35 is built. Remove #35's `Unreleased` line from
   `CHANGELOG.md`. Mark Done in all four places (proposal header, README row,
   this Progress table, this header's `**Done:**`). Say plainly "CI outstanding".
-- [ ] **Step 5: Scoped checks and `npm run specs:check`.**
+- [x] **Step 5: Scoped checks and `npm run specs:check`.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -619,4 +619,4 @@ exists).
   npm run specs:check
   ```
 
-- [ ] **Step 6: Commit:** `Close spec 35: commit the accepted changes`.
+- [x] **Step 6: Commit:** `Close spec 35: commit the accepted changes`.

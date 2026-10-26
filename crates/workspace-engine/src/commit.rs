@@ -29,6 +29,7 @@ use crate::git_service::{DiffOptions, GitService};
 use crate::hash::{create_id, now_millis, repository_id_for_root};
 use crate::mode::SessionMode;
 use crate::patch_engine::GeneratedSecretWarning;
+use crate::path_policy::PathPolicy;
 use crate::plan::TaskPlan;
 use crate::secret_scanner::SecretScanner;
 use crate::session::{ChangeEvent, SessionStore, TaskStatus};
@@ -373,6 +374,7 @@ pub struct CommitEngine {
     config: Config,
     audit_log: AuditLog,
     scanner: SecretScanner,
+    path_policy: PathPolicy,
     session_store: SessionStore,
     checkpoint_store: CheckpointStore,
     git: GitService,
@@ -403,6 +405,7 @@ impl CommitEngine {
         config: Config,
         audit_log: AuditLog,
         scanner: SecretScanner,
+        path_policy: PathPolicy,
         session_store: SessionStore,
         checkpoint_store: CheckpointStore,
         git: GitService,
@@ -412,6 +415,7 @@ impl CommitEngine {
             config,
             audit_log,
             scanner,
+            path_policy,
             session_store,
             checkpoint_store,
             git,
@@ -572,6 +576,13 @@ impl CommitEngine {
                 "That preparation belongs to a different session.",
             ));
         }
+        let prepared_root = Path::new(&record.repository_root);
+        if fs::canonicalize(prepared_root).ok() != fs::canonicalize(root).ok() {
+            return Err(CommitError::refused(
+                "commit_not_prepared",
+                "That preparation belongs to a different repository.",
+            ));
+        }
         if record.state != "prepared" {
             return Err(CommitError::refused(
                 "commit_not_prepared",
@@ -579,6 +590,22 @@ impl CommitEngine {
             ));
         }
         let selected = self.selected_candidates(&record, &request.selected_paths)?;
+        for candidate in &selected {
+            if self
+                .path_policy
+                .resolve_for_write(root, &candidate.path)
+                .is_err()
+                || self.path_is_restricted(&candidate.path)
+            {
+                return Err(CommitError::refused(
+                    "commit_restricted_path",
+                    format!(
+                        "{} is outside this checkout or is restricted, so it cannot be committed.",
+                        candidate.path
+                    ),
+                ));
+            }
+        }
         let message = request.message.trim_end().to_string();
         if message.trim().is_empty() {
             return Err(CommitError::refused(
@@ -715,7 +742,10 @@ impl CommitEngine {
             .session_store
             .create_task(
                 &request.session_id,
-                "Commit prepared changes",
+                // Not a prompt: an empty one keeps a crash-interrupted commit
+                // task from being offered a "resume" that would run a chat
+                // turn. The recovery card explains the action instead.
+                "",
                 &self.config.model_provider,
                 &self.config.model_name,
             )
@@ -1124,7 +1154,7 @@ impl CommitEngine {
                     .to_string(),
             );
         }
-        if refusal.is_none() && head.is_some() {
+        if refusal.is_none() {
             let identity = self.git_output(root, &["var", "GIT_COMMITTER_IDENT"])?;
             if !identity.status.success() {
                 refusal = Some(
@@ -1264,6 +1294,8 @@ impl CommitEngine {
             } else if let Some(acceptance) = acceptance {
                 let recorded = acceptance.applied_hash.as_deref();
                 let matches = match recorded {
+                    // A deletion records an empty hash, and the file is gone.
+                    Some(hash) if hash.is_empty() && blob.is_none() => true,
                     // A recorded hash is SHA-256 of what Damaian wrote.
                     Some(hash) => content_sha256.as_deref() == Some(hash),
                     // A decision written before spec 35 has no hash; fall back
@@ -1326,6 +1358,13 @@ impl CommitEngine {
         }
         candidates.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(candidates)
+    }
+
+    fn path_is_restricted(&self, path: &str) -> bool {
+        self.path_policy.is_restricted(path, false)
+            || path
+                .match_indices('/')
+                .any(|(at, _)| self.path_policy.is_restricted(&path[..at], true))
     }
 
     fn checkpoint_paths(
@@ -1718,7 +1757,11 @@ impl CommitEngine {
             fs::remove_dir_all(&dir)?;
         }
         fs::create_dir_all(&dir)?;
-        Ok(dir)
+        // `GIT_INDEX_FILE` and hook arguments are interpreted by child
+        // processes whose working directory is the repository, so a relative
+        // `data_dir` (the documented `DAMAIAN_DATA_DIR=.damaian` form) must be
+        // resolved here, not left relative.
+        Ok(fs::canonicalize(&dir)?)
     }
 
     fn record_path(&self, prepare_id: &str) -> PathBuf {
@@ -1764,11 +1807,15 @@ impl CommitEngine {
         if !symlink && !metadata.is_file() {
             return Ok(None);
         }
-        let oid = if symlink {
+        let (oid, content_sha256) = if symlink {
             let target = fs::read_link(&full)?;
-            self.hash_object_stdin(root, target.as_os_str().as_bytes(), false)?
+            let bytes = target.as_os_str().as_bytes();
+            (
+                self.hash_object_stdin(root, bytes, false)?,
+                Some(crate::hash::sha256(bytes)),
+            )
         } else {
-            self.hash_object_path(root, path, false)?
+            (self.hash_object_path(root, path, false)?, None)
         };
         let mode = match self.head_entry(root, path)? {
             Some((mode, _)) => mode,
@@ -1786,7 +1833,7 @@ impl CommitEngine {
             mode,
             size: metadata.len(),
             symlink,
-            content_sha256: None,
+            content_sha256,
         }))
     }
 

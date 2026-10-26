@@ -114,7 +114,7 @@ It was split because only part of it exists to rearrange:
 | Change count → diff view, "changes" icon | No working-tree diff view exists | Next spec in the series |
 | Browser panel, files panel | Do not exist | Later specs |
 | Branch menu | Branch switching is #36 | #36 |
-| Commit / Create PR action | #35 and #37, not started | They fill this spec's slot |
+| Commit / Create PR action | #35 built 2026-10-26; #37 not started | They fill this spec's slot |
 
 The layout was agreed against a clickable mockup on 2026-10-12–13. Two
 decisions changed during review:

@@ -7,7 +7,7 @@ Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#33](33_mcp_management_and_deferred_discovery.md) (the MCP client
 it publishes through) — **not built**; [#35](35_commit_preparation/proposal.md) (commit
-preparation) — **not built**; [#36](36_branch_and_worktree_delivery.md) (branch
+preparation) — built (Done 2026-10-26); [#36](36_branch_and_worktree_delivery.md) (branch
 delivery) — **not built**. Everything else named below is a cross-reference,
 not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4

@@ -262,7 +262,7 @@ only:
 
 1. Open error findings → *Fix N errors*
 2. Open warning findings → *Fix N warnings*
-3. *(#35)* Uncommitted accepted changes → *Commit…*
+3. *(#35, built)* Uncommitted accepted changes → *Commit…*
 4. *(#37)* Branch ahead of its base → *Create PR*
 5. Nothing → hidden
 

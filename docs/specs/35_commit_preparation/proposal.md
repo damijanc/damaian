@@ -1,6 +1,7 @@
 # Feature Spec: Commit Preparation
 
-Status: In progress
+Status: Done (2026-10-26). CI outstanding: the seven-check gate runs after the
+user pushes; agents never push.
 Order: 35 of 37
 Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -32,10 +33,12 @@ warn-and-override mechanism §5.4 reuses),
 
 ## 1. Motivation
 
-Damaian has never written to a user's Git repository. `git_service.rs` is 141
-lines and read-only: `status`, `diff`, and `suggest_commit_message`. Every
-requirement in this work package is new code, and all of it crosses from reading
-the user's repository to writing it — the largest trust boundary in the roadmap.
+Damaian has never written to a user's Git repository. When this was written,
+`git_service.rs` was 141 lines and read-only: `status`, `diff`, and
+`suggest_commit_message`. It is 1,381 lines now, still read-only, because #58 and
+#60 widened its read surface (context.md §2.1). Every requirement in this work
+package was new code, and all of it crosses from reading the user's repository to
+writing it — the largest trust boundary in the roadmap.
 
 The value is concrete. Damaian already applies changes selectively — per file and
 per hunk ([spec 04](../04_hunk_level_patch_apply.md)) — so it knows exactly what the
@@ -55,6 +58,11 @@ leaving the machine, and the preview that authorised it hid the very thing that
 matters. §5.4 handles this.
 
 ## 2. Current State
+
+The references below are the ones this decision was written against.
+[`context.md`](context.md) §2 has the current ones and the fifteen corrections
+planning found; where the two disagree, `context.md` is the measured state and
+this section is the history.
 
 - **`GitService` is read-only.** `status` (`git_service.rs:37`), `diff`
   (`git_service.rs:77`), `suggest_commit_message` (`git_service.rs:110`). No
@@ -367,15 +375,187 @@ crash actually landed, and where the commit appears in the audit log.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+### 7.1 What shipped
 
-- Whether the private-index approach in §5.3 worked as specified across the
-  fixture cases — in particular a repository mid-rebase, mid-merge, or with a
-  detached `HEAD`, where `read-tree HEAD` and `-p HEAD` need care. If any state
-  had to be refused rather than handled, say which and why refusing is correct.
-- How often the §5.4 secret check fired on real content, and whether it produced
-  false positives severe enough to make the override routine. A routine override
-  is a defeated control, and [spec 07](../07_generated_secret_override.md) exists
-  because that already happened once.
-- Whether `core.hooksPath` was honoured correctly for repositories using a
-  shared hooks directory.
+A new `workspace-engine/src/commit.rs` module, exposed as
+`WorkspaceEngine::commit`, does the work end to end:
+
+- **Candidate set.** The session log's `patch_file_decided` and `commit_created`
+  events are walked in order to answer "which accepted changes are not committed
+  yet". An accepted path is selected by default only while its current SHA-256
+  equals the `applied_hash` the apply recorded. Everything else `git status`
+  reports is labelled and unselected: a hand edit after Damaian's change, a
+  command effect from the session's checkpoint (`CheckpointOrigin::Command`), a
+  legacy patch with no decision, an untracked or external path, or an unresolved
+  conflict. `GitService::changes` uses `-uall -z` so an untracked directory
+  becomes files, and the same restricted-path filter as every other git read.
+- **Private index.** Every tree is built with `GIT_INDEX_FILE` pointing at
+  `<data_dir>/commits/<prepare-id>/index`: `read-tree HEAD` (or `--empty` for an
+  unborn branch), `hash-object -w`, `update-index -z --index-info`,
+  `write-tree`, then `ls-tree -r -z` compared against the full expected map
+  (HEAD's tree with the selected additions, modifications and deletions). Only
+  then `commit-tree`, a final HEAD check, and
+  `update-ref refs/heads/<branch> <commit> <expected-old>`. The user's
+  `.git/index` is never read or written. The tree check compares the whole tree,
+  not only the selected paths, so a composition bug cannot commit an extra
+  entry.
+- **Exact approval.** The prepared record stores each candidate's Git blob id
+  and mode; `commit` recomputes both and refuses `commit_content_changed` on a
+  mismatch. The record also stores the expected old `HEAD` and the branch, and
+  refuses when either moved. The approval therefore covers the bytes, not the
+  redacted preview.
+- **Secrets.** The scanner runs on the bytes that would become blobs, not the
+  redacted diff. Findings become `GeneratedSecretWarning` (path, categories,
+  count), a file over `max_file_bytes` is `unscanned` and needs the override
+  too, and `allow_generated_secrets` is a separate request field. The override
+  writes `commit_secret_override` with categories and counts; the prepared
+  record keeps only the redacted diff.
+- **Hooks.** The report honours `core.hooksPath` (relative to the root) and
+  otherwise `git rev-parse --git-path hooks`. `pre-commit`,
+  `prepare-commit-msg`, `commit-msg` and `post-commit` run in Git's order through
+  `CommandRunner::run_at_with_env`, which adds `GIT_INDEX_FILE`, `GIT_DIR` and
+  `GIT_WORK_TREE` to the existing timeout, truncation, redaction and PID
+  registration. A rewrite of the approved message is a typed refusal with the
+  final text and no commit; a failing or timed-out pre-commit, prepare-commit-msg
+  or commit-msg aborts; a failing post-commit is a warning after the ref moved.
+  There is no `--no-verify` and no parameter that skips a hook.
+- **Durable state.** Each attempt creates a synthetic task in `RunningTool` and
+  a `commit` marker with `sideEffecting: true`. The prepared commit is written to
+  the record before `update-ref`, so a crash in that window is inspectable:
+  recovery reports the expected old, the prepared commit and the current HEAD,
+  and never re-commits. Audit events are `commit_prepared`, `commit_refused`,
+  `commit_secret_override` and `commit_created`, with SHA, branch, path/hunk
+  counts, message length, hook outcomes and the override flag — never content.
+- **Approval and policy.** `allow_git_commits` is the sixth profile capability
+  key, classified `Capability` and restrict-only from repository config; the
+  Read-only profile turns it off. Committing is refused outside Code mode. The
+  shell route requires `approval=commit`; there is no Allow Always.
+- **Message.** `GitService::suggest_commit_message` remains the deterministic
+  answer, used by `prepare`. `POST /api/commit-message` may draft with a model
+  from the redacted diff and the latest plan's step titles; no adapter, a
+  refusal, an empty answer or an unparsable one falls back to the template. The
+  textarea is the user's, and the edited text is committed.
+- **Desktop.** *Commit…* is one entry in #58's contextual-action provider list,
+  visible while the session has a candidate. Its dialog shows the per-file
+  labels and redacted diffs, the standing redaction statement, the hook report,
+  the check evidence, any refusal, the secret override and the message.
+  `POST /api/commit` maps `CommitError` to a code the dialog branches on.
+
+### 7.2 Private-index behaviour across states
+
+The approach worked as specified for the normal, unborn, merge, rebase and
+detached cases, in the sense that each has a definite answer:
+
+- **Normal branch:** supported; the tree is built from `HEAD` and the ref moves
+  with a compare-and-swap.
+- **Unborn branch (`HEAD` absent):** supported. The index starts empty
+  (`read-tree --empty`), the tree has no parent (`commit-tree` without `-p`), and
+  `update-ref` uses an empty old value, which requires the ref not to exist.
+- **Detached `HEAD`:** **refused.** `update-ref refs/heads/<branch>` has no
+  branch to move; naming `HEAD` directly is a different operation with different
+  recovery semantics. Refusing with "check out a branch" is correct rather than
+  committing onto a detached checkout.
+- **Merge, cherry-pick, revert, rebase or sequencer in progress:**
+  **refused.** `read-tree HEAD` and `-p HEAD` would need the merge's second
+  parent (or the sequencer's state) to produce the commit Git itself would
+  produce. Approximating that is exactly where a partial or wrong commit hides;
+  refusing names the marker (`MERGE_HEAD`, `rebase-merge`, …) instead.
+- **Unresolved conflicts:** **refused** before composing, because the working
+  tree contains conflict markers and the private index does not resolve them.
+- **A branch checked out in another worktree:** **refused**, because updating it
+  would move a checkout this session is not in.
+- **No committer identity:** **refused** with a message to set `user.name` and
+  `user.email`; Damaian does not set them.
+
+No test created a real merge or rebase commit; the refusal path is asserted for a
+detached HEAD and a `MERGE_HEAD` marker.
+
+### 7.3 The secret check in practice
+
+The deterministic eval tier and the scoped test suite do not exercise a real
+user repository, so there is **no measurement of how often the check fires on
+real content**. What is measured:
+
+- The seeded fake AWS key in a generated file is flagged with
+  `aws_access_key`, count 1, and no matched text in the prepared JSON.
+- A file over `max_file_bytes` is `unscanned` and needs the same override,
+  rather than being silently committed.
+- The override is refused without the separate field, lands with it, is audited
+  with categories and counts, and the audit and record contain no key text.
+
+There is therefore no evidence that the override is routine; there is also no
+evidence from real use. That is the honest position, and the acceptance table
+below marks the live frequency as unmeasured.
+
+### 7.4 `core.hooksPath`
+
+Honoured correctly: a repository with `core.hooksPath=.githooks` reports that
+source and the `.githooks/pre-commit` path, and runs it. The default directory is
+resolved with `git rev-parse --git-path hooks`, so a linked worktree uses the
+hooks Git itself would. A non-executable hook is reported as one Git would skip
+and is not run.
+
+### 7.5 Deviations from the written design
+
+1. **`prepare-commit-msg` is run, not only detected.** `commit-tree` skips all
+   hooks. Running only `pre-commit`, `commit-msg` and `post-commit` would silently
+   defeat a hook Git runs, so the implementation runs all four in Git's order.
+   Its rewrite is treated exactly like `commit-msg`'s.
+2. **A rewritten message is a second approval, not a silent edit.** The first
+   attempt refuses with the final text and creates no commit; the user reviews
+   it and approves again. The record stays usable, so the retry does not need a
+   new preparation.
+3. **The model draft lives in the desktop shell.** The engine holds no model
+   adapter; the shell already resolves the provider key and builds one. The
+   deterministic template stays in `GitService`.
+4. **Each attempt gets a synthetic task.** #17's classifier is task-scoped, and a
+   commit usually happens after the turn that proposed the changes has ended, so
+   a dedicated `Commit prepared changes` task is what makes a crash visible. It
+   makes no model call and carries no plan.
+5. **The candidate set is session-wide, not task-wide.** "This task" in §5.2 is
+   read as "this session's uncommitted accepted changes": a user who accepts
+   files across two turns expects both, and `commit_created` removes them from
+   the pending set. The labels still distinguish each path's origin.
+6. **No CLI command.** The specification's flow is the desktop shell; the CLI
+   has no interactive staging. This is recorded rather than assumed.
+7. **The commit route is not streamed.** A commit is short by comparison with a
+   turn; hooks are bounded by `command_timeout_secs`, and the dialog shows the
+   outcome.
+
+### 7.6 Acceptance
+
+Every criterion in §6, with the test or the reason it is not automated. Tests
+named without a path are in
+`crates/workspace-engine/tests/commit_preparation.rs`; the shell tests are in
+`crates/desktop-shell/src/lib.rs` and `src/recovery.rs`.
+
+| Criterion | Evidence |
+|---|---|
+| Three of five accepted files, asserted against the tree | `a_commit_contains_only_the_accepted_files` |
+| Hunk-level acceptance contains exactly the accepted hunks | `a_hunk_level_acceptance_commits_only_the_accepted_hunks` |
+| A hand-edited accepted file is shown, labelled, unselected | `a_hand_edited_accepted_file_is_shown_labelled_and_unselected` |
+| A command-changed file is shown, labelled, unselected | `a_command_changed_file_is_shown_labelled_and_unselected` |
+| Staged work is not committed and the index is unchanged | `the_users_index_and_working_tree_are_unchanged_by_a_commit` |
+| A failing pre-commit aborts and reports its output | `a_failing_pre_commit_aborts_and_reports_its_output` |
+| A commit-msg rewrite is shown before the commit exists | `a_commit_msg_hook_that_rewrites_the_message_is_shown_before_the_commit`, `a_prepare_commit_msg_hook_is_run_and_its_rewrite_is_shown` |
+| A failing post-commit is a warning and does not un-commit | `a_failing_post_commit_hook_is_a_warning_and_the_commit_stays` |
+| No code path passes `--no-verify` | `there_is_no_hook_bypass` |
+| Hooks time out; output is truncated and redacted; PIDs registered | `a_hanging_hook_times_out`, `hook_output_is_truncated_and_redacted`, `a_running_hook_is_registered_with_the_process_registry` |
+| HEAD moving fails with nothing changed | `head_moving_between_prepare_and_commit_fails_with_nothing_changed` |
+| An accepted deletion commits the file away | `an_accepted_deletion_is_selected_and_commits_the_file_away` |
+| Index and working tree identical after a failed attempt | same test, plus `the_users_index_and_working_tree_are_unchanged_by_a_commit` |
+| Secret warnings have categories/counts and no text; override audited | `a_seeded_secret_warns_with_categories_and_counts_and_no_text`, `a_secret_needs_a_separate_per_commit_override`, `the_recorded_diff_is_redacted_and_the_record_holds_no_secret` |
+| The approval UI says the diff is redacted and the commit is not | the dialog's `.commit-redaction` line; **manual, not walked** |
+| Action markers and a crash classify as unknown with no re-commit | `a_commit_is_bracketed_by_a_side_effecting_marker`, `a_crash_between_the_markers_is_an_unknown_outcome`, `an_interrupted_commit_reports_the_prepared_commit_and_the_current_head` |
+| SHA reported and audited | `the_commit_is_audited_with_counts_and_no_secret_text`, `a_commit_route_creates_the_commit_and_reports_the_sha` |
+| `suggest_commit_message` answers when no model is configured or the call fails | `a_failed_or_empty_model_draft_falls_back_to_the_template`, `no_configured_model_falls_back_without_a_call` |
+| The drafted message is editable and the edit is committed | `the_commit_is_audited_with_counts_and_no_secret_text` asserts `git log` is the edited text |
+| Committing is refused in Ask, Plan and Review and under a profile that denies it | `committing_is_refused_outside_code_mode_and_without_the_profile_capability` (all three modes), `a_commit_is_refused_in_ask_mode` at the route |
+| Repository config cannot enable committing | `every_capability_key_resists_weakening_from_repository_scope` |
+| No amend, reset or history rewrite | `the_commit_module_has_no_history_rewriting_operation` |
+| Every quality-gate command passes and the baseline shows no regression | CI outstanding; locally `scripts/quality-gate.sh fmt node lint typos deny`, scoped clippy for `workspace-engine` and `desktop-shell`, `cargo nextest -p workspace-engine --test commit_preparation` (30), `--test permission_profiles` (74 passed, 1 skipped), `--test foundation` (171), `-p desktop-shell --lib` (193 passed, 5 skipped), and the deterministic eval tier |
+
+The one manual gap is the dialog walk: the web UI bootstraps through Tauri
+(`damaian_desktop_bootstrap`), and no browser harness was available in this
+session. The JS is `node --check`ed and Biome-linted, and every route it calls
+is covered by a test; the interaction itself was read, not clicked.

@@ -177,6 +177,8 @@ isolated tree — that is the intended way to test without touching real data.
 | `patches/pending/` | Proposed patches awaiting approval | `PatchStore::save` ([edit.rs](../crates/workspace-engine/src/edit.rs)) |
 | `patches/rejected/` | Rejected patches, kept for inspection | `PatchStore::mark_rejected` ([edit.rs](../crates/workspace-engine/src/edit.rs)) |
 | `rollback/<patch-id>/` | Pre-edit file copies backing patch rollback, **unredacted** | `PatchEngine::apply_patch` ([patch_engine.rs](../crates/workspace-engine/src/patch_engine.rs)) |
+| `commits/<prepare-id>.json` | A prepared commit’s record: candidates, exact blob ids, expected old `HEAD`, prepared commit, hooks and state. Redacted diffs only, no file content | `CommitEngine::save_record` ([commit.rs](../crates/workspace-engine/src/commit.rs)) |
+| `commits/<prepare-id>/` | The private index and message file used for one attempt; removed after a known outcome | `CommitEngine` ([commit.rs](../crates/workspace-engine/src/commit.rs)) |
 | `checkpoints/<repo-id>/objects/` | Session checkpoint content, a Damaian-owned Git object store, **unredacted** | [checkpoint.rs](../crates/workspace-engine/src/checkpoint.rs) |
 | `checkpoints/<repo-id>/manifests/<checkpoint-id>.json` | What one checkpoint covers: paths, hashes, origins. No file content | [checkpoint.rs](../crates/workspace-engine/src/checkpoint.rs) |
 | `commands/pending/<id>.dcmd` | Command proposals awaiting approval | `CommandStore::save_proposal` ([validation.rs](../crates/workspace-engine/src/validation.rs)) |
@@ -1503,6 +1505,24 @@ proposal it was waiting on. There is nothing to reattach and nothing safe to
 guess, so it is failed with that stated reason rather than shown as an approval
 card rebuilt from partial data. **No stored proposal is deleted** — the patches
 and commands themselves remain on disk and stay usable.
+
+### A commit was refused, or an interrupted commit's outcome is unknown
+
+A commit refusal is a value, not a guess. The dialog shows the sentence and the
+code, and nothing was committed unless the commit object is reported as created:
+
+- **`commit_head_moved`** — `HEAD` moved after the preview. Nothing was committed; prepare the commit again. The same code covers a branch switch and a ref change during the commit.
+- **`commit_content_changed`** — a selected file no longer has the bytes you reviewed. Nothing was committed. Look at what changed the file (a formatter, a command, another editor), prepare again, and review the new diff.
+- **`commit_hooks_changed`** — a Git hook was added or edited after the preview. Prepare again so the hooks you approve are the hooks that run.
+- **`commit_hook_failed`** — the named hook exited non-zero; the response carries its redacted, truncated output. A failing `pre-commit`, `prepare-commit-msg` or `commit-msg` aborts before a commit object exists. A failing `post-commit` does **not** undo the commit; the SHA is reported with a warning.
+- **`commit_message_rewritten`** — a message hook changed your text. The rewritten text is returned and prefilled; review it and approve again. Nothing was committed on the first attempt.
+- **`commit_secrets_require_override`** — the real bytes contain something the scanner flags. The displayed diff is redacted, so the match may not be visible; review the file and tick the override to commit it anyway. The override applies to that one commit and is audited.
+- **`commit_not_allowed`** — the session is not in Code mode, or the permission profile has `allow_git_commits=false` (Read-only does). Switching mode does not help a profile refusal.
+- **`commit_restricted_path`** — the named path is outside the checkout or matches `restricted_patterns`. It cannot be committed.
+
+The audit trail records `commit_prepared`, `commit_refused`, `commit_secret_override` and `commit_created` in `audit/events.jsonl`. `commit_created` carries the SHA, branch, path and hunk counts, message length, hook outcomes and whether the secret override was used — never the message or file content.
+
+If the app stops while a commit was in progress, the task classifies as an unknown external outcome and recovery **does not re-commit**. Open the recovery card's **Inspect**: the “Commit in flight” row shows the prepared commit, the expected old `HEAD`, the current `HEAD`, and whether the prepared commit is where `HEAD` is. If it is, the commit landed; if `HEAD` is still the old value, it did not. The durable record is `commits/<prepare-id>.json`; the marker is an `action_started` with `"action":"commit"` and `"sideEffecting":true` in the session log.
 
 ### After a crash: what was still running
 

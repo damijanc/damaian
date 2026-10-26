@@ -171,6 +171,32 @@ impl Fixture {
         patch.id
     }
 
+    fn apply_deleted(&self, session: &Session, task: &Task, path: &str) -> String {
+        let mut patch = self
+            .engine
+            .patch_engine
+            .create_patch(
+                &self.repository,
+                &[workspace_engine::ProposedChange {
+                    path: path.to_string(),
+                    new_content: String::new(),
+                    status: Some("deleted".to_string()),
+                    allow_restricted: false,
+                }],
+                Some(&task.id),
+                "delete",
+            )
+            .unwrap();
+        patch.session_id = session.id.clone();
+        patch.origin_session_id = session.id.clone();
+        self.engine.patch_store.save(&patch).unwrap();
+        self.engine
+            .edit_orchestrator
+            .apply_stored_patch(&self.repository, &patch.id, None, None, "tester", false)
+            .unwrap();
+        patch.id
+    }
+
     fn prepare(&self, session: &Session) -> workspace_engine::CommitPreparation {
         self.engine
             .commit
@@ -620,6 +646,22 @@ fn committing_is_refused_outside_code_mode_and_without_the_profile_capability() 
         "{:?}",
         preparation.refusals
     );
+    for mode in [SessionMode::Plan, SessionMode::Review] {
+        fixture
+            .engine
+            .session_store
+            .set_session_mode(&session.id, mode, "user")
+            .unwrap();
+        let preparation = fixture.prepare(&session);
+        assert!(
+            preparation
+                .refusals
+                .iter()
+                .any(|refusal| refusal.contains("Code mode")),
+            "{mode:?}: {:?}",
+            preparation.refusals
+        );
+    }
     fixture
         .engine
         .session_store
@@ -1353,6 +1395,11 @@ fn the_commit_is_audited_with_counts_and_no_secret_text() {
             true,
         )
         .unwrap();
+    assert_eq!(
+        fixture.git(&["log", "-1", "--pretty=%B"]),
+        format!("Commit a\n\n{FAKE_AWS_KEY}"),
+        "the user's edited message is what was committed"
+    );
     let audit = fs::read_to_string(fixture.data_dir.join("audit/events.jsonl")).unwrap();
     assert!(audit.contains(r#""eventType":"commit_created""#), "{audit}");
     assert!(audit.contains(r#""pathCount":"1""#), "{audit}");
@@ -1367,5 +1414,92 @@ fn the_commit_is_audited_with_counts_and_no_secret_text() {
         !audit.contains(FAKE_AWS_KEY),
         "the audit leaked the message's key"
     );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_restricted_path_cannot_be_committed_even_if_the_record_names_it() {
+    let fixture = Fixture::new("restricted");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    let preparation = fixture.prepare(&session);
+    let record_path = fixture
+        .data_dir
+        .join("commits")
+        .join(format!("{}.json", preparation.prepare_id));
+    let mut record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+    let candidates = record["candidates"].as_array_mut().unwrap();
+    let mut forged = candidates[0].clone();
+    forged["path"] = serde_json::Value::String(".env".to_string());
+    forged["selectedByDefault"] = serde_json::Value::Bool(false);
+    candidates.push(forged);
+    fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+    let outcome = fixture.commit(
+        &session,
+        &preparation,
+        &[".env".to_string()],
+        "Commit the env file",
+        false,
+    );
+    assert!(
+        matches!(
+            outcome,
+            Err(CommitError::Refused {
+                code: "commit_restricted_path",
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn the_commit_module_has_no_history_rewriting_operation() {
+    let source = include_str!("../src/commit.rs");
+    for forbidden in [
+        "\"amend\"",
+        "\"reset\"",
+        "\"rebase\"",
+        "\"cherry-pick\"",
+        "\"filter-branch\"",
+        "\"commit --amend\"",
+    ] {
+        assert!(!source.contains(forbidden), "commit.rs reaches {forbidden}");
+    }
+}
+
+#[test]
+fn an_accepted_deletion_is_selected_and_commits_the_file_away() {
+    let fixture = Fixture::new("delete");
+    fixture.write("a.txt", "original\n");
+    fixture.write("keep.txt", "keep\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.apply_deleted(&session, &task, "a.txt");
+    let preparation = fixture.prepare(&session);
+    let candidate = preparation
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path == "a.txt")
+        .expect("the deletion is a candidate");
+    assert_eq!(candidate.status, "deleted");
+    assert_eq!(candidate.source, CommitCandidateSource::AcceptedPatch);
+    assert!(candidate.selected_by_default);
+    fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            "Remove a",
+            false,
+        )
+        .unwrap();
+    assert!(!fixture.tree_paths().contains(&"a.txt".to_string()));
+    assert!(fixture.tree_paths().contains(&"keep.txt".to_string()));
     fixture.cleanup();
 }

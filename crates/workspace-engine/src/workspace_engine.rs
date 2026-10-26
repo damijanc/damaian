@@ -177,6 +177,7 @@ impl WorkspaceEngine {
             config.clone(),
             audit_log.clone(),
             scanner.clone(),
+            path_policy.clone(),
             session_store.clone(),
             checkpoint_store.clone(),
             git.clone(),
