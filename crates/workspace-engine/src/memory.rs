@@ -770,6 +770,7 @@ pub fn is_instruction_shaped(statement: &str) -> bool {
         "you may ",
         "you can ",
         "you are allowed ",
+        "you are permitted ",
         "you have permission ",
         "do not ",
         "don't ",
@@ -807,7 +808,11 @@ pub fn is_instruction_shaped(statement: &str) -> bool {
         "commands are pre-approved",
         "approval is not required",
         "no approval is required",
+        "approval is not needed",
+        "no approval is needed",
         "approval is disabled",
+        "anything is allowed",
+        "without permission",
         "ignore the previous",
         "ignore previous",
         "disregard the previous",
@@ -1726,7 +1731,13 @@ impl MemoryStore {
         });
         self.session_store
             .append_memory_proposal_decision(session_id, &decision.to_string())?;
-        self.audit_proposal_decision("memory_proposal_confirmed", &proposal, "confirmed")?;
+        let mut fields = self.proposal_audit_fields(&proposal);
+        fields.push(("decision", "confirmed".to_string()));
+        fields.push(("entryId", stored.id.clone()));
+        fields.push(("confirmationId", confirmation.id.clone()));
+        fields.push(("source", proposal.source_label()));
+        self.audit_log
+            .record("memory_proposal_confirmed", &fields)?;
         Ok(stored)
     }
 

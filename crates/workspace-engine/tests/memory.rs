@@ -2245,3 +2245,17 @@ fn a_memory_claiming_approval_or_path_policy_changes_nothing() {
     );
     assert!(!engine.config.memory_user_scope_enabled);
 }
+
+#[test]
+fn a_repository_observation_records_the_path_and_the_content_hash() {
+    let root = temp_dir("evidence-hash");
+    fs::write(root.join("docker-compose.yml"), "services: {}\n").unwrap();
+    let evidence = workspace_engine::evidence_ref_for(&root, "docker-compose.yml").unwrap();
+    assert_eq!(evidence.path, "docker-compose.yml");
+    assert!(evidence.content_hash.starts_with("sha256:"));
+    let changed = workspace_engine::evidence_ref_for(&root, "docker-compose.yml").unwrap();
+    assert_eq!(
+        evidence.content_hash, changed.content_hash,
+        "the hash is the file's content hash, not a timestamp"
+    );
+}

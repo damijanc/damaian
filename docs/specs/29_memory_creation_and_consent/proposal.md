@@ -539,17 +539,19 @@ and hashes and `EvidenceCurrent`. No source is silently dropped.
 
 **The instruction patterns.** The check is a lowercased, whitespace-normalized
 match. Refused prefixes: `always`, `never`, `you must`, `you should`, `you may`,
-`you can`, `you are allowed`, `you have permission`, `do not`, `don't`,
-`ignore`, `disregard`, `approve`, `pre-approve`, `auto-approve`, `skip`,
-`bypass`, `ensure`, `ensure that`, `make sure`, `remember to`, `run`, `use`.
+`you can`, `you are allowed`, `you are permitted`, `you have permission`,
+`do not`, `don't`, `ignore`, `disregard`, `approve`, `pre-approve`,
+`auto-approve`, `skip`, `bypass`, `ensure`, `ensure that`, `make sure`,
+`remember to`, `run`, `use`.
 Refused phrases: `pre-approved`, `preapproved`, `pre approval`,
 `without asking`, `without approval`, `without confirmation`,
-`without a prompt`, `skip approval`, `skip the approval`, `bypass approval`,
-`approve all`, `all commands are approved`, `commands are approved`,
-`commands are pre-approved`, `approval is not required`,
-`no approval is required`, `approval is disabled`, `ignore the previous`,
-`ignore previous`, `disregard the previous`, `disregard previous`,
-`treat this as`, `from now on`.
+`without a prompt`, `without permission`, `skip approval`, `skip the approval`,
+`bypass approval`, `approve all`, `all commands are approved`,
+`commands are approved`, `commands are pre-approved`,
+`approval is not required`, `no approval is required`, `approval is not needed`,
+`no approval is needed`, `approval is disabled`, `anything is allowed`,
+`ignore the previous`, `ignore previous`, `disregard the previous`,
+`disregard previous`, `treat this as`, `from now on`.
 
 **The check runs on every non-user origin**, including `ModelSuggestion`, so a
 poisoned repository file cannot be laundered into a trusted-looking card by

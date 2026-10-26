@@ -5928,16 +5928,25 @@ function renderMemoryProposals() {
   if (!memoryProposals.length) return;
   const stack = document.createElement("section");
   stack.className = "memory-proposal-stack";
-  const heading = document.createElement("p");
-  heading.className = "memory-proposal-heading";
-  heading.textContent =
-    memoryProposals.length === 1
-      ? "A memory to confirm"
-      : `${memoryProposals.length} memories to confirm`;
-  stack.append(heading);
-  memoryProposals.forEach((proposal) => {
-    stack.append(createMemoryProposalCard(proposal));
-  });
+  if (memoryProposals.length > 1) {
+    // More than one suggestion would otherwise push the completion report up
+    // the page. Collapse to a count, and let the user open the list.
+    const details = document.createElement("details");
+    details.className = "memory-proposal-details";
+    const summary = document.createElement("summary");
+    summary.className = "memory-proposal-heading";
+    summary.textContent = `${memoryProposals.length} memories to confirm`;
+    details.append(summary);
+    memoryProposals.forEach((proposal) => {
+      details.append(createMemoryProposalCard(proposal));
+    });
+    stack.append(details);
+  } else {
+    const heading = document.createElement("p");
+    heading.className = "memory-proposal-heading";
+    heading.textContent = "A memory to confirm";
+    stack.append(heading, createMemoryProposalCard(memoryProposals[0]));
+  }
   log.append(stack);
 }
 
@@ -5964,11 +5973,22 @@ function createMemoryProposalCard(proposal) {
   const scopeSelect = document.createElement("select");
   scopeSelect.className = "memory-proposal-scope";
   scopeSelect.setAttribute("aria-label", "Memory scope");
-  ["session", "project", "user"].forEach((value) => {
+  // Only scopes this proposal may actually be confirmed as: a project fact
+  // cannot silently become session- or user-scope, and a user-scope proposal
+  // may be narrowed to project when the user scope is off.
+  const allowedScopes =
+    proposal.scope === "user"
+      ? memoryUserScopeEnabled
+        ? ["project", "user"]
+        : ["project"]
+      : proposal.scope === "session"
+        ? ["session"]
+        : ["project"];
+  allowedScopes.forEach((value) => {
     const option = document.createElement("option");
     option.value = value;
     option.textContent = value;
-    if (value === "user" && !memoryUserScopeEnabled && proposal.scope !== "user") {
+    if (value === "user" && !memoryUserScopeEnabled) {
       option.disabled = true;
       option.textContent = "user (off)";
     }
@@ -5976,7 +5996,8 @@ function createMemoryProposalCard(proposal) {
   });
   // A user-scope proposal while the scope is off offers project scope instead;
   // saving it must not flip the setting as a side effect.
-  scopeSelect.value = proposal.scope === "user" && !memoryUserScopeEnabled ? "project" : scope;
+  scopeSelect.value =
+    proposal.scope === "user" && !memoryUserScopeEnabled ? "project" : proposal.scope;
   controls.append(scopeSelect);
 
   const confirm = document.createElement("button");

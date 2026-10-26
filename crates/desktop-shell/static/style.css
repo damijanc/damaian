@@ -5743,3 +5743,11 @@ body.worker-view #chat-model-menu {
   background: var(--bg);
   color: var(--text);
 }
+
+.memory-proposal-details > summary {
+  cursor: pointer;
+}
+
+.memory-proposal-details[open] .memory-proposal-card {
+  margin-top: 8px;
+}
