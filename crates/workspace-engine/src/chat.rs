@@ -8887,6 +8887,24 @@ impl PausedTurns {
         })
     }
 
+    /// The manifest a paused context review would send, or `None` when the id
+    /// names no paused turn, or one that is not a context review (spec 27).
+    ///
+    /// Read as loose JSON for the same reason as the other readers: a file
+    /// written by a different version must answer "not a review" rather than
+    /// fail to deserialise and look absent.
+    pub fn context_review_manifest(&self, proposal_id: &str) -> Option<ContextManifest> {
+        let path = PendingCommandStore::new(&self.data_dir).path_for(proposal_id);
+        let content = fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let manifest = value
+            .get("context_review")?
+            .get("prepared")?
+            .get("manifest")?
+            .clone();
+        serde_json::from_value(manifest).ok()
+    }
+
     /// The proposal ids a paused check batch holds, in card order, or `None`
     /// when the id names no paused turn, or one that is not a check batch
     /// (spec 23). Recovery reads it to know whether the batch can still be

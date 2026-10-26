@@ -19,6 +19,7 @@
 use crate::audit::AuditLog;
 use crate::chat::PausedTurns;
 use crate::clarification::PendingDecision;
+use crate::context_manager::ContextManifest;
 use crate::edit::PatchStore;
 use crate::error::{ClientError, Result};
 use crate::model::TokenUsage;
@@ -364,6 +365,15 @@ pub enum ReattachedApproval {
         rounds_used: u32,
         rounds_granted: u32,
     },
+    /// A paused pre-send context review (spec 27 §5.1). Its paused turn is on
+    /// disk, so the review is re-presented rather than lost; a paused turn that
+    /// is gone fails the task instead, because sending would have nothing to
+    /// send.
+    ContextReview {
+        task_id: String,
+        proposal_id: String,
+        manifest: ContextManifest,
+    },
     /// A verification check batch waiting for one card's decisions (spec 23).
     /// Its paused turn is on disk, so the batch is re-presented rather than
     /// lost; a paused turn that is gone, or one with no proposals, fails the
@@ -484,6 +494,20 @@ pub fn reattach_pending_approvals(
                     })
                     .ok_or_else(|| {
                         format!("the paused turn behind round-budget pause {proposal_id} is gone")
+                    })
+            }
+            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+                if kind == "context_review" =>
+            {
+                paused
+                    .context_review_manifest(proposal_id)
+                    .map(|manifest| ReattachedApproval::ContextReview {
+                        task_id: task_id.clone(),
+                        proposal_id: proposal_id.clone(),
+                        manifest,
+                    })
+                    .ok_or_else(|| {
+                        format!("the paused turn behind context review {proposal_id} is gone")
                     })
             }
             Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))

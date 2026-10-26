@@ -705,6 +705,21 @@ fn describe_approval(
                 unavailable_reason: None,
             }
         }
+        ReattachedApproval::ContextReview {
+            task_id,
+            proposal_id,
+            manifest,
+        } => Approval {
+            session_id: session_id.to_string(),
+            task_id,
+            kind: "context_review",
+            payload: format!(
+                "{{\"proposalId\":\"{}\",\"manifest\":{}}}",
+                escape_json(&proposal_id),
+                serde_json::to_string(&manifest).unwrap_or_else(|_| "null".to_string())
+            ),
+            unavailable_reason: None,
+        },
         ReattachedApproval::Question {
             task_id,
             question_id,
@@ -1233,6 +1248,63 @@ mod tests {
     /// as a question, not as an approval, with what was asked and whether it
     /// has been answered. The payload carries no proposal id, command or
     /// patch, so no command or patch endpoint has anything to act on.
+    /// Spec 27's pre-send review is saved like a plan review, so a crash while
+    /// it is open must re-present it rather than fail the task with an unknown
+    /// approval kind.
+    #[test]
+    fn a_reattached_context_review_carries_its_manifest() {
+        let (engine, dir) = engine("context-review");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Recovery")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "read the code", "mock", "m")
+            .unwrap();
+        let pending = dir.join("chat").join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(
+            pending.join("contextreview_1.json"),
+            concat!(
+                r#"{"proposal_id":"contextreview_1","context_review":{"prepared":{"#,
+                r#""manifest":{"repositoryId":"repo_1","taskId":"task","assembledAtMs":0,"#,
+                r#""limit":{"tokens":100,"source":"declared","safetyMarginBps":0,"window":null},"#,
+                r#""totalTokens":3,"categories":[],"included":[],"excluded":[]},"#,
+                r#""items":[]},"conversation":{"summary":null,"body":null},"#,
+                r#""summary":null,"summary_removed":false}}"#,
+            ),
+        )
+        .unwrap();
+        eprintln!(
+            "PENDING: {}",
+            fs::read_to_string(pending.join("contextreview_1.json")).unwrap()
+        );
+        eprintln!(
+            "READER: {:?}",
+            workspace_engine::PausedTurns::new(&dir).context_review_manifest("contextreview_1")
+        );
+        engine
+            .session_store
+            .await_approval(
+                &task,
+                &PendingApprovalRef {
+                    kind: "context_review".to_string(),
+                    proposal_id: "contextreview_1".to_string(),
+                },
+            )
+            .unwrap();
+
+        let (_, payload) = sweep(&engine);
+
+        assert!(
+            payload.contains("\"kind\":\"context_review\""),
+            "got {payload}"
+        );
+        assert!(payload.contains("contextreview_1"), "got {payload}");
+        assert!(payload.contains("\"totalTokens\":3"), "got {payload}");
+    }
+
     #[test]
     fn a_reattached_question_is_offered_for_an_answer_not_an_approval() {
         let (engine, _dir) = engine("question");

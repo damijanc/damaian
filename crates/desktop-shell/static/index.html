@@ -92,6 +92,18 @@
             </div>
             <div class="thread-actions">
               <button
+                id="context-inspector-btn"
+                class="topbar-button context-inspector-button"
+                type="button"
+                aria-label="Show context for this turn"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+                title="Show context for this turn"
+                hidden
+              >
+                <span id="context-inspector-label">Context</span>
+              </button>
+              <button
                 id="symbol-search-btn"
                 class="topbar-button symbol-search-button"
                 type="button"
@@ -156,6 +168,68 @@
         </div>
 
         <section id="chat-log" class="chat-log" aria-live="polite"></section>
+
+        <section
+          id="context-panel"
+          class="context-panel"
+          role="dialog"
+          aria-label="Context for this turn"
+          hidden
+        >
+          <div class="context-panel-header">
+            <strong>Context</strong>
+            <span id="context-panel-summary" class="context-panel-summary"></span>
+            <button
+              id="context-panel-close"
+              class="btn-icon"
+              type="button"
+              aria-label="Close context"
+            >
+              ×
+            </button>
+          </div>
+          <div id="context-panel-body" class="context-panel-body"></div>
+          <div class="context-panel-controls">
+            <div class="context-pin-form">
+              <input
+                id="context-pin-path"
+                type="text"
+                aria-label="Path to pin"
+                placeholder="src/upload.rs"
+              />
+              <input
+                id="context-pin-range"
+                type="text"
+                aria-label="Line range to pin"
+                placeholder="40-120"
+              />
+              <button id="context-pin-btn" class="btn-sm" type="button">Pin</button>
+            </div>
+            <p class="context-panel-hint">
+              Pins apply to later turns in this session. A range is optional and uses
+              <code>start-end</code>.
+            </p>
+            <label class="context-restriction-label" for="context-restriction-paths">
+              Restrict this session to these paths (one per line; empty means every path)
+            </label>
+            <textarea
+              id="context-restriction-paths"
+              rows="2"
+              placeholder="src/upload.rs&#10;tests/upload.rs"
+            ></textarea>
+            <div class="context-panel-actions">
+              <button id="context-restriction-apply" class="btn-sm" type="button">
+                Apply paths
+              </button>
+              <button id="context-restriction-clear" class="btn-sm btn-quiet" type="button">
+                Clear paths
+              </button>
+              <button id="context-pins-clear" class="btn-sm btn-quiet" type="button">
+                Clear pins
+              </button>
+            </div>
+          </div>
+        </section>
 
         <section id="workers-board" class="workers-board" aria-label="Workers" hidden></section>
 
@@ -457,6 +531,15 @@
               Summarises older messages when a conversation outgrows the model's context. Each
               summary is a model call billed to your provider. Off: older messages are left out of
               the request and marked in the transcript, and you can still compact by hand.
+            </p>
+            <label class="field-checkbox">
+              <input id="pause-for-context-review-input" type="checkbox" disabled />
+              <span>Pause before sending to review context</span>
+            </label>
+            <p class="settings-page-hint pause-for-context-review-hint">
+              Holds each turn after its context is assembled so you can pin, remove or restrict it
+              before anything is sent. Off by default; user-only, so a repository or profile cannot
+              set it.
             </p>
           </section>
           <section class="settings-section">

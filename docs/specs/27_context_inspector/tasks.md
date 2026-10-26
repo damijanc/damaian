@@ -17,8 +17,8 @@ the resolved §7 open question in [`context.md`](context.md)
 | 5 · `pause_for_context_review` config | Done 2026-10-26 | `Config.pause_for_context_review` (default `false`) and its `ConfigOverlay` field are classified `Capability`, applied through `scoped(..., forbidden, ...)`, printed by both `to_policy_text` functions, labelled in `effective_policy`, and refused by `split_profile_keys`. Added a `weakening_cases` entry and `pause_for_context_review_is_off_by_default_and_user_only`. Scoped: fast five passed, scoped clippy passed, `permission_profiles` 79 passed / 1 skipped. |
 | 6 · The pre-send pause and send gate | Done 2026-10-26 | `TurnProgress::Context` is emitted after `context_assembled` and before the first call; `build_model_prompt` is split into `build_conversation` + `build_model_prompt_with_conversation` with byte-identical output (the `prompt_cache` guard passes). `PausedFor::ContextReview` and `PendingContextReview` persist the prepared plan, the conversation block and the summary; `resume_after_context_decision` refuses every other pause and every other resume refuses a review; `remove_context_item`/`remove_context_summary` amend and re-record the manifest without taking the pause. Decline sends nothing and marks the task `Cancelled`. Tests: 10 new (pause no-call, default ordering, send, decline, instruction removal in the request, Required refusal, both cross-resume directions, removal across a reload, stripped-field load). **Falsified:** not saving the amended review left the removed instruction in the request and the test failed. Scoped: `context_inspector` 23/23, `prompt_cache`/`foundation`/`round_budget`/`compaction` 206 passed, scoped clippy passed. |
 | 7 · Post-send record and past turns | Done 2026-10-26 | `SessionStore::read_session_context_manifests` reads `<data_dir>/audit/events.jsonl` (the manifest is an audit record, not a session event), filters by `sessionId`, and keeps the newest `context_assembled` per task. The edit flow reads the origin session's pins/restriction; the repair continuation now reads them too, reads the conversation before assembly, and emits `TurnProgress::Context`. Tests: newest-wins after a removal, two turns' manifests in one session, an old manifest without the new fields, and an edit from a session with a pin and a restriction. **Falsified:** `or_insert` (first-wins) made the removal test read the pre-removal manifest. Scoped: `context_inspector` 27/27, `prompt_cache` + `verification_loop` 84 passed, scoped clippy passed. |
-| 8 · Shell routes, JSON and SSE | Done 2026-10-26 | Added `POST /api/context-pin`, `/api/context-restriction`, `/api/context-remove`, `/api/context-remove-summary`, `/api/resume-context-stream`; `chat_result_json` carries `contextReview` (manifest only); `/api/session` carries `contextState` plus a `context` manifest on each task; `TurnProgress::Context` maps to `TurnEvent::Context` and the SSE `context` event. Unknown pin actions and review decisions are refused, not defaulted. A decline path uses a no-op adapter, so it needs no provider key. Tests: pin round-trip through `/api/session`, restriction set/clear, unknown action, unknown decision, task JSON carries the manifest and no item content, and the progress mapping. Scoped: `desktop-shell --lib` 204 passed / 5 skipped, scoped clippy passed, fast five passed (typos caught an intentional `addd` test value; changed to `unknown_action`). |
-| 9 · The web panel and review card | Not started | |
+| 8 · Shell routes, JSON and SSE | Done 2026-10-26 | Added `POST /api/context-pin`, `/api/context-restriction`, `/api/context-remove`, `/api/context-remove-summary`, `/api/resume-context-stream`; `chat_result_json` carries `contextReview` (manifest only); `/api/session` carries `contextState` plus a `context` manifest on each task; `TurnProgress::Context` maps to `TurnEvent::Context` and the SSE `context` event. Unknown pin actions and review decisions are refused, not defaulted. A decline path uses a no-op adapter, so it needs no provider key. Tests: pin round-trip through `/api/session`, restriction set/clear, unknown action, unknown decision, task JSON carries the manifest and no item content, and the progress mapping. Scoped: `desktop-shell --lib` 204 passed / 5 skipped, scoped clippy passed, fast five passed (typos caught an intentionally misspelled action value; changed to `unknown_action`). |
+| 9 · The web panel and review card | Done 2026-10-26 | Header control shows `total / limit`; `#context-panel` renders category details (Required locked, symbols heuristic count, summary row), included paths/ranges, a session-pin list with unpin, an excluded `<details>` with every reason, a pin form, restriction textarea, and remove controls only on an open review. Every path opens through `/api/open-vscode-file`. `createContextReview` offers Review context / Send / Decline and streams `/api/resume-context-stream`; `context` SSE events and done payloads update the panel; past turns get a Context link from each task's manifest. Added the settings checkbox and `refreshPauseForContextReview`. Recovery re-presents a paused review (`a_reattached_context_review_carries_its_manifest`). Scoped: `desktop-shell --lib` 205 passed / 5 skipped, clippy on both crates passed, `node --check` and `npm run lint:web` passed, fast five passed after fixing one typo in this record. **Manual walk is Task 10.** |
 | 10 · Docs, manual walk, close-out | Not started | |
 
 **Goal:** Make "the user can see what context the agent uses" true. The panel
@@ -721,13 +721,13 @@ the pause matrix test lives there.
 
 **Files:** `static/index.html`, `static/app.js`, `static/style.css`.
 
-- [ ] **Step 1: Add the markup.** A `#context-inspector-btn` in
+- [x] **Step 1: Add the markup.** A `#context-inspector-btn` in
   `.thread-actions` (label shows `tokens / limit`, `aria-haspopup="dialog"`,
   hidden until a manifest exists), a `#context-panel` section inside
   `.conversation` (header with total/limit/source, close button, body, controls),
   and a `pause-for-context-review-input` checkbox in the Conversation settings
   section with a hint naming the default and that it is user-only.
-- [ ] **Step 2: Implement the state and rendering.**
+- [x] **Step 2: Implement the state and rendering.**
   - Globals: `lastContextManifest`, `contextPanelTaskId`, `contextPins`,
     `contextRestriction`, `currentContextReview`.
   - `formatContextTokens`, `renderContextButton`, `renderContextPanel`,
@@ -746,7 +746,7 @@ the pause matrix test lives there.
   - Remove buttons render only when `currentContextReview` matches the displayed
     task and the row is not `required`; they call `/api/context-remove` (or
     `/api/context-remove-summary`) and re-render from the returned manifest.
-- [ ] **Step 3: Wire the events.**
+- [x] **Step 3: Wire the events.**
   - `processSseEvent` handles `context` → `lastContextManifest = payload;
     renderContextButton(); if open, renderContextPanel()`.
   - Every `done` handler calls `noteContext(payload)`; `renderMessages` builds
@@ -763,12 +763,12 @@ the pause matrix test lives there.
     and reloads the editor so the next Save cannot write the old value back.
   - Relabel the composer chips' remove aria to "Remove … from this request" and
     add a short title saying they are attachments, not session pins.
-- [ ] **Step 4: Style** with existing variables: a right-hand drawer
+- [x] **Step 4: Style** with existing variables: a right-hand drawer
   (`position: absolute; right: 16px; top: 48px; width: min(520px, …);
   max-height: calc(100% - 120px); overflow: auto`), `.context-row`,
   `.context-row[data-locked]`, `.context-excluded`, `.context-controls`. Keep
   it 2-space indented and under ~100 columns where practical.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   node --check crates/desktop-shell/static/app.js
@@ -776,9 +776,9 @@ the pause matrix test lives there.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p desktop-shell --lib
   ```
 
-- [ ] **Step 6: Manual smoke** against a throwaway shell (port not 4765) before
+- [x] **Step 6: Manual smoke** against a throwaway shell (port not 4765) before
   the formal walk in Task 10: open the panel, see the category rows.
-- [ ] **Step 7: Update the Progress row** and commit.
+- [x] **Step 7: Update the Progress row** and commit.
   Subject: `Add the context inspector panel and review card`.
 
 ---

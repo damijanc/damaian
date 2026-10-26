@@ -18,6 +18,16 @@ let pinnedContextFiles = [];
 // (`context.md` §4, §13). Loaded from `/api/repository-map`.
 let repositoryRoots = [];
 let contextChipsDismissed = false;
+// The newest manifest this page has seen (live `context` event, a done payload
+// or `/api/session`). The panel renders this and nothing else.
+let lastContextManifest = null;
+// The task the panel is showing; `""` means the newest turn.
+let contextPanelTaskId = "";
+// The paused pre-send review, while one is open.
+let currentContextReview = null;
+// Session pins and restriction from `/api/session` or a control route.
+let contextPins = [];
+let contextRestriction = null;
 let terminalOpen = false;
 let term = null;
 let termFit = null;
@@ -2183,6 +2193,455 @@ function renderPinnedContextFiles() {
   });
 }
 
+const CONTEXT_CATEGORY_LABELS = {
+  required: "Required",
+  instructions: "Instructions",
+  hook_context: "Hook context",
+  pinned: "Pinned",
+  plan_state: "Plan state",
+  repository_map: "Repository map",
+  symbols: "Symbols",
+  search_results: "Search results",
+  file_ranges: "File ranges",
+  findings: "Findings",
+  conversation_summary: "Summary",
+};
+
+const CONTEXT_REASON_LABELS = {
+  restricted_path: "restricted path",
+  secret_bearing: "contains a secret",
+  category_budget_exhausted: "category share exhausted",
+  total_budget_exhausted: "context budget exhausted",
+  deduplicated_into_range: "merged into a wider range",
+  truncated: "shortened to fit",
+  too_large: "too large",
+  binary: "binary file",
+  user_removed: "removed by you",
+  path_not_selected: "outside this session's paths",
+  missing: "file missing",
+};
+
+function formatContextTokens(value) {
+  const tokens = Number(value) || 0;
+  return tokens >= 10000 ? `${(tokens / 1000).toFixed(1)}k` : tokens.toLocaleString();
+}
+
+function contextRangeLabel(range) {
+  return range ? `:${range.start}-${range.end}` : "";
+}
+
+// A path is a reference, never content: this is the one route that opens a
+// file, and it is used for included and excluded paths alike.
+function contextPathButton(path, range) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "context-path";
+  button.textContent = `${path}${contextRangeLabel(range)}`;
+  button.title = `${path} — open in Visual Studio Code`;
+  button.addEventListener("click", async () => {
+    try {
+      const payload = await api(
+        "/api/open-vscode-file",
+        form({ repo: requireRepo(), path, line: range ? String(range.start) : "" }),
+      );
+      toast(`Opened ${payload.path}`);
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  return button;
+}
+
+function renderContextButton() {
+  const button = $("context-inspector-btn");
+  if (!button) return;
+  if (!lastContextManifest) {
+    button.hidden = true;
+    button.setAttribute("aria-expanded", "false");
+    return;
+  }
+  button.hidden = false;
+  const total = formatContextTokens(lastContextManifest.totalTokens);
+  const limit = formatContextTokens(lastContextManifest.limit?.tokens ?? 0);
+  $("context-inspector-label").textContent = `${total} / ${limit}`;
+  button.title = `Context for this turn: ${total} of ${limit} tokens`;
+}
+
+function setContextManifest(manifest, target = "") {
+  lastContextManifest = manifest || null;
+  if (target) contextPanelTaskId = target;
+  renderContextButton();
+  if (!$("context-panel").hidden) renderContextPanel();
+}
+
+function openContextPanel(manifest, target = "") {
+  if (manifest) setContextManifest(manifest, target);
+  const panel = $("context-panel");
+  panel.hidden = false;
+  $("context-inspector-btn").setAttribute("aria-expanded", "true");
+  renderContextPanel();
+}
+
+function closeContextPanel() {
+  $("context-panel").hidden = true;
+  $("context-inspector-btn").setAttribute("aria-expanded", "false");
+}
+
+function contextCanRemove() {
+  return Boolean(
+    currentContextReview && contextPanelTaskId === `review:${currentContextReview.proposalId}`,
+  );
+}
+
+function contextCategoryRow(manifest, category) {
+  const items = (manifest.included || []).filter((item) => item.category === category);
+  const usage = (manifest.categories || []).find((entry) => entry.category === category);
+  const details = document.createElement("details");
+  details.className = "context-category";
+  details.open = category === "required" || category === "pinned";
+  const summary = document.createElement("summary");
+  const label = document.createElement("span");
+  label.className = "context-category-label";
+  label.textContent = CONTEXT_CATEGORY_LABELS[category] || category;
+  const tokens = document.createElement("span");
+  tokens.className = "context-category-tokens";
+  tokens.textContent = `${formatContextTokens(usage?.used ?? 0)} tokens`;
+  const count = document.createElement("span");
+  count.className = "context-category-count";
+  count.textContent = `${usage?.items ?? items.length} item${(usage?.items ?? items.length) === 1 ? "" : "s"}`;
+  summary.append(label, tokens, count);
+  if (category === "required") {
+    const locked = document.createElement("span");
+    locked.className = "context-locked";
+    locked.textContent = "locked";
+    summary.append(locked);
+  }
+  if (category === "symbols" && manifest.symbolProvenance) {
+    const provenance = document.createElement("span");
+    provenance.className = "context-provenance";
+    provenance.textContent = `${manifest.symbolProvenance.total} symbols (${manifest.symbolProvenance.heuristic} heuristic)`;
+    summary.append(provenance);
+  }
+  details.append(summary);
+
+  const list = document.createElement("div");
+  list.className = "context-items";
+  items.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "context-item";
+    if (item.path) {
+      row.append(contextPathButton(item.path, item.lineRange));
+    } else {
+      const name = document.createElement("span");
+      name.textContent = item.kind || category;
+      row.append(name);
+    }
+    const meta = document.createElement("span");
+    meta.className = "context-item-tokens";
+    meta.textContent = `${formatContextTokens(item.tokens)} tokens${
+      item.provenance === "heuristic" ? " · heuristic" : ""
+    }`;
+    row.append(meta);
+    if (item.path) {
+      const pin = document.createElement("button");
+      pin.type = "button";
+      pin.className = "btn-icon context-item-action";
+      pin.title = "Pin for later turns";
+      pin.setAttribute("aria-label", `Pin ${item.path} for later turns`);
+      pin.textContent = "📌";
+      pin.addEventListener("click", () =>
+        addContextPin(item.path, item.lineRange).catch((error) => toast(error.message)),
+      );
+      row.append(pin);
+    }
+    if (category !== "required" && contextCanRemove()) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn-icon context-item-action context-remove";
+      remove.title = "Remove from this turn";
+      remove.setAttribute("aria-label", `Remove ${item.path || category} from this turn`);
+      remove.textContent = "×";
+      remove.addEventListener("click", () =>
+        removeContextItem(item).catch((error) => toast(error.message)),
+      );
+      row.append(remove);
+    }
+    list.append(row);
+  });
+  details.append(list);
+  return details;
+}
+
+function renderContextPanel() {
+  const body = $("context-panel-body");
+  const summary = $("context-panel-summary");
+  body.innerHTML = "";
+  if (!lastContextManifest) {
+    summary.textContent = "Nothing assembled yet.";
+    return;
+  }
+  const manifest = lastContextManifest;
+  const limit = manifest.limit?.tokens ?? 0;
+  summary.textContent = `${formatContextTokens(manifest.totalTokens)} / ${formatContextTokens(
+    limit,
+  )} tokens · ${manifest.limit?.source === "observed" ? "observed" : "declared"} limit`;
+  if (contextCanRemove()) {
+    const hint = document.createElement("p");
+    hint.className = "context-panel-hint";
+    hint.textContent =
+      "Nothing has been sent. Remove optional items here, then send or decline from the review card.";
+    body.append(hint);
+  }
+
+  const order = (manifest.categories || []).map((entry) => entry.category);
+  for (const category of order) {
+    // The summary row is its own shape (tokens and a message count), not a
+    // list of included refs.
+    if (category === "conversation_summary") continue;
+    body.append(contextCategoryRow(manifest, category));
+  }
+
+  if (manifest.conversationSummary) {
+    const details = document.createElement("details");
+    details.className = "context-category";
+    details.open = true;
+    const row = document.createElement("summary");
+    const label = document.createElement("span");
+    label.className = "context-category-label";
+    label.textContent = "Summary";
+    const tokens = document.createElement("span");
+    tokens.className = "context-category-tokens";
+    tokens.textContent = `${formatContextTokens(manifest.conversationSummary.tokens)} tokens`;
+    const count = document.createElement("span");
+    count.className = "context-category-count";
+    count.textContent = `${manifest.conversationSummary.messages} messages${
+      manifest.conversationSummary.factsOnly ? " · facts only" : ""
+    }`;
+    row.append(label, tokens, count);
+    if (contextCanRemove()) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn-icon context-item-action context-remove";
+      remove.title = "Remove the summary from this turn";
+      remove.setAttribute("aria-label", "Remove the conversation summary from this turn");
+      remove.textContent = "×";
+      remove.addEventListener("click", () =>
+        removeContextSummary().catch((error) => toast(error.message)),
+      );
+      row.append(remove);
+    }
+    details.append(row);
+    body.append(details);
+  }
+
+  const pins = document.createElement("details");
+  pins.className = "context-category";
+  pins.open = contextPins.length > 0;
+  const pinSummary = document.createElement("summary");
+  const pinLabel = document.createElement("span");
+  pinLabel.className = "context-category-label";
+  pinLabel.textContent = "Pinned for this session";
+  const pinCount = document.createElement("span");
+  pinCount.className = "context-category-count";
+  pinCount.textContent = `${contextPins.length}`;
+  pinSummary.append(pinLabel, pinCount);
+  pins.append(pinSummary);
+  const pinList = document.createElement("div");
+  pinList.className = "context-items";
+  if (!contextPins.length) {
+    const empty = document.createElement("p");
+    empty.className = "context-panel-hint";
+    empty.textContent = "No pins. A pin applies to later turns.";
+    pinList.append(empty);
+  }
+  contextPins.forEach((pin) => {
+    const row = document.createElement("div");
+    row.className = "context-item";
+    row.append(contextPathButton(pin.path, pin.range));
+    const unpin = document.createElement("button");
+    unpin.type = "button";
+    unpin.className = "btn-icon context-item-action";
+    unpin.title = "Unpin";
+    unpin.setAttribute("aria-label", `Unpin ${pin.path}`);
+    unpin.textContent = "×";
+    unpin.addEventListener("click", () =>
+      removeContextPin(pin.path, pin.range).catch((error) => toast(error.message)),
+    );
+    row.append(unpin);
+    pinList.append(row);
+  });
+  pins.append(pinList);
+  body.append(pins);
+
+  if (contextRestriction) {
+    const restriction = document.createElement("p");
+    restriction.className = "context-panel-hint";
+    restriction.textContent = contextRestriction.length
+      ? `This session is restricted to ${contextRestriction.length} path(s).`
+      : "This session is restricted to no paths, so no file content is eligible.";
+    body.append(restriction);
+  }
+
+  const excluded = document.createElement("details");
+  excluded.className = "context-excluded";
+  const excludedSummary = document.createElement("summary");
+  excludedSummary.textContent = `Excluded (${manifest.excluded?.length ?? 0})`;
+  excluded.append(excludedSummary);
+  (manifest.excluded || []).forEach((record) => {
+    const row = document.createElement("div");
+    row.className = "context-excluded-row";
+    if (record.path) {
+      row.append(contextPathButton(record.path, record.lineRange));
+    }
+    const reason = document.createElement("span");
+    reason.className = "context-excluded-reason";
+    reason.textContent = CONTEXT_REASON_LABELS[record.reason] || record.reason;
+    row.append(reason);
+    if (record.detail) {
+      const detail = document.createElement("span");
+      detail.className = "context-excluded-detail";
+      detail.textContent = record.detail;
+      row.append(detail);
+    }
+    if (record.path) {
+      const pin = document.createElement("button");
+      pin.type = "button";
+      pin.className = "btn-icon context-item-action";
+      pin.title = "Pin for later turns";
+      pin.setAttribute("aria-label", `Pin ${record.path} for later turns`);
+      pin.textContent = "📌";
+      pin.addEventListener("click", () =>
+        addContextPin(record.path, record.lineRange).catch((error) => toast(error.message)),
+      );
+      row.append(pin);
+    }
+    excluded.append(row);
+  });
+  body.append(excluded);
+}
+
+async function addContextPin(path, range) {
+  const payload = await api(
+    "/api/context-pin",
+    form({
+      session_id: currentSessionId,
+      action: "add",
+      path,
+      start: range ? String(range.start) : "",
+      end: range ? String(range.end) : "",
+    }),
+  );
+  contextPins = payload.pins || [];
+  renderContextPanel();
+  toast(`Pinned ${path} for later turns`);
+}
+
+async function removeContextPin(path, range) {
+  const payload = await api(
+    "/api/context-pin",
+    form({
+      session_id: currentSessionId,
+      action: "remove",
+      path,
+      start: range ? String(range.start) : "",
+      end: range ? String(range.end) : "",
+    }),
+  );
+  contextPins = payload.pins || [];
+  renderContextPanel();
+}
+
+async function clearContextPins() {
+  const payload = await api(
+    "/api/context-pin",
+    form({ session_id: currentSessionId, action: "clear" }),
+  );
+  contextPins = payload.pins || [];
+  renderContextPanel();
+  toast("Pins cleared");
+}
+
+async function applyContextRestriction() {
+  const paths = $("context-restriction-paths").value;
+  const payload = await api(
+    "/api/context-restriction",
+    form({ session_id: currentSessionId, paths }),
+  );
+  contextRestriction = payload.restrictedPaths ?? null;
+  renderContextPanel();
+  toast("Session paths applied to later turns");
+}
+
+async function clearContextRestriction() {
+  const payload = await api(
+    "/api/context-restriction",
+    form({ session_id: currentSessionId, clear: "true" }),
+  );
+  contextRestriction = payload.restrictedPaths ?? null;
+  $("context-restriction-paths").value = "";
+  renderContextPanel();
+  toast("Session path restriction cleared");
+}
+
+function contextItemIndex(item) {
+  return (lastContextManifest?.included || []).findIndex(
+    (candidate) =>
+      candidate.category === item.category &&
+      candidate.kind === item.kind &&
+      candidate.path === item.path &&
+      JSON.stringify(candidate.lineRange || null) === JSON.stringify(item.lineRange || null),
+  );
+}
+
+async function removeContextItem(item) {
+  if (!currentContextReview) throw new Error("No context review is open");
+  const index = contextItemIndex(item);
+  if (index < 0) throw new Error("That item is no longer in the review");
+  const payload = await api(
+    "/api/context-remove",
+    form({ proposal_id: currentContextReview.proposalId, index: String(index) }),
+  );
+  currentContextReview = { ...currentContextReview, manifest: payload.manifest };
+  setContextManifest(payload.manifest, `review:${currentContextReview.proposalId}`);
+}
+
+async function removeContextSummary() {
+  if (!currentContextReview) throw new Error("No context review is open");
+  const payload = await api(
+    "/api/context-remove-summary",
+    form({ proposal_id: currentContextReview.proposalId }),
+  );
+  currentContextReview = { ...currentContextReview, manifest: payload.manifest };
+  setContextManifest(payload.manifest, `review:${currentContextReview.proposalId}`);
+}
+
+function noteContextPayload(payload) {
+  if (payload.context) {
+    setContextManifest(payload.context, payload.taskId || "");
+  }
+  if (payload.contextReview) {
+    currentContextReview = payload.contextReview;
+    setContextManifest(
+      payload.contextReview.manifest,
+      `review:${payload.contextReview.proposalId}`,
+    );
+  }
+}
+
+function appendContextLink(body, manifest) {
+  if (!manifest) return;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "context-link";
+  button.textContent = `Context · ${formatContextTokens(manifest.totalTokens)} tokens`;
+  button.title = "Show what this turn was sent";
+  button.addEventListener("click", () => {
+    currentContextReview = null;
+    openContextPanel(manifest, manifest.taskId || "");
+  });
+  body.append(button);
+}
+
 function dismissContextChips() {
   if (!pinnedContextFiles.length || contextChipsDismissed) return;
   contextChipsDismissed = true;
@@ -2201,6 +2660,12 @@ function applyRepositoryState(value, persist = true) {
   }
   currentSessionId = "";
   loadPinnedContextFiles("");
+  lastContextManifest = null;
+  currentContextReview = null;
+  contextPins = [];
+  contextRestriction = null;
+  closeContextPanel();
+  renderContextButton();
   void refreshRepoBar();
   // Refresh the roots cache so chips and patch files can qualify by root. A
   // failure here is not fatal: the UI simply shows unqualified names.
@@ -4500,6 +4965,7 @@ async function loadConfigFile() {
   // that content is the file's: saving an empty editor would empty the file.
   $("worker-sessions-input").disabled = false;
   void refreshConversationAutoCompact();
+  void refreshPauseForContextReview();
   void refreshModelKeyStatus().catch((error) => setModelKeyStatus(error.message, "error"));
   return payload;
 }
@@ -5108,6 +5574,11 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
   const notesByTask = new Map(
     tasks.filter((task) => task.notes).map((task) => [task.id, task.notes]),
   );
+  // The newest manifest per task (spec 27 §5.3). Absent for a turn that never
+  // recorded an assembly, so an old session stays link-free.
+  const contextByTask = new Map(
+    tasks.filter((task) => task.context).map((task) => [task.id, task.context]),
+  );
   // Set before any message renders: each one runs the legacy thumbnail scan.
   sessionHasRecordedDiagnostics = diagnosticsByTask.size > 0;
   // Whatever a turn appends *after* its answer — a stop row, the plan panel —
@@ -5190,6 +5661,7 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
           renderWebDiagnosticCard(bubble, record);
         });
         appendTurnNotes(bubble.body, notesByTask.get(message.taskId));
+        appendContextLink(bubble.body, contextByTask.get(message.taskId));
       }
       if (message.taskId) markMessageUsage(bubble, usageByTask.get(message.taskId));
     }
@@ -5704,6 +6176,7 @@ function createReattachedApprovalCard(approval) {
     plan: "A plan was waiting for your review when Damaian stopped",
     provider_fallback: "An offer to switch providers was waiting when Damaian stopped",
     round_budget: "A turn was waiting for your decision when Damaian stopped",
+    context_review: "A turn was waiting for you to review its context when Damaian stopped",
     checks: "Checks were waiting for your approval when Damaian stopped",
   };
   const notes = {
@@ -5727,6 +6200,9 @@ function createReattachedApprovalCard(approval) {
     round_budget:
       "This turn reached its round budget and was saved while you decided. Continue grants " +
       "it more rounds; Answer now ends it.",
+    context_review:
+      "This turn was assembled but not sent, and it was saved while you reviewed it. " +
+      "Sending continues that turn; declining sends nothing.",
     checks:
       "The verification of an applied patch stopped on this card. Deciding it continues the " +
       "same attempt; the report follows when every check is answered.",
@@ -5755,6 +6231,10 @@ function createReattachedApprovalCard(approval) {
   } else if (approval.kind === "round_budget") {
     // No `onResolved`, for the plan's reason: either answer ends the task.
     wrapper.append(createRoundBudgetOffer(approval.payload, repo()));
+  } else if (approval.kind === "context_review") {
+    // Saved and re-presented like a plan review; either answer ends this card.
+    currentContextReview = approval.payload;
+    wrapper.append(createContextReview(approval.payload, repo()));
   } else if (approval.kind === "checks") {
     wrapper.append(
       createCheckBatchCard(approval.payload, repo(), {
@@ -6140,6 +6620,19 @@ async function refreshConversationAutoCompact() {
   } catch {
     // Unknown reads as unchecked and disabled: a control must not appear to
     // hold a setting it could not read.
+    input.checked = false;
+    input.disabled = true;
+  }
+}
+
+async function refreshPauseForContextReview() {
+  const input = $("pause-for-context-review-input");
+  try {
+    const payload = await api(`/api/effective-policy?repo=${encodeURIComponent(repo() || "")}`);
+    const rule = (payload.rules || []).find((entry) => entry.key === "pause_for_context_review");
+    input.checked = rule?.value === "true";
+    input.disabled = false;
+  } catch {
     input.checked = false;
     input.disabled = true;
   }
@@ -10193,6 +10686,7 @@ function createVerificationOfferCard(due) {
 // after the user approved a command was silently dropped and could never be
 // reviewed.
 function appendProposals(message, payload, repo) {
+  noteContextPayload(payload);
   if (payload.commandProposal) {
     message.body.append(createCommandApprovalPreview(payload.commandProposal, repo));
   }
@@ -10223,6 +10717,9 @@ function appendProposals(message, payload, repo) {
   }
   if (payload.questionProposal) {
     message.body.append(createQuestionCard(payload.questionProposal, repo));
+  }
+  if (payload.contextReview) {
+    message.body.append(createContextReview(payload.contextReview, repo));
   }
 }
 
@@ -10403,6 +10900,155 @@ function createFallbackOffer(proposal, proposalRepo) {
 // exposes. For the reattached shape the hard cap is derived from roundsUsed,
 // duplicating `ABSOLUTE_TURN_ROUND_CAP` (64) from chat.rs, so a reattached
 // pause at the cap is never offered a Continue the engine would refuse.
+
+// Spec 27 §5.1: a turn assembled and not sent. The card is the decision; the
+// panel is the detail. Removal happens in the panel, so Send reads the amended
+// manifest the panel last received.
+function createContextReview(review, reviewRepo) {
+  const manifest = review.manifest || {};
+  const total = formatContextTokens(manifest.totalTokens || 0);
+  const limit = formatContextTokens(manifest.limit?.tokens || 0);
+  const excluded = manifest.excluded?.length || 0;
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "command-approval context-review";
+
+  const header = document.createElement("div");
+  header.className = "command-approval-header";
+  const title = document.createElement("strong");
+  title.textContent = "Review the context before sending";
+  const meta = document.createElement("span");
+  meta.className = "command-approval-risk";
+  meta.textContent = `${total} / ${limit} tokens`;
+  meta.dataset.blocked = "false";
+  header.append(title, meta);
+
+  const note = document.createElement("p");
+  note.className = "plan-review-note";
+  note.textContent = `Nothing has been sent yet. ${excluded} item${
+    excluded === 1 ? "" : "s"
+  } were left out; open the panel to see why or to pin something for later turns.`;
+
+  const actions = document.createElement("div");
+  actions.className = "command-approval-actions";
+
+  const reviewButton = document.createElement("button");
+  reviewButton.type = "button";
+  reviewButton.className = "btn-sm btn-quiet";
+  reviewButton.textContent = "Review context";
+  reviewButton.addEventListener("click", () => {
+    currentContextReview = review;
+    openContextPanel(
+      currentContextReview.manifest || review.manifest,
+      `review:${review.proposalId}`,
+    );
+  });
+
+  const sendButton = document.createElement("button");
+  sendButton.type = "button";
+  sendButton.className = "btn-sm btn-primary";
+  sendButton.textContent = "Send";
+  const declineButton = document.createElement("button");
+  declineButton.type = "button";
+  declineButton.className = "btn-sm btn-quiet";
+  declineButton.textContent = "Decline";
+  actions.append(reviewButton, sendButton, declineButton);
+
+  const output = document.createElement("pre");
+  output.className = "command-approval-output";
+  output.hidden = true;
+
+  async function decide(decision) {
+    reviewButton.disabled = true;
+    sendButton.disabled = true;
+    declineButton.disabled = true;
+    output.hidden = false;
+    output.textContent = decision === "send" ? "Sending…" : "Declining…";
+    const assistantMessage = appendChatMessage("assistant", "");
+    const indicator = startTurnIndicator(assistantMessage);
+    let assistantText = "";
+    let streamError = null;
+    try {
+      await streamResumeContextRequest(
+        {
+          repo: reviewRepo,
+          proposal_id: review.proposalId,
+          decision,
+        },
+        {
+          phase(payload) {
+            indicator.phase(payload);
+          },
+          plan(planPayload) {
+            renderPlanPanel(assistantMessage, planPayload);
+          },
+          context(payload) {
+            setContextManifest(payload, payload.taskId || "");
+          },
+          webDiagnostic(record) {
+            sessionHasRecordedDiagnostics = true;
+            renderWebDiagnosticCard(assistantMessage, record);
+          },
+          token(token) {
+            assistantText += token;
+            updateChatMessage(assistantMessage, assistantText);
+            indicator.streaming();
+          },
+          done(payload) {
+            if (payload.response && payload.response !== assistantText) {
+              assistantText = payload.response;
+              updateChatMessage(assistantMessage, assistantText);
+            }
+            appendProposals(assistantMessage, payload, reviewRepo);
+            if (payload.sessionId) {
+              currentSessionId = payload.sessionId;
+              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+            }
+            appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            appendTurnNotes(assistantMessage.body, payload.turnNotes);
+            markMessageUsage(assistantMessage, payload.usage);
+            indicator.finish(chatCompletionState(payload));
+            markMessageTurnStop(assistantMessage, payload);
+          },
+          error(payload) {
+            streamError = new Error(payload.error || "Context decision failed");
+          },
+        },
+      );
+    } catch (error) {
+      streamError = error;
+    } finally {
+      indicator.finish("failed");
+    }
+    if (streamError) {
+      renderChatMessageError(assistantMessage, streamError);
+      // The review is put back by the engine on a refusal, so the card stays
+      // answerable.
+      reviewButton.disabled = false;
+      sendButton.disabled = false;
+      declineButton.disabled = false;
+      output.textContent = streamError.message;
+      return;
+    }
+    currentContextReview = null;
+    closeContextPanel();
+    output.textContent =
+      decision === "send" ? "Sent the reviewed context." : "No request was sent.";
+    await loadSessions(currentSessionId, false);
+    await refreshFindings();
+  }
+
+  sendButton.addEventListener("click", () => {
+    decide("send").catch((error) => toast(error.message));
+  });
+  declineButton.addEventListener("click", () => {
+    decide("decline").catch((error) => toast(error.message));
+  });
+
+  wrapper.append(header, note, actions, output);
+  return wrapper;
+}
+
 function createRoundBudgetOffer(proposal, proposalRepo) {
   const more = proposal.roundsMore;
   const atHardCap = proposal.atHardCap === true || (proposal.roundsUsed ?? 0) >= 64;
@@ -11534,6 +12180,18 @@ async function loadSession(sessionId) {
     payload.conversationView?.conversation || null,
   );
   renderSpawnedWorkerEntries(rendered, currentSessionId);
+  contextPins = payload.contextState?.pins || [];
+  contextRestriction = payload.contextState?.restrictedPaths ?? null;
+  const manifests = (payload.tasks || []).map((task) => task.context).filter(Boolean);
+  lastContextManifest = manifests.reduce(
+    (newest, manifest) =>
+      !newest || (manifest.assembledAtMs || 0) >= (newest.assembledAtMs || 0) ? manifest : newest,
+    null,
+  );
+  contextPanelTaskId = lastContextManifest?.taskId || "";
+  currentContextReview = null;
+  renderContextButton();
+  if (!$("context-panel").hidden) renderContextPanel();
   await refreshFindings();
   // After the conversation, because `renderMessages` clears the log and the
   // cards sit above what it renders.
@@ -11574,6 +12232,10 @@ async function streamResumeFallbackRequest(data, handlers) {
 // there is no one-shot endpoint to fall back to.
 async function streamResumeRoundBudgetRequest(data, handlers) {
   return streamRequest("/api/resume-round-budget-stream", null, data, handlers);
+}
+
+async function streamResumeContextRequest(data, handlers) {
+  return streamRequest("/api/resume-context-stream", null, data, handlers);
 }
 
 // Verification is a continuation turn the engine starts, not a user prompt, so
@@ -11640,6 +12302,7 @@ function processSseEvent(raw, handlers) {
   if (event === "phase" && handlers.phase) handlers.phase(payload);
   if (event === "plan" && handlers.plan) handlers.plan(payload);
   if (event === "web_diagnostic" && handlers.webDiagnostic) handlers.webDiagnostic(payload);
+  if (event === "context" && handlers.context) handlers.context(payload);
   if (event === "done") handlers.done(payload);
   if (event === "error") handlers.error(payload);
 }
@@ -11686,6 +12349,60 @@ async function pickWorkingFolder() {
     toast(error.message);
   }
 }
+
+$("context-inspector-btn").addEventListener("click", () => {
+  if ($("context-panel").hidden) openContextPanel();
+  else closeContextPanel();
+});
+
+$("context-panel-close").addEventListener("click", closeContextPanel);
+
+$("context-pin-btn").addEventListener("click", async () => {
+  try {
+    const path = $("context-pin-path").value.trim();
+    if (!path) throw new Error("A path is required");
+    const raw = $("context-pin-range").value.trim();
+    let range = null;
+    if (raw) {
+      const match = /^(\d+)\s*-\s*(\d+)$/.exec(raw);
+      if (!match) throw new Error("A range must look like 40-120");
+      range = { start: Number(match[1]), end: Number(match[2]) };
+    }
+    await addContextPin(path, range);
+    $("context-pin-path").value = "";
+    $("context-pin-range").value = "";
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("context-pins-clear").addEventListener("click", () => {
+  clearContextPins().catch((error) => toast(error.message));
+});
+
+$("context-restriction-apply").addEventListener("click", () => {
+  applyContextRestriction().catch((error) => toast(error.message));
+});
+
+$("context-restriction-clear").addEventListener("click", () => {
+  clearContextRestriction().catch((error) => toast(error.message));
+});
+
+$("pause-for-context-review-input").addEventListener("change", async (event) => {
+  const enabled = event.target.checked;
+  try {
+    await api(
+      "/api/config-set",
+      form({ key: "pause_for_context_review", value: enabled ? "true" : "false" }),
+    );
+    await loadConfigFile();
+    await refreshPauseForContextReview();
+    toast(enabled ? "Turns will pause before sending" : "Turns send without pausing");
+  } catch (error) {
+    event.target.checked = !enabled;
+    toast(error.message);
+  }
+});
 
 $("composer-attach-btn").addEventListener("click", (event) => {
   event.stopPropagation();
