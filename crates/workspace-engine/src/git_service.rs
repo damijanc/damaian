@@ -996,6 +996,39 @@ impl GitService {
         git_line(root_path.as_ref(), &["rev-parse", "--verify", "-q", "HEAD"])
     }
 
+    /// The repository's first root commit, or `None` when it has no history.
+    ///
+    /// Tier 1 of spec 28 §5.2's project identity: a property of the
+    /// repository's history rather than of where it sits, so it survives a
+    /// clone, move or rename. A merged history can have more than one root;
+    /// the first line is taken, and the result is stable because Git reports
+    /// them in a deterministic order.
+    ///
+    /// Not audited, like [`Self::head_commit`]: the memory store audits the
+    /// lifecycle this enables, and a lookup that happens on every open would
+    /// otherwise fill the log.
+    pub fn root_commit(&self, root_path: impl AsRef<Path>) -> Result<Option<String>> {
+        let Some(output) = git_line(root_path.as_ref(), &["rev-list", "--max-parents=0", "HEAD"])?
+        else {
+            return Ok(None);
+        };
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string))
+    }
+
+    /// The configured `origin` URL, if there is one. Tier 2 of spec 28 §5.2's
+    /// project identity; not audited for the same reason as
+    /// [`Self::root_commit`].
+    pub fn origin_url(&self, root_path: impl AsRef<Path>) -> Result<Option<String>> {
+        git_line(
+            root_path.as_ref(),
+            &["config", "--get", "remote.origin.url"],
+        )
+    }
+
     pub fn suggest_commit_message(&self, summary: &str, changed_files: &[String]) -> String {
         let normalized = summary.trim().trim_end_matches(['.', '!', '?']);
         if normalized.is_empty() {

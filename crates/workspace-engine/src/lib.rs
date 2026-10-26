@@ -143,7 +143,8 @@ pub use mcp::{
 };
 pub use memory::{
     EvidenceRef, MemoryCategory, MemoryEntry, MemoryExpiry, MemoryProvenance, MemoryScope,
-    MemoryState, Sensitivity, Verification,
+    MemoryState, ProjectIdentity, ProjectKeySource, Sensitivity, Verification,
+    normalize_remote_url,
 };
 pub use mode::SessionMode;
 pub use model::{

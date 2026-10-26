@@ -15,8 +15,11 @@
 //!   redacted memory is permanently useless and records that a credential
 //!   exists.
 
-use crate::hash::{create_id, now_millis};
+use crate::error::Result;
+use crate::git_service::GitService;
+use crate::hash::{create_id, now_millis, repository_id_for_root, sha256_hex};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -418,6 +421,164 @@ fn is_ipv4(word: &str) -> bool {
             .all(|part| !part.is_empty() && part.parse::<u8>().is_ok())
 }
 
+/// Which resolution tier produced a [`ProjectIdentity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectKeySource {
+    /// The repository's first root commit. Survives clones, moves, renames,
+    /// remote changes and forks.
+    RootCommit,
+    /// The normalized `origin` remote. Survives clones and moves, not a remote
+    /// rename.
+    RemoteUrl,
+    /// The existing path-derived `repository_id`. Nothing survives; the
+    /// per-checkout fallback.
+    RepositoryId,
+}
+
+impl ProjectKeySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RootCommit => "root_commit",
+            Self::RemoteUrl => "remote_url",
+            Self::RepositoryId => "repository_id",
+        }
+    }
+}
+
+/// Memory's own repository identity, separate from `repository_id`.
+///
+/// `repository_id` is a hash of the checkout's path, which is the right
+/// identity for permissions and the wrong one for memory: two clones of one
+/// repository must share memory, and a moved checkout must keep it. Changing
+/// `repository_id` would invalidate the keyword index, the vector index,
+/// sessions, checkpoints, the repository map and file access, so memory gets a
+/// second key instead (spec 28 §5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectIdentity {
+    /// `root_…`, `remote_…` or `path_…`. The prefix names the tier, which is
+    /// how the UI can report the source without a second stored field, and the
+    /// suffix is already filesystem-safe.
+    pub key: String,
+    pub source: ProjectKeySource,
+    pub repository_id: String,
+}
+
+impl ProjectIdentity {
+    /// Resolves in the proposal's order: root commit, then normalized origin,
+    /// then the path hash. Each tier is attempted only when the previous one
+    /// produced nothing.
+    pub fn resolve(
+        root: impl AsRef<Path>,
+        repository_id: impl Into<String>,
+        git: &GitService,
+    ) -> Result<Self> {
+        let root = root.as_ref();
+        let repository_id = repository_id.into();
+
+        if let Some(commit) = git.root_commit(root)?
+            && !commit.is_empty()
+        {
+            return Ok(Self {
+                key: format!("root_{}", commit.to_lowercase()),
+                source: ProjectKeySource::RootCommit,
+                repository_id,
+            });
+        }
+
+        if let Some(url) = git.origin_url(root)?
+            && let Some(normalized) = normalize_remote_url(&url)
+        {
+            return Ok(Self {
+                key: format!("remote_{}", &sha256_hex(normalized.as_bytes())[..16]),
+                source: ProjectKeySource::RemoteUrl,
+                repository_id,
+            });
+        }
+
+        Ok(Self {
+            key: format!("path_{repository_id}"),
+            source: ProjectKeySource::RepositoryId,
+            repository_id,
+        })
+    }
+
+    /// [`Self::resolve`] with the path-derived id computed from `root`.
+    pub fn resolve_for_root(root: impl AsRef<Path>, git: &GitService) -> Result<Self> {
+        let root = root.as_ref();
+        Self::resolve(root, repository_id_for_root(root), git)
+    }
+
+    /// Reads the tier back out of a stored key, for a UI or a troubleshooting
+    /// reader. `None` for a key no build of Damaian wrote.
+    pub fn source_of_key(key: &str) -> Option<ProjectKeySource> {
+        if key.starts_with("root_") {
+            Some(ProjectKeySource::RootCommit)
+        } else if key.starts_with("remote_") {
+            Some(ProjectKeySource::RemoteUrl)
+        } else if key.starts_with("path_repo_") {
+            Some(ProjectKeySource::RepositoryId)
+        } else {
+            None
+        }
+    }
+}
+
+/// Normalizes an `origin` URL to `host/path`, stripping the scheme, any
+/// credentials, a port and a trailing `.git`.
+///
+/// Handles both `https://user:token@host:443/owner/repo.git` and the scp-style
+/// `git@host:owner/repo.git`. A remote that is a local filesystem path has no
+/// host to share and returns `None`, so identity falls through to the path
+/// tier rather than pretending a machine-local path is portable.
+pub fn normalize_remote_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+
+    let (host, path) = if let Some((_scheme, rest)) = url.split_once("://") {
+        let rest = rest.trim_start_matches('/');
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        (authority, path)
+    } else if let Some((user_host, path)) = url.split_once(':')
+        && !url.starts_with('/')
+        && !url.starts_with('.')
+    {
+        // scp-style `user@host:path`, or a bare `host:path`. A local absolute
+        // path or a relative `./` path is not this shape and falls through.
+        let host = user_host
+            .rsplit_once('@')
+            .map_or(user_host, |(_, host)| host);
+        (host, path)
+    } else {
+        return None;
+    };
+
+    // Credentials may appear without a scheme in the scp form; the caller
+    // already stripped them above, and the authority form is handled here.
+    let authority = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    let authority = match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => host,
+        _ => authority,
+    };
+    let host = authority.trim().to_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+
+    let path = path
+        .trim()
+        .trim_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
+    if path.is_empty() {
+        return None;
+    }
+    Some(format!("{host}/{path}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,6 +712,47 @@ mod tests {
     fn sensitivity_order_is_restrictiveness_order() {
         assert!(Sensitivity::Ordinary < Sensitivity::Environmental);
         assert!(Sensitivity::Environmental < Sensitivity::Personal);
+    }
+
+    #[test]
+    fn a_remote_normalizes_to_host_and_path() {
+        assert_eq!(
+            normalize_remote_url("https://user:token@GitHub.com:443/Owner/Repo.git").as_deref(),
+            Some("github.com/Owner/Repo")
+        );
+        assert_eq!(
+            normalize_remote_url("git@github.com:owner/repo.git").as_deref(),
+            Some("github.com/owner/repo")
+        );
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com/owner/repo.git/").as_deref(),
+            Some("github.com/owner/repo")
+        );
+    }
+
+    #[test]
+    fn a_remote_with_no_portable_host_does_not_become_an_identity() {
+        assert_eq!(normalize_remote_url("/srv/git/repo.git"), None);
+        assert_eq!(normalize_remote_url("../repo.git"), None);
+        assert_eq!(normalize_remote_url("https://github.com"), None);
+        assert_eq!(normalize_remote_url(""), None);
+    }
+
+    #[test]
+    fn a_project_key_names_its_tier() {
+        assert_eq!(
+            ProjectIdentity::source_of_key("root_0f1e2d"),
+            Some(ProjectKeySource::RootCommit)
+        );
+        assert_eq!(
+            ProjectIdentity::source_of_key("remote_0123456789abcdef"),
+            Some(ProjectKeySource::RemoteUrl)
+        );
+        assert_eq!(
+            ProjectIdentity::source_of_key("path_repo_0123456789abcdef"),
+            Some(ProjectKeySource::RepositoryId)
+        );
+        assert_eq!(ProjectIdentity::source_of_key("mem_1"), None);
     }
 
     #[test]

@@ -12,7 +12,7 @@ criteria) · corrections and planning decisions in [`context.md`](context.md)
 |---|---|---|
 | 1 · Folder conversion, status and links | Done 2026-10-26 | `git mv` of the flat spec; `proposal.md` keeps §1 and §3-§7 with its `§5.x` numbering intact, `context.md` holds the former §2 plus a corrections table for every drifted line reference, and `tasks.md` is new. Status In progress in the proposal, the README current-state bullets and both implementation-order rows. Every link naming the flat file in specs 27, 29, 30, 34, 50, 53, 55 and the README now names `28_memory_model_and_storage/proposal.md`. A relative-link scan over `docs/**/*.md` found no broken link in this folder; the one failure it reported is pre-existing in spec 66. `npm run specs:check` was not run (it needs `node_modules`); scoped docs-only change, no Rust touched. |
 | 2 · Record types and sensitivity by rule | Done 2026-10-26 | `memory.rs` defines the seven enums, `MemoryProvenance` (three variants only), `EvidenceRef`, `MemoryExpiry` and `MemoryEntry`, and exports them from `lib.rs`. `Sensitivity`'s declaration order is its restrictiveness order; `derived_sensitivity` applies the §5.5a table with the most restrictive match winning, and `effective_sensitivity` raises a lower caller value but keeps a higher one. Environmental markers are an absolute path, `~/`, URL, `localhost`, `dot.host.tld`, `host:port` or `:port`, IPv4, and the local `USER`/`LOGNAME`/`HOME` name. **Deviation:** the proposal's `rename_all = "camelCase"` on `MemoryProvenance` renames variants only, so the variant fields carry explicit `sessionId`/`messageId`/`taskId` renames to keep the JSON camelCase throughout. Ten inline tests pass; scoped clippy clean. |
-| 3 · Project identity resolution | Not started | |
+| 3 · Project identity resolution | Done 2026-10-26 | `GitService::root_commit` (`rev-list --max-parents=0 HEAD`, first line) and `origin_url` are unaudited read helpers beside `head_commit`. `ProjectIdentity::resolve` takes the root commit first, then a normalized origin, then the path hash, and keys are `root_<sha>`, `remote_<sha256[..16]>`, `path_<repository_id>`; `source_of_key` reads the tier back. Remote normalization strips scheme, credentials, port and `.git`, lowercases the host, handles scp syntax, and returns `None` for a local path so identity falls to the path tier rather than pretending a machine path is portable. Nine integration tests cover: two clones sharing (with different `repository_id`s), a rename keeping the key, different root commits not sharing, a fork sharing deliberately, remotes without history (different and same), neither falling to the path hash, a non-repository, and no credential or slash in a key. **Measured cost:** about 12 ms per tier-1 resolution on this machine (20 iterations, 0.246 s total), dominated by process launch. |
 | 4 · Store layout, schema version and migration | Not started | |
 | 5 · Refusal path: secrets, evidence, scopes | Not started | |
 | 6 · Lifecycle transitions and audit | Not started | |
@@ -128,22 +128,22 @@ folder); `npm run specs:check` reports no new mismatch for #28.
 
 ## Task 3 · Project identity resolution
 
-- [ ] Add read-only identity helpers to `git_service.rs`: the first root commit
+- [x] Add read-only identity helpers to `git_service.rs`: the first root commit
       (`git rev-list --max-parents=0 HEAD`, first line) and the `origin` URL
       (`git config --get remote.origin.url`). Neither is audited, matching
       `head_commit`.
-- [ ] Add `ProjectKeySource { RootCommit, RemoteUrl, RepositoryId }` and
+- [x] Add `ProjectKeySource { RootCommit, RemoteUrl, RepositoryId }` and
       `ProjectIdentity { key, source, repository_id }` to `memory.rs`.
-- [ ] `ProjectIdentity::resolve(root, repository_id, &GitService)` resolves in
+- [x] `ProjectIdentity::resolve(root, repository_id, &GitService)` resolves in
       order: root commit → `root_<sha>`; normalized origin URL →
       `remote_<sha256[..16]>`; `repository_id` → `path_<repository_id>`.
-- [ ] Normalize a remote URL: strip scheme, credentials, port and a trailing
+- [x] Normalize a remote URL: strip scheme, credentials, port and a trailing
       `.git`, lowercase the host, keep host and path; handle `git@host:owner/repo`
       scp syntax. Return `None` for a URL with no host or path.
-- [ ] Test each tier, including two checkouts of one repository sharing a key
+- [x] Test each tier, including two checkouts of one repository sharing a key
       (clone), a renamed checkout keeping its key, two unrelated repositories
       differing at every tier, and a fork sharing the root commit deliberately.
-- [ ] Record the measured cost of resolution (a `git` process per tier) in the
+- [x] Record the measured cost of resolution (a `git` process per tier) in the
       progress row and in the proposal's §7.
 
 **Verification:** `cargo nextest run -p workspace-engine --test memory
