@@ -1458,6 +1458,13 @@ impl MemoryStore {
         }
     }
 
+    /// Whether one evidence path is eligible. Used by the suggestion tool
+    /// *before* it reads the file to hash it: a protected or ignored path must
+    /// not be opened at all, not merely refused after its hash was computed.
+    pub fn check_evidence_path(&self, root: &Path, path: &str) -> MemoryResult<()> {
+        self.proposal_gate(root, None).check_evidence(path)
+    }
+
     /// The file a project key names, for a caller that already holds a
     /// [`ProjectIdentity`]. The shape is enforced by [`Self::validate_shape`] on
     /// write and [`Self::project_entries`] on read before this is reached; this
@@ -1669,6 +1676,30 @@ impl MemoryStore {
             .append_memory_proposal(proposal.origin.session_id(), &encoded)?;
         self.audit_proposal_created(&proposal)?;
         Ok(Some(proposal))
+    }
+
+    /// [`Self::propose`] for a repository observation. The evidence path is
+    /// checked before the file is opened, and the content hash is filled in only
+    /// once it is eligible. A refused path is audited with the proposal's
+    /// origin and the path, exactly like any other proposal-stage refusal;
+    /// nothing about the file is read.
+    pub fn propose_with_evidence(
+        &self,
+        root: &Path,
+        mut proposal: MemoryProposal,
+    ) -> MemoryResult<Option<MemoryProposal>> {
+        if let Some(evidence) = proposal.evidence.first() {
+            if let Err(error) = self.check_evidence_path(root, &evidence.path) {
+                self.audit_proposal_refused(&proposal, &error)?;
+                return Ok(None);
+            }
+            let hash = file_hash(root.join(&evidence.path))
+                .map_err(|error| MemoryError::Io(error.to_string()))?;
+            if let Some(evidence) = proposal.evidence.first_mut() {
+                evidence.content_hash = hash;
+            }
+        }
+        self.propose(root, proposal)
     }
 
     /// The proposals still awaiting a decision in a session, oldest first.

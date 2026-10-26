@@ -2275,3 +2275,30 @@ fn a_multi_line_candidate_is_refused_rather_than_flattened() {
     assert!(store.pending_proposals(&session).unwrap().is_empty());
     assert!(audit_text(&root).contains("memory_proposal_refused"));
 }
+
+#[test]
+fn an_ineligible_evidence_path_is_refused_before_the_file_is_opened() {
+    let root = temp_dir("proposal-evidence-not-opened");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let mut proposal = suggestion(
+        MemoryScope::Project,
+        "The database host is configured in the environment.",
+        ProposalOrigin::RepositoryObservation {
+            session_id: session.clone(),
+        },
+        "task_evidence_order",
+    );
+    // The path does not exist. If the gate hashed first, the failure would be
+    // an IO error; because it screens first, the reason is `restricted`.
+    proposal.evidence = vec![EvidenceRef::new(".env", String::new())];
+    assert!(
+        store
+            .propose_with_evidence(&root, proposal)
+            .unwrap()
+            .is_none()
+    );
+    let audit = audit_text(&root);
+    assert!(audit.contains("evidence_restricted"), "{audit}");
+    assert!(!audit.contains("io_error"), "{audit}");
+}

@@ -32,8 +32,8 @@ use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::language::detect_language;
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
 use crate::memory::{
-    MemoryCategory, MemoryProposal, MemoryScope, MemoryStore, ProposalOrigin, evidence_ref_for,
-    explicit_memory_request,
+    EvidenceRef as MemoryEvidence, MemoryCategory, MemoryProposal, MemoryScope, MemoryStore,
+    ProposalOrigin, explicit_memory_request,
 };
 use crate::mode::{Permission, SessionMode, permits, refusal_message};
 use crate::model::{
@@ -7066,7 +7066,7 @@ impl ChatOrchestrator {
                             scope,
                             source,
                             evidence_path,
-                        } => 'propose: {
+                        } => {
                             let origin = if evidence_path.is_some() {
                                 ProposalOrigin::RepositoryObservation {
                                     session_id: session.id.clone(),
@@ -7082,20 +7082,10 @@ impl ChatOrchestrator {
                                     task_id: task.id.clone(),
                                 }
                             };
-                            let evidence =
-                                match evidence_path.as_deref() {
-                                    Some(path) => match evidence_ref_for(repository_root, path) {
-                                        Ok(evidence) => vec![evidence],
-                                        Err(_) => break 'propose (
-                                            "Attempted to suggest a memory.".to_string(),
-                                            "A memory was not proposed: that evidence path could \
-                                         not be read."
-                                                .to_string(),
-                                            ActionOutcome::Failed,
-                                        ),
-                                    },
-                                    None => Vec::new(),
-                                };
+                            let evidence = evidence_path
+                                .as_deref()
+                                .map(|path| vec![MemoryEvidence::new(path, String::new())])
+                                .unwrap_or_default();
                             let proposal = MemoryProposal::new(
                                 scope.unwrap_or(MemoryScope::Project),
                                 category,
@@ -7104,7 +7094,10 @@ impl ChatOrchestrator {
                                 evidence,
                                 Some(task.id.clone()),
                             );
-                            match self.memory_store.propose(repository_root, proposal) {
+                            match self
+                                .memory_store
+                                .propose_with_evidence(repository_root, proposal)
+                            {
                                 Ok(Some(_)) => (
                                     "Suggested a memory.".to_string(),
                                     "A memory proposal was created for the user to confirm. It \
