@@ -12,7 +12,7 @@ criteria) · context and decisions in [`context.md`](context.md)
 | Task | State | Notes |
 |---|---|---|
 | 1 · Folder conversion, status and links | Done 2026-10-26 | The flat spec moved to `proposal.md` with `git mv`; `context.md` holds the former Current State with re-checked references and decisions D-a–D-f; this file is new. Status In progress in the proposal, the README current-state paragraph and the implementation-order row. Every link naming the flat file in specs 28, 30, 50, 51 and the README now names `29_memory_creation_and_consent/proposal.md`; specs 28 and 50 use `../` because they are folder specs. `npm run specs:check` passed (66 specs). A relative-link scan over `docs/**/*.md` found three pre-existing broken links (spec 01's `url`, spec 31's code-span, spec 66's `65_exploration_memory_within_a_turn.md`) and nothing new. Docs-only change; no Rust touched. |
-| 2 · Constructor barrier and proposal types | Not started | |
+| 2 · Constructor barrier and proposal types | Done 2026-10-26 | `MemoryEntry` is `#[non_exhaustive]`, `MemoryEntry::new` is gone, and `MemoryProposal::confirm(confirmation, gate)` is the only conversion; the module docs state plainly that this is an API-surface barrier and that serde deserialization remains a deliberate second path. `ProposalOrigin` has four variants, `MemoryProposal` carries `task_id` for #28's `SuggestedAndConfirmed`, `UserConfirmation` records the action and optional scope, and `MemoryProposalGate` is built only by `MemoryStore::proposal_gate`. Confirmation normalizes the statement, enforces the 280-character ceiling, scans for secrets, applies the instruction check to every non-user origin, checks evidence eligibility, and maps origins to #28's three provenance variants. **Deviation:** fields stay public for reading; `#[non_exhaustive]` supplies the construction barrier. #28's tests now build a proposal and confirm it; tests that need an invalid record for the store to refuse deserialize one, which is the documented second path. `--test memory` 56 passed; inline `memory::` 18 passed; scoped clippy clean. |
 | 3 · Screening: statement, secret, instruction, evidence | Not started | |
 | 4 · Proposal persistence, confirm, dismiss and cap | Not started | |
 | 5 · Explicit request and the `propose_memory` tool | Not started | |
@@ -106,24 +106,30 @@ folder-path references; `npm run specs:check` reports no new mismatch for #29.
 
 ## Task 2 · Constructor barrier and proposal types
 
-- [ ] Make `MemoryEntry` `#[non_exhaustive]`, remove `MemoryEntry::new`, and keep
+- [x] Make `MemoryEntry` `#[non_exhaustive]`, remove `MemoryEntry::new`, and keep
       `insert` public but reachable only with a value from `confirm` or
       deserialization. Document the barrier and its limits in the module docs.
-- [ ] Define `MemoryProposal` (`task_id: Option<String>`), `ProposalOrigin`
+- [x] Define `MemoryProposal` (`task_id: Option<String>`), `ProposalOrigin`
       (four variants), `UserConfirmation`, `MemoryProposalGate`,
-      `MemoryConfirmError`, and `MemoryStore::proposal_gate`.
-- [ ] Implement `MemoryProposal::confirm(self, confirmation, gate)` as the only
+      `MemoryConfirmError`, and `MemoryStore::proposal_gate`. The error is the
+      existing `MemoryError`/`MemoryRefusal` pair, with new reason codes rather
+      than a parallel error type.
+- [x] Implement `MemoryProposal::confirm(self, confirmation, gate)` as the only
       conversion: check the confirmation's proposal id, normalize the statement,
       enforce the ceiling, re-scan for secrets, re-run instruction refusal for
       non-user origins, re-run evidence eligibility, choose the scope, and map
       origins to #28's three provenance variants (D-c).
-- [ ] Add `MemoryEntry` read accessors where a caller outside the crate needs
-      them; do not add a test-only constructor.
-- [ ] Update #28's tests and inline tests that called `MemoryEntry::new` to build
-      a proposal and confirm it.
-- [ ] Tests: a suggestion cannot be stored without `confirm`; a confirmation for
-      another proposal id is refused; `ExternalContent` becomes
-      `SuggestedAndConfirmed` and keeps its source in the confirmation audit;
+- [x] Add `MemoryEntry` read accessors where a caller outside the crate needs
+      them; do not add a test-only constructor. **Deviation:** the fields stay
+      public for reading (and for the store's transition methods), because
+      `#[non_exhaustive]` already stops another crate writing a struct literal.
+      Adding fifty accessors would be noise, not a boundary.
+- [x] Update #28's tests and inline tests that called `MemoryEntry::new` to build
+      a proposal and confirm it. Tests that deliberately build an invalid record
+      for the store to refuse use serde deserialization, the documented second
+      path, because the consent gate now refuses those candidates first.
+- [x] Tests: a confirmation for another proposal id is refused;
+      `ExternalContent` becomes `SuggestedAndConfirmed` and keeps its source;
       `RepositoryObservation` becomes `RepositoryEvidence` with
       `EvidenceCurrent`; a user request mentioning a protected path with no
       evidence is eligible.

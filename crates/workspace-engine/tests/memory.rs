@@ -271,8 +271,9 @@ fn a_project_key_cannot_be_confused_between_tiers() {
 
 use workspace_engine::{
     AuditLog, EvidenceRef, MEMORY_SCHEMA_VERSION, MemoryCategory, MemoryEntry, MemoryError,
-    MemoryExpiry, MemoryProvenance, MemorySchemaOutcome, MemoryScope, MemoryState, MemoryStore,
-    MemoryStoreConfig, Sensitivity, Verification,
+    MemoryExpiry, MemoryProposal, MemoryProposalGate, MemoryProvenance, MemorySchemaOutcome,
+    MemoryScope, MemoryState, MemoryStore, MemoryStoreConfig, PathPolicy, ProposalOrigin,
+    Sensitivity, UserConfirmation, Verification,
 };
 
 fn memory_store(root: &Path, user_scope_enabled: bool) -> MemoryStore {
@@ -301,17 +302,50 @@ fn memory_store_with(
     )
 }
 
+fn confirm_entry(proposal: MemoryProposal, identity: Option<&ProjectIdentity>) -> MemoryEntry {
+    let config = Config::default();
+    let scanner = SecretScanner::new(Vec::new());
+    let path_policy = PathPolicy::new(&config);
+    let confirmation = UserConfirmation::new(proposal.id.clone());
+    proposal
+        .confirm(
+            confirmation,
+            MemoryProposalGate {
+                root: Path::new("."),
+                identity,
+                scanner: &scanner,
+                path_policy: &path_policy,
+                ignore_patterns: &[],
+            },
+        )
+        .expect("a ready fixture proposal should confirm")
+}
+
+/// A record the store's checks must refuse. The consent gate would refuse it
+/// first, so the test reaches the store the one way a deliberate caller could:
+/// deserialization. That is the honest boundary this spec documents.
+fn tampered(entry: MemoryEntry, patch: serde_json::Value) -> MemoryEntry {
+    let mut value = serde_json::to_value(entry).expect("entry should serialize");
+    let object = value.as_object_mut().expect("entry is an object");
+    for (key, value) in patch.as_object().expect("patch is an object") {
+        object.insert(key.clone(), value.clone());
+    }
+    serde_json::from_value(value).expect("tampered entry should deserialize")
+}
+
 fn full_entry(project_key: &str) -> MemoryEntry {
-    let mut entry = MemoryEntry::new(
+    let proposal = MemoryProposal::new(
         MemoryScope::Project,
         MemoryCategory::Environment,
         "The integration suite needs Docker running.",
-        MemoryProvenance::RepositoryEvidence {
-            paths: vec![EvidenceRef::new("docker-compose.yml", "sha256:abc")],
+        ProposalOrigin::RepositoryObservation {
+            session_id: "session_fixture".to_string(),
         },
-        Verification::EvidenceCurrent,
-    )
-    .in_project(project_key);
+        vec![EvidenceRef::new("docker-compose.yml", "sha256:abc")],
+        Some("task_fixture".to_string()),
+    );
+    let identity = project_identity(project_key);
+    let mut entry = confirm_entry(proposal, Some(&identity));
     entry.sensitivity = Sensitivity::Environmental;
     entry.expiry = Some(MemoryExpiry {
         expires_at_ms: Some(1_700_000_000_000),
@@ -608,44 +642,49 @@ fn project_identity(key: &str) -> ProjectIdentity {
 }
 
 fn project_entry(key: &str, statement: &str) -> MemoryEntry {
-    MemoryEntry::new(
+    let proposal = MemoryProposal::new(
         MemoryScope::Project,
         MemoryCategory::Convention,
         statement,
-        MemoryProvenance::UserRequest {
+        ProposalOrigin::UserRequest {
             session_id: "session_fixture".to_string(),
             message_id: "message_fixture".to_string(),
         },
-        Verification::UserConfirmed,
-    )
-    .in_project(key)
+        Vec::new(),
+        None,
+    );
+    let identity = project_identity(key);
+    confirm_entry(proposal, Some(&identity))
 }
 
 fn user_entry(statement: &str) -> MemoryEntry {
-    MemoryEntry::new(
+    let proposal = MemoryProposal::new(
         MemoryScope::User,
         MemoryCategory::Preference,
         statement,
-        MemoryProvenance::UserRequest {
+        ProposalOrigin::UserRequest {
             session_id: "session_fixture".to_string(),
             message_id: "message_fixture".to_string(),
         },
-        Verification::UserConfirmed,
-    )
+        Vec::new(),
+        None,
+    );
+    confirm_entry(proposal, None)
 }
 
 fn session_entry(session_id: &str, statement: &str) -> MemoryEntry {
-    MemoryEntry::new(
+    let proposal = MemoryProposal::new(
         MemoryScope::Session,
         MemoryCategory::Fact,
         statement,
-        MemoryProvenance::UserRequest {
+        ProposalOrigin::UserRequest {
             session_id: session_id.to_string(),
             message_id: "message_fixture".to_string(),
         },
-        Verification::UserConfirmed,
-    )
-    .in_session(session_id)
+        Vec::new(),
+        None,
+    );
+    confirm_entry(proposal, None)
 }
 
 const SEEDED_SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
@@ -677,9 +716,11 @@ fn a_detected_secret_is_refused_rather_than_stored_redacted() {
     let root = temp_dir("refuse-secret");
     let store = memory_store(&root, false);
     let identity = project_identity("root_refuse_secret");
-    let entry = project_entry(
-        &identity.key,
-        &format!("The deploy key {SEEDED_SECRET} is set on the runner."),
+    let entry = tampered(
+        project_entry(&identity.key, "A harmless fact."),
+        serde_json::json!({
+            "statement": format!("The deploy key {SEEDED_SECRET} is set on the runner."),
+        }),
     );
 
     let error = store.insert(&root, Some(&identity), entry).unwrap_err();
@@ -699,6 +740,126 @@ fn a_detected_secret_is_refused_rather_than_stored_redacted() {
 }
 
 #[test]
+fn a_confirmation_for_another_proposal_is_refused() {
+    let proposal = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Fact,
+        "The build is reproducible.",
+        ProposalOrigin::UserRequest {
+            session_id: "session_fixture".to_string(),
+            message_id: "message_fixture".to_string(),
+        },
+        Vec::new(),
+        None,
+    );
+    let identity = project_identity("root_confirmation_mismatch");
+    let config = Config::default();
+    let scanner = SecretScanner::new(Vec::new());
+    let path_policy = PathPolicy::new(&config);
+    let error = proposal
+        .confirm(
+            UserConfirmation::new("proposal_someone_else"),
+            MemoryProposalGate {
+                root: Path::new("."),
+                identity: Some(&identity),
+                scanner: &scanner,
+                path_policy: &path_policy,
+                ignore_patterns: &[],
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::ConfirmationMismatch)
+    ));
+}
+
+#[test]
+fn an_external_content_proposal_confirms_as_a_confirmed_suggestion_and_keeps_its_source() {
+    let root = temp_dir("external-content-confirm");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_external_content");
+    let proposal = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Convention,
+        "Releases are tagged on Friday.",
+        ProposalOrigin::ExternalContent {
+            session_id: "session_fixture".to_string(),
+            source: "issue #412".to_string(),
+        },
+        Vec::new(),
+        Some("task_fixture".to_string()),
+    );
+    let confirmation = UserConfirmation::new(proposal.id.clone());
+    let gate = store.proposal_gate(&root, Some(&identity));
+    let entry = proposal.confirm(confirmation, gate).unwrap();
+    assert!(matches!(
+        entry.provenance,
+        MemoryProvenance::SuggestedAndConfirmed { .. }
+    ));
+    assert_eq!(entry.verification, Verification::UserConfirmed);
+    let stored = store.insert(&root, Some(&identity), entry).unwrap();
+    assert_eq!(stored.scope, MemoryScope::Project);
+    assert_eq!(stored.project_key.as_deref(), Some(identity.key.as_str()));
+    assert_eq!(stored.statement, "Releases are tagged on Friday.");
+}
+
+#[test]
+fn a_repository_observation_confirms_as_current_evidence() {
+    let root = temp_dir("repository-observation-confirm");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_repository_observation");
+    let proposal = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Environment,
+        "The integration suite needs Docker.",
+        ProposalOrigin::RepositoryObservation {
+            session_id: "session_fixture".to_string(),
+        },
+        vec![EvidenceRef::new("docker-compose.yml", "sha256:fixture")],
+        Some("task_fixture".to_string()),
+    );
+    let confirmation = UserConfirmation::new(proposal.id.clone());
+    let gate = store.proposal_gate(&root, Some(&identity));
+    let entry = proposal.confirm(confirmation, gate).unwrap();
+    assert_eq!(entry.verification, Verification::EvidenceCurrent);
+    assert!(matches!(
+        entry.provenance,
+        MemoryProvenance::RepositoryEvidence { ref paths } if paths.len() == 1
+    ));
+    assert_eq!(
+        entry.expiry,
+        Some(MemoryExpiry {
+            expires_at_ms: None,
+            revalidate_on_evidence_change: true,
+        })
+    );
+}
+
+#[test]
+fn a_user_request_mentioning_a_protected_path_without_evidence_is_eligible() {
+    let root = temp_dir("user-mentions-protected-path");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_user_mentions_protected");
+    let proposal = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Environment,
+        "Environment configuration is in .env, not in the repository config.",
+        ProposalOrigin::UserRequest {
+            session_id: "session_fixture".to_string(),
+            message_id: "message_fixture".to_string(),
+        },
+        Vec::new(),
+        None,
+    );
+    let confirmation = UserConfirmation::new(proposal.id.clone());
+    let gate = store.proposal_gate(&root, Some(&identity));
+    let entry = proposal.confirm(confirmation, gate).unwrap();
+    assert!(entry.statement.contains(".env"));
+    assert!(entry.provenance.kind() == "user_request");
+}
+
+#[test]
 fn a_session_entry_with_a_secret_is_refused_and_never_reaches_the_log() {
     let root = temp_dir("refuse-session-secret");
     let store = memory_store(&root, false);
@@ -707,7 +868,12 @@ fn a_session_entry_with_a_secret_is_refused_and_never_reaches_the_log() {
         .create_session("repo_fixture", "fixture session")
         .unwrap();
 
-    let entry = session_entry(&session.id, &format!("My token is {SEEDED_SECRET}."));
+    let entry = tampered(
+        session_entry(&session.id, "A harmless fact."),
+        serde_json::json!({
+            "statement": format!("My token is {SEEDED_SECRET}."),
+        }),
+    );
     let error = store.insert(&root, None, entry).unwrap_err();
     assert!(matches!(
         error,
@@ -905,13 +1071,11 @@ fn a_statement_over_the_ceiling_is_refused_not_truncated() {
     let store = memory_store(&root, false);
     let identity = project_identity("root_statement_ceiling");
     let statement = "a".repeat(workspace_engine::STATEMENT_MAX_CHARS + 1);
-    let error = store
-        .insert(
-            &root,
-            Some(&identity),
-            project_entry(&identity.key, &statement),
-        )
-        .unwrap_err();
+    let entry = tampered(
+        project_entry(&identity.key, "A harmless fact."),
+        serde_json::json!({ "statement": statement }),
+    );
+    let error = store.insert(&root, Some(&identity), entry).unwrap_err();
     assert!(matches!(
         error,
         MemoryError::Refused(MemoryRefusal::InvalidShape(_))
@@ -1474,9 +1638,13 @@ fn a_project_key_shape_cannot_escape_the_project_directory() {
     let store = memory_store(&root, false);
     for key in ["../escape", "root_../x", "root_", "root_has.dot"] {
         let identity = project_identity(key);
-        let error = store
-            .insert(&root, Some(&identity), project_entry(key, "A fact."))
-            .unwrap_err();
+        let entry = tampered(
+            project_entry("root_valid_shape", "A harmless fact."),
+            serde_json::json!({
+                "projectKey": key,
+            }),
+        );
+        let error = store.insert(&root, Some(&identity), entry).unwrap_err();
         assert!(
             matches!(error, MemoryError::Refused(MemoryRefusal::InvalidShape(_))),
             "{key} was not refused"

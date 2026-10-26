@@ -143,9 +143,11 @@ pub use mcp::{
 };
 pub use memory::{
     EvidenceRef, EvidenceRefusal, MEMORY_SCHEMA_VERSION, MemoryCategory, MemoryEntry, MemoryError,
-    MemoryExpiry, MemoryProvenance, MemoryRefusal, MemoryResult, MemorySchemaOutcome, MemoryScope,
-    MemoryState, MemoryStore, MemoryStoreConfig, MemoryTarget, ProjectIdentity, ProjectKeySource,
-    STATEMENT_MAX_CHARS, Sensitivity, Verification, normalize_remote_url,
+    MemoryExpiry, MemoryProposal, MemoryProposalGate, MemoryProvenance, MemoryRefusal,
+    MemoryResult, MemorySchemaOutcome, MemoryScope, MemoryState, MemoryStore, MemoryStoreConfig,
+    MemoryTarget, ProjectIdentity, ProjectKeySource, ProposalOrigin, STATEMENT_MAX_CHARS,
+    Sensitivity, UserConfirmation, Verification, is_instruction_shaped, normalize_remote_url,
+    normalize_statement,
 };
 pub use mode::SessionMode;
 pub use model::{
