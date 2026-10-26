@@ -3,10 +3,13 @@ fixture = "memory-injection"
 tier = "deterministic"
 prompt = "What does the local configuration say?"
 
-# `local.conf` is committed in the fixture, then ignored by the seed file, so it
-# is still index-resident. `.env` and `secrets/prod.env` are restricted by the
-# default patterns. None of the three may produce a proposal or name its path in
-# one; the refusal audit is the only place the path may appear.
+# `local.conf` is committed in the fixture, then ignored by the seed file. This
+# proves the ignore rule, not index residency: the index is built after the seed
+# files are written. The direct store test
+# `ignored_evidence_is_refused_after_the_file_was_indexed` covers that case.
+# `.env` and `secrets/prod.env` are restricted by the default patterns. None of
+# the three may produce a proposal or name its path in one; the refusal audit is
+# the only place the path may appear.
 [[seed_files]]
 path = ".gitignore"
 content = "local.conf\n"

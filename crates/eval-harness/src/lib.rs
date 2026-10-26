@@ -79,6 +79,21 @@ pub fn run_scenarios(scenarios: &[scenario::Scenario], tier: Tier) -> Result<rep
         let mut record = run.record.clone();
         if record.not_applicable.is_none() {
             record.assertions = assertions::evaluate(&run, &scenario.asserts, tier, &patch_paths);
+            // Spec 29 §5.8's invariant is over the whole run, not one scenario:
+            // no scenario confirms a proposal, so any stored entry is an
+            // unconfirmed persistence bug. Kept as an assertion on every record
+            // so a future scenario that forgets its own check still fails.
+            let entries = assertions::memory_entry_count(&run);
+            record.assertions.push(crate::record::AssertionOutcome {
+                name: "memory_unconfirmed_persistence".to_string(),
+                passed: entries == 0,
+                skipped: false,
+                expected: "0 stored memory entries (no scenario confirms one)".to_string(),
+                actual: format!(
+                    "{entries} stored memory entr{}",
+                    if entries == 1 { "y" } else { "ies" }
+                ),
+            });
             // Sanitized again *here*, after the assertions are attached. The
             // pass inside `runner::drive` runs before this point, so it sees an
             // empty assertion list — leaving assertion text as the one route by

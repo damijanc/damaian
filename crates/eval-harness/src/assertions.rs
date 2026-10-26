@@ -847,6 +847,13 @@ fn memory_entry_lines(run: &Run) -> Vec<String> {
     lines
 }
 
+/// How many memory records a run persisted. Exposed so the tier can assert the
+/// consent invariant over every run, not only the scenarios that remember to
+/// ask for it.
+pub fn memory_entry_count(run: &Run) -> u64 {
+    memory_entry_lines(run).len() as u64
+}
+
 fn memory_user_entry_lines(run: &Run) -> Vec<String> {
     non_empty_lines(&run.data_dir.join("memory").join("user.jsonl"))
 }

@@ -6032,8 +6032,9 @@ function createMemoryProposalCard(proposal) {
     const note = document.createElement("p");
     note.className = "memory-proposal-note";
     note.textContent =
-      "User scope is off. Remembering this saves it for this project; enabling " +
-      "user scope is a separate setting and affects every repository.";
+      "User scope is off. Remembering this saves it for this project; enable " +
+      "user scope separately by setting memory_user_scope_enabled=true in your " +
+      "user.conf (see the user guide). It then affects every repository.";
     card.append(note);
   }
   return card;

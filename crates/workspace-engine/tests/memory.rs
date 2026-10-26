@@ -2302,3 +2302,182 @@ fn an_ineligible_evidence_path_is_refused_before_the_file_is_opened() {
     assert!(audit.contains("evidence_restricted"), "{audit}");
     assert!(!audit.contains("io_error"), "{audit}");
 }
+
+#[test]
+fn the_stored_proposal_carries_the_sentence_confirmation_will_persist() {
+    let root = temp_dir("proposal-normalized");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_proposal_normalized");
+    let proposal = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Fact,
+        "The  build   is\t reproducible.  ",
+        ProposalOrigin::UserRequest {
+            session_id: session.clone(),
+            message_id: "message_1".to_string(),
+        },
+        Vec::new(),
+        None,
+    );
+    // The tab is a control character, so this is refused rather than
+    // normalized; use runs of spaces to prove the stored sentence matches.
+    assert!(store.propose(&root, proposal).unwrap().is_none());
+    let proposal = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Fact,
+        "The  build   is reproducible.  ",
+        ProposalOrigin::UserRequest {
+            session_id: session.clone(),
+            message_id: "message_1".to_string(),
+        },
+        Vec::new(),
+        None,
+    );
+    let created = store.propose(&root, proposal).unwrap().unwrap();
+    assert_eq!(created.statement, "The build is reproducible.");
+    let pending = store.pending_proposals(&session).unwrap();
+    assert_eq!(pending[0].statement, "The build is reproducible.");
+    let entry = store
+        .confirm_proposal(
+            &root,
+            Some(&identity),
+            &session,
+            &created.id,
+            UserConfirmation::new(created.id.clone()),
+        )
+        .unwrap();
+    assert_eq!(entry.statement, "The build is reproducible.");
+}
+
+#[test]
+fn a_secret_in_an_external_source_produces_no_proposal_or_session_event() {
+    let root = temp_dir("proposal-source-secret");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let proposal = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Fact,
+        "The API is documented externally.",
+        ProposalOrigin::ExternalContent {
+            session_id: session.clone(),
+            source: format!("https://user:{SEEDED_SECRET}@example.invalid/issue/1"),
+        },
+        Vec::new(),
+        Some("task_source_secret".to_string()),
+    );
+    assert!(store.propose(&root, proposal).unwrap().is_none());
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+    let session_log = fs::read_to_string(
+        root.join(".damaian")
+            .join("sessions")
+            .join(format!("{session}.jsonl")),
+    )
+    .unwrap_or_default();
+    assert!(!session_log.contains("memory_proposal_proposed"));
+    assert!(!session_log.contains(SEEDED_SECRET));
+    let audit = audit_text(&root);
+    assert!(audit.contains("memory_proposal_refused"));
+    assert!(audit.contains("secret"));
+    assert!(!audit.contains(SEEDED_SECRET));
+}
+
+#[test]
+fn a_repository_observation_requires_a_content_hash() {
+    let root = temp_dir("proposal-empty-hash");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let mut proposal = suggestion(
+        MemoryScope::Project,
+        "The integration suite needs Docker.",
+        ProposalOrigin::RepositoryObservation {
+            session_id: session.clone(),
+        },
+        "task_empty_hash",
+    );
+    proposal.evidence = vec![EvidenceRef::new("docker-compose.yml", String::new())];
+    assert!(store.propose(&root, proposal).unwrap().is_none());
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+    assert!(audit_text(&root).contains("invalid_shape"));
+
+    fs::write(root.join("docker-compose.yml"), "services: {}\n").unwrap();
+    let mut proposal = suggestion(
+        MemoryScope::Project,
+        "The integration suite needs Docker.",
+        ProposalOrigin::RepositoryObservation {
+            session_id: session.clone(),
+        },
+        "task_hash_filled",
+    );
+    proposal.evidence = vec![EvidenceRef::new("docker-compose.yml", String::new())];
+    let created = store
+        .propose_with_evidence(&root, proposal)
+        .unwrap()
+        .unwrap();
+    assert!(
+        created.evidence[0].content_hash.starts_with("sha256:"),
+        "{:?}",
+        created.evidence
+    );
+}
+
+#[test]
+fn an_external_content_proposal_needs_the_task_it_came_from() {
+    let root = temp_dir("proposal-external-task");
+    let session = fixture_session(&root);
+    let store = memory_store(&root, false);
+    let proposal = MemoryProposal::new(
+        MemoryScope::Project,
+        MemoryCategory::Fact,
+        "The API is documented externally.",
+        ProposalOrigin::ExternalContent {
+            session_id: session.clone(),
+            source: "issue #412".to_string(),
+        },
+        Vec::new(),
+        None,
+    );
+    assert!(store.propose(&root, proposal).unwrap().is_none());
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+    assert!(audit_text(&root).contains("invalid_shape"));
+}
+
+#[test]
+fn ignored_evidence_is_refused_after_the_file_was_indexed() {
+    let root = temp_dir("proposal-index-resident");
+    init_repo(&root);
+    commit(&root, "local.conf", "host=localhost\n");
+    let store = memory_store(&root, false);
+    let session = fixture_session(&root);
+
+    let config = test_config(&root);
+    let scanner = SecretScanner::new(Vec::new());
+    let audit = AuditLog::new(&config.data_dir, false, scanner.clone());
+    let indexer = workspace_engine::ProjectIndexer::new(config, scanner, audit);
+    let index = indexer.index_repository(&root).unwrap();
+    assert!(
+        index.files.iter().any(|file| file.path == "local.conf"),
+        "the fixture must be index-resident before the ignore rule is written"
+    );
+
+    // The rule is added after indexing, which is the window `index_single_file`
+    // does not repair: membership in the index is not proof of eligibility.
+    fs::write(root.join(".gitignore"), "local.conf\n").unwrap();
+    let mut proposal = suggestion(
+        MemoryScope::Project,
+        "Local configuration points at the development host.",
+        ProposalOrigin::RepositoryObservation {
+            session_id: session.clone(),
+        },
+        "task_index_resident",
+    );
+    proposal.evidence = vec![EvidenceRef::new("local.conf", String::new())];
+    assert!(
+        store
+            .propose_with_evidence(&root, proposal)
+            .unwrap()
+            .is_none()
+    );
+    assert!(audit_text(&root).contains("evidence_ignored"));
+    assert!(store.pending_proposals(&session).unwrap().is_empty());
+}

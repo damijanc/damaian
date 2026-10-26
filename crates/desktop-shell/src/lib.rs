@@ -725,6 +725,27 @@ fn parse_memory_scope(value: &str) -> Result<MemoryScope, String> {
     }
 }
 
+/// A memory proposal belongs to the session that produced it, and the session
+/// belongs to the repository it was created in. The client supplies both ids,
+/// so both are checked here; otherwise `repo=B` with a session from repository
+/// A would write A's confirmed statement into B's project memory.
+fn require_memory_session_in_repository(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    repo: &str,
+) -> Result<(), String> {
+    let session = engine
+        .session_store
+        .read_session(session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Unknown session: {session_id}"))?;
+    let expected = repository_id_for_root(Path::new(repo));
+    if session.repository_id != expected {
+        return Err("That memory proposal belongs to a session in another repository".to_string());
+    }
+    Ok(())
+}
+
 /// `POST /api/memory-confirm`: one proposal id, never a statement. The route
 /// reloads the stored proposal and the server resolves the project identity;
 /// a client cannot choose either. The confirmation is recorded here because
@@ -735,6 +756,7 @@ fn handle_memory_confirm(stream: &mut TcpStream, request: &Request) -> Result<()
     let session_id = required_form(&form, "session_id")?;
     let proposal_id = required_form(&form, "proposal_id")?;
     let engine = engine_for_repo(&repo)?;
+    require_memory_session_in_repository(&engine, &session_id, &repo)?;
     let identity = ProjectIdentity::resolve_for_root(Path::new(&repo), &engine.git)
         .map_err(|error| error.to_string())?;
     let mut confirmation = UserConfirmation::new(&proposal_id);
@@ -773,6 +795,7 @@ fn handle_memory_dismiss(stream: &mut TcpStream, request: &Request) -> Result<()
     let session_id = required_form(&form, "session_id")?;
     let proposal_id = required_form(&form, "proposal_id")?;
     let engine = engine_for_repo(&repo)?;
+    require_memory_session_in_repository(&engine, &session_id, &repo)?;
     engine
         .memory_store
         .dismiss_proposal(&session_id, &proposal_id)
@@ -14894,7 +14917,7 @@ mod memory_route_tests {
         let repo = repo_fixture("decisions");
         let sessions = SessionStore::new(data_dir);
         let session = sessions
-            .create_session("repo_fixture", "memory route")
+            .create_session(&repository_id_for_root(&repo), "memory route")
             .unwrap();
         let store = engine(data_dir);
         let first = fixture_proposal(
@@ -14966,7 +14989,7 @@ mod memory_route_tests {
         let repo = repo_fixture("user-scope");
         let sessions = SessionStore::new(data_dir);
         let session = sessions
-            .create_session("repo_fixture", "memory user scope")
+            .create_session(&repository_id_for_root(&repo), "memory user scope")
             .unwrap();
         let store = engine(data_dir);
         let proposal = fixture_proposal(
@@ -15024,6 +15047,109 @@ mod memory_route_tests {
             .expect("the confirm handler");
         assert!(!handler.contains("required_form(&form, \"statement\")"));
         assert!(!handler.contains("required_form(&form, \"project_key\")"));
+    }
+
+    #[test]
+    fn a_session_from_another_repository_cannot_confirm_or_dismiss_here() {
+        let data_dir = isolated_data_dir();
+        let repo_a = repo_fixture("session-a");
+        let repo_b = repo_fixture("session-b");
+        let sessions = SessionStore::new(data_dir);
+        let session = sessions
+            .create_session(&repository_id_for_root(&repo_a), "memory session a")
+            .unwrap();
+        let store = engine(data_dir);
+        let proposal = fixture_proposal(
+            &session.id,
+            "task_mismatch",
+            MemoryScope::Project,
+            "Integration tests use nextest.",
+        );
+        let proposal = store
+            .memory_store
+            .propose(&repo_a, proposal)
+            .unwrap()
+            .unwrap();
+
+        let (port, token) = serve();
+        for path in ["/api/memory-confirm", "/api/memory-dismiss"] {
+            let refused = post(
+                port,
+                &token,
+                path,
+                &[
+                    ("repo", &repo_b.to_string_lossy()),
+                    ("session_id", &session.id),
+                    ("proposal_id", &proposal.id),
+                    ("scope", "project"),
+                ],
+            );
+            assert!(refused.starts_with("HTTP/1.1 500"), "{refused}");
+            assert!(refused.contains("another repository"), "{refused}");
+        }
+        let identity_b = ProjectIdentity::resolve_for_root(&repo_b, &store.git).unwrap();
+        let project_b = store.memory_store.project_path(&identity_b.key);
+        assert!(
+            !project_b.exists(),
+            "the other repository must not receive an entry: {}",
+            project_b.display()
+        );
+        let list = get(
+            port,
+            &token,
+            &format!("/api/memory-proposals?session_id={}", session.id),
+        );
+        assert_eq!(
+            body_json(&list)["proposals"].as_array().unwrap().len(),
+            1,
+            "a mismatched decision leaves the proposal pending"
+        );
+    }
+
+    /// The one surface with no browser assertion in the ordinary suite. Run:
+    ///
+    /// ```sh
+    /// cargo test -p desktop-shell --lib -- --ignored --exact \
+    ///   memory_route_tests::serves_the_memory_card_for_manual_inspection --nocapture
+    /// ```
+    ///
+    /// Then open <http://127.0.0.1:4899/>, set the token in the page and load
+    /// the printed session. It binds 4899 and seeds two pending proposals.
+    #[test]
+    #[ignore]
+    fn serves_the_memory_card_for_manual_inspection() {
+        let data_dir = isolated_data_dir();
+        let repo = repo_fixture("memory-walk");
+        let session = SessionStore::new(data_dir)
+            .create_session(&repository_id_for_root(&repo), "Memory card walk")
+            .unwrap();
+        let engine = engine(data_dir);
+        for (scope, statement, task) in [
+            (
+                MemoryScope::Project,
+                "Integration tests need Docker running",
+                "task_walk_project",
+            ),
+            (
+                MemoryScope::User,
+                "The user prefers tab indentation",
+                "task_walk_user",
+            ),
+        ] {
+            let proposal = fixture_proposal(&session.id, task, scope, statement);
+            engine.memory_store.propose(&repo, proposal).unwrap();
+        }
+        println!("Memory walk server: http://127.0.0.1:4899/");
+        println!("  apiToken = \"damaian-memory-walk-token\"");
+        println!("  repository = {}", repo.display());
+        println!("  session = {}", session.id);
+        println!("  data_dir = {}", data_dir.display());
+        run_server(ShellOptions {
+            port: 4899,
+            default_repo: Some(repo.to_string_lossy().to_string()),
+            api_token: "damaian-memory-walk-token".to_string(),
+        })
+        .expect("serve the memory walk");
     }
 
     /// Spec 29 §5.4: consent is one proposal at a time. There is no route that

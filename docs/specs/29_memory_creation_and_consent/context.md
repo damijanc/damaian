@@ -92,11 +92,11 @@ discoveries; later tasks must follow them.
 private fields.** `MemoryEntry` keeps its public fields for reading and for the
 store's transition methods, but the struct becomes `#[non_exhaustive]`, so a
 different crate (the shell, the CLI, the eval harness) cannot write a struct
-literal. `MemoryEntry::new` is removed. The only ways to obtain an entry are
-`MemoryProposal::confirm` and `serde` deserialization, both inside the crate
-that owns the store. `MemoryStore::insert` stays public because #28's tests and
-the transition methods call it directly; it can only be handed a value that is
-already one of those two things. This is an API-surface barrier, not a sandbox:
+literal. `MemoryEntry::new` is removed. The ordinary ways to obtain an entry are
+`MemoryProposal::confirm` and `serde` deserialization. `Deserialize` is public,
+so any crate can deliberately deserialize a record; `MemoryStore::insert` is
+public and re-runs the store's shape, secret, evidence, scope and sensitivity
+checks on whatever it receives. This is an API-surface barrier, not a sandbox:
 an in-process caller that deliberately deserializes a record can still build
 one, because the store itself must. A `#[doc(hidden)]` or `#[cfg(test)]`
 constructor is deliberately not added — a test-only bypass must not compile into
@@ -194,8 +194,9 @@ No second model round trip and no post-task prose scan.
 - Eval scenarios use `crates/eval-harness/fixtures/`. The protected/ignored case
   needs a file that is committed and then ignored, so the scenario format gains
   `seed_files`: files written after the baseline commit, without committing
-  them. That is what makes the gitignored file index-resident, which is the case
-  `index_single_file`'s comment warns about.
-- The manual UI walk, if performed, uses port 4899 and a throwaway
-  `DAMAIAN_DATA_DIR`. The Tauri window and a real model call are acceptable
-  gaps; record what was and was not walked.
+  them. That exercises the ignore rule, but it does **not** prove index
+  residency: the index is built lazily after seed files are written. A direct
+  store test indexes the file first, then writes the rule, and proves that case.
+- The manual UI walk uses port 4899 and a throwaway `DAMAIAN_DATA_DIR`. The
+  Tauri window and a real model call are acceptable gaps; record what was and
+  was not walked.

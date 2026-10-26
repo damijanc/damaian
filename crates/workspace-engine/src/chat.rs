@@ -15001,7 +15001,7 @@ mod memory_proposal_tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(
             pending[0].statement,
-            "integration tests need Docker running."
+            "integration tests need Docker running"
         );
         assert!(matches!(
             pending[0].origin,

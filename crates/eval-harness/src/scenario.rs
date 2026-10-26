@@ -50,8 +50,9 @@ pub struct SeedMessage {
 }
 
 /// One file written into the fixture after its baseline commit. Not committed,
-/// so the index keeps whatever the fixture already tracked — which is exactly
-/// the "still index-resident but now ignored" case the memory gate must refuse.
+/// so it exercises the ignore rule. It does **not** prove index residency: the
+/// index is built lazily after seed files are written. The direct store test
+/// `ignored_evidence_is_refused_after_the_file_was_indexed` owns that case.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct SeedFile {
@@ -248,8 +249,9 @@ pub struct Scenario {
     /// Messages written before the first ask (spec 55 §5.9).
     pub seed_conversation: Vec<SeedMessage>,
     /// Files written after the fixture's baseline commit, without committing
-    /// them (spec 29 §5.8). This is how a committed file can become ignored
-    /// while staying index-resident.
+    /// them (spec 29 §5.8). This makes a committed file ignored; it does not
+    /// prove the file is still index-resident, because the index is built after
+    /// these writes.
     pub seed_files: Vec<SeedFile>,
     /// Whether to compact the seeded conversation before the ask.
     pub compact_before_prompt: bool,

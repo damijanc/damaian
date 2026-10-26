@@ -575,6 +575,21 @@ does not reset it; explicit user requests are uncapped. The statement ceiling is
 again at the store; an over-long candidate is rejected, not truncated. A real-use
 confirm/dismiss rate was **not** measured — no user has run this build yet.
 
+**Screening order and the source line.** `screen` checks the raw candidate
+before normalization, so a multi-line statement is refused rather than flattened;
+it then scans the statement, scans an `ExternalContent` source, applies the
+instruction rule to every non-user origin, checks every evidence path, requires
+a content hash on a repository observation and a task id on external content.
+`propose` normalizes after screening and before serializing, so the card and the
+proposal event carry exactly the sentence `confirm` will persist. The suggestion
+tool screens an evidence path before it opens the file to hash it, so a protected
+or ignored file is never read.
+
+**Parser edge cases.** `explicit_memory_request` searches an ASCII-only
+lowercase copy, so its byte offsets stay valid for multi-byte prompts (`İ`,
+`ẞ`); a `.`/`!`/`?` ends the sentence only when followed by whitespace or the
+line end, so URLs and versions survive; trailing punctuation is trimmed.
+
 **Where a pending proposal lives.** Proposed and decided events are appended to
 the session log through `pub(crate)` `SessionStore` methods; `append_session_event`
 stays private. A proposal dies with its session, survives a reload and a
@@ -597,13 +612,45 @@ re-read from the session log after a load, after a turn and after each decision.
 A user-scope proposal while the scope is off defaults to project scope and
 explains that enabling user scope is separate.
 
-**What was not verified.** The manual UI walk was **not** performed in this
-slice: the shell-level routes and the DOM-independent behaviour are tested, but
-the Tauri window was not opened and no real model call was made. The eval
-scenarios are deterministic only, as specified. `evals/baseline.json` was **not**
-regenerated — observation #40 records that it is already stale for reasons
-outside this spec, and no test compares it automatically. The dismissal rate and
-false-positive rate need real use. Every other acceptance criterion has a test
+**Index-residency evidence.** The eval scenario's `seed_files` writes
+`.gitignore` before the index is built, so it proves the ignore rule but **not**
+that the file was still index-resident. The direct store test
+`ignored_evidence_is_refused_after_the_file_was_indexed` indexes `local.conf`,
+asserts it is in `index.files`, then writes the ignore rule and asserts the
+proposal is refused. That is the case `index_single_file`'s comment warns about.
+
+**The full-run invariant.** `run_scenarios` adds
+`memory_unconfirmed_persistence` to every record: zero stored entries, because
+no scenario confirms one. A scenario that forgot its own `memory_entries = 0`
+still fails the tier, and `the_deterministic_tier_runs_every_scenario_and_passes`
+asserts the invariant is present and passing on every record.
+
+**Manual UI walk.** Performed on 2026-10-26 against the real shell on port 4899
+with a throwaway `DAMAIAN_DATA_DIR` and a seeded pair of proposals, driven in
+headless Chrome (CDP). Observed:
+
+- Both cards rendered below the conversation; the heading was “2 memories to
+  confirm” and the details disclosure opened to the two cards.
+- The project card showed the exact statement, `project memory · convention ·
+  suggested by the assistant during this task`, and only a `project` scope
+  option.
+- The user-scope card defaulted to `project`, offered only `project` while the
+  setting was off, and carried the note naming
+  `memory_user_scope_enabled=true` in `user.conf`.
+- **Remember** on the project card wrote one project entry
+  (`root_…jsonl`), removed the card, and a reload showed only the user-scope card.
+- **Dismiss** on the user-scope card wrote no entry, removed the card, and the
+  session log recorded `decision:"dismissed"`.
+- No accept-all control appeared anywhere in the page.
+
+Not walked: the Tauri window and a real model call; both are accepted gaps. The
+walk found no defect in the card or the routes.
+
+**What was not verified.** The eval scenarios are deterministic only, as
+specified. `evals/baseline.json` was **not** regenerated — observation #40
+records that it is already stale for reasons outside this spec, and no test
+compares it automatically. The dismissal rate and the false-positive rate on
+real repository files need real use. Every other acceptance criterion has a test
 or scenario named in `tasks.md`.
 
 **Checks.** Scoped local checks passed: `scripts/quality-gate.sh fmt node lint

@@ -1553,6 +1553,33 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
         "the runnable scenarios must have been evaluated, not merely executed"
     );
 
+    // Spec 29 §5.8's invariant over the full run, checked here rather than in a
+    // scenario: no scenario confirms a proposal, so every record must report
+    // zero stored memory entries.
+    let invariants: Vec<&eval_harness::record::AssertionOutcome> = built
+        .records
+        .iter()
+        .filter_map(|record| {
+            record
+                .assertions
+                .iter()
+                .find(|assertion| assertion.name == "memory_unconfirmed_persistence")
+        })
+        .collect();
+    assert_eq!(
+        invariants.len(),
+        built
+            .records
+            .iter()
+            .filter(|record| record.not_applicable.is_none())
+            .count(),
+        "every run must carry the memory consent invariant"
+    );
+    assert!(
+        invariants.iter().all(|assertion| assertion.passed),
+        "a run persisted a memory entry without a confirmation: {invariants:?}"
+    );
+
     // `check_pass_rate` over an empty set would report 0.000, which reads as a
     // real "nothing passed". At least one scenario must record real checks, or
     // that metric is an artifact rather than a measurement.

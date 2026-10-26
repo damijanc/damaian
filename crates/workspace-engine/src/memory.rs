@@ -477,8 +477,30 @@ impl MemoryProposal {
                 category: finding.category,
             }));
         }
+        if let ProposalOrigin::ExternalContent { source, .. } = &self.origin
+            && let Some(finding) = gate.scanner.scan(source).into_iter().next()
+        {
+            return Err(MemoryError::Refused(MemoryRefusal::Secret {
+                category: finding.category,
+            }));
+        }
+        if matches!(self.origin, ProposalOrigin::ExternalContent { .. }) && self.task_id.is_none() {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "an external suggestion needs the task it came from".to_string(),
+            )));
+        }
         for evidence in &self.evidence {
             gate.check_evidence(&evidence.path)?;
+        }
+        if matches!(self.origin, ProposalOrigin::RepositoryObservation { .. })
+            && self
+                .evidence
+                .iter()
+                .any(|evidence| evidence.content_hash.trim().is_empty())
+        {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "a repository observation needs a content hash for its evidence".to_string(),
+            )));
         }
         Ok(())
     }
@@ -690,7 +712,11 @@ pub struct ExplicitMemoryRequest {
 /// model's paraphrase, and the confirmation card still shows it before it can
 /// become an entry.
 pub fn explicit_memory_request(prompt: &str) -> Option<ExplicitMemoryRequest> {
-    let lowered = prompt.to_lowercase();
+    // The cues are ASCII. `to_ascii_lowercase` leaves every non-ASCII byte
+    // untouched, so an offset found in it is a valid byte offset into
+    // `prompt`; `to_lowercase` is not length-preserving (`İ` grows, `ẞ`
+    // shrinks) and slicing with its offsets can panic mid-character.
+    let lowered = prompt.to_ascii_lowercase();
     const CUES: &[&str] = &[
         "please remember that ",
         "please remember ",
@@ -722,11 +748,25 @@ pub fn explicit_memory_request(prompt: &str) -> Option<ExplicitMemoryRequest> {
     let start = index + cue.len();
     let rest = &prompt[start..];
     let line = rest.lines().next().unwrap_or_default();
-    let end = line
-        .find(['.', '!', '?'])
-        .map(|index| index + 1)
-        .unwrap_or(line.len());
-    let statement = line[..end].trim();
+    // A period inside a URL or a version is not a sentence end. Only a
+    // terminator followed by whitespace or end-of-line ends the sentence; with
+    // none, the whole line is the statement.
+    let mut end = line.len();
+    for (offset, character) in line.char_indices() {
+        if matches!(character, '.' | '!' | '?')
+            && line[offset + character.len_utf8()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+        {
+            end = offset + character.len_utf8();
+            break;
+        }
+    }
+    let statement = line[..end]
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .trim_end();
     if statement.is_empty() {
         return None;
     }
@@ -1599,9 +1639,9 @@ impl MemoryStore {
     /// The store enforces the *shape* of consent, not consent itself: it can
     /// require a provenance that names a user request or a confirmed
     /// suggestion, but it cannot tell a fabricated `UserRequest` from a real
-    /// one. Spec 29 owns that boundary — `MemoryProposal` has no public
-    /// conversion to this type without a user action — and no production code
-    /// outside that flow may call this method.
+    /// one. Spec 29's conversion is `MemoryProposal::confirm`, which requires a
+    /// `UserConfirmation`; `insert` cannot authenticate that value, and no
+    /// production code outside that flow may call this method.
     pub fn insert(
         &self,
         root: &Path,
@@ -1661,13 +1701,17 @@ impl MemoryStore {
     pub fn propose(
         &self,
         root: &Path,
-        proposal: MemoryProposal,
+        mut proposal: MemoryProposal,
     ) -> MemoryResult<Option<MemoryProposal>> {
         let gate = self.proposal_gate(root, None);
         if let Err(error) = proposal.screen(&gate) {
             self.audit_proposal_refused(&proposal, &error)?;
             return Ok(None);
         }
+        // The card and the proposal event must carry the exact sentence that
+        // `confirm` will persist. Screening deliberately sees the raw candidate
+        // first; normalization is the next step, before serialization.
+        proposal.statement = normalize_statement(&proposal.statement);
         if !proposal.origin.is_user_request()
             && let Some(task_id) = proposal.task_id.as_deref()
             && self.proposals_for_task(proposal.origin.session_id(), task_id)?
@@ -2845,7 +2889,7 @@ mod tests {
         let request =
             explicit_memory_request("Please remember that integration tests need Docker running.")
                 .expect("a request");
-        assert_eq!(request.statement, "integration tests need Docker running.");
+        assert_eq!(request.statement, "integration tests need Docker running");
         assert_eq!(request.scope, MemoryScope::Project);
         assert_eq!(request.category, MemoryCategory::Fact);
 
@@ -2863,5 +2907,36 @@ mod tests {
             explicit_memory_request("Remember to run make fmt before committing.").expect("a cue");
         assert_eq!(command.category, MemoryCategory::Convention);
         assert!(explicit_memory_request("What does this function do?").is_none());
+    }
+
+    #[test]
+    fn a_non_ascii_prompt_does_not_break_the_cue_offsets() {
+        // Reproduces the `to_lowercase` byte-offset panic: `İ` is multi-byte and
+        // `to_lowercase` can change its byte length.
+        let request = explicit_memory_request("İ remember that über tests pass.")
+            .expect("a request after a multi-byte prefix");
+        assert_eq!(request.statement, "über tests pass");
+    }
+
+    #[test]
+    fn a_dot_inside_a_url_or_version_is_not_a_sentence_end() {
+        assert_eq!(
+            explicit_memory_request("Remember that the API is at https://api.example.com.")
+                .expect("a URL")
+                .statement,
+            "the API is at https://api.example.com"
+        );
+        assert_eq!(
+            explicit_memory_request("Remember that we target v1.2 of the API.")
+                .expect("a version")
+                .statement,
+            "we target v1.2 of the API"
+        );
+        assert_eq!(
+            explicit_memory_request("Remember that the build is reproducible. It uses Cargo.")
+                .expect("two sentences")
+                .statement,
+            "the build is reproducible"
+        );
     }
 }
