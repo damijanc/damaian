@@ -1,8 +1,7 @@
 # Feature Spec: Memory Creation, Consent, and Scope
 
-Status: Done 2026-10-26 (planned and built on 2026-10-26; Tasks 1–9;
-**CI outstanding** — the scoped checks passed and the seven-check gate runs
-after the user pushes).
+Status: Done 2026-10-26 (planned and built on 2026-10-26; Tasks 1–9; the full
+seven-check gate passed in CI on 2026-10-26 for the `main` push at `4abbf1f`).
 Order: 29 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 2 (Must). That directory is local-only and not committed, so the
@@ -670,6 +669,6 @@ here, and neither is a weakening of a boundary this spec established.
 typos deny`, scoped clippy for `workspace-engine`, `desktop-shell` and
 `eval-harness` with `-D warnings`, `cargo nextest` for the memory suite and the
 new shell/eval tests, and the whole deterministic eval tier. The workspace
-clippy and test suite are left to CI, so this spec's status is Done with **CI
-outstanding**.
+clippy and test suite were left to CI; the full seven-check gate passed in CI on
+2026-10-26 for the `main` push at `4abbf1f`.
 

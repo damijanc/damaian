@@ -1,8 +1,7 @@
 # Feature Spec: Memory Model and Storage
 
-Status: Done 2026-10-26 (planned and built on 2026-10-26; Tasks 1–8;
-**CI outstanding** — the scoped checks passed and the seven-check gate runs
-after the user pushes).
+Status: Done 2026-10-26 (planned and built on 2026-10-26; Tasks 1–8; the full
+seven-check gate passed in CI on 2026-10-26 for the `main` push at `4abbf1f`).
 Order: 28 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -591,6 +590,6 @@ pattern detects is still redacted before it is sent" belongs to #30: it needs a
 memory to be recalled into a `ContextItem` and a rendered request, and #28 does
 not touch `chat.rs` or `context_manager.rs`. The layer that makes it true is
 unchanged — context assembly redacts every item — and #30's test should assert
-it end to end. "Every quality-gate command passes" is CI's: the scoped local
-checks are recorded in [`tasks.md`](tasks.md), and the workspace clippy and test
-suite are left to CI.
+it end to end. "Every quality-gate command passes" passed in CI on 2026-10-26
+for the `main` push at `4abbf1f`; the scoped local checks are recorded in
+[`tasks.md`](tasks.md).
