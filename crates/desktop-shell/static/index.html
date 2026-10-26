@@ -447,6 +447,18 @@
               own session and git worktree.
             </p>
           </section>
+          <section class="settings-section" id="conversation-section">
+            <h3>Conversation</h3>
+            <label class="field-checkbox">
+              <input id="conversation-auto-compact-input" type="checkbox" disabled />
+              <span>Compact long conversations automatically</span>
+            </label>
+            <p class="settings-page-hint conversation-auto-compact-hint">
+              Summarises older messages when a conversation outgrows the model's context. Each
+              summary is a model call billed to your provider. Off: older messages are left out of
+              the request and marked in the transcript, and you can still compact by hand.
+            </p>
+          </section>
           <section class="settings-section">
             <div class="section-heading">
               <h3>User configuration</h3>

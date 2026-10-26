@@ -336,6 +336,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/finding-status") => handle_finding_status(stream, &request),
         ("POST", "/api/findings-repair") => handle_findings_repair(stream, &request),
         ("POST", "/api/session-delete") => handle_session_delete(stream, &request),
+        ("POST", "/api/compact") => handle_compact(stream, &request),
         ("POST", "/api/open-vscode") => handle_open_vscode(stream, &request),
         ("POST", "/api/reveal-in-finder") => handle_reveal_in_finder(stream, &request),
         // Spec 58: takes `repo` only and opens the URL derived from `origin`.
@@ -619,7 +620,7 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         200,
         "application/json",
         &format!(
-            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}]}}",
+            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}],\"conversationView\":{}}}",
             session_json(&session, engine.session_store.session_mode(&session.id)),
             messages_json(&messages, &question_states),
             task_states_json(
@@ -630,9 +631,132 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
                 &task_web_diagnostics,
                 &task_notes,
                 &engine.config
-            )
+            ),
+            conversation_json(&engine, &session_id)
         ),
     )
+}
+
+/// The display half of conversation compaction (spec 55 §5.9): every active
+/// summary, and where the model's view begins.
+///
+/// The transcript itself is unchanged — `messages_json` above still carries
+/// every message — so the marker sits *between* messages and the originals are
+/// below it.
+fn conversation_json(engine: &WorkspaceEngine, session_id: &str) -> String {
+    let compactions = engine
+        .session_store
+        .read_conversation_compactions(session_id)
+        .unwrap_or_default();
+    let conversation = engine
+        .session_store
+        .read_conversation(session_id)
+        .unwrap_or_default();
+    let sequenced = engine
+        .session_store
+        .read_messages_with_seq(session_id)
+        .unwrap_or_default();
+    let previous_through = conversation
+        .summary
+        .as_ref()
+        .map(|summary| summary.through_seq)
+        .unwrap_or(0);
+    let message_refs = sequenced
+        .iter()
+        .map(|(_, message)| message)
+        .collect::<Vec<_>>();
+    let window_len = workspace_engine::compaction::window_slice(
+        &message_refs,
+        engine.chat_orchestrator.conversation_window_tokens(),
+    )
+    .len();
+    let outside = workspace_engine::compaction::window_start(
+        &sequenced,
+        previous_through,
+        engine.chat_orchestrator.conversation_window_tokens(),
+    );
+    let (kind, through_seq, omitted) = if let Some(summary) = &conversation.summary {
+        (
+            "summary",
+            summary.through_seq,
+            conversation.summarised_messages + (conversation.messages.len() - window_len),
+        )
+    } else if outside.is_some() {
+        (
+            "elision",
+            outside.unwrap_or(0),
+            conversation.messages.len().saturating_sub(window_len),
+        )
+    } else {
+        ("none", 0, 0)
+    };
+    serde_json::json!({
+        "compactions": compactions,
+        "conversation": {
+            "kind": kind,
+            "throughSeq": through_seq,
+            "omittedMessages": omitted,
+            "windowMessages": window_len,
+            "autoCompact": engine.config.conversation_auto_compact,
+            "windowShare": engine.config.conversation_window_share,
+            "canCompact": outside.is_some()
+        }
+    })
+    .to_string()
+}
+
+/// `POST /api/compact` — the manual control (spec 55 requirement 4).
+///
+/// It takes no approval and touches no file. The engine appends one event or
+/// nothing; the response says which, so the UI can report it.
+fn handle_compact(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let body = run_compact_request(&repo, &session_id)?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// The body of the manual compaction route, split out so the refusal path is
+/// testable without a stream.
+fn run_compact_request(repo: &str, session_id: &str) -> Result<String, String> {
+    let engine = engine_for_repo(repo)?;
+    if engine
+        .session_store
+        .read_session(session_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err(format!("Unknown session: {session_id}"));
+    }
+    let mut adapter = chat_model_adapter(&engine.config, || {
+        resolve_shell_model_api_key(&engine.config)
+    })?;
+    let cancel = CancelToken::new();
+    let body = match engine.chat_orchestrator.compact_conversation(
+        Path::new(repo),
+        session_id,
+        adapter.as_mut(),
+        &cancel,
+    ) {
+        Ok(workspace_engine::compaction::CompactionOutcome::Compacted(summary)) => {
+            serde_json::json!({
+                "kind": "compacted",
+                "summaryId": summary.id,
+                "throughSeq": summary.through_seq,
+                "messageCount": summary.message_count,
+                "factsOnly": summary.is_facts_only(),
+            })
+        }
+        Ok(workspace_engine::compaction::CompactionOutcome::NothingToCompact) => {
+            serde_json::json!({"kind": "nothing"})
+        }
+        Ok(workspace_engine::compaction::CompactionOutcome::Failed(reason)) => {
+            serde_json::json!({"kind": "failed", "reason": reason})
+        }
+        Err(error) => serde_json::json!({"kind": "failed", "reason": error.to_string()}),
+    };
+    Ok(body.to_string())
 }
 
 fn handle_session_rename(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
@@ -12816,5 +12940,161 @@ mod round_budget_tests {
         );
         assert_eq!(resumed.task.status, TaskStatus::Complete);
         assert_eq!(adapters, 1, "one adapter for the resumed turn");
+    }
+}
+
+/// The display side of spec 55: the marker's data and the manual route.
+#[cfg(test)]
+mod conversation_compaction_tests {
+    use super::{conversation_json, run_compact_request};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use workspace_engine::compaction::{
+        ApprovalDigest, ConversationSummary, PlanStepDigest, SUMMARY_FORMAT_VERSION,
+        ValidationDigest,
+    };
+    use workspace_engine::{Config, Task, WorkspaceEngine};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_repo() -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-shell-compaction-{now}-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(repo.join("src")).expect("repository");
+        repo
+    }
+
+    fn engine(repo: &Path) -> WorkspaceEngine {
+        WorkspaceEngine::new(Config {
+            data_dir: repo.join(".damaian"),
+            conversation_window_share: 100,
+            enable_index_watcher: false,
+            ..Config::default()
+        })
+    }
+
+    fn seeded(engine: &WorkspaceEngine, repo: &Path) -> (String, Task) {
+        let repository_id = engine.indexer.repository_id_for_path(repo).unwrap();
+        let session = engine
+            .session_store
+            .create_session(&repository_id, "Compacted")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "work", "openai", "gpt-4.1")
+            .unwrap();
+        for index in 0..12 {
+            engine
+                .session_store
+                .append_message(
+                    &session.id,
+                    Some(&task.id),
+                    if index % 2 == 0 { "user" } else { "assistant" },
+                    &format!("message {index} {}", "x".repeat(200)),
+                )
+                .unwrap();
+        }
+        (session.id, task)
+    }
+
+    fn summary(id: &str, through_seq: u64) -> ConversationSummary {
+        ConversationSummary {
+            id: id.to_string(),
+            through_seq,
+            format_version: SUMMARY_FORMAT_VERSION,
+            objective: "Do not touch the public API.".to_string(),
+            files_changed: vec!["src/lib.rs".to_string()],
+            plan_steps: vec![PlanStepDigest {
+                id: "step_1".to_string(),
+                title: "Add the parser".to_string(),
+                status: workspace_engine::plan::StepStatus::Completed,
+            }],
+            approvals: vec![ApprovalDigest {
+                kind: "command".to_string(),
+                id: "cmd_1".to_string(),
+                decision: "approved".to_string(),
+                subject: Some("cargo test".to_string()),
+            }],
+            validation: vec![ValidationDigest {
+                label: "cargo test (repository root)".to_string(),
+                outcome: "passed".to_string(),
+            }],
+            constraints: vec!["keep the API stable".to_string()],
+            decisions: Vec::new(),
+            failed_approaches: Vec::new(),
+            uncertainty: Vec::new(),
+            model_run_id: Some("modelrun_1".to_string()),
+            message_count: 8,
+        }
+    }
+
+    #[test]
+    fn the_session_payload_carries_its_compactions_and_boundary() {
+        let repo = temp_repo();
+        let engine = engine(&repo);
+        let (session_id, _) = seeded(&engine, &repo);
+        let messages = engine
+            .session_store
+            .read_messages_with_seq(&session_id)
+            .unwrap();
+        let through = messages[7].0;
+        engine
+            .session_store
+            .append_conversation_compaction(&session_id, &summary("summary_1", through))
+            .unwrap();
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&conversation_json(&engine, &session_id)).expect("JSON");
+        assert_eq!(payload["compactions"][0]["id"], "summary_1");
+        assert_eq!(payload["compactions"][0]["formatVersion"], 1);
+        assert_eq!(payload["compactions"][0]["messageCount"], 8);
+        assert_eq!(payload["conversation"]["kind"], "summary");
+        assert_eq!(payload["conversation"]["throughSeq"], through);
+        assert_eq!(payload["conversation"]["autoCompact"], true);
+        assert!(
+            payload["conversation"]["omittedMessages"].as_u64().unwrap() >= 8,
+            "the covered messages are counted as omitted from the request"
+        );
+        assert!(
+            payload["conversation"]["canCompact"].as_bool().unwrap(),
+            "the messages after the summary still exceed the window"
+        );
+        assert_eq!(
+            engine
+                .session_store
+                .read_messages(&session_id)
+                .unwrap()
+                .len(),
+            12,
+            "the display reader still has every message"
+        );
+    }
+
+    #[test]
+    fn the_session_payload_reports_an_uncompacted_boundary_as_elision() {
+        let repo = temp_repo();
+        let engine = engine(&repo);
+        let (session_id, _) = seeded(&engine, &repo);
+        let payload: serde_json::Value =
+            serde_json::from_str(&conversation_json(&engine, &session_id)).expect("JSON");
+        assert_eq!(payload["conversation"]["kind"], "elision");
+        assert!(payload["conversation"]["omittedMessages"].as_u64().unwrap() > 0);
+        assert!(payload["conversation"]["canCompact"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn the_compact_route_refuses_a_repository_without_a_session() {
+        let repo = temp_repo();
+        let error = run_compact_request(&repo.to_string_lossy(), "session_that_does_not_exist")
+            .expect_err("an unknown session is an error");
+        assert!(error.contains("Unknown session"), "{error}");
     }
 }

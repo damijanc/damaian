@@ -5274,3 +5274,28 @@ body.worker-view #chat-model-menu {
     white-space: normal;
   }
 }
+
+/* Conversation compaction (spec 55 §5.9): the boundary is a system line that
+   opens to the summary, with the original transcript still below it. */
+.compaction-boundary summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.compaction-summary {
+  margin-top: 10px;
+}
+
+.compaction-summary-heading {
+  margin: 10px 0 2px;
+  font-weight: 600;
+}
+
+.compaction-summary ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.compaction-boundary .compaction-now {
+  margin-top: 10px;
+}

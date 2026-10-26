@@ -8685,7 +8685,7 @@ fn build_model_prompt(
         .collect::<Vec<_>>();
     // Spec 55 §5.1: the window is a token budget, not eight messages, so a
     // conversation of short messages keeps more turns than one of long ones.
-    let recent_messages = window_slice(&conversation_messages, window_tokens);
+    let recent_messages = crate::compaction::window_slice(&conversation_messages, window_tokens);
     let omitted = conversation_messages.len() - recent_messages.len();
     if summary.is_some() || !recent_messages.is_empty() {
         output.push('\n');
@@ -10801,31 +10801,6 @@ fn sandbox_command_context(execution: &CommandExecution) -> String {
     output.push_str("\n\nSTDERR:\n");
     output.push_str(&truncate_for_prompt(&execution.stderr, 4_000));
     output
-}
-
-/// The messages that fit the conversation window, newest first accumulated
-/// until the token budget is spent, returned in log order.
-///
-/// The newest message is always kept, even if it alone exceeds the budget: it
-/// is the user's current position, and a window that dropped it would answer a
-/// question it could not see.
-fn window_slice<'a>(messages: &[&'a ChatMessage], window_tokens: usize) -> Vec<&'a ChatMessage> {
-    if messages.is_empty() {
-        return Vec::new();
-    }
-    let newest = messages.len() - 1;
-    let mut used = 0usize;
-    let mut kept = Vec::new();
-    for (index, message) in messages.iter().enumerate().rev() {
-        let cost = crate::context_manager::TokenEstimate::Prose.tokens(&message.content);
-        if index != newest && used + cost > window_tokens {
-            break;
-        }
-        used += cost;
-        kept.push(*message);
-    }
-    kept.reverse();
-    kept
 }
 
 fn truncate_for_prompt(value: &str, max_chars: usize) -> String {

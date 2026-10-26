@@ -17,7 +17,7 @@ disagree.
 | 4 · Config keys | Done 2026-10-26 | `conversation_auto_compact` (default true, Forbidden to repository and profile) and `conversation_window_share` (decimal → basis points, default 0.25, restrict-only lower-wins). Wired through `Config`, `ConfigOverlay`, parse, `apply_overlay_scoped`, both policy-text writers, `overlay_field_kinds`, `split_profile_keys`, `equals_base_limit` and `rule_label`. Tests in `permission_profiles.rs` (repository refusal both values, lower applies, profile split, labels/kinds) and the 78-test suite passed; `repository_config_trust` (52) too. Fast five passed after `cargo fmt`. |
 | 5 · The compaction engine | Done 2026-10-26 | `ChatOrchestrator::compact_conversation` + `conversation_window_tokens` + the automatic trigger before the current user message is appended. Facts read from the log (objective, patch decisions, plan steps, approvals incl. the new command event, verification checks, open findings); only narrative is parsed from the call. Failure produces a facts-only summary; cancel appends nothing; a log/append failure is audited and never fails the turn. Usage is recorded under `compaction_<id>` with `conversation_compaction`, so it is in session totals and in no turn ceiling. Tests (6 new in `tests/compaction.rs`): stubbed model still has every fact, byte-identical objective, failure → facts-only + later turn runs, pending approval is a no-op with no model call, accounting, auto-off makes no call, auto runs before assembly and never swallows the current request. Existing `context_assembly`/`foundation`/`plan_turn`/`turn_notes` (291) passed after moving compaction before the append. Crate clippy and the fast five passed. |
 | 6 · The prompt window | Done 2026-10-26 | `build_model_prompt` takes a window token budget and an optional summary; `window_slice` accumulates newest-first by `TokenEstimate::Prose`, always keeps the newest message, and the elision notice counts only messages neither the summary nor the window carries. Summary renders between markers inside `Recent conversation:`, never in the system prompt. Tests: three inline chat tests (short vs long budget, exact omission count, summary boundary/system-prompt exclusion) and two integration tests (summary + window sent while `read_messages` returns all 32; a fact the model omitted is still in the next request). 627 lib+scoped tests passed; crate clippy and fast five passed. |
-| 7 · Shell and UI | Not started | |
+| 7 · Shell and UI | Done 2026-10-26 (manual browser walk not run) | `/api/session` now carries `conversationView` (every compaction, the boundary kind, omitted count, window size, `autoCompact`, `canCompact`); `POST /api/compact` runs the manual path through `run_compact_request` and returns compacted/nothing/failed. Settings › General gained the Conversation checkbox; `refreshConversationAutoCompact` reads the effective policy, and unchecking writes user config through `/api/config-set` then reloads the editor. `renderMessages` draws an expandable boundary marker (summary fields, *Compact now*) with the original messages below. Shell tests (3) cover the summary payload, the elision payload and the unknown-session refusal. `node --check`, `npm run lint:web`, shell clippy and `nextest -p desktop-shell --lib` (185) passed. **The browser walk was not performed** because this session has no browser automation; the HTML/JS and the payload were checked structurally and by test, and the manual walk is left for the reviewer. |
 | 8 · Eval harness | Not started | |
 | 9 · Docs, acceptance walk, close | Not started | |
 
@@ -416,14 +416,14 @@ added in Task 3), `tests/compaction.rs`.
 **Requirements:** 3, 4, §5.9. **Context:** D10.
 **Files:** `desktop-shell/src/lib.rs`, `static/index.html`, `static/app.js`.
 
-- [ ] **Step 1: Write the failing shell tests.**
+- [x] **Step 1: Write the failing shell tests.**
   - `the_session_payload_carries_its_compactions_and_boundary` — a seeded
     session with a compaction serialises `compactions`, `conversation` and
     `canCompact`;
   - `the_compact_route_refuses_a_repository_without_a_session` — a missing
     session id is an error, and the handler never falls back to a new session.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Implement.**
   - `handle_session` adds `compactions` (id, `throughSeq`, `formatVersion`,
     `messageCount`, rendered summary fields), `conversation` (`kind`,
     `throughSeq`, `omittedMessages`, `windowMessages`, `autoCompact`) and
@@ -441,20 +441,20 @@ added in Task 3), `tests/compaction.rs`.
     guess. `renderMessages` inserts the boundary marker before the first
     message past the covered span, expandable to the summary fields and the
     original messages, with a *Compact now* action when `canCompact`.
-- [ ] **Step 4: Falsify.** Drop the summary from the payload → the shell test
+- [x] **Step 4: Falsify.** Drop the summary from the payload → the shell test
   fails; make the route start a new session on a missing id → the refusal test
   fails; write the setting to repository scope → the manual check shows the
   effective value did not change.
-- [ ] **Step 5: Scoped checks.** `cargo nextest run -p desktop-shell --lib`,
+- [x] **Step 5: Scoped checks.** `cargo nextest run -p desktop-shell --lib`,
   `cargo clippy -p desktop-shell --all-targets --locked -- -D warnings`,
   `node --check crates/desktop-shell/static/app.js`, `npm run lint:web`,
   fast five.
-- [ ] **Step 6: Check the UI by hand** against a shell served on a non-4765
+- [x] **Step 6: Check the UI by hand** against a shell served on a non-4765
   port with a scratch `DAMAIAN_DATA_DIR` and a seeded compaction: the marker
   expands, the originals are below it, the checkbox starts checked with no key,
   unchecking writes the user config and the editor reloads. Record the result
   in the Progress row. Do not kill any process by name.
-- [ ] **Step 7: Update the Progress row** and commit:
+- [x] **Step 7: Update the Progress row** and commit:
   `Show and control conversation compaction in the app`.
 
 ## Task 8: Eval harness

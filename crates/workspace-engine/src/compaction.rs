@@ -467,6 +467,34 @@ pub fn conversation_tokens(view: &ConversationView) -> usize {
     summary + messages
 }
 
+/// The messages that fit the conversation window, newest first accumulated
+/// until the token budget is spent, returned in log order.
+///
+/// The newest message is always kept, even if it alone exceeds the budget: it
+/// is the user's current position, and a window that dropped it would answer a
+/// question it could not see.
+pub fn window_slice<'a>(
+    messages: &[&'a crate::session::ChatMessage],
+    window_tokens: usize,
+) -> Vec<&'a crate::session::ChatMessage> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+    let newest = messages.len() - 1;
+    let mut used = 0usize;
+    let mut kept = Vec::new();
+    for (index, message) in messages.iter().enumerate().rev() {
+        let cost = crate::context_manager::TokenEstimate::Prose.tokens(&message.content);
+        if index != newest && used + cost > window_tokens {
+            break;
+        }
+        used += cost;
+        kept.push(*message);
+    }
+    kept.reverse();
+    kept
+}
+
 /// The highest event `seq` that belongs outside the recency window, or `None`
 /// when the whole conversation fits.
 ///
