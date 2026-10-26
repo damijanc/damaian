@@ -1,0 +1,540 @@
+//! Spec 27: the context inspector's data and controls.
+//!
+//! These tests pin what the panel renders — manifest rows, exclusions, pins and
+//! the session restriction — and the removal API's refusal of `Required`. The
+//! browser surface is walked manually in the close-out task.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use workspace_engine::compaction::ConversationSummary;
+use workspace_engine::context_manager::ExclusionReason;
+use workspace_engine::{
+    Config, ContextCategory, ContextKind, ContextPin, ContextRequest, LineRange, Provenance,
+    Symbol, SymbolIndexStore, WorkspaceEngine,
+};
+
+static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn temp_dir(name: &str) -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should work")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "damaian-context-inspector-{name}-{now}-{}",
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("temp dir should be created");
+    dir
+}
+
+fn write_fixture(root: &Path, relative_path: &str, content: &str) {
+    let path = root.join(relative_path);
+    fs::create_dir_all(path.parent().expect("fixture should have parent")).unwrap();
+    fs::write(path, content).unwrap();
+}
+
+fn test_config(repo: &Path) -> Config {
+    Config {
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        ..Config::default()
+    }
+}
+
+fn fixture_repo(name: &str) -> PathBuf {
+    let repo = temp_dir(name);
+    write_fixture(&repo, "AGENTS.md", "Follow the repository rules.\n");
+    write_fixture(&repo, "README.md", "# Fixture\n\nA small repository.\n");
+    write_fixture(
+        &repo,
+        "src/upload.rs",
+        &format!(
+            "{}pub fn upload_retry() {{}}\n\npub fn upload_once() {{}}\n",
+            "// filler\n".repeat(41)
+        ),
+    );
+    write_fixture(
+        &repo,
+        "src/other.rs",
+        "pub fn other_marker_zzq() -> usize { 7 }\n",
+    );
+    write_fixture(&repo, "secrets/api_token.txt", "not a real token\n");
+    repo
+}
+
+fn summary() -> ConversationSummary {
+    ConversationSummary {
+        id: "summary_1".to_string(),
+        through_seq: 12,
+        format_version: 1,
+        objective: "Ship the upload retry.".to_string(),
+        files_changed: vec!["src/upload.rs".to_string()],
+        plan_steps: Vec::new(),
+        approvals: Vec::new(),
+        validation: Vec::new(),
+        constraints: vec!["Keep the retry bounded.".to_string()],
+        decisions: Vec::new(),
+        failed_approaches: Vec::new(),
+        uncertainty: Vec::new(),
+        model_run_id: None,
+        message_count: 4,
+    }
+}
+
+/// Assemble once through the public manager with the controls under test.
+fn assemble(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    prompt: &str,
+    pinned: &[ContextPin],
+    restriction: Option<&[String]>,
+) -> workspace_engine::ContextPlan {
+    let index = engine
+        .indexer
+        .index_repository(repo)
+        .expect("the fixture should index");
+    engine
+        .context_manager
+        .build_context(ContextRequest {
+            repository_root: repo,
+            repository_id: &index.repository_id,
+            task_id: "task_inspector",
+            prompt,
+            index: Some(&index),
+            explicit_paths: &[],
+            limit: 16_000,
+            hook_context: &[],
+            plan: None,
+            pinned,
+            restriction,
+            conversation_summary: None,
+        })
+        .expect("the assembly should run")
+}
+
+fn excluded_reason(plan: &workspace_engine::ContextPlan, path: &str) -> Option<ExclusionReason> {
+    plan.manifest
+        .excluded
+        .iter()
+        .find(|record| record.path.as_deref() == Some(path))
+        .map(|record| record.reason)
+}
+
+fn included_paths(plan: &workspace_engine::ContextPlan) -> Vec<&str> {
+    plan.manifest
+        .included
+        .iter()
+        .filter_map(|included| included.path.as_deref())
+        .collect()
+}
+
+#[test]
+fn the_manifest_has_a_summary_row_with_its_message_count() {
+    let repo = fixture_repo("summary-row");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let summary = summary();
+
+    let plan = engine
+        .context_manager
+        .build_context(ContextRequest {
+            repository_root: &repo,
+            repository_id: &index.repository_id,
+            task_id: "task_summary",
+            prompt: "What next?",
+            index: Some(&index),
+            explicit_paths: &[],
+            limit: 16_000,
+            hook_context: &[],
+            plan: None,
+            pinned: &[],
+            restriction: None,
+            conversation_summary: Some(&summary),
+        })
+        .expect("the assembly should run");
+
+    let usage = plan
+        .manifest
+        .conversation_summary
+        .expect("the summary row is present");
+    assert_eq!(usage.messages, 4);
+    assert_eq!(usage.through_seq, 12);
+    assert!(!usage.facts_only);
+    assert!(usage.tokens > 0, "{usage:?}");
+    // The manifest is safe to show: the summary's text is not in it.
+    let json = serde_json::to_string(&plan.manifest).unwrap();
+    assert!(!json.contains("Keep the retry bounded"), "{json}");
+}
+
+#[test]
+fn the_symbols_row_counts_language_server_and_heuristic_symbols() {
+    let repo = fixture_repo("symbol-counts");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let (stored, _) = engine.symbol_index(&repo).unwrap();
+    let retry = stored
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "upload_retry")
+        .expect("the heuristic index has the symbol")
+        .clone();
+    let hash = index
+        .files
+        .iter()
+        .find(|file| file.path == "src/upload.rs")
+        .expect("the fixture is indexed")
+        .content_hash
+        .clone();
+    let store = SymbolIndexStore::new(&engine.config.data_dir, engine.audit_log.clone());
+    assert!(
+        store
+            .merge_language_server(
+                &index.repository_id,
+                "src/upload.rs",
+                &hash,
+                vec![Symbol {
+                    provenance: Provenance::LanguageServer,
+                    ..retry
+                }],
+            )
+            .unwrap(),
+        "the language-server symbol was not merged"
+    );
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        "Compare upload_retry and upload_once",
+        &[],
+        None,
+    );
+    let counts = plan
+        .manifest
+        .symbol_provenance
+        .expect("the symbols block was included");
+    assert!(counts.total >= 2, "{counts:?}");
+    assert_eq!(
+        counts.total,
+        counts.language_server + counts.heuristic,
+        "{counts:?}"
+    );
+    assert!(counts.language_server >= 1, "{counts:?}");
+    assert!(counts.heuristic >= 1, "{counts:?}");
+}
+
+#[test]
+fn a_pinned_file_enters_the_pinned_category() {
+    let repo = fixture_repo("pin-file");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let pin = ContextPin {
+        path: "src/other.rs".to_string(),
+        range: None,
+    };
+
+    let plan = assemble(&engine, &repo, "What is this?", &[pin], None);
+
+    let pinned = plan
+        .manifest
+        .included
+        .iter()
+        .find(|included| included.category == ContextCategory::Pinned)
+        .expect("a pinned item is present");
+    assert_eq!(pinned.path.as_deref(), Some("src/other.rs"));
+    assert_eq!(pinned.range, None);
+    assert!(plan.files.iter().any(|path| path == "src/other.rs"));
+}
+
+#[test]
+fn a_pinned_range_carries_its_line_range() {
+    let repo = fixture_repo("pin-range");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let pin = ContextPin {
+        path: "src/upload.rs".to_string(),
+        range: Some(LineRange { start: 42, end: 44 }),
+    };
+
+    let plan = assemble(&engine, &repo, "What is this?", &[pin], None);
+
+    let pinned = plan
+        .manifest
+        .included
+        .iter()
+        .find(|included| included.category == ContextCategory::Pinned)
+        .expect("a pinned item is present");
+    assert_eq!(pinned.range, Some(LineRange { start: 42, end: 44 }));
+    let item = plan
+        .items
+        .iter()
+        .find(|item| item.category == ContextCategory::Pinned)
+        .unwrap();
+    assert!(item.content.contains("upload_retry"), "{}", item.content);
+}
+
+#[test]
+fn a_pinned_file_the_policy_refuses_is_an_exclusion_not_an_item() {
+    let repo = fixture_repo("pin-restricted");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let pin = ContextPin {
+        path: "secrets/api_token.txt".to_string(),
+        range: None,
+    };
+
+    let plan = assemble(&engine, &repo, "What is this?", &[pin], None);
+
+    assert_eq!(
+        excluded_reason(&plan, "secrets/api_token.txt"),
+        Some(ExclusionReason::RestrictedPath)
+    );
+    assert!(
+        !included_paths(&plan).contains(&"secrets/api_token.txt"),
+        "{:?}",
+        included_paths(&plan)
+    );
+    assert!(
+        !plan
+            .manifest
+            .excluded
+            .iter()
+            .find(|record| record.path.as_deref() == Some("secrets/api_token.txt"))
+            .is_some_and(|record| record
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("not a real token"))),
+        "the exclusion must carry no content"
+    );
+}
+
+#[test]
+fn a_pinned_file_that_no_longer_reads_is_missing() {
+    let repo = fixture_repo("pin-deleted");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let pin = ContextPin {
+        path: "src/gone.rs".to_string(),
+        range: None,
+    };
+
+    let plan = assemble(&engine, &repo, "What is this?", &[pin], None);
+
+    assert_eq!(
+        excluded_reason(&plan, "src/gone.rs"),
+        Some(ExclusionReason::Missing)
+    );
+}
+
+#[test]
+fn a_restriction_filters_each_file_bearing_source() {
+    let repo = fixture_repo("restriction");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    write_fixture(&repo, "src/mentioned.rs", "pub fn mentioned_zzq() {}\n");
+    let restriction = vec!["src/upload.rs".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        "Look at src/upload.rs and src/mentioned.rs and other_marker_zzq",
+        &[ContextPin {
+            path: "src/other.rs".to_string(),
+            range: None,
+        }],
+        Some(&restriction),
+    );
+
+    for path in ["src/mentioned.rs", "src/other.rs", "README.md"] {
+        assert_eq!(
+            excluded_reason(&plan, path),
+            Some(ExclusionReason::PathNotSelected),
+            "{path} should be outside the restriction: {:?}",
+            plan.manifest.excluded
+        );
+    }
+    assert!(
+        included_paths(&plan).contains(&"src/upload.rs"),
+        "{:?}",
+        included_paths(&plan)
+    );
+}
+
+#[test]
+fn a_restriction_cannot_include_a_path_the_policy_refuses() {
+    let repo = fixture_repo("restriction-restricted");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let restriction = vec!["secrets/api_token.txt".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        "Look at secrets/api_token.txt",
+        &[ContextPin {
+            path: "secrets/api_token.txt".to_string(),
+            range: None,
+        }],
+        Some(&restriction),
+    );
+
+    assert_eq!(
+        excluded_reason(&plan, "secrets/api_token.txt"),
+        Some(ExclusionReason::RestrictedPath)
+    );
+    assert!(
+        !included_paths(&plan).contains(&"secrets/api_token.txt"),
+        "{:?}",
+        included_paths(&plan)
+    );
+}
+
+#[test]
+fn a_restriction_does_not_remove_agent_instructions() {
+    let repo = fixture_repo("restriction-instructions");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let restriction = vec!["src/upload.rs".to_string()];
+
+    let plan = assemble(&engine, &repo, "What is this?", &[], Some(&restriction));
+
+    assert!(
+        included_paths(&plan).contains(&"AGENTS.md"),
+        "the instruction hierarchy is policy, not content: {:?}",
+        included_paths(&plan)
+    );
+}
+
+#[test]
+fn the_required_item_is_still_first_and_cannot_be_removed() {
+    let repo = fixture_repo("required-order");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let plan = assemble(&engine, &repo, "What is this?", &[], None);
+    let mut prepared = workspace_engine::PreparedContext::from_plan(&plan);
+    let required = prepared
+        .items
+        .iter()
+        .position(|item| item.category == ContextCategory::Required)
+        .expect("the user's message is required");
+    assert_eq!(
+        prepared.items[required].kind,
+        ContextKind::UserPrompt,
+        "Required holds the user's own message"
+    );
+
+    let error = prepared
+        .remove_optional(required)
+        .expect_err("Required must not be removable");
+    assert!(
+        error.to_string().to_lowercase().contains("required"),
+        "{error}"
+    );
+    assert_eq!(prepared.items.len(), plan.items.len());
+}
+
+#[test]
+fn removing_an_instruction_reduces_tokens_and_records_user_removed() {
+    let repo = fixture_repo("remove-instruction");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let plan = assemble(&engine, &repo, "What is this?", &[], None);
+    let mut prepared = workspace_engine::PreparedContext::from_plan(&plan);
+    let index = prepared
+        .items
+        .iter()
+        .position(|item| item.kind == ContextKind::AgentInstruction)
+        .expect("the fixture has AGENTS.md");
+    let before = prepared.manifest.total_tokens;
+    let item = prepared.items[index].clone();
+
+    let record = prepared.remove_optional(index).unwrap();
+
+    assert_eq!(record.reason, ExclusionReason::UserRemoved);
+    assert_eq!(record.path.as_deref(), Some("AGENTS.md"));
+    assert_eq!(record.category, ContextCategory::Instructions);
+    assert!(prepared.manifest.total_tokens < before);
+    assert!(
+        prepared
+            .manifest
+            .included
+            .iter()
+            .all(|included| included.path.as_deref() != Some("AGENTS.md"))
+    );
+    let usage = prepared
+        .manifest
+        .categories
+        .iter()
+        .find(|usage| usage.category == ContextCategory::Instructions)
+        .unwrap();
+    assert!(
+        !prepared
+            .items
+            .iter()
+            .any(|item| item.kind == ContextKind::AgentInstruction)
+    );
+    let remaining_tokens: usize = prepared
+        .items
+        .iter()
+        .filter(|item| item.category == ContextCategory::Instructions)
+        .map(|item| item.tokens)
+        .sum();
+    assert_eq!(usage.used, remaining_tokens);
+    assert!(item.tokens > 0);
+}
+
+#[test]
+fn removing_a_whole_file_removes_it_from_files() {
+    let repo = fixture_repo("remove-file");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let plan = assemble(&engine, &repo, "Look at src/other.rs", &[], None);
+    let mut prepared = workspace_engine::PreparedContext::from_plan(&plan);
+    let index = prepared
+        .items
+        .iter()
+        .position(|item| item.path.as_deref() == Some("src/other.rs"))
+        .expect("the mention includes the file");
+
+    prepared.remove_optional(index).unwrap();
+
+    assert!(!prepared.files().iter().any(|path| path == "src/other.rs"));
+}
+
+#[test]
+fn removing_the_summary_records_its_category_and_hides_the_row() {
+    let repo = fixture_repo("remove-summary");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let plan = engine
+        .context_manager
+        .build_context(ContextRequest {
+            repository_root: &repo,
+            repository_id: &index.repository_id,
+            task_id: "task_summary_remove",
+            prompt: "What next?",
+            index: Some(&index),
+            explicit_paths: &[],
+            limit: 16_000,
+            hook_context: &[],
+            plan: None,
+            pinned: &[],
+            restriction: None,
+            conversation_summary: Some(&summary()),
+        })
+        .unwrap();
+    let mut prepared = workspace_engine::PreparedContext::from_plan(&plan);
+
+    let record = prepared.remove_summary().unwrap();
+
+    assert_eq!(record.reason, ExclusionReason::UserRemoved);
+    assert_eq!(record.category, ContextCategory::ConversationSummary);
+    assert!(prepared.manifest.conversation_summary.is_none());
+    assert!(
+        prepared
+            .manifest
+            .excluded
+            .iter()
+            .any(
+                |excluded| excluded.category == ContextCategory::ConversationSummary
+                    && excluded.reason == ExclusionReason::UserRemoved
+            )
+    );
+    assert!(
+        prepared.remove_summary().is_err(),
+        "a second removal has nothing to remove"
+    );
+}

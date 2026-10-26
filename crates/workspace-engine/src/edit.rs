@@ -519,6 +519,11 @@ impl EditOrchestrator {
             hook_context: &hook_context,
             // A one-shot edit has no turn whose plan it could carry.
             plan: None,
+            // Task 7 reads the origin session's controls here; an edit with no
+            // origin session has none.
+            pinned: &[],
+            restriction: None,
+            conversation_summary: None,
         }) {
             Ok(context) => context,
             // A required prompt that cannot fit is the user's to see, and the

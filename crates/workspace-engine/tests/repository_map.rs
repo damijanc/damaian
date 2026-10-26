@@ -1845,6 +1845,9 @@ fn build_context_places_one_map_item_before_retrieved_files() {
             limit: 16_000,
             hook_context: &[],
             plan: None,
+            pinned: &[],
+            restriction: None,
+            conversation_summary: None,
         })
         .expect("the map assembly should run");
     let kinds: Vec<ContextKind> = plan.items.iter().map(|item| item.kind).collect();
@@ -1894,6 +1897,9 @@ fn build_context_places_one_map_item_before_retrieved_files() {
             limit: 16_000,
             hook_context: &[],
             plan: None,
+            pinned: &[],
+            restriction: None,
+            conversation_summary: None,
         })
         .expect("the map assembly should run");
     assert!(
@@ -1916,6 +1922,9 @@ fn build_context_places_one_map_item_before_retrieved_files() {
             limit: 16_000,
             hook_context: &[],
             plan: None,
+            pinned: &[],
+            restriction: None,
+            conversation_summary: None,
         })
         .expect("the map assembly should run");
     assert!(
@@ -1950,6 +1959,9 @@ fn a_map_that_cannot_be_stored_is_left_out_and_the_turn_goes_on() {
             limit: 16_000,
             hook_context: &[],
             plan: None,
+            pinned: &[],
+            restriction: None,
+            conversation_summary: None,
         })
         .expect("the map assembly should run");
     let kinds: Vec<&str> = plan.items.iter().map(|item| item.kind.as_str()).collect();

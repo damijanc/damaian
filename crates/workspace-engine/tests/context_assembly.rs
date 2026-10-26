@@ -302,6 +302,9 @@ fn a_required_item_that_does_not_fit_is_an_error() {
         limit,
         hook_context: &[],
         plan: None,
+        pinned: &[],
+        restriction: None,
+        conversation_summary: None,
     });
     assert!(
         matches!(&direct, Err(ClientError::InvalidInput(message)) if message.contains(&limit.to_string())),
@@ -536,6 +539,9 @@ fn assemble_with_limit(
             limit,
             hook_context: &[],
             plan,
+            pinned: &[],
+            restriction: None,
+            conversation_summary: None,
         })
         .expect("the assembly should succeed")
 }
@@ -858,6 +864,7 @@ fn every_collection_source_refuses_a_restricted_path() {
         CollectionSource::Symbols,
         CollectionSource::HookContext,
         CollectionSource::PlanState,
+        CollectionSource::Pinned,
     ];
     for source in sources {
         let expected = match source {
@@ -868,7 +875,8 @@ fn every_collection_source_refuses_a_restricted_path() {
             | CollectionSource::Instruction
             | CollectionSource::ProjectRule
             | CollectionSource::Map
-            | CollectionSource::Symbols => Some(ExclusionReason::RestrictedPath),
+            | CollectionSource::Symbols
+            | CollectionSource::Pinned => Some(ExclusionReason::RestrictedPath),
             // These carry session content, not a file path, so there is no
             // path for the policy to refuse.
             CollectionSource::HookContext | CollectionSource::PlanState => None,

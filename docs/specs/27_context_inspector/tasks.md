@@ -12,7 +12,7 @@ the resolved §7 open question in [`context.md`](context.md)
 |---|---|---|
 | 1 · Folder split, context map and links | Done 2026-10-26 | `git mv` to `27_context_inspector/proposal.md`; added this plan and `context.md`; every link to `27_context_inspector.md` repointed (28, 29, 30, 32 ×2, 24, 54, 51, 42 ×2, 26 ×4, 55 ×2, README); Status moved to In progress and README current state/row updated. No code. `npm run specs:check` passes (66 specs; it initially flagged the Progress rows until their State cells used the checker's three words). |
 | 2 · Session-scoped pins and restrictions | Done 2026-10-26 | `ContextPin` and the seven methods in `session.rs` append/replay `context_pin_added` / `context_pin_removed` / `context_pins_cleared` / `context_restriction_set` / `context_restriction_cleared`. Readers use `parsed_events` (a rewind does not clear the controls); pins match on `(path, range)`; an empty restriction is `Some([])`. **Deviation:** the five tests are inline in `session.rs` rather than the new integration file, because they need only a `SessionStore` and a temp dir; the integration file starts at Task 3. **Falsified:** dropping the `context_pin_removed` arm left the removed range in the list and the test failed. Scoped checks: fast five passed; scoped clippy passed; the filtered lib nextest run passed 7 tests. |
-| 3 · Manifest extensions and collection controls | Not started | |
+| 3 · Manifest extensions and collection controls | Done 2026-10-26 | `ContextManifest` gained `conversationSummary` (from the #55 summary, measured redacted) and `symbolProvenance` (`total`/`languageServer`/`heuristic`, counted over the lines the renderer showed); `ExclusionReason` gained `UserRemoved`, `PathNotSelected`, `Missing`. `ContextRequest` gained `pinned`, `restriction` and `conversationSummary`; pins are collected through `add_file` (policy applies, a deleted pin is `Missing`), the restriction filters explicit/mention/search/project-rule/pin sources and exempts `AgentInstruction`. New `tests/context_inspector.rs` (13 tests at this point). **Falsified:** filtering instructions too made `a_restriction_does_not_remove_agent_instructions` fail. Scoped: fast five passed, scoped clippy passed, `context_inspector` 13/13, the five affected suites (context_assembly, prompt_cache, hooks, repository_map, symbol_index) 277 passed / 5 skipped. |
 | 4 · `PreparedContext` and removal | Not started | |
 | 5 · `pause_for_context_review` config | Not started | |
 | 6 · The pre-send pause and send gate | Not started | |
@@ -338,7 +338,7 @@ flat file; `docs/specs/README.md`.
 **Files:** `context_manager.rs`; `tests/context_assembly.rs` and
 `tests/context_inspector.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `the_manifest_has_a_summary_row_with_its_message_count`
     (`tests/context_inspector.rs`): assemble with a `ConversationSummary`
     fixture (build one through `crate::compaction` or the test helper if one
@@ -370,9 +370,9 @@ flat file; `docs/specs/README.md`.
     `every_exclusion_reason_reaches_the_manifest` in the inline
     `context_manager.rs` tests with `UserRemoved`, `PathNotSelected`, `Missing`
     (the serialised names `user_removed`, `path_not_selected`, `missing`).
-- [ ] **Step 2: Run them and confirm they fail** on the missing fields,
+- [x] **Step 2: Run them and confirm they fail** on the missing fields,
   reasons and request fields.
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - Add `ConversationSummaryUsage`, `SymbolProvenanceCounts`,
     `ContextManifest.conversation_summary` and `.symbol_provenance`. Defaults
     are `None`; do not add `#[serde(default)]` unless an old `context_assembled`
@@ -402,13 +402,13 @@ flat file; `docs/specs/README.md`.
   - Update every `ContextRequest` construction (`chat.rs` twice, `edit.rs`
     once) with `pinned: &[]`, `restriction: None`, `conversation_summary: None`
     for now; Task 6/7 wire the real values.
-- [ ] **Step 4: Falsify.** (1) Count all matches instead of `shown` → the symbol
+- [x] **Step 4: Falsify.** (1) Count all matches instead of `shown` → the symbol
   count test fails on a truncated block. (2) Filter `AgentInstruction` too → the
   instructions test fails. (3) Apply the restriction before the policy check →
   the `.env` restriction test reports `PathNotSelected` instead of
   `RestrictedPath`. (4) Drop `Missing` on read failure → the deleted-pin test
   loses its record. Restore each.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -416,7 +416,7 @@ flat file; `docs/specs/README.md`.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test context_inspector --test context_assembly
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit.
+- [x] **Step 6: Update the Progress row** and commit.
   Subject: `Show pins, restrictions and summary cost in the context manifest`.
 
 ---

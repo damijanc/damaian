@@ -1,4 +1,5 @@
 use crate::command_policy::CommandPolicy;
+use crate::compaction::ConversationSummary;
 use crate::error::{ClientError, Result};
 use crate::file_access::{FileAccessController, LineRange};
 use crate::hash::now_millis;
@@ -7,6 +8,7 @@ use crate::path_policy::PathPolicy;
 use crate::plan::TaskPlan;
 use crate::repository_map::{RepositoryMap, RepositoryMapStore};
 use crate::secret_scanner::SecretScanner;
+use crate::session::ContextPin;
 use crate::symbol_index::{Provenance, SymbolIndex, SymbolIndexStore, SymbolMatch};
 use crate::vector_index::VectorIndexCache;
 use serde::{Deserialize, Serialize};
@@ -415,6 +417,8 @@ pub enum CollectionSource {
     HookContext,
     /// The plan a resumed turn carries.
     PlanState,
+    /// A file or range the user pinned for the session (spec 27 §5.4).
+    Pinned,
 }
 
 /// Why an item was left out of the plan (proposal §5.5).
@@ -436,6 +440,15 @@ pub enum ExclusionReason {
     TooLarge,
     /// A read the read path refuses because the file looks binary.
     Binary,
+    /// The user removed an optional item in a paused pre-send review
+    /// (spec 27 §5.4). `Required` can never carry this reason.
+    UserRemoved,
+    /// The session's path restriction admits only selected paths, and this
+    /// one is not among them (spec 27 §5.4).
+    PathNotSelected,
+    /// A pinned file no longer reads: it was deleted, or became unreadable.
+    /// Recorded instead of dropping the pin silently (spec 27 §5.4).
+    Missing,
 }
 
 /// One item that did not enter the plan, with the reason. Never content.
@@ -483,6 +496,35 @@ impl IncludedRef {
     }
 }
 
+/// The conversation summary a turn is sending (spec 27 §5.2).
+///
+/// #55 sends the summary inside the conversation block rather than as a
+/// `ContextItem`, so it has no `IncludedRef`. This row is what makes its cost
+/// visible in the inspector and what lets a paused review remove it for a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSummaryUsage {
+    pub tokens: usize,
+    /// Messages the summary covers, as #55 recorded them.
+    pub messages: usize,
+    pub through_seq: u64,
+    /// True when the model call failed and only the facts half was kept.
+    pub facts_only: bool,
+}
+
+/// How many of the symbols actually shown came from each provenance
+/// (spec 27 §5.2, spec 25).
+///
+/// The symbols block is one `ContextItem`, so its `IncludedRef.provenance` can
+/// only carry the weakest line. "12 symbols (4 heuristic)" needs the counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolProvenanceCounts {
+    pub total: usize,
+    pub language_server: usize,
+    pub heuristic: usize,
+}
+
 /// What one assembly included and left out, by path, range, count and reason
 /// (proposal §5.5).
 ///
@@ -505,6 +547,14 @@ pub struct ContextManifest {
     pub included: Vec<IncludedRef>,
     /// Everything left out, or included only in part, with a reason.
     pub excluded: Vec<ExclusionRecord>,
+    /// The conversation summary this turn sends, when it has one (spec 27
+    /// §5.2). `#[serde(default)]` keeps a `context_assembled` event written
+    /// before this field readable.
+    #[serde(default)]
+    pub conversation_summary: Option<ConversationSummaryUsage>,
+    /// Provenance counts for the symbols block, when one was included.
+    #[serde(default)]
+    pub symbol_provenance: Option<SymbolProvenanceCounts>,
 }
 
 impl ContextManifest {
@@ -572,7 +622,8 @@ impl PromptSectionName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContextPlan {
     pub repository_id: String,
     pub task_id: String,
@@ -583,6 +634,128 @@ pub struct ContextPlan {
     /// with the limit and per-category usage (proposal §5.5). Recorded by the
     /// caller as one `context_assembled` audit event.
     pub manifest: ContextManifest,
+}
+
+/// One assembly, inspectable and not yet sent (spec 27 §5.1).
+///
+/// A view of a [`ContextPlan`] rather than a second pipeline: `files` and
+/// `sections` are derived from `items`, and `into_plan` reconstructs the plan
+/// exactly. The paused pre-send review persists this; the shell is never sent
+/// `items`, only `manifest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedContext {
+    pub manifest: ContextManifest,
+    pub items: Vec<ContextItem>,
+}
+
+impl PreparedContext {
+    pub fn from_plan(plan: &ContextPlan) -> Self {
+        Self {
+            manifest: plan.manifest.clone(),
+            items: plan.items.clone(),
+        }
+    }
+
+    /// The plan shape the prompt renderer and the resumed turn need.
+    pub fn into_plan(self) -> ContextPlan {
+        let token_estimate = self.items.iter().map(|item| item.tokens).sum();
+        let files = included_files(&self.items);
+        ContextPlan {
+            repository_id: self.manifest.repository_id.clone(),
+            task_id: self.manifest.task_id.clone(),
+            token_estimate,
+            items: self.items,
+            files,
+            manifest: self.manifest,
+        }
+    }
+
+    /// The unique included paths, in inclusion order.
+    pub fn files(&self) -> Vec<String> {
+        included_files(&self.items)
+    }
+
+    pub fn sections(&self) -> Vec<PromptSection> {
+        prompt_sections(&self.items)
+    }
+
+    /// Removes one optional item (spec 27 §5.4, §5.5).
+    ///
+    /// `Required` is refused before anything changes: a UI bug or a future
+    /// caller cannot remove the user's own message from a request. The
+    /// exclusion is recorded, the category's use is recomputed from what is
+    /// left, and `total_tokens` follows. `allocated` is left alone: it is what
+    /// the category was allowed, not what it used.
+    pub fn remove_optional(&mut self, index: usize) -> Result<ExclusionRecord> {
+        let Some(item) = self.items.get(index) else {
+            return Err(ClientError::InvalidInput(format!(
+                "No context item at index {index}"
+            )));
+        };
+        if item.category == ContextCategory::Required {
+            return Err(ClientError::InvalidInput(
+                "Required context cannot be removed".to_string(),
+            ));
+        }
+        let category = item.category;
+        let record = ExclusionRecord {
+            reason: ExclusionReason::UserRemoved,
+            path: item.path.clone(),
+            range: item.range,
+            category,
+            detail: Some("removed for this turn by the user".to_string()),
+        };
+        self.items.remove(index);
+        push_exclusion(&mut self.manifest.excluded, record.clone());
+        if let Some(usage) = self
+            .manifest
+            .categories
+            .iter_mut()
+            .find(|usage| usage.category == category)
+        {
+            usage.used = self
+                .items
+                .iter()
+                .filter(|item| item.category == category)
+                .map(|item| item.tokens)
+                .sum();
+            usage.items = self
+                .items
+                .iter()
+                .filter(|item| item.category == category)
+                .count();
+        }
+        self.manifest.included = self.items.iter().map(IncludedRef::from_item).collect();
+        self.manifest.total_tokens = self.items.iter().map(|item| item.tokens).sum();
+        Ok(record)
+    }
+
+    /// Removes the #55 conversation summary for this turn.
+    ///
+    /// The summary is not an item, so there is no index to remove; the row and
+    /// the exclusion are enough. The resumed request passes no summary and
+    /// states what was removed (spec 27 §5.4).
+    pub fn remove_summary(&mut self) -> Result<ExclusionRecord> {
+        let Some(usage) = self.manifest.conversation_summary.take() else {
+            return Err(ClientError::InvalidInput(
+                "This context has no conversation summary to remove".to_string(),
+            ));
+        };
+        let record = ExclusionRecord {
+            reason: ExclusionReason::UserRemoved,
+            path: None,
+            range: None,
+            category: ContextCategory::ConversationSummary,
+            detail: Some(format!(
+                "conversation summary covering {} message{} removed for this turn by the user",
+                usage.messages,
+                if usage.messages == 1 { "" } else { "s" }
+            )),
+        };
+        push_exclusion(&mut self.manifest.excluded, record.clone());
+        Ok(record)
+    }
 }
 
 impl ContextPlan {
@@ -621,36 +794,57 @@ impl ContextPlan {
     /// repeated. That is also what keeps the request out of the repository
     /// context block, where it used to be sent a second time.
     pub fn sections(&self) -> Vec<PromptSection> {
-        let mut context = String::new();
-        let mut request = String::new();
-        for item in &self.items {
-            match item.category {
-                ContextCategory::Required => {
-                    if !request.is_empty() {
-                        request.push('\n');
-                    }
-                    request.push_str(&item.content);
-                }
-                _ => context.push_str(&Self::render_item(item)),
-            }
-        }
-
-        vec![
-            PromptSection {
-                name: PromptSectionName::RepositoryContext,
-                text: context,
-            },
-            PromptSection {
-                name: PromptSectionName::UserRequest,
-                text: request,
-            },
-        ]
+        prompt_sections(&self.items)
     }
 
     /// The unique included paths, in inclusion order.
     pub fn included_paths(&self) -> &[String] {
         &self.files
     }
+}
+
+/// The two prompt blocks a plan contributes, from its items alone.
+///
+/// Shared with [`PreparedContext`] so a paused review and an ordinary turn
+/// cannot render different text for the same items.
+fn prompt_sections(items: &[ContextItem]) -> Vec<PromptSection> {
+    let mut context = String::new();
+    let mut request = String::new();
+    for item in items {
+        match item.category {
+            ContextCategory::Required => {
+                if !request.is_empty() {
+                    request.push('\n');
+                }
+                request.push_str(&item.content);
+            }
+            _ => context.push_str(&ContextPlan::render_item(item)),
+        }
+    }
+
+    vec![
+        PromptSection {
+            name: PromptSectionName::RepositoryContext,
+            text: context,
+        },
+        PromptSection {
+            name: PromptSectionName::UserRequest,
+            text: request,
+        },
+    ]
+}
+
+/// The unique included paths, in inclusion order.
+fn included_files(items: &[ContextItem]) -> Vec<String> {
+    let mut files = Vec::new();
+    for item in items {
+        if let Some(path) = &item.path
+            && !files.iter().any(|existing| existing == path)
+        {
+            files.push(path.clone());
+        }
+    }
+    files
 }
 
 /// Everything one assembly needs (Correction C12).
@@ -671,6 +865,16 @@ pub struct ContextRequest<'a> {
     /// The plan a resumed turn carries, read from `SessionStore` by the caller.
     /// `None` for a new turn, an edit, and every caller that has no plan.
     pub plan: Option<&'a TaskPlan>,
+    /// The session's pinned files and ranges (spec 27 §5.4), read from
+    /// `SessionStore` by the caller. Each becomes a `Pinned` item.
+    pub pinned: &'a [ContextPin],
+    /// The session's path restriction (spec 27 §5.4), already read from
+    /// `SessionStore`. `None` means no restriction; `Some([])` admits no
+    /// file content at all. Instructions are not filtered.
+    pub restriction: Option<&'a [String]>,
+    /// The #55 summary this turn sends, for the manifest's cost row. The
+    /// summary text itself stays in the conversation block, not in the plan.
+    pub conversation_summary: Option<&'a ConversationSummary>,
 }
 
 /// A gap of at most this many lines still merges two ranges (proposal §5.4).
@@ -750,6 +954,14 @@ struct BlockItem {
     /// or `symbol_context_max_tokens`).
     max_tokens: usize,
     content: BlockContent,
+}
+
+/// One block after its own renderer has fitted it to a ceiling.
+struct RenderedBlock {
+    text: String,
+    provenance: Option<Provenance>,
+    /// Provenance counts for the symbols block, which has no other carrier.
+    symbols: Option<SymbolProvenanceCounts>,
 }
 
 #[derive(Debug)]
@@ -1025,6 +1237,7 @@ impl ContextManager {
             // path policy has no path to judge.
             CollectionSource::HookContext => false,
             CollectionSource::PlanState => false,
+            CollectionSource::Pinned => self.path_policy.is_restricted(path, false),
         };
         restricted.then_some(ExclusionReason::RestrictedPath)
     }
@@ -1065,7 +1278,31 @@ impl ContextManager {
             limit,
             hook_context,
             plan,
+            pinned,
+            restriction,
+            conversation_summary,
         } = request;
+
+        // Normalise the restriction once, with the read path's own resolver,
+        // so `./src/x` and `src/x` cannot disagree about what is selected.
+        // A path that does not resolve keeps its spelling: it selects nothing,
+        // which is the narrowing direction.
+        let restriction = restriction.map(|paths| {
+            paths
+                .iter()
+                .map(|path| self.normalise_candidate(repository_root, path, false))
+                .collect::<Vec<_>>()
+        });
+        let restriction = restriction.as_deref();
+        let summary_usage = conversation_summary.map(|summary| {
+            let rendered = self.scanner.redact(&summary.render_for_model()).text;
+            ConversationSummaryUsage {
+                tokens: TokenEstimate::Prose.tokens(&rendered),
+                messages: summary.message_count,
+                through_seq: summary.through_seq,
+                facts_only: summary.is_facts_only(),
+            }
+        });
 
         let mut pending = Vec::new();
         // Every whole file collected so far, for dedup and range absorption.
@@ -1156,6 +1393,7 @@ impl ContextManager {
                 &mut range_candidates,
                 repository_map.as_ref(),
                 requested,
+                restriction,
             );
         }
 
@@ -1175,6 +1413,7 @@ impl ContextManager {
                 &mut range_candidates,
                 repository_map.as_ref(),
                 false,
+                restriction,
             );
         }
 
@@ -1194,6 +1433,32 @@ impl ContextManager {
                 &mut range_candidates,
                 repository_map.as_ref(),
                 false,
+                restriction,
+            );
+        }
+
+        // The session's pins (spec 27 §5.4). Collected through the same path as
+        // every other file, so the path policy still decides and a pin that is
+        // restricted, outside the restriction or deleted becomes a record
+        // rather than disappearing. The pin list itself is never rewritten by a
+        // failing read: restoring the file restores the pin.
+        for pin in pinned {
+            self.add_file(
+                repository_root,
+                repository_id,
+                task_id,
+                &pin.path,
+                pin.range,
+                None,
+                CollectionSource::Pinned,
+                ContextKind::Pinned,
+                &mut files,
+                &mut pending,
+                &mut excluded,
+                &mut range_candidates,
+                repository_map.as_ref(),
+                false,
+                restriction,
             );
         }
 
@@ -1279,6 +1544,7 @@ impl ContextManager {
                     &mut range_candidates,
                     repository_map.as_ref(),
                     false,
+                    restriction,
                 );
             }
         }
@@ -1302,6 +1568,7 @@ impl ContextManager {
             pending,
             EffectiveLimit::declared(limit),
             excluded,
+            summary_usage,
         )
     }
 
@@ -1320,7 +1587,9 @@ impl ContextManager {
         pending: Vec<PendingItem>,
         limit: EffectiveLimit,
         mut excluded: Vec<ExclusionRecord>,
+        conversation_summary: Option<ConversationSummaryUsage>,
     ) -> Result<ContextPlan> {
+        let mut symbol_provenance: Option<SymbolProvenanceCounts> = None;
         let required_tokens: usize = pending
             .iter()
             .filter(|item| item.category() == ContextCategory::Required)
@@ -1389,19 +1658,26 @@ impl ContextManager {
                         }
                     }
                     PendingItem::Block(block) => {
-                        let Some((text, provenance)) = self.render_block(block, block.max_tokens)
-                        else {
+                        let Some(rendered) = self.render_block(block, block.max_tokens) else {
                             // Nothing to send even at its configured ceiling.
                             continue;
                         };
-                        let Some(full) =
-                            add_text(&self.scanner, block.kind, None, None, provenance, &text)
-                        else {
+                        let Some(full) = add_text(
+                            &self.scanner,
+                            block.kind,
+                            None,
+                            None,
+                            rendered.provenance,
+                            &rendered.text,
+                        ) else {
                             continue;
                         };
                         if used + full.tokens <= allocation {
                             used += full.tokens;
                             kept += 1;
+                            if let Some(counts) = rendered.symbols {
+                                symbol_provenance = Some(counts);
+                            }
                             placed[index] = Some(full);
                             continue;
                         }
@@ -1411,13 +1687,24 @@ impl ContextManager {
                         let remaining = allocation - used;
                         let shortened = self
                             .render_block(block, remaining)
-                            .and_then(|(text, provenance)| {
-                                add_text(&self.scanner, block.kind, None, None, provenance, &text)
+                            .and_then(|rendered| {
+                                add_text(
+                                    &self.scanner,
+                                    block.kind,
+                                    None,
+                                    None,
+                                    rendered.provenance,
+                                    &rendered.text,
+                                )
+                                .map(|item| (item, rendered.symbols))
                             })
-                            .filter(|item| item.tokens <= remaining);
-                        if let Some(item) = shortened {
+                            .filter(|(item, _)| item.tokens <= remaining);
+                        if let Some((item, counts)) = shortened {
                             used += item.tokens;
                             kept += 1;
+                            if let Some(counts) = counts {
+                                symbol_provenance = Some(counts);
+                            }
                             placed[index] = Some(item);
                             truncated = true;
                             excluded.push(ExclusionRecord {
@@ -1450,23 +1737,33 @@ impl ContextManager {
         }
 
         let items: Vec<ContextItem> = placed.into_iter().flatten().collect();
-        let mut files = Vec::new();
-        for item in &items {
-            if let Some(path) = &item.path
-                && !files.iter().any(|existing| existing == path)
-            {
-                files.push(path.clone());
-            }
-        }
         let token_estimate = items.iter().map(|item| item.tokens).sum();
-        let manifest = build_manifest(repository_id, task_id, limit, &items, categories, excluded);
+        let manifest = build_manifest(
+            repository_id,
+            task_id,
+            limit,
+            &items,
+            categories,
+            excluded,
+            conversation_summary,
+            symbol_provenance,
+        );
 
         Ok(ContextPlan {
             repository_id: repository_id.to_string(),
             task_id: task_id.to_string(),
             token_estimate,
             items,
-            files,
+            files: manifest
+                .included
+                .iter()
+                .filter_map(|included| included.path.clone())
+                .fold(Vec::new(), |mut paths, path| {
+                    if !paths.contains(&path) {
+                        paths.push(path);
+                    }
+                    paths
+                }),
             manifest,
         })
     }
@@ -1502,18 +1799,18 @@ impl ContextManager {
     }
 
     /// Render a block at `max_tokens` through its own renderer (Correction C14).
-    fn render_block(
-        &self,
-        block: &BlockItem,
-        max_tokens: usize,
-    ) -> Option<(String, Option<Provenance>)> {
+    fn render_block(&self, block: &BlockItem, max_tokens: usize) -> Option<RenderedBlock> {
         if max_tokens == 0 {
             return None;
         }
         match &block.content {
             BlockContent::Map(map) => {
                 let rendered = map.render_for_model(max_tokens);
-                (!rendered.text.is_empty()).then_some((rendered.text, None))
+                (!rendered.text.is_empty()).then_some(RenderedBlock {
+                    text: rendered.text,
+                    provenance: None,
+                    symbols: None,
+                })
             }
             BlockContent::Symbols { index, matches } => {
                 let rendered = index.render_for_model(matches, max_tokens);
@@ -1522,12 +1819,25 @@ impl ContextManager {
                 }
                 // The weakest provenance among the lines actually shown, as
                 // before: one heuristic symbol makes the whole block a guess.
-                let provenance = matches
+                let shown = matches.iter().take(rendered.shown).collect::<Vec<_>>();
+                let provenance = shown.iter().map(|matched| matched.symbol.provenance).max();
+                // The counts spec 27 §5.2 shows beside the block: a single
+                // `IncludedRef` can only carry the weakest provenance, not "12
+                // symbols (4 heuristic)".
+                let heuristic = shown
                     .iter()
-                    .take(rendered.shown)
-                    .map(|matched| matched.symbol.provenance)
-                    .max();
-                Some((rendered.text, provenance))
+                    .filter(|matched| matched.symbol.provenance == Provenance::Heuristic)
+                    .count();
+                let symbols = SymbolProvenanceCounts {
+                    total: shown.len(),
+                    language_server: shown.len() - heuristic,
+                    heuristic,
+                };
+                Some(RenderedBlock {
+                    text: rendered.text,
+                    provenance,
+                    symbols: Some(symbols),
+                })
             }
         }
     }
@@ -1593,6 +1903,7 @@ impl ContextManager {
         range_candidates: &mut Vec<FileCandidate>,
         roots: Option<&RepositoryMap>,
         allow_outside_root: bool,
+        restriction: Option<&[String]>,
     ) {
         // Normalise before the dedup, the collection check and the candidate
         // list, so all three compare what the read path will actually open
@@ -1603,6 +1914,26 @@ impl ContextManager {
         // here, where the assembler still knows this is a file and not a
         // session block with a path-shaped label.
         let root_path = roots.and_then(|map| owning_root(map, path));
+        // The session restriction narrows file-bearing collection only
+        // (spec 27 §5.4, context.md C10). `AGENTS.md` is repository policy, not
+        // one of the files the user is choosing between, so it is exempt; the
+        // policy check below still applies to it.
+        if kind != ContextKind::AgentInstruction
+            && let Some(allowed) = restriction
+            && !allowed.iter().any(|selected| selected == path)
+        {
+            push_exclusion(
+                excluded,
+                ExclusionRecord {
+                    reason: ExclusionReason::PathNotSelected,
+                    path: Some(path.to_string()),
+                    range,
+                    category: kind.category(),
+                    detail: Some("the session's path restriction does not include it".to_string()),
+                },
+            );
+            return;
+        }
         // Whole files are deduplicated here, as they always were. A range for
         // a path already included whole is kept as a candidate so the merge can
         // record it as absorbed rather than silently dropped (§5.4).
@@ -1657,7 +1988,23 @@ impl ContextManager {
                 // between the check and the read, or the size cap and the
                 // binary check, which only the read knows about). Record what
                 // the error says rather than dropping it silently.
-                record_read_failure(excluded, path, range, kind, &error);
+                if !record_read_failure(excluded, path, range, kind, &error)
+                    && kind == ContextKind::Pinned
+                {
+                    // A pin is the user's standing request: a file that no
+                    // longer reads is reported rather than dropped from the
+                    // list (spec 27 §5.4).
+                    push_exclusion(
+                        excluded,
+                        ExclusionRecord {
+                            reason: ExclusionReason::Missing,
+                            path: Some(path.to_string()),
+                            range,
+                            category: kind.category(),
+                            detail: Some("the pinned file could not be read".to_string()),
+                        },
+                    );
+                }
                 return;
             }
         };
@@ -1727,8 +2074,22 @@ impl ContextManager {
                     // paths; what is left is a read-time refusal the error can
                     // name (a restriction that appeared since, the size cap, a
                     // binary file) or an ordinary missing/unreadable file. Only
-                    // the first becomes a record, with a fixed detail.
-                    record_read_failure(excluded, &file.path, file.range, file.kind, &error);
+                    // the first becomes a record, with a fixed detail, except
+                    // for a pinned range, which reports the loss.
+                    if !record_read_failure(excluded, &file.path, file.range, file.kind, &error)
+                        && file.kind == ContextKind::Pinned
+                    {
+                        push_exclusion(
+                            excluded,
+                            ExclusionRecord {
+                                reason: ExclusionReason::Missing,
+                                path: Some(file.path.clone()),
+                                range: file.range,
+                                category: file.kind.category(),
+                                detail: Some("the pinned file could not be read".to_string()),
+                            },
+                        );
+                    }
                     continue;
                 }
             };
@@ -1761,6 +2122,7 @@ impl ContextManager {
 /// Kept separate from `apply_budget` so the manifest can be tested against every
 /// [`ExclusionReason`], including ones today's collection cannot yet produce
 /// (no collection source yields a line range — Task 3's discovery).
+#[allow(clippy::too_many_arguments)]
 fn build_manifest(
     repository_id: &str,
     task_id: &str,
@@ -1768,6 +2130,8 @@ fn build_manifest(
     items: &[ContextItem],
     categories: Vec<CategoryUsage>,
     excluded: Vec<ExclusionRecord>,
+    conversation_summary: Option<ConversationSummaryUsage>,
+    symbol_provenance: Option<SymbolProvenanceCounts>,
 ) -> ContextManifest {
     ContextManifest {
         repository_id: repository_id.to_string(),
@@ -1778,6 +2142,8 @@ fn build_manifest(
         categories,
         included: items.iter().map(IncludedRef::from_item).collect(),
         excluded,
+        conversation_summary,
+        symbol_provenance,
     }
 }
 
@@ -1806,15 +2172,16 @@ fn push_exclusion(excluded: &mut Vec<ExclusionRecord>, record: ExclusionRecord) 
 /// outside the root is not a dropped item — so those stay unrecorded rather
 /// than carrying a fabricated reason. The detail is never the error text: it
 /// names the path and the manifest is not the place for a second copy of it.
+/// Returns whether the error named a reason this manifest can record.
 fn record_read_failure(
     excluded: &mut Vec<ExclusionRecord>,
     path: &str,
     range: Option<LineRange>,
     kind: ContextKind,
     error: &ClientError,
-) {
+) -> bool {
     let ClientError::AccessDenied(message) = error else {
-        return;
+        return false;
     };
     let reason = if message.starts_with("Path is restricted by policy:") {
         ExclusionReason::RestrictedPath
@@ -1823,7 +2190,7 @@ fn record_read_failure(
     } else if message == "Binary file reads are denied by default" {
         ExclusionReason::Binary
     } else {
-        return;
+        return false;
     };
     push_exclusion(
         excluded,
@@ -1835,6 +2202,7 @@ fn record_read_failure(
             detail: None,
         },
     );
+    true
 }
 
 /// A carried plan as the `plan_state` item's text (proposal §5.11).
@@ -2110,6 +2478,9 @@ mod tests {
             ExclusionReason::Truncated,
             ExclusionReason::TooLarge,
             ExclusionReason::Binary,
+            ExclusionReason::UserRemoved,
+            ExclusionReason::PathNotSelected,
+            ExclusionReason::Missing,
         ];
         let excluded = reasons
             .iter()
@@ -2129,6 +2500,8 @@ mod tests {
             &[],
             Vec::new(),
             excluded.clone(),
+            None,
+            None,
         );
 
         assert_eq!(manifest.excluded, excluded);
@@ -2140,6 +2513,9 @@ mod tests {
             "truncated",
             "too_large",
             "binary",
+            "user_removed",
+            "path_not_selected",
+            "missing",
         ] {
             assert!(json.contains(name), "{name} is missing from {json}");
         }

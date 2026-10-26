@@ -1154,6 +1154,13 @@ impl ChatOrchestrator {
             .read_task_plan(&session.id, &task.id)
             .ok()
             .flatten();
+        // Session-scoped controls (spec 27 §5.4), read once before assembly so
+        // every source sees the same list.
+        let context_pins = self
+            .session_store
+            .context_pins(&session.id)
+            .unwrap_or_default();
+        let context_restriction = self.session_store.context_restriction(&session.id)?;
         let context = self.context_manager.build_context(ContextRequest {
             repository_root,
             repository_id: &index.repository_id,
@@ -1164,6 +1171,9 @@ impl ChatOrchestrator {
             limit: self.config.context_token_budget(),
             hook_context: &hook_context,
             plan: carried_plan.as_ref(),
+            pinned: &context_pins,
+            restriction: context_restriction.as_deref(),
+            conversation_summary: conversation.summary.as_ref(),
         })?;
         // One `context_assembled` event per assembly, recorded by the caller:
         // the manager holds no audit log and adding one would be a second audit
@@ -2146,6 +2156,11 @@ impl ChatOrchestrator {
             limit: self.config.context_token_budget(),
             hook_context: &[],
             plan: Some(plan),
+            // Task 7 wires the repair continuation to the session's controls;
+            // until then it assembles exactly as it did.
+            pinned: &[],
+            restriction: None,
+            conversation_summary: None,
         })?;
         let mut fields = vec![
             ("actor", "system".to_string()),
@@ -13675,6 +13690,8 @@ mod approval_prompt_wording_tests {
                 categories: Vec::new(),
                 included: Vec::new(),
                 excluded: Vec::new(),
+                conversation_summary: None,
+                symbol_provenance: None,
             },
         };
         let with_result = build_model_prompt(
@@ -13744,6 +13761,8 @@ mod approval_prompt_wording_tests {
                 categories: Vec::new(),
                 included: Vec::new(),
                 excluded: Vec::new(),
+                conversation_summary: None,
+                symbol_provenance: None,
             },
         };
         let prompt = build_model_prompt(
@@ -13790,6 +13809,8 @@ mod approval_prompt_wording_tests {
                 categories: Vec::new(),
                 included: Vec::new(),
                 excluded: Vec::new(),
+                conversation_summary: None,
+                symbol_provenance: None,
             },
         }
     }
