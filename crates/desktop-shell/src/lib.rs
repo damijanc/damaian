@@ -726,6 +726,16 @@ fn handle_compact(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
 /// testable without a stream.
 fn run_compact_request(repo: &str, session_id: &str) -> Result<String, String> {
     let engine = engine_for_repo(repo)?;
+    compact_session(&engine, repo, session_id)
+}
+
+/// The manual compaction against an already-built engine, so the refusal paths
+/// are testable without a stream or a re-loaded config.
+fn compact_session(
+    engine: &WorkspaceEngine,
+    repo: &str,
+    session_id: &str,
+) -> Result<String, String> {
     let Some(session) = engine
         .session_store
         .read_session(session_id)
@@ -739,6 +749,18 @@ fn run_compact_request(repo: &str, session_id: &str) -> Result<String, String> {
         .map_err(|error| error.to_string())?;
     if session.repository_id != repository_id {
         return Err("Session belongs to a different repository".to_string());
+    }
+    // Compaction runs at a turn boundary. A manual click during a turn would
+    // land inside an action span, so it waits; automatic compaction is already
+    // before the request by construction.
+    let statuses = engine
+        .session_store
+        .read_task_statuses(session_id)
+        .map_err(|error| error.to_string())?;
+    if statuses.values().any(|status| {
+        workspace_engine::TaskStatus::parse(status).is_some_and(|status| status.is_active())
+    }) {
+        return Err("A turn is running in this session; compact after it finishes.".to_string());
     }
     let mut adapter = chat_model_adapter(&engine.config, || {
         resolve_shell_model_api_key(&engine.config)
@@ -13099,6 +13121,20 @@ mod conversation_compaction_tests {
         assert_eq!(payload["conversation"]["kind"], "elision");
         assert!(payload["conversation"]["omittedMessages"].as_u64().unwrap() > 0);
         assert!(payload["conversation"]["canCompact"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn the_compact_route_refuses_while_a_turn_is_running() {
+        let repo = temp_repo();
+        let engine = engine(&repo);
+        let (session_id, task) = seeded(&engine, &repo);
+        engine
+            .session_store
+            .update_task_status(&task, workspace_engine::TaskStatus::RunningTool, None)
+            .unwrap();
+        let error = super::compact_session(&engine, &repo.to_string_lossy(), &session_id)
+            .expect_err("a running turn is not a boundary");
+        assert!(error.contains("A turn is running"), "{error}");
     }
 
     #[test]
