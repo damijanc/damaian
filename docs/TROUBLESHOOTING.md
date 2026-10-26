@@ -812,7 +812,9 @@ same manifest, without a shell.
   instructions are policy, not one of the content files a restriction selects.
 - **An earlier turn.** Each assistant message with a recorded manifest has a
   **Context · N tokens** link. It opens the read-only view of what that turn
-  actually sent, including any removal made before it was sent.
+  actually sent, including any removal made before it was sent. The post-send
+  record is an audit event: with `audit_enabled=false`, or after audit retention
+  has removed it, an old turn has no link. The live pre-send view is unaffected.
 
 ### Reading a turn's context manifest
 
