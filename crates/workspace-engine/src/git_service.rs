@@ -1168,6 +1168,18 @@ mod tests {
         assert_eq!(copy[0].renamed_from, None);
         assert_eq!(copy[0].copied_from.as_deref(), Some("a.txt"));
 
+        // The worktree column is a rename too: ` R`, `RM` and `RD` all carry
+        // the source record and must keep it.
+        for record in [
+            b" R b.txt\0a.txt\0".as_slice(),
+            b"RM b.txt\0a.txt\0".as_slice(),
+            b"RD b.txt\0a.txt\0".as_slice(),
+        ] {
+            let parsed = parse_porcelain_z(record, &|_| false);
+            assert_eq!(parsed.len(), 1, "{record:?}");
+            assert_eq!(parsed[0].renamed_from.as_deref(), Some("a.txt"));
+        }
+
         // A restricted source drops the whole pair: committing one half of a
         // rename would be worse than not offering it.
         let restricted = parse_porcelain_z(b"R  b.txt\0.env\0", &|path| path == ".env");
