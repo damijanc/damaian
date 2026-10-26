@@ -1572,7 +1572,10 @@ impl CommitEngine {
         let mut hooks = Vec::new();
         for name in GIT_COMMIT_HOOKS {
             let path = directory.join(name);
-            let metadata = fs::symlink_metadata(&path).ok();
+            // Follow a symlink, as Git does: skipping a linked hook would
+            // silently defeat a protection the repository relies on. The report
+            // names the link Git would run.
+            let metadata = fs::metadata(&path).ok();
             let exists = metadata.is_some();
             let is_file = metadata.as_ref().is_some_and(|meta| meta.is_file());
             let executable = metadata
