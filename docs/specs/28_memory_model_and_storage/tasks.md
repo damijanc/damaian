@@ -14,7 +14,7 @@ criteria) · corrections and planning decisions in [`context.md`](context.md)
 | 2 · Record types and sensitivity by rule | Done 2026-10-26 | `memory.rs` defines the seven enums, `MemoryProvenance` (three variants only), `EvidenceRef`, `MemoryExpiry` and `MemoryEntry`, and exports them from `lib.rs`. `Sensitivity`'s declaration order is its restrictiveness order; `derived_sensitivity` applies the §5.5a table with the most restrictive match winning, and `effective_sensitivity` raises a lower caller value but keeps a higher one. Environmental markers are an absolute path, `~/`, URL, `localhost`, `dot.host.tld`, `host:port` or `:port`, IPv4, and the local `USER`/`LOGNAME`/`HOME` name. **Deviation:** the proposal's `rename_all = "camelCase"` on `MemoryProvenance` renames variants only, so the variant fields carry explicit `sessionId`/`messageId`/`taskId` renames to keep the JSON camelCase throughout. Ten inline tests pass; scoped clippy clean. |
 | 3 · Project identity resolution | Done 2026-10-26 | `GitService::root_commit` (`rev-list --max-parents=0 HEAD`, first line) and `origin_url` are unaudited read helpers beside `head_commit`. `ProjectIdentity::resolve` takes the root commit first, then a normalized origin, then the path hash, and keys are `root_<sha>`, `remote_<sha256[..16]>`, `path_<repository_id>`; `source_of_key` reads the tier back. Remote normalization strips scheme, credentials, port and `.git`, lowercases the host, handles scp syntax, and returns `None` for a local path so identity falls to the path tier rather than pretending a machine path is portable. Nine integration tests cover: two clones sharing (with different `repository_id`s), a rename keeping the key, different root commits not sharing, a fork sharing deliberately, remotes without history (different and same), neither falling to the path hash, a non-repository, and no credential or slash in a key. **Measured cost:** about 12 ms per tier-1 resolution on this machine (20 iterations, 0.246 s total), dominated by process launch. |
 | 4 · Store layout, schema version and migration | Done 2026-10-26 | `MemoryStore` + `MemoryStoreConfig` write `<data_dir>/memory/{schema.conf,project/<key>.jsonl,user.jsonl}` with the directory at `0700`. Append-only JSONL: one complete record per line, last record per id wins, first appearance fixes order, a torn final line is discarded, and an unparsable middle line is counted and skipped so one bad record cannot make the store unreadable. The flat marker mirrors `data_schema`: absent means version 0 if files exist (migrate) or fresh (initialise), equal proceeds, newer/unparsable/0 refuses with path and versions. Version-0 migration appends a complete record for every parseable legacy line — deriving sensitivity, defaulting `state` to `Active` — keeps the old line, writes the marker, and audits `memory_schema_migrated`. A project entry whose `project_key` differs from its file's is a hard error, not a filtered row. Reads do not create the directory; writes will. `DAMAIAN_DATA_DIR` is honoured through `Config::default_data_dir` (asserted with nextest's per-test process isolation). Ten new integration tests (19 in the file) pass; scoped clippy clean. |
-| 5 · Refusal path: secrets, evidence, scopes | Not started | |
+| 5 · Refusal path: secrets, evidence, scopes | Done 2026-10-26 | `MemoryStore::insert(root, identity, entry)` is the single write path and runs shape/scope, secret, evidence, sensitivity and persistence in that order. Secrets are refused with a category and never redacted; the statement and every evidence path are scanned. Evidence must be repository-relative (absolute, `..` and `./` refused), not `PathPolicy::is_restricted`, and not ignored by configured patterns or any per-directory `.gitignore` from the root down. Project writes require the resolved identity and a matching key; session writes require an existing session and reach the log only through `SessionStore::append_memory_record`/`memory_records` (`pub(crate)`, leaving `append_session_event` private); user writes refuse while disabled and reads return nothing without opening `user.jsonl`. Sensitivity is stored as `max(supplied, derived)`, so it can be raised but never lowered. Fourteen new integration tests (33 total) pass, including a session-scope write carrying a seeded fake AWS key that leaves no `memory_recorded` event and no secret in the log. Scoped clippy clean. |
 | 6 · Lifecycle transitions and audit | Not started | |
 | 7 · User-scope config key and engine wiring | Not started | |
 | 8 · Documentation and close-out | Not started | |
@@ -176,30 +176,30 @@ scoped clippy.
 
 ## Task 5 · Refusal path: secrets, evidence, scopes
 
-- [ ] Define `MemoryError`/`MemoryRefusal` with stable variants for a detected
+- [x] Define `MemoryError`/`MemoryRefusal` with stable variants for a detected
       secret, ineligible evidence (restricted / ignored / not-relative), a
       disabled scope, an invalid shape and an unsupported schema. Implement
       `Display` with the stated sentences and `From<MemoryError> for ClientError`.
-- [ ] `MemoryStore::insert(root, entry)` validates scope/key consistency: Project
+- [x] `MemoryStore::insert(root, entry)` validates scope/key consistency: Project
       requires `project_key` equal to the root's resolved key and no session id;
       Session requires a session id and no project key; User requires neither.
-- [ ] Secret refusal: scan the statement and every evidence path with
+- [x] Secret refusal: scan the statement and every evidence path with
       `SecretScanner::scan`; any finding refuses the write. Never call `redact`.
-- [ ] Evidence eligibility: refuse an absolute path or one containing `..`; then
+- [x] Evidence eligibility: refuse an absolute path or one containing `..`; then
       `PathPolicy::is_restricted(path, false)`; then ignore rules accumulated
       from configured `ignore_patterns` plus per-directory `.gitignore` files
       from the root down.
-- [ ] Scope enforcement: a User write refuses when
+- [x] Scope enforcement: a User write refuses when
       `memory_user_scope_enabled=false`; a User read returns nothing without
       opening `user.jsonl` when false.
-- [ ] Session writes append through `SessionStore::append_memory_record`
+- [x] Session writes append through `SessionStore::append_memory_record`
       (`pub(crate)`), never by calling `append_session_event`; reads go through
       `memory_records`. A session entry is invisible from another session and
       disappears with `delete_session`.
-- [ ] Sensitivity is applied on the write path: the stored value is the maximum
+- [x] Sensitivity is applied on the write path: the stored value is the maximum
       of what the caller supplied and the derived rule, so a caller cannot lower
       it.
-- [ ] Tests: session-scope write carrying a seeded fake secret is refused and
+- [x] Tests: session-scope write carrying a seeded fake secret is refused and
       nothing reaches the session log; a project entry citing a
       `restricted_patterns` path is refused when calling the store directly; the
       same for a per-directory `.gitignore` path; user scope refused on write and

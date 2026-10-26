@@ -16,9 +16,14 @@
 //!   exists.
 
 use crate::audit::AuditLog;
+use crate::config::DEFAULT_IGNORE_PATTERNS;
 use crate::error::{ClientError, Result};
 use crate::git_service::GitService;
 use crate::hash::{create_id, now_millis, repository_id_for_root, sha256_hex};
+use crate::ignore::{is_ignored_by_rules, parse_ignore_patterns};
+use crate::path_policy::PathPolicy;
+use crate::secret_scanner::SecretScanner;
+use crate::session::SessionStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -747,11 +752,26 @@ pub struct MemoryStoreConfig {
 pub struct MemoryStore {
     config: MemoryStoreConfig,
     audit_log: AuditLog,
+    scanner: SecretScanner,
+    path_policy: PathPolicy,
+    session_store: SessionStore,
 }
 
 impl MemoryStore {
-    pub fn new(config: MemoryStoreConfig, audit_log: AuditLog) -> Self {
-        Self { config, audit_log }
+    pub fn new(
+        config: MemoryStoreConfig,
+        audit_log: AuditLog,
+        scanner: SecretScanner,
+        path_policy: PathPolicy,
+        session_store: SessionStore,
+    ) -> Self {
+        Self {
+            config,
+            audit_log,
+            scanner,
+            path_policy,
+            session_store,
+        }
     }
 
     pub fn memory_dir(&self) -> PathBuf {
@@ -858,6 +878,284 @@ impl MemoryStore {
             }
         }
         Ok(entries)
+    }
+
+    /// The one write path for every scope.
+    ///
+    /// `identity` is required for a project entry and must match the entry's
+    /// own key, so a caller cannot write project A's entry into project B's
+    /// file. Session and user callers pass `None`.
+    ///
+    /// The order is deliberate: shape and scope first (a refused shape cannot
+    /// become a disclosure), then the secret check, then evidence eligibility,
+    /// then sensitivity derivation, then the write. Nothing before the last
+    /// step touches the disk.
+    pub fn insert(
+        &self,
+        root: &Path,
+        identity: Option<&ProjectIdentity>,
+        mut entry: MemoryEntry,
+    ) -> MemoryResult<MemoryEntry> {
+        self.validate_shape(identity, &entry)?;
+        self.refuse_secrets(&entry)?;
+        self.refuse_ineligible_evidence(root, &entry)?;
+        entry.sensitivity = entry.effective_sensitivity();
+        entry.updated_at_ms = entry.updated_at_ms.max(entry.created_at_ms);
+
+        match entry.scope {
+            MemoryScope::Project => {
+                self.ensure_schema()?;
+                append_entry_line(
+                    &self.project_path(&entry.project_key.clone().unwrap()),
+                    &entry,
+                )?;
+            }
+            MemoryScope::User => {
+                self.ensure_schema()?;
+                append_entry_line(&self.user_path(), &entry)?;
+            }
+            MemoryScope::Session => {
+                let session_id = entry.session_id.clone().unwrap();
+                let record = serde_json::to_string(&entry).map_err(|error| {
+                    MemoryError::Invalid(format!("Failed to serialize memory: {error}"))
+                })?;
+                self.session_store
+                    .append_memory_record(&session_id, &record)?;
+            }
+        }
+
+        self.audit_transition("memory_created", &entry, None, entry.state)?;
+        if matches!(
+            entry.provenance,
+            MemoryProvenance::SuggestedAndConfirmed { .. }
+        ) {
+            self.audit_transition("memory_confirmed", &entry, None, MemoryState::Active)?;
+        }
+        Ok(entry)
+    }
+
+    fn validate_shape(
+        &self,
+        identity: Option<&ProjectIdentity>,
+        entry: &MemoryEntry,
+    ) -> MemoryResult<()> {
+        if entry.id.trim().is_empty() {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "the entry has no id".to_string(),
+            )));
+        }
+        let statement = entry.statement.trim();
+        if statement.is_empty() {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "a memory needs a statement".to_string(),
+            )));
+        }
+        if statement.chars().count() > STATEMENT_MAX_CHARS {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(format!(
+                "a memory statement is one sentence of at most {STATEMENT_MAX_CHARS} \
+                 characters; this one is longer and was not truncated"
+            ))));
+        }
+        if statement.contains(['\n', '\r']) || entry.statement.chars().any(char::is_control) {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "a memory statement is one line, not an excerpt".to_string(),
+            )));
+        }
+
+        match entry.scope {
+            MemoryScope::Project => {
+                let Some(key) = entry.project_key.as_deref() else {
+                    return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                        "project-scope memory needs a project key".to_string(),
+                    )));
+                };
+                if entry.session_id.is_some() {
+                    return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                        "project-scope memory cannot carry a session id".to_string(),
+                    )));
+                }
+                let Some(identity) = identity else {
+                    return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                        "the project identity for this repository was not supplied".to_string(),
+                    )));
+                };
+                if key != identity.key {
+                    return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                        "the project key does not match this repository's identity".to_string(),
+                    )));
+                }
+            }
+            MemoryScope::Session => {
+                if entry.project_key.is_some() {
+                    return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                        "session-scope memory cannot carry a project key".to_string(),
+                    )));
+                }
+                let Some(session_id) = entry.session_id.as_deref() else {
+                    return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                        "session-scope memory needs a session id".to_string(),
+                    )));
+                };
+                if self.session_store.read_session(session_id)?.is_none() {
+                    return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                        "that session does not exist".to_string(),
+                    )));
+                }
+            }
+            MemoryScope::User => {
+                if entry.project_key.is_some() || entry.session_id.is_some() {
+                    return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                        "user-scope memory belongs to no project or session".to_string(),
+                    )));
+                }
+                if !self.config.user_scope_enabled {
+                    return Err(MemoryError::Refused(MemoryRefusal::UserScopeDisabled));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A detected secret is refused, never stored with a placeholder. See the
+    /// module docs and §5.4: a redacted memory is permanently useless, is
+    /// recalled forever, and records that a credential exists.
+    fn refuse_secrets(&self, entry: &MemoryEntry) -> MemoryResult<()> {
+        if let Some(finding) = self.scanner.scan(&entry.statement).into_iter().next() {
+            return Err(MemoryError::Refused(MemoryRefusal::Secret {
+                category: finding.category,
+            }));
+        }
+        if let MemoryProvenance::RepositoryEvidence { paths } = &entry.provenance {
+            for path in paths {
+                if let Some(finding) = self.scanner.scan(&path.path).into_iter().next() {
+                    return Err(MemoryError::Refused(MemoryRefusal::Secret {
+                        category: finding.category,
+                    }));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// An evidence path must be repository-relative and eligible. A path that
+    /// is protected or ignored would launder content the user told Damaian to
+    /// stay out of into a permanent store, and would record that the path
+    /// exists even with no content attached.
+    fn refuse_ineligible_evidence(&self, root: &Path, entry: &MemoryEntry) -> MemoryResult<()> {
+        let MemoryProvenance::RepositoryEvidence { paths } = &entry.provenance else {
+            return Ok(());
+        };
+        for evidence in paths {
+            let relative = Path::new(&evidence.path);
+            if evidence.path.trim().is_empty()
+                || relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(MemoryError::Refused(MemoryRefusal::IneligibleEvidence {
+                    reason: EvidenceRefusal::NotRelative,
+                }));
+            }
+            if self.path_policy.is_restricted(&evidence.path, false) {
+                return Err(MemoryError::Refused(MemoryRefusal::IneligibleEvidence {
+                    reason: EvidenceRefusal::Restricted,
+                }));
+            }
+            if self.is_ignored_in_repository(root, &evidence.path) {
+                return Err(MemoryError::Refused(MemoryRefusal::IneligibleEvidence {
+                    reason: EvidenceRefusal::Ignored,
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// The same rule set the index walks with: configured patterns at the root
+    /// plus every per-directory `.gitignore` from the root down to the file's
+    /// directory. A `.gitignore` added after a memory was written is caught
+    /// again at retrieval (spec 30 §5.5), but the write path refuses it first.
+    fn is_ignored_in_repository(&self, root: &Path, relative_path: &str) -> bool {
+        let configured = if self.config.ignore_patterns.is_empty() {
+            DEFAULT_IGNORE_PATTERNS
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            self.config.ignore_patterns.clone()
+        };
+        let mut rules = parse_ignore_patterns(&configured, "");
+        if let Ok(content) = fs::read_to_string(root.join(".gitignore")) {
+            let patterns: Vec<String> = content.lines().map(str::to_string).collect();
+            rules.extend(parse_ignore_patterns(&patterns, ""));
+        }
+        let mut base = String::new();
+        let components: Vec<&str> = relative_path.split('/').collect();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            base = if base.is_empty() {
+                (*component).to_string()
+            } else {
+                format!("{base}/{component}")
+            };
+            if let Ok(content) = fs::read_to_string(root.join(&base).join(".gitignore")) {
+                let patterns: Vec<String> = content.lines().map(str::to_string).collect();
+                rules.extend(parse_ignore_patterns(&patterns, &base));
+            }
+        }
+        is_ignored_by_rules(&rules, relative_path, false)
+    }
+
+    /// Session-scope entries, read from the session log. A session that no
+    /// longer exists has no entries: that is how the scope dies with its
+    /// session rather than needing a cleanup pass.
+    pub fn session_entries(&self, session_id: &str) -> MemoryResult<Vec<MemoryEntry>> {
+        if self.session_store.read_session(session_id)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let records = self.session_store.memory_records(session_id)?;
+        let (entries, _) = replay_entries(records.iter().map(String::as_str));
+        for entry in &entries {
+            if entry.scope != MemoryScope::Session
+                || entry.session_id.as_deref() != Some(session_id)
+            {
+                return Err(MemoryError::Invalid(format!(
+                    "Memory entry {} in session {session_id} is scoped {:?} for session {:?}.",
+                    entry.id, entry.scope, entry.session_id
+                )));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Records a lifecycle transition. Fields are the ids and classifications
+    /// needed to answer "what happened"; the statement is included only for
+    /// `Ordinary` sensitivity, because a personal or environmental statement
+    /// copied into an append-only retained log is exactly the exposure §5.8
+    /// forbids.
+    fn audit_transition(
+        &self,
+        event: &str,
+        entry: &MemoryEntry,
+        from: Option<MemoryState>,
+        to: MemoryState,
+    ) -> MemoryResult<()> {
+        let mut fields = vec![
+            ("entryId", entry.id.clone()),
+            ("scope", entry.scope.as_str().to_string()),
+            ("category", entry.category.as_str().to_string()),
+            ("provenance", entry.provenance.kind().to_string()),
+            ("sensitivity", entry.sensitivity.as_str().to_string()),
+            (
+                "fromState",
+                from.map(MemoryState::as_str).unwrap_or("none").to_string(),
+            ),
+            ("toState", to.as_str().to_string()),
+        ];
+        if entry.sensitivity == Sensitivity::Ordinary {
+            fields.push(("statement", entry.statement.clone()));
+        }
+        self.audit_log.record(event, &fields)?;
+        Ok(())
     }
 
     fn ensure_if_present(&self) -> MemoryResult<()> {
@@ -1024,11 +1322,14 @@ fn read_entries(path: &Path) -> MemoryResult<(Vec<MemoryEntry>, usize)> {
         // No newline at all: every byte is a torn line. Nothing to read.
         None => "",
     };
+    Ok(replay_entries(complete.lines()))
+}
 
+fn replay_entries<'a>(lines: impl Iterator<Item = &'a str>) -> (Vec<MemoryEntry>, usize) {
     let mut entries: Vec<MemoryEntry> = Vec::new();
     let mut positions: HashMap<String, usize> = HashMap::new();
     let mut skipped = 0;
-    for line in complete.lines() {
+    for line in lines {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -1044,7 +1345,7 @@ fn read_entries(path: &Path) -> MemoryResult<(Vec<MemoryEntry>, usize)> {
             Err(_) => skipped += 1,
         }
     }
-    Ok((entries, skipped))
+    (entries, skipped)
 }
 
 fn append_entry_line(path: &Path, entry: &MemoryEntry) -> MemoryResult<()> {

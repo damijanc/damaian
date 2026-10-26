@@ -276,16 +276,28 @@ use workspace_engine::{
 };
 
 fn memory_store(root: &Path, user_scope_enabled: bool) -> MemoryStore {
-    let config = test_config(root);
-    let scanner = SecretScanner::new(Vec::new());
-    let audit = AuditLog::new(&config.data_dir, true, scanner);
+    memory_store_with(root, user_scope_enabled, |_| {})
+}
+
+fn memory_store_with(
+    root: &Path,
+    user_scope_enabled: bool,
+    tweak: impl FnOnce(&mut Config),
+) -> MemoryStore {
+    let mut config = test_config(root);
+    tweak(&mut config);
+    let scanner = SecretScanner::new(config.secret_patterns.clone());
+    let audit = AuditLog::new(&config.data_dir, true, scanner.clone());
     MemoryStore::new(
         MemoryStoreConfig {
-            data_dir: config.data_dir,
+            data_dir: config.data_dir.clone(),
             user_scope_enabled,
-            ignore_patterns: Vec::new(),
+            ignore_patterns: config.ignore_patterns.clone(),
         },
         audit,
+        scanner,
+        workspace_engine::PathPolicy::new(&config),
+        workspace_engine::SessionStore::new(&config.data_dir),
     )
 }
 
@@ -565,7 +577,7 @@ fn the_store_follows_config_default_data_dir() {
 
     assert_eq!(data_dir, root.join("redirected"));
     let scanner = SecretScanner::new(Vec::new());
-    let audit = AuditLog::new(&data_dir, true, scanner);
+    let audit = AuditLog::new(&data_dir, true, scanner.clone());
     let store = MemoryStore::new(
         MemoryStoreConfig {
             data_dir: data_dir.clone(),
@@ -573,7 +585,356 @@ fn the_store_follows_config_default_data_dir() {
             ignore_patterns: Vec::new(),
         },
         audit,
+        scanner,
+        workspace_engine::PathPolicy::unrestricted(),
+        workspace_engine::SessionStore::new(&data_dir),
     );
     store.ensure_schema().unwrap();
     assert!(data_dir.join("memory").join("schema.conf").exists());
+}
+
+// ---------------------------------------------------------------------------
+// Refusal path: secrets, evidence and scopes (Task 5).
+// ---------------------------------------------------------------------------
+
+use workspace_engine::{EvidenceRefusal, MemoryRefusal, SessionStore};
+
+fn project_identity(key: &str) -> ProjectIdentity {
+    ProjectIdentity {
+        key: key.to_string(),
+        source: ProjectKeySource::RootCommit,
+        repository_id: format!("repo_{key}"),
+    }
+}
+
+fn project_entry(key: &str, statement: &str) -> MemoryEntry {
+    MemoryEntry::new(
+        MemoryScope::Project,
+        MemoryCategory::Convention,
+        statement,
+        MemoryProvenance::UserRequest {
+            session_id: "session_fixture".to_string(),
+            message_id: "message_fixture".to_string(),
+        },
+        Verification::UserConfirmed,
+    )
+    .in_project(key)
+}
+
+fn user_entry(statement: &str) -> MemoryEntry {
+    MemoryEntry::new(
+        MemoryScope::User,
+        MemoryCategory::Preference,
+        statement,
+        MemoryProvenance::UserRequest {
+            session_id: "session_fixture".to_string(),
+            message_id: "message_fixture".to_string(),
+        },
+        Verification::UserConfirmed,
+    )
+}
+
+fn session_entry(session_id: &str, statement: &str) -> MemoryEntry {
+    MemoryEntry::new(
+        MemoryScope::Session,
+        MemoryCategory::Fact,
+        statement,
+        MemoryProvenance::UserRequest {
+            session_id: session_id.to_string(),
+            message_id: "message_fixture".to_string(),
+        },
+        Verification::UserConfirmed,
+    )
+    .in_session(session_id)
+}
+
+const SEEDED_SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+
+#[test]
+fn an_entry_written_through_insert_round_trips_with_every_field() {
+    let root = temp_dir("insert-round-trip");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_insert_round_trip");
+    let mut entry = project_entry(&identity.key, "Builds write into /tmp/damaian-build.");
+    entry.category = MemoryCategory::Environment;
+    entry.verification = Verification::EvidenceCurrent;
+    entry.provenance = MemoryProvenance::RepositoryEvidence {
+        paths: vec![EvidenceRef::new("README.md", "sha256:abc")],
+    };
+    entry.expiry = Some(MemoryExpiry {
+        expires_at_ms: Some(1_700_000_000_000),
+        revalidate_on_evidence_change: true,
+    });
+    entry.supersedes = Some("mem_previous".to_string());
+
+    let stored = store.insert(&root, Some(&identity), entry).unwrap();
+    assert_eq!(stored.sensitivity, Sensitivity::Environmental);
+    assert_eq!(store.project_entries(&identity).unwrap(), vec![stored]);
+}
+
+#[test]
+fn a_detected_secret_is_refused_rather_than_stored_redacted() {
+    let root = temp_dir("refuse-secret");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_refuse_secret");
+    let entry = project_entry(
+        &identity.key,
+        &format!("The deploy key {SEEDED_SECRET} is set on the runner."),
+    );
+
+    let error = store.insert(&root, Some(&identity), entry).unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::Secret { .. })
+    ));
+    assert!(error.to_string().contains("will not store it"));
+    assert!(!error.to_string().contains(SEEDED_SECRET));
+    assert!(
+        store.project_entries(&identity).unwrap().is_empty(),
+        "nothing was written"
+    );
+    let stored_text = fs::read_to_string(store.project_path(&identity.key)).unwrap_or_default();
+    assert!(!stored_text.contains(SEEDED_SECRET));
+    assert!(!stored_text.contains("[REDACTED"), "refused, not redacted");
+}
+
+#[test]
+fn a_session_entry_with_a_secret_is_refused_and_never_reaches_the_log() {
+    let root = temp_dir("refuse-session-secret");
+    let store = memory_store(&root, false);
+    let sessions = SessionStore::new(root.join(".damaian"));
+    let session = sessions
+        .create_session("repo_fixture", "fixture session")
+        .unwrap();
+
+    let entry = session_entry(&session.id, &format!("My token is {SEEDED_SECRET}."));
+    let error = store.insert(&root, None, entry).unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::Secret { .. })
+    ));
+
+    let log = fs::read_to_string(
+        root.join(".damaian")
+            .join("sessions")
+            .join(format!("{}.jsonl", session.id)),
+    )
+    .unwrap();
+    assert!(!log.contains(SEEDED_SECRET));
+    assert!(
+        !log.contains("memory_recorded"),
+        "the store refused before appending"
+    );
+    assert!(store.session_entries(&session.id).unwrap().is_empty());
+}
+
+#[test]
+fn session_memory_is_private_to_its_session_and_dies_with_it() {
+    let root = temp_dir("session-scope");
+    let store = memory_store(&root, false);
+    let sessions = SessionStore::new(root.join(".damaian"));
+    let first = sessions.create_session("repo_fixture", "first").unwrap();
+    let second = sessions.create_session("repo_fixture", "second").unwrap();
+
+    let entry = session_entry(&first.id, "This checkout is the review copy.");
+    let stored = store.insert(&root, None, entry).unwrap();
+    assert_eq!(store.session_entries(&first.id).unwrap(), vec![stored]);
+    assert!(store.session_entries(&second.id).unwrap().is_empty());
+
+    sessions.delete_session(&first.id).unwrap();
+    assert!(store.session_entries(&first.id).unwrap().is_empty());
+}
+
+#[test]
+fn a_session_entry_must_name_a_session_that_exists() {
+    let root = temp_dir("session-unknown");
+    let store = memory_store(&root, false);
+    let entry = session_entry("session_missing", "A fact.");
+    let error = store.insert(&root, None, entry).unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::InvalidShape(_))
+    ));
+}
+
+#[test]
+fn user_scope_is_refused_on_write_and_invisible_on_read_while_disabled() {
+    let root = temp_dir("user-scope-disabled");
+    let disabled = memory_store(&root, false);
+    let error = disabled
+        .insert(&root, None, user_entry("Prefer short commit subjects."))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::UserScopeDisabled)
+    ));
+
+    // A store written while the scope was enabled must stop influencing
+    // sessions once it is switched off.
+    let enabled = memory_store(&root, true);
+    let stored = enabled
+        .insert(&root, None, user_entry("Prefer short commit subjects."))
+        .unwrap();
+    assert_eq!(enabled.user_entries().unwrap(), vec![stored]);
+    assert!(
+        disabled.user_entries().unwrap().is_empty(),
+        "a disabled scope must not read the file"
+    );
+}
+
+#[test]
+fn evidence_citing_a_restricted_path_is_refused_by_the_store() {
+    let root = temp_dir("evidence-restricted");
+    let store = memory_store_with(&root, false, |config| {
+        config.restricted_patterns = vec!["secrets/**".to_string()];
+    });
+    let identity = project_identity("root_evidence_restricted");
+    let mut entry = project_entry(&identity.key, "The deploy reads one protected file.");
+    entry.provenance = MemoryProvenance::RepositoryEvidence {
+        paths: vec![EvidenceRef::new("secrets/prod.env", "sha256:abc")],
+    };
+
+    let error = store.insert(&root, Some(&identity), entry).unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::IneligibleEvidence {
+            reason: EvidenceRefusal::Restricted
+        })
+    ));
+    assert!(store.project_entries(&identity).unwrap().is_empty());
+}
+
+#[test]
+fn evidence_excluded_by_a_per_directory_gitignore_is_refused() {
+    let root = temp_dir("evidence-ignored");
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::write(root.join("nested/.gitignore"), "*.tmp\n").unwrap();
+    fs::write(root.join("nested/scratch.tmp"), "scratch\n").unwrap();
+    fs::write(root.join("nested/kept.txt"), "kept\n").unwrap();
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_evidence_ignored");
+
+    let mut entry = project_entry(&identity.key, "Scratch files are disposable.");
+    entry.provenance = MemoryProvenance::RepositoryEvidence {
+        paths: vec![EvidenceRef::new("nested/scratch.tmp", "sha256:abc")],
+    };
+    let error = store.insert(&root, Some(&identity), entry).unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::IneligibleEvidence {
+            reason: EvidenceRefusal::Ignored
+        })
+    ));
+
+    let mut allowed = project_entry(&identity.key, "Kept files are committed.");
+    allowed.provenance = MemoryProvenance::RepositoryEvidence {
+        paths: vec![EvidenceRef::new("nested/kept.txt", "sha256:abc")],
+    };
+    assert!(store.insert(&root, Some(&identity), allowed).is_ok());
+}
+
+#[test]
+fn evidence_must_be_repository_relative() {
+    let root = temp_dir("evidence-relative");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_evidence_relative");
+
+    for path in ["/etc/passwd", "../outside.txt", "./README.md", ""] {
+        let mut entry = project_entry(&identity.key, "A statement.");
+        entry.provenance = MemoryProvenance::RepositoryEvidence {
+            paths: vec![EvidenceRef::new(path, "sha256:abc")],
+        };
+        let error = store.insert(&root, Some(&identity), entry).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MemoryError::Refused(MemoryRefusal::IneligibleEvidence {
+                    reason: EvidenceRefusal::NotRelative
+                })
+            ),
+            "{path:?} was not refused as non-relative"
+        );
+    }
+}
+
+#[test]
+fn a_secret_in_an_evidence_path_is_refused() {
+    let root = temp_dir("evidence-secret-path");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_evidence_secret_path");
+    let mut entry = project_entry(&identity.key, "The runner uses a generated key.");
+    entry.provenance = MemoryProvenance::RepositoryEvidence {
+        paths: vec![EvidenceRef::new(
+            format!("config/{SEEDED_SECRET}.txt"),
+            "sha256:abc",
+        )],
+    };
+    let error = store.insert(&root, Some(&identity), entry).unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::Secret { .. })
+    ));
+    assert!(!error.to_string().contains(SEEDED_SECRET));
+}
+
+#[test]
+fn sensitivity_is_raised_to_the_derived_value_but_never_lowered() {
+    let root = temp_dir("sensitivity-write");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_sensitivity_write");
+
+    let mut lowered = project_entry(&identity.key, "Logs live under /var/log/damaian.");
+    lowered.sensitivity = Sensitivity::Ordinary;
+    let stored = store.insert(&root, Some(&identity), lowered).unwrap();
+    assert_eq!(stored.sensitivity, Sensitivity::Environmental);
+
+    let mut raised = project_entry(&identity.key, "A plain convention.");
+    raised.sensitivity = Sensitivity::Personal;
+    let stored = store.insert(&root, Some(&identity), raised).unwrap();
+    assert_eq!(stored.sensitivity, Sensitivity::Personal);
+}
+
+#[test]
+fn a_statement_over_the_ceiling_is_refused_not_truncated() {
+    let root = temp_dir("statement-ceiling");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_statement_ceiling");
+    let statement = "a".repeat(workspace_engine::STATEMENT_MAX_CHARS + 1);
+    let error = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, &statement),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::InvalidShape(_))
+    ));
+    assert!(error.to_string().contains("not truncated"));
+}
+
+#[test]
+fn a_project_key_that_is_not_this_repository_is_refused() {
+    let root = temp_dir("project-key-mismatch");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_mine");
+    let entry = project_entry("root_someone_else", "A fact.");
+    let error = store.insert(&root, Some(&identity), entry).unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::InvalidShape(_))
+    ));
+}
+
+#[test]
+fn a_project_write_without_an_identity_is_refused() {
+    let root = temp_dir("project-key-missing-identity");
+    let store = memory_store(&root, false);
+    let entry = project_entry("root_any", "A fact.");
+    let error = store.insert(&root, None, entry).unwrap_err();
+    assert!(matches!(
+        error,
+        MemoryError::Refused(MemoryRefusal::InvalidShape(_))
+    ));
 }

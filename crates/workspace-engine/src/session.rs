@@ -1107,6 +1107,30 @@ impl SessionStore {
         Ok(allowed)
     }
 
+    /// Appends a memory record to this session's log (spec 28 §5.3).
+    ///
+    /// Session-scoped memory lives in the session log rather than a memory
+    /// file so it cannot outlive its session. The memory store is the only
+    /// production caller: it runs the secret, evidence and scope checks before
+    /// reaching here. `append_session_event` stays private so a second caller
+    /// cannot write a memory around those checks.
+    pub(crate) fn append_memory_record(&self, session_id: &str, record: &str) -> Result<()> {
+        self.append_session_event(session_id, "memory_recorded", record)
+    }
+
+    /// The memory record payloads in a session log, in append order.
+    pub(crate) fn memory_records(&self, session_id: &str) -> Result<Vec<String>> {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(Vec::new());
+        };
+        Ok(active_events(&content)
+            .into_iter()
+            .filter(|event| event.event_type == "memory_recorded")
+            .map(|event| event.payload.to_string())
+            .collect())
+    }
+
     /// Adds a file or range to the context the session carries into every
     /// turn (spec 27 §5.4). Appends an event; it never rewrites the log.
     pub fn add_context_pin(
