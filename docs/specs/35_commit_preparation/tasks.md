@@ -157,7 +157,7 @@ truthful". **Context:** §1, §2.
 `tests/permission_profiles.rs`, `tests/commit_preparation.rs` (the gate test
 lands in Task 3; this task covers the key).
 
-- [ ] **Step 1: Write the failing tests** in `tests/permission_profiles.rs`:
+- [x] **Step 1: Write the failing tests** in `tests/permission_profiles.rs`:
   - add `case("allow_git_commits", "allow_git_commits=false\n",
     "allow_git_commits=true\n", Reported("allow_git_commits"))` to
     `weakening_cases()`;
@@ -165,9 +165,9 @@ lands in Task 3; this task covers the key).
     `every_overlay_field_is_classified_exactly_once` and
     `the_preference_keys_are_exactly_spec_34s_free_keys` must still pass because
     classification is explicit.
-- [ ] **Step 2: Confirm they fail** (the key does not parse, so the weakening
+- [x] **Step 2: Confirm they fail** (the key does not parse, so the weakening
   case cannot be constructed).
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - `Config`: `pub allow_git_commits: bool`, default `true`.
   - `ConfigOverlay`: `pub allow_git_commits: Option<bool>`, parsed by `set`,
     emitted by `to_policy_text`, carried in the exhaustive destructuring.
@@ -179,11 +179,11 @@ lands in Task 3; this task covers the key).
     key through the profile split and import base.
   - `effective_policy.rs`: label `"Git commits allowed"`.
   - `to_policy_text`: one line beside the other capability keys.
-- [ ] **Step 4: Falsify.** Classify it `Preference` → the capability-cover test
+- [x] **Step 4: Falsify.** Classify it `Preference` → the capability-cover test
   fails. Omit it from the restrict-only loop → the repository-scope case fails
   (a repository turns it on). Remove it from `ProfileCapabilities` → the matrix
   test fails to compile.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -191,7 +191,7 @@ lands in Task 3; this task covers the key).
   CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo nextest run -p workspace-engine --test permission_profiles
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Make committing a capability a profile can deny`.
 
 ## Task 3: Durable acceptance detail and the commit engine
