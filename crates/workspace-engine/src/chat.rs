@@ -6613,75 +6613,106 @@ impl ChatOrchestrator {
                                 ActionOutcome::Failed,
                             ),
                             Some(current) => {
-                                // The model asked to move on; it does not get to say
-                                // how the step ended. §5.3: the status is a function
-                                // of the evidence, and this is the only place a step
-                                // reaches a terminal status.
-                                let accrued = std::mem::take(&mut step_evidence);
-                                let now = now_millis();
-                                let mut finished_title = String::new();
-                                let mut status = crate::plan::StepStatus::Completed;
-                                if let Some(open) = current
-                                    .steps
-                                    .iter_mut()
-                                    .find(|step| step.status == crate::plan::StepStatus::InProgress)
-                                {
-                                    // Extends rather than replaces. A step can already
-                                    // carry evidence this turn never saw: a patch
-                                    // applied after the turn that proposed it appends
-                                    // through the log (`edit.rs`), and a resumed plan
-                                    // arrives with everything its earlier turns
-                                    // recorded. Assigning here would silently drop
-                                    // both, and the step would then be judged on a
-                                    // fraction of what is known about it.
-                                    open.evidence.extend(accrued);
-                                    status = crate::plan::status_from_evidence(&open.evidence);
-                                    open.status = status;
-                                    open.completed_at_ms = Some(now);
-                                    finished_title = open.title.clone();
-                                    let closed = open.clone();
-                                    self.session_store.update_plan_step(&task, &closed)?;
-                                }
+                                // A step can only be closed while it is the one
+                                // running. A second `complete_step` after a block
+                                // used to find no open step, leave `status` at its
+                                // default `Completed`, and start the next pending
+                                // step — laundering the block into a handoff
+                                // (found in a session on 2026-10-26).
+                                match current.steps.iter().position(|step| {
+                                    step.status == crate::plan::StepStatus::InProgress
+                                }) {
+                                    None => {
+                                        let blocked = current
+                                            .steps
+                                            .iter()
+                                            .find(|step| {
+                                                step.status == crate::plan::StepStatus::Blocked
+                                            })
+                                            .map(|step| step.title.clone());
+                                        let result = match blocked {
+                                            Some(title) => format!(
+                                                "No step is in progress. Step \"{title}\" is blocked: resolve what blocked it before moving on; the remaining steps are still pending."
+                                            ),
+                                            None => "No step is in progress, so there is nothing to complete. Do not call complete_step again.".to_string(),
+                                        };
+                                        (
+                                            "Attempted to complete a step.".to_string(),
+                                            result,
+                                            ActionOutcome::Failed,
+                                        )
+                                    }
+                                    Some(open_index) => {
+                                        // The model asked to move on; it does not get
+                                        // to say how the step ended. §5.3: the status
+                                        // is a function of the evidence, and this is
+                                        // the only place a step reaches a terminal
+                                        // status.
+                                        let accrued = std::mem::take(&mut step_evidence);
+                                        let now = now_millis();
+                                        let open = &mut current.steps[open_index];
+                                        // Extends rather than replaces. A step can
+                                        // already carry evidence this turn never saw:
+                                        // a patch applied after the turn that proposed
+                                        // it appends through the log (`edit.rs`), and
+                                        // a resumed plan arrives with everything its
+                                        // earlier turns recorded. Assigning here would
+                                        // silently drop both, and the step would then
+                                        // be judged on a fraction of what is known
+                                        // about it.
+                                        open.evidence.extend(accrued);
+                                        let status =
+                                            crate::plan::status_from_evidence(&open.evidence);
+                                        open.status = status;
+                                        open.completed_at_ms = Some(now);
+                                        let finished_title = open.title.clone();
+                                        let closed = open.clone();
+                                        self.session_store.update_plan_step(&task, &closed)?;
 
-                                // A blocked step does not hand off: the next step's
-                                // prerequisite failed, and starting it anyway would
-                                // build on work that did not happen.
-                                let mut next_title = None;
-                                if status == crate::plan::StepStatus::Completed
-                                    && let Some(next) = current.steps.iter_mut().find(|step| {
-                                        step.status == crate::plan::StepStatus::Pending
-                                    })
-                                {
-                                    next.status = crate::plan::StepStatus::InProgress;
-                                    next.started_at_ms = Some(now);
-                                    next_title = Some(next.title.clone());
-                                    let started = next.clone();
-                                    self.session_store.update_plan_step(&task, &started)?;
-                                }
-                                // Once, after the handoff rather than after each of its
-                                // two writes: between them the closing step is already
-                                // terminal and the next has not opened, so a panel
-                                // updated mid-handoff would blink through a state with
-                                // no current step. The log keeps both writes; the panel
-                                // does not need them.
-                                sink.plan(current);
+                                        // A blocked step does not hand off: the next
+                                        // step's prerequisite failed, and starting it
+                                        // anyway would build on work that did not
+                                        // happen.
+                                        let mut next_title = None;
+                                        if status == crate::plan::StepStatus::Completed
+                                            && let Some(next) =
+                                                current.steps.iter_mut().find(|step| {
+                                                    step.status == crate::plan::StepStatus::Pending
+                                                })
+                                        {
+                                            next.status = crate::plan::StepStatus::InProgress;
+                                            next.started_at_ms = Some(now);
+                                            next_title = Some(next.title.clone());
+                                            let started = next.clone();
+                                            self.session_store.update_plan_step(&task, &started)?;
+                                        }
+                                        // Once, after the handoff rather than after
+                                        // each of its two writes: between them the
+                                        // closing step is already terminal and the
+                                        // next has not opened, so a panel updated
+                                        // mid-handoff would blink through a state with
+                                        // no current step. The log keeps both writes;
+                                        // the panel does not need them.
+                                        sink.plan(current);
 
-                                let result = match (status, &next_title) {
-                                    (crate::plan::StepStatus::Blocked, _) => format!(
-                                        "Step \"{finished_title}\" is blocked: a command it ran did not succeed. Fix that before moving on; the remaining steps are still pending."
-                                    ),
-                                    (_, Some(next)) => format!(
-                                        "Step \"{finished_title}\" is complete. The current step is now: {next}."
-                                    ),
-                                    (_, None) => format!(
-                                        "Step \"{finished_title}\" is complete. That was the last step."
-                                    ),
-                                };
-                                (
-                                    format!("Finished: {finished_title}"),
-                                    result,
-                                    ActionOutcome::Ok,
-                                )
+                                        let result = match (status, &next_title) {
+                                            (crate::plan::StepStatus::Blocked, _) => format!(
+                                                "Step \"{finished_title}\" is blocked: a command it ran did not succeed. Fix that before moving on; the remaining steps are still pending."
+                                            ),
+                                            (_, Some(next)) => format!(
+                                                "Step \"{finished_title}\" is complete. The current step is now: {next}."
+                                            ),
+                                            (_, None) => format!(
+                                                "Step \"{finished_title}\" is complete. That was the last step."
+                                            ),
+                                        };
+                                        (
+                                            format!("Finished: {finished_title}"),
+                                            result,
+                                            ActionOutcome::Ok,
+                                        )
+                                    }
+                                }
                             }
                         },
                         ToolAction::EditFile { summary, edits } => {
@@ -10556,7 +10587,7 @@ fn list_directory_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "list_directory".to_string(),
         description: "List repository-relative file paths, honouring .gitignore. With `worktree`, list a git worktree of this repository instead, even one .gitignore hides. Prefer this over a shell command: it needs no approval.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"dir\":{\"type\":\"string\",\"description\":\"Repository-relative directory; defaults to the repository root\"},\"depth\":{\"type\":\"integer\",\"description\":\"Maximum directory depth to descend\"}},\"required\":[]}".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"dir\":{\"type\":\"string\",\"description\":\"Repository-relative directory; defaults to the repository root\"},\"depth\":{\"type\":\"integer\",\"description\":\"Maximum directory depth to descend below `dir`; 0 lists that directory's own files\"}},\"required\":[]}".to_string(),
     }
 }
 

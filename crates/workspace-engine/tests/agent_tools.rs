@@ -409,6 +409,50 @@ fn listing_respects_gitignore_and_caps_with_a_notice() {
     );
 }
 
+/// `depth` is relative to the directory being listed, not to the repository
+/// root. Counting slashes in the full relative path made `depth: 1` exclude
+/// every file inside a nested `dir` (found in a session on 2026-10-26, where
+/// `list_directory docs/specs` returned "0 paths").
+#[test]
+fn listing_depth_is_relative_to_the_listed_directory() {
+    let repo = temp_dir("list-depth-relative");
+    write_fixture(&repo, "docs/specs/alpha.md", "a\n");
+    write_fixture(&repo, "docs/specs/sub/beta.md", "b\n");
+    write_fixture(&repo, "docs/specs/sub/deep/gamma.md", "c\n");
+    write_fixture(&repo, "README.md", "root\n");
+    let config = test_config(&repo);
+    let nav = navigation_for(&repo, &config);
+
+    let listing = |depth| {
+        nav.list_directory(&repo, Some("docs/specs"), Some(depth), None, None)
+            .unwrap()
+            .paths
+    };
+
+    assert_eq!(listing(0), vec!["docs/specs/alpha.md".to_string()]);
+    assert_eq!(
+        listing(1),
+        vec![
+            "docs/specs/alpha.md".to_string(),
+            "docs/specs/sub/beta.md".to_string()
+        ]
+    );
+    assert_eq!(
+        listing(2),
+        vec![
+            "docs/specs/alpha.md".to_string(),
+            "docs/specs/sub/beta.md".to_string(),
+            "docs/specs/sub/deep/gamma.md".to_string()
+        ]
+    );
+
+    // The root listing keeps its meaning: depth 0 is the root's own files.
+    let root = nav
+        .list_directory(&repo, None, Some(0), None, None)
+        .unwrap();
+    assert_eq!(root.paths, vec!["README.md".to_string()]);
+}
+
 /// Requirement 2: resolved through `PathPolicy` on the same path
 /// `FileAccessController::read_file` uses. `.env` is in
 /// `DEFAULT_RESTRICTED_PATTERNS` and deliberately *not* in

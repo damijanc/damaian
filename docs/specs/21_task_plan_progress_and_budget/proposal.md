@@ -471,3 +471,16 @@ dropped, which for a token ceiling would spend past the ceiling to discover it
 had been crossed — see [`context.md`](context.md) §3.3. The check therefore sits
 at the top of the loop, before the call: a turn stops at the last round whose
 spending was under the ceiling, never after the one that crossed it.
+
+### `complete_step` needs a step that is actually running
+
+Found in a session on 2026-10-26. `complete_step` took the first `InProgress`
+step, but when there was none it left its local status at the default
+`Completed` and then started the next `Pending` step. After a blocked step, a
+second `complete_step` therefore produced `Finished: ` (an empty title) and
+advanced the plan past the block — exactly the handoff §5.3 and spec 66 §5.2
+forbid. A call with no step in progress is now refused with
+`ActionOutcome::Failed`, naming the blocked step and leaving every status and
+the pending evidence untouched. Pinned by
+`a_second_complete_step_after_a_block_is_refused_and_starts_nothing`, which
+fails on the old code at the third step becoming `InProgress`.

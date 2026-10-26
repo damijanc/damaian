@@ -475,6 +475,13 @@ not stuck; how to read `plan_left_open` and `plan_reminder_sent`).
   forced-final call has `action_rounds >= max_rounds`, so the two-round gate is
   always false. The call is still made at both completion points so the rule has
   one definition.
+- **A blocked step could be handed off by a second `complete_step`.** The claim
+  in §5.2 that #21 already stops the handoff held only for the first call: with
+  no step `InProgress`, the second call left the status at its default
+  `Completed` and started the next pending step. Fixed in #21's `chat.rs` path
+  on 2026-10-26
+  (`a_second_complete_step_after_a_block_is_refused_and_starts_nothing`);
+  §5.2's rule is now true for every call.
 - **`TaskStatus::is_active` is not `!is_terminal()`.** `Interrupted` and
   `UnknownExternalOutcome` stay recoverable but are inactive; a test pins the
   partition.

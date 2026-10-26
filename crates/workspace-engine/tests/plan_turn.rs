@@ -267,6 +267,70 @@ fn a_step_whose_command_failed_is_blocked_however_the_model_describes_it() {
     );
 }
 
+/// Found in a session on 2026-10-26: after a step blocked, a second
+/// `complete_step` found no step in progress, left its status at the default
+/// `Completed`, and started the next pending step. A blocked step must not
+/// hand off, however many times the model asks.
+#[test]
+fn a_second_complete_step_after_a_block_is_refused_and_starts_nothing() {
+    let repo = temp_repo("blocked-twice");
+    fs::write(repo.join("check"), "#!/bin/sh\nexec ls no-such-directory\n").unwrap();
+    fs::set_permissions(repo.join("check"), fs::Permissions::from_mode(0o755)).unwrap();
+    let engine = WorkspaceEngine::new(Config {
+        command_allowlist: vec!["./check".to_string()],
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        ..Config::default()
+    });
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"A"},{"title":"B"},{"title":"C"}]}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"./check","reason":"Check it"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        // The call that used to fabricate a completion and start C.
+        vec![call("complete_step", "{}")],
+    ]);
+
+    let result = ask(&engine, &repo, "Do it", &mut adapter);
+    let plan = plan_of(&engine, &result).expect("the turn proposed a plan");
+
+    assert_eq!(plan.steps[0].status, StepStatus::Completed);
+    assert_eq!(plan.steps[1].status, StepStatus::Blocked);
+    assert_eq!(
+        plan.steps[2].status,
+        StepStatus::Pending,
+        "a blocked step must not hand off, even after another complete_step"
+    );
+    assert!(!plan.violates_single_in_progress());
+
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .expect("messages should read");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content.contains("No step is in progress")),
+        "the refusal should say why: {:?}",
+        messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.content == "Finished: "),
+        "no empty completion may be recorded"
+    );
+}
+
 #[test]
 fn a_step_whose_command_passed_completes_and_carries_its_evidence() {
     let repo = temp_repo("passed");

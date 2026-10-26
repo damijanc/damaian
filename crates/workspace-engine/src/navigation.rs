@@ -121,6 +121,11 @@ impl NavigationController {
         } else {
             target.relative_path.clone()
         };
+        // `depth` is relative to the directory being listed, not to the
+        // repository root. Counting slashes in `file.relative_path` made
+        // `depth: 1` exclude every file inside a nested `dir` (for example
+        // `docs/specs`), which read as an empty directory.
+        let base_prefix = (!base.is_empty()).then(|| format!("{base}/"));
 
         let mut paths = Vec::new();
         let mut total_found = 0usize;
@@ -140,10 +145,14 @@ impl NavigationController {
                 {
                     return Ok(());
                 }
-                if let Some(limit) = depth
-                    && file.relative_path.matches('/').count() > limit
-                {
-                    return Ok(());
+                if let Some(limit) = depth {
+                    let relative_to_base = base_prefix
+                        .as_deref()
+                        .and_then(|prefix| file.relative_path.strip_prefix(prefix))
+                        .unwrap_or(file.relative_path.as_str());
+                    if relative_to_base.matches('/').count() > limit {
+                        return Ok(());
+                    }
                 }
                 total_found += 1;
                 if paths.len() < self.config.max_list_entries {

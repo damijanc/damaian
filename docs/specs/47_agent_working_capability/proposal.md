@@ -367,6 +367,17 @@ order of consequence.
    against each other rather than each being spliced against the on-disk file
    independently — which would silently drop all but the last edit to one file.
 
+7. **`depth` is relative to `dir`, not to the repository root.** §5.2's table
+   names `depth?` without saying what it counts from. The implementation
+   compared the full relative path's slash count, so `depth: 1` on
+   `docs/specs` excluded every file in it and the tool reported "0 paths" —
+   which reads as an empty directory, not as a too-shallow window. It now
+   strips `dir`'s own prefix before counting, so `0` is the listed directory's
+   files and each step descends one level, matching the tool description and
+   spec 65's `list_directory docs/specs depth 3` example. Pinned by
+   `listing_depth_is_relative_to_the_listed_directory`; the old code fails it
+   at `depth: 0` with an empty list.
+
 ### 7.1 Eval coverage, added after the slice closed
 
 The slice shipped with no [#18](../18_local_evaluation_harness/proposal.md)
