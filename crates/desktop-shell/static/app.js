@@ -28,6 +28,9 @@ let currentContextReview = null;
 // Session pins and restriction from `/api/session` or a control route.
 let contextPins = [];
 let contextRestriction = null;
+// True while the restriction textarea holds text the user typed but has not
+// applied. Re-rendering must not overwrite it with the stored restriction.
+let contextRestrictionDirty = false;
 let terminalOpen = false;
 let term = null;
 let termFit = null;
@@ -2372,10 +2375,21 @@ function contextCategoryRow(manifest, category) {
   return details;
 }
 
+// The textarea is the *current* restriction as well as a form: populate it
+// whenever the stored list changes (a session load, Apply, Clear), but never
+// overwrite text the user has typed and not applied. Without this, re-applying
+// a blank field after a reload silently replaced a real restriction with
+// `Some([])`, which admits no file content.
+function syncContextRestrictionField() {
+  if (contextRestrictionDirty || !$("context-restriction-paths")) return;
+  $("context-restriction-paths").value = (contextRestriction || []).join("\n");
+}
+
 function renderContextPanel() {
   const body = $("context-panel-body");
   const summary = $("context-panel-summary");
   body.innerHTML = "";
+  syncContextRestrictionField();
   if (!lastContextManifest) {
     summary.textContent = "Nothing assembled yet.";
     return;
@@ -2477,8 +2491,8 @@ function renderContextPanel() {
     const restriction = document.createElement("p");
     restriction.className = "context-panel-hint";
     restriction.textContent = contextRestriction.length
-      ? `This session is restricted to ${contextRestriction.length} path(s).`
-      : "This session is restricted to no paths, so no file content is eligible.";
+      ? `This session is restricted to ${contextRestriction.length} path(s); file content outside them is not sent. The symbols row is still looked up across the repository.`
+      : "This session is restricted to no paths, so no file content is eligible. The symbols row is still looked up across the repository.";
     body.append(restriction);
   }
 
@@ -2562,12 +2576,22 @@ async function clearContextPins() {
 }
 
 async function applyContextRestriction() {
-  const paths = $("context-restriction-paths").value;
+  const paths = $("context-restriction-paths").value.trim();
+  if (!paths) {
+    // `Some([])` is a restriction that admits no file content, not "no
+    // restriction". Removing one is what Clear paths is for, so an empty Apply
+    // is refused rather than silently blanking the session.
+    throw new Error(
+      "An empty list admits no file content. Use Clear paths to remove the restriction.",
+    );
+  }
   const payload = await api(
     "/api/context-restriction",
     form({ session_id: currentSessionId, paths }),
   );
+  contextRestrictionDirty = false;
   contextRestriction = payload.restrictedPaths ?? null;
+  syncContextRestrictionField();
   renderContextPanel();
   toast("Session paths applied to later turns");
 }
@@ -2577,8 +2601,9 @@ async function clearContextRestriction() {
     "/api/context-restriction",
     form({ session_id: currentSessionId, clear: "true" }),
   );
+  contextRestrictionDirty = false;
   contextRestriction = payload.restrictedPaths ?? null;
-  $("context-restriction-paths").value = "";
+  syncContextRestrictionField();
   renderContextPanel();
   toast("Session path restriction cleared");
 }
@@ -2664,6 +2689,8 @@ function applyRepositoryState(value, persist = true) {
   currentContextReview = null;
   contextPins = [];
   contextRestriction = null;
+  contextRestrictionDirty = false;
+  syncContextRestrictionField();
   closeContextPanel();
   renderContextButton();
   void refreshRepoBar();
@@ -10986,9 +11013,6 @@ function createContextReview(review, reviewRepo) {
           plan(planPayload) {
             renderPlanPanel(assistantMessage, planPayload);
           },
-          context(payload) {
-            setContextManifest(payload, payload.taskId || "");
-          },
           webDiagnostic(record) {
             sessionHasRecordedDiagnostics = true;
             renderWebDiagnosticCard(assistantMessage, record);
@@ -12185,7 +12209,9 @@ async function loadSession(sessionId) {
   );
   renderSpawnedWorkerEntries(rendered, currentSessionId);
   contextPins = payload.contextState?.pins || [];
+  contextRestrictionDirty = false;
   contextRestriction = payload.contextState?.restrictedPaths ?? null;
+  syncContextRestrictionField();
   const manifests = (payload.tasks || []).map((task) => task.context).filter(Boolean);
   lastContextManifest = manifests.reduce(
     (newest, manifest) =>
@@ -12306,7 +12332,14 @@ function processSseEvent(raw, handlers) {
   if (event === "phase" && handlers.phase) handlers.phase(payload);
   if (event === "plan" && handlers.plan) handlers.plan(payload);
   if (event === "web_diagnostic" && handlers.webDiagnostic) handlers.webDiagnostic(payload);
-  if (event === "context" && handlers.context) handlers.context(payload);
+  if (event === "context") {
+    // Handled here rather than per call site: every stream that assembles a
+    // turn emits this, including a plain prompt and the verification repair.
+    // A per-call handler left the default (no-pause) pre-send view invisible
+    // until a reload read it back from /api/session (spec 27 C9).
+    setContextManifest(payload, payload.taskId || "");
+    if (handlers.context) handlers.context(payload);
+  }
   if (event === "done") handlers.done(payload);
   if (event === "error") handlers.error(payload);
 }
@@ -12382,6 +12415,10 @@ $("context-pin-btn").addEventListener("click", async () => {
 
 $("context-pins-clear").addEventListener("click", () => {
   clearContextPins().catch((error) => toast(error.message));
+});
+
+$("context-restriction-paths").addEventListener("input", () => {
+  contextRestrictionDirty = true;
 });
 
 $("context-restriction-apply").addEventListener("click", () => {
