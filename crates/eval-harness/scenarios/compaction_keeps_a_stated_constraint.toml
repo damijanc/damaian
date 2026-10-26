@@ -1,0 +1,138 @@
+name = "compaction_keeps_a_stated_constraint"
+fixture = "rust-workspace"
+tier = "deterministic"
+compact_before_prompt = true
+prompt = "Where does the upload client live, and what did we agree not to change?"
+
+# Spec 55 §5.9 and requirement 9: a conversation long enough to compact would,
+# before this spec, have dropped the user's constraint at the ninth message.
+# The window is 1% of the 16,000-token budget so a normal seed falls outside it,
+# and automatic compaction is off so the manual path is the one measured. The
+# first `[[turn]]` is the summarisation reply, because compaction runs before
+# the ask and consumes the first scripted response.
+config_overlay = """
+conversation_window_share=0.01
+conversation_auto_compact=false
+"""
+
+[[seed_conversation]]
+role = "user"
+content = """
+Do not touch the public API. This crate has to stay on the 2021 edition, because
+the build machine still runs an older toolchain. Keep the tests passing, and do
+not rename any exported function while you investigate the upload client.
+"""
+
+[[seed_conversation]]
+role = "assistant"
+content = """
+Understood: no public API changes, no edition bump, and the exported names stay
+as they are. I will read the upload client and the supporting modules first and
+report what connects to what before proposing anything.
+"""
+
+[[seed_conversation]]
+role = "user"
+content = """
+Also, the retry work is a separate task. Do not start it here; just tell me what
+the upload path does and where the boundary is between upload and checkout.
+"""
+
+[[seed_conversation]]
+role = "assistant"
+content = """
+The upload path sends the payload through upload(), and checkout handles pricing
+and inventory. They meet at the request builder, which is shared. I have not
+changed anything yet: the public surface is being treated as fixed.
+"""
+
+[[seed_conversation]]
+role = "user"
+content = """
+One more constraint: do not add a dependency for this. If the answer needs
+something the standard library does not provide, say so instead of reaching for
+a crate we would then have to audit and pin.
+"""
+
+[[seed_conversation]]
+role = "assistant"
+content = """
+No new dependency. The existing HTTP module is enough to describe the upload
+path, and the question here is where it lives rather than how to extend it. I am
+keeping the 2021 edition and the public API untouched.
+"""
+
+[[seed_conversation]]
+role = "user"
+content = """
+Please double-check that the logging module does not capture the payload body.
+That would be a privacy problem even if the tests pass, and it is exactly the
+kind of thing a broad refactor would accidentally introduce.
+"""
+
+[[seed_conversation]]
+role = "assistant"
+content = """
+I checked the logging call sites in the upload path: they record the endpoint and
+the status, not the body. I will keep it that way and will not widen the logging
+while looking around.
+"""
+
+[[seed_conversation]]
+role = "user"
+content = """
+If you find a function that is only used by tests, leave it alone for now. The
+cleanup is a separate change with its own review, and mixing it into this
+investigation would make the diff harder to read.
+"""
+
+[[seed_conversation]]
+role = "assistant"
+content = """
+Agreed. Test-only helpers stay where they are. The investigation is read-only:
+no patches, no renames, and nothing that changes the public API or the edition.
+"""
+
+[[seed_conversation]]
+role = "user"
+content = """
+Summarise the upload client's location and the constraints we agreed, then stop.
+Do not run a command that changes anything or write a patch in this turn.
+"""
+
+[[seed_conversation]]
+role = "assistant"
+content = """
+I will summarise where the upload client lives and restate the constraints:
+public API unchanged, 2021 edition, no new dependency, tests keep passing, and
+no cleanup mixed in. No files will be changed in this turn.
+"""
+
+[[turn]]
+content = """
+{"constraints": ["do not touch the public API", "stay on the 2021 edition", "no new dependency", "keep the tests passing"], "decisions": ["the investigation is read-only and the upload/checkout boundary is the request builder"], "failed_approaches": [], "uncertainty": ["whether the logging module captures the payload body"]}
+"""
+
+[[turn]]
+content = "The upload client lives in src/upload.rs; the public API and the 2021 edition were left untouched."
+
+[assert]
+response_contains = ["src/upload.rs"]
+response_excludes = ["changed the public API"]
+patch_applied = false
+final_task_status = "complete"
+compacted_request_contains = [
+  "--- begin prior conversation summary",
+  "do not touch the public API",
+  "stay on the 2021 edition",
+  "Where does the upload client live",
+]
+compacted_system_excludes = ["do not touch the public API"]
+conversation_compactions = 1
+compaction_facts_only = false
+deterministic_only = [
+  "compacted_request_contains",
+  "compacted_system_excludes",
+  "conversation_compactions",
+  "compaction_facts_only",
+]

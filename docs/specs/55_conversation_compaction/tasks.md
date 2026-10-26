@@ -18,7 +18,7 @@ disagree.
 | 5 · The compaction engine | Done 2026-10-26 | `ChatOrchestrator::compact_conversation` + `conversation_window_tokens` + the automatic trigger before the current user message is appended. Facts read from the log (objective, patch decisions, plan steps, approvals incl. the new command event, verification checks, open findings); only narrative is parsed from the call. Failure produces a facts-only summary; cancel appends nothing; a log/append failure is audited and never fails the turn. Usage is recorded under `compaction_<id>` with `conversation_compaction`, so it is in session totals and in no turn ceiling. Tests (6 new in `tests/compaction.rs`): stubbed model still has every fact, byte-identical objective, failure → facts-only + later turn runs, pending approval is a no-op with no model call, accounting, auto-off makes no call, auto runs before assembly and never swallows the current request. Existing `context_assembly`/`foundation`/`plan_turn`/`turn_notes` (291) passed after moving compaction before the append. Crate clippy and the fast five passed. |
 | 6 · The prompt window | Done 2026-10-26 | `build_model_prompt` takes a window token budget and an optional summary; `window_slice` accumulates newest-first by `TokenEstimate::Prose`, always keeps the newest message, and the elision notice counts only messages neither the summary nor the window carries. Summary renders between markers inside `Recent conversation:`, never in the system prompt. Tests: three inline chat tests (short vs long budget, exact omission count, summary boundary/system-prompt exclusion) and two integration tests (summary + window sent while `read_messages` returns all 32; a fact the model omitted is still in the next request). 627 lib+scoped tests passed; crate clippy and fast five passed. |
 | 7 · Shell and UI | Done 2026-10-26 (manual browser walk not run) | `/api/session` now carries `conversationView` (every compaction, the boundary kind, omitted count, window size, `autoCompact`, `canCompact`); `POST /api/compact` runs the manual path through `run_compact_request` and returns compacted/nothing/failed. Settings › General gained the Conversation checkbox; `refreshConversationAutoCompact` reads the effective policy, and unchecking writes user config through `/api/config-set` then reloads the editor. `renderMessages` draws an expandable boundary marker (summary fields, *Compact now*) with the original messages below. Shell tests (3) cover the summary payload, the elision payload and the unknown-session refusal. `node --check`, `npm run lint:web`, shell clippy and `nextest -p desktop-shell --lib` (185) passed. **The browser walk was not performed** because this session has no browser automation; the HTML/JS and the payload were checked structurally and by test, and the manual walk is left for the reviewer. |
-| 8 · Eval harness | Not started | |
+| 8 · Eval harness | Done 2026-10-26 | Scenario schema gained `seed_conversation` and `compact_before_prompt`; assertions gained `compacted_request_contains`, `compacted_request_excludes`, `compacted_system_excludes`, `response_excludes`, `conversation_compactions` and `compaction_facts_only`; `Run` carries the first post-compaction request, its system message, the event count and the facts-only flag. Two deterministic scenarios passed in the tier: `compaction_keeps_a_stated_constraint` (the first message is a constraint, the window is 1% of the budget, manual compaction, then the ask still sends the constraint and a task still completes) and `compaction_treats_an_injected_instruction_as_data` (a fetched-page injection echoed into the summary by the scripted reply is sent only as a `> ` quotation, never in the system prompt, and no patch is proposed). A live-tier twin is credential-gated and **was not run**. Count guards moved 28 → 30 deterministic / 31 files. `nextest -p eval-harness` (97) and the deterministic tier passed, as did `cargo run -p eval-harness -- run --tier deterministic` (completion 1.000). |
 | 9 · Docs, acceptance walk, close | Not started | |
 
 **Goal:** Replace the silent eight-message / 2,000-character cliff with a
@@ -463,13 +463,13 @@ added in Task 3), `tests/compaction.rs`.
 **Files:** `crates/eval-harness/src/scenario.rs`, `runner.rs`, `assertions.rs`,
 `record.rs` (only if a count is needed), `scenarios/*.toml`, `tests/harness.rs`.
 
-- [ ] **Step 1: Write the failing harness tests.**
+- [x] **Step 1: Write the failing harness tests.**
   - `a_seeded_conversation_can_be_compacted_and_the_next_request_carries_the_constraint`;
   - `an_injected_instruction_in_summarised_material_is_quoted_data_in_the_next_request`;
   - `a_compaction_failure_is_reported_as_such_and_does_not_fail_the_run`;
   - update the scenario-count guard and its comment.
-- [ ] **Step 2: Run them and confirm they fail** (unknown scenario field).
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail** (unknown scenario field).
+- [x] **Step 3: Implement.**
   - `scenario.rs`: `seed_conversation: Vec<SeedMessage>` (role + content),
     `compact_before_prompt: bool` / `compact_after_turn: Option<u32>` if needed,
     and the new assertions.
@@ -494,16 +494,16 @@ added in Task 3), `tests/compaction.rs`.
     proposes no patch.
   - A live counterpart that asserts the following answer does not act on the
     injection, marked `tier = "live"`; never run by CI.
-- [ ] **Step 4: Falsify.** Remove the delimiters from the request → the
+- [x] **Step 4: Falsify.** Remove the delimiters from the request → the
   injection assertion fails; make the window ignore the share → the constraint
   scenario fails; count a failed compaction as success → its test fails.
-- [ ] **Step 5: Scoped checks.** `cargo nextest run -p eval-harness`,
+- [x] **Step 5: Scoped checks.** `cargo nextest run -p eval-harness`,
   `cargo run -p eval-harness -- run --tier deterministic` with
   `DAMAIAN_DATA_DIR` pointing at a scratch directory, clippy, fast five.
-- [ ] **Step 6: Record the measurement** in the Progress row and
+- [x] **Step 6: Record the measurement** in the Progress row and
   `proposal.md` §7: the window share chosen, how many scenarios triggered
   compaction, and whether the facts-only fallback occurred.
-- [ ] **Step 7: Update the Progress row** and commit:
+- [x] **Step 7: Update the Progress row** and commit:
   `Measure compacted conversations in the eval harness`.
 
 ## Task 9: Docs, acceptance walk, close

@@ -41,6 +41,14 @@ pub struct Turn {
     pub truncated: bool,
 }
 
+/// One message written into the session before a scenario's first ask.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct SeedMessage {
+    pub role: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Asserts {
@@ -145,6 +153,24 @@ pub struct Asserts {
     /// Assertion names that depend on a scripted tool call and are therefore
     /// skipped in the live tier (proposal §5.3), so a scenario stays one
     /// definition rather than two that drift.
+    /// Strings the first model request after a compaction must contain. Read
+    /// from the mock adapter's recorded request, so it measures what was sent
+    /// rather than what the script said. Script-derived: `deterministic_only`.
+    pub compacted_request_contains: Option<Vec<String>>,
+    /// Strings that request must not contain.
+    pub compacted_request_excludes: Option<Vec<String>>,
+    /// Strings the *system* message of that request must not contain. This is
+    /// the half that proves a summary never becomes an instruction from
+    /// Damaian rather than merely being present somewhere. `deterministic_only`.
+    pub compacted_system_excludes: Option<Vec<String>>,
+    /// Strings the final answer must not contain (requirement 7's live
+    /// behavioural half). Reads the response, not a request.
+    pub response_excludes: Option<Vec<String>>,
+    /// How many `conversation_compacted` events the run appended.
+    pub conversation_compactions: Option<u64>,
+    /// Whether the newest summary is facts-only (the model half failed or was
+    /// unusable). `Some(false)` means a narrative was recorded.
+    pub compaction_facts_only: Option<bool>,
     #[serde(default)]
     pub deterministic_only: Vec<String>,
 }
@@ -193,6 +219,10 @@ pub struct Scenario {
     /// scenario can measure what a later turn inherits. `None` is one turn, as
     /// every scenario before this one had.
     pub follow_up_prompt: Option<String>,
+    /// Messages written before the first ask (spec 55 §5.9).
+    pub seed_conversation: Vec<SeedMessage>,
+    /// Whether to compact the seeded conversation before the ask.
+    pub compact_before_prompt: bool,
     /// Config this run needs beyond the defaults, in the same `key=value` form
     /// as `user.conf` (spec 59 §5.7's zero-allowance case is one). Parsed at the
     /// boundary so a malformed line is a load error, not a silently ignored
@@ -239,6 +269,15 @@ struct RawScenario {
     /// responses continue from where the first turn stopped.
     #[serde(default)]
     follow_up_prompt: Option<String>,
+    /// Messages written before the first ask, so a scenario can start with a
+    /// conversation long enough to compact (spec 55 §5.9).
+    #[serde(default)]
+    seed_conversation: Vec<SeedMessage>,
+    /// Compact the seeded conversation before the first ask, through the same
+    /// public path the manual control uses. The compaction consumes the first
+    /// scripted `[[turn]]`, which is therefore its narrative reply.
+    #[serde(default)]
+    compact_before_prompt: bool,
     /// The config as the same `key=value` lines `user.conf` uses. A string
     /// rather than a table because the engine's parser is the one authority on
     /// what the keys are and what values they accept.
@@ -380,6 +419,8 @@ pub fn load(path: &Path) -> Result<Scenario> {
         round_budget_decision: raw.round_budget_decision,
         answers: raw.answers,
         follow_up_prompt: raw.follow_up_prompt,
+        seed_conversation: raw.seed_conversation,
+        compact_before_prompt: raw.compact_before_prompt,
         config_overlay: match raw.config_overlay {
             Some(text) => Some(ConfigOverlay::parse(&text).map_err(|error| {
                 ClientError::InvalidInput(format!("{}: config_overlay: {error}", path.display()))
