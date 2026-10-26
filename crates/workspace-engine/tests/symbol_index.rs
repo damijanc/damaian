@@ -3202,6 +3202,9 @@ impl Repo {
                 limit: 16_000,
                 hook_context: &[],
                 plan: None,
+                pinned: &[],
+                restriction: None,
+                conversation_summary: None,
             })
             .expect("the symbols assembly should run")
     }

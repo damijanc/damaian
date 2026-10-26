@@ -19,7 +19,7 @@ Related implementation specs:
 (the scale and disclosure pattern this builds on; §2 of that spec names the
 context strip as this spec's opening item),
 [`../26_context_assembly/proposal.md`](../26_context_assembly/proposal.md) and
-[`../27_context_inspector.md`](../27_context_inspector.md) (the eventual
+[`../27_context_inspector.md`](../27_context_inspector/proposal.md) (the eventual
 first-class context view; this spec is presentation only and does not
 anticipate it).
 
@@ -53,7 +53,7 @@ permanent chrome around too little conversation.
 - **Persisting context files per message.** The disclosure is live-turn only
   and disappears on session reload — see [`context.md`](context.md) §3. Making
   it durable is a server-side storage change, and it belongs with
-  [`../27_context_inspector.md`](../27_context_inspector.md), which will own the
+  [`../27_context_inspector.md`](../27_context_inspector/proposal.md), which will own the
   context view properly.
 - **Changing what goes into context.** Assembly, budgets and ordering are
   specs 26 and 27. This spec changes only how the result is displayed.

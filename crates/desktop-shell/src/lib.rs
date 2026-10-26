@@ -12,22 +12,23 @@ use workspace_engine::hooks::{
     HookReviewDecision, list_hooks, review_hook, set_hook_enabled, test_run,
 };
 use workspace_engine::{
-    AgentCheckBatch, AgentFallbackProposal, AgentPlanProposal, AgentQuestionProposal,
-    AgentRoundBudgetProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage,
-    ChatTurnOptions, ChatTurnResult, CommitError, Config, CostEstimate, CurlModelTransport,
-    DataSchemaOutcome, EffectivePolicy, ExportFormat, GeneratedSecretWarning, HookActivation,
-    HookEvent, LanguageServerStatus, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
-    ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns,
-    PlanRevisionStep, ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState,
-    RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session,
-    SessionMode, StepStatus, SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnNotes, TurnPhase,
-    TurnProgress, TurnSink, VerificationReport, WebDiagnosticCall, WebDiagnosticKind,
-    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
-    WorkspaceEngine, allow_always_eligible, command_approval_prompt, custom_profile_ids,
-    ensure_data_dir_schema, export_profile, import_profile, normalize_mcp_server_id,
-    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
-    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
-    review_profile_import, review_profile_rejections, select_profile,
+    AgentCheckBatch, AgentContextReview, AgentFallbackProposal, AgentPlanProposal,
+    AgentQuestionProposal, AgentRoundBudgetProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken,
+    ChatMessage, ChatTurnOptions, ChatTurnResult, CommitError, Config, ContextDecision,
+    ContextManifest, CostEstimate, CurlModelTransport, DataSchemaOutcome, EffectivePolicy,
+    ExportFormat, GeneratedSecretWarning, HookActivation, HookEvent, LanguageServerStatus,
+    LineRange, McpClient, McpServerConfig, McpTokenResolver, McpTransport, ModelAdapter,
+    ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
+    ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState, RepositoryConfigReport,
+    ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus,
+    SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink,
+    VerificationReport, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
+    allow_always_eligible, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
+    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
+    select_profile,
 };
 
 mod keychain;
@@ -331,6 +332,11 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/session-create") => handle_session_create(stream, &request),
         ("POST", "/api/session-rename") => handle_session_rename(stream, &request),
         ("POST", "/api/session-mode") => handle_session_mode(stream, &request),
+        ("POST", "/api/context-pin") => handle_context_pin(stream, &request),
+        ("POST", "/api/context-restriction") => handle_context_restriction(stream, &request),
+        ("POST", "/api/context-remove") => handle_context_remove(stream, &request),
+        ("POST", "/api/context-remove-summary") => handle_context_remove_summary(stream, &request),
+        ("POST", "/api/resume-context-stream") => handle_resume_context_stream(stream, &request),
         // Spec 22 Task 10. Each findings route is its own function, so the
         // engine it builds lives in that frame rather than this one: every
         // arm's locals share `handle_connection`'s frame, and inlining three
@@ -618,13 +624,27 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         .session_store
         .read_turn_notes(&session_id)
         .map_err(|error| error.to_string())?;
+    // Each turn's newest context manifest, joined by `taskId` (spec 27 §5.3),
+    // and the session's pins and restriction (spec 27 §5.4).
+    let task_contexts = engine
+        .session_store
+        .read_session_context_manifests(&session_id)
+        .map_err(|error| error.to_string())?;
+    let context_pins = engine
+        .session_store
+        .context_pins(&session_id)
+        .unwrap_or_default();
+    let context_restriction = engine
+        .session_store
+        .context_restriction(&session_id)
+        .map_err(|error| error.to_string())?;
     write_response(
         stream,
         request,
         200,
         "application/json",
         &format!(
-            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}],\"conversationView\":{}}}",
+            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}],\"conversationView\":{},\"contextState\":{{\"pins\":{},\"restrictedPaths\":{}}}}}",
             session_json(&session, engine.session_store.session_mode(&session.id)),
             messages_json(&messages, &question_states),
             task_states_json(
@@ -634,9 +654,12 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
                 &task_failure_kinds,
                 &task_web_diagnostics,
                 &task_notes,
+                &task_contexts,
                 &engine.config
             ),
-            conversation_json(&engine, &session_id)
+            conversation_json(&engine, &session_id),
+            serde_json::to_string(&context_pins).unwrap_or_else(|_| "[]".to_string()),
+            serde_json::to_string(&context_restriction).unwrap_or_else(|_| "null".to_string())
         ),
     )
 }
@@ -855,6 +878,190 @@ fn handle_session_mode(stream: &mut TcpStream, request: &Request) -> Result<(), 
         200,
         "application/json",
         &format!("{{\"session\":{}}}", session_json(&session, mode)),
+    )
+}
+
+/// Adds, removes or clears a session pin (spec 27 §5.4).
+///
+/// `action` is required and unknown values are refused rather than defaulted:
+/// a typo must not turn into a clear.
+fn handle_context_pin(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let session_id = required_form(&form, "session_id")?;
+    let action = required_form(&form, "action")?;
+    let engine = default_engine()?;
+    if engine
+        .session_store
+        .read_session(&session_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err(format!("Unknown session: {session_id}"));
+    }
+    match action.as_str() {
+        "add" => {
+            let path = required_form(&form, "path")?;
+            let range = parse_context_range(&form)?;
+            engine
+                .session_store
+                .add_context_pin(&session_id, &path, range)
+                .map_err(|error| error.to_string())?;
+        }
+        "remove" => {
+            let path = required_form(&form, "path")?;
+            let range = parse_context_range(&form)?;
+            engine
+                .session_store
+                .remove_context_pin(&session_id, &path, range)
+                .map_err(|error| error.to_string())?;
+        }
+        "clear" => engine
+            .session_store
+            .clear_context_pins(&session_id)
+            .map_err(|error| error.to_string())?,
+        other => return Err(format!("Unknown context pin action: {other}")),
+    }
+    let pins = engine
+        .session_store
+        .context_pins(&session_id)
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"pins\":{}}}",
+            serde_json::to_string(&pins).unwrap_or_else(|_| "[]".to_string())
+        ),
+    )
+}
+
+/// `start`/`end` as an optional 1-based inclusive range. Both absent is a
+/// whole-file pin; one absent or `start > end` is a malformed request.
+fn parse_context_range(form: &HashMap<String, String>) -> Result<Option<LineRange>, String> {
+    let start = form
+        .get("start")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| "start must be a line number".to_string())
+        })
+        .transpose()?;
+    let end = form
+        .get("end")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| "end must be a line number".to_string())
+        })
+        .transpose()?;
+    match (start, end) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) if start >= 1 && start <= end => {
+            Ok(Some(LineRange { start, end }))
+        }
+        _ => Err("A context pin range needs start and end with 1 <= start <= end".to_string()),
+    }
+}
+
+/// Sets or clears the session's path restriction (spec 27 §5.4).
+fn handle_context_restriction(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let session_id = required_form(&form, "session_id")?;
+    let engine = default_engine()?;
+    if engine
+        .session_store
+        .read_session(&session_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err(format!("Unknown session: {session_id}"));
+    }
+    if form.get("clear").map(String::as_str) == Some("true") {
+        engine
+            .session_store
+            .clear_context_restriction(&session_id)
+            .map_err(|error| error.to_string())?;
+    } else {
+        let paths = form
+            .get("paths")
+            .map(|value| {
+                value
+                    .lines()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        engine
+            .session_store
+            .set_context_restriction(&session_id, &paths)
+            .map_err(|error| error.to_string())?;
+    }
+    let restriction = engine
+        .session_store
+        .context_restriction(&session_id)
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"restrictedPaths\":{}}}",
+            serde_json::to_string(&restriction).unwrap_or_else(|_| "null".to_string())
+        ),
+    )
+}
+
+/// Removes one optional item from a paused review (spec 27 §5.4).
+fn handle_context_remove(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let proposal_id = required_form(&form, "proposal_id")?;
+    let index = required_form(&form, "index")?
+        .parse::<usize>()
+        .map_err(|_| "index must be a number".to_string())?;
+    let engine = default_engine()?;
+    let manifest = engine
+        .chat_orchestrator
+        .remove_context_item(&proposal_id, index)
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"manifest\":{}}}",
+            serde_json::to_string(&manifest).unwrap_or_else(|_| "null".to_string())
+        ),
+    )
+}
+
+/// Removes the conversation summary from a paused review (spec 27 §5.4).
+fn handle_context_remove_summary(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let proposal_id = required_form(&form, "proposal_id")?;
+    let engine = default_engine()?;
+    let manifest = engine
+        .chat_orchestrator
+        .remove_context_summary(&proposal_id)
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"manifest\":{}}}",
+            serde_json::to_string(&manifest).unwrap_or_else(|_| "null".to_string())
+        ),
     )
 }
 
@@ -2302,6 +2509,14 @@ fn handle_resume_plan_stream(stream: &mut TcpStream, request: &Request) -> Resul
     })
 }
 
+fn handle_resume_context_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    write_event_stream_headers(stream, request)?;
+    stream_turn(stream, move |cancel, events| {
+        run_resume_context_request(&form, cancel, events)
+    })
+}
+
 fn handle_answer_question_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     write_event_stream_headers(stream, request)?;
@@ -2577,6 +2792,78 @@ fn run_resume_plan_request(
             &mut sink,
         )
         .map_err(|error| error.to_string())
+}
+
+/// Sends or declines a paused pre-send context review (spec 27 §5.1).
+///
+/// Declining needs no model, so it deliberately does not resolve a key: a user
+/// with no configured provider must still be able to say "do not send this".
+fn run_resume_context_request(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+) -> Result<ChatTurnResult, String> {
+    let repo = required_form(form, "repo")?;
+    let proposal_id = required_form(form, "proposal_id")?;
+    let decision = match required_form(form, "decision")?.as_str() {
+        "send" => ContextDecision::Send,
+        "decline" => ContextDecision::Decline,
+        other => {
+            return Err(format!(
+                "Unknown context review decision: {other}. Expected send or decline."
+            ));
+        }
+    };
+    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+
+    let mut model_adapter: Box<dyn ModelAdapter> = match decision {
+        ContextDecision::Send => chat_model_adapter(&engine.config, || {
+            resolve_shell_model_api_key(&engine.config)
+        })?,
+        ContextDecision::Decline => Box::new(NoModelAdapter),
+    };
+    let mut on_token = |token: &str| {
+        let _ = events.send(TurnEvent::Token(token.to_string()));
+    };
+    let mut on_progress = |progress: TurnProgress| {
+        if let Some(event) = turn_progress_event(progress) {
+            let _ = events.send(event);
+        }
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_context_decision(
+            &proposal_id,
+            decision,
+            "desktop_user",
+            model_adapter.as_mut(),
+            &mut sink,
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// A model adapter that is never called. Used by the decline path, which must
+/// not resolve a provider key to say "send nothing".
+struct NoModelAdapter;
+
+impl ModelAdapter for NoModelAdapter {
+    fn stream_response(
+        &mut self,
+        _request: &workspace_engine::ModelRequest,
+        _cancel: &CancelToken,
+        _on_token: &mut dyn FnMut(&str),
+        _on_wait: &mut dyn FnMut(u64),
+    ) -> workspace_engine::Result<ModelRun> {
+        Err(workspace_engine::ClientError::InvalidInput(
+            "A declined context review makes no model call".to_string(),
+        ))
+    }
 }
 
 /// Answers the question a turn paused on (spec 50 requirement 1).
@@ -2874,6 +3161,7 @@ fn turn_progress_event(progress: TurnProgress) -> Option<TurnEvent> {
             active: false,
         }),
         TurnProgress::WebDiagnostic(record) => Some(TurnEvent::WebDiagnostic(record)),
+        TurnProgress::Context(manifest) => Some(TurnEvent::Context(manifest)),
         TurnProgress::Paused | TurnProgress::Resumed | TurnProgress::NoteAdded { .. } => None,
     }
 }
@@ -4589,6 +4877,9 @@ enum TurnEvent {
     },
     /// Boxed for the same reason as `Plan`: a record carries a whole report.
     WebDiagnostic(Box<WebDiagnosticRecord>),
+    /// What the turn is about to send (spec 27 §5.1). Boxed because a manifest
+    /// carries every included ref and exclusion.
+    Context(Box<ContextManifest>),
     Token(String),
     Done(Box<ChatTurnResult>),
     Failed(String),
@@ -4769,6 +5060,11 @@ fn relay_turn_events<W: Write>(
                         TurnEvent::WebDiagnostic(record) => {
                             write_sse_event(out, "web_diagnostic", &web_diagnostic_json(record))
                         }
+                        TurnEvent::Context(manifest) => write_sse_event(
+                            out,
+                            "context",
+                            &serde_json::to_string(manifest).unwrap_or_default(),
+                        ),
                         TurnEvent::Token(token) => write_sse_event(
                             out,
                             "token",
@@ -4849,7 +5145,7 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         None => "null".to_string(),
     };
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"checkBatch\":{},\"verificationReport\":{},\"turnNotes\":{},\"usage\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"checkBatch\":{},\"verificationReport\":{},\"turnNotes\":{},\"usage\":{},\"contextReview\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -4867,7 +5163,21 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         check_batch_json(result.check_batch.as_ref()),
         verification_report_json(result.verification_report.as_ref()),
         turn_notes,
-        task_usage_json(result.usage.as_ref(), result.estimated_cost)
+        task_usage_json(result.usage.as_ref(), result.estimated_cost),
+        context_review_json(result.context_review.as_ref())
+    )
+}
+
+/// A paused pre-send context review (spec 27 §5.1). The manifest only: the
+/// prepared items never leave the engine.
+fn context_review_json(review: Option<&AgentContextReview>) -> String {
+    let Some(review) = review else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"proposalId\":\"{}\",\"manifest\":{}}}",
+        escape_json(&review.id),
+        serde_json::to_string(&review.manifest).unwrap_or_else(|_| "null".to_string())
     )
 }
 
@@ -5444,6 +5754,7 @@ fn session_fields_json(session: &Session) -> String {
 /// sent as zero: a session written before spec 19 has no figures, and a zero
 /// would render as a turn that cost nothing. Same for `reportedCost`, which is
 /// absent unless the provider actually reported one.
+#[allow(clippy::too_many_arguments)]
 fn task_states_json(
     statuses: &HashMap<String, String>,
     usage: &HashMap<String, TaskUsage>,
@@ -5451,6 +5762,7 @@ fn task_states_json(
     failure_kinds: &HashMap<String, String>,
     web_diagnostics: &HashMap<String, Vec<WebDiagnosticRecord>>,
     notes: &BTreeMap<String, TurnNotes>,
+    contexts: &HashMap<String, ContextManifest>,
     config: &Config,
 ) -> String {
     let mut entries: Vec<&String> = statuses.keys().collect();
@@ -5523,15 +5835,26 @@ fn task_states_json(
                 ),
                 _ => String::new(),
             };
+            // The turn's newest context manifest (spec 27 §5.3). Absent when
+            // the turn has no recorded assembly, so an old session stays
+            // panel-free rather than showing an empty one.
+            let context_field = match contexts.get(*id) {
+                Some(manifest) => format!(
+                    ",\"context\":{}",
+                    serde_json::to_string(manifest).unwrap_or_else(|_| "null".to_string())
+                ),
+                None => String::new(),
+            };
             format!(
-                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}{}{}}}",
+                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}{}{}{}}}",
                 escape_json(id),
                 escape_json(&statuses[*id]),
                 usage_json,
                 failure_kind_field,
                 plan_json_field,
                 notes_field,
-                web_diagnostics_field
+                web_diagnostics_field,
+                context_field
             )
         })
         .collect::<Vec<_>>()
@@ -5934,6 +6257,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &HashMap::new(),
             &Config::default(),
         );
         assert!(json.contains("\"active\":false"), "{json}");
@@ -5950,6 +6274,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &HashMap::new(),
             &Config::default(),
         );
         assert!(json.contains("\"active\":true"), "{json}");
@@ -9761,6 +10086,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &HashMap::new(),
             &Config::default(),
         );
 
@@ -9914,6 +10240,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &notes,
+            &HashMap::new(),
             &Config::default(),
         );
 
@@ -9956,6 +10283,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &HashMap::new(),
             &Config::default(),
         );
 
@@ -9978,6 +10306,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &HashMap::new(),
             &Config::default(),
         );
 
@@ -10003,6 +10332,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &HashMap::new(),
             &Config::default(),
         );
 
@@ -10078,6 +10408,7 @@ mod tests {
             &HashMap::new(),
             &web_diagnostics,
             &BTreeMap::new(),
+            &HashMap::new(),
             &Config::default(),
         );
 
@@ -10130,7 +10461,8 @@ mod tests {
     fn a_web_diagnostic_progress_event_streams_as_web_diagnostic() {
         let record = sample_web_diagnostic_record("task_1");
 
-        let event = turn_progress_event(TurnProgress::WebDiagnostic(Box::new(record.clone())));
+        let event =
+            crate::turn_progress_event(TurnProgress::WebDiagnostic(Box::new(record.clone())));
         let Some(TurnEvent::WebDiagnostic(streamed)) = event else {
             panic!("expected TurnEvent::WebDiagnostic");
         };
@@ -10620,6 +10952,194 @@ mod tests {
     /// Spec 57 Task 6: a worker's turns, hosted on this process by the same
     /// turn thread `--worker` runs. Its data directory is the shell's
     /// (`isolated_data_dir`), as it is in the app.
+    fn context_test_repo() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "damaian-shell-context-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("README.md"), "# Context\n").unwrap();
+        dir
+    }
+
+    fn shell_session() -> String {
+        isolated_data_dir();
+        let engine = default_engine().expect("the shell engine should build");
+        engine
+            .session_store
+            .create_session("repo_shell_context", "Context controls")
+            .expect("a session")
+            .id
+    }
+
+    #[test]
+    fn context_pin_routes_round_trip_and_session_json_carries_them() {
+        let session_id = shell_session();
+        let (port, token) = serve_for_test();
+
+        let added = post_form_for_test(
+            port,
+            &token,
+            "/api/context-pin",
+            &form_body_for_test(&[
+                ("session_id", &session_id),
+                ("action", "add"),
+                ("path", "src/lib.rs"),
+                ("start", "2"),
+                ("end", "8"),
+            ]),
+        );
+        assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+        let json = json_of(&added);
+        assert_eq!(json["pins"][0]["path"], "src/lib.rs");
+        assert_eq!(json["pins"][0]["range"]["start"], 2);
+
+        let session = json_of(&get_for_test(
+            port,
+            &token,
+            &format!("/api/session?session_id={session_id}"),
+        ));
+        assert_eq!(session["contextState"]["pins"][0]["path"], "src/lib.rs");
+        assert!(session["contextState"]["restrictedPaths"].is_null());
+
+        let cleared = post_form_for_test(
+            port,
+            &token,
+            "/api/context-pin",
+            &form_body_for_test(&[("session_id", &session_id), ("action", "clear")]),
+        );
+        assert_eq!(json_of(&cleared)["pins"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn context_restriction_route_sets_and_clears() {
+        let session_id = shell_session();
+        let (port, token) = serve_for_test();
+
+        let set = post_form_for_test(
+            port,
+            &token,
+            "/api/context-restriction",
+            &form_body_for_test(&[
+                ("session_id", &session_id),
+                ("paths", "src/lib.rs\nsrc/main.rs"),
+            ]),
+        );
+        assert_eq!(
+            json_of(&set)["restrictedPaths"].as_array().unwrap().len(),
+            2
+        );
+
+        let cleared = post_form_for_test(
+            port,
+            &token,
+            "/api/context-restriction",
+            &form_body_for_test(&[("session_id", &session_id), ("clear", "true")]),
+        );
+        assert!(json_of(&cleared)["restrictedPaths"].is_null());
+    }
+
+    #[test]
+    fn a_context_pin_action_is_never_defaulted() {
+        let session_id = shell_session();
+        let (port, token) = serve_for_test();
+        let response = post_form_for_test(
+            port,
+            &token,
+            "/api/context-pin",
+            &form_body_for_test(&[("session_id", &session_id), ("action", "unknown_action")]),
+        );
+        assert!(
+            response.contains("Unknown context pin action"),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn a_context_review_decision_is_never_defaulted() {
+        let repo = context_test_repo();
+        let (port, token) = serve_for_test();
+        let response = post_form_for_test(
+            port,
+            &token,
+            "/api/resume-context-stream",
+            &form_body_for_test(&[
+                ("repo", &repo.to_string_lossy()),
+                ("proposal_id", "contextreview_missing"),
+                ("decision", "maybe"),
+            ]),
+        );
+        assert!(
+            response.contains("Unknown context review decision"),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn task_json_carries_the_manifest_and_no_item_content() {
+        let mut statuses = HashMap::new();
+        statuses.insert("task_1".to_string(), "complete".to_string());
+        let mut contexts = HashMap::new();
+        contexts.insert(
+            "task_1".to_string(),
+            workspace_engine::ContextManifest {
+                repository_id: "repo".to_string(),
+                task_id: "task_1".to_string(),
+                assembled_at_ms: 0,
+                limit: workspace_engine::EffectiveLimit::declared(100),
+                total_tokens: 12,
+                categories: Vec::new(),
+                included: vec![workspace_engine::IncludedRef {
+                    category: workspace_engine::ContextCategory::FileRanges,
+                    kind: workspace_engine::ContextKind::ExplicitFile,
+                    path: Some("src/lib.rs".to_string()),
+                    range: None,
+                    tokens: 12,
+                    root_path: None,
+                    provenance: None,
+                }],
+                excluded: Vec::new(),
+                conversation_summary: None,
+                symbol_provenance: None,
+            },
+        );
+
+        let json = task_states_json(
+            &statuses,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &contexts,
+            &Config::default(),
+        );
+
+        assert!(json.contains("\"context\""), "{json}");
+        assert!(json.contains("src/lib.rs"), "{json}");
+        assert!(!json.contains("item content"), "{json}");
+    }
+
+    #[test]
+    fn a_context_progress_event_becomes_the_sse_context_event() {
+        let manifest = workspace_engine::ContextManifest {
+            repository_id: "repo".to_string(),
+            task_id: "task".to_string(),
+            assembled_at_ms: 0,
+            limit: workspace_engine::EffectiveLimit::declared(10),
+            total_tokens: 3,
+            categories: Vec::new(),
+            included: Vec::new(),
+            excluded: Vec::new(),
+            conversation_summary: None,
+            symbol_provenance: None,
+        };
+        let event = crate::turn_progress_event(TurnProgress::Context(Box::new(manifest)));
+        assert!(matches!(event, Some(crate::TurnEvent::Context(_))));
+    }
     mod worker_turns {
         use super::*;
         use crate::run_chat_request_with;

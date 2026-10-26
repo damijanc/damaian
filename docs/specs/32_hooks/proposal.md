@@ -200,7 +200,7 @@ navigable and repairable. `context` additions are bounded strings that enter
 context assembly as ordinary `ContextItem`s in a dedicated category
 ([spec 26](../26_context_assembly/proposal.md)) — not a privileged channel, subject to the
 same budget and the same visibility in the inspector
-([spec 27](../27_context_inspector.md)).
+([spec 27](../27_context_inspector/proposal.md)).
 
 ### 5.3 Hooks return verdicts, not edits
 
@@ -378,7 +378,7 @@ report means.
   persistence, and entry into context.
 - Hook output exceeding the byte ceiling is a failure, not a truncation.
 - `context` additions appear in the context inspector
-  ([spec 27](../27_context_inspector.md)) within a bounded category, not as
+  ([spec 27](../27_context_inspector/proposal.md)) within a bounded category, not as
   instructions.
 - Hook configuration is a capability key: a repository cannot add a hook without
   review, nor disable a user's hook.
@@ -506,9 +506,12 @@ needs no budget. The limit is a guard for hook chains, not a normal path.
 - **`before_tool` and `after_tool` also attach to a requested command**, in
   Task 5's dispatcher. Task 8 therefore dispatches them for the turn's own
   action only and does not double-dispatch for a hook's command.
-- **The inspector criterion is not met**, because spec 27 does not exist. It is
-  met as a bounded `hook_context` item in the turn's context plan (criterion
-  16).
+- **The inspector criterion is now met.** When #32 was closed it was met only
+  as a bounded `hook_context` item in the turn's context plan, because spec 27
+  did not exist (criterion 16). Spec 27's inspector gives `HookContext` its own
+  category row in the pre- and post-send manifest, with its items, token count
+  and exclusions, so the criterion's "visible in the context inspector" half is
+  satisfied by the shipped panel.
 
 ### 7.4 What the plan did not foresee
 

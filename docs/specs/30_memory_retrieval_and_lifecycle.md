@@ -13,7 +13,7 @@ and secret policy), section 7.9 (context assembly). Related implementation
 specs: [`11_agents_md_support.md`](11_agents_md_support.md),
 [`20_working_modes/proposal.md`](20_working_modes/proposal.md),
 [`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (the only delivery path),
-[`27_context_inspector.md`](27_context_inspector.md) (where recall is visible
+[`27_context_inspector.md`](27_context_inspector/proposal.md) (where recall is visible
 and removable), [`28_memory_model_and_storage.md`](28_memory_model_and_storage.md),
 [`29_memory_creation_and_consent.md`](29_memory_creation_and_consent.md).
 See also [`SECURITY.md`](../../SECURITY.md).
@@ -60,7 +60,7 @@ mechanisms below are what make the slow failure detectable.
   and excluded items with reasons (§5.5). It has **no memory category yet** —
   adding one is this spec's integration point.
 - **The inspector renders the manifest** pre- and post-send and supports removing
-  optional items ([spec 27](27_context_inspector.md) §5.2, §5.4), with
+  optional items ([spec 27](27_context_inspector/proposal.md) §5.2, §5.4), with
   `ContextCategory::Required` non-removable by API.
 - **Verification distinguishes evidence staleness.**
   [Spec 28](28_memory_model_and_storage.md) §5.1 defines
@@ -112,7 +112,7 @@ mechanisms below are what make the slow failure detectable.
   this phase's minimum slice.
 - A management view for listing, editing, or exporting — also WP3. Inspection of
   *what was recalled* is available here through
-  [spec 27](27_context_inspector.md); inspection of the *store* is WP3.
+  [spec 27](27_context_inspector/proposal.md); inspection of the *store* is WP3.
 - Automatic memory creation or revision. Revalidation marks an entry stale; it
   never rewrites the statement.
 - Cross-repository or cross-user recall beyond the opt-in user scope.
@@ -228,7 +228,7 @@ displays.
 
 ### 5.4 Visibility and removal
 
-Requirement 3 is satisfied by [spec 27](27_context_inspector.md) with no new
+Requirement 3 is satisfied by [spec 27](27_context_inspector/proposal.md) with no new
 surface. The `Memory` category appears in the inspector like any other:
 
 ```text
@@ -316,7 +316,7 @@ WP3 criterion both require that deleting an entry removes it from future context
 (§5.3 is lexical over the store), which removes the class of bug — but two
 derived copies do exist and must be handled:
 
-- **In-flight `PreparedContext`.** [Spec 27](27_context_inspector.md) §5.1
+- **In-flight `PreparedContext`.** [Spec 27](27_context_inspector/proposal.md) §5.1
   assembles before sending. An entry deleted between assembly and send must not
   be sent, so the send path re-checks entry state immediately before the call.
 - **Any in-process retrieval cache.** If one is added for performance, it is

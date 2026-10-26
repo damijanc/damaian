@@ -17,7 +17,7 @@ screenshot artifacts §1 is about; Done 2026-09-29, so §5.5 builds on its
 shipped artifact record rather than coordinating a change to it),
 [`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (the budget and category an
 image enters through),
-[`27_context_inspector.md`](27_context_inspector.md) (where a user sees what was
+[`27_context_inspector.md`](27_context_inspector/proposal.md) (where a user sees what was
 sent), [`44_composer_control_density/proposal.md`](44_composer_control_density/proposal.md)
 (owns the composer surface the attach control lives on),
 [`53_session_search_and_export.md`](53_session_search_and_export/proposal.md) (the export
@@ -228,7 +228,7 @@ paste one that a text message would have had cleaned.
 | **Never** | An image fetched from a URL, including one named by a fetched page ([spec 51](51_external_reference_retrieval.md) §5.3 constraint 5 forbids sub-resource loading, and an image is a sub-resource) |
 | Size | A byte cap and a dimension cap; a larger image is downscaled with the downscaling stated, or refused where it cannot be |
 | Storage | Copied under the data directory keyed by content hash, so the transcript is stable if the user moves or deletes the original |
-| Provenance | Recorded as user-attached or agent-captured, and shown as such in [spec 27](27_context_inspector.md) |
+| Provenance | Recorded as user-attached or agent-captured, and shown as such in [spec 27](27_context_inspector/proposal.md) |
 
 The "never from a URL" row is a boundary worth stating rather than assuming.
 Spec 51 lets a model name a URL to fetch as text; if an image could arrive the

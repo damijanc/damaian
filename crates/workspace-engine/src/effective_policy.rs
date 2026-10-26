@@ -137,6 +137,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "repository_map_max_tokens" => "Tokens the repository map may use per turn",
         "symbol_context_max_tokens" => "Tokens matching symbols may use per turn",
         "conversation_auto_compact" => "Compact long conversations automatically",
+        "pause_for_context_review" => "Pause before sending to review context",
         "conversation_window_share" => "Conversation kept verbatim (share of context)",
         "context_budget.instructions" => "Context share for instructions",
         "context_budget.hook_context" => "Context share for hook context",

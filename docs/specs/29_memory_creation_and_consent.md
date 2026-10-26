@@ -334,7 +334,7 @@ explanation says what actually changes:
 
 - Entries in this scope are recalled in **every** repository, not only this one.
 - They are still local, still visible in the context inspector
-  ([spec 27](27_context_inspector.md)), still removable.
+  ([spec 27](27_context_inspector/proposal.md)), still removable.
 - Existing project memory is unaffected and is not migrated.
 
 Enabling is not a side effect of confirming a proposal. A user-scope proposal

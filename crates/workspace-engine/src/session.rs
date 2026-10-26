@@ -3,6 +3,7 @@ use crate::clarification::{
     AskUserInput, PendingDecision, PendingQuestionRef, QuestionState, validate_answer,
 };
 use crate::error::Result;
+use crate::file_access::LineRange;
 use crate::hash::{create_id, now_millis};
 use crate::mode::SessionMode;
 use crate::model::{TokenUsage, UsageSource};
@@ -42,6 +43,19 @@ pub struct TurnNotes {
     pub chars: usize,
     /// The running size of the record after the change.
     pub total_chars: usize,
+}
+
+/// A file or range the user pinned for the session (spec 27 §5.4).
+///
+/// A whole-file pin has `range: None`; a ranged pin names the lines the user
+/// chose. The pin is control state, not content: only the path and range are
+/// stored, and the assembler reads the file through the same path policy and
+/// redaction as every other source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPin {
+    pub path: String,
+    pub range: Option<LineRange>,
 }
 
 /// What makes a session a worker (spec 57 §5.1 step 7): where it came from,
@@ -1091,6 +1105,175 @@ impl SessionStore {
             }
         }
         Ok(allowed)
+    }
+
+    /// Adds a file or range to the context the session carries into every
+    /// turn (spec 27 §5.4). Appends an event; it never rewrites the log.
+    pub fn add_context_pin(
+        &self,
+        session_id: &str,
+        path: &str,
+        range: Option<LineRange>,
+    ) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "context_pin_added",
+            &serde_json::json!({
+                "sessionId": session_id,
+                "path": path,
+                "range": range,
+            })
+            .to_string(),
+        )
+    }
+
+    /// Removes one pin, identified by `(path, range)` so a second range of the
+    /// same file survives. A pair that is not pinned is a no-op.
+    pub fn remove_context_pin(
+        &self,
+        session_id: &str,
+        path: &str,
+        range: Option<LineRange>,
+    ) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "context_pin_removed",
+            &serde_json::json!({
+                "sessionId": session_id,
+                "path": path,
+                "range": range,
+            })
+            .to_string(),
+        )
+    }
+
+    pub fn clear_context_pins(&self, session_id: &str) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "context_pins_cleared",
+            &serde_json::json!({ "sessionId": session_id }).to_string(),
+        )
+    }
+
+    /// The session's pins, newest-wins, in pin order.
+    ///
+    /// Reads `parsed_events`, not `active_events`: a rewind discards
+    /// conversation, not the user's control of what may be sent — the same
+    /// reasoning `session_mode` records. A missing or unreadable log is an
+    /// empty list, not an error, like the browser-diagnostics approval.
+    pub fn context_pins(&self, session_id: &str) -> Result<Vec<ContextPin>> {
+        let content = fs::read_to_string(self.session_log_path(session_id)).unwrap_or_default();
+        let mut pins: Vec<ContextPin> = Vec::new();
+        for event in parsed_events(&content).0 {
+            match event.event_type.as_str() {
+                "context_pin_added" => {
+                    let Some(pin) = context_pin_from_event(&event) else {
+                        continue;
+                    };
+                    if !pins.contains(&pin) {
+                        pins.push(pin);
+                    }
+                }
+                "context_pin_removed" => {
+                    if let Some(pin) = context_pin_from_event(&event) {
+                        pins.retain(|existing| existing != &pin);
+                    }
+                }
+                "context_pins_cleared" => pins.clear(),
+                _ => {}
+            }
+        }
+        Ok(pins)
+    }
+
+    /// Restricts the session's file-bearing context to `paths` (spec 27 §5.4).
+    /// An empty list is a restriction that admits no file content, not a clear.
+    pub fn set_context_restriction(&self, session_id: &str, paths: &[String]) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "context_restriction_set",
+            &serde_json::json!({
+                "sessionId": session_id,
+                "paths": paths,
+            })
+            .to_string(),
+        )
+    }
+
+    pub fn clear_context_restriction(&self, session_id: &str) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "context_restriction_cleared",
+            &serde_json::json!({ "sessionId": session_id }).to_string(),
+        )
+    }
+
+    /// The newest restriction, or `None` when none is set. `Some([])` is an
+    /// empty restriction and excludes every file-bearing source.
+    pub fn context_restriction(&self, session_id: &str) -> Result<Option<Vec<String>>> {
+        let content = fs::read_to_string(self.session_log_path(session_id)).unwrap_or_default();
+        let mut restriction = None;
+        for event in parsed_events(&content).0 {
+            match event.event_type.as_str() {
+                "context_restriction_set" => {
+                    restriction = Some(
+                        event
+                            .payload
+                            .get("paths")
+                            .and_then(|paths| serde_json::from_value(paths.clone()).ok())
+                            .unwrap_or_default(),
+                    );
+                }
+                "context_restriction_cleared" => restriction = None,
+                _ => {}
+            }
+        }
+        Ok(restriction)
+    }
+
+    /// The newest `context_assembled` manifest per task (spec 27 §5.3).
+    ///
+    /// The manifest is an **audit** record, not a session event, so this reads
+    /// `<data_dir>/audit/events.jsonl` and keeps the entries whose
+    /// `sessionId` matches. A removed item appends a second assembly before the
+    /// resumed turn sends anything, so "newest wins" is what makes the
+    /// post-send view show what was actually sent rather than what was first
+    /// planned. The manifest is stored as one JSON string field by
+    /// `audit_fields`; a malformed record is skipped rather than failing the
+    /// session read. Audit retention can remove older events, in which case an
+    /// old turn simply has no stored manifest — the same shape as a session
+    /// written before #26.
+    pub fn read_session_context_manifests(
+        &self,
+        session_id: &str,
+    ) -> Result<HashMap<String, crate::context_manager::ContextManifest>> {
+        let path = self.data_dir.join("audit").join("events.jsonl");
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(HashMap::new());
+        };
+        let mut manifests = HashMap::new();
+        for value in content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        {
+            if value.get("eventType").and_then(|kind| kind.as_str()) != Some("context_assembled") {
+                continue;
+            }
+            if value.get("sessionId").and_then(|id| id.as_str()) != Some(session_id) {
+                continue;
+            }
+            let Some(task_id) = value.get("taskId").and_then(|id| id.as_str()) else {
+                continue;
+            };
+            let Some(raw) = value.get("manifest").and_then(|raw| raw.as_str()) else {
+                continue;
+            };
+            let Ok(manifest) = serde_json::from_str(raw) else {
+                continue;
+            };
+            manifests.insert(task_id.to_string(), manifest);
+        }
+        Ok(manifests)
     }
 
     /// Sets the session's working mode by appending an event; the log is
@@ -3020,6 +3203,23 @@ impl SessionEvent {
     }
 }
 
+/// The pin a `context_pin_added`/`context_pin_removed` payload names.
+///
+/// `None` for a payload with no path, so a malformed event is skipped rather
+/// than becoming a pin on an empty path.
+fn context_pin_from_event(event: &SessionEvent) -> Option<ContextPin> {
+    let path = event.text("path")?;
+    if path.trim().is_empty() {
+        return None;
+    }
+    let range = event
+        .payload
+        .get("range")
+        .filter(|value| !value.is_null())
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    Some(ContextPin { path, range })
+}
+
 /// `None` for a line that is not a complete JSON object carrying an
 /// `eventType`. A torn final line is the expected cause; `seq` falls back to
 /// the caller's line ordering for events written before spec 16 added it, which
@@ -3982,5 +4182,139 @@ mod tests {
         expected.sort();
 
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn pins_are_appended_events_and_replay_newest_wins() {
+        let store = SessionStore::new(temp_data_dir("pins"));
+        let session = store.create_session("repo_1", "Pinned").unwrap();
+        let range = |start, end| LineRange { start, end };
+
+        store
+            .add_context_pin(&session.id, "src/upload.rs", None)
+            .unwrap();
+        store
+            .add_context_pin(&session.id, "src/upload.rs", Some(range(40, 120)))
+            .unwrap();
+        store
+            .add_context_pin(&session.id, "tests/upload.rs", Some(range(1, 20)))
+            .unwrap();
+        store
+            .remove_context_pin(&session.id, "tests/upload.rs", Some(range(1, 20)))
+            .unwrap();
+        store
+            .add_context_pin(&session.id, "tests/upload.rs", Some(range(30, 50)))
+            .unwrap();
+
+        assert_eq!(
+            store.context_pins(&session.id).unwrap(),
+            vec![
+                ContextPin {
+                    path: "src/upload.rs".to_string(),
+                    range: None,
+                },
+                ContextPin {
+                    path: "src/upload.rs".to_string(),
+                    range: Some(range(40, 120)),
+                },
+                ContextPin {
+                    path: "tests/upload.rs".to_string(),
+                    range: Some(range(30, 50)),
+                },
+            ]
+        );
+
+        let log = fs::read_to_string(store.session_log_path(&session.id)).unwrap();
+        assert!(log.contains("\"eventType\":\"context_pin_added\""), "{log}");
+        assert!(
+            log.contains("\"eventType\":\"context_pin_removed\""),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn clearing_pins_removes_every_earlier_pin() {
+        let store = SessionStore::new(temp_data_dir("pins-clear"));
+        let session = store.create_session("repo_1", "Pinned").unwrap();
+
+        store.add_context_pin(&session.id, "a.rs", None).unwrap();
+        store.add_context_pin(&session.id, "b.rs", None).unwrap();
+        store.clear_context_pins(&session.id).unwrap();
+        assert!(store.context_pins(&session.id).unwrap().is_empty());
+
+        store.add_context_pin(&session.id, "c.rs", None).unwrap();
+        assert_eq!(
+            store
+                .context_pins(&session.id)
+                .unwrap()
+                .into_iter()
+                .map(|pin| pin.path)
+                .collect::<Vec<_>>(),
+            vec!["c.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_pin_round_trips_through_a_second_store_and_survives_a_rewind() {
+        let data_dir = temp_data_dir("pins-restart");
+        let store = SessionStore::new(&data_dir);
+        let session = store.create_session("repo_1", "Pinned").unwrap();
+        let pin = ContextPin {
+            path: "src/a.rs".to_string(),
+            range: Some(LineRange { start: 3, end: 9 }),
+        };
+        store
+            .add_context_pin(&session.id, &pin.path, pin.range)
+            .unwrap();
+        // A rewind discards conversation, not the user's control of context.
+        store.rewind_conversation(&session.id, 0).unwrap();
+
+        let reopened = SessionStore::new(&data_dir);
+        assert_eq!(reopened.context_pins(&session.id).unwrap(), vec![pin]);
+    }
+
+    #[test]
+    fn a_restriction_replaces_and_clears() {
+        let store = SessionStore::new(temp_data_dir("restriction"));
+        let session = store.create_session("repo_1", "Restricted").unwrap();
+
+        assert_eq!(store.context_restriction(&session.id).unwrap(), None);
+
+        store
+            .set_context_restriction(&session.id, &["src/a.rs".to_string()])
+            .unwrap();
+        store
+            .set_context_restriction(&session.id, &["src/b.rs".to_string()])
+            .unwrap();
+        assert_eq!(
+            store.context_restriction(&session.id).unwrap(),
+            Some(vec!["src/b.rs".to_string()])
+        );
+
+        store.clear_context_restriction(&session.id).unwrap();
+        assert_eq!(store.context_restriction(&session.id).unwrap(), None);
+
+        store.set_context_restriction(&session.id, &[]).unwrap();
+        assert_eq!(
+            store.context_restriction(&session.id).unwrap(),
+            Some(Vec::new()),
+            "an empty restriction is a restriction, not a clear"
+        );
+    }
+
+    #[test]
+    fn a_line_containing_a_pin_event_name_is_not_a_pin() {
+        let store = SessionStore::new(temp_data_dir("pin-substring"));
+        let session = store.create_session("repo_1", "Talk").unwrap();
+        store
+            .append_message(
+                &session.id,
+                None,
+                "user",
+                "we should add a context_pin_added event someday",
+            )
+            .unwrap();
+
+        assert!(store.context_pins(&session.id).unwrap().is_empty());
     }
 }

@@ -56,11 +56,11 @@ pub mod worktree_access;
 pub use audit::AuditLog;
 pub use cancel::CancelToken;
 pub use chat::{
-    AgentCheckBatch, AgentCommandProposal, AgentFallbackProposal, AgentPatchProposal,
-    AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal, ChatOrchestrator,
-    ChatTurnOptions, ChatTurnResult, McpTokenResolver, PausedTurns, PhaseKind, PlanRevisionStep,
-    ResumeDecisionOptions, RoundBudgetDecision, RoundBudgetPause, TurnPhase, TurnProgress,
-    TurnSink,
+    AgentCheckBatch, AgentCommandProposal, AgentContextReview, AgentFallbackProposal,
+    AgentPatchProposal, AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal,
+    ChatOrchestrator, ChatTurnOptions, ChatTurnResult, ContextDecision, McpTokenResolver,
+    PausedTurns, PhaseKind, PlanRevisionStep, ResumeDecisionOptions, RoundBudgetDecision,
+    RoundBudgetPause, TurnPhase, TurnProgress, TurnSink,
 };
 pub use checkpoint::{
     CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,
@@ -98,9 +98,9 @@ pub use config::{
 };
 pub use context_manager::{
     CategoryUsage, CollectionSource, ContextBudget, ContextCategory, ContextItem, ContextKind,
-    ContextManager, ContextManifest, ContextPlan, ContextRequest, EffectiveLimit, ExclusionRecord,
-    IncludedRef, LimitSource, PromptSection, PromptSectionName, RepositoryMapSource, SymbolSource,
-    TokenEstimate,
+    ContextManager, ContextManifest, ContextPlan, ContextRequest, ConversationSummaryUsage,
+    EffectiveLimit, ExclusionRecord, IncludedRef, LimitSource, PreparedContext, PromptSection,
+    PromptSectionName, RepositoryMapSource, SymbolProvenanceCounts, SymbolSource, TokenEstimate,
 };
 pub use data_schema::{
     CURRENT_DATA_SCHEMA_VERSION, DataSchemaError, DataSchemaOutcome, ensure_data_dir_schema,
@@ -184,9 +184,9 @@ pub use repository_trust::{
 };
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
-    ActionMarker, ChatMessage, DanglingAction, ExportFormat, PatchFileDecision, PendingApprovalRef,
-    SearchOptions, Session, SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskStatus,
-    TaskUsage, TurnNotes, WorkerRecord,
+    ActionMarker, ChatMessage, ContextPin, DanglingAction, ExportFormat, PatchFileDecision,
+    PendingApprovalRef, SearchOptions, Session, SessionSearchHit, SessionSearchResult,
+    SessionStore, Task, TaskStatus, TaskUsage, TurnNotes, WorkerRecord,
 };
 pub use steering::TurnSteering;
 pub use symbol_index::{

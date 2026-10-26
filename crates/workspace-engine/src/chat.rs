@@ -14,7 +14,10 @@ use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::compaction::ConversationSummary;
 use crate::config::{Config, CostEstimate, McpTransport};
-use crate::context_manager::{ContextManager, ContextPlan, ContextRequest, PromptSectionName};
+use crate::context_manager::{
+    ContextManager, ContextManifest, ContextPlan, ContextRequest, PreparedContext,
+    PromptSectionName,
+};
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
 use crate::error::{ClientError, ProviderRefusal, Result};
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
@@ -256,6 +259,11 @@ pub enum TurnProgress {
     /// Boxed because a record carries a whole report, several times larger
     /// than every other variant.
     WebDiagnostic(Box<WebDiagnosticRecord>),
+    /// What this turn is sending, emitted after assembly and before the first
+    /// model call (spec 27 §5.1, C9). Boxed because a manifest carries every
+    /// included ref and exclusion; it is sent once or twice per turn, not per
+    /// token. The shell sees the manifest only — never an item's content.
+    Context(Box<ContextManifest>),
     /// The turn is holding at a round boundary because its steering asked it
     /// to (spec 57 §5.4). Only a host that passed `steering` ever sees this.
     Paused,
@@ -324,6 +332,10 @@ impl TurnSink<'_> {
 
     fn web_diagnostic(&mut self, record: WebDiagnosticRecord) {
         (self.on_progress)(TurnProgress::WebDiagnostic(Box::new(record)));
+    }
+
+    fn context(&mut self, manifest: &ContextManifest) {
+        (self.on_progress)(TurnProgress::Context(Box::new(manifest.clone())));
     }
 
     fn progress(&mut self, event: TurnProgress) {
@@ -564,6 +576,30 @@ pub struct ChatTurnResult {
     /// The turn's final notes, already redacted, and whether they include text
     /// carried from an earlier turn (spec 65 §5.8). Empty notes show nothing.
     pub turn_notes: Option<TurnNotesView>,
+    /// The turn paused after assembly and before its first model call so the
+    /// user can review its context (spec 27 §5.1). Resumed through
+    /// [`ChatOrchestrator::resume_after_context_decision`]. Carries the
+    /// manifest only; the prepared items stay on disk.
+    pub context_review: Option<AgentContextReview>,
+}
+
+/// A paused pre-send context review (spec 27 §5.1).
+///
+/// `manifest` is the whole view: categories, included refs by path and range,
+/// exclusions and the limit. It deliberately has no `items` field — the shell
+/// must never receive item content, and a structure that cannot hold it is a
+/// stronger guarantee than a renderer that remembers not to print it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentContextReview {
+    pub id: String,
+    pub manifest: ContextManifest,
+}
+
+/// What the user decided on a paused context review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextDecision {
+    Send,
+    Decline,
 }
 
 /// What the user sees of a turn's notes (spec 65 §5.8).
@@ -1154,6 +1190,13 @@ impl ChatOrchestrator {
             .read_task_plan(&session.id, &task.id)
             .ok()
             .flatten();
+        // Session-scoped controls (spec 27 §5.4), read once before assembly so
+        // every source sees the same list.
+        let context_pins = self
+            .session_store
+            .context_pins(&session.id)
+            .unwrap_or_default();
+        let context_restriction = self.session_store.context_restriction(&session.id)?;
         let context = self.context_manager.build_context(ContextRequest {
             repository_root,
             repository_id: &index.repository_id,
@@ -1164,26 +1207,29 @@ impl ChatOrchestrator {
             limit: self.config.context_token_budget(),
             hook_context: &hook_context,
             plan: carried_plan.as_ref(),
+            pinned: &context_pins,
+            restriction: context_restriction.as_deref(),
+            conversation_summary: conversation.summary.as_ref(),
         })?;
-        // One `context_assembled` event per assembly, recorded by the caller:
-        // the manager holds no audit log and adding one would be a second audit
-        // path for one event (proposal §5.5, Correction C9). The manifest holds
-        // no content, and `AuditLog::record` redacts every field value anyway.
-        let mut context_fields = vec![
-            ("actor", "system".to_string()),
-            ("sessionId", session.id.clone()),
-        ];
-        context_fields.extend(context.manifest.audit_fields());
-        self.audit_log
-            .record("context_assembled", &context_fields)?;
-        let model_prompt = build_model_prompt(
-            &context,
+        // What this turn is about to send (spec 27 §5.1, C9). Sent before the
+        // first call, so the default (no pause) still gives the user a
+        // pre-send view; the shell relays it as its `context` event.
+        //
+        // The matching `context_assembled` record is written only once the turn
+        // is committed to sending (below, and on `Send` in
+        // `resume_after_context_decision`). A pause has assembled a plan but
+        // sent nothing, and a declined turn never sends: recording at assembly
+        // would put a "what this turn was sent" manifest on a task that sent
+        // nothing (proposal §5.3, C9).
+        sink.context(&context.manifest);
+        let prompt_conversation = build_conversation(
             &conversation.messages,
             conversation.summary.as_ref(),
             self.conversation_window_tokens(),
             &self.scanner,
-            None,
         );
+        let model_prompt =
+            build_model_prompt_with_conversation(&context, &prompt_conversation, None);
         let mode = self.session_store.session_mode(&session.id);
         // A worker is never invited to hand off further work (spec 57 §5.0).
         let offer_handoffs = self.config.enable_worker_sessions
@@ -1197,6 +1243,36 @@ impl ChatOrchestrator {
             )),
             ModelMessage::user(model_prompt),
         ];
+
+        // The one interruption point between assembly and sending (spec 27
+        // §5.1). Off by default: a confirmation on every message is how the
+        // feature gets abandoned. Nothing has been sent when this pauses.
+        if self.config.pause_for_context_review {
+            return self.pause_for_context_review(
+                repository_root,
+                session,
+                task,
+                context,
+                prompt_conversation,
+                conversation.summary.clone(),
+                messages,
+                turn_notes,
+                options,
+            );
+        }
+
+        // The turn is now committed to sending, so this is its one
+        // `context_assembled` record. The manager holds no audit log and adding
+        // one would be a second audit path for one event (proposal §5.5,
+        // Correction C9). The manifest holds no content, and `AuditLog::record`
+        // redacts every field value anyway.
+        let mut context_fields = vec![
+            ("actor", "system".to_string()),
+            ("sessionId", session.id.clone()),
+        ];
+        context_fields.extend(context.manifest.audit_fields());
+        self.audit_log
+            .record("context_assembled", &context_fields)?;
 
         self.run_agentic_turn(
             repository_root,
@@ -1213,6 +1289,358 @@ impl ChatOrchestrator {
             sink,
             options,
         )
+    }
+
+    /// Parks a turn after assembly and before its first model call so the user
+    /// can review and edit what it is about to send (spec 27 §5.1).
+    ///
+    /// Nothing has been sent, so this is a pause and not a failure. It is the
+    /// only pause that may be resumed by
+    /// [`Self::resume_after_context_decision`].
+    #[allow(clippy::too_many_arguments)]
+    fn pause_for_context_review(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        plan: ContextPlan,
+        conversation: PromptConversation,
+        summary: Option<ConversationSummary>,
+        messages: Vec<ModelMessage>,
+        turn_notes: TurnNotesState,
+        turn_options: ChatTurnOptions,
+    ) -> Result<ChatTurnResult> {
+        let proposal_id = create_id("contextreview");
+        let prepared = PreparedContext::from_plan(&plan);
+        let manifest = prepared.manifest.clone();
+        let context_files = prepared.files();
+        let response =
+            "Review the context before this turn is sent. Nothing has been sent yet.".to_string();
+        self.pending_commands.save(&PendingChatTurn {
+            proposal_id: proposal_id.clone(),
+            session: session.clone(),
+            task: task.clone(),
+            repository_root: repository_root.to_string_lossy().to_string(),
+            context_files: context_files.clone(),
+            round: 0,
+            exploration_rounds: 0,
+            turn_notes: turn_notes.text.clone(),
+            turn_notes_carried: turn_notes.carried,
+            calls: turn_notes.calls.clone(),
+            step_evidence: Vec::new(),
+            plan_reminder_sent: false,
+            messages,
+            matched_tool_call: None,
+            last_content: String::new(),
+            turn_options,
+            reasoning_content: None,
+            round_calls_fed_back: false,
+            mcp_call: None,
+            web_diagnostic_call: None,
+            plan_review: None,
+            provider_fallback: None,
+            round_budget: None,
+            question: None,
+            check_batch: None,
+            context_review: Some(PendingContextReview {
+                prepared,
+                conversation,
+                summary,
+                summary_removed: false,
+            }),
+        })?;
+        self.note_pending_approvals(
+            &session,
+            &task,
+            vec![PendingApproval {
+                kind: "context_review".to_string(),
+                proposal_id: proposal_id.clone(),
+            }],
+        );
+        let task = self.session_store.await_approval(
+            &task,
+            &crate::session::PendingApprovalRef {
+                kind: "context_review".to_string(),
+                proposal_id: proposal_id.clone(),
+            },
+        )?;
+        self.audit_log.record(
+            "context_review_paused",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
+                ("proposalId", proposal_id.clone()),
+                ("tokenEstimate", manifest.total_tokens.to_string()),
+                ("limit", manifest.limit.tokens.to_string()),
+                (
+                    "limitSource",
+                    format!("{:?}", manifest.limit.source).to_lowercase(),
+                ),
+            ],
+        )?;
+        let usage = self
+            .session_store
+            .read_task_usage(&session.id)
+            .ok()
+            .and_then(|usage| usage.get(&task.id).copied());
+        let estimated_cost = usage.as_ref().and_then(|usage| {
+            self.config.estimated_cost(&TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                source: usage.source,
+            })
+        });
+        let mut model_run =
+            ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
+        model_run.content = response.clone();
+        Ok(ChatTurnResult {
+            session,
+            task,
+            model_run,
+            context_files,
+            response,
+            command_proposal: None,
+            patch_proposal: None,
+            plan_proposal: None,
+            question_proposal: None,
+            fallback_proposal: None,
+            round_budget_proposal: None,
+            check_batch: None,
+            verification_report: None,
+            turn_notes: turn_notes.view(),
+            cancelled: false,
+            usage,
+            estimated_cost,
+            context_review: Some(AgentContextReview {
+                id: proposal_id,
+                manifest,
+            }),
+        })
+    }
+
+    /// Continues or declines a paused pre-send review (spec 27 §5.1).
+    ///
+    /// `Send` re-renders the user message from the amended prepared plan and
+    /// enters the same `run_agentic_turn` a non-paused turn would have entered.
+    /// `Decline` sends nothing at all: no model call, and the task is
+    /// `Cancelled` with a transcript line saying so.
+    pub fn resume_after_context_decision(
+        &self,
+        proposal_id: &str,
+        decision: ContextDecision,
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let pending = self.pending_commands.take(proposal_id)?;
+        let turn_notes = TurnNotesState::from_pending(&pending);
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::ContextReview)?;
+        let Some(review) = pending.context_review.clone() else {
+            // `refuse_unless_paused_for` just proved the pause is a review.
+            unreachable!("a context review pause must carry its review");
+        };
+        self.audit_log.record(
+            "context_review_decision",
+            &[
+                ("actor", approved_by.to_string()),
+                ("sessionId", pending.session.id.clone()),
+                ("taskId", pending.task.id.clone()),
+                ("proposalId", proposal_id.to_string()),
+                (
+                    "decision",
+                    match decision {
+                        ContextDecision::Send => "send",
+                        ContextDecision::Decline => "decline",
+                    }
+                    .to_string(),
+                ),
+            ],
+        )?;
+
+        if decision == ContextDecision::Decline {
+            let message = "No request was sent: you declined the context review.".to_string();
+            self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+            self.session_store.append_message(
+                &pending.session.id,
+                Some(&pending.task.id),
+                "assistant",
+                &message,
+            )?;
+            let task = self.session_store.update_task_status_with_kind(
+                &pending.task,
+                TaskStatus::Cancelled,
+                Some(&message),
+                Some("context_review_declined"),
+            )?;
+            let usage = self
+                .session_store
+                .read_task_usage(&pending.session.id)
+                .ok()
+                .and_then(|usage| usage.get(&task.id).copied());
+            let estimated_cost = usage.as_ref().and_then(|usage| {
+                self.config.estimated_cost(&TokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cached_input_tokens: usage.cached_input_tokens,
+                    source: usage.source,
+                })
+            });
+            let mut model_run = ModelRun::cancelled_before_start(
+                &self.config.model_provider,
+                &self.config.model_name,
+            );
+            model_run.content = message.clone();
+            return Ok(ChatTurnResult {
+                session: pending.session,
+                task,
+                model_run,
+                context_files: pending.context_files,
+                response: message,
+                command_proposal: None,
+                patch_proposal: None,
+                plan_proposal: None,
+                question_proposal: None,
+                fallback_proposal: None,
+                round_budget_proposal: None,
+                check_batch: None,
+                verification_report: None,
+                turn_notes: turn_notes.view(),
+                cancelled: true,
+                usage,
+                estimated_cost,
+                context_review: None,
+            });
+        }
+
+        let plan = review.prepared.into_plan();
+        let conversation = if review.summary_removed {
+            let covered = review
+                .summary
+                .as_ref()
+                .map(|summary| summary.message_count)
+                .unwrap_or(0);
+            review.conversation.without_summary(covered)
+        } else {
+            review.conversation
+        };
+        let mut messages = pending.messages;
+        // The request is rebuilt from the amended plan; the system prompt is
+        // unchanged and stays at index 0.
+        if messages.len() >= 2 {
+            messages[1] = ModelMessage::user(build_model_prompt_with_conversation(
+                &plan,
+                &conversation,
+                None,
+            ));
+        }
+        self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+        let task = self.session_store.update_task_status(
+            &pending.task,
+            TaskStatus::PreparingContext,
+            None,
+        )?;
+        // The turn is now committed to sending, so this is its one
+        // `context_assembled` record, whether or not the user amended the plan.
+        // The newest record wins in the reader, so an amended manifest is what
+        // the post-send view shows, and an unchanged send writes it once.
+        let mut context_fields = vec![
+            ("actor", "system".to_string()),
+            ("sessionId", pending.session.id.clone()),
+        ];
+        context_fields.extend(plan.manifest.audit_fields());
+        self.audit_log
+            .record("context_assembled", &context_fields)?;
+        sink.context(&plan.manifest);
+
+        self.run_agentic_turn(
+            &PathBuf::from(&pending.repository_root),
+            pending.session,
+            task,
+            plan.files,
+            messages,
+            pending.round,
+            pending.exploration_rounds,
+            turn_notes,
+            pending.step_evidence,
+            pending.plan_reminder_sent,
+            model_adapter,
+            sink,
+            pending.turn_options,
+        )
+    }
+
+    /// Removes one optional item from a paused review and returns the amended
+    /// manifest (spec 27 §5.4).
+    ///
+    /// Refuses a turn that is not a context review, and refuses `Required`
+    /// below the UI. The pending turn is **not** taken: the review is still
+    /// open, and the user may remove another item or decline.
+    pub fn remove_context_item(&self, proposal_id: &str, index: usize) -> Result<ContextManifest> {
+        let pending = self.pending_commands.load(proposal_id)?;
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::ContextReview)?;
+        let mut review = pending.context_review.clone().ok_or_else(|| {
+            ClientError::InvalidInput(format!("{proposal_id} is not a context review"))
+        })?;
+        let record = review.prepared.remove_optional(index)?;
+        self.audit_log.record(
+            "context_item_removed",
+            &[
+                ("actor", "user".to_string()),
+                ("sessionId", pending.session.id.clone()),
+                ("taskId", pending.task.id.clone()),
+                ("proposalId", proposal_id.to_string()),
+                ("category", record.category.as_str().to_string()),
+                (
+                    "path",
+                    record.path.clone().unwrap_or_else(|| "(none)".to_string()),
+                ),
+                (
+                    "range",
+                    record
+                        .range
+                        .map(|range| format!("{}-{}", range.start, range.end))
+                        .unwrap_or_else(|| "(whole)".to_string()),
+                ),
+            ],
+        )?;
+        self.save_context_review(&pending, review.clone())?;
+        Ok(review.prepared.manifest)
+    }
+
+    /// Removes the #55 conversation summary from a paused review
+    /// (spec 27 §5.4). The summary is not an item, so it has its own call.
+    pub fn remove_context_summary(&self, proposal_id: &str) -> Result<ContextManifest> {
+        let pending = self.pending_commands.load(proposal_id)?;
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::ContextReview)?;
+        let mut review = pending.context_review.clone().ok_or_else(|| {
+            ClientError::InvalidInput(format!("{proposal_id} is not a context review"))
+        })?;
+        let record = review.prepared.remove_summary()?;
+        review.summary_removed = true;
+        self.audit_log.record(
+            "context_summary_removed",
+            &[
+                ("actor", "user".to_string()),
+                ("sessionId", pending.session.id.clone()),
+                ("taskId", pending.task.id.clone()),
+                ("proposalId", proposal_id.to_string()),
+                ("category", record.category.as_str().to_string()),
+            ],
+        )?;
+        self.save_context_review(&pending, review.clone())?;
+        Ok(review.prepared.manifest)
+    }
+
+    fn save_context_review(
+        &self,
+        pending: &PendingChatTurn,
+        review: PendingContextReview,
+    ) -> Result<()> {
+        let mut updated = pending.clone();
+        updated.context_review = Some(review);
+        self.pending_commands.save(&updated)
     }
 
     /// Runs the verification that a settled Code-mode patch made due (spec 23).
@@ -1957,6 +2385,7 @@ impl ChatOrchestrator {
                 files_changed: changed.clone(),
                 file_hashes,
             }),
+            context_review: None,
         })?;
         self.note_pending_approvals(
             &session,
@@ -2136,6 +2565,15 @@ impl ChatOrchestrator {
             },
         );
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
+        // The repair continuation sees the same conversation the turn does,
+        // including any active summary (spec 55 §5.3), and the session's
+        // context controls (spec 27 §5.4).
+        let conversation = self.session_store.read_conversation(&session.id)?;
+        let context_pins = self
+            .session_store
+            .context_pins(&session.id)
+            .unwrap_or_default();
+        let context_restriction = self.session_store.context_restriction(&session.id)?;
         let context = self.context_manager.build_context(ContextRequest {
             repository_root,
             repository_id: &index.repository_id,
@@ -2146,6 +2584,9 @@ impl ChatOrchestrator {
             limit: self.config.context_token_budget(),
             hook_context: &[],
             plan: Some(plan),
+            pinned: &context_pins,
+            restriction: context_restriction.as_deref(),
+            conversation_summary: conversation.summary.as_ref(),
         })?;
         let mut fields = vec![
             ("actor", "system".to_string()),
@@ -2153,9 +2594,7 @@ impl ChatOrchestrator {
         ];
         fields.extend(context.manifest.audit_fields());
         self.audit_log.record("context_assembled", &fields)?;
-        // The repair continuation sees the same conversation the turn does,
-        // including any active summary (spec 55 §5.3).
-        let conversation = self.session_store.read_conversation(&session.id)?;
+        sink.context(&context.manifest);
         let messages = vec![
             ModelMessage::system(system_prompt_for_session(
                 SessionMode::Code,
@@ -2397,6 +2836,7 @@ impl ChatOrchestrator {
             cancelled: false,
             usage,
             estimated_cost,
+            context_review: None,
         })
     }
 
@@ -5627,6 +6067,7 @@ impl ChatOrchestrator {
                         round_budget: None,
                         question: None,
                         check_batch: None,
+                        context_review: None,
                     })?;
                     self.note_pending_approvals(
                         &session,
@@ -5913,6 +6354,7 @@ impl ChatOrchestrator {
                                     round_budget: None,
                                     question: None,
                                     check_batch: None,
+                                    context_review: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -6296,6 +6738,7 @@ impl ChatOrchestrator {
                                     round_budget: None,
                                     question: None,
                                     check_batch: None,
+                                    context_review: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -6418,6 +6861,7 @@ impl ChatOrchestrator {
                                     round_budget: None,
                                     question: None,
                                     check_batch: None,
+                                    context_review: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -6633,6 +7077,7 @@ impl ChatOrchestrator {
                                             question_id: question.question_id().to_string(),
                                         }),
                                         check_batch: None,
+                                        context_review: None,
                                     })?;
                                     // A clean stop for a human decision, not a
                                     // crash: the marker says what it waits on.
@@ -7023,6 +7468,7 @@ impl ChatOrchestrator {
             fallback_proposal: None,
             round_budget_proposal: None,
             check_batch: proposals.checks,
+            context_review: None,
             verification_report: None,
             turn_notes: turn_notes.view(),
             cancelled: false,
@@ -7083,6 +7529,7 @@ impl ChatOrchestrator {
             round_budget: None,
             question: None,
             check_batch: None,
+            context_review: None,
         })?;
         self.note_pending_approvals(
             &session,
@@ -7148,6 +7595,7 @@ impl ChatOrchestrator {
             }),
             round_budget_proposal: None,
             check_batch: None,
+            context_review: None,
             verification_report: None,
             turn_notes: turn_notes.view(),
             cancelled: false,
@@ -7216,6 +7664,7 @@ impl ChatOrchestrator {
             round_budget: Some(pause),
             question: None,
             check_batch: None,
+            context_review: None,
         })?;
         self.note_pending_approvals(
             &session,
@@ -7288,6 +7737,7 @@ impl ChatOrchestrator {
                 at_hard_cap,
             }),
             check_batch: None,
+            context_review: None,
             verification_report: None,
             turn_notes: turn_notes.view(),
             cancelled: false,
@@ -7384,6 +7834,7 @@ impl ChatOrchestrator {
             fallback_proposal: None,
             round_budget_proposal: None,
             check_batch: None,
+            context_review: None,
             verification_report: None,
             turn_notes: turn_notes.view(),
             cancelled: true,
@@ -8009,6 +8460,10 @@ enum PausedFor {
     /// (spec 23).
     CheckBatch,
     Question,
+    /// A pre-send context review (spec 27 §5.1). Nothing was sent, and the
+    /// only route that may continue it is
+    /// `resume_after_context_decision`.
+    ContextReview,
     /// A file carrying more than one marker. No writer produces this, and
     /// guessing which pause it means is exactly the mistake this type exists
     /// to prevent, so every resume refuses it.
@@ -8024,6 +8479,7 @@ impl PausedFor {
             Self::RoundBudget => "a round-budget pause",
             Self::CheckBatch => "a check approval",
             Self::Question => "a question",
+            Self::ContextReview => "a context review",
             Self::Conflicting => "more than one kind of pause",
         }
     }
@@ -8036,6 +8492,7 @@ impl PausedFor {
             Self::RoundBudget => "resume_round_budget",
             Self::CheckBatch => "resume_after_check_decision",
             Self::Question => "resume_after_answer",
+            Self::ContextReview => "resume_after_context_decision",
             Self::Conflicting => "",
         }
     }
@@ -8059,13 +8516,15 @@ fn paused_for(pending: &PendingChatTurn) -> PausedFor {
         pending.round_budget.is_some(),
         pending.question.is_some(),
         pending.check_batch.is_some(),
+        pending.context_review.is_some(),
     ) {
-        (false, false, false, false, false) => PausedFor::Action,
-        (true, false, false, false, false) => PausedFor::PlanReview,
-        (false, true, false, false, false) => PausedFor::ProviderFallback,
-        (false, false, true, false, false) => PausedFor::RoundBudget,
-        (false, false, false, true, false) => PausedFor::Question,
-        (false, false, false, false, true) => PausedFor::CheckBatch,
+        (false, false, false, false, false, false) => PausedFor::Action,
+        (true, false, false, false, false, false) => PausedFor::PlanReview,
+        (false, true, false, false, false, false) => PausedFor::ProviderFallback,
+        (false, false, true, false, false, false) => PausedFor::RoundBudget,
+        (false, false, false, true, false, false) => PausedFor::Question,
+        (false, false, false, false, true, false) => PausedFor::CheckBatch,
+        (false, false, false, false, false, true) => PausedFor::ContextReview,
         _ => PausedFor::Conflicting,
     }
 }
@@ -8228,6 +8687,11 @@ struct PendingChatTurn {
     /// finishes the report without re-deriving what the check saw.
     #[serde(default)]
     check_batch: Option<PendingCheckBatch>,
+    /// Present when the pause is a pre-send context review (spec 27 §5.1).
+    /// `#[serde(default)]` keeps pending turns written before the review
+    /// existed loadable.
+    #[serde(default)]
+    context_review: Option<PendingContextReview>,
 }
 
 /// The persisted half of a check-batch pause (spec 23 §3).
@@ -8286,6 +8750,21 @@ impl BrowserCheck {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PendingPlanReview {
     deferred_action: String,
+}
+
+/// The persisted half of a pre-send context review (spec 27 §5.1).
+///
+/// The prepared plan is what the user may edit; the conversation block and the
+/// summary are what the resumed turn needs to re-render the user message
+/// without re-reading the transcript. `summary` and `summary_removed` are both
+/// kept so the resume can either send the summary or state that the user
+/// removed it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingContextReview {
+    prepared: PreparedContext,
+    conversation: PromptConversation,
+    summary: Option<ConversationSummary>,
+    summary_removed: bool,
 }
 
 /// The persisted half of a round-budget pause (spec 61). `rounds_granted` is
@@ -8401,6 +8880,24 @@ impl PausedTurns {
         })
     }
 
+    /// The manifest a paused context review would send, or `None` when the id
+    /// names no paused turn, or one that is not a context review (spec 27).
+    ///
+    /// Read as loose JSON for the same reason as the other readers: a file
+    /// written by a different version must answer "not a review" rather than
+    /// fail to deserialise and look absent.
+    pub fn context_review_manifest(&self, proposal_id: &str) -> Option<ContextManifest> {
+        let path = PendingCommandStore::new(&self.data_dir).path_for(proposal_id);
+        let content = fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let manifest = value
+            .get("context_review")?
+            .get("prepared")?
+            .get("manifest")?
+            .clone();
+        serde_json::from_value(manifest).ok()
+    }
+
     /// The proposal ids a paused check batch holds, in card order, or `None`
     /// when the id names no paused turn, or one that is not a check batch
     /// (spec 23). Recovery reads it to know whether the batch can still be
@@ -8472,6 +8969,18 @@ impl PendingCommandStore {
         })?;
         fs::write(path, json)?;
         Ok(())
+    }
+
+    /// Loads the pending state without consuming it. Used by a paused review's
+    /// edit routes, where the turn must remain resumable afterwards.
+    fn load(&self, proposal_id: &str) -> Result<PendingChatTurn> {
+        let path = self.path_for(proposal_id);
+        let content = fs::read_to_string(&path).map_err(|_| {
+            ClientError::InvalidInput(format!("No pending chat turn for proposal: {proposal_id}"))
+        })?;
+        serde_json::from_str(&content).map_err(|error| {
+            ClientError::InvalidInput(format!("Failed to parse pending chat turn: {error}"))
+        })
     }
 
     /// Loads and removes the pending state — a command decision can only be
@@ -8667,12 +9176,114 @@ fn command_envelope_paragraph_read_only(shell: &str) -> String {
     )
 }
 
+/// The conversation half of a user message: the #55 summary and the recent
+/// messages, already redacted (spec 27 §5.1).
+///
+/// Split out so a paused pre-send review can re-render the request after an
+/// item removal without re-reading the transcript. `build_model_prompt` still
+/// composes the same two pieces and produces byte-identical text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PromptConversation {
+    /// The rendered, redacted summary, if the turn sends one.
+    summary: Option<String>,
+    /// The omitted-message notice and the messages; `None` when the block would
+    /// be empty, which is what decides whether its heading appears.
+    body: Option<String>,
+}
+
+impl PromptConversation {
+    /// The same conversation with the #55 summary removed for this turn.
+    ///
+    /// The model is told what it lost rather than silently receiving a
+    /// shorter block: the summary's whole job is to make an omission visible.
+    fn without_summary(&self, messages: usize) -> Self {
+        let notice = format!(
+            "[Damaian: the user removed the conversation summary covering {messages} earlier \
+             message{} from this request.]\n",
+            if messages == 1 { "" } else { "s" }
+        );
+        Self {
+            summary: None,
+            body: Some(format!("{notice}{}", self.body.clone().unwrap_or_default())),
+        }
+    }
+}
+
+fn build_conversation(
+    prior_messages: &[ChatMessage],
+    summary: Option<&ConversationSummary>,
+    window_tokens: usize,
+    scanner: &SecretScanner,
+) -> PromptConversation {
+    // A plan reminder is the engine's nudge, not the user's words: seeding a
+    // later turn with it would present an instruction as something the user
+    // said (spec 66 `context.md` D10).
+    let conversation_messages =
+        crate::compaction::sendable_messages(&prior_messages.iter().collect::<Vec<_>>());
+    // Spec 55 §5.1: the window is a token budget, not eight messages, so a
+    // conversation of short messages keeps more turns than one of long ones.
+    let recent_messages = crate::compaction::window_slice(&conversation_messages, window_tokens);
+    let omitted = conversation_messages.len() - recent_messages.len();
+
+    // Spec 55 §5.6: the summary is delimited recorded data, inside the
+    // conversation block. It is never merged into the system prompt and never
+    // placed where repository instructions live. A stored summary is local
+    // data, like the transcript; the objective is quoted byte for byte in it.
+    // Redact at the boundary so a secret in an earlier message cannot leave the
+    // machine through the summary after being caught in the message itself.
+    let summary = summary.map(|summary| scanner.redact(&summary.render_for_model()).text);
+
+    let mut body = String::new();
+    // §5.5: with no active summary covering the omitted messages, the loss is
+    // stated rather than left silent. Messages the summary covers are not in
+    // `prior_messages` at all, so `omitted` counts only those outside both the
+    // summary and the window.
+    if omitted > 0 {
+        body.push_str(&format!(
+            "[Damaian: {omitted} earlier message{} in this conversation were not sent to you \
+             and were not summarised. The full transcript is still stored in the session and \
+             is readable in the app.]\n",
+            if omitted == 1 { "" } else { "s" }
+        ));
+    }
+    for message in recent_messages {
+        body.push_str(&message.role);
+        body.push_str(": ");
+        // Stored messages are verbatim by spec 16's design, so a secret typed
+        // in an earlier turn is still in the transcript. Redact before
+        // truncating: truncating first could leave half a secret straddling the
+        // cut with nothing left to recognise it (C17).
+        let redacted = scanner.redact(&message.content).text;
+        body.push_str(&truncate_for_prompt(&redacted, 2_000));
+        body.push('\n');
+    }
+
+    PromptConversation {
+        summary,
+        body: (!body.is_empty()).then_some(body),
+    }
+}
+
 fn build_model_prompt(
     plan: &ContextPlan,
     prior_messages: &[ChatMessage],
     summary: Option<&ConversationSummary>,
     window_tokens: usize,
     scanner: &SecretScanner,
+    command_context: Option<&str>,
+) -> String {
+    let conversation = build_conversation(prior_messages, summary, window_tokens, scanner);
+    build_model_prompt_with_conversation(plan, &conversation, command_context)
+}
+
+/// Join a plan's sections with an already-built conversation block.
+///
+/// The split exists so a paused review can re-render the request from an
+/// amended plan without the transcript (spec 27 §5.1). The output is exactly
+/// what `build_model_prompt` produced before the split.
+fn build_model_prompt_with_conversation(
+    plan: &ContextPlan,
+    conversation: &PromptConversation,
     command_context: Option<&str>,
 ) -> String {
     let mut output = String::new();
@@ -8691,52 +9302,16 @@ fn build_model_prompt(
         }
     }
 
-    // A plan reminder is the engine's nudge, not the user's words: seeding a
-    // later turn with it would present an instruction as something the user
-    // said (spec 66 `context.md` D10).
-    let conversation_messages =
-        crate::compaction::sendable_messages(&prior_messages.iter().collect::<Vec<_>>());
-    // Spec 55 §5.1: the window is a token budget, not eight messages, so a
-    // conversation of short messages keeps more turns than one of long ones.
-    let recent_messages = crate::compaction::window_slice(&conversation_messages, window_tokens);
-    let omitted = conversation_messages.len() - recent_messages.len();
-    if summary.is_some() || !recent_messages.is_empty() {
+    if conversation.summary.is_some() || conversation.body.is_some() {
         output.push('\n');
         output.push_str(PromptSectionName::RecentConversation.heading());
         output.push('\n');
-        // Spec 55 §5.6: the summary is delimited recorded data, inside the
-        // conversation block. It is never merged into the system prompt and
-        // never placed where repository instructions live.
-        if let Some(summary) = summary {
-            // A stored summary is local data, like the transcript; the
-            // objective is quoted byte for byte in it. Redact at the boundary
-            // so a secret in an earlier message cannot leave the machine
-            // through the summary after being caught in the message itself.
-            output.push_str(&scanner.redact(&summary.render_for_model()).text);
+        if let Some(summary) = &conversation.summary {
+            output.push_str(summary);
             output.push('\n');
         }
-        // §5.5: with no active summary covering the omitted messages, the loss
-        // is stated rather than left silent. Messages the summary covers are
-        // not in `prior_messages` at all, so `omitted` counts only those
-        // outside both the summary and the window.
-        if omitted > 0 {
-            output.push_str(&format!(
-                "[Damaian: {omitted} earlier message{} in this conversation were not sent to you \
-                 and were not summarised. The full transcript is still stored in the session and \
-                 is readable in the app.]\n",
-                if omitted == 1 { "" } else { "s" }
-            ));
-        }
-        for message in recent_messages {
-            output.push_str(&message.role);
-            output.push_str(": ");
-            // Stored messages are verbatim by spec 16's design, so a secret
-            // typed in an earlier turn is still in the transcript. Redact
-            // before truncating: truncating first could leave half a secret
-            // straddling the cut with nothing left to recognise it (C17).
-            let redacted = scanner.redact(&message.content).text;
-            output.push_str(&truncate_for_prompt(&redacted, 2_000));
-            output.push('\n');
+        if let Some(body) = &conversation.body {
+            output.push_str(body);
         }
     }
 
@@ -13675,6 +14250,8 @@ mod approval_prompt_wording_tests {
                 categories: Vec::new(),
                 included: Vec::new(),
                 excluded: Vec::new(),
+                conversation_summary: None,
+                symbol_provenance: None,
             },
         };
         let with_result = build_model_prompt(
@@ -13744,6 +14321,8 @@ mod approval_prompt_wording_tests {
                 categories: Vec::new(),
                 included: Vec::new(),
                 excluded: Vec::new(),
+                conversation_summary: None,
+                symbol_provenance: None,
             },
         };
         let prompt = build_model_prompt(
@@ -13790,6 +14369,8 @@ mod approval_prompt_wording_tests {
                 categories: Vec::new(),
                 included: Vec::new(),
                 excluded: Vec::new(),
+                conversation_summary: None,
+                symbol_provenance: None,
             },
         }
     }

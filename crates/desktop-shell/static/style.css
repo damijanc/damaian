@@ -5469,3 +5469,218 @@ body.worker-view #chat-model-menu {
 .compaction-boundary .compaction-now {
   margin-top: 10px;
 }
+
+/* Spec 27: the context inspector. An overlay drawer over the conversation, so
+   it never reflows the log or the composer. */
+.context-inspector-button {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.context-panel {
+  position: absolute;
+  top: 56px;
+  right: 16px;
+  z-index: 45;
+  width: min(540px, calc(100% - 32px));
+  max-height: calc(100% - 120px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.16);
+  font-size: 12px;
+  overflow: hidden;
+}
+
+/* The `display: flex` above beats the UA `[hidden]` rule. */
+.context-panel[hidden] {
+  display: none;
+}
+
+.context-panel-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.context-panel-header .btn-icon {
+  margin-left: auto;
+}
+
+.context-panel-summary {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.context-panel-body {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 6px;
+}
+
+.context-category,
+.context-excluded {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 6px 8px;
+}
+
+.context-category > summary,
+.context-excluded > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.context-category-label {
+  min-width: 110px;
+}
+
+.context-category-tokens,
+.context-category-count,
+.context-provenance {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.context-locked {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.context-items {
+  display: grid;
+  gap: 2px;
+  padding: 6px 0 2px 6px;
+}
+
+.context-item,
+.context-excluded-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.context-path {
+  border: 0;
+  background: transparent;
+  padding: 1px 0;
+  text-align: left;
+  color: var(--accent);
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-path:hover {
+  text-decoration: underline;
+}
+
+.context-item-tokens {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.context-item-action {
+  flex: none;
+}
+
+.context-remove {
+  color: var(--danger);
+}
+
+.context-excluded-reason {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.context-excluded-detail {
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-panel-controls {
+  display: grid;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.context-pin-form {
+  display: flex;
+  gap: 6px;
+}
+
+.context-pin-form input {
+  min-width: 0;
+  flex: 1;
+}
+
+#context-pin-range {
+  flex: 0 0 90px;
+}
+
+.context-restriction-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.context-panel-controls textarea {
+  width: 100%;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.context-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.context-panel-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.context-link {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: left;
+}
+
+.context-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}

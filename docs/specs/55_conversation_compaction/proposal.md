@@ -28,7 +28,7 @@ safe to do at all, and owns the rewind that must survive it),
 (owns the plan state §5.2 reads, and the per-turn ceiling §5.5 must not make
 worse), [`26_context_assembly/proposal.md`](../26_context_assembly/proposal.md) (owns the budget this
 is measured against),
-[`27_context_inspector.md`](../27_context_inspector.md) (where a summary is seen),
+[`27_context_inspector.md`](../27_context_inspector/proposal.md) (where a summary is seen),
 [`30_memory_retrieval_and_lifecycle.md`](../30_memory_retrieval_and_lifecycle.md)
 (the injection-resistance pattern §5.6 reuses),
 [`49_prompt_cache_accounting_and_reuse/proposal.md`](../49_prompt_cache_accounting_and_reuse/proposal.md)
@@ -449,7 +449,7 @@ Requirement 3, and the reason a user trusts this at all.
 - The transcript shows a **boundary marker** where compaction occurred, naming
   how many messages it covers, expandable to read the summary and to read the
   original messages — which are all still there.
-- [Spec 27](../27_context_inspector.md)'s inspector shows the summary as a context
+- [Spec 27](../27_context_inspector/proposal.md)'s inspector shows the summary as a context
   item with its own provenance, so "what did the model actually see" stays
   answerable. That spec is `Not started`; the transcript boundary marker above
   does not depend on it and carries this requirement on its own until it lands.

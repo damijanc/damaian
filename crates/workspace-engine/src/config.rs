@@ -254,6 +254,13 @@ pub struct Config {
     /// conversation to the provider, so a repository may lower it and never
     /// raise it.
     pub conversation_window_share: u16,
+    /// Whether a turn pauses after assembly and before its first model call so
+    /// the user can review and edit its context (spec 27 §5.1). Off by default:
+    /// a confirmation on every message would be abandoned within a day. Forbidden
+    /// to repository and profile config, because it decides whether every turn
+    /// waits for a human, which is neither a restriction nor a repository's
+    /// business.
+    pub pause_for_context_review: bool,
     /// Per-category shares of the context limit and the observed-window safety
     /// margin (spec 26 §5.2, §5.7). Restrict-only: a repository may lower a
     /// share and raise the margin, never the reverse.
@@ -1129,6 +1136,7 @@ impl Config {
             symbol_context_max_tokens,
             conversation_auto_compact,
             conversation_window_share,
+            pause_for_context_review,
             context_budget_instructions,
             context_budget_hook_context,
             context_budget_pinned,
@@ -1724,6 +1732,16 @@ impl Config {
         ) {
             self.conversation_auto_compact = value;
             outcome.record(scope, "conversation_auto_compact", None, false);
+        }
+        if let Some(value) = scoped(
+            pause_for_context_review,
+            "pause_for_context_review",
+            trusted,
+            forbidden,
+            rejected,
+        ) {
+            self.pause_for_context_review = value;
+            outcome.record(scope, "pause_for_context_review", None, false);
         }
         if let Some(value) = conversation_window_share
             && let Some(loosened) = restrict_only_share(
@@ -2560,6 +2578,15 @@ impl Config {
             "conversation_window_share",
             &format_basis_points(self.conversation_window_share),
         );
+        push_line(
+            &mut output,
+            "pause_for_context_review",
+            if self.pause_for_context_review {
+                "true"
+            } else {
+                "false"
+            },
+        );
         for (key, value) in context_budget_policy_lines(&self.context_budget) {
             push_line(&mut output, key, &format_basis_points(value));
         }
@@ -2790,6 +2817,7 @@ impl Default for Config {
             symbol_context_max_tokens: 1_600,
             conversation_auto_compact: true,
             conversation_window_share: crate::compaction::DEFAULT_WINDOW_SHARE_BPS,
+            pause_for_context_review: false,
             context_budget: ContextBudget::default(),
             max_command_output_bytes: 1024 * 1024,
             command_timeout_secs: 600,
@@ -2877,6 +2905,8 @@ pub struct ConfigOverlay {
     pub conversation_auto_compact: Option<bool>,
     /// Spec 55 §5.1: a share of `context_token_budget`, restrict-only lower-wins.
     pub conversation_window_share: Option<u16>,
+    /// Spec 27 §5.1: off by default, and forbidden to repository and profile.
+    pub pause_for_context_review: Option<bool>,
     /// `context_budget.*` shares, in basis points. Each is its own field so the
     /// overlay macro classifies it and a repository raise is refused by name.
     pub context_budget_instructions: Option<u16>,
@@ -3030,6 +3060,9 @@ classify_overlay_fields! {
     // capabilities rather than preferences.
     conversation_auto_compact => Capability,
     conversation_window_share => Capability,
+    // Spec 27 §5.1: waits for a human on every turn; neither direction is a
+    // restriction, so repository and profile config may not set it.
+    pause_for_context_review => Capability,
     // Spec 26 §5.2: a share steers model traffic toward or away from a
     // repository's own content, so a clone may lower one but never raise it.
     // The safety margin is the reverse direction (higher is restrictive).
@@ -3245,6 +3278,9 @@ impl ConfigOverlay {
             }
             "conversation_auto_compact" => {
                 self.conversation_auto_compact = Some(parse_bool(key, value)?)
+            }
+            "pause_for_context_review" => {
+                self.pause_for_context_review = Some(parse_bool(key, value)?)
             }
             // A zero window would compact on every turn; a window above the
             // whole budget would leave nothing to compact against.
@@ -3689,6 +3725,7 @@ impl ConfigOverlay {
             symbol_context_max_tokens,
             conversation_auto_compact,
             conversation_window_share,
+            pause_for_context_review,
             context_budget_instructions,
             context_budget_hook_context,
             context_budget_pinned,
@@ -3784,6 +3821,13 @@ impl ConfigOverlay {
                 &mut output,
                 "conversation_window_share",
                 &format_basis_points(*value),
+            );
+        }
+        if let Some(value) = pause_for_context_review {
+            push_line(
+                &mut output,
+                "pause_for_context_review",
+                if *value { "true" } else { "false" },
             );
         }
         for (key, value) in [
