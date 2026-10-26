@@ -1722,6 +1722,11 @@ impl MemoryStore {
             .into_iter()
             .find(|proposal| proposal.id == proposal_id)
             .ok_or(MemoryError::Refused(MemoryRefusal::UnknownProposal))?;
+        if proposal.origin.session_id() != session_id {
+            return Err(MemoryError::Refused(MemoryRefusal::InvalidShape(
+                "that proposal belongs to another session".to_string(),
+            )));
+        }
         let entry = proposal
             .clone()
             .confirm(confirmation.clone(), self.proposal_gate(root, identity))?;
