@@ -17,7 +17,7 @@ the resolved §7 open question in [`context.md`](context.md)
 | 5 · `pause_for_context_review` config | Done 2026-10-26 | `Config.pause_for_context_review` (default `false`) and its `ConfigOverlay` field are classified `Capability`, applied through `scoped(..., forbidden, ...)`, printed by both `to_policy_text` functions, labelled in `effective_policy`, and refused by `split_profile_keys`. Added a `weakening_cases` entry and `pause_for_context_review_is_off_by_default_and_user_only`. Scoped: fast five passed, scoped clippy passed, `permission_profiles` 79 passed / 1 skipped. |
 | 6 · The pre-send pause and send gate | Done 2026-10-26 | `TurnProgress::Context` is emitted after `context_assembled` and before the first call; `build_model_prompt` is split into `build_conversation` + `build_model_prompt_with_conversation` with byte-identical output (the `prompt_cache` guard passes). `PausedFor::ContextReview` and `PendingContextReview` persist the prepared plan, the conversation block and the summary; `resume_after_context_decision` refuses every other pause and every other resume refuses a review; `remove_context_item`/`remove_context_summary` amend and re-record the manifest without taking the pause. Decline sends nothing and marks the task `Cancelled`. Tests: 10 new (pause no-call, default ordering, send, decline, instruction removal in the request, Required refusal, both cross-resume directions, removal across a reload, stripped-field load). **Falsified:** not saving the amended review left the removed instruction in the request and the test failed. Scoped: `context_inspector` 23/23, `prompt_cache`/`foundation`/`round_budget`/`compaction` 206 passed, scoped clippy passed. |
 | 7 · Post-send record and past turns | Done 2026-10-26 | `SessionStore::read_session_context_manifests` reads `<data_dir>/audit/events.jsonl` (the manifest is an audit record, not a session event), filters by `sessionId`, and keeps the newest `context_assembled` per task. The edit flow reads the origin session's pins/restriction; the repair continuation now reads them too, reads the conversation before assembly, and emits `TurnProgress::Context`. Tests: newest-wins after a removal, two turns' manifests in one session, an old manifest without the new fields, and an edit from a session with a pin and a restriction. **Falsified:** `or_insert` (first-wins) made the removal test read the pre-removal manifest. Scoped: `context_inspector` 27/27, `prompt_cache` + `verification_loop` 84 passed, scoped clippy passed. |
-| 8 · Shell routes, JSON and SSE | Not started | |
+| 8 · Shell routes, JSON and SSE | Done 2026-10-26 | Added `POST /api/context-pin`, `/api/context-restriction`, `/api/context-remove`, `/api/context-remove-summary`, `/api/resume-context-stream`; `chat_result_json` carries `contextReview` (manifest only); `/api/session` carries `contextState` plus a `context` manifest on each task; `TurnProgress::Context` maps to `TurnEvent::Context` and the SSE `context` event. Unknown pin actions and review decisions are refused, not defaulted. A decline path uses a no-op adapter, so it needs no provider key. Tests: pin round-trip through `/api/session`, restriction set/clear, unknown action, unknown decision, task JSON carries the manifest and no item content, and the progress mapping. Scoped: `desktop-shell --lib` 204 passed / 5 skipped, scoped clippy passed, fast five passed (typos caught an intentional `addd` test value; changed to `unknown_action`). |
 | 9 · The web panel and review card | Not started | |
 | 10 · Docs, manual walk, close-out | Not started | |
 
@@ -661,7 +661,7 @@ the pause matrix test lives there.
 
 **Files:** `crates/desktop-shell/src/lib.rs`; its inline tests.
 
-- [ ] **Step 1: Write the failing tests** (beside the existing handler tests,
+- [x] **Step 1: Write the failing tests** (beside the existing handler tests,
   using `post_form_for_test`, `get_for_test`, `json_of`, and the SSE harness):
   - a `context` SSE event reaches the stream before `done` and carries a
     manifest with no item content;
@@ -677,8 +677,8 @@ the pause matrix test lives there.
     through the same harness as the existing resume tests);
   - `GET /api/session` puts a `context` object on each task that has one and
     omits it otherwise.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Implement.**
   - Add `TurnProgress::Context` mapping in `progress_event` (`lib.rs:2866`),
     `TurnEvent::Context(Box<ContextManifest>)`, and the SSE arm writing
     `serde_json::to_string(&manifest)` (the manifest is `Serialize`; no manual
@@ -698,11 +698,11 @@ the pause matrix test lives there.
     exists; reject an unknown `action`/`decision` rather than defaulting.
   - `run_resume_context_request` follows `run_resume_plan_request`'s shape and
     calls `resume_after_context_decision` with a dedicated adapter.
-- [ ] **Step 4: Falsify.** (1) Serialise the prepared items by mistake → the
+- [x] **Step 4: Falsify.** (1) Serialise the prepared items by mistake → the
   no-content assertion fails. (2) Default an unknown decision to `send` → the
   reject test fails. (3) Take the review in `context-remove` → the subsequent
   send fails. Restore each.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -710,7 +710,7 @@ the pause matrix test lives there.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p desktop-shell --lib
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit.
+- [x] **Step 6: Update the Progress row** and commit.
   Subject: `Serve the context manifest and its controls to the shell`.
 
 ---

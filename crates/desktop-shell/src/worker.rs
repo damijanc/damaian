@@ -1051,7 +1051,9 @@ impl ProgressSink<'_> {
             }
             // The session is the worker's own, and diagnostics are in the
             // session log; neither is a board column.
-            TurnProgress::Session(_) | TurnProgress::WebDiagnostic(_) => {}
+            TurnProgress::Session(_)
+            | TurnProgress::WebDiagnostic(_)
+            | TurnProgress::Context(_) => {}
         }
     }
 }
