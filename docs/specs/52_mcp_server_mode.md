@@ -118,7 +118,7 @@ agent may do.
 | `search_codebase` | Read-only, path-policed, redacted |
 | `read_file` (ranged, per [spec 47](47_agent_working_capability/proposal.md)) | Read-only, path-policed, redacted |
 | `list_directory` ([spec 47](47_agent_working_capability/proposal.md)) | Read-only, path-policed |
-| `read_git_status`, `read_git_diff` | Read-only; the diff redacts, and [spec 35](35_commit_preparation.md)'s warning about redacted diffs concerns *committing* from one, which this cannot do |
+| `read_git_status`, `read_git_diff` | Read-only; the diff redacts, and [spec 35](35_commit_preparation/proposal.md)'s warning about redacted diffs concerns *committing* from one, which this cannot do |
 | Repository map (Phase 3 WP2), symbol lookup (Phase 3 WP3) | Read-only, derived, when they exist |
 
 Since this was written, [#60](60_worktree_aware_read_tools/proposal.md) added a

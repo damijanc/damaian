@@ -204,7 +204,11 @@ async function api(path, options = {}, retriedAuth = false) {
     return api(path, options, true);
   }
   if (!response.ok || payload.error) {
-    throw new Error(payload.error || response.statusText);
+    // The commit dialog branches on `code` (a rewritten message, a failed
+    // hook, HEAD moving) instead of parsing prose.
+    const error = new Error(payload.error || response.statusText);
+    error.payload = payload;
+    throw error;
   }
   // An answer from the API is proof it is available, whichever way the token
   // arrived.
@@ -1218,6 +1222,9 @@ async function selectSessionMode(mode) {
 // until one arrives, and stays null when the request fails, which draws the
 // folder alone, as for a folder that is not a repository.
 let repoBarStatus = { repoPath: "", payload: null };
+// Spec 35: whether the open session has anything to commit, and whether it may.
+// `null` until the first answer, or when no session is open.
+let repoBarCommitStatus = null;
 let repoBarRefreshSeq = 0;
 let repoBarRefreshedAt = 0;
 // Focus refreshes are at least this far apart (§1 req 15). There is no timer:
@@ -1235,22 +1242,30 @@ async function refreshRepoBar() {
   }
   if (!repoPath) return;
   let payload = null;
-  try {
-    payload = await api(`/api/git-status?repo=${encodeURIComponent(repoPath)}`);
-  } catch {
-    // The folder menu still works without a status; the bar shows the folder.
-  }
+  let commitStatus = null;
+  const sessionId = currentSessionId;
+  const [statusAnswer, commitAnswer] = await Promise.allSettled([
+    api(`/api/git-status?repo=${encodeURIComponent(repoPath)}`),
+    sessionId
+      ? api(
+          `/api/commit-status?repo=${encodeURIComponent(repoPath)}&session=${encodeURIComponent(sessionId)}`,
+        )
+      : Promise.resolve(null),
+  ]);
+  if (statusAnswer.status === "fulfilled") payload = statusAnswer.value;
+  if (commitAnswer.status === "fulfilled") commitStatus = commitAnswer.value;
   // A later refresh, or a folder switch, owns the bar now.
   if (seq !== repoBarRefreshSeq || repoPath !== repo()) return;
-  applyRepoBarStatus(repoPath, payload);
+  applyRepoBarStatus(repoPath, payload, commitStatus);
 }
 
-function applyRepoBarStatus(repoPath, payload) {
+function applyRepoBarStatus(repoPath, payload, commitStatus = null) {
   if (repoPath !== repo()) return;
   // Newer than anything still in flight.
   repoBarRefreshSeq += 1;
   repoBarRefreshedAt = Date.now();
   repoBarStatus = { repoPath, payload };
+  repoBarCommitStatus = commitStatus;
   renderRepoBar();
 }
 
@@ -1261,6 +1276,7 @@ function renderRepoBar() {
   if (!repoPath) {
     repoFolderMenu.close();
     closeFindingsPopover();
+    repoBarCommitStatus = null;
     return;
   }
   $("repo-folder-name").textContent = projectName(repoPath);
@@ -1292,6 +1308,7 @@ function renderRepoBar() {
   $("repo-insertions").textContent = `+${insertions.toLocaleString("en-US")}`;
   $("repo-deletions").textContent = `−${deletions.toLocaleString("en-US")}`;
   changes.title = `${insertions} inserted, ${deletions} deleted against HEAD, untracked files included`;
+  renderRepoAction();
 }
 
 window.addEventListener("focus", () => {
@@ -1379,8 +1396,23 @@ const repoActionProviders = [
   findingsRepairAction("error"),
   findingsRepairAction("warning"),
   // #35: uncommitted accepted changes → Commit…
+  commitAction,
   // #37: branch ahead of its base → Create PR
 ];
+
+// What the repo bar's Commit… entry shows, per spec 35 §5.1. It is offered
+// whenever the session has a candidate, because a file changed by an approved
+// command is still worth committing even though it starts unselected.
+function commitAction() {
+  const status = repoBarCommitStatus;
+  if (!status || !Number(status.candidateCount)) return null;
+  return {
+    key: "commit",
+    label: "Commit…",
+    tone: "",
+    run: () => void openCommitDialog(),
+  };
+}
 
 let repoActionCurrent = null;
 // Covers the `/api/findings-repair` request before `sendChatPrompt` sets
@@ -1439,6 +1471,370 @@ function renderRepoAction() {
     more.title = action.more.label;
     more.setAttribute("aria-expanded", String(action.more.isOpen()));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Commit preparation (docs/specs/35_commit_preparation/proposal.md §5.1).
+// The diff is redacted for display; the commit contains the real content, and
+// the dialog says so before the button. Nothing here decides what is
+// committable: the server prepared the record, the secret scan and the hooks.
+
+async function openCommitDialog() {
+  const repoPath = repo();
+  const sessionId = currentSessionId;
+  if (!repoPath || !sessionId) return;
+  let preparation;
+  try {
+    preparation = await api(
+      `/api/commit-preparation?repo=${encodeURIComponent(repoPath)}&session=${encodeURIComponent(sessionId)}`,
+    );
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
+  showCommitDialog(preparation, repoPath, sessionId);
+}
+
+function commitSubject(message) {
+  return (
+    String(message || "")
+      .split("\n")
+      .find((line) => line.trim()) || "Commit"
+  );
+}
+
+function commitSize(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} kB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function showCommitDialog(preparation, repoPath, sessionId) {
+  const backdrop = document.createElement("div");
+  backdrop.className = "app-dialog-backdrop";
+  backdrop.innerHTML = `
+    <div class="app-dialog app-dialog-commit" role="dialog" aria-modal="true" aria-label="Commit changes">
+      <p class="app-dialog-title">Commit changes</p>
+      <p class="app-dialog-message commit-summary"></p>
+      <p class="commit-redaction">The diffs below are redacted for display. The commit contains
+        the real file content.</p>
+      <div class="commit-file-list"></div>
+      <p class="commit-secret-warning" hidden></p>
+      <label class="commit-secret-override" hidden>
+        <input type="checkbox" />
+        <span>I understand these files contain the real content the scanner flagged, and I
+          want to commit it.</span>
+      </label>
+      <label class="commit-message-label" for="commit-message-input">Commit message</label>
+      <textarea id="commit-message-input" class="commit-message" rows="4"></textarea>
+      <p class="commit-draft-notice" hidden></p>
+      <div class="commit-hooks"></div>
+      <div class="commit-verification"></div>
+      <p class="commit-refusal" hidden></p>
+      <p class="commit-error" hidden></p>
+      <div class="app-dialog-actions">
+        <button type="button" class="app-dialog-btn app-dialog-cancel">Cancel</button>
+        <button type="button" class="app-dialog-btn commit-draft">Draft with model</button>
+        <button type="button" class="app-dialog-btn app-dialog-confirm commit-submit" disabled>
+          Commit
+        </button>
+      </div>
+    </div>
+  `;
+  document.body.append(backdrop);
+
+  const dialog = backdrop.querySelector(".app-dialog");
+  const list = backdrop.querySelector(".commit-file-list");
+  const summary = backdrop.querySelector(".commit-summary");
+  const secretWarning = backdrop.querySelector(".commit-secret-warning");
+  const override = backdrop.querySelector(".commit-secret-override");
+  const overrideInput = override.querySelector('input[type="checkbox"]');
+  const messageInput = backdrop.querySelector(".commit-message");
+  const draftNotice = backdrop.querySelector(".commit-draft-notice");
+  const hooks = backdrop.querySelector(".commit-hooks");
+  const verification = backdrop.querySelector(".commit-verification");
+  const refusal = backdrop.querySelector(".commit-refusal");
+  const errorLine = backdrop.querySelector(".commit-error");
+  const draftButton = backdrop.querySelector(".commit-draft");
+  const submit = backdrop.querySelector(".commit-submit");
+
+  const selected = new Set(
+    preparation.candidates
+      .filter((candidate) => candidate.selectedByDefault)
+      .map((candidate) => candidate.path),
+  );
+  let message = preparation.message || "";
+  let allowSecrets = false;
+  let stale = false;
+  let lastWarnings = "";
+  messageInput.value = message;
+
+  const selectedCandidates = () =>
+    preparation.candidates.filter((candidate) => selected.has(candidate.path));
+  // A rename is one change in two paths. The checkboxes move together; the
+  // engine refuses a half-selection anyway, so this is the visible half of the
+  // same rule.
+  const syncCheckboxes = () => {
+    list.querySelectorAll('input[type="checkbox"][data-path]').forEach((input) => {
+      input.checked = selected.has(input.dataset.path);
+    });
+  };
+  const warningsFor = (candidates) =>
+    candidates.flatMap((candidate) =>
+      (candidate.secretWarnings || []).map((warning) => ({ ...warning, path: candidate.path })),
+    );
+
+  const showError = (text) => {
+    errorLine.textContent = text || "";
+    errorLine.hidden = !text;
+  };
+
+  const refresh = () => {
+    const chosen = selectedCandidates();
+    const warnings = warningsFor(chosen);
+    const warningKey = warnings
+      .map((warning) => `${warning.path}:${warning.categories.join(",")}:${warning.count}`)
+      .sort()
+      .join("|");
+    if (warningKey !== lastWarnings) {
+      lastWarnings = warningKey;
+      allowSecrets = false;
+      overrideInput.checked = false;
+    }
+    summary.textContent = `${chosen.length} of ${preparation.candidates.length} files selected${
+      preparation.branch
+        ? ` · ${preparation.branch}`
+        : preparation.head
+          ? ` · ${preparation.head.slice(0, 8)}`
+          : ""
+    }`;
+    secretWarning.hidden = warnings.length === 0;
+    override.hidden = warnings.length === 0;
+    if (warnings.length) {
+      secretWarning.textContent =
+        "The scanner flags the real content of: " +
+        warnings
+          .map((warning) => `${warning.path} (${warning.categories.join(", ")} × ${warning.count})`)
+          .join("; ") +
+        ". The displayed diff hides the matched text; the commit will not.";
+    }
+    const blockedBySecrets = warnings.length > 0 && !allowSecrets;
+    submit.disabled =
+      stale || chosen.length === 0 || preparation.refusals.length > 0 || blockedBySecrets;
+    submit.textContent = chosen.length
+      ? `Commit ${chosen.length} file${chosen.length === 1 ? "" : "s"}`
+      : "Commit";
+  };
+
+  preparation.candidates.forEach((candidate) => {
+    const row = document.createElement("div");
+    row.className = "commit-file";
+    const head = document.createElement("label");
+    head.className = "commit-file-head";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = selected.has(candidate.path);
+    checkbox.dataset.path = candidate.path;
+    // A submodule or nested repository has no file bytes this flow can
+    // compose; the server refuses it, and the checkbox says so by staying off.
+    checkbox.disabled = candidate.source === "unsupported";
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) selected.add(candidate.path);
+      else selected.delete(candidate.path);
+      const pair = candidate.renamedFrom || candidate.renamedTo;
+      if (pair) {
+        if (checkbox.checked) selected.add(pair);
+        else selected.delete(pair);
+      }
+      syncCheckboxes();
+      refresh();
+    });
+    const path = document.createElement("code");
+    path.className = "commit-file-path";
+    path.textContent = candidate.path;
+    const label = document.createElement("span");
+    label.className = "commit-file-label";
+    label.textContent = `${candidate.status} · ${candidate.label}`;
+    head.append(checkbox, path, label);
+    row.append(head);
+    const details = document.createElement("details");
+    details.className = "commit-file-diff";
+    const caption = document.createElement("summary");
+    caption.textContent = "Diff (redacted)";
+    const pre = document.createElement("pre");
+    pre.textContent = candidate.diff || "No diff is shown for this file.";
+    details.append(caption, pre);
+    row.append(details);
+    list.append(row);
+  });
+
+  const hookSource =
+    preparation.hooks.source === "core.hooksPath"
+      ? "core.hooksPath"
+      : "the default hooks directory";
+  const hookRows = preparation.hooks.hooks || [];
+  const hookTitle = document.createElement("p");
+  hookTitle.className = "commit-section-title";
+  hookTitle.textContent = `Git hooks from ${hookSource} (${preparation.hooks.directory || "none"})`;
+  hooks.append(hookTitle);
+  if (!hookRows.length) {
+    const none = document.createElement("p");
+    none.className = "commit-note";
+    none.textContent = "No hooks are present in the report.";
+    hooks.append(none);
+  }
+  hookRows.forEach((hook) => {
+    const row = document.createElement("p");
+    row.className = "commit-hook";
+    const detail = [
+      hook.path,
+      hook.exists ? commitSize(hook.size) : "not present",
+      hook.interpreter || "no interpreter line",
+    ].join(" · ");
+    row.textContent = `${hook.name}: ${detail} — ${
+      hook.runs ? "will run" : hook.skippedReason || "not present, so nothing runs"
+    }`;
+    hooks.append(row);
+  });
+  const never = document.createElement("p");
+  never.className = "commit-note";
+  never.textContent =
+    "Damaian runs these hooks and never skips them. A failing hook aborts the commit.";
+  hooks.append(never);
+
+  const verdict = preparation.verification || {};
+  const verifyTitle = document.createElement("p");
+  verifyTitle.className = "commit-section-title";
+  verifyTitle.textContent = "Checks";
+  verification.append(verifyTitle);
+  const verifyLine = document.createElement("p");
+  verifyLine.className = "commit-note";
+  verifyLine.textContent = verdict.summary || "No check evidence was recorded for this session.";
+  verification.append(verifyLine);
+  if (verdict.passed?.length) {
+    const passed = document.createElement("p");
+    passed.className = "commit-note";
+    passed.textContent = `Passed: ${verdict.passed.join(", ")}`;
+    verification.append(passed);
+  }
+  if (verdict.failed?.length) {
+    const failed = document.createElement("p");
+    failed.className = "commit-note commit-note-warn";
+    failed.textContent = `Failed: ${verdict.failed.join(", ")}`;
+    verification.append(failed);
+  }
+  if (verdict.stale?.length) {
+    const staleChecks = document.createElement("p");
+    staleChecks.className = "commit-note commit-note-warn";
+    staleChecks.textContent = `Stale: ${verdict.stale.join(", ")}`;
+    verification.append(staleChecks);
+  }
+
+  if (preparation.refusals.length) {
+    refusal.hidden = false;
+    refusal.textContent = preparation.refusals.join(" ");
+  }
+
+  overrideInput.addEventListener("change", () => {
+    allowSecrets = overrideInput.checked;
+    refresh();
+  });
+  messageInput.addEventListener("input", () => {
+    message = messageInput.value;
+  });
+
+  draftButton.addEventListener("click", async () => {
+    draftButton.disabled = true;
+    draftNotice.hidden = true;
+    try {
+      const payload = await api(
+        "/api/commit-message",
+        form({
+          repo: repoPath,
+          session_id: sessionId,
+          prepare_id: preparation.prepareId,
+          paths: [...selected].join("\n"),
+        }),
+      );
+      message = payload.message || message;
+      messageInput.value = message;
+      if (payload.notice) {
+        draftNotice.textContent = payload.notice;
+        draftNotice.hidden = false;
+      }
+    } catch (error) {
+      draftNotice.textContent = error.message;
+      draftNotice.hidden = false;
+    } finally {
+      draftButton.disabled = false;
+    }
+  });
+
+  submit.addEventListener("click", async () => {
+    submit.disabled = true;
+    showError("");
+    try {
+      const payload = await api(
+        "/api/commit",
+        form({
+          repo: repoPath,
+          session_id: sessionId,
+          prepare_id: preparation.prepareId,
+          approval: "commit",
+          paths: [...selected].join("\n"),
+          message,
+          allow_generated_secrets: allowSecrets ? "true" : "false",
+        }),
+      );
+      cleanup();
+      const warning = payload.warnings?.length ? ` ${payload.warnings.join(" ")}` : "";
+      toast(
+        `Committed ${payload.commitSha.slice(0, 8)} — ${commitSubject(payload.message)}.${warning}`,
+        {
+          duration: 9000,
+        },
+      );
+      await refreshRepoBar();
+    } catch (error) {
+      const body = error.payload || {};
+      if (body.code === "commit_message_rewritten") {
+        message = body.message || message;
+        messageInput.value = message;
+        showError(
+          "A commit-message hook rewrote your message. Review it above and commit again; " +
+            "nothing was committed.",
+        );
+      } else {
+        showError(error.message);
+      }
+      if (
+        [
+          "commit_head_moved",
+          "commit_content_changed",
+          "commit_hooks_changed",
+          "commit_not_prepared",
+          "commit_selection_invalid",
+        ].includes(body.code)
+      ) {
+        stale = true;
+        showError(`${error.message} Close this dialog and choose Commit… again.`);
+      }
+      refresh();
+    }
+  });
+
+  const cleanup = () => {
+    document.removeEventListener("keydown", onKeydown, true);
+    backdrop.remove();
+  };
+  const onKeydown = (event) => {
+    if (event.key === "Escape") cleanup();
+  };
+  backdrop.querySelector(".app-dialog-cancel").addEventListener("click", cleanup);
+  document.addEventListener("keydown", onKeydown, true);
+  refresh();
+  dialog.querySelector(".commit-message").focus();
 }
 
 function closeApprovalMenu() {
@@ -5072,6 +5468,24 @@ function createRecoveryDetail(task) {
       ? `${task.danglingAction}${task.danglingRef ? ` — ${task.danglingRef}` : ""} (event ${task.danglingSeq})`
       : `None recorded. The turn's last recorded state was "${task.previousStatus}".`,
   );
+
+  // A commit that was in flight is not a file-edit question: the record says
+  // exactly which commit object may exist and where HEAD is now. The comparison
+  // is shown, never applied (spec 35 §5.7).
+  if (task.commit) {
+    const short = (sha) => (sha ? sha.slice(0, 8) : "no commit");
+    const outcome =
+      task.commit.landed === true
+        ? "It landed."
+        : task.commit.landed === false
+          ? "It did not land."
+          : "HEAD is somewhere else, so whether it landed cannot be decided from here.";
+    row(
+      "Commit in flight",
+      `Prepared ${short(task.commit.preparedCommit)} on top of ${short(task.commit.expectedOld)}. ` +
+        `HEAD is now ${short(task.commit.headNow)}. ${outcome}`,
+    );
+  }
 
   const files = Array.isArray(task.files) ? task.files : [];
   if (files.length) {
@@ -9117,7 +9531,19 @@ function renderGitStatusText(payload) {
 // `#repo-state` (spec 58 §3.3); that line now always names the folder alone.
 async function appendGitStatusAfterChange(repoPath) {
   const payload = await api(`/api/git-status?repo=${encodeURIComponent(repoPath)}`);
-  applyRepoBarStatus(repoPath, payload);
+  // The commit candidate count is a session question, not a git-status one;
+  // ask it again rather than showing the previous count beside a new status.
+  let commitStatus = null;
+  if (currentSessionId) {
+    try {
+      commitStatus = await api(
+        `/api/commit-status?repo=${encodeURIComponent(repoPath)}&session=${encodeURIComponent(currentSessionId)}`,
+      );
+    } catch {
+      // The bar still works; the action hides rather than claiming a count.
+    }
+  }
+  applyRepoBarStatus(repoPath, payload, commitStatus);
   appendChatMessage("system", renderGitStatusText(payload));
 }
 

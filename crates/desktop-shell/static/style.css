@@ -4209,6 +4209,176 @@ body.worker-view #chat-model-menu {
   color: var(--danger);
 }
 
+.app-dialog-commit {
+  width: min(720px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+}
+
+.commit-summary {
+  font-variant-numeric: tabular-nums;
+}
+
+/* The one sentence that closes the redacted-preview trap (spec 35 §5.4). It is
+   never hidden behind a disclosure. */
+.commit-redaction {
+  margin: 0;
+  border-left: 3px solid var(--warn);
+  padding: 6px 10px;
+  border-radius: 0 6px 6px 0;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.commit-file-list {
+  display: grid;
+  gap: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.commit-file {
+  display: grid;
+  gap: 3px;
+}
+
+.commit-file-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.commit-file-head input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.commit-file-path {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
+.commit-file-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.commit-file-diff summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  padding-left: 22px;
+}
+
+.commit-file-diff pre {
+  margin: 4px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--surface-soft);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.commit-secret-warning {
+  margin: 0;
+  border-left: 3px solid var(--danger);
+  padding: 6px 10px;
+  border-radius: 0 6px 6px 0;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.commit-secret-override {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.commit-secret-override input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.commit-message-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.commit-message {
+  width: 100%;
+  min-height: 0;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.commit-draft-notice,
+.commit-note,
+.commit-hook,
+.commit-refusal {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.commit-section-title {
+  margin: 8px 0 2px;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.commit-hooks {
+  border-top: 1px solid var(--line);
+  padding-top: 6px;
+}
+
+.commit-verification {
+  border-top: 1px solid var(--line);
+  padding-top: 6px;
+}
+
+.commit-note-warn {
+  color: var(--warn);
+}
+
+.commit-refusal {
+  border-left: 3px solid var(--danger);
+  padding: 6px 10px;
+  border-radius: 0 6px 6px 0;
+  background: var(--surface-soft);
+  color: var(--ink);
+}
+
+.commit-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
 .app-dialog-checklist {
   display: grid;
   gap: 6px;

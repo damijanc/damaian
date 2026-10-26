@@ -452,6 +452,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "allow_mutating_mcp_tools=true\n",
             Reported("allow_mutating_mcp_tools"),
         ),
+        // Spec 35: a commit writes to the repository, so a clone may refuse it
+        // and may never grant it.
+        case(
+            "allow_git_commits",
+            "allow_git_commits=false\n",
+            "allow_git_commits=true\n",
+            Reported("allow_git_commits"),
+        ),
         // Task 3: the selection is the user's, like `Allow Always` (context.md §4).
         case(
             "permission_profile_by_repository",
@@ -1072,39 +1080,41 @@ struct ProfileRow {
 
 #[test]
 fn each_built_in_profile_resolves_to_its_table_row() {
-    let capabilities = |edits, access, browser, mutating_mcp, mcp| ProfileCapabilities {
-        allow_file_edits: edits,
-        command_access: access,
-        allow_browser_diagnostics: browser,
-        allow_mutating_mcp_tools: mutating_mcp,
-        mcp_enabled: mcp,
-    };
+    let capabilities =
+        |edits, access, browser, mutating_mcp, git_commits, mcp| ProfileCapabilities {
+            allow_file_edits: edits,
+            command_access: access,
+            allow_browser_diagnostics: browser,
+            allow_mutating_mcp_tools: mutating_mcp,
+            allow_git_commits: git_commits,
+            mcp_enabled: mcp,
+        };
     // context.md §3, over a permissive user config that turned edit approval off.
     let rows = [
         ProfileRow {
             id: ProfileId::ReadOnly,
-            capabilities: capabilities(false, CommandAccess::None, false, false, true),
+            capabilities: capabilities(false, CommandAccess::None, false, false, false, true),
             require_approval_for_file_edits: false,
             audit_retention_days: 90,
             checkpoint_retention_days: 90,
         },
         ProfileRow {
             id: ProfileId::SafeLocal,
-            capabilities: capabilities(true, CommandAccess::Local, true, true, true),
+            capabilities: capabilities(true, CommandAccess::Local, true, true, true, true),
             require_approval_for_file_edits: true,
             audit_retention_days: 90,
             checkpoint_retention_days: 90,
         },
         ProfileRow {
             id: ProfileId::Full,
-            capabilities: capabilities(true, CommandAccess::All, true, true, true),
+            capabilities: capabilities(true, CommandAccess::All, true, true, true, true),
             require_approval_for_file_edits: false,
             audit_retention_days: 90,
             checkpoint_retention_days: 90,
         },
         ProfileRow {
             id: ProfileId::OfflinePrivate,
-            capabilities: capabilities(true, CommandAccess::Local, false, true, false),
+            capabilities: capabilities(true, CommandAccess::Local, false, true, true, false),
             require_approval_for_file_edits: false,
             audit_retention_days: 7,
             checkpoint_retention_days: 7,
@@ -1113,7 +1123,7 @@ fn each_built_in_profile_resolves_to_its_table_row() {
     let fixture = profile_fixture("built-ins");
     assert_eq!(
         Config::default().profile_capabilities(),
-        capabilities(true, CommandAccess::All, true, true, true)
+        capabilities(true, CommandAccess::All, true, true, true, true)
     );
 
     for row in rows {

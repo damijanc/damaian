@@ -6,6 +6,7 @@ pub mod clarification;
 pub mod command_policy;
 pub mod command_purpose;
 pub mod command_runner;
+pub mod commit;
 pub mod config;
 pub mod context_manager;
 pub mod data_schema;
@@ -76,6 +77,11 @@ pub use command_policy::{
 };
 pub use command_purpose::{CommandPurpose, command_purpose};
 pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
+pub use commit::{
+    CommitCandidate, CommitCandidateSource, CommitEngine, CommitError, CommitHookOutcome,
+    CommitOutcome, CommitPreparation, CommitRecord, CommitRequest, CommitStatus,
+    CommitVerification, GIT_COMMIT_HOOKS, GitHookInfo, GitHookReport,
+};
 pub use config::{
     AppliedKey, CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, CostEstimate,
     DEFAULT_CONTEXT_TOKEN_BUDGET, HookConfig, HookConfigOverlay, HookEvent, HookMode, HookReview,

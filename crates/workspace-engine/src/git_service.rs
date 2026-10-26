@@ -16,6 +16,13 @@ pub struct GitFileStatus {
     pub worktree: bool,
     pub untracked: bool,
     pub conflicted: bool,
+    /// The source path of a rename, when Git reported one. The commit
+    /// preparation represents that source as a deletion candidate too
+    /// (spec 35 §5.2), so the old path cannot be silently left behind.
+    pub renamed_from: Option<String>,
+    /// The source path of a copy. A copy leaves the source in place, so it
+    /// produces no deletion candidate.
+    pub copied_from: Option<String>,
 }
 
 /// `git status` as a read sees it (spec 60 §5.4): entries naming a restricted
@@ -318,6 +325,43 @@ impl GitService {
 
     pub fn status(&self, root_path: impl AsRef<Path>) -> Result<GitStatus> {
         self.status_in(root_path, None)
+    }
+
+    /// Every changed and untracked **file**, with no untracked directory
+    /// collapsed, for a commit's candidate set (spec 35 §5.2).
+    ///
+    /// `status` is the read a model sees: it is capped and it collapses an
+    /// untracked directory into one entry, which a commit cannot use because a
+    /// directory is not a blob. This runs `-uall` and `-z`, so a path holding a
+    /// newline or non-ASCII bytes arrives as itself rather than C-quoted, and
+    /// applies the same restricted-path filter. Not capped: a commit that
+    /// silently omitted a candidate would be worse than a long list, and the
+    /// caller's UI is the place to bound presentation.
+    pub fn changes(&self, root_path: impl AsRef<Path>) -> Result<Vec<GitFileStatus>> {
+        let root = root_path.as_ref();
+        let output = git_output(
+            root,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )?;
+        let exit_code = output.status.code().unwrap_or(-1);
+        if exit_code != 0 {
+            return Err(ClientError::Git(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        let files = parse_porcelain_z(&output.stdout, &|path| self.path_is_restricted(path));
+        self.audit_log.record(
+            "git_status_read",
+            &[
+                ("actor", "system".to_string()),
+                ("resourcePath", root.to_string_lossy().to_string()),
+                ("status", "complete".to_string()),
+                ("exitCode", exit_code.to_string()),
+                ("scope", "commit_candidates".to_string()),
+                ("fileCount", files.len().to_string()),
+            ],
+        )?;
+        Ok(files)
     }
 
     /// [`Self::status`] of a worktree's root, recording `worktree` (its
@@ -945,6 +989,13 @@ impl GitService {
         capped
     }
 
+    /// The full `HEAD` SHA, or `None` on an unborn branch. Used by commit
+    /// recovery to answer whether an interrupted commit landed (spec 35 §5.7).
+    /// Not audited: the sweep that reads it records its own findings.
+    pub fn head_commit(&self, root_path: impl AsRef<Path>) -> Result<Option<String>> {
+        git_line(root_path.as_ref(), &["rev-parse", "--verify", "-q", "HEAD"])
+    }
+
     pub fn suggest_commit_message(&self, summary: &str, changed_files: &[String]) -> String {
         let normalized = summary.trim().trim_end_matches(['.', '!', '?']);
         if normalized.is_empty() {
@@ -1012,6 +1063,51 @@ fn unquote_porcelain_path(path: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The `-z` porcelain `changes` reads: one record per changed file, with a
+/// rename or copy followed by its source path. A rename keeps its source so
+/// the commit can carry the deletion; a copy does not, because the source
+/// stays in place. Both sides of a pair are judged against the restricted
+/// matcher, and a pair is dropped whole when either is restricted.
+fn parse_porcelain_z(raw: &[u8], is_restricted: &dyn Fn(&str) -> bool) -> Vec<GitFileStatus> {
+    let mut records = raw
+        .split(|&byte| byte == 0)
+        .filter(|record| !record.is_empty());
+    let mut files = Vec::new();
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+        let index_status = record[0];
+        let worktree_status = record[1];
+        let renamed = index_status == b'R' || worktree_status == b'R';
+        let copied = index_status == b'C' || worktree_status == b'C';
+        let original = if renamed || copied {
+            records
+                .next()
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .filter(|path| !path.is_empty())
+        } else {
+            None
+        };
+        let path = String::from_utf8_lossy(&record[3..]).into_owned();
+        if is_restricted(&path) || original.as_deref().is_some_and(is_restricted) {
+            continue;
+        }
+        let pair = format!("{}{}", index_status as char, worktree_status as char);
+        files.push(GitFileStatus {
+            path,
+            raw: String::from_utf8_lossy(record).into_owned(),
+            staged: index_status != b' ' && index_status != b'?',
+            worktree: worktree_status != b' ',
+            untracked: index_status == b'?' && worktree_status == b'?',
+            conflicted: ["AA", "DD", "AU", "UD", "UA", "DU", "UU"].contains(&pair.as_str()),
+            renamed_from: if renamed { original.clone() } else { None },
+            copied_from: if copied { original } else { None },
+        });
+    }
+    files
+}
+
 fn parse_porcelain(raw: &str) -> Vec<GitFileStatus> {
     raw.lines()
         .filter(|line| !line.is_empty())
@@ -1019,8 +1115,13 @@ fn parse_porcelain(raw: &str) -> Vec<GitFileStatus> {
             let index_status = line.as_bytes().first().copied().unwrap_or(b' ');
             let worktree_status = line.as_bytes().get(1).copied().unwrap_or(b' ');
             let path = line.get(3..).unwrap_or_default();
-            let path = path.split(" -> ").last().unwrap_or(path).to_string();
+            let (path, original) = match path.split_once(" -> ") {
+                Some((old, new)) => (new.to_string(), Some(old.to_string())),
+                None => (path.to_string(), None),
+            };
             let pair = format!("{}{}", index_status as char, worktree_status as char);
+            let renamed = index_status == b'R' || worktree_status == b'R';
+            let copied = index_status == b'C' || worktree_status == b'C';
             GitFileStatus {
                 path,
                 raw: line.to_string(),
@@ -1028,6 +1129,8 @@ fn parse_porcelain(raw: &str) -> Vec<GitFileStatus> {
                 worktree: worktree_status != b' ',
                 untracked: index_status == b'?' && worktree_status == b'?',
                 conflicted: ["AA", "DD", "AU", "UD", "UA", "DU", "UU"].contains(&pair.as_str()),
+                renamed_from: if renamed { original.clone() } else { None },
+                copied_from: if copied { original } else { None },
             }
         })
         .collect()
@@ -1047,6 +1150,40 @@ mod tests {
             owner: owner.to_string(),
             name: name.to_string(),
         })
+    }
+
+    /// A rename keeps its source so the commit can carry the deletion; a copy
+    /// does not, because its source stays in place (spec 35 §5.3).
+    #[test]
+    fn a_rename_record_keeps_its_source_and_a_copy_record_does_not() {
+        let rename = parse_porcelain_z(b"R  b.txt\0a.txt\0", &|_| false);
+        assert_eq!(rename.len(), 1);
+        assert_eq!(rename[0].path, "b.txt");
+        assert_eq!(rename[0].renamed_from.as_deref(), Some("a.txt"));
+        assert_eq!(rename[0].copied_from, None);
+
+        let copy = parse_porcelain_z(b"C  c.txt\0a.txt\0", &|_| false);
+        assert_eq!(copy.len(), 1);
+        assert_eq!(copy[0].path, "c.txt");
+        assert_eq!(copy[0].renamed_from, None);
+        assert_eq!(copy[0].copied_from.as_deref(), Some("a.txt"));
+
+        // The worktree column is a rename too: ` R`, `RM` and `RD` all carry
+        // the source record and must keep it.
+        for record in [
+            b" R b.txt\0a.txt\0".as_slice(),
+            b"RM b.txt\0a.txt\0".as_slice(),
+            b"RD b.txt\0a.txt\0".as_slice(),
+        ] {
+            let parsed = parse_porcelain_z(record, &|_| false);
+            assert_eq!(parsed.len(), 1, "{record:?}");
+            assert_eq!(parsed[0].renamed_from.as_deref(), Some("a.txt"));
+        }
+
+        // A restricted source drops the whole pair: committing one half of a
+        // rename would be worse than not offering it.
+        let restricted = parse_porcelain_z(b"R  b.txt\0.env\0", &|path| path == ".env");
+        assert!(restricted.is_empty());
     }
 
     #[test]

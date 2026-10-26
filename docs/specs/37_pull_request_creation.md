@@ -6,8 +6,8 @@ Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#33](33_mcp_management_and_deferred_discovery.md) (the MCP client
-it publishes through) — **not built**; [#35](35_commit_preparation.md) (commit
-preparation) — **not built**; [#36](36_branch_and_worktree_delivery.md) (branch
+it publishes through) — **not built**; [#35](35_commit_preparation/proposal.md) (commit
+preparation) — built (Done 2026-10-26); [#36](36_branch_and_worktree_delivery.md) (branch
 delivery) — **not built**. Everything else named below is a cross-reference,
 not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
@@ -24,7 +24,7 @@ body quotes), [`31_permission_profiles/proposal.md`](31_permission_profiles/prop
 [`33_mcp_management_and_deferred_discovery.md`](33_mcp_management_and_deferred_discovery.md)
 (per-tool approval, and the rule that a remote read-only claim is an assertion),
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md),
-[`35_commit_preparation.md`](35_commit_preparation.md),
+[`35_commit_preparation/proposal.md`](35_commit_preparation/proposal.md),
 [`36_branch_and_worktree_delivery.md`](36_branch_and_worktree_delivery.md).
 See also [`SECURITY.md`](../../SECURITY.md).
 
@@ -78,7 +78,7 @@ bespoke GitHub client would duplicate all of that and add a credential path.
   `diff`, `suggest_commit_message`, invoked via `-C <root>`
   (`git_service.rs:37`, `:77`, `:110`).
 - **`GitService::diff` redacts** (`git_service.rs:107`), which matters here for
-  the same reason as in [spec 35](35_commit_preparation.md) §5.4: what is
+  the same reason as in [spec 35](35_commit_preparation/proposal.md) §5.4: what is
   displayed is not what is transmitted.
 - **`unknown_external_outcome` and action markers exist** in
   [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.1 and §5.3, including
@@ -307,7 +307,7 @@ the author sees it as it will appear.
 
 **The body is scanned for secrets before the approval**, against the composed
 text rather than a redacted preview — the same reasoning as
-[spec 35](35_commit_preparation.md) §5.4. A PR body is more exposed than a
+[spec 35](35_commit_preparation/proposal.md) §5.4. A PR body is more exposed than a
 commit: it is rendered in a web UI, emailed in notifications, and indexed. Check
 output quoted into the body is the realistic source, and command output has
 already been redacted once by the time it reaches a `Finding`

@@ -32,6 +32,7 @@ This build is a developer preview. Release builds are Developer ID signed and no
 - [Chat](#chat)
 - [File Changes](#file-changes)
 - [Verification](#verification)
+- [Commits](#commits)
 - [Rewind](#rewind)
 - [The Plan Panel](#the-plan-panel)
 - [Search and Export](#search-and-export)
@@ -348,7 +349,7 @@ A strip directly above the prompt shows where the next turn will work:
 - **The folder button** names the working folder. It opens a menu: **Show in Finder**, **Open repository on GitHub**, **Copy path**, **Change folder…** (the same folder picker as the **+** beside **Projects**) and **Open in terminal**. **Open repository on GitHub** appears only when the folder's `origin` remote is on github.com. Damaian rebuilds the address as `https://github.com/<owner>/<repo>` from the remote rather than opening the remote's text as it stands, because a cloned repository controls that text.
 - **The branch** follows it in grey. On a detached HEAD it shows the short commit hash instead.
 - **The change count**, `+N −M` on the right, is the working tree's lines added and removed against the last commit, with new untracked text files counted as added lines. It is hidden when there is nothing to count. It is information only; clicking it does nothing yet.
-- **A contextual action** may appear at the far right. Today that is **Fix N errors** or **Fix N warnings** ([Findings](#fix-n-errors-and-the-findings-list)).
+- **A contextual action** may appear at the far right. Today that is **Commit…** when the session has changes ([Commits](#commits)), or **Fix N errors** / **Fix N warnings** ([Findings](#fix-n-errors-and-the-findings-list)); errors and warnings take priority.
 
 In a folder that is not a Git repository, the bar shows the folder button alone, and its menu still works. The bar refreshes when you open a session, after every turn, after you apply or roll back a patch, after a rewind, and when you return to the window (at most once every five seconds). It never polls on a timer.
 
@@ -571,6 +572,23 @@ to verify. From the command line, `damaian verify <repo> <session>` runs it and
 prints the report; `--decline-checks` answers an approval card with every check
 declined. This checks that the project's own tests pass — it does not prove the
 change is correct, and the report is written to avoid implying that.
+
+## Commits
+
+**Commit…** in the repo bar prepares a commit from the changes Damaian applied and you accepted in this session. It is the first action that writes to your Git repository, so it is the most explicit one:
+
+- **Only accepted files start selected.** A file Damaian applied and you have not edited since is checked. A file you edited by hand after Damaian changed it, a file an approved command changed, and any other change appear with a label and start unchecked — the commit is the set you reviewed, and nothing is added behind your back.
+- **A rename moves both paths together.** If you renamed a file with `git mv`, the review shows the new path and the old path's deletion; the checkboxes move as a pair, and committing only the new path is refused with `commit_rename_incomplete`, because that would leave the old file behind. A copy does not produce a deletion.
+- **The mode is part of the change.** A chmod-only change, or a file replaced by a symlink, is shown as a candidate and committed with the mode that is on disk (`100755` or `120000`), not the old mode from `HEAD`.
+- **Your staging area is not used.** Damaian builds the commit through a private index, so anything you had staged stays staged and your working tree is not touched. If the commit fails, there is nothing to restore.
+- **The displayed diff is redacted; the commit is not.** The scanner redacts credentials in the preview. The dialog says so, and before the commit Damaian scans the real content again. If it finds something, you must tick the override for that commit; the override is recorded in the audit log. The bytes are also checked against the preview, so a file edited after you looked refuses the commit rather than committing something you did not see.
+- **Repository hooks run for real.** The dialog lists `pre-commit`, `prepare-commit-msg`, `commit-msg` and `post-commit`, where they are and whether they will run. Damaian never passes `--no-verify`. A failing `pre-commit` aborts, a failing `post-commit` is reported after the commit, and a hook that rewrites the message asks you to approve the rewritten text before anything is created. A hook that reformats and stages files — lint-staged, for example — does not change what is committed: the commit keeps the bytes you reviewed, and a warning names the hook and says its staged changes remain uncommitted in your working tree.
+- **One approval per commit.** There is no “always allow”. Committing is available in **Code** mode only, and only under a permission profile whose `allow_git_commits` is on; **Read-only** turns it off. A repository may turn it off and never on.
+- **The result is reported.** The dialog shows the short commit SHA and the message, and the audit log records the SHA, the file and hunk counts, the message length, the hooks and whether the secret override was used.
+
+The commit message starts as a template from your request. **Draft with model** asks the configured model for a subject and body using the redacted diff and the plan; if there is no model, the call fails or the answer is unusable, the template stays. You can always edit the message, and your text is what is committed.
+
+If Damaian is interrupted while committing, the recovery card offers **Inspect**: it shows the prepared commit, the `HEAD` it was prepared on, and where `HEAD` is now. It does not resolve the commit for you.
 
 ## Rewind
 

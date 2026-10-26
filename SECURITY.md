@@ -200,6 +200,44 @@ and desktop shell inherit them because they call the same functions:
   `--end-of-options`; `paths` are resolved through `PathPolicy` against the
   checkout and passed after `--`, so neither can be read as an option.
 
+## Git Commits
+
+Committing is the only operation that writes to the user's Git repository, and
+it is treated as a capability rather than a convenience:
+
+- **A typed, per-commit approval.** A commit request carries its own approval
+  field and is audited as `commit_created`; a command approval, a plan approval
+  or an answer to a question never satisfies it. There is no persistent
+  "always allow" for committing.
+- **Code mode and a profile that permits it.** Committing is refused in Ask,
+  Plan and Review, and whenever the resolved `allow_git_commits` capability is
+  false. The built-in **Read-only** profile turns it off. Repository config may
+  turn it off and may never turn it on, like every other capability key.
+- **The user's index is never used.** The tree is composed through a private
+  `GIT_INDEX_FILE` under the data directory, verified with `ls-tree` before
+  `commit-tree`, and the branch moves with an `update-ref` compare-and-swap
+  against the `HEAD` that was reviewed. A failure before the ref moves leaves
+  the user's index and working tree untouched.
+- **The preview is redacted; the commit is not.** The displayed diff goes
+  through `SecretScanner`. Before the commit, the scanner runs on the exact
+  bytes that will become blobs. A finding is reported as categories and counts
+  — never matched text — and requires a separate per-commit override that is
+  audited. Files too large to scan are treated as unscanned and need the same
+  override. The prepared record stores each candidate's exact blob id, so a
+  file that changed after review refuses the commit.
+- **Hooks are not bypassed.** `commit-tree` runs no hooks, so `pre-commit`,
+  `prepare-commit-msg`, `commit-msg` and `post-commit` are executed explicitly
+  in Git's order, with the private index in their environment, through the
+  command path's timeout, output truncation, redaction and process registry.
+  There is no `--no-verify` and no setting that adds one. A hook that rewrites
+  the message must be approved again before the commit object is created.
+- **Restricted paths stay out.** Candidates come from a status read that applies
+  `PathPolicy`, and the commit re-checks every selected path for containment
+  and restriction before composing the tree.
+- **A commit is a side-effecting action.** It is bracketed by #17's markers with
+  `sideEffecting: true`; a crash between them classifies as an unknown external
+  outcome and recovery offers inspection, never an automatic re-commit.
+
 ## Repository Config Trust Boundary
 
 Configuration comes from three files, applied in order: user (`<data_dir>/config/user.conf`), repository (`<repo>/.damaian/config.conf`), and admin (`DAMAIAN_ADMIN_CONFIG` or `<data_dir>/config/admin.conf`). Only the repository file arrives with a clone, so **repository config is untrusted input**: it may add restrictions and never remove one.
@@ -208,7 +246,7 @@ A repository cannot set `shell`, `data_dir`, `allowed_roots`, `secret_patterns`,
 
 `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are unioned with the user's, so a repository may add a restriction but never drop one. `require_approval_for_file_edits`, `require_approval_for_risky_commands`, and `require_approval_for_all_commands` may be turned on by a repository, never off. `mcp_enabled` and a server's `enabled` may be turned off, never on, and `mcp_server_allowlist` may only be narrowed. A repository may *define* an MCP server — a useful suggestion — but the definition is created disabled and approval-gated, and it cannot redefine a server the user has already configured. The same holds for hooks: a repository may define a hook of its own, but it arrives pending review at a definition hash, cannot record its own review, and cannot change a hook the user or admin config already defines.
 
-Limits on how much one tool call, command or turn may read, run or spend may be lowered by a repository and never raised: `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, and `agent_max_turn_notes_chars`. Raising one would widen what leaves your machine or how long a command may run.
+Limits on how much one tool call, command or turn may read, run or spend may be lowered by a repository and never raised: `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, `agent_max_turn_notes_chars`, and `allow_git_commits`. Raising one would widen what leaves your machine or how long a command may run.
 
 `command_allowlist` is never taken from repository config. An `Allow Always` decision is the user's decision about a repository, so it is stored in user config as `command_allowlist.<repository_id>`, keyed per checkout. The repository's own file cannot grant its commands no-approval execution, and a `command_allowlist` already present in a repository file is offered once for itemised keep-or-discard rather than honoured.
 
