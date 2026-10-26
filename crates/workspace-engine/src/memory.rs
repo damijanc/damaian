@@ -857,11 +857,13 @@ impl MemoryStore {
         self.ensure_if_present()?;
         let entries = read_entries(&self.project_path(&identity.key))?.0;
         for entry in &entries {
-            if entry.project_key.as_deref() != Some(identity.key.as_str()) {
+            if entry.scope != MemoryScope::Project
+                || entry.project_key.as_deref() != Some(identity.key.as_str())
+            {
                 return Err(MemoryError::Invalid(format!(
-                    "Memory entry {} in the store for project {} declares project key {:?}. \
+                    "Memory entry {} in the store for project {} is scoped {:?} with project key {:?}. \
                      Refusing to read it; this would cross a project boundary.",
-                    entry.id, identity.key, entry.project_key
+                    entry.id, identity.key, entry.scope, entry.project_key
                 )));
             }
         }
@@ -898,12 +900,22 @@ impl MemoryStore {
     /// become a disclosure), then the secret check, then evidence eligibility,
     /// then sensitivity derivation, then the write. Nothing before the last
     /// step touches the disk.
+    ///
+    /// The store enforces the *shape* of consent, not consent itself: it can
+    /// require a provenance that names a user request or a confirmed
+    /// suggestion, but it cannot tell a fabricated `UserRequest` from a real
+    /// one. Spec 29 owns that boundary — `MemoryProposal` has no public
+    /// conversion to this type without a user action — and no production code
+    /// outside that flow may call this method.
     pub fn insert(
         &self,
         root: &Path,
         identity: Option<&ProjectIdentity>,
         mut entry: MemoryEntry,
     ) -> MemoryResult<MemoryEntry> {
+        // Normalize before validating: a stored statement is the sentence the
+        // confirmation showed, with no surrounding whitespace.
+        entry.statement = entry.statement.trim().to_string();
         self.validate_shape(identity, &entry)?;
         self.refuse_secrets(&entry)?;
         self.refuse_ineligible_evidence(root, &entry)?;
