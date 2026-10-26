@@ -1231,6 +1231,51 @@ impl SessionStore {
         Ok(restriction)
     }
 
+    /// The newest `context_assembled` manifest per task (spec 27 §5.3).
+    ///
+    /// The manifest is an **audit** record, not a session event, so this reads
+    /// `<data_dir>/audit/events.jsonl` and keeps the entries whose
+    /// `sessionId` matches. A removed item appends a second assembly before the
+    /// resumed turn sends anything, so "newest wins" is what makes the
+    /// post-send view show what was actually sent rather than what was first
+    /// planned. The manifest is stored as one JSON string field by
+    /// `audit_fields`; a malformed record is skipped rather than failing the
+    /// session read. Audit retention can remove older events, in which case an
+    /// old turn simply has no stored manifest — the same shape as a session
+    /// written before #26.
+    pub fn read_session_context_manifests(
+        &self,
+        session_id: &str,
+    ) -> Result<HashMap<String, crate::context_manager::ContextManifest>> {
+        let path = self.data_dir.join("audit").join("events.jsonl");
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(HashMap::new());
+        };
+        let mut manifests = HashMap::new();
+        for value in content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        {
+            if value.get("eventType").and_then(|kind| kind.as_str()) != Some("context_assembled") {
+                continue;
+            }
+            if value.get("sessionId").and_then(|id| id.as_str()) != Some(session_id) {
+                continue;
+            }
+            let Some(task_id) = value.get("taskId").and_then(|id| id.as_str()) else {
+                continue;
+            };
+            let Some(raw) = value.get("manifest").and_then(|raw| raw.as_str()) else {
+                continue;
+            };
+            let Ok(manifest) = serde_json::from_str(raw) else {
+                continue;
+            };
+            manifests.insert(task_id.to_string(), manifest);
+        }
+        Ok(manifests)
+    }
+
     /// Sets the session's working mode by appending an event; the log is
     /// never rewritten. `set_by` is always `"user"` (`proposal.md` §5.4) —
     /// the field exists so a future non-user origin cannot be introduced

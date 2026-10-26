@@ -508,6 +508,21 @@ impl EditOrchestrator {
             }
             outcome.context
         };
+        // The edit is proposed from the user's chat session, so that session's
+        // pins and restriction govern it too (spec 27 §5.4). An edit with no
+        // origin session has none.
+        let context_pins = if origin_session_id.is_empty() {
+            Vec::new()
+        } else {
+            self.session_store
+                .context_pins(origin_session_id)
+                .unwrap_or_default()
+        };
+        let context_restriction = if origin_session_id.is_empty() {
+            None
+        } else {
+            self.session_store.context_restriction(origin_session_id)?
+        };
         let context = match self.context_manager.build_context(ContextRequest {
             repository_root: repository_root.as_ref(),
             repository_id: &index.repository_id,
@@ -519,10 +534,8 @@ impl EditOrchestrator {
             hook_context: &hook_context,
             // A one-shot edit has no turn whose plan it could carry.
             plan: None,
-            // Task 7 reads the origin session's controls here; an edit with no
-            // origin session has none.
-            pinned: &[],
-            restriction: None,
+            pinned: &context_pins,
+            restriction: context_restriction.as_deref(),
             conversation_summary: None,
         }) {
             Ok(context) => context,

@@ -904,3 +904,157 @@ fn a_context_review_cannot_resume_a_command_approval() {
         "{error}"
     );
 }
+
+// ---- Task 7: the post-send record, past turns, and the edit flow ----
+
+#[test]
+fn the_newest_manifest_per_task_is_what_was_sent() {
+    let repo = fixture_repo("newest-manifest");
+    let engine = WorkspaceEngine::new(pause_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let (result, _) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+    let review = result.context_review.expect("the review is present");
+    let index = review
+        .manifest
+        .included
+        .iter()
+        .position(|included| included.kind == ContextKind::AgentInstruction)
+        .expect("the fixture has AGENTS.md");
+    engine
+        .chat_orchestrator
+        .remove_context_item(&review.id, index)
+        .expect("the instruction is removable");
+    let resumed = resume_context(&engine, &review.id, ContextDecision::Send, &mut adapter)
+        .expect("the amended context should send");
+
+    let manifests = engine
+        .session_store
+        .read_session_context_manifests(&resumed.session.id)
+        .expect("the session log should read");
+    let manifest = manifests
+        .get(&resumed.task.id)
+        .expect("the task has a manifest");
+    assert!(
+        manifest
+            .included
+            .iter()
+            .all(|included| included.path.as_deref() != Some("AGENTS.md")),
+        "the sent manifest still lists the removed instruction"
+    );
+    assert!(
+        manifest
+            .excluded
+            .iter()
+            .any(|record| record.reason == ExclusionReason::UserRemoved
+                && record.path.as_deref() == Some("AGENTS.md"))
+    );
+}
+
+#[test]
+fn a_past_turns_context_is_readable_after_another_turn() {
+    let repo = fixture_repo("past-turns");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let first = ask_with(&engine, &repo, "What is this?", &mut adapter).0;
+    let second = ask_with_again(&engine, &repo, &first.session.id, "And now?", &mut adapter);
+
+    let manifests = engine
+        .session_store
+        .read_session_context_manifests(&second.session.id)
+        .expect("the session log should read");
+    assert!(manifests.contains_key(&first.task.id), "{manifests:?}");
+    assert!(manifests.contains_key(&second.task.id), "{manifests:?}");
+    assert_ne!(first.task.id, second.task.id);
+}
+
+fn ask_with_again(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: &str,
+    prompt: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut tokens = |_token: &str| {};
+    let mut progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut tokens,
+        on_progress: &mut progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .ask_with_session(repo, prompt, &[], Some(session_id), adapter, &mut sink)
+        .expect("the second turn should run")
+}
+
+#[test]
+fn an_old_context_assembled_record_without_the_new_fields_still_parses() {
+    let repo = fixture_repo("old-manifest");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let result = ask_with(&engine, &repo, "What is this?", &mut adapter).0;
+    let manifests = engine
+        .session_store
+        .read_session_context_manifests(&result.session.id)
+        .unwrap();
+    let manifest = manifests.get(&result.task.id).unwrap();
+    let mut value = serde_json::to_value(manifest).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("conversationSummary");
+    object.remove("symbolProvenance");
+    let parsed: workspace_engine::ContextManifest = serde_json::from_value(value).unwrap();
+    assert!(parsed.conversation_summary.is_none());
+    assert!(parsed.symbol_provenance.is_none());
+}
+
+#[test]
+fn an_edit_from_a_session_honours_its_pins_and_restriction() {
+    let repo = fixture_repo("edit-controls");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let session = engine
+        .session_store
+        .create_session(&index.repository_id, "Editing")
+        .unwrap();
+    engine
+        .session_store
+        .add_context_pin(&session.id, "src/other.rs", None)
+        .unwrap();
+    engine
+        .session_store
+        .set_context_restriction(&session.id, &["src/other.rs".to_string()])
+        .unwrap();
+    let mut adapter = MockModelAdapter::new(
+        "DAMAIAN_EDIT_V1\nSUMMARY: Update other\nFILE: src/other.rs\nSTATUS: modified\nCONTENT:\npub fn other_marker_zzq() -> usize { 8 }\nEND_FILE\nEND_PATCH\n",
+    );
+
+    let result = engine
+        .edit_orchestrator
+        .propose_edit(&repo, "Update other", &[], Some(&session.id), &mut adapter)
+        .expect("the edit should be proposed");
+
+    let manifests = engine
+        .session_store
+        .read_session_context_manifests(&result.session.id)
+        .unwrap();
+    let manifest = manifests.get(&result.task.id).unwrap();
+    assert!(
+        manifest
+            .included
+            .iter()
+            .any(|included| included.category == ContextCategory::Pinned
+                && included.path.as_deref() == Some("src/other.rs")),
+        "the origin session's pin did not reach the edit: {:?}",
+        manifest.included
+    );
+    assert!(
+        manifest.included.iter().all(|included| matches!(
+            included.path.as_deref(),
+            None | Some("AGENTS.md") | Some("src/other.rs")
+        )),
+        "the restriction did not reach the edit: {:?}",
+        manifest.included
+    );
+}

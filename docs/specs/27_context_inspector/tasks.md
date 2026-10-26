@@ -16,7 +16,7 @@ the resolved §7 open question in [`context.md`](context.md)
 | 4 · `PreparedContext` and removal | Done 2026-10-26 | `PreparedContext` (`from_plan`/`into_plan`/`files`/`sections`) and `remove_optional`/`remove_summary` landed with Task 3's commit; this task added `removing_by_index_twice_uses_the_new_indices`. `Required` is refused before any mutation; category use, `items`, `total_tokens` and `included` are recomputed, `allocated` is left alone. **Falsified:** moving the `Required` check after the removal made the test see one fewer item and fail. Scoped: `context_inspector` 14/14, scoped clippy passed. |
 | 5 · `pause_for_context_review` config | Done 2026-10-26 | `Config.pause_for_context_review` (default `false`) and its `ConfigOverlay` field are classified `Capability`, applied through `scoped(..., forbidden, ...)`, printed by both `to_policy_text` functions, labelled in `effective_policy`, and refused by `split_profile_keys`. Added a `weakening_cases` entry and `pause_for_context_review_is_off_by_default_and_user_only`. Scoped: fast five passed, scoped clippy passed, `permission_profiles` 79 passed / 1 skipped. |
 | 6 · The pre-send pause and send gate | Done 2026-10-26 | `TurnProgress::Context` is emitted after `context_assembled` and before the first call; `build_model_prompt` is split into `build_conversation` + `build_model_prompt_with_conversation` with byte-identical output (the `prompt_cache` guard passes). `PausedFor::ContextReview` and `PendingContextReview` persist the prepared plan, the conversation block and the summary; `resume_after_context_decision` refuses every other pause and every other resume refuses a review; `remove_context_item`/`remove_context_summary` amend and re-record the manifest without taking the pause. Decline sends nothing and marks the task `Cancelled`. Tests: 10 new (pause no-call, default ordering, send, decline, instruction removal in the request, Required refusal, both cross-resume directions, removal across a reload, stripped-field load). **Falsified:** not saving the amended review left the removed instruction in the request and the test failed. Scoped: `context_inspector` 23/23, `prompt_cache`/`foundation`/`round_budget`/`compaction` 206 passed, scoped clippy passed. |
-| 7 · Post-send record and past turns | Not started | |
+| 7 · Post-send record and past turns | Done 2026-10-26 | `SessionStore::read_session_context_manifests` reads `<data_dir>/audit/events.jsonl` (the manifest is an audit record, not a session event), filters by `sessionId`, and keeps the newest `context_assembled` per task. The edit flow reads the origin session's pins/restriction; the repair continuation now reads them too, reads the conversation before assembly, and emits `TurnProgress::Context`. Tests: newest-wins after a removal, two turns' manifests in one session, an old manifest without the new fields, and an edit from a session with a pin and a restriction. **Falsified:** `or_insert` (first-wins) made the removal test read the pre-removal manifest. Scoped: `context_inspector` 27/27, `prompt_cache` + `verification_loop` 84 passed, scoped clippy passed. |
 | 8 · Shell routes, JSON and SSE | Not started | |
 | 9 · The web panel and review card | Not started | |
 | 10 · Docs, manual walk, close-out | Not started | |
@@ -612,7 +612,7 @@ the pause matrix test lives there.
 
 **Files:** `session.rs`, `chat.rs`, `edit.rs`, `tests/context_inspector.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `the_newest_context_assembled_event_per_task_is_what_was_sent`: a paused
     turn with one removal then send; `read_session_context_manifests` returns
     the amended manifest for that task, not the first one.
@@ -625,8 +625,8 @@ the pause matrix test lives there.
     restrict to it, call `propose_edit` with the origin session id; its
     `context_assembled` manifest has the pin and no path outside the
     restriction.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Implement.**
   - `SessionStore::read_session_context_manifests`: iterate parsed events, keep
     `event_type == "context_assembled"`, read `taskId` and the `manifest` field
     (a JSON string, because `audit_fields` stores it as one), parse into
@@ -638,11 +638,11 @@ the pause matrix test lives there.
   - In `chat.rs`'s verification repair turn, pass `pinned`/`restriction`/summary
     from the session (read the conversation before assembly so the summary is
     available) and emit `TurnProgress::Context` after its audit record.
-- [ ] **Step 4: Falsify.** (1) Keep the first event per task instead of the
+- [x] **Step 4: Falsify.** (1) Keep the first event per task instead of the
   newest → the removal test sees the pre-removal manifest. (2) Read the
   `manifest` field as an object → parse fails and the test catches it.
   (3) Skip the edit wiring → its manifest has no pin. Restore each.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -650,7 +650,7 @@ the pause matrix test lives there.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test context_inspector --test prompt_cache
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit.
+- [x] **Step 6: Update the Progress row** and commit.
   Subject: `Keep each turn's sent context readable after it ends`.
 
 ---

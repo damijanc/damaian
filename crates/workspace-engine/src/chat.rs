@@ -2572,6 +2572,15 @@ impl ChatOrchestrator {
             },
         );
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
+        // The repair continuation sees the same conversation the turn does,
+        // including any active summary (spec 55 §5.3), and the session's
+        // context controls (spec 27 §5.4).
+        let conversation = self.session_store.read_conversation(&session.id)?;
+        let context_pins = self
+            .session_store
+            .context_pins(&session.id)
+            .unwrap_or_default();
+        let context_restriction = self.session_store.context_restriction(&session.id)?;
         let context = self.context_manager.build_context(ContextRequest {
             repository_root,
             repository_id: &index.repository_id,
@@ -2582,11 +2591,9 @@ impl ChatOrchestrator {
             limit: self.config.context_token_budget(),
             hook_context: &[],
             plan: Some(plan),
-            // Task 7 wires the repair continuation to the session's controls;
-            // until then it assembles exactly as it did.
-            pinned: &[],
-            restriction: None,
-            conversation_summary: None,
+            pinned: &context_pins,
+            restriction: context_restriction.as_deref(),
+            conversation_summary: conversation.summary.as_ref(),
         })?;
         let mut fields = vec![
             ("actor", "system".to_string()),
@@ -2594,9 +2601,7 @@ impl ChatOrchestrator {
         ];
         fields.extend(context.manifest.audit_fields());
         self.audit_log.record("context_assembled", &fields)?;
-        // The repair continuation sees the same conversation the turn does,
-        // including any active summary (spec 55 §5.3).
-        let conversation = self.session_store.read_conversation(&session.id)?;
+        sink.context(&context.manifest);
         let messages = vec![
             ModelMessage::system(system_prompt_for_session(
                 SessionMode::Code,
