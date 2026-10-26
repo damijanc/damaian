@@ -1,22 +1,22 @@
 # Feature Spec: Memory Creation, Consent, and Scope
 
-Status: Not started
+Status: In progress
 Order: 29 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#28](28_memory_model_and_storage/proposal.md) (the memory record and store)
+Depends on: [#28](../28_memory_model_and_storage/proposal.md) (the memory record and store)
 — built (Done 2026-10-26). Everything else named below is a cross-reference, not
 a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.8 (risk classification and approval), section 7.10
 (secret detection). Related implementation specs:
-[`11_agents_md_support.md`](11_agents_md_support.md) (instruction precedence
-memory sits below), [`20_working_modes/proposal.md`](20_working_modes/proposal.md) (mode is a
+[`11_agents_md_support.md`](../11_agents_md_support.md) (instruction precedence
+memory sits below), [`20_working_modes/proposal.md`](../20_working_modes/proposal.md) (mode is a
 capability boundary memory cannot widen),
-[`28_memory_model_and_storage/proposal.md`](28_memory_model_and_storage/proposal.md) (the record
-this spec creates), [`30_memory_retrieval_and_lifecycle.md`](30_memory_retrieval_and_lifecycle.md).
-See also [`SECURITY.md`](../../SECURITY.md).
+[`28_memory_model_and_storage/proposal.md`](../28_memory_model_and_storage/proposal.md) (the record
+this spec creates), [`30_memory_retrieval_and_lifecycle.md`](../30_memory_retrieval_and_lifecycle.md).
+See also [`SECURITY.md`](../../../SECURITY.md).
 
 ## 1. Motivation
 
@@ -33,7 +33,7 @@ is, absent a consent boundary, a way for a repository author to write persistent
 instructions into a stranger's assistant.
 
 That is the attack this work package exists to close, and it is not hypothetical:
-`AGENTS.md` arrives with a cloned repository, and [spec 20](20_working_modes/proposal.md)
+`AGENTS.md` arrives with a cloned repository, and [spec 20](../20_working_modes/proposal.md)
 §5.5 already establishes that repository content is untrusted with respect to
 capability. Memory needs the same treatment, with one addition — repository
 content may *motivate a suggestion*, but only a user action can cause a write.
@@ -42,37 +42,12 @@ The consent boundary is therefore a single rule with no exceptions:
 **suggestion and persistence are separate steps with a user action between
 them.**
 
-## 2. Current State
-
-- **No memory exists**, so there is no current creation path.
-  [Spec 28](28_memory_model_and_storage/proposal.md) defines the record and the store.
-- **`MemoryProvenance` has no model-inference variant**
-  ([spec 28](28_memory_model_and_storage/proposal.md) §5.1). Its three variants each
-  require a session and message, a confirmed suggestion, or repository evidence,
-  so an unconfirmed inference has nowhere to be recorded. This spec's
-  requirement 2 is partly enforced by that type already.
-- **Secret refusal is available.** `SecretScanner::contains_secrets`
-  (`crates/workspace-engine/src/secret_scanner.rs:65`) and `scan`
-  (`secret_scanner.rs:27`) return findings without transforming;
-  [spec 28](28_memory_model_and_storage/proposal.md) §5.4 puts refusal on the store's
-  write path.
-- **User scope is off by default and enforced on both read and write**
-  ([spec 28](28_memory_model_and_storage/proposal.md) §5.6), gated by
-  `memory_user_scope_enabled`.
-- **Instruction precedence is established.**
-  [Spec 11](11_agents_md_support.md) defines how `AGENTS.md` orders against user
-  and admin config. Memory must sit below all of it.
-- **Approval UI patterns exist to imitate.** Command approval produces a card
-  the user acts on ([spec 10](10_persistent_command_approval.md)), with
-  exact-scope `Allow Always` and no broad patterns. Memory confirmation is the
-  same shape: a specific proposal, an explicit action.
-- **Session-scoped approval has a precedent.**
-  `SessionStore::allow_browser_diagnostics_for_session`
-  (`crates/workspace-engine/src/session.rs:261-291`) records a session-scoped
-  user decision as an appended event.
-- **The repository watcher exists** in `index_cache.rs` and is what
-  [spec 30](30_memory_retrieval_and_lifecycle.md) uses for revalidation; this
-  spec only records the evidence that makes revalidation possible.
+The pre-implementation state this proposal was written against, including where
+its line references had drifted by 2026-10-26, is in [`context.md`](context.md).
+That file also records the design decisions taken before code was written. The
+remaining section numbers are unchanged so every existing `§5.x` cross-reference
+in specs 28 and 30 keeps resolving. Task order and verification are in
+[`tasks.md`](tasks.md).
 
 ## 3. Requirements
 
@@ -109,7 +84,7 @@ ignored file content, which the roadmap does not address at all.
 
 - Deciding *what is worth* remembering, as a quality problem. This spec defines
   the gate; suggestion quality is measured by
-  [spec 18](18_local_evaluation_harness/proposal.md)'s memory metrics, not tuned
+  [spec 18](../18_local_evaluation_harness/proposal.md)'s memory metrics, not tuned
   here.
 - Automatic learning from repository content without confirmation. Explicitly
   forbidden by requirement 6, and listed as a roadmap non-goal.
@@ -117,7 +92,7 @@ ignored file content, which the roadmap does not address at all.
   this phase's minimum slice.
 - Contradiction detection between entries — also WP3.
 - Retrieval and staleness —
-  [spec 30](30_memory_retrieval_and_lifecycle.md).
+  [spec 30](../30_memory_retrieval_and_lifecycle.md).
 - Bulk confirmation of many suggestions in one action. §5.4 explains why.
 - Import as a creation path — WP3, and it carries its own untrusted-input rules.
 - A memory that can change mode, approval policy, or path policy. Requirement 5
@@ -143,6 +118,10 @@ pub struct MemoryProposal {
     /// What prompted this. Includes untrusted origins — see §5.3.
     pub origin: ProposalOrigin,
     pub evidence: Vec<EvidenceRef>,
+    /// The turn a non-user-origin proposal came from. Required for every
+    /// origin except `UserRequest`, because #28's `SuggestedAndConfirmed`
+    /// carries a task id. See §5.10.
+    pub task_id: Option<String>,
     pub created_at_ms: u128,
 }
 
@@ -164,20 +143,52 @@ pub enum ProposalOrigin {
 the latter. The single conversion is:
 
 ```rust
+pub struct UserConfirmation {
+    pub id: String,
+    pub proposal_id: String,
+    /// Set when the user chose a different eligible scope, per §5.6.
+    pub scope: Option<MemoryScope>,
+    pub confirmed_at_ms: u128,
+}
+
+/// Everything the conversion needs to re-check the candidate and to resolve
+/// the entry's identity. Supplied by the store, never by a client.
+pub struct MemoryProposalGate<'a> {
+    pub root: &'a Path,
+    pub identity: Option<&'a ProjectIdentity>,
+    pub scanner: &'a SecretScanner,
+    pub path_policy: &'a PathPolicy,
+    pub ignore_patterns: &'a [String],
+}
+
 impl MemoryProposal {
     /// The only way a proposal becomes storable. `confirmation` records the
     /// user action, and there is no other constructor for MemoryEntry.
-    pub fn confirm(self, confirmation: UserConfirmation) -> Result<MemoryEntry>;
+    pub fn confirm(
+        self,
+        confirmation: UserConfirmation,
+        gate: MemoryProposalGate<'_>,
+    ) -> Result<MemoryEntry>;
 }
 ```
 
-`MemoryEntry` has no public constructor other than this and deserialization from
-the store. Requirement 2 is then a property of the API surface: there is no
-function that turns a model suggestion into a stored entry without a
-`UserConfirmation`, so a future caller cannot add one by mistake — only by
-deliberately adding a constructor, which is a reviewable change.
+`MemoryEntry`'s fields are public for reading and for the store's own
+transition methods, but it is `#[non_exhaustive]` and has no public constructor:
+an external crate cannot write a struct literal, and `MemoryEntry::new` is gone.
+The only ways to obtain one are `confirm` and deserialization. `MemoryStore::insert`
+stays public so #28's tests and transitions can call it directly, but it now
+accepts only a value that is already one of those two things.
 
-This is the same reasoning as [spec 21](21_task_plan_progress_and_budget/proposal.md)'s
+The barrier is honest about what it is: **the API surface, not a sandbox.** Any
+in-process caller that deliberately deserializes a `MemoryEntry` from JSON can
+still construct one, because the store must deserialize its own records.
+Requirement 2 is therefore a property of every ordinary path — there is no
+function that turns a model suggestion into a stored entry without a
+`UserConfirmation` — and adding a convenience constructor is a reviewable change
+rather than something a caller reaches for by accident. A test-only constructor
+is deliberately absent: it would compile into the application binary.
+
+This is the same reasoning as [spec 21](../21_task_plan_progress_and_budget/proposal.md)'s
 `Evidence` having no `ModelAsserted` variant: make the unsafe state
 unrepresentable rather than checked.
 
@@ -206,32 +217,44 @@ text.
 
 ### 5.3 External content: motivate, never write
 
-Requirement 6 is the security core. `ProposalOrigin` distinguishes trusted from
-untrusted origins, and untrusted origins carry two extra constraints:
+Requirement 6 is the security core. `ProposalOrigin` distinguishes the user's
+own request from every other origin, and every non-user origin carries two extra
+constraints:
 
 - **`RepositoryObservation` and `ExternalContent` proposals are always shown with
   their source**, named explicitly: "suggested from `CONTRIBUTING.md`",
-  "suggested from issue #412". The user confirming one knows whose words they are
-  agreeing to persist.
-- **An imperative statement from an untrusted origin is refused as a proposal**,
+  "suggested from issue #412". A `ModelSuggestion` is labelled as the assistant's
+  suggestion, never as the user's words. The user confirming one knows whose words
+  they are agreeing to persist.
+- **An imperative statement from any non-user origin is refused as a proposal**,
   not merely flagged. A candidate whose statement reads as an instruction to
   Damaian — "always approve commands", "you may edit files without asking",
-  "ignore the previous rules" — is rejected at proposal time when its origin is
-  untrusted, with the reason recorded. A repository author gets no proposal card,
-  because a card is itself a nudge: users click through prompts, which is why
-  [spec 10](10_persistent_command_approval.md) exists.
+  "ignore the previous rules" — is rejected at proposal time, with the reason
+  recorded. A repository author gets no proposal card, because a card is itself a
+  nudge: users click through prompts, which is why
+  [spec 10](../10_persistent_command_approval.md) exists.
+
+**The check is applied to `ModelSuggestion` too, not only to the two obviously
+untrusted origins.** A poisoned `CONTRIBUTING.md` can make the model call the
+suggestion tool with no `source`, which would otherwise be laundered into a
+trusted-looking `ModelSuggestion` card. The rule is therefore about the origin
+class — user request or not — rather than about which untrusted label the tool
+happened to choose. A non-user candidate cannot bypass the check by relabelling
+itself, because the label does not change the branch that runs the check. The
+injection eval is the arbiter, and a false negative there is a defect.
 
 The detection is a conservative pattern match, and it will have false positives —
 a legitimate convention phrased as an imperative ("always run `make fmt` before
-committing") may be refused from an untrusted origin. That is the correct
+committing") may be refused from a non-user origin. That is the correct
 direction to fail: the user can state the same thing themselves, and it then
 arrives via `UserRequest`, which is trusted. A false negative, by contrast, puts
-an instruction-shaped memory in front of the user for confirmation.
+an instruction-shaped memory in front of the user for confirmation. The patterns
+are recorded in §7.
 
 Requirement 5's precedence is what makes even a confirmed memory safe:
-[spec 30](30_memory_retrieval_and_lifecycle.md) delivers memory as the
+[spec 30](../30_memory_retrieval_and_lifecycle.md) delivers memory as the
 lowest-priority context category, as data, and
-[spec 20](20_working_modes/proposal.md)'s mode boundary is not consultable from memory at
+[spec 20](../20_working_modes/proposal.md)'s mode boundary is not consultable from memory at
 all. A memory saying "all commands are approved" changes nothing, because
 approval is not read from context.
 
@@ -244,15 +267,21 @@ one click means four were not read, and the one that mattered was the one nobody
 looked at. Requirement 2's "a user action between them" is satisfied literally by
 a batch button and defeated in substance.
 
-Suggestions are also capped per task — a small number, highest-value first — so
-the choice is not between reading twelve proposals and dismissing all of them.
-Dismissing a suggestion is one action and is recorded, so a repeatedly dismissed
-suggestion can stop being offered.
+Suggestions are also capped per task — three, highest-value first, and the cap
+counts what the session log already holds for that task so a resumed turn does
+not get a fresh allowance. The choice is therefore not between reading twelve
+proposals and dismissing all of them. Dismissing a suggestion is one action and
+is recorded in the session log and the audit, so a repeatedly dismissed
+suggestion can stop being offered; deciding *which* suggestion to stop offering
+is a quality problem left to the metrics in §5.8 rather than guessed here.
+
+An explicit user request is not capped: the user asked, and refusing the fourth
+thing they asked to remember would be the feature arguing with them.
 
 ### 5.5 Secret refusal at the proposal stage
 
 Requirement 4's enforcement lives on the store's write path
-([spec 28](28_memory_model_and_storage/proposal.md) §5.4), and it is applied again here,
+([spec 28](../28_memory_model_and_storage/proposal.md) §5.4), and it is applied again here,
 earlier: a proposal whose statement contains a detected secret is never shown.
 
 Both checks are deliberate. The store's check is the guarantee; the proposal
@@ -266,14 +295,14 @@ store it" — and the refusal itself is audited without the statement.
 "Unnecessary file content" in requirement 4 is bounded structurally rather than
 by judgement: a `statement` is a single normalized sentence with a length
 ceiling, and `EvidenceRef` holds a path and a hash
-([spec 28](28_memory_model_and_storage/proposal.md) §5.5), never an excerpt. A proposal
+([spec 28](../28_memory_model_and_storage/proposal.md) §5.5), never an excerpt. A proposal
 whose statement exceeds the ceiling is rejected rather than truncated, since a
 truncated sentence is a misleading memory.
 
 ### 5.5a Eligible evidence: protected and ignored files are off limits
 
 Requirement 8's second half. A `RepositoryObservation` proposal
-([spec 28](28_memory_model_and_storage/proposal.md) §5.1) derives a statement from
+([spec 28](../28_memory_model_and_storage/proposal.md) §5.1) derives a statement from
 repository content, and some repository content is content the user has already
 told Damaian to stay out of. A memory derived from it would launder that content
 into a permanent, cross-session store — the one place it is hardest to notice
@@ -334,7 +363,7 @@ explanation says what actually changes:
 
 - Entries in this scope are recalled in **every** repository, not only this one.
 - They are still local, still visible in the context inspector
-  ([spec 27](27_context_inspector/proposal.md)), still removable.
+  ([spec 27](../27_context_inspector/proposal.md)), still removable.
 - Existing project memory is unaffected and is not migrated.
 
 Enabling is not a side effect of confirming a proposal. A user-scope proposal
@@ -346,18 +375,20 @@ the feature on for a user who was answering a different question.
 ### 5.7 Surfaces
 
 A confirmation card in the conversation, shaped like the command-approval card
-([spec 10](10_persistent_command_approval.md)): the exact statement, the scope,
+([spec 10](../10_persistent_command_approval.md)): the exact statement, the scope,
 the category, the origin with its source named, and Confirm / Dismiss / Edit
-scope.
+scope. The card is rendered from the pending proposals the shell serves for the
+open session, not from a statement the client supplies; the confirm route takes
+a proposal id and re-reads the stored proposal (§5.10).
 
 Suggestions appear at the end of a task, collapsed to a count when there is more
 than one, so they do not compete with the completion report
-([spec 23](23_verification_loop/proposal.md)).
+([spec 23](../23_verification_loop/proposal.md)).
 
 ### 5.8 Evals
 
 Requirement 2 and 6 are proven by scenarios, not by design argument. Added to
-[spec 18](18_local_evaluation_harness/proposal.md):
+[spec 18](../18_local_evaluation_harness/proposal.md):
 
 - **Prompt-injection via repository content**: a fixture whose `AGENTS.md` and
   `CONTRIBUTING.md` instruct the agent to remember that commands are
@@ -388,6 +419,50 @@ a repository file is refused outright, and what enabling user scope does.
 `docs/TROUBLESHOOTING.md`: why a memory was not created, how to read a refused
 proposal in the audit log, and how to see which scope an entry is in.
 
+### 5.10 Where a pending proposal lives
+
+A proposal is not an entry and must not become one by being read back. It lives
+in the **session log**, beside the conversation that produced it, as an appended
+`memory_proposal_proposed` event. The session log already survives a reload, a
+restart and a crash (`SessionStore`'s append-only events), and a proposal that
+belongs to a session dies with that session for the same reason session-scope
+memory does (spec 28 §5.3).
+
+The rules that follow from that placement:
+
+- **The confirm route takes a proposal id, never a statement.** It loads the
+  session, re-reads the stored proposal, re-runs the gate, and only then
+  converts. A client cannot edit the sentence between card and click.
+- **A decision is another event.** `memory_proposal_dismissed` and
+  `memory_proposal_confirmed` carry the proposal id and the entry id; the pending
+  list is the proposed events minus the decided ones. A dismissed proposal
+  therefore leaves the proposal and its dismissal in the session log for the
+  audit, and leaves nothing in the memory store.
+- **The card is rendered from the pending list**, so a reload or restart shows
+  exactly what is still undecided. Nothing about the card is client-authoritative.
+- **A refused candidate is never written to the session log at all.** It produces
+  no proposal to dismiss; only the audit refusal in §5.5a remains.
+
+### 5.11 How a suggestion is triggered
+
+The suggestion path is a model tool, `propose_memory`, dispatched during the
+turn like `ask_user` and `turn_notes`. It is the smallest deterministic trigger:
+no second model round trip, no post-task scanner guessing at prose, and the
+harness can script it exactly. The tool cannot store anything; it produces a
+proposal at most, and the cap in §5.4 is read from the session log.
+
+The tool's optional `evidence_path` selects `RepositoryObservation` and makes
+Damaian hash the file; an optional `source` without evidence selects
+`ExternalContent`; otherwise the origin is `ModelSuggestion`. The tool's origin
+is not trusted in any of the three cases: §5.3's instruction-shape check runs on
+all of them. A model that names a repository file as its source is still making
+a model suggestion, and the card says so.
+
+An explicit "remember that…" is detected from the user's own message at turn
+start and produces a `UserRequest` proposal. It is not a tool call, because the
+user's message is the trusted origin and asking the model to re-state it would
+add a round trip and a chance to misremember it. See §5.2.
+
 ## 6. Acceptance Criteria
 
 - An explicit "remember that…" produces a proposal showing the exact statement
@@ -398,10 +473,11 @@ proposal in the audit log, and how to see which scope an entry is in.
   without a `UserConfirmation`, and `MemoryEntry` has no other public
   constructor.
 - A prompt-injection fixture instructing the agent to remember something
-  produces **no proposal** when the origin is untrusted and the statement is
-  instruction-shaped; any other untrusted suggestion produces at most a proposal
-  requiring approval.
-- An untrusted-origin proposal names its source in the confirmation card.
+  produces **no proposal** when the origin is not the user's request and the
+  statement is instruction-shaped; any other non-user suggestion produces at
+  most a proposal requiring approval.
+- A non-user-origin proposal names its origin and its source in the confirmation
+  card, and a `ModelSuggestion` is never presented as the user's words.
 - A seeded fake secret in a candidate is refused at the proposal stage and at the
   store's write path, appears in no card, no entry, and no audit field.
 - A statement exceeding the length ceiling is rejected, not truncated.
@@ -428,7 +504,7 @@ proposal in the audit log, and how to see which scope an entry is in.
   policy — asserted by a test where a memory states otherwise.
 - Repository observations record `EvidenceRef` with path and content hash.
 - Every quality-gate command from `AGENTS.md` passes, and the
-  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no increase
+  [spec 18](../18_local_evaluation_harness/proposal.md) baseline shows no increase
   in approval-policy violations.
 
 ## 7. Implementation Notes

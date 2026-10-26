@@ -116,7 +116,7 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
   why a native tool is specified anyway.
 - **Caching as a knowledge base.** Fetched pages are cached to avoid re-fetching
   within a session, not to build a corpus. No index, no embeddings, no recall
-  across sessions — that is memory, and it has [spec 29](29_memory_creation_and_consent.md)'s
+  across sessions — that is memory, and it has [spec 29](29_memory_creation_and_consent/proposal.md)'s
   consent rules, which content from a web page cannot satisfy.
 - **Downloading files.** The tool returns text. It does not write to the
   repository, and it is not a package installer.

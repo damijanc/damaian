@@ -7,7 +7,7 @@ Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#28](28_memory_model_and_storage/proposal.md) (the store) — built
 (Done 2026-10-26);
-[#29](29_memory_creation_and_consent.md) (the consent gate) — **not built**.
+[#29](29_memory_creation_and_consent/proposal.md) (the consent gate) — **not built**.
 Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.9 (context assembly). Related implementation
@@ -16,7 +16,7 @@ specs: [`11_agents_md_support.md`](11_agents_md_support.md),
 [`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (the only delivery path),
 [`27_context_inspector.md`](27_context_inspector/proposal.md) (where recall is visible
 and removable), [`28_memory_model_and_storage/proposal.md`](28_memory_model_and_storage/proposal.md),
-[`29_memory_creation_and_consent.md`](29_memory_creation_and_consent.md).
+[`29_memory_creation_and_consent/proposal.md`](29_memory_creation_and_consent/proposal.md).
 See also [`SECURITY.md`](../../SECURITY.md).
 
 ## 1. Motivation
@@ -25,7 +25,7 @@ This is the work package where memory either becomes safe or becomes the hidden
 instruction channel the product direction rejects.
 
 [Spec 28](28_memory_model_and_storage/proposal.md) gives memory a shape with provenance
-and state. [Spec 29](29_memory_creation_and_consent.md) ensures nothing enters
+and state. [Spec 29](29_memory_creation_and_consent/proposal.md) ensures nothing enters
 without the user agreeing. Neither prevents the remaining failure: a store full
 of legitimately confirmed entries, delivered invisibly, growing stale, quietly
 steering every session. The user consented to each entry once, months ago, and
@@ -53,7 +53,7 @@ mechanisms below are what make the slow failure detectable.
 ## 2. Current State
 
 - **No memory exists.** [Spec 28](28_memory_model_and_storage/proposal.md) defines the
-  store; [spec 29](29_memory_creation_and_consent.md) the creation gate. This
+  store; [spec 29](29_memory_creation_and_consent/proposal.md) the creation gate. This
   spec is the read side.
 - **Context assembly is category-budgeted with a manifest.**
   [Spec 26](26_context_assembly/proposal.md) §5.1 defines `ContextCategory` as an ordered
@@ -153,7 +153,7 @@ Last in declaration order means last in the derived `Ord`, which
 [spec 26](26_context_assembly/proposal.md) uses as priority — so memory is the first
 category truncated when the budget is contested, and it can never displace
 instructions, plan state, or file content. Requirement 5 of
-[spec 29](29_memory_creation_and_consent.md) ("memory is the lowest-priority
+[spec 29](29_memory_creation_and_consent/proposal.md) ("memory is the lowest-priority
 context source") is therefore a property of the enum's ordering, not a rule
 someone must remember.
 

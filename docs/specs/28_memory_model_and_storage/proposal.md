@@ -19,7 +19,7 @@ user-owned model memory should imitate),
 [`26_context_assembly/proposal.md`](../26_context_assembly/proposal.md) and
 [`27_context_inspector/proposal.md`](../27_context_inspector/proposal.md) (memory
 is delivered and inspected through these, never around them),
-[`29_memory_creation_and_consent.md`](../29_memory_creation_and_consent.md),
+[`29_memory_creation_and_consent/proposal.md`](../29_memory_creation_and_consent/proposal.md),
 [`30_memory_retrieval_and_lifecycle.md`](../30_memory_retrieval_and_lifecycle.md).
 See also [`SECURITY.md`](../../../SECURITY.md).
 
@@ -43,7 +43,7 @@ that — not less.
 
 This work package is the storage layer only, and it is deliberately the first of
 three because the shape of the record determines whether the safety properties in
-[spec 29](../29_memory_creation_and_consent.md) and
+[spec 29](../29_memory_creation_and_consent/proposal.md) and
 [spec 30](../30_memory_retrieval_and_lifecycle.md) are expressible at all. A record
 with no provenance cannot be attributed; one with no state cannot be superseded;
 one with no scope cannot be isolated. Those fields are not bookkeeping, they are
@@ -75,7 +75,7 @@ where that either becomes controllable or does not.
 ## 4. Non-goals
 
 - Cloud, cross-device, or cross-user memory synchronization.
-- Deciding what to remember — [spec 29](../29_memory_creation_and_consent.md).
+- Deciding what to remember — [spec 29](../29_memory_creation_and_consent/proposal.md).
 - Retrieval, ranking, or staleness detection —
   [spec 30](../30_memory_retrieval_and_lifecycle.md).
 - A management UI, export, or import — Phase 3b WP3, Should-tier and outside
@@ -170,7 +170,7 @@ Two shapes are worth their reasoning:
 identifiers needed to answer "why does this exist?" — and there is deliberately
 **no variant for a model-inferred memory with no user action.** A model
 suggestion that the user has not confirmed is not a `MemoryEntry` at all; it is a
-proposal ([spec 29](../29_memory_creation_and_consent.md)). Requirement 1 of that
+proposal ([spec 29](../29_memory_creation_and_consent/proposal.md)). Requirement 1 of that
 spec is enforced by this type having nowhere to put an unconfirmed entry.
 
 **`Verification` folds confidence and staleness into one enum** rather than a
@@ -318,10 +318,10 @@ accepted. Requirement 4's "never stored" is therefore delivered by three layers,
 and the second is the one that actually covers the undetectable case:
 
 1. **Pattern refusal**, on the store's write path and again at proposal time
-   ([spec 29](../29_memory_creation_and_consent.md) §5.5) — catches
+   ([spec 29](../29_memory_creation_and_consent/proposal.md) §5.5) — catches
    recognisable credentials.
 2. **User confirmation.** No entry exists that the user did not confirm
-   ([spec 29](../29_memory_creation_and_consent.md)), and confirmation shows the
+   ([spec 29](../29_memory_creation_and_consent/proposal.md)), and confirmation shows the
    exact sentence that will persist. A human looking at "the deploy token is
    hunter2" will not confirm it. This is why the consent gate is a
    confidentiality control and not only a consent control.
@@ -359,7 +359,7 @@ requirement 6's "concise normalized statement" doing real work: it bounds what a
 memory store can accumulate.
 
 **An evidence path must be eligible, and the store enforces it.**
-[Spec 29](../29_memory_creation_and_consent.md) §5.5a prevents a proposal from ever
+[Spec 29](../29_memory_creation_and_consent/proposal.md) §5.5a prevents a proposal from ever
 being generated for a protected or ignored file. `MemoryStore::insert` checks the
 same two conditions again — `PathPolicy::is_restricted` (`path_policy.rs:138`)
 and `is_ignored_by_rules` (`ignore.rs:44`) with per-directory `.gitignore` rules
@@ -410,7 +410,7 @@ stop growing.
 
 Enabling it is a separate explicit action with its own explanation, per Phase 3b
 WP2 requirement 7 — the explanation belongs to
-[spec 29](../29_memory_creation_and_consent.md), the enforcement belongs here.
+[spec 29](../29_memory_creation_and_consent/proposal.md), the enforcement belongs here.
 
 ### 5.7 Schema version and migration
 
@@ -490,7 +490,7 @@ note about session files.
 - An entry whose `EvidenceRef` cites a `restricted_patterns` path or a path
   excluded by a per-directory `.gitignore` is refused by
   `MemoryStore::insert`, independently of the proposal-stage check in
-  [spec 29](../29_memory_creation_and_consent.md) §5.5a — asserted by calling the
+  [spec 29](../29_memory_creation_and_consent/proposal.md) §5.5a — asserted by calling the
   store directly.
 - `Sensitivity` is derived by rule and cannot be set from model output. A
   statement containing a path or hostname derives `Environmental`, a

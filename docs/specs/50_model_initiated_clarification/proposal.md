@@ -38,7 +38,7 @@ surface this adds to),
 [`20_working_modes/proposal.md`](../20_working_modes/proposal.md) (the capability boundary this sits
 inside), [`21_task_plan_progress_and_budget/proposal.md`](../21_task_plan_progress_and_budget/proposal.md)
 (owns the plan review gate and the budget this counts against), and
-[`29_memory_creation_and_consent.md`](../29_memory_creation_and_consent.md) (the
+[`29_memory_creation_and_consent/proposal.md`](../29_memory_creation_and_consent/proposal.md) (the
 type-separation pattern §5.2 follows).
 
 ## 1. Motivation
@@ -161,7 +161,7 @@ value of this tool is that answering it takes one click.
 ### 5.2 A question is not an approval, and the types make that true
 
 This is the load-bearing rule, and it is enforced by construction rather than by
-discipline — the pattern [spec 29](../29_memory_creation_and_consent.md) uses to
+discipline — the pattern [spec 29](../29_memory_creation_and_consent/proposal.md) uses to
 make unconfirmed persistence unrepresentable.
 
 `PendingApprovalRef.kind` is a `String` today, so the cheap implementation is to
