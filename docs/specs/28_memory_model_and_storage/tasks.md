@@ -11,7 +11,7 @@ criteria) · corrections and planning decisions in [`context.md`](context.md)
 | Task | State | Notes |
 |---|---|---|
 | 1 · Folder conversion, status and links | Done 2026-10-26 | `git mv` of the flat spec; `proposal.md` keeps §1 and §3-§7 with its `§5.x` numbering intact, `context.md` holds the former §2 plus a corrections table for every drifted line reference, and `tasks.md` is new. Status In progress in the proposal, the README current-state bullets and both implementation-order rows. Every link naming the flat file in specs 27, 29, 30, 34, 50, 53, 55 and the README now names `28_memory_model_and_storage/proposal.md`. A relative-link scan over `docs/**/*.md` found no broken link in this folder; the one failure it reported is pre-existing in spec 66. `npm run specs:check` was not run (it needs `node_modules`); scoped docs-only change, no Rust touched. |
-| 2 · Record types and sensitivity by rule | Not started | |
+| 2 · Record types and sensitivity by rule | Done 2026-10-26 | `memory.rs` defines the seven enums, `MemoryProvenance` (three variants only), `EvidenceRef`, `MemoryExpiry` and `MemoryEntry`, and exports them from `lib.rs`. `Sensitivity`'s declaration order is its restrictiveness order; `derived_sensitivity` applies the §5.5a table with the most restrictive match winning, and `effective_sensitivity` raises a lower caller value but keeps a higher one. Environmental markers are an absolute path, `~/`, URL, `localhost`, `dot.host.tld`, `host:port` or `:port`, IPv4, and the local `USER`/`LOGNAME`/`HOME` name. **Deviation:** the proposal's `rename_all = "camelCase"` on `MemoryProvenance` renames variants only, so the variant fields carry explicit `sessionId`/`messageId`/`taskId` renames to keep the JSON camelCase throughout. Ten inline tests pass; scoped clippy clean. |
 | 3 · Project identity resolution | Not started | |
 | 4 · Store layout, schema version and migration | Not started | |
 | 5 · Refusal path: secrets, evidence, scopes | Not started | |
@@ -105,22 +105,22 @@ folder); `npm run specs:check` reports no new mismatch for #28.
 
 ## Task 2 · Record types and sensitivity by rule
 
-- [ ] Add `crates/workspace-engine/src/memory.rs` and export it from `lib.rs`.
-- [ ] Define `MemoryScope`, `MemoryCategory`, `MemoryState`, `Verification`,
+- [x] Add `crates/workspace-engine/src/memory.rs` and export it from `lib.rs`.
+- [x] Define `MemoryScope`, `MemoryCategory`, `MemoryState`, `Verification`,
       `Sensitivity`, `MemoryProvenance`, `EvidenceRef`, `MemoryExpiry` and
       `MemoryEntry` exactly as the proposal's §5.1 and §5.5 shapes require,
       with `serde(rename_all = "camelCase")` on the structs and
       `serde(rename_all = "snake_case")` on the enums.
-- [ ] Give `Sensitivity` a total restrictiveness order
+- [x] Give `Sensitivity` a total restrictiveness order
       (`Ordinary < Environmental < Personal`) and derive it by rule, in the
       proposal's order: an environmental marker anywhere, then a `Preference`
       category or `User` scope, else `Ordinary`; the most restrictive match wins.
-- [ ] Implement environmental-marker detection: absolute path, `~/` path,
+- [x] Implement environmental-marker detection: absolute path, `~/` path,
       hostname (including `localhost`, `.local`, dotted names), `host:port` /
       `:port`, IPv4, and the local user name from `USER`/`LOGNAME`/`HOME`.
-- [ ] Add `MemoryEntry::effective_sensitivity()` returning the maximum of the
+- [x] Add `MemoryEntry::effective_sensitivity()` returning the maximum of the
       stored value and the derived one, plus `with_sensitivity_raised_to_derived`.
-- [ ] Unit tests for each derivation row, for the restriction order, and for a
+- [x] Unit tests for each derivation row, for the restriction order, and for a
       lowering attempt being raised.
 
 **Verification:** `cargo nextest run -p workspace-engine --lib memory::` passes;

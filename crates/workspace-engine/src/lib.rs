@@ -27,6 +27,7 @@ pub mod indexer;
 pub mod language;
 pub mod lsp;
 pub mod mcp;
+pub mod memory;
 pub mod mode;
 pub mod model;
 pub mod navigation;
@@ -139,6 +140,10 @@ pub use lsp::{
 pub use mcp::{
     McpClient, McpRuntime, McpServerRuntime, McpTool, McpToolResult, namespaced_tool_name,
     parse_namespaced_tool_name,
+};
+pub use memory::{
+    EvidenceRef, MemoryCategory, MemoryEntry, MemoryExpiry, MemoryProvenance, MemoryScope,
+    MemoryState, Sensitivity, Verification,
 };
 pub use mode::SessionMode;
 pub use model::{
