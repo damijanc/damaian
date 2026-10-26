@@ -543,6 +543,7 @@ named without a path are in
 | Hooks time out; output is truncated and redacted; PIDs registered | `a_hanging_hook_times_out`, `hook_output_is_truncated_and_redacted`, `a_running_hook_is_registered_with_the_process_registry` |
 | HEAD moving fails with nothing changed | `head_moving_between_prepare_and_commit_fails_with_nothing_changed` |
 | An accepted deletion commits the file away | `an_accepted_deletion_is_selected_and_commits_the_file_away` |
+| A submodule or nested repository is shown and never selected | `a_nested_repository_is_shown_and_can_never_be_selected` |
 | Index and working tree identical after a failed attempt | same test, plus `the_users_index_and_working_tree_are_unchanged_by_a_commit` |
 | Secret warnings have categories/counts and no text; override audited | `a_seeded_secret_warns_with_categories_and_counts_and_no_text`, `a_secret_needs_a_separate_per_commit_override`, `the_recorded_diff_is_redacted_and_the_record_holds_no_secret` |
 | The approval UI says the diff is redacted and the commit is not | the dialog's `.commit-redaction` line; **manual, not walked** |
@@ -553,7 +554,7 @@ named without a path are in
 | Committing is refused in Ask, Plan and Review and under a profile that denies it | `committing_is_refused_outside_code_mode_and_without_the_profile_capability` (all three modes), `a_commit_is_refused_in_ask_mode` at the route |
 | Repository config cannot enable committing | `every_capability_key_resists_weakening_from_repository_scope` |
 | No amend, reset or history rewrite | `the_commit_module_has_no_history_rewriting_operation` |
-| Every quality-gate command passes and the baseline shows no regression | CI outstanding; locally `scripts/quality-gate.sh fmt node lint typos deny`, scoped clippy for `workspace-engine` and `desktop-shell`, `cargo nextest -p workspace-engine --test commit_preparation` (30), `--test permission_profiles` (74 passed, 1 skipped), `--test foundation` (171), `-p desktop-shell --lib` (193 passed, 5 skipped), and the deterministic eval tier |
+| Every quality-gate command passes and the baseline shows no regression | CI outstanding; locally `scripts/quality-gate.sh fmt node lint typos deny`, scoped clippy for `workspace-engine` and `desktop-shell`, `cargo nextest -p workspace-engine --test commit_preparation` (31), `--test permission_profiles` (74 passed, 1 skipped), `--test foundation` (171), `-p desktop-shell --lib` (193 passed, 5 skipped), and the deterministic eval tier |
 
 The one manual gap is the dialog walk: the web UI bootstraps through Tauri
 (`damaian_desktop_bootstrap`), and no browser harness was available in this

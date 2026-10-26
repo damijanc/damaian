@@ -72,6 +72,10 @@ pub enum CommitCandidateSource {
     Untracked,
     /// The working tree has an unresolved conflict at this path.
     Conflict,
+    /// A submodule or a nested repository. Writing its gitlink from the
+    /// working tree is not something this spec implements, so it is shown and
+    /// can never be selected.
+    Unsupported,
 }
 
 impl CommitCandidateSource {
@@ -93,6 +97,9 @@ impl CommitCandidateSource {
             Self::External => "Changed outside Damaian — not selected",
             Self::Untracked => "Untracked file — not selected",
             Self::Conflict => "Unresolved conflict — resolve it before committing",
+            Self::Unsupported => {
+                "Submodule or nested repository — not supported, so it cannot be committed"
+            }
         }
     }
 }
@@ -449,12 +456,16 @@ impl CommitEngine {
         let refusal = self.refusal_from_state(root, session_id, &state)?;
         let mut candidates = self.candidates(root, session_id)?;
         for candidate in &mut candidates {
-            candidate.diff = self.diff_for(
-                root,
-                &candidate.path,
-                &candidate.status,
-                state.head.is_some(),
-            )?;
+            candidate.diff = if candidate.source == CommitCandidateSource::Unsupported {
+                "[Submodule or nested repository: no file diff is available.]\n".to_string()
+            } else {
+                self.diff_for(
+                    root,
+                    &candidate.path,
+                    &candidate.status,
+                    state.head.is_some(),
+                )?
+            };
         }
         let selected_paths = candidates
             .iter()
@@ -1087,6 +1098,12 @@ impl CommitEngine {
                     format!("{path} has an unresolved conflict."),
                 ));
             }
+            if candidate.source == CommitCandidateSource::Unsupported {
+                return Err(CommitError::refused(
+                    "commit_not_supported",
+                    format!("{path} is a submodule or nested repository and cannot be committed."),
+                ));
+            }
             selected.push(candidate.clone());
         }
         Ok(selected)
@@ -1243,6 +1260,25 @@ impl CommitEngine {
             let path = change.path.clone();
             let acceptance = pending.get(&path);
             let checkpoint_entry = checkpoint.get(&path);
+            let metadata = fs::symlink_metadata(root.join(&path)).ok();
+            if metadata.as_ref().is_some_and(|meta| meta.is_dir()) {
+                candidates.push(CommitCandidate {
+                    path,
+                    status: "unsupported".to_string(),
+                    source: CommitCandidateSource::Unsupported,
+                    label: CommitCandidateSource::Unsupported.label().to_string(),
+                    selected_by_default: false,
+                    blob_oid: None,
+                    content_sha256: None,
+                    mode: None,
+                    size: 0,
+                    unscanned: false,
+                    secret_warnings: Vec::new(),
+                    diff: String::new(),
+                    accepted_hunks: Vec::new(),
+                });
+                continue;
+            }
             let blob = self.blob_info(root, &path)?;
             // Nothing in the working tree differs from HEAD: there is nothing
             // to commit at this path, whatever the index may say. The user's
@@ -1507,6 +1543,11 @@ impl CommitEngine {
             Ok(metadata) => metadata,
             Err(_) => return Ok(String::new()),
         };
+        if metadata.is_dir() {
+            return Ok(
+                "[Submodule or nested repository: no file diff is available.]\n".to_string(),
+            );
+        }
         if metadata.len() > self.config.max_file_bytes {
             return Ok(format!(
                 "[File is {} bytes; the diff is not shown here.]\n",

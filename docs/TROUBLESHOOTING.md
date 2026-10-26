@@ -1519,6 +1519,7 @@ code, and nothing was committed unless the commit object is reported as created:
 - **`commit_secrets_require_override`** — the real bytes contain something the scanner flags. The displayed diff is redacted, so the match may not be visible; review the file and tick the override to commit it anyway. The override applies to that one commit and is audited.
 - **`commit_not_allowed`** — the session is not in Code mode, or the permission profile has `allow_git_commits=false` (Read-only does). Switching mode does not help a profile refusal.
 - **`commit_restricted_path`** — the named path is outside the checkout or matches `restricted_patterns`. It cannot be committed.
+- **`commit_not_supported`** — the path is a submodule or a nested repository. It is shown with that label and its checkbox stays off.
 
 The audit trail records `commit_prepared`, `commit_refused`, `commit_secret_override` and `commit_created` in `audit/events.jsonl`. `commit_created` carries the SHA, branch, path and hunk counts, message length, hook outcomes and whether the secret override was used — never the message or file content.
 

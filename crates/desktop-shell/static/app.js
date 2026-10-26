@@ -1627,6 +1627,9 @@ function showCommitDialog(preparation, repoPath, sessionId) {
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.checked = selected.has(candidate.path);
+    // A submodule or nested repository has no file bytes this flow can
+    // compose; the server refuses it, and the checkbox says so by staying off.
+    checkbox.disabled = candidate.source === "unsupported";
     checkbox.addEventListener("change", () => {
       if (checkbox.checked) selected.add(candidate.path);
       else selected.delete(candidate.path);

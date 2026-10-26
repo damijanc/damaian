@@ -1503,3 +1503,41 @@ fn an_accepted_deletion_is_selected_and_commits_the_file_away() {
     assert!(fixture.tree_paths().contains(&"keep.txt".to_string()));
     fixture.cleanup();
 }
+
+#[test]
+fn a_nested_repository_is_shown_and_can_never_be_selected() {
+    let fixture = Fixture::new("nested");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let nested = fixture.repository.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fixture.git_at(&nested, &["init", "--quiet"]);
+    fs::write(nested.join("inner.txt"), "inner\n").unwrap();
+    let (session, _task) = fixture.session();
+    let preparation = fixture.prepare(&session);
+    let candidate = preparation
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path.starts_with("nested"))
+        .expect("the nested repository is a candidate");
+    assert_eq!(candidate.source, CommitCandidateSource::Unsupported);
+    assert!(!candidate.selected_by_default);
+    let outcome = fixture.commit(
+        &session,
+        &preparation,
+        std::slice::from_ref(&candidate.path),
+        "Commit the nested repo",
+        false,
+    );
+    assert!(
+        matches!(
+            outcome,
+            Err(CommitError::Refused {
+                code: "commit_not_supported",
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
+    fixture.cleanup();
+}
