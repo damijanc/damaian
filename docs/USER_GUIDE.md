@@ -289,14 +289,14 @@ Your message is secret-scanned before it is sent, and so is every earlier messag
 | `required` | none | Your message. Never dropped and never truncated; it is subtracted before any category is allocated. |
 | `instructions` | 10% | The `AGENTS.md` files for the collected paths, root first and each nested file after it, then the root project rules (`README.md`, `CONTRIBUTING.md`, `.editorconfig`, `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `pom.xml`, `build.gradle`). When this category runs short the most specific `AGENTS.md` survives; the root project rules are dropped first, then broader instruction files. |
 | `hook_context` | 5% | Text a [hook](#hooks) returned for this turn. |
-| `pinned` | 15% | Reserved for context you select item by item; no shipped feature produces it yet, so its share is released. |
+| `pinned` | 15% | Files and line ranges you pinned for the session in the [context inspector](#inspecting-and-controlling-context). |
 | `plan_state` | 5% | The plan a continued or resumed turn carries forward, as numbered steps with their status and detail. |
 | `repository_map` | 5% | The [repository map](#the-map-the-assistant-sees) block, still capped by `repository_map_max_tokens`. |
 | `symbols` | 10% | The symbol hints block, still capped by `symbol_context_max_tokens`. |
 | `search_results` | 15% | Files found by search: exact keyword hits first, then semantic-similarity hits. Semantic hits are dropped first when this category runs short. |
 | `file_ranges` | 25% | Files you named in the prompt and files you added with **+** ([Chat](#chat)); explicit paths are ordered ahead of mentioned ones. |
 | `findings` | 5% | Reserved for the [findings](#fix-n-errors-and-the-findings-list) repair flow. The assistant still receives only the findings you select for a repair request, so nothing fills this automatically today and its share is released. |
-| `conversation_summary` | 5% | Reserved for a conversation summary. The summary Damaian actually sends now travels inside `Recent conversation:` rather than as a context item, so this share is released. |
+| `conversation_summary` | 5% | The summary shown in the inspector's **Summary** row. It travels inside `Recent conversation:` rather than as a context item, so this share is released. |
 
 A category that uses less than its share releases the remainder to the categories after it. In a repository with no hook context, no carried plan, no pinned context, no findings and no conversation summary, the five unused shares add up to 35% of the budget released to the categories that do have content. A category that wants more than its share is shortened within itself — its lowest-priority items are dropped, or the map or symbols block is re-rendered smaller — and it never takes from another category.
 
@@ -319,6 +319,70 @@ context_budget.safety_margin=0.1000
 The defaults sum to exactly `1.00`; a set that sums above `1.00` is a configuration error naming the key family rather than a silent scale-down. `damaian config-show` prints the resolved values. `context_budget.safety_margin` is reserved from a *measured* provider window and never from the declared budget; Damaian does not measure a window today, so the limit is `context_token_budget` used unchanged. See [Troubleshooting](TROUBLESHOOTING.md#reading-a-turns-context-manifest) for what a turn's manifest records.
 
 A repository's `.damaian/config.conf` may lower a share and raise the margin, and never the other way: a share steers traffic toward or away from the repository's own content, and a clone may tighten a bound but not widen one. A raise there is refused and reported like any other rejected key. A permission profile has the same one-way limit.
+
+### Inspecting and controlling context
+
+The **Context** control in the conversation header shows this turn's assembled
+context as `tokens / limit`. Open it to see what Damaian is about to send, or
+what an earlier turn sent:
+
+- **Every category**, with the tokens it used and how many items it holds.
+  Expanding a category lists its items by path, and a line range where one
+  exists. The **Required** row is marked **locked**: it is your own message and
+  Damaian's required context, and nothing in this view can remove it.
+- **The symbols row** also says how many of the shown symbols are heuristic, for
+  example `12 symbols (4 heuristic)`. A language-server symbol is a fact; a
+  heuristic one is Damaian's guess.
+- **The Summary row**, when the conversation is compacted, with its token cost
+  and how many messages it covers.
+- **Excluded**, collapsed by default, with one row per omitted item and the
+  reason: a restricted path, a secret-bearing file, a category or total budget
+  exhausted, a range merged into a wider one, a truncated block, a file too
+  large, a binary file, an item you removed, a path outside this session's
+  selection, or a pinned file that no longer exists.
+- **The limit and its source** — declared from `context_token_budget`, or
+  observed from a measured provider window. Damaian does not measure a window
+  today, so every limit reads **declared**.
+
+Every path in the panel, including in **Excluded**, opens in Visual Studio Code.
+That includes a restricted path: the panel refuses to *send* its content, but you
+may still read your own file. The panel itself only ever shows paths, ranges and
+counts — never file content, and never a secret.
+
+**Pins.** A pin is a file or a line range Damaian includes on every later turn
+of the session, in the **Pinned** category. Use the pin control on any item row,
+or the path/range form at the bottom of the panel (a range looks like `40-120`).
+Pins are stored in the session, so they survive a restart. **Clear pins** removes
+them. A pin that later becomes restricted, or whose file is deleted, stays in the
+pin list and appears in **Excluded** with the reason, so restoring the file
+restores the pin without you re-pinning it. Pins made in the panel differ from
+the **+** composer chips: a chip is an attachment for the request you are typing
+and is not carried into later turns.
+
+**Path restriction.** Enter one path per line and choose **Apply paths** to make
+only those files eligible for context in this session. The restriction narrows;
+it never widens. `restricted_patterns` and the path policy still apply on top, so
+selecting a restricted path does not include it. The `AGENTS.md` hierarchy and
+your own message are still included: repository instructions are policy rather
+than one of the content files you are choosing between, and your message is
+required. An empty list is a restriction that admits no file content, which is
+why **Clear paths** is a separate button.
+
+**Reviewing before sending.** By default a turn sends as soon as its context is
+assembled; the panel shows the manifest while the turn runs. Turn on **Pause
+before sending to review context** in **Settings › Conversation** to hold every
+turn at that point instead. The turn card then offers **Review context**,
+**Send** and **Decline**. While it is paused, expanding a category gives each
+optional item a **×** to remove it from this turn only; the removal appears under
+**Excluded** as **removed by you**, and the token total falls. **Send** sends the
+amended context, and **Decline** sends nothing at all. `Required` items have no
+**×** and the API refuses their removal even if a client asks. The setting is
+yours alone: a repository or a permission profile cannot turn it on or off.
+
+**Past turns.** Each assistant message whose turn recorded a manifest has a
+**Context · N tokens** link. It opens the same panel for that turn, read-only.
+The link shows the manifest that was actually sent, including any item you
+removed while the turn was paused.
 
 ### Long conversations and summaries
 

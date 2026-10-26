@@ -893,9 +893,9 @@ const RANGE_GUTTER: usize = 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileCandidate {
     path: String,
-    /// `None` is the whole file. Spec 26 produces no ranges yet — every source
-    /// is whole-file — so the merge below is exercised by its unit tests until
-    /// a source supplies one.
+    /// `None` is the whole file. A pin may name a range (spec 27 §5.4); every
+    /// automatic source is still whole-file, so automatic collection exercises
+    /// the merge only through its unit tests.
     range: Option<LineRange>,
     kind: ContextKind,
     provenance: Option<Provenance>,
@@ -1550,8 +1550,9 @@ impl ContextManager {
         }
 
         // After collection, so ranges for one path can merge and a whole-file
-        // item from an earlier stage can absorb them. No production source asks
-        // for a range yet (see `FileCandidate`), so this is a no-op today.
+        // item from an earlier stage can absorb them. A session pin is the one
+        // production source that can ask for a range (spec 27 §5.4); automatic
+        // collection is still whole-file.
         self.flush_file_ranges(
             repository_root,
             repository_id,

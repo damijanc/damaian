@@ -1,7 +1,9 @@
 # Feature Spec: Context Inspector
 
-Status: In progress (started 2026-10-26). Split into a folder and planned on
-2026-10-26 from [#26](../26_context_assembly/proposal.md)'s shipped manifest.
+Status: Done 2026-10-26 (planned and built on 2026-10-26; Tasks 1–10; the
+manual browser walk is recorded in §7, and **CI is outstanding** — the
+seven-check gate runs after the user pushes). Split into a folder and planned
+from [#26](../26_context_assembly/proposal.md)'s shipped manifest.
 [`context.md`](context.md) records the pre-implementation code, the corrections
 planning found, and the resolved §7 open question (whether separating assembly
 from sending restructures the turn path); [`tasks.md`](tasks.md) carries the
@@ -401,12 +403,115 @@ to inspect a past turn's context.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+Implemented on 2026-10-26 in ten tasks. [`context.md`](context.md) is the
+planning record; this section is what shipped and what was measured.
 
-- Whether separating assembly from sending (§5.1) required restructuring the
-  turn path in `chat.rs`, and what else that touched.
-- Whether users in practice pinned files or removed items more often — it
-  indicates which control is carrying the value and where to invest next.
-- Whether `pause_for_context_review` was used at all after the first day. If not,
-  that is evidence the non-blocking default was right, and worth recording
-  before someone proposes making it the default.
+### Separating assembly from sending (§5.1)
+
+**Yes, it required restructuring the turn path in `chat.rs` — as one new pause
+kind, not a new pipeline.** The answer in full is `context.md` §4. In summary:
+
+- `ContextPlan` already carried everything the prompt needs, so assembly stayed
+  where it was. `PreparedContext { manifest, items }` is a lossless view of it;
+  `files` and `sections` are derived, and `into_plan` reconstructs the plan.
+- `build_model_prompt` was split without changing its output:
+  `build_conversation` builds the summary and recent-message block, and
+  `build_model_prompt_with_conversation` joins it with `plan.sections()`. The
+  original function remains the entry point for every existing caller, and
+  `prompt_cache`'s byte-identical determinism guard still passes.
+- `PausedFor::ContextReview` was added to the existing exhaustive pause
+  machinery. Every other resume refuses it and it refuses every other kind; the
+  cross-resume tests cover both directions. `resume_after_context_decision`
+  sends the amended plan through the same `run_agentic_turn` a non-paused turn
+  uses.
+- What else the work touched: `ChatTurnResult` (one field), `PendingChatTurn`
+  (one field and seven literals), `TurnProgress`/`TurnEvent` (one boxed
+  manifest), the shell's result and session JSON, five routes, the panel and
+  review card, and recovery's reattachment table. It did not touch
+  `run_agentic_turn`'s loop, tool dispatch, round budgets or the model adapter.
+- **A declined review makes no model call.** The shell's decline path uses a
+  no-op adapter, so saying "do not send this" does not require a provider key.
+
+### The manual walk (2026-10-26)
+
+The web UI was served against a throwaway `DAMAIAN_DATA_DIR` and the inspection
+fixture repository on **port 4899**, with
+`DAMAIAN_MOCK_MODEL_RESPONSE="Mock answer from the walk."`. A plain browser has
+no Tauri bootstrap, so the devtools console set
+`apiToken = 'damaian-ui-inspection-token'` and then ran
+`setRepository('<repo>', false)`.
+
+What was walked, and what was seen:
+
+1. **A paused first turn.** `pause_for_context_review=true`; a prompt
+   mentioning `retry.rs` paused with `contextreview_…`, no model call, and a
+   card reading *Review the context before sending · 74 / 16.0K tokens*. The
+   panel showed `Required 4`, `Repository map 63`, `File ranges 7`, every other
+   category at `0`, and `Excluded (0)`. The limit read `declared`.
+2. **`Required` is locked at the API.** A direct `POST /api/context-remove` at
+   the Required index returned `Required context cannot be removed`; the item
+   stayed in the manifest and the turn stayed resumable.
+3. **Removing an optional item.** Removing the `File ranges` item took the total
+   from **74 to 67** tokens and put `retry.rs · removed by you` under
+   `Excluded (1)`.
+4. **Send and post-send.** *Send* completed the task with the amended manifest.
+   A reload showed a **Context · 67 tokens** link on the assistant message; it
+   opened the read-only panel with the same total and the `user_removed`
+   exclusion. This is the post-send view, and it is the amended manifest rather
+   than the first assembly.
+5. **Pins and the restriction.** A ranged pin (`retry.rs:1-3`) and a restriction
+   to `retry.rs` were applied, shown in the panel, and cleared; `/api/session`
+   reported both between the two requests. A prompt after the pin showed the
+   file in the **Pinned** category.
+6. **Past turns.** Both turns' manifests were present in `/api/session`, each on
+   its own task, which is what the per-message link reads.
+7. **Not walked in the browser:** the Tauri app's own window (its platform
+   chrome and folder picker are outside this view), and opening a path in Visual
+   Studio Code (the button is present and calls `/api/open-vscode-file`; the
+   environment has no editor to open). The path button was exercised through the
+   route in the handler tests instead.
+
+### The two product questions the spec asked
+
+- **Do users pin or remove more often?** **Not measured.** One manual walk is
+  not usage data, and no live session corpus was read. The controls are
+  instrumented by their audit events (`context_item_removed`,
+  `context_summary_removed`, and the `context_pin_added` family), so a later
+  session can answer this from the log rather than from a guess. Nothing in the
+  design depends on the answer yet.
+- **Was `pause_for_context_review` used after the first day?** **Not measured.**
+  It remains off by default, which is the design decision §5.1 records; no
+  evidence has arrived to reopen it, and none is claimed.
+
+### What the manifest gained, and what that corrected
+
+- `conversationSummary` (tokens, messages, span, facts-only) was missing because
+  #55 sends the summary in the conversation block rather than as an item.
+- `symbolProvenance` (`total`/`languageServer`/`heuristic`) was missing because a
+  single `IncludedRef` can only carry the weakest provenance.
+- `ExclusionReason` gained `user_removed`, `path_not_selected` and `missing`, the
+  three facts this spec's controls can produce.
+- **The first production line-range producer is this spec's pins.** #26's §7
+  said no collection source yields a `LineRange`; a pinned range does, and #26's
+  note and test name were corrected on the same day. Automatic collection is
+  still whole-file.
+- The session restriction filters file-bearing collection only; `AGENTS.md` and
+  `Required` are exempt (`context.md` C10). That was a planning decision, not an
+  oversight, and the user guide states it.
+
+### Known gaps
+
+- **No live model was called with a real provider.** The walk used
+  `DAMAIAN_MOCK_MODEL_RESPONSE`; the engine's pause, removal, send and
+  persistence paths are covered by tests, but a live provider adds no different
+  code path to this view.
+- **`context_summary_removed` is tested at the API and the manifest level**
+  (`remove_summary` and the resumed `without_summary` block), not through a
+  whole turn with an active #55 summary. Building a live summary in a fixture
+  costs a model call and the renderer path is shared with the item removal that
+  is tested end to end. This is a coverage gap, not an unbuilt control.
+- **Composer chips are still per-request attachments.** They are deliberately
+  not session pins; the panel labels the two differently. Unifying them is a
+  later product decision, not a missing piece of this spec.
+- **CI is outstanding.** The seven-check gate runs after the user pushes; scoped
+  local checks are recorded in [`tasks.md`](tasks.md)'s Task 10 row.

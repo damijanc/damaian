@@ -506,9 +506,12 @@ needs no budget. The limit is a guard for hook chains, not a normal path.
 - **`before_tool` and `after_tool` also attach to a requested command**, in
   Task 5's dispatcher. Task 8 therefore dispatches them for the turn's own
   action only and does not double-dispatch for a hook's command.
-- **The inspector criterion is not met**, because spec 27 does not exist. It is
-  met as a bounded `hook_context` item in the turn's context plan (criterion
-  16).
+- **The inspector criterion is now met.** When #32 was closed it was met only
+  as a bounded `hook_context` item in the turn's context plan, because spec 27
+  did not exist (criterion 16). Spec 27's inspector gives `HookContext` its own
+  category row in the pre- and post-send manifest, with its items, token count
+  and exclusions, so the criterion's "visible in the context inspector" half is
+  satisfied by the shipped panel.
 
 ### 7.4 What the plan did not foresee
 

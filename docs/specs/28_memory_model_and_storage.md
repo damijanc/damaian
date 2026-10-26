@@ -7,8 +7,9 @@ Package 1 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#26](26_context_assembly/proposal.md) (context assembly) — built
 (Done 2026-10-25);
-[#27](27_context_inspector/proposal.md) (the inspector memory appears in) — **not
-built**. Everything else named below is a cross-reference, not a prerequisite.
+[#27](27_context_inspector/proposal.md) (the inspector memory appears in) — built
+(Done 2026-10-26). Everything else named below is a cross-reference, not a
+prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.10 (secret detection). Related implementation
 specs: [`11_agents_md_support.md`](11_agents_md_support.md) (the inspectable,

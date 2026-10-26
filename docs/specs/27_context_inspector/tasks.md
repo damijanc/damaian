@@ -4,7 +4,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) in full · corrections, decisions and
 the resolved §7 open question in [`context.md`](context.md)
-**Started:** 2026-10-26
+**Started:** 2026-10-26 — **Done:** 2026-10-26
 
 ## Progress
 
@@ -19,7 +19,7 @@ the resolved §7 open question in [`context.md`](context.md)
 | 7 · Post-send record and past turns | Done 2026-10-26 | `SessionStore::read_session_context_manifests` reads `<data_dir>/audit/events.jsonl` (the manifest is an audit record, not a session event), filters by `sessionId`, and keeps the newest `context_assembled` per task. The edit flow reads the origin session's pins/restriction; the repair continuation now reads them too, reads the conversation before assembly, and emits `TurnProgress::Context`. Tests: newest-wins after a removal, two turns' manifests in one session, an old manifest without the new fields, and an edit from a session with a pin and a restriction. **Falsified:** `or_insert` (first-wins) made the removal test read the pre-removal manifest. Scoped: `context_inspector` 27/27, `prompt_cache` + `verification_loop` 84 passed, scoped clippy passed. |
 | 8 · Shell routes, JSON and SSE | Done 2026-10-26 | Added `POST /api/context-pin`, `/api/context-restriction`, `/api/context-remove`, `/api/context-remove-summary`, `/api/resume-context-stream`; `chat_result_json` carries `contextReview` (manifest only); `/api/session` carries `contextState` plus a `context` manifest on each task; `TurnProgress::Context` maps to `TurnEvent::Context` and the SSE `context` event. Unknown pin actions and review decisions are refused, not defaulted. A decline path uses a no-op adapter, so it needs no provider key. Tests: pin round-trip through `/api/session`, restriction set/clear, unknown action, unknown decision, task JSON carries the manifest and no item content, and the progress mapping. Scoped: `desktop-shell --lib` 204 passed / 5 skipped, scoped clippy passed, fast five passed (typos caught an intentionally misspelled action value; changed to `unknown_action`). |
 | 9 · The web panel and review card | Done 2026-10-26 | Header control shows `total / limit`; `#context-panel` renders category details (Required locked, symbols heuristic count, summary row), included paths/ranges, a session-pin list with unpin, an excluded `<details>` with every reason, a pin form, restriction textarea, and remove controls only on an open review. Every path opens through `/api/open-vscode-file`. `createContextReview` offers Review context / Send / Decline and streams `/api/resume-context-stream`; `context` SSE events and done payloads update the panel; past turns get a Context link from each task's manifest. Added the settings checkbox and `refreshPauseForContextReview`. Recovery re-presents a paused review (`a_reattached_context_review_carries_its_manifest`). Scoped: `desktop-shell --lib` 205 passed / 5 skipped, clippy on both crates passed, `node --check` and `npm run lint:web` passed, fast five passed after fixing one typo in this record. **Manual walk is Task 10.** |
-| 10 · Docs, manual walk, close-out | Not started | |
+| 10 · Docs, manual walk, close-out | Done 2026-10-26 | User guide gained **Inspecting and controlling context**; troubleshooting gained the panel-first diagnosis section and the three new exclusion reasons; the `pinned` and `conversation_summary` category rows were corrected. §7 records the resolved open question, the walk and honest "not measured" answers. #32 §7.1's inspector criterion is closed. **Manual walk:** shell on port 4899 against a throwaway data dir and the inspection fixture with `DAMAIAN_MOCK_MODEL_RESPONSE`; `apiToken` + `setRepository()` from the console. First turn paused at 74 tokens (Required 4, map 63, file ranges 7); `Required` refused at the API; removing the file range took it to 67 and recorded `user_removed`; Send completed; after reload a **Context · 67 tokens** link opened the amended read-only manifest with the exclusion; a ranged pin, a restriction, and their clears were applied and read back from `/api/session`. Not walked: the Tauri window and an actual editor launch. **Deviations:** recovery reattachment for a paused review was added (not in the original plan) because the launch sweep would otherwise call the pause an unknown approval kind and fail the task; #26's "no producer yields a line range" note and test name were corrected because session pins are now the first producer; summary removal is API/manifest-tested but not walked through a live #55 summary. **Checks:** `scripts/quality-gate.sh fmt node lint typos deny` passed; scoped clippy on `workspace-engine` and `desktop-shell` passed; `nextest` on context_inspector/context_assembly/permission_profiles/prompt_cache/round_budget/foundation **339 passed, 3 skipped**; `desktop-shell --lib` **205 passed, 5 skipped**; the deterministic eval tier **30/30 scenarios pass**, completion 1.000, 0 approval-policy violations, 0 restricted-path/secret violations, 0 unrelated files changed, recovery 1.000 (check pass 0.686 against the 30-scenario tier; the figure is not comparable to #26's 23-scenario run); `npm run specs:check` passed (66 specs). **CI outstanding:** the seven-check gate runs after the user pushes. |
 
 **Goal:** Make "the user can see what context the agent uses" true. The panel
 renders #26's sanitized manifest pre- and post-send, and the user can pin a file
@@ -267,7 +267,7 @@ flat file; `docs/specs/README.md`.
   progress table and per-task verification.
 - [x] **Step 5: Set Status In progress** in the proposal header, the README
   current-state paragraph (move #27 from ready to in progress) and the README
-  implementation-order row; add `**Started:** 2026-10-26` to this header.
+  implementation-order row; add `**Started:** 2026-10-26 — **Done:** 2026-10-26` to this header.
 - [x] **Step 6: Verify links and statuses.** `npm run specs:check`; read its
   output. `grep -rn "27_context_inspector\\.md" docs` must return nothing but
   this plan's historical note, if any.
@@ -791,7 +791,7 @@ the pause matrix test lives there.
 `docs/specs/README.md`, `docs/specs/28_memory_model_and_storage.md`,
 `docs/specs/32_hooks/proposal.md`, `proposal.md`, this file.
 
-- [ ] **Step 1: Documentation.**
+- [x] **Step 1: Documentation.**
   - `USER_GUIDE.md`: how to read the panel (categories, tokens, limit source,
     excluded), what each category is, what a pin is and how long it lasts, what
     a session restriction does, why `Required` is locked, why instructions can
@@ -802,28 +802,28 @@ the pause matrix test lives there.
     `deduplicated_into_range`, `truncated`, `too_large`, `binary`,
     `user_removed`, `path_not_selected`, `missing`), how to inspect a past
     turn, and what to do when a pin is not included.
-- [ ] **Step 2: Manual browser walk** from `context.md` §10: a throwaway
+- [x] **Step 2: Manual browser walk** from `context.md` §10: a throwaway
   `DAMAIAN_DATA_DIR`, a fixture repo, a port other than 4765, `apiToken = '…'`
   then `setRepository('<repo>', false)` in devtools. Walk and record in
   `proposal.md` §7: the header control's numbers, a category expanded, one
   excluded path opened, a pin added/cleared, a restriction applied/cleared, and
   (setting on) a paused review with one item removed and sent. Record what was
   seen and anything that was not reachable.
-- [ ] **Step 3: Fill `proposal.md` §7** with the resolved open question (from
+- [x] **Step 3: Fill `proposal.md` §7** with the resolved open question (from
   `context.md` §4), what the walk showed, and honest answers to the two
   product questions the spec asks. Do not invent usage data; say "not measured"
   where it is not.
-- [ ] **Step 4: Close #32's criterion.** In `32_hooks/proposal.md` §7.1 change
+- [x] **Step 4: Close #32's criterion.** In `32_hooks/proposal.md` §7.1 change
   "The inspector criterion is not met ... until #27" to met, naming the
   `HookContext` category row.
-- [ ] **Step 5: Close-out.** Mark Done in all four places (proposal header,
+- [x] **Step 5: Close-out.** Mark Done in all four places (proposal header,
   README implementation-order row, this Progress table, this header's
   `**Done:**`). Re-derive the README ready set: #27 leaves it, **#28 is
   promoted** (its only dependency); flip #28's `Depends on:` line to built and
   add a "Re-derived on 2026-10-26" history entry. Remove the
   "Show exactly what went into each request, with the ability to pin and
   exclude." line from `CHANGELOG.md`'s Unreleased section; add no release row.
-- [ ] **Step 6: Checks.**
+- [x] **Step 6: Checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -836,5 +836,5 @@ the pause matrix test lives there.
 
   Do **not** run the workspace clippy or the workspace test suite; CI runs
   them. Record every result in the Progress row and say "CI outstanding".
-- [ ] **Step 7: Update the Progress row** and commit the close-out.
+- [x] **Step 7: Update the Progress row** and commit the close-out.
   Subject: `Close out the context inspector`.

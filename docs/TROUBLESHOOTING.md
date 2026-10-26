@@ -53,6 +53,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | A permission profile key has no effect | [A permission profile key had no effect](#a-permission-profile-key-had-no-effect) |
 | A file read or search result was cut short | [A file read or search result was truncated](#a-file-read-or-search-result-was-truncated) |
 | A file is missing from the model's context | [A file the model should see is missing from context](#a-file-the-model-should-see-is-missing-from-context) |
+| Why a file was not consulted, or a pin or restriction is not taking effect | [The context inspector: why a file was not consulted](#the-context-inspector-why-a-file-was-not-consulted) |
 | Why a file or search hit was excluded, or what a turn's context actually held | [Reading a turn's context manifest](#reading-a-turns-context-manifest) |
 | A `worktree` argument is refused | [A `worktree` argument is refused](#a-worktree-argument-is-refused) |
 | `list_worktrees` shows none from a worktree session | [`list_worktrees` shows no worktrees from a worktree session](#list_worktrees-shows-no-worktrees-from-a-worktree-session) |
@@ -781,6 +782,38 @@ Useful reads:
 - `context_assembled` is the one event that says what a turn's context held and
   what it left out: [Reading a turn's context manifest](#reading-a-turns-context-manifest).
 
+### The context inspector: why a file was not consulted
+
+The first place to look when an answer missed a file is the **Context** control
+in the conversation header, not the audit log. It opens the panel described in
+the [user guide](USER_GUIDE.md#inspecting-and-controlling-context) and shows the
+same manifest, without a shell.
+
+- **Expand Excluded.** It holds one row per omitted item with the reason. The
+  common answers are `restricted_path` (the path policy refused it),
+  `category_budget_exhausted` (its category was full), `too_large`,
+  `path_not_selected` (the session's path restriction does not include it) and
+  `missing` (a pinned file no longer reads).
+- **A pin is not in the request.** Look under Excluded for that path. A pin that
+  became restricted or whose file was deleted stays pinned and appears there
+  with the reason; restoring the file restores the pin. A pin whose path is not
+  in Excluded was included — expand **Pinned** to confirm.
+- **Only a few files are being considered.** Check the line under the pin list
+  that says the session is restricted to N paths, and clear it with **Clear
+  paths** if that was not what you meant. The restriction never overrides
+  `restricted_patterns`, so selecting a restricted path does not include it.
+- **An item you removed is still listed.** On a paused turn, an item removed in
+  the panel appears under Excluded as `user_removed` and the token total falls.
+  Removal is per turn; a pin or restriction is what changes later turns.
+- **Something is missing from the panel.** `Required` cannot be removed by
+  design: it is your own message and Damaian's required context, and the API
+  refuses its removal even if a client asks. `AGENTS.md` is removable for a
+  paused turn, but a path restriction does not remove it — repository
+  instructions are policy, not one of the content files a restriction selects.
+- **An earlier turn.** Each assistant message with a recorded manifest has a
+  **Context · N tokens** link. It opens the read-only view of what that turn
+  actually sent, including any removal made before it was sent.
+
 ### Reading a turn's context manifest
 
 Each model turn records one `context_assembled` event before its first
@@ -819,6 +852,8 @@ Inside the manifest:
 | `categories` | One entry per category **in budget order**: `category`, `allocated` (after redistribution from earlier categories), `used`, `items`, `truncated`, `estimated`. `estimated` is always `true` for assembly: the figure is the estimator's, never a provider measurement. |
 | `included` | One entry per item: `category`, `kind`, `path`, `lineRange`, `tokens`, `rootPath`, `provenance`. `kind` is the source label the prompt header shows (`explicit_file`, `retrieved_file`, `agent_instruction`, `project_rule`, `hook_context`, `repository_map`, `symbols`, `plan_state`); your own message is listed as `user_prompt` with no path. `category` is the budget bucket, which is not always the same thing: a search hit is `kind: retrieved_file` but `category: search_results`. The entry records where the item came from and how big it was, never its text. |
 | `excluded` | One entry per item left out or shortened: `reason`, `path`, `lineRange`, `category`, `detail`. |
+| `conversationSummary` | The #55 summary this turn sent, when it has one: `tokens`, `messages`, `throughSeq`, `factsOnly`. It is not an `included` item because it travels inside `Recent conversation:`; `null` when there is no summary. |
+| `symbolProvenance` | For the symbols block, `total`, `languageServer` and `heuristic`. The one `included` entry for the block can only carry the weakest provenance; these are the counts behind "12 symbols (4 heuristic)". |
 
 `rootPath` is the repository root that owns the path: `""` means the repository
 root itself, `"packages/api"` a nested root from the repository map. It is
@@ -846,12 +881,17 @@ carries one today; a file item, an instruction file and hook context are `null`.
 | `too_large` | A whole-file read was refused because the file exceeds `max_file_bytes`. | Yes |
 | `binary` | A whole-file read was refused because the file looks binary. | Yes |
 | `deduplicated_into_range` | A line range was merged into another range for the same path, or absorbed by a whole-file item. | Not yet: nothing produces a line range. |
+| `user_removed` | You removed an optional item in a paused pre-send review, or removed the conversation summary. It applies to that turn only. | Yes, spec 27 |
+| `path_not_selected` | The session's path restriction admits only selected paths, and this one is not among them. `AGENTS.md` is exempt by design. | Yes, spec 27 |
+| `missing` | A pinned file no longer reads: it was deleted or became unreadable. The pin stays in the session. | Yes, spec 27 |
 
-`secret_bearing`, `total_budget_exhausted` and `user_removed` are not produced
-by this version; they arrive with the stages that generate them. A file that is
-simply missing or unreadable, and a path that resolves outside the repository
-root, produce **no** record: the enum has no reason for them, and inventing one
-would be worse than the omission.
+`secret_bearing` and `total_budget_exhausted` are not produced by this version;
+they arrive with the stages that generate them. A file that is simply missing or
+unreadable, and a path that resolves outside the repository root, produce **no**
+record unless it is a pin — the enum has no reason for an ordinary missing file,
+and inventing one would be worse than the omission. A pinned file is different:
+its absence is the user's standing request failing, so it is recorded as
+`missing`.
 
 #### Declared and observed limits
 

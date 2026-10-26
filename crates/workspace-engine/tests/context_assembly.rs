@@ -1165,7 +1165,7 @@ fn the_symbols_item_keeps_the_lowest_provenance_it_contains() {
 /// signal to cover the merge through `build_context` and to stop calling the
 /// machinery unit-only.
 #[test]
-fn no_collection_source_yields_a_line_range_yet() {
+fn unpinned_collection_sources_still_yield_whole_files() {
     let repo = temp_dir("range-source-finding");
     write_fixture(
         &repo,
@@ -1207,7 +1207,7 @@ fn no_collection_source_yields_a_line_range_yet() {
         .collect::<Vec<_>>();
     assert!(
         ranged.is_empty(),
-        "a collection source now produces line ranges; cover merging through build_context: {ranged:?}"
+        "an unpinned collection source now produces line ranges; cover merging through build_context: {ranged:?}"
     );
 
     fs::remove_dir_all(repo).unwrap();

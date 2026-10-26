@@ -5645,7 +5645,9 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
       if (checkpoint) markMessageRewindable(bubble, checkpoint);
     }
     if (message.role === "assistant") {
-      void finalizeChatMessage(bubble, message.content);
+      // The context link is added after the markdown render, because
+      // `finalizeChatMessage` replaces the body's children.
+      const finalized = finalizeChatMessage(bubble, message.content);
       if (message.taskId && endsTheTurn(message)) {
         if (cancelledTasks.has(message.taskId)) {
           markMessageStopped(bubble);
@@ -5661,7 +5663,9 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
           renderWebDiagnosticCard(bubble, record);
         });
         appendTurnNotes(bubble.body, notesByTask.get(message.taskId));
-        appendContextLink(bubble.body, contextByTask.get(message.taskId));
+        void finalized.then(() =>
+          appendContextLink(bubble.body, contextByTask.get(message.taskId)),
+        );
       }
       if (message.taskId) markMessageUsage(bubble, usageByTask.get(message.taskId));
     }

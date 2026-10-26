@@ -980,7 +980,13 @@ process launches stall intermittently; the same variance is recorded in
 None of these blocks acceptance; each is recorded so a later spec does not
 rediscover it:
 
-- **No collection source yields a `LineRange` yet.** Range deduplication,
+- **No automatic collection source yields a `LineRange`.** Spec 27's session
+  pins became the first producer on 2026-10-26: a pinned range reads through
+  `ReadWindow::ContextRange` and can merge or be absorbed by a whole-file item.
+  Automatic collection (prompt mentions, search hits, instructions) is still
+  whole-file, so range merging is exercised through `build_context` only by the
+  pin tests and no automatic source records `deduplicated_into_range`. The
+  original note follows. Range deduplication,
   whole-file absorption and per-item line provenance are implemented and
   covered by unit tests, but inert in production: every source asks for the
   whole file, so `lineRange` is null on every included item and
