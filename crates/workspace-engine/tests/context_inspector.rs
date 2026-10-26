@@ -403,6 +403,44 @@ fn a_restriction_does_not_remove_agent_instructions() {
 }
 
 #[test]
+fn a_restriction_narrows_file_content_but_not_the_symbols_block() {
+    let repo = fixture_repo("restriction-symbols");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let restriction = vec!["src/upload.rs".to_string()];
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        "Compare upload_retry in src/upload.rs and other_marker_zzq in src/other.rs",
+        &[],
+        Some(&restriction),
+    );
+
+    assert_eq!(
+        excluded_reason(&plan, "src/other.rs"),
+        Some(ExclusionReason::PathNotSelected),
+        "the file itself is outside the restriction: {:?}",
+        plan.manifest.excluded
+    );
+    // The documented exemption (proposal §5.4, context.md C10): the symbols
+    // block is a path-less index lookup built from the prompt's own
+    // identifiers, so it is not a file-bearing source and the restriction does
+    // not filter it. If that ever changes, this test changes with the spec and
+    // the panel hint.
+    let symbols = plan
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::Symbols)
+        .expect("the prompt names symbols");
+    assert!(
+        symbols.content.contains("other_marker_zzq") && symbols.content.contains("src/other.rs"),
+        "the symbols block is exempt from the restriction by design: {}",
+        symbols.content
+    );
+    assert!(!included_paths(&plan).contains(&"src/other.rs"));
+}
+
+#[test]
 fn the_required_item_is_still_first_and_cannot_be_removed() {
     let repo = fixture_repo("required-order");
     let engine = WorkspaceEngine::new(test_config(&repo));
@@ -967,6 +1005,58 @@ fn a_past_turns_context_is_readable_after_another_turn() {
     assert_ne!(first.task.id, second.task.id);
 }
 
+#[test]
+fn the_newest_record_for_a_task_is_what_the_reader_returns() {
+    let repo = fixture_repo("reader-newest");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let session = engine
+        .session_store
+        .create_session(&index.repository_id, "Reading")
+        .unwrap();
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        "Look at src/upload.rs and src/other.rs",
+        &[],
+        None,
+    );
+    let mut prepared = workspace_engine::PreparedContext::from_plan(&plan);
+    let first = prepared.manifest.clone();
+    let optional = first
+        .included
+        .iter()
+        .position(|item| item.category != ContextCategory::Required)
+        .expect("there is an optional item");
+    prepared
+        .remove_optional(optional)
+        .expect("optional items are removable");
+    let amended = prepared.manifest.clone();
+    assert!(amended.total_tokens < first.total_tokens);
+
+    // Two records for one task only happen in logs written before the send
+    // became the sole writer, or by a future writer. The reader must still
+    // return the newest, not the first.
+    for manifest in [&first, &amended] {
+        let mut fields = vec![
+            ("actor", "system".to_string()),
+            ("sessionId", session.id.clone()),
+        ];
+        fields.extend(manifest.audit_fields());
+        engine
+            .audit_log
+            .record("context_assembled", &fields)
+            .unwrap();
+    }
+
+    let manifests = engine
+        .session_store
+        .read_session_context_manifests(&session.id)
+        .unwrap();
+    assert_eq!(manifests.get(&plan.task_id), Some(&amended));
+}
+
 fn ask_with_again(
     engine: &WorkspaceEngine,
     repo: &Path,
@@ -1071,16 +1161,46 @@ fn context_events_for(engine: &WorkspaceEngine, task_id: &str) -> usize {
 }
 
 #[test]
-fn an_unchanged_review_is_recorded_once_and_a_changed_one_twice() {
+fn a_turn_records_its_context_only_when_it_is_sent() {
     let repo = fixture_repo("review-record-count");
     let engine = WorkspaceEngine::new(pause_config(&repo));
     let mut adapter = MockModelAdapter::new("Done.");
+
+    // Assembly alone sends nothing, so a paused review records no manifest.
     let (first, _) = ask_with(&engine, &repo, "What is this?", &mut adapter);
     let first_review = first.context_review.expect("the review is present");
-    assert_eq!(context_events_for(&engine, &first.task.id), 1);
-    let sent = resume_context(
+    assert_eq!(
+        context_events_for(&engine, &first.task.id),
+        0,
+        "a paused review has not sent anything and must not record a manifest"
+    );
+    let declined = resume_context(
         &engine,
         &first_review.id,
+        ContextDecision::Decline,
+        &mut adapter,
+    )
+    .expect("declining is a result, not an error");
+    assert!(declined.cancelled);
+    assert_eq!(
+        context_events_for(&engine, &declined.task.id),
+        0,
+        "a declined turn sent nothing and must not record a manifest"
+    );
+
+    // An unchanged review records exactly the manifest it sent, once.
+    let second = ask_with_again(
+        &engine,
+        &repo,
+        &declined.session.id,
+        "Try again?",
+        &mut adapter,
+    );
+    let second_review = second.context_review.expect("the review is present");
+    assert_eq!(context_events_for(&engine, &second.task.id), 0);
+    let sent = resume_context(
+        &engine,
+        &second_review.id,
         ContextDecision::Send,
         &mut adapter,
     )
@@ -1088,12 +1208,14 @@ fn an_unchanged_review_is_recorded_once_and_a_changed_one_twice() {
     assert_eq!(
         context_events_for(&engine, &sent.task.id),
         1,
-        "an unchanged turn must not record a second assembly"
+        "sending records the assembly that was sent"
     );
 
-    let second = ask_with_again(&engine, &repo, &sent.session.id, "And now?", &mut adapter);
-    let second_review = second.context_review.expect("the review is present");
-    let index = second_review
+    // A changed review records the amended manifest, once, not the first
+    // assembly and not a second copy of it.
+    let third = ask_with_again(&engine, &repo, &sent.session.id, "And now?", &mut adapter);
+    let third_review = third.context_review.expect("the review is present");
+    let index = third_review
         .manifest
         .included
         .iter()
@@ -1101,18 +1223,19 @@ fn an_unchanged_review_is_recorded_once_and_a_changed_one_twice() {
         .expect("the map is included");
     engine
         .chat_orchestrator
-        .remove_context_item(&second_review.id, index)
+        .remove_context_item(&third_review.id, index)
         .expect("the map is removable");
+    assert_eq!(context_events_for(&engine, &third.task.id), 0);
     let sent = resume_context(
         &engine,
-        &second_review.id,
+        &third_review.id,
         ContextDecision::Send,
         &mut adapter,
     )
     .expect("the amended review sends");
     assert_eq!(
         context_events_for(&engine, &sent.task.id),
-        2,
-        "a changed turn records the amended assembly as the newest"
+        1,
+        "the amended send records one assembly: the one it sent"
     );
 }

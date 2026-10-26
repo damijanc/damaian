@@ -1211,20 +1211,16 @@ impl ChatOrchestrator {
             restriction: context_restriction.as_deref(),
             conversation_summary: conversation.summary.as_ref(),
         })?;
-        // One `context_assembled` event per assembly, recorded by the caller:
-        // the manager holds no audit log and adding one would be a second audit
-        // path for one event (proposal §5.5, Correction C9). The manifest holds
-        // no content, and `AuditLog::record` redacts every field value anyway.
-        let mut context_fields = vec![
-            ("actor", "system".to_string()),
-            ("sessionId", session.id.clone()),
-        ];
-        context_fields.extend(context.manifest.audit_fields());
-        self.audit_log
-            .record("context_assembled", &context_fields)?;
         // What this turn is about to send (spec 27 §5.1, C9). Sent before the
         // first call, so the default (no pause) still gives the user a
         // pre-send view; the shell relays it as its `context` event.
+        //
+        // The matching `context_assembled` record is written only once the turn
+        // is committed to sending (below, and on `Send` in
+        // `resume_after_context_decision`). A pause has assembled a plan but
+        // sent nothing, and a declined turn never sends: recording at assembly
+        // would put a "what this turn was sent" manifest on a task that sent
+        // nothing (proposal §5.3, C9).
         sink.context(&context.manifest);
         let prompt_conversation = build_conversation(
             &conversation.messages,
@@ -1264,6 +1260,19 @@ impl ChatOrchestrator {
                 options,
             );
         }
+
+        // The turn is now committed to sending, so this is its one
+        // `context_assembled` record. The manager holds no audit log and adding
+        // one would be a second audit path for one event (proposal §5.5,
+        // Correction C9). The manifest holds no content, and `AuditLog::record`
+        // redacts every field value anyway.
+        let mut context_fields = vec![
+            ("actor", "system".to_string()),
+            ("sessionId", session.id.clone()),
+        ];
+        context_fields.extend(context.manifest.audit_fields());
+        self.audit_log
+            .record("context_assembled", &context_fields)?;
 
         self.run_agentic_turn(
             repository_root,
@@ -1338,7 +1347,6 @@ impl ChatOrchestrator {
                 conversation,
                 summary,
                 summary_removed: false,
-                changed: false,
             }),
         })?;
         self.note_pending_approvals(
@@ -1533,19 +1541,18 @@ impl ChatOrchestrator {
             TaskStatus::PreparingContext,
             None,
         )?;
-        // An unchanged turn already has its `context_assembled` record from
-        // the pause; only a changed plan adds a newer one, so the post-send
-        // view reads what was actually sent.
-        if review.changed {
-            let mut context_fields = vec![
-                ("actor", "system".to_string()),
-                ("sessionId", pending.session.id.clone()),
-            ];
-            context_fields.extend(plan.manifest.audit_fields());
-            self.audit_log
-                .record("context_assembled", &context_fields)?;
-            sink.context(&plan.manifest);
-        }
+        // The turn is now committed to sending, so this is its one
+        // `context_assembled` record, whether or not the user amended the plan.
+        // The newest record wins in the reader, so an amended manifest is what
+        // the post-send view shows, and an unchanged send writes it once.
+        let mut context_fields = vec![
+            ("actor", "system".to_string()),
+            ("sessionId", pending.session.id.clone()),
+        ];
+        context_fields.extend(plan.manifest.audit_fields());
+        self.audit_log
+            .record("context_assembled", &context_fields)?;
+        sink.context(&plan.manifest);
 
         self.run_agentic_turn(
             &PathBuf::from(&pending.repository_root),
@@ -1577,7 +1584,6 @@ impl ChatOrchestrator {
             ClientError::InvalidInput(format!("{proposal_id} is not a context review"))
         })?;
         let record = review.prepared.remove_optional(index)?;
-        review.changed = true;
         self.audit_log.record(
             "context_item_removed",
             &[
@@ -1613,7 +1619,6 @@ impl ChatOrchestrator {
         })?;
         let record = review.prepared.remove_summary()?;
         review.summary_removed = true;
-        review.changed = true;
         self.audit_log.record(
             "context_summary_removed",
             &[
@@ -8760,12 +8765,6 @@ struct PendingContextReview {
     conversation: PromptConversation,
     summary: Option<ConversationSummary>,
     summary_removed: bool,
-    /// Whether the user changed the prepared plan. The initial assembly is
-    /// already the audit record of an unchanged turn, so a resume records a
-    /// second `context_assembled` only when it will actually send something
-    /// else (spec 27 §5.3).
-    #[serde(default)]
-    changed: bool,
 }
 
 /// The persisted half of a round-budget pause (spec 61). `rounds_granted` is
