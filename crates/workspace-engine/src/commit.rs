@@ -1005,10 +1005,12 @@ impl CommitEngine {
                     .filter(|hook| hook.name != "post-commit" && hook.outcome == "ok")
                     .map(|hook| hook.name.as_str())
                     .collect::<Vec<_>>();
-                let who = if names.is_empty() {
+                let who = if names.contains(&"pre-commit") {
+                    "The pre-commit hook".to_string()
+                } else if names.is_empty() {
                     "A Git hook".to_string()
                 } else {
-                    names.join(", ")
+                    format!("The {} hook", names.join(", "))
                 };
                 warnings.push(format!(
                     "{who} changed the index while committing. The commit contains the bytes \
