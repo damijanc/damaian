@@ -1156,8 +1156,13 @@ impl CommitEngine {
             let (content_sha256, warnings) = match &blob {
                 Some(blob) if !blob.symlink => {
                     if blob.size > self.config.max_file_bytes {
+                        // Too large to scan, but still hashed: the acceptance
+                        // record is a SHA-256, and refusing to recognise an
+                        // accepted file because it is big would mislabel it as
+                        // hand-edited. Reading it once to hash is the price of
+                        // committing it at all.
                         (
-                            None,
+                            Some(crate::hash::file_hash(root.join(&path))?),
                             vec![GeneratedSecretWarning {
                                 path: path.clone(),
                                 categories: vec!["unscanned".to_string()],

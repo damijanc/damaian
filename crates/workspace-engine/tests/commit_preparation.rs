@@ -128,6 +128,18 @@ impl Fixture {
         approved: Option<&[String]>,
         hunks: Option<&HashMap<String, Vec<String>>>,
     ) -> String {
+        self.apply_with(session, task, files, approved, hunks, false)
+    }
+
+    fn apply_with(
+        &self,
+        session: &Session,
+        task: &Task,
+        files: &[(&str, &str)],
+        approved: Option<&[String]>,
+        hunks: Option<&HashMap<String, Vec<String>>>,
+        allow_secrets: bool,
+    ) -> String {
         let changes = files
             .iter()
             .map(|(path, content)| ProposedChange {
@@ -153,7 +165,7 @@ impl Fixture {
                 approved,
                 hunks,
                 "tester",
-                false,
+                allow_secrets,
             )
             .unwrap();
         patch.id
@@ -1038,6 +1050,188 @@ fn a_running_hook_is_registered_with_the_process_registry() {
     assert!(
         seen.load(AtomicOrdering::SeqCst),
         "the running hook's pid was never registered"
+    );
+    fixture.cleanup();
+}
+
+const FAKE_AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+
+#[test]
+fn the_approved_content_is_the_committed_content() {
+    let fixture = Fixture::new("content-identity");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    let preparation = fixture.prepare(&session);
+    fixture.write("a.txt", "changed after the preview\n");
+    let before = fixture.head();
+    let outcome = fixture.commit(
+        &session,
+        &preparation,
+        &fixture.default_paths(&preparation),
+        "Commit a",
+        false,
+    );
+    assert!(matches!(
+        outcome,
+        Err(CommitError::Refused {
+            code: "commit_content_changed",
+            ..
+        })
+    ));
+    assert_eq!(fixture.head(), before);
+
+    fixture.write("a.txt", "damaian\n");
+    fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            "Commit a",
+            false,
+        )
+        .expect("the reviewed bytes are committed once they are back");
+    assert_eq!(fixture.show("a.txt"), "damaian\n");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_seeded_secret_warns_with_categories_and_counts_and_no_text() {
+    let fixture = Fixture::new("secret-warning");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    let content = format!("token = {FAKE_AWS_KEY}\n");
+    fixture.write("a.txt", &content);
+    fixture.apply_with(&session, &task, &[("a.txt", &content)], None, None, true);
+    let preparation = fixture.prepare(&session);
+    let candidate = preparation
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path == "a.txt")
+        .unwrap();
+    let warning = candidate
+        .secret_warnings
+        .first()
+        .expect("the seeded key is flagged");
+    assert!(warning.categories.contains(&"aws_access_key".to_string()));
+    assert_eq!(warning.count, 1);
+    assert_eq!(warning.path, "a.txt");
+
+    let serialized = serde_json::to_string(&preparation).unwrap();
+    assert!(!serialized.contains(FAKE_AWS_KEY), "{serialized}");
+    assert!(serialized.contains("aws_access_key"));
+    fixture.cleanup();
+}
+
+#[test]
+fn a_secret_needs_a_separate_per_commit_override() {
+    let fixture = Fixture::new("secret-override");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    let content = format!("token = {FAKE_AWS_KEY}\n");
+    fixture.write("a.txt", &content);
+    fixture.apply_with(&session, &task, &[("a.txt", &content)], None, None, true);
+    let preparation = fixture.prepare(&session);
+    let selected = fixture.default_paths(&preparation);
+    let before = fixture.head();
+
+    let first = fixture.commit(&session, &preparation, &selected, "Commit a", false);
+    assert!(matches!(
+        first,
+        Err(CommitError::Refused {
+            code: "commit_secrets_require_override",
+            ..
+        })
+    ));
+    assert_eq!(fixture.head(), before);
+
+    let outcome = fixture
+        .commit(&session, &preparation, &selected, "Commit a", true)
+        .expect("the override commits");
+    assert!(outcome.generated_secret_override);
+    assert_ne!(fixture.head(), before);
+
+    let audit = fs::read_to_string(fixture.data_dir.join("audit/events.jsonl")).unwrap();
+    assert!(audit.contains("commit_secret_override"), "{audit}");
+    assert!(audit.contains("aws_access_key"), "{audit}");
+    assert!(audit.contains("generatedSecretOverride"));
+    assert!(!audit.contains(FAKE_AWS_KEY), "the audit leaked the secret");
+    fixture.cleanup();
+}
+
+#[test]
+fn an_unscannable_file_is_treated_as_a_secret_warning() {
+    let mut fixture = Fixture::new("unscanned");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    let content = "this file is far too long to scan\n";
+    fixture.write("big.txt", content);
+    fixture.apply(&session, &task, &[("big.txt", content)], None, None);
+    fixture.rebuild(|config| config.max_file_bytes = 8);
+    let preparation = fixture.prepare(&session);
+    let candidate = preparation
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path == "big.txt")
+        .unwrap();
+    assert!(candidate.unscanned);
+    assert!(
+        candidate
+            .secret_warnings
+            .iter()
+            .any(|warning| warning.categories == vec!["unscanned".to_string()])
+    );
+    let outcome = fixture.commit(
+        &session,
+        &preparation,
+        &fixture.default_paths(&preparation),
+        "Commit big",
+        false,
+    );
+    assert!(
+        matches!(
+            outcome,
+            Err(CommitError::Refused {
+                code: "commit_secrets_require_override",
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn the_recorded_diff_is_redacted_and_the_record_holds_no_secret() {
+    let fixture = Fixture::new("record-redacted");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    let content = format!("token = {FAKE_AWS_KEY}\n");
+    fixture.write("a.txt", &content);
+    fixture.apply_with(&session, &task, &[("a.txt", &content)], None, None, true);
+    let preparation = fixture.prepare(&session);
+    let candidate = preparation
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path == "a.txt")
+        .unwrap();
+    assert!(candidate.diff.contains("[REDACTED"), "{}", candidate.diff);
+    let record = fs::read_to_string(
+        fixture
+            .data_dir
+            .join("commits")
+            .join(format!("{}.json", preparation.prepare_id)),
+    )
+    .unwrap();
+    assert!(
+        !record.contains(FAKE_AWS_KEY),
+        "the record leaked the secret"
     );
     fixture.cleanup();
 }

@@ -14,7 +14,7 @@ pre-implementation state in [`context.md`](context.md)
 | 2 · The `allow_git_commits` capability | Done 2026-10-26 | Added the sixth capability key beside `allow_file_edits`: `Config` default `true`, `ConfigOverlay` parse/serialise, an explicit capability classification, a restrict-only merge case, `ProfileCapabilities.allow_git_commits`, `ReadOnly` turns it off, the effective-policy label "Git commits allowed", and `Config::profile_capabilities`. The weakening case in `tests/permission_profiles.rs` proves a repository can only refuse it; `each_built_in_profile_resolves_to_its_table_row` now expects Read-only `false`. Scoped `cargo nextest -p workspace-engine --test permission_profiles` passed (74 passed, 1 skipped); clippy clean; fast checks clean after `cargo fmt`. |
 | 3 · Durable acceptance detail and the commit engine | Done 2026-10-26 | `PatchFileDecision` gained `applied_hashes` and `accepted_hunks` (both `#[serde(default)]`); `apply_stored_patch` fills them from `PatchApplyResult::applied` and `hunk_selection`, reject paths leave them empty. `SessionStore` gained `append_commit_created` and `read_change_timeline`, which walks applied decisions and commits in log order. New `workspace-engine/src/commit.rs`: candidate set from that timeline plus checkpoint origins, redacted per-path diffs, deterministic message, verification summary, and `prepare`/`commit` through a private `GIT_INDEX_FILE` with `read-tree`/`hash-object`/`update-index`/`write-tree`/`ls-tree` verification/`commit-tree`/`update-ref <new> <old>`; the record is saved under `<data_dir>/commits/`. `GitService::changes` lists untracked files with `-uall` and `-z`, filtered by the same restricted-path rule. Hooks and the secret scan are implemented in the same module; their tests land in Tasks 4 and 5. Nine tests in `tests/commit_preparation.rs` pass (accepted subset, hunk-level, hand edit, command effect, index untouched, HEAD moved, detached/merge, mode+profile gate, invalid selection); `--test foundation` passed (171). Scoped clippy and the fast checks are clean. Deviations: `prepare` saves a record under the data dir (Damaian state, not the repository); the tree is verified against a full expected map, not only the selected paths; `GitService::changes` is new rather than widening `status`, because `status` collapses untracked directories. |
 | 4 · Git hooks: detect, report, run, never bypass | Done 2026-10-26 | Detection honours `core.hooksPath` (relative to the root) and otherwise `git rev-parse --git-path hooks`; the report names path, existence, execute bit, size, interpreter, whether it runs, and why not. `prepare-commit-msg`, `commit-msg` and `post-commit` run in Git order through `CommandRunner::run_at_with_env`, which adds `GIT_INDEX_FILE`, `GIT_DIR` and `GIT_WORK_TREE` to the existing timeout/truncation/redaction/PID path. A rewrite of the approved message is a typed refusal with the final text and no commit; a non-zero or timed-out pre-commit/prepare-commit-msg/commit-msg aborts; a failing post-commit is a warning after the ref moved. A hook report changed between prepare and commit is refused. Tests (10 new): report metadata including `core.hooksPath`, failing pre-commit, commit-msg rewrite then a second approval, prepare-commit-msg rewrite, post-commit warning, private index seen by `git diff --cached`, timeout, truncation plus redaction of a seeded fake AWS key, no `--no-verify` code path, and PID registration while a hook sleeps. All 19 `commit_preparation` tests pass. Deviation from the plan’s wording: `prepare-commit-msg` is run as well as detected, because not running it would silently defeat a hook Git itself would run; recorded in context D4. |
-| 5 · Exact bytes, the secret check and the per-commit override | Not started | |
+| 5 · Exact bytes, the secret check and the per-commit override | Done 2026-10-26 | `commit` recomputes each selected path’s Git blob id and mode and refuses `commit_content_changed` when either differs from the record, before composing anything; restoring the reviewed bytes lets the same preparation commit. The secret scan runs on the bytes that would become blobs, reports categories/counts through `GeneratedSecretWarning` (now `Serialize`/`Deserialize`), treats a file over `max_file_bytes` as `unscanned` but still hashes it so an accepted large file is not mislabelled as hand-edited, and requires the separate `allow_generated_secrets` request field. The override writes `commit_secret_override` with categories/counts and no text, and `commit_created` records `generatedSecretOverride`; the prepared record stores only the redacted diff. Five tests: content changed then the same preparation commits the restored bytes, seeded fake AWS key warning with no text in the serialized preparation, override refused then accepted with a clean audit, unscannable file, and a record that contains neither the key nor an unredacted copy. All 24 `commit_preparation` tests pass. |
 | 6 · Message drafting with the deterministic fallback | Not started | |
 | 7 · Durable action markers, audit and crash inspection | Not started | |
 | 8 · Shell routes and the *Commit…* dialog | Not started | |
@@ -352,7 +352,7 @@ D1–D3.
 
 **Files:** `commit.rs`, `tests/commit_preparation.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   1. `the_approved_content_is_the_committed_content` — prepare, change a selected
      file, commit → `CommitError::ContentChanged`, no ref moved; restore and
      commit succeeds with the reviewed bytes.
@@ -371,8 +371,8 @@ D1–D3.
      a secret in the diff; the candidate's `diff` contains `[REDACTED]`, and the
      prepared record on disk does not contain the secret. (The record stores the
      redacted diff.)
-- [ ] **Step 2: Confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Confirm they fail.**
+- [x] **Step 3: Implement.**
   - Scan each selected candidate's composed bytes with `SecretScanner::scan`;
     aggregate categories/counts into `GeneratedSecretWarning`. Files over
     `max_file_bytes` are `unscanned`.
@@ -382,12 +382,12 @@ D1–D3.
   - The record already stores the blob identity; enforce equality for every
     selected path before composing, and refuse with `ContentChanged` otherwise.
   - Never store unredacted content or matched text in the record or audit.
-- [ ] **Step 4: Falsify.** Remove the equality check → test 1 commits the changed
+- [x] **Step 4: Falsify.** Remove the equality check → test 1 commits the changed
   bytes. Scan the diff instead of the composed bytes → the seeded secret in a
   hand-edited region the diff redacts is not flagged (construct the test so the
   scanner sees only the raw bytes). Put matched text in the warning → test 2
   fails.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -395,7 +395,7 @@ D1–D3.
   CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo nextest run -p workspace-engine --test commit_preparation
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Check the bytes a commit will write, not the redacted diff`.
 
 ## Task 6: Message drafting with the deterministic fallback
