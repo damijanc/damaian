@@ -79,23 +79,23 @@ directory was renamed from `ROADMAP` to `PLAN` because it was never a roadmap:
 
 ## What to build next, and what may run in parallel
 
-### Current state (2026-10-25)
+### Current state (2026-10-26)
 
 A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
 reports the disagreement.
 
-#23, #25, #26, #32, #50, #59, #62, #65 and #66 are all Done and merged into
-`main`. #23 and #26 both finished on 2026-10-25, so the two keystones are no
-longer in flight.
+#23, #25, #26, #32, #50, #55, #59, #62, #65 and #66 are all Done. #23 and #26
+both finished on 2026-10-25, so the two keystones are no longer in flight. #55
+finished on 2026-10-26 with the seven-check gate outstanding (it runs in CI after
+the user pushes).
 
 - **In progress:** #49 prompt cache — the accounting slice is done and the
   reuse slice (requirement 4) is the only unbuilt requirement. #26's ordering
-  now exists, but the spec's own `Depends on:` line still names Phase 1 WP3
-  (provider capability validation) as unspecified, and the eight-message
-  sliding window it is most sensitive to is #55's to replace, so it is not in
-  the ready set. **#55 conversation compaction** is in progress from 2026-10-26
-  in a solo `chat.rs` track; it replaces that window.
+  exists, and #55 replaced the eight-message sliding window on 2026-10-26, so
+  the reuse slice is no longer blocked by either. The spec's own `Depends on:`
+  line still names Phase 1 WP3 (provider capability validation) as unspecified,
+  so it is not in the ready set.
 - **Ready, not started:** #27 context inspector; #33 MCP management; #35 commit
   preparation (its last dependency, #23, was built on 2026-10-25); #51 external
   reference retrieval.
@@ -104,8 +104,8 @@ longer in flight.
   WP3 (provider capability validation), which is unspecified.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
 - **Pairing:** two specs may run together only if at most one of them edits
-  `chat.rs`, and #55 and #49's reuse slice never run with each other — both
-  edit `build_model_prompt` or the turn loop. #26, #65 and #66 are Done and no
+  `chat.rs`, and #49's reuse slice is a solo `chat.rs` track while it rewrites
+  the request around `build_model_prompt`. #26, #55, #65 and #66 are Done and no
   longer constrain anything. See [Parallel work](#parallel-work).
 - **Open decision:** the priority table below predates #59–#64 and does not
   rank them; the text after it now calls #23 the priority with #65 done.
@@ -369,7 +369,7 @@ nothing is promoted by their completion.
 | | Build | Why here |
 |---|---|---|
 | 1 | #23 verification | Ready now that #22 is done, and the next priority with #65 finished; the last thing in front of #35. Its loop lives in `chat.rs` |
-| 2 | #55 compaction | Unblocked by #26; also what makes #49's reuse slice worth measuring |
+| 2 | #55 compaction | **Done 2026-10-26.** Replaced the eight-message window with a token budget plus an append-only summary, so #49's reuse slice now has a stable conversation block to measure |
 | 3 | #27, #33, #51 | The fan-out #26 unblocked. #27 also unblocks #28 |
 | 4 | #28 → #29 → #30 | Memory, strictly serial behind #27 |
 | 5 | #35 → #36/#37; #33 → #52 | Delivery and extensibility clusters |
@@ -394,9 +394,8 @@ promoted. #35 and #37 name it only as a cross-reference: they add *Commit…*
 and *Create PR* to its contextual-action slot when they are built.
 [#49](49_prompt_cache_accounting_and_reuse/proposal.md)'s accounting slice is
 done, off this table for the same reason #56 is: nothing left in it is
-unbuilt. Its reuse slice re-enters this table once #55 replaces the sliding
-window and the spec's Phase 1 WP3 line is resolved; #26's ordering, one of the
-two things it previously waited on, now exists.
+unbuilt. Its reuse slice now waits only on the spec's Phase 1 WP3 line: #26's
+ordering exists and #55 replaced the sliding window on 2026-10-26.
 [#59](59_exploration_round_allowance/proposal.md), added on 2026-10-17, sits
 off the table like #50 and #57: every dependency (#21, #34, #47) is built and
 nothing depends on it, so it joined the ready set beside #23; it is done
@@ -580,7 +579,7 @@ is ready.
 | 52 | [52_mcp_server_mode.md](52_mcp_server_mode.md) | **Not started.** Roadmap Phase 4 WP6. #06 and #33 are client-side only, so Damaian's indexed search, redaction and path policy are reachable only from its own window — the alternative being to give another tool raw filesystem access. Exposes a read-only subset over stdio, with the set computed as the intersection of read-only and profile-permitted rather than listed, so a tool added later is excluded until classified. The repository is fixed at launch and unreachable from the wire; a server has no user, therefore no approval, therefore nothing that writes. |
 | 53 | [53_session_search_and_export/proposal.md](53_session_search_and_export/proposal.md) | **Done.** Roadmap Phase 1 WP9. A rescope, not greenfield: listing, renaming and deleting already work end to end, and what is missing is finding anything and getting anything out. A bounded scan through #17's parse-first reader rather than a second index, anchored on `seq` because it survives rewinds. Its sharp edge is inherited from #16: `append_message` stores content verbatim and deliberately does not redact, so that a rewind restores what was actually said — which makes export a display path that writes a file, and redaction on the way out mandatory, with the redaction count stated rather than silently applied. |
 | 54 | [54_image_input.md](54_image_input.md) | **Not started.** Roadmap Phase 3 WP9. Lets a user paste a picture into the composer and lets the model see #12's diagnostic screenshots, which today it receives only as a file reference. Its hard part is that **an image defeats `SecretScanner`** and OCR is rejected, so the guarantee becomes informed consent: no unseen image is ever sent, and no setting can make screenshot inclusion automatic. |
-| 55 | [55_conversation_compaction/](55_conversation_compaction/proposal.md) | **In progress (started 2026-10-26).** Roadmap Phase 3 WP6 (Must, and in that phase's minimum slice). Conversations were silently **clipped to the last eight messages, each cut to 2,000 characters**, so a constraint stated in the first message was gone at the ninth; compaction appends a `conversation_compacted` event rather than rewriting anything and replaces the window with a token budget. Its load-bearing rule is that **a model never writes a field the engine can compute**: files changed, plan steps, approvals and validation status come from the session log. |
+| 55 | [55_conversation_compaction/](55_conversation_compaction/proposal.md) | **Done 2026-10-26 (CI outstanding).** Roadmap Phase 3 WP6 (Must, and in that phase's minimum slice). Conversations were silently **clipped to the last eight messages, each cut to 2,000 characters**, so a constraint stated in the first message was gone at the ninth; compaction appends a `conversation_compacted` event rather than rewriting anything and replaces the window with a token budget (`conversation_window_share`, default 0.25). Its load-bearing rule is that **a model never writes a field the engine can compute**: files changed, plan steps, approvals and validation status come from the session log, and only constraints, decisions, failed approaches and uncertainty are model-written. Automatic compaction is `conversation_auto_compact` (default on, forbidden to repository and profile config); the full transcript stays readable, rewind deactivates the compaction, a failed call produces a facts-only summary, and two injection scenarios prove a summary is data rather than an instruction. |
 | 56 | [56_provider_fallback_consent/](56_provider_fallback_consent/proposal.md) | **Done** 2026-10-12. A terminal refusal with a qualifying second provider pauses on a one-shot, refused-by-default offer in the desktop app ("Keep it failed" or "Answer with …", no "always"); approval re-issues the refused call through the fallback and records the switch, and decline fails exactly as #48 does. Split out of #48, it depends on #48's classification and `failureKind` and reuses the pending-approval and resume machinery. |
 | 57 | [57_worker_sessions/proposal.md](57_worker_sessions/proposal.md) | **Done 2026-10-16** (Tasks 1–12, started 2026-10-07; acceptance passed with DeepSeek on its re-run, see its §6). Hosts the planner-and-workers workflow behind one user setting, off by default and forbidden to repository config: a *Start worker* button on `worker-prompt` blocks runs the handoff in its own git worktree and process, with a per-project Workers board and pause, resume, stop and steering notes. Its load-bearing rule is that **nothing survives**: a stdin lifeline makes every worker exit when the shell dies, including on `SIGKILL`. |
 | 58 | [58_header_repo_bar_and_menus/](58_header_repo_bar_and_menus/proposal.md) | **Done (2026-10-14).** Every acceptance criterion walked in the running app; the full seven-check gate passed in CI. Usability rework of the desktop shell: every "more actions" control becomes one vertical ⋮ menu, the header keeps only title, terminal and ⋮, and a repo bar above the prompt shows folder, branch, `+N −M` and contextual actions such as *Fix N errors*. `githubUrl` is reconstructed from a parsed `origin`, never opened raw, because the remote is repository-controlled. |

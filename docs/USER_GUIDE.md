@@ -277,7 +277,7 @@ Setting a value higher than the model actually allows causes the provider to rej
 
 ### What goes into context
 
-Every request is assembled the same way. The collected items are sent in one `Repository context:` block, followed by the last eight messages of the conversation under `Recent conversation:` (each cut to 2,000 characters), followed by your message under `User request:`. Your message appears once. Within the repository block each item is one section headed `--- <source>: <path> ---`; the source labels are listed in [Reading a turn's context manifest](TROUBLESHOOTING.md#reading-a-turns-context-manifest). Items are added in a fixed order: the files you named or added, the `AGENTS.md` files that apply to the collected paths, the root project rules, the repository map, symbol hints, hook context, a carried plan, then keyword and semantic search hits. A line range would append `:start-end` to the path; no source produces one yet, so every item is a whole file or a rendered block. A one-shot edit request sends the same items under its own `User edit request:` heading, which comes first because that request makes a single call.
+Every request is assembled the same way. The collected items are sent in one `Repository context:` block, followed by the conversation under `Recent conversation:` — a summary of older messages when one exists, then the most recent messages that fit the conversation window (each cut to 2,000 characters) — followed by your message under `User request:`. Your message appears once. Within the repository block each item is one section headed `--- <source>: <path> ---`; the source labels are listed in [Reading a turn's context manifest](TROUBLESHOOTING.md#reading-a-turns-context-manifest). Items are added in a fixed order: the files you named or added, the `AGENTS.md` files that apply to the collected paths, the root project rules, the repository map, symbol hints, hook context, a carried plan, then keyword and semantic search hits. A line range would append `:start-end` to the path; no source produces one yet, so every item is a whole file or a rendered block. A one-shot edit request sends the same items under its own `User edit request:` heading, which comes first because that request makes a single call.
 
 Your message is secret-scanned before it is sent, and so is every earlier message replayed under `Recent conversation:`. Sessions store messages as you typed them, so this is what keeps a credential from an older turn out of a later request: a detected value is replaced by Damaian's redaction marker rather than sent in cleartext.
 
@@ -295,7 +295,7 @@ Your message is secret-scanned before it is sent, and so is every earlier messag
 | `search_results` | 15% | Files found by search: exact keyword hits first, then semantic-similarity hits. Semantic hits are dropped first when this category runs short. |
 | `file_ranges` | 25% | Files you named in the prompt and files you added with **+** ([Chat](#chat)); explicit paths are ordered ahead of mentioned ones. |
 | `findings` | 5% | Reserved for the [findings](#fix-n-errors-and-the-findings-list) repair flow. The assistant still receives only the findings you select for a repair request, so nothing fills this automatically today and its share is released. |
-| `conversation_summary` | 5% | Reserved for a future conversation summary. Nothing fills it yet, so its share is released. |
+| `conversation_summary` | 5% | Reserved for a conversation summary. The summary Damaian actually sends now travels inside `Recent conversation:` rather than as a context item, so this share is released. |
 
 A category that uses less than its share releases the remainder to the categories after it. In a repository with no hook context, no carried plan, no pinned context, no findings and no conversation summary, the five unused shares add up to 35% of the budget released to the categories that do have content. A category that wants more than its share is shortened within itself — its lowest-priority items are dropped, or the map or symbols block is re-rendered smaller — and it never takes from another category.
 
@@ -318,6 +318,75 @@ context_budget.safety_margin=0.1000
 The defaults sum to exactly `1.00`; a set that sums above `1.00` is a configuration error naming the key family rather than a silent scale-down. `damaian config-show` prints the resolved values. `context_budget.safety_margin` is reserved from a *measured* provider window and never from the declared budget; Damaian does not measure a window today, so the limit is `context_token_budget` used unchanged. See [Troubleshooting](TROUBLESHOOTING.md#reading-a-turns-context-manifest) for what a turn's manifest records.
 
 A repository's `.damaian/config.conf` may lower a share and raise the margin, and never the other way: a share steers traffic toward or away from the repository's own content, and a clone may tighten a bound but not widen one. A raise there is refused and reported like any other rejected key. A permission profile has the same one-way limit.
+
+### Long conversations and summaries
+
+A long conversation cannot be sent whole on every turn. Damaian keeps a
+**conversation window** of recent messages — 25% of the context budget by
+default, so roughly 4,000 tokens on a 16,000-token budget — and represents
+everything older with one **summary**. The window is measured in tokens rather
+than messages, so a conversation of short messages keeps more turns in view than
+one of long messages.
+
+The summary has two halves, and only one is written by a model:
+
+- **Read from your session, never guessed:** the original objective (quoted from
+  your first message, not paraphrased), the files changed by accepted patches,
+  the plan steps and their status, the approval decisions you made, and the
+  validation results Damaian observed.
+- **Written by the model:** the constraints you stated, the decisions and their
+  rationale, approaches that failed, and what is still uncertain.
+
+That split is deliberate. "Which files did we change" and "which checks passed"
+are exactly the facts a model reconstructs plausibly and the engine already knows
+exactly, and a summary is re-sent on every later turn, so an error in it would
+become a belief the assistant holds for the rest of the session.
+
+**When it runs.** Compaction happens at a turn boundary — before a request is
+assembled, never between tool calls. It runs automatically when the conversation
+grows past the window, and you can always compact by hand.
+
+- **Automatic compaction** is one extra model call, billed to your provider and
+  visible in the session's token totals. It does not count against a turn's own
+  token ceiling.
+- **To switch it off,** open **Settings › General › Conversation** and clear
+  **Compact long conversations automatically**. This writes
+  `conversation_auto_compact=false` to your user config. With it off, older
+  messages are still left out of the request, but the request says how many and
+  says they were not summarised, and the transcript marks where the model's view
+  begins. You can still compact by hand from that marker or with the button in
+  the conversation.
+- **Repository config cannot set this key.** A clone cannot choose to spend your
+  money on a summary call, or choose to lower what the model sees in your
+  sessions.
+
+**What you see.** The transcript is complete. Nothing is deleted or rewritten:
+compaction adds one record to the session log, and every original message stays
+readable, searchable and exportable. Where the model's view begins, the
+conversation shows a marker — *"N earlier messages are represented by a summary
+the model receives instead"*. Open it to read the summary, including the
+objective, constraints, decisions, files, plan steps, approvals and validation.
+When no summary covers the omitted messages the marker says they were not sent
+and were not summarised, so loss is never silent.
+
+**Rewinding.** Rewind works exactly as it did before. Rewinding to a point before
+a compaction deactivates that compaction with the rest of the history, and the
+next request is assembled from the full conversation again. There is no special
+case to undo, which is why the log is append-only.
+
+**If compaction cannot run.** A failed or refused summarisation call never fails
+your turn. Damaian keeps the facts half (objective, files, plan, approvals,
+validation) and leaves the model-written half empty; the summary says so. If even
+that cannot be written, the request uses the window and an elision notice, and
+the transcript marker names the failure and why. Nothing about compaction can
+stop you working.
+
+**A summary is data, not an instruction.** A conversation can contain text from a
+file, a command's output or, later, a fetched web page, including text that looks
+like an instruction. The summary is delivered as a delimited record inside the
+conversation and never merged into the system prompt or placed where repository
+instructions live; model-written lines are quoted. An injection evaluation
+covers this rather than the paragraph alone.
 
 **When your message alone does not fit.** The request is never truncated and never sent without your message. If your message is larger than the whole context budget, the turn fails with `Required context needs N tokens but the context budget is M` and no request is sent. Raise **Context budget** in the **Provider details** panel above, or send a shorter message.
 

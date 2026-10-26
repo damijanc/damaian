@@ -1,8 +1,11 @@
 # Feature Spec: Conversation Compaction
 
-Status: In progress. Split into a folder and planned on 2026-10-26; the
-pre-implementation state and the corrections to this text are in
-[`context.md`](context.md), and the task breakdown is in [`tasks.md`](tasks.md).
+Status: Done 2026-10-26 (implementation and scoped checks; **CI outstanding** —
+the seven-check gate runs after the user pushes, and agents never push). Split
+into a folder and planned the same day; the pre-implementation state and the
+corrections to this text are in [`context.md`](context.md), the task breakdown
+and results are in [`tasks.md`](tasks.md), and §7 below walks every acceptance
+criterion and records what was not measured.
 Order: 55 of 55
 Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work Package 6
 (Must, and in this phase's minimum releasable slice). That directory is
@@ -515,18 +518,75 @@ compacted and how to restate it.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+Built on 2026-10-26. Scoped tests and clippy passed locally; the full seven-check
+gate is left to CI, and **CI is outstanding** at hand-off. The live tier was not
+run because no provider credentials were available; that is stated rather than
+inferred.
 
-- **What repeated compaction costs in fidelity.** §5.3 makes each summary an
-  input to the next. Run the continuity eval against a session compacted three or
-  four times and record where it degrades. This is the number that decides
-  whether a later spec needs to re-summarise from the original transcript rather
-  than from the previous summary — which is possible precisely because nothing
-  was deleted.
-- The recency window size that was chosen, and the measured share of turns that
-  triggered compaction at all. A threshold nothing reaches is a feature that does
-  not exist.
-- Whether the facts-only fallback in §5.7 was ever produced in practice, and
-  whether it was good enough to keep.
-- Whether the prompt-section ordering noted in §2 was addressed elsewhere by the
-  time this landed, since this spec assembles the string that has the problem.
+### Acceptance walk
+
+| §6 criterion | Where it is proved |
+|---|---|
+| A session longer than the window sends a summary plus the window, and `read_messages` still returns every message | `a_compacted_session_sends_the_summary_and_the_window_and_read_messages_still_has_everything` (30 seeded + 2 new = 32 stored, summary + window sent) |
+| Facts match the log with the model stubbed out | `compaction_with_the_model_stubbed_out_still_has_every_fact` (unparsable reply; objective, files, plan steps, approvals, validation all present) |
+| Objective byte-identical and bounded | `the_objective_is_bounded_but_not_paraphrased` plus the same assertion in the facts test |
+| A first-message constraint is still honoured after compaction | deterministic scenario `compaction_keeps_a_stated_constraint`, which asserts the post-compaction request carries it and the task completes. **The live behavioural version was not run.** |
+| An injected instruction does not change behaviour | `compaction_treats_an_injected_instruction_as_data` asserts it appears only as a `> ` quotation, never in the system prompt, and no patch is proposed. `compaction_injection_live` is the credential-gated behavioural twin and **was not run.** |
+| Compaction stops before a pending approval, proposal intact | `a_compaction_that_would_cross_a_pending_approval_is_a_no_op`, `a_pending_approval_clamps_the_compaction_limit_before_its_message` |
+| Never across an unfinished action's span | `a_dangling_action_clamps_the_compaction_limit_before_its_start`; `automatic_compaction_runs_before_the_request_is_assembled` shows the compaction precedes the turn's first request |
+| Rewind restores the full conversation | `rewinding_before_a_compaction_restores_the_full_model_view` (no special-case code: the rewind marker deactivates the compaction) |
+| A failed call leaves the turn running, tells the user; partial failure is facts-only | `a_failed_summarisation_call_produces_a_facts_only_summary_and_no_turn_error`, `a_failed_compaction_is_recorded_for_the_user_and_not_only_in_the_audit_log`; the shell reports `lastFailure` on the boundary marker. A cancelled compaction appends nothing. |
+| Compaction only at a turn boundary | By construction: `compact_conversation` is called in `ask_with_session_with_options` before the request and by `POST /api/compact`, never from the loop; `automatic_compaction_runs_before_the_request_is_assembled` pins the ordering |
+| The summarisation call is in #19 accounting and not in the turn's ceiling | `the_summarisation_call_is_in_session_totals_but_not_a_turn_ceiling` (synthetic `compaction_<id>` task id, reason `conversation_compaction`) |
+| Auto off: no call, elision notice, boundary marker, manual works | `auto_compaction_makes_no_model_call_when_switched_off`, `switching_auto_off_still_states_the_loss_and_leaves_manual_compaction_working`, `the_session_payload_reports_an_uncompacted_boundary_as_elision` |
+| Repository `conversation_auto_compact` is ignored and reported | `a_repository_cannot_set_the_conversation_auto_compact_off_switch_either_way`, `conversation_compaction_defaults_and_restrict_only_direction`, `a_profile_cannot_carry_the_auto_compact_switch_but_may_lower_the_window` |
+| Settings shows the checkbox checked when the key is absent; unchecking writes user config and reloads the editor | Implemented in `index.html` and `app.js` (`refreshConversationAutoCompact`, the change handler calls `/api/config-set` then `loadConfigFile`). **The browser walk was not performed** in this session; the effective-value read and the JSON payload are covered by tests, and the walk is left for the reviewer. |
+| Transcript marker and inspector | `conversation_json` + `renderMessages` marker (expandable summary, originals below, *Compact now*). The inspector is #27, still unbuilt; as the proposal says, the marker carries the requirement until it lands. |
+| Two compactions compound | `a_second_compaction_summarises_the_first_one_plus_what_followed` (the second call receives the first summary) |
+| Every quality-gate command passes | Fast five and scoped clippy/tests passed locally; the workspace gate and the seven checks run in CI after the user pushes. **CI outstanding.** |
+
+### Measurements and decisions
+
+- **Window size:** `conversation_window_share` defaults to `0.25`, so a
+  default 16,000-token budget gives a 4,000-token conversation window. The
+  deterministic scenarios set `0.01` so a seeded conversation crosses it; in
+  real use the default is the number to read. It is also the automatic
+  threshold, because a threshold that does not equal the window could trigger a
+  compaction that changes nothing (context.md D2).
+- **Trigger rate:** the deterministic tier now runs 30 scenarios; **two** of
+  them exercised compaction (the two named above). That is a fixture count, not
+  a measurement of real sessions, and it is recorded as such.
+- **Fidelity under repeated compaction:** not measured against a real model,
+  because the live tier was not run. What is proved structurally is that each
+  summary is an input to the next
+  (`a_second_compaction_summarises_the_first_one_plus_what_followed`). The
+  question §7 asks — how far a third or fourth summary drifts — remains open and
+  is the first thing a live tier should measure. Nothing is lost to make that
+  possible: the original messages stay in the log, so a future change can
+  re-summarise from the transcript rather than from the previous summary.
+- **Facts-only fallback:** produced in
+  `a_failed_summarisation_call_produces_a_facts_only_summary_and_no_turn_error`
+  and by the unparsable-reply test. It did **not** occur in the deterministic
+  tier, whose two scripted replies are valid narratives. It is worth keeping:
+  the fact half is complete without the model, which is the property the split
+  exists for.
+- **Deterministic tier result** (`cargo run -p eval-harness -- run --tier
+  deterministic`): 30 scenarios, completion 1.000, check pass 0.686, 0
+  approval-policy violations, 0 restricted-path/secret violations, 0 unrelated
+  files changed, recovery 1.000, tool/model error rate 0.095. Both compaction
+  scenarios passed.
+- **Prompt-section ordering:** #26 fixed it (stable-to-volatile) before this
+  spec was implemented. No ordering work was done here, and #49's reuse slice
+  inherits an order it can put a breakpoint on.
+- **Raw command approvals were not in the session log.** §5.2's table said
+  "Session log", which was true for patches and plan approval and false for
+  shell commands. A `conversation_approval_recorded` event is now appended at
+  both command decision points; without it the digest would have silently
+  omitted every command approval (context.md §3.3).
+- **The summary is not a `context_budget.conversation_summary` item.** It is
+  rendered inside the conversation block, which is not assembled by
+  `ContextManager`. The reserved category therefore stays unused and its share
+  is still released; moving it would be a #26-shaped change, not this one.
+- **A failure is recorded twice:** an audit event for the trail and a
+  `conversation_compaction_failed` session event so the marker can tell the user
+  on a reload. It is a diagnostic, not a summary; no message is touched.

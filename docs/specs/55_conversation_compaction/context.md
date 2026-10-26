@@ -35,7 +35,7 @@ harder to notice the longer a session runs.
   contains the repository context, the recent conversation, and the user
   request in that order (`chat.rs:8382-8433`). Within a turn the array grows
   into real role-tagged messages.
-- **The section order is now stable-to-volatile.** `prompt section ordering` was
+- **The section order is now stable-to-volatile.** The prompt-section ordering was
   still described as a defect in the proposal, but [#26](../26_context_assembly/proposal.md)
   landed on 2026-10-25 and reordered it: `RepositoryContext` first,
   `RecentConversation` second, `UserRequest` last (`build_model_prompt`, and

@@ -5,13 +5,13 @@
 **Implements:** [`proposal.md`](proposal.md) in full, with the corrections in
 [`context.md`](context.md) §3 and the decisions in §4 overriding it where they
 disagree.
-**Started:** 2026-10-26
+**Started:** 2026-10-26 — **Done:** 2026-10-26
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Folder, records, links, status | In progress | Splitting the flat spec into a folder and rewriting the links. |
+| 1 · Folder, records, links, status | Done 2026-10-26 | Split the flat spec into `proposal.md`, `context.md`, `tasks.md` with `git mv`; rewrote every link that named the old path (README, specs 26/47/49/61/65); status set to In progress in all three places. `npm run specs:check` passed. |
 | 2 · Summary types and rendering | Done 2026-10-26 | New `compaction.rs`: `ConversationSummary` and its digests, `format_version`, delimited model rendering with quoted narrative, the summarisation prompt and a JSON narrative parser. Ten unit tests pin the markers, the quoting, the data-not-instruction sentence, the version, redaction/bounding, and that a malformed reply yields no narrative. Scoped `cargo nextest -p workspace-engine --lib compaction` passed (10 tests) and crate clippy was clean. |
 | 3 · Session log and the two readers | Done 2026-10-26 | `conversation_compacted` append/read; `read_conversation` returns the newest active summary plus only messages after `through_seq`; `read_messages` unchanged; `compaction_limit` clamps to pending approvals, pending questions and dangling actions; command decisions append `conversation_approval_recorded`; `facts_for_span` reads objective/files/steps/approvals/validation. Tests: 8 in `tests/compaction.rs` (append-only, model view, rewind, compounding, unknown version, two guards, approval event) and 2 fact unit tests. Scoped nextest and crate clippy passed. |
 | 4 · Config keys | Done 2026-10-26 | `conversation_auto_compact` (default true, Forbidden to repository and profile) and `conversation_window_share` (decimal → basis points, default 0.25, restrict-only lower-wins). Wired through `Config`, `ConfigOverlay`, parse, `apply_overlay_scoped`, both policy-text writers, `overlay_field_kinds`, `split_profile_keys`, `equals_base_limit` and `rule_label`. Tests in `permission_profiles.rs` (repository refusal both values, lower applies, profile split, labels/kinds) and the 78-test suite passed; `repository_config_trust` (52) too. Fast five passed after `cargo fmt`. |
@@ -19,7 +19,7 @@ disagree.
 | 6 · The prompt window | Done 2026-10-26 | `build_model_prompt` takes a window token budget and an optional summary; `window_slice` accumulates newest-first by `TokenEstimate::Prose`, always keeps the newest message, and the elision notice counts only messages neither the summary nor the window carries. Summary renders between markers inside `Recent conversation:`, never in the system prompt. Tests: three inline chat tests (short vs long budget, exact omission count, summary boundary/system-prompt exclusion) and two integration tests (summary + window sent while `read_messages` returns all 32; a fact the model omitted is still in the next request). 627 lib+scoped tests passed; crate clippy and fast five passed. |
 | 7 · Shell and UI | Done 2026-10-26 (manual browser walk not run) | `/api/session` now carries `conversationView` (every compaction, the boundary kind, omitted count, window size, `autoCompact`, `canCompact`); `POST /api/compact` runs the manual path through `run_compact_request` and returns compacted/nothing/failed. Settings › General gained the Conversation checkbox; `refreshConversationAutoCompact` reads the effective policy, and unchecking writes user config through `/api/config-set` then reloads the editor. `renderMessages` draws an expandable boundary marker (summary fields, *Compact now*) with the original messages below. Shell tests (3) cover the summary payload, the elision payload and the unknown-session refusal. `node --check`, `npm run lint:web`, shell clippy and `nextest -p desktop-shell --lib` (185) passed. **The browser walk was not performed** because this session has no browser automation; the HTML/JS and the payload were checked structurally and by test, and the manual walk is left for the reviewer. |
 | 8 · Eval harness | Done 2026-10-26 | Scenario schema gained `seed_conversation` and `compact_before_prompt`; assertions gained `compacted_request_contains`, `compacted_request_excludes`, `compacted_system_excludes`, `response_excludes`, `conversation_compactions` and `compaction_facts_only`; `Run` carries the first post-compaction request, its system message, the event count and the facts-only flag. Two deterministic scenarios passed in the tier: `compaction_keeps_a_stated_constraint` (the first message is a constraint, the window is 1% of the budget, manual compaction, then the ask still sends the constraint and a task still completes) and `compaction_treats_an_injected_instruction_as_data` (a fetched-page injection echoed into the summary by the scripted reply is sent only as a `> ` quotation, never in the system prompt, and no patch is proposed). A live-tier twin is credential-gated and **was not run**. Count guards moved 28 → 30 deterministic / 31 files. `nextest -p eval-harness` (97) and the deterministic tier passed, as did `cargo run -p eval-harness -- run --tier deterministic` (completion 1.000). |
-| 9 · Docs, acceptance walk, close | Not started | |
+| 9 · Docs, acceptance walk, close | Done 2026-10-26 (CI outstanding) | §6 walked into `proposal.md` §7 with a per-criterion table and the measurement recorded; USER_GUIDE gained "Long conversations and summaries" and TROUBLESHOOTING "The assistant seems to have forgotten something you said earlier"; README current state/row/priority updated; CHANGELOG `Unreleased` line removed; status Done in all four places; `npm run specs:check` passed. Scoped checks: fast five (fmt/node/lint/typos/deny), clippy for `workspace-engine`, `desktop-shell` and `eval-harness`, `nextest -p workspace-engine --test compaction` (19) plus the lib and neighbouring suites, `nextest -p desktop-shell --lib` (185), `nextest -p eval-harness` (97), and the deterministic tier (30 scenarios, completion 1.000). **Not run:** the live tier (no credentials) and the manual browser walk (no browser automation in this session). The seven-check gate and workspace suite are left to CI; **CI outstanding**. |
 
 **Goal:** Replace the silent eight-message / 2,000-character cliff with a
 budgeted recency window plus an append-only `conversation_compacted` summary.
@@ -512,23 +512,23 @@ added in Task 3), `tests/compaction.rs`.
 **Files:** `docs/USER_GUIDE.md`, `docs/TROUBLESHOOTING.md`, `proposal.md` §7,
 `docs/specs/README.md`, `CHANGELOG.md`, this file.
 
-- [ ] **Step 1: Walk every §6 criterion** and record the per-criterion evidence
+- [x] **Step 1: Walk every §6 criterion** and record the per-criterion evidence
   in `proposal.md` §7, naming the test for each and marking the manual ones.
-- [ ] **Step 2: Update the user docs.** USER_GUIDE: what compaction is, when it
+- [x] **Step 2: Update the user docs.** USER_GUIDE: what compaction is, when it
   runs, that the full transcript is kept and how to read it, what a summary
   holds, rewinding past a compaction, switching it off in Settings › General
   and what changes. TROUBLESHOOTING: the agent seems to have forgotten a
   constraint — how to check whether compaction ran, how to read the summary,
   how to restate the constraint, and what a compaction failure means.
-- [ ] **Step 3: Close the records.** Status Done in the proposal header, the
+- [x] **Step 3: Close the records.** Status Done in the proposal header, the
   README current-state bullet, the README implementation-order row and this
   file's header/progress table; remove #55 from the README ready set and note
   that #49's reuse slice is no longer blocked by #55 while its Phase 1 WP3 line
   still is; remove the compaction line from CHANGELOG `Unreleased`.
-- [ ] **Step 4: Run `npm run specs:check` and read it.**
-- [ ] **Step 5: Scoped checks and hand-off.** Fast five, scoped clippy for every
+- [x] **Step 4: Run `npm run specs:check` and read it.**
+- [x] **Step 5: Scoped checks and hand-off.** Fast five, scoped clippy for every
   crate touched, scoped tests, the deterministic eval tier. State plainly that
   the workspace clippy/test suite and the seven-check gate run in CI after the
   user pushes, and that the live provider run was not performed without
   credentials.
-- [ ] **Step 6: Commit:** `Close conversation compaction`.
+- [x] **Step 6: Commit:** `Close conversation compaction`.
