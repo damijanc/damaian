@@ -15,7 +15,7 @@ the resolved §7 open question in [`context.md`](context.md)
 | 3 · Manifest extensions and collection controls | Done 2026-10-26 | `ContextManifest` gained `conversationSummary` (from the #55 summary, measured redacted) and `symbolProvenance` (`total`/`languageServer`/`heuristic`, counted over the lines the renderer showed); `ExclusionReason` gained `UserRemoved`, `PathNotSelected`, `Missing`. `ContextRequest` gained `pinned`, `restriction` and `conversationSummary`; pins are collected through `add_file` (policy applies, a deleted pin is `Missing`), the restriction filters explicit/mention/search/project-rule/pin sources and exempts `AgentInstruction`. New `tests/context_inspector.rs` (13 tests at this point). **Falsified:** filtering instructions too made `a_restriction_does_not_remove_agent_instructions` fail. Scoped: fast five passed, scoped clippy passed, `context_inspector` 13/13, the five affected suites (context_assembly, prompt_cache, hooks, repository_map, symbol_index) 277 passed / 5 skipped. |
 | 4 · `PreparedContext` and removal | Done 2026-10-26 | `PreparedContext` (`from_plan`/`into_plan`/`files`/`sections`) and `remove_optional`/`remove_summary` landed with Task 3's commit; this task added `removing_by_index_twice_uses_the_new_indices`. `Required` is refused before any mutation; category use, `items`, `total_tokens` and `included` are recomputed, `allocated` is left alone. **Falsified:** moving the `Required` check after the removal made the test see one fewer item and fail. Scoped: `context_inspector` 14/14, scoped clippy passed. |
 | 5 · `pause_for_context_review` config | Done 2026-10-26 | `Config.pause_for_context_review` (default `false`) and its `ConfigOverlay` field are classified `Capability`, applied through `scoped(..., forbidden, ...)`, printed by both `to_policy_text` functions, labelled in `effective_policy`, and refused by `split_profile_keys`. Added a `weakening_cases` entry and `pause_for_context_review_is_off_by_default_and_user_only`. Scoped: fast five passed, scoped clippy passed, `permission_profiles` 79 passed / 1 skipped. |
-| 6 · The pre-send pause and send gate | Not started | |
+| 6 · The pre-send pause and send gate | Done 2026-10-26 | `TurnProgress::Context` is emitted after `context_assembled` and before the first call; `build_model_prompt` is split into `build_conversation` + `build_model_prompt_with_conversation` with byte-identical output (the `prompt_cache` guard passes). `PausedFor::ContextReview` and `PendingContextReview` persist the prepared plan, the conversation block and the summary; `resume_after_context_decision` refuses every other pause and every other resume refuses a review; `remove_context_item`/`remove_context_summary` amend and re-record the manifest without taking the pause. Decline sends nothing and marks the task `Cancelled`. Tests: 10 new (pause no-call, default ordering, send, decline, instruction removal in the request, Required refusal, both cross-resume directions, removal across a reload, stripped-field load). **Falsified:** not saving the amended review left the removed instruction in the request and the test failed. Scoped: `context_inspector` 23/23, `prompt_cache`/`foundation`/`round_budget`/`compaction` 206 passed, scoped clippy passed. |
 | 7 · Post-send record and past turns | Not started | |
 | 8 · Shell routes, JSON and SSE | Not started | |
 | 9 · The web panel and review card | Not started | |
@@ -515,7 +515,7 @@ flat file; `docs/specs/README.md`.
 **Files:** `chat.rs`; `tests/context_inspector.rs`; `tests/round_budget.rs` if
 the pause matrix test lives there.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `a_turn_pauses_before_its_first_model_call_when_the_setting_is_on`: config
     with `pause_for_context_review: true`; ask; `result.context_review` is
     `Some`, `adapter.requests` is empty, the pending file exists, and
@@ -544,8 +544,8 @@ the pause matrix test lives there.
   - `an_old_pending_turn_without_the_review_field_still_loads`: strip
     `context_review` from a pending file written by a command pause, resume it;
     it loads (the field is `#[serde(default)]`).
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Implement.**
   - Add `TurnProgress::Context(Box<ContextManifest>)` and emit it in
     `ask_with_session_with_options` after the audit record and before the pause
     decision. Emit it again on a resume whose manifest changed.
@@ -588,12 +588,12 @@ the pause matrix test lives there.
     `run_agentic_turn` with the carried fields.
   - The post-send manifest for the task is the newest `context_assembled`
     event; do not record a second event when nothing changed.
-- [ ] **Step 4: Falsify.** (1) Resume with the unamended plan → the removed
+- [x] **Step 4: Falsify.** (1) Resume with the unamended plan → the removed
   instruction test sees it in the request. (2) Do not refuse the wrong pause
   kind → the cross-resume tests resume something they should not. (3) Emit
   `Context` after the first call → the ordering test fails. (4) Drop the
   `#[serde(default)]` → the old-file test fails. Restore each.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -601,7 +601,7 @@ the pause matrix test lives there.
   CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test context_inspector --test foundation --test round_budget --test prompt_cache --test context_assembly
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit.
+- [x] **Step 6: Update the Progress row** and commit.
   Subject: `Pause a turn before sending so its context can be reviewed`.
 
 ---

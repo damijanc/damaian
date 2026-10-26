@@ -12,8 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::compaction::ConversationSummary;
 use workspace_engine::context_manager::ExclusionReason;
 use workspace_engine::{
-    Config, ContextCategory, ContextKind, ContextPin, ContextRequest, LineRange, Provenance,
-    Symbol, SymbolIndexStore, WorkspaceEngine,
+    CancelToken, ChatTurnResult, Config, ContextCategory, ContextDecision, ContextKind, ContextPin,
+    ContextRequest, LineRange, MockModelAdapter, ModelAdapter, Provenance, Symbol,
+    SymbolIndexStore, TaskStatus, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -572,5 +573,334 @@ fn removing_the_summary_records_its_category_and_hides_the_row() {
     assert!(
         prepared.remove_summary().is_err(),
         "a second removal has nothing to remove"
+    );
+}
+
+// ---- Task 6: the pre-send pause and the send gate ----
+
+fn pause_config(repo: &Path) -> Config {
+    let mut config = test_config(repo);
+    config.pause_for_context_review = true;
+    config
+}
+
+type Progress = std::rc::Rc<std::cell::RefCell<Vec<TurnProgress>>>;
+
+fn ask_with(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    prompt: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> (ChatTurnResult, Progress) {
+    let cancel = CancelToken::new();
+    let mut tokens = |_token: &str| {};
+    let progress: Progress = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let collected = progress.clone();
+    let mut on_progress = move |event: TurnProgress| collected.borrow_mut().push(event);
+    let mut sink = TurnSink {
+        on_token: &mut tokens,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let result = engine
+        .chat_orchestrator
+        .ask_with_session(repo, prompt, &[], None, adapter, &mut sink)
+        .expect("the turn should run or pause");
+    (result, progress)
+}
+
+fn resume_context(
+    engine: &WorkspaceEngine,
+    proposal: &str,
+    decision: ContextDecision,
+    adapter: &mut dyn ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut tokens = |_token: &str| {};
+    let mut progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut tokens,
+        on_progress: &mut progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.resume_after_context_decision(
+        proposal,
+        decision,
+        "desktop_user",
+        adapter,
+        &mut sink,
+    )
+}
+
+#[test]
+fn a_turn_pauses_before_its_first_model_call_when_the_setting_is_on() {
+    let repo = fixture_repo("pause-review");
+    let engine = WorkspaceEngine::new(pause_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (result, progress) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+
+    assert!(
+        adapter.requests.is_empty(),
+        "a paused review must not call the model: {:?}",
+        adapter.requests
+    );
+    let review = result.context_review.expect("the review is present");
+    assert!(!review.manifest.included.is_empty());
+    let pending = engine
+        .config
+        .data_dir
+        .join("chat")
+        .join("pending")
+        .join(format!("{}.json", review.id));
+    assert!(pending.exists(), "the pause is on disk at {pending:?}");
+    let json = fs::read_to_string(&pending).unwrap();
+    assert!(json.contains("\"context_review\""), "{json}");
+    assert!(
+        progress
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, TurnProgress::Context(_))),
+        "the pre-send manifest was not emitted"
+    );
+}
+
+#[test]
+fn the_default_turn_emits_its_manifest_before_the_first_request() {
+    let repo = fixture_repo("no-pause");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (result, progress) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+
+    assert!(result.context_review.is_none());
+    assert_eq!(adapter.requests.len(), 1);
+    let events = progress.borrow();
+    let context_at = events
+        .iter()
+        .position(|event| matches!(event, TurnProgress::Context(_)))
+        .expect("the manifest was emitted");
+    let model_at = events
+        .iter()
+        .position(
+            |event| matches!(event, TurnProgress::Phase(phase) if phase.kind.as_str() == "model"),
+        )
+        .expect("the model phase was emitted");
+    assert!(
+        context_at < model_at,
+        "the manifest must precede the first model phase: {events:?}"
+    );
+}
+
+#[test]
+fn sending_a_reviewed_context_makes_exactly_one_request() {
+    let repo = fixture_repo("send-review");
+    let engine = WorkspaceEngine::new(pause_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let (result, _) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+    let review = result.context_review.expect("the review is present");
+
+    let resumed = resume_context(&engine, &review.id, ContextDecision::Send, &mut adapter)
+        .expect("sending the reviewed context should run");
+
+    assert_eq!(adapter.requests.len(), 1);
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    assert!(
+        adapter.requests[0].messages[1]
+            .content
+            .contains("What is this?")
+    );
+}
+
+#[test]
+fn declining_a_review_makes_no_model_call_and_does_not_send() {
+    let repo = fixture_repo("decline-review");
+    let engine = WorkspaceEngine::new(pause_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let (result, _) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+    let review = result.context_review.expect("the review is present");
+
+    let resumed = resume_context(&engine, &review.id, ContextDecision::Decline, &mut adapter)
+        .expect("declining is a result, not an error");
+
+    assert!(adapter.requests.is_empty());
+    assert_eq!(resumed.task.status, TaskStatus::Cancelled);
+    assert!(resumed.cancelled);
+    assert!(resumed.response.contains("No request was sent"));
+}
+
+#[test]
+fn removing_an_instruction_changes_the_request_that_is_sent() {
+    let repo = fixture_repo("remove-before-send");
+    let engine = WorkspaceEngine::new(pause_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let (result, _) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+    let review = result.context_review.expect("the review is present");
+    let index = review
+        .manifest
+        .included
+        .iter()
+        .position(|included| included.kind == ContextKind::AgentInstruction)
+        .expect("the fixture has AGENTS.md");
+    let instruction_tokens = review.manifest.included[index].tokens;
+
+    let amended = engine
+        .chat_orchestrator
+        .remove_context_item(&review.id, index)
+        .expect("an Instructions item is removable");
+    assert!(amended.total_tokens < review.manifest.total_tokens);
+    assert_eq!(
+        amended.total_tokens + instruction_tokens,
+        review.manifest.total_tokens
+    );
+    assert!(
+        amended
+            .excluded
+            .iter()
+            .any(|record| record.reason == ExclusionReason::UserRemoved
+                && record.path.as_deref() == Some("AGENTS.md"))
+    );
+
+    let _ = resume_context(&engine, &review.id, ContextDecision::Send, &mut adapter)
+        .expect("the amended context should send");
+    let sent = &adapter.requests[0].messages[1].content;
+    assert!(
+        !sent.contains("Follow the repository rules."),
+        "the removed instruction was still sent: {sent}"
+    );
+    assert!(sent.contains("What is this?"));
+}
+
+#[test]
+fn removing_a_required_item_is_refused_at_the_api() {
+    let repo = fixture_repo("required-refused");
+    let engine = WorkspaceEngine::new(pause_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let (result, _) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+    let review = result.context_review.expect("the review is present");
+    let index = review
+        .manifest
+        .included
+        .iter()
+        .position(|included| included.category == ContextCategory::Required)
+        .expect("the request is required");
+
+    let error = engine
+        .chat_orchestrator
+        .remove_context_item(&review.id, index)
+        .expect_err("Required must be refused");
+
+    assert!(
+        error.to_string().to_lowercase().contains("required"),
+        "{error}"
+    );
+    // The review is still open and can be sent.
+    let resumed = resume_context(&engine, &review.id, ContextDecision::Send, &mut adapter);
+    assert!(resumed.is_ok(), "{resumed:?}");
+    assert_eq!(adapter.requests.len(), 1);
+    assert!(
+        adapter.requests[0].messages[1]
+            .content
+            .contains("What is this?")
+    );
+}
+
+#[test]
+fn a_command_approval_cannot_resume_a_context_review() {
+    let repo = fixture_repo("cross-resume");
+    let engine = WorkspaceEngine::new(pause_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let (result, _) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+    let review = result.context_review.expect("the review is present");
+
+    let error = engine.chat_orchestrator.resume_after_command_decision(
+        &review.id,
+        true,
+        "desktop_user",
+        &mut adapter,
+        &mut TurnSink {
+            on_token: &mut |_token: &str| {},
+            on_progress: &mut |_event: TurnProgress| {},
+            cancel: &CancelToken::new(),
+            steering: None,
+        },
+    );
+
+    assert!(
+        error.is_err(),
+        "a review must not be resumed as an approval"
+    );
+    assert!(
+        fs::read_dir(engine.config.data_dir.join("chat").join("pending"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+            > 0,
+        "the refused resume must not consume the review"
+    );
+}
+
+#[test]
+fn a_pending_turn_written_without_the_review_field_still_loads() {
+    let repo = fixture_repo("old-pending");
+    let engine = WorkspaceEngine::new(pause_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let (result, _) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+    let review = result.context_review.expect("the review is present");
+    let path = engine
+        .config
+        .data_dir
+        .join("chat")
+        .join("pending")
+        .join(format!("{}.json", review.id));
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("context_review");
+    fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+    // The turn still parses; it is now an action pause, so this route refuses
+    // it by kind rather than failing to read the file.
+    let error = engine
+        .chat_orchestrator
+        .remove_context_item(&review.id, 0)
+        .expect_err("without the field it is not a review");
+    let message = error.to_string();
+    assert!(!message.contains("Failed to parse"), "{message}");
+}
+
+#[test]
+fn a_context_review_cannot_resume_a_command_approval() {
+    let repo = fixture_repo("cross-resume-2");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    // A side-effecting command pauses for approval, producing a real command
+    // pause to try to resume as a review.
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_run_command".to_string(),
+                name: "run_command".to_string(),
+                arguments_json: serde_json::json!({
+                    "command": "sed -i '' 's/1/2/' src/other.rs",
+                    "reason": "Change the value"
+                })
+                .to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let (result, _) = ask_with(&engine, &repo, "Change the value", &mut adapter);
+    let proposal = result
+        .command_proposal
+        .expect("the command should pause for approval");
+
+    let error = resume_context(&engine, &proposal.id, ContextDecision::Send, &mut adapter)
+        .expect_err("a command pause is not a context review");
+    assert!(
+        error
+            .to_string()
+            .contains("resume it with resume_after_command_decision"),
+        "{error}"
     );
 }
