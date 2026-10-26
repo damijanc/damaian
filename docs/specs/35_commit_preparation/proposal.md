@@ -60,7 +60,7 @@ matters. §5.4 handles this.
 ## 2. Current State
 
 The references below are the ones this decision was written against.
-[`context.md`](context.md) §2 has the current ones and the fifteen corrections
+[`context.md`](context.md) §2 has the current ones and the eighteen corrections
 planning found; where the two disagree, `context.md` is the measured state and
 this section is the history.
 
@@ -197,6 +197,26 @@ Three properties this buys, each mapping to requirement 4:
 - **A partial commit is unreachable.** The commit object either exists and the
   ref moves, or neither.
 
+Two composition details follow from building the tree from `HEAD` rather than
+from the user's index:
+
+- **A rename is one change in two paths.** `git status` reports a rename as the
+  target plus the source path; `changes` keeps both. The target carries
+  `renamed_from` and the source is a synthesized deletion candidate carrying
+  `renamed_to`. Selecting the target without the source deletion is refused
+  (`commit_rename_incomplete`), because committing only the target would leave
+  the old path behind — a copy the review never showed. A copy record (`C`)
+  carries `copied_from` and produces no deletion, because the source stays.
+  The dialog moves the pair's checkboxes together; the engine check is the
+  backstop.
+- **The mode is the working tree's.** A chmod-only change has the same blob id
+  as `HEAD`, and a file replaced by a symlink must become a `120000` entry. So
+  the mode is `120000` for a symlink, `100755` when executable and `100644`
+  otherwise, read from the filesystem (with `core.fileMode=false` falling back to
+  `HEAD`'s mode rather than inventing a change Git does not track). The
+  "nothing changed" test compares mode as well as blob id, and the commit's
+  freshness check compares both.
+
 This is more machinery than `git add` plus `git commit`, and it is the machinery
 that makes requirement 4 true rather than approximately true. The
 `git stash`-adjacent approach in
@@ -256,6 +276,15 @@ repository's own protections. So the flow runs them explicitly:
 - `post-commit` runs after, and its failure does not un-commit anything —
   reported as a warning, since the commit has happened and pretending otherwise
   would be worse.
+- **A hook that stages its own fix does not get it committed, and the user is
+  told.** `pre-commit` commonly reformats files and `git add`s them. The tree was
+  composed before the hooks ran, and the commit keeps exactly the bytes the user
+  reviewed. After the hooks, Damaian recomputes the private index's tree; if a
+  hook changed it, the commit succeeds with the reviewed tree and carries a
+  warning naming the hook: its staged changes remain uncommitted in the working
+  tree. A hook that leaves the private index unreadable is a warning too, not a
+  failed commit. Silently dropping the hook's work, or silently including bytes
+  the user never approved, are both worse.
 
 Because hooks are arbitrary local programs, they are executed through the
 existing command path with its timeout, output truncation, and `SecretScanner`
@@ -389,6 +418,9 @@ A new `workspace-engine/src/commit.rs` module, exposed as
   legacy patch with no decision, an untracked or external path, or an unresolved
   conflict. `GitService::changes` uses `-uall -z` so an untracked directory
   becomes files, and the same restricted-path filter as every other git read.
+  A rename keeps both halves: the target has `renamed_from`, the source is a
+  deletion candidate with `renamed_to`, and the pair is selected and refused
+  together. A copy (`C`) has `copied_from` and produces no deletion.
 - **Private index.** Every tree is built with `GIT_INDEX_FILE` pointing at
   `<data_dir>/commits/<prepare-id>/index`: `read-tree HEAD` (or `--empty` for an
   unborn branch), `hash-object -w`, `update-index -z --index-info`,
@@ -398,7 +430,10 @@ A new `workspace-engine/src/commit.rs` module, exposed as
   `update-ref refs/heads/<branch> <commit> <expected-old>`. The user's
   `.git/index` is never read or written. The tree check compares the whole tree,
   not only the selected paths, so a composition bug cannot commit an extra
-  entry.
+  entry. The mode comes from the working tree (`120000`, `100755`, `100644`),
+  so a chmod-only change and a file-to-symlink change are commit as what is
+  there; `core.fileMode=false` falls back to HEAD's mode. The "no change" test
+  and the commit's freshness check both compare mode and blob id.
 - **Exact approval.** The prepared record stores each candidate's Git blob id
   and mode; `commit` recomputes both and refuses `commit_content_changed` on a
   mismatch. The record also stores the expected old `HEAD` and the branch, and
@@ -418,7 +453,10 @@ A new `workspace-engine/src/commit.rs` module, exposed as
   registration. A rewrite of the approved message is a typed refusal with the
   final text and no commit; a failing or timed-out pre-commit, prepare-commit-msg
   or commit-msg aborts; a failing post-commit is a warning after the ref moved.
-  There is no `--no-verify` and no parameter that skips a hook.
+  There is no `--no-verify` and no parameter that skips a hook. After the
+  hooks, the private index's tree is recomputed; if a hook changed it, the
+  commit keeps the reviewed tree and a warning names the hook and says its
+  staged changes remain uncommitted.
 - **Durable state.** Each attempt creates a synthetic task in `RunningTool` and
   a `commit` marker with `sideEffecting: true`. The prepared commit is written to
   the record before `update-ref`, so a crash in that window is inspectable:
@@ -522,7 +560,34 @@ and is not run.
    turn; hooks are bounded by `command_timeout_secs`, and the dialog shows the
    outcome.
 
-### 7.6 Acceptance
+### 7.6 Composition corrections after review
+
+Three defects found while reviewing the finished branch were fixed in place,
+and each is covered by a test:
+
+1. **A staged rename was committed as a copy.** `GitService::changes` dropped
+   the source record of `R  target\0source\0`, so the tree kept the old path and
+   the review never showed the deletion. `GitFileStatus` now carries
+   `renamed_from`/`copied_from`; the parser keeps both halves; the preparation
+   synthesizes the source deletion for a rename (but not for a copy); the
+   dialog moves the pair's checkboxes together; and the engine refuses a
+   half-selected rename with `commit_rename_incomplete`. The committed tree is
+   now the target only.
+2. **A hook that staged a fix had it silently dropped.** The tree is composed
+   and verified before the hooks run, and `commit-tree` uses it. After the
+   hooks, `write-tree` is recomputed on the private index; a difference is a
+   warning naming the hook, and the commit keeps the reviewed bytes. The hook's
+   edit stays in the working tree. A hook that leaves the index unreadable is
+   also a warning, not a failed commit.
+3. **The committed mode came from HEAD.** A chmod-only change was dropped by the
+   "nothing changed" check (same blob id), and a file replaced by a symlink was
+   written with HEAD's `100644` and the target's bytes as content. The mode now
+   comes from the filesystem — `120000` for a symlink, `100755` when
+   executable, else `100644` — with `core.fileMode=false` falling back to HEAD's
+   mode. The no-change check compares mode as well as blob id; the commit's
+   freshness check already did.
+
+### 7.7 Acceptance
 
 Every criterion in §6, with the test or the reason it is not automated. Tests
 named without a path are in
@@ -545,6 +610,12 @@ named without a path are in
 | An accepted deletion commits the file away | `an_accepted_deletion_is_selected_and_commits_the_file_away` |
 | A submodule or nested repository is shown and never selected | `a_nested_repository_is_shown_and_can_never_be_selected` |
 | A hook edited after the report refuses the commit | `a_same_size_hook_edit_after_the_report_is_refused` |
+| A staged rename is prepared as a pair and committed as one | `a_staged_rename_is_prepared_as_a_pair_and_committed_as_one` |
+| A copy record produces no deletion | `a_rename_record_keeps_its_source_and_a_copy_record_does_not`, `a_copy_record_carries_no_rename_source` |
+| A hook that stages a fix keeps it out of the commit and warns | `a_hook_that_stages_a_fix_keeps_it_out_of_the_commit_and_says_so` |
+| A chmod-only change is a candidate and commits `100755` | `a_chmod_only_change_is_a_candidate_and_commits_the_mode` |
+| A file replaced by a symlink commits `120000` | `replacing_a_file_with_a_symlink_commits_mode_120000` |
+| A chmod after preparation is refused | `a_chmod_after_preparation_is_refused_as_content_changed` |
 | Index and working tree identical after a failed attempt | same test, plus `the_users_index_and_working_tree_are_unchanged_by_a_commit` |
 | Secret warnings have categories/counts and no text; override audited | `a_seeded_secret_warns_with_categories_and_counts_and_no_text`, `a_secret_needs_a_separate_per_commit_override`, `the_recorded_diff_is_redacted_and_the_record_holds_no_secret` |
 | The approval UI says the diff is redacted and the commit is not | the dialog's `.commit-redaction` line; **manual, not walked** |
@@ -555,7 +626,7 @@ named without a path are in
 | Committing is refused in Ask, Plan and Review and under a profile that denies it | `committing_is_refused_outside_code_mode_and_without_the_profile_capability` (all three modes), `a_commit_is_refused_in_ask_mode` at the route |
 | Repository config cannot enable committing | `every_capability_key_resists_weakening_from_repository_scope` |
 | No amend, reset or history rewrite | `the_commit_module_has_no_history_rewriting_operation` |
-| Every quality-gate command passes and the baseline shows no regression | CI outstanding; locally `scripts/quality-gate.sh fmt node lint typos deny`, scoped clippy for `workspace-engine` and `desktop-shell`, `cargo nextest -p workspace-engine --test commit_preparation` (32), `--test permission_profiles` (74 passed, 1 skipped), `--test foundation` (171), `-p desktop-shell --lib` (193 passed, 5 skipped), and the deterministic eval tier |
+| Every quality-gate command passes and the baseline shows no regression | CI outstanding; locally `scripts/quality-gate.sh fmt node lint typos deny`, scoped clippy for `workspace-engine` and `desktop-shell`, `cargo nextest -p workspace-engine --test commit_preparation` (37), `--test permission_profiles` (74 passed, 1 skipped), `--test foundation` (171), `-p desktop-shell --lib` (193 passed, 5 skipped), and the deterministic eval tier |
 
 The one manual gap is the dialog walk: the web UI bootstraps through Tauri
 (`damaian_desktop_bootstrap`), and no browser harness was available in this

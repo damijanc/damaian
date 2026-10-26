@@ -123,6 +123,25 @@ is no commit, add, branch or ref mutation anywhere in the crate.
     `git status` would then see the fixture's own data directory as untracked
     candidate files. Commit fixtures put the data directory beside the
     repository, not in it.
+16. **`GitService::changes` dropped a rename's source path.** `git status
+    --porcelain=v1 -z -uall` reports `R  target\0source\0`; the first version of
+    `changes` kept only `target` and called it "the one a commit names". The
+    preparation therefore showed an addition, the tree kept `source` from
+    `HEAD`, and the commit was a copy the reviewer never saw. Both halves are
+    now carried: `GitFileStatus` has `renamed_from`/`copied_from`, the target and
+    the synthesized source deletion move together, and a copy produces no
+    deletion.
+17. **A hook that staged its own fix was silently discarded.** The tree is
+    composed and verified before the hooks run, and `commit-tree` uses that
+    tree. A `pre-commit` that reformats and `git add`s (lint-staged) changed the
+    private index, but the commit contained the pre-hook bytes and nothing said
+    so. The private tree is now compared after the hooks; a difference is a
+    warning, and the commit keeps the reviewed bytes.
+18. **The committed mode came from `HEAD`.** `blob_info` took the mode from
+    `head_entry`, so a chmod-only change (same blob id) was dropped as
+    unchanged, and a file replaced by a symlink was written as `100644` with the
+    link target as ordinary content. The mode now comes from the filesystem,
+    with `core.fileMode=false` falling back to `HEAD`.
 
 ## 3. Decisions the implementation takes from the proposal
 
@@ -178,6 +197,20 @@ These are the points later tasks must not re-derive from the proposal alone.
 - **D10 — Refusals are typed values.** `CommitError` carries a code the shell
   returns beside the message, so the UI can prefill a rewritten message, show a
   hook's output, or explain that HEAD moved, instead of parsing prose.
+- **D11 — A rename is one change in two paths.** The target carries
+  `renamed_from`, the source deletion carries `renamed_to`, and selecting one
+  without the other is refused with `commit_rename_incomplete`. A copy carries
+  `copied_from` and no deletion. `Git status`'s worktree column is handled too
+  (` R`, `RM`, `RD` as well as `R `).
+- **D12 — A hook's staged work is reported, never silently included or
+  dropped.** The commit keeps the reviewed tree. After the hooks, the private
+  index is written again; a changed tree adds a warning naming the hook and
+  saying its changes remain uncommitted. An unreadable index is a warning, not
+  a failed commit.
+- **D13 — The mode is the working tree's.** `120000` for a symlink, `100755`
+  when executable, else `100644`; `core.fileMode=false` falls back to `HEAD`'s
+  mode. The no-change test compares mode and blob id, and the commit freshness
+  check compares both.
 
 ## 4. What this is not
 

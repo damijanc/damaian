@@ -488,7 +488,7 @@ already built. #23 leaves the in-progress set. The ready set is now #27, #33,
 Re-checked on 2026-10-26, when [#35](35_commit_preparation/proposal.md) was
 planned. It moved from the ready set into **In progress** without being built:
 the flat spec became a folder, [`context.md`](35_commit_preparation/context.md)
-records the pre-implementation state and fifteen corrections, and
+records the pre-implementation state and eighteen corrections, and
 [`tasks.md`](35_commit_preparation/tasks.md) holds nine tasks. No dependency
 line changes, because nothing waits on #35 until it is Done. What planning found
 that matters to the order: committing is not a capability in `ProfileCapabilities`
