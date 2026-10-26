@@ -495,6 +495,42 @@ fn removing_a_whole_file_removes_it_from_files() {
 }
 
 #[test]
+fn removing_by_index_twice_uses_the_new_indices() {
+    let repo = fixture_repo("remove-twice");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let plan = assemble(&engine, &repo, "Look at src/other.rs", &[], None);
+    let mut prepared = workspace_engine::PreparedContext::from_plan(&plan);
+    // Remove the first non-required item, then the first non-required item of
+    // what is left; both removals use the manifest the previous one returned.
+    let first = prepared
+        .items
+        .iter()
+        .position(|item| item.category != ContextCategory::Required)
+        .unwrap();
+    let first_item = prepared.items[first].clone();
+    prepared.remove_optional(first).unwrap();
+    let second = prepared
+        .items
+        .iter()
+        .position(|item| item.category != ContextCategory::Required)
+        .unwrap();
+    let second_item = prepared.items[second].clone();
+    prepared.remove_optional(second).unwrap();
+
+    assert!(!prepared.items.contains(&first_item));
+    assert!(!prepared.items.contains(&second_item));
+    assert_eq!(
+        prepared
+            .manifest
+            .excluded
+            .iter()
+            .filter(|record| record.reason == ExclusionReason::UserRemoved)
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn removing_the_summary_records_its_category_and_hides_the_row() {
     let repo = fixture_repo("remove-summary");
     let engine = WorkspaceEngine::new(test_config(&repo));

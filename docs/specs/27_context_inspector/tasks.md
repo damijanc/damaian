@@ -13,7 +13,7 @@ the resolved §7 open question in [`context.md`](context.md)
 | 1 · Folder split, context map and links | Done 2026-10-26 | `git mv` to `27_context_inspector/proposal.md`; added this plan and `context.md`; every link to `27_context_inspector.md` repointed (28, 29, 30, 32 ×2, 24, 54, 51, 42 ×2, 26 ×4, 55 ×2, README); Status moved to In progress and README current state/row updated. No code. `npm run specs:check` passes (66 specs; it initially flagged the Progress rows until their State cells used the checker's three words). |
 | 2 · Session-scoped pins and restrictions | Done 2026-10-26 | `ContextPin` and the seven methods in `session.rs` append/replay `context_pin_added` / `context_pin_removed` / `context_pins_cleared` / `context_restriction_set` / `context_restriction_cleared`. Readers use `parsed_events` (a rewind does not clear the controls); pins match on `(path, range)`; an empty restriction is `Some([])`. **Deviation:** the five tests are inline in `session.rs` rather than the new integration file, because they need only a `SessionStore` and a temp dir; the integration file starts at Task 3. **Falsified:** dropping the `context_pin_removed` arm left the removed range in the list and the test failed. Scoped checks: fast five passed; scoped clippy passed; the filtered lib nextest run passed 7 tests. |
 | 3 · Manifest extensions and collection controls | Done 2026-10-26 | `ContextManifest` gained `conversationSummary` (from the #55 summary, measured redacted) and `symbolProvenance` (`total`/`languageServer`/`heuristic`, counted over the lines the renderer showed); `ExclusionReason` gained `UserRemoved`, `PathNotSelected`, `Missing`. `ContextRequest` gained `pinned`, `restriction` and `conversationSummary`; pins are collected through `add_file` (policy applies, a deleted pin is `Missing`), the restriction filters explicit/mention/search/project-rule/pin sources and exempts `AgentInstruction`. New `tests/context_inspector.rs` (13 tests at this point). **Falsified:** filtering instructions too made `a_restriction_does_not_remove_agent_instructions` fail. Scoped: fast five passed, scoped clippy passed, `context_inspector` 13/13, the five affected suites (context_assembly, prompt_cache, hooks, repository_map, symbol_index) 277 passed / 5 skipped. |
-| 4 · `PreparedContext` and removal | Not started | |
+| 4 · `PreparedContext` and removal | Done 2026-10-26 | `PreparedContext` (`from_plan`/`into_plan`/`files`/`sections`) and `remove_optional`/`remove_summary` landed with Task 3's commit; this task added `removing_by_index_twice_uses_the_new_indices`. `Required` is refused before any mutation; category use, `items`, `total_tokens` and `included` are recomputed, `allocated` is left alone. **Falsified:** moving the `Required` check after the removal made the test see one fewer item and fail. Scoped: `context_inspector` 14/14, scoped clippy passed. |
 | 5 · `pause_for_context_review` config | Not started | |
 | 6 · The pre-send pause and send gate | Not started | |
 | 7 · Post-send record and past turns | Not started | |
@@ -427,7 +427,7 @@ flat file; `docs/specs/README.md`.
 
 **Files:** `context_manager.rs`; `tests/context_inspector.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `removing_an_optional_item_reduces_the_tokens_and_records_user_removed`:
     build a plan, `PreparedContext::from_plan`, remove an `Instructions` item;
     `total_tokens` falls by the item's tokens, its category's `used` and
@@ -443,8 +443,8 @@ flat file; `docs/specs/README.md`.
     `UserRemoved` in category `ConversationSummary`.
   - `removing_by_index_twice_uses_the_new_indices`: two removals, each by the
     index in the manifest returned by the previous call; both are gone.
-- [ ] **Step 2: Run them and confirm they fail to compile.**
-- [ ] **Step 3: Implement.** `PreparedContext` beside `ContextPlan`; derive
+- [x] **Step 2: Run them and confirm they fail to compile.**
+- [x] **Step 3: Implement.** `PreparedContext` beside `ContextPlan`; derive
   `Serialize`/`Deserialize`/`Eq` on it and on `ContextPlan` if not already
   (the pause persists it). `from_plan` clones items and manifest; `into_plan`
   reconstructs `token_estimate` and `files`. `remove_optional`:
@@ -457,11 +457,11 @@ flat file; `docs/specs/README.md`.
     was allowed, not what it used).
   `remove_summary` sets the row to `None` and pushes a `UserRemoved` record in
   `ConversationSummary` with a detail naming the message count.
-- [ ] **Step 4: Falsify.** (1) Check `Required` after mutating → the unchanged
+- [x] **Step 4: Falsify.** (1) Check `Required` after mutating → the unchanged
   assertion fails. (2) Leave `used` alone → the category assertion fails.
   (3) Do not rebuild `files` → the whole-file assertion fails. Restore each.
-- [ ] **Step 5: Scoped checks** (same three commands as Task 3).
-- [ ] **Step 6: Update the Progress row** and commit.
+- [x] **Step 5: Scoped checks** (same three commands as Task 3).
+- [x] **Step 6: Update the Progress row** and commit.
   Subject: `Remove optional context from a prepared turn`.
 
 ---
