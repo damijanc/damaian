@@ -493,11 +493,11 @@ become a statement recalled in every other repository.
 
 **Memory never outranks instructions.** An applicable `AGENTS.md`, a current
 instruction from you, the active mode and the permission profile all take
-precedence over anything remembered. Memory is delivered as the
-lowest-priority context category, after file content and plan state, and a
-remembered sentence is shown to the model as a dated claim with its provenance —
-never as an instruction. Removing an entry in the context panel removes it from
-that turn, not from the store.
+precedence over anything remembered. Memory is the lowest-priority context
+source: when recall ships, a remembered sentence will reach the model as a dated
+claim with its provenance, never as an instruction, and the context panel will
+show it so you can remove it from that turn. Today memory is stored and
+inspectable in the store, but nothing is recalled into a request yet.
 
 **A secret is refused, not redacted.** If a candidate statement contains
 something the secret scanner recognises, Damaian refuses it and says so. It does

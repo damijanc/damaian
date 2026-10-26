@@ -438,8 +438,8 @@ by a `.gitignore`, with a message naming which of the two applied but not the
 protected path.
 
 Pattern matching cannot see every credential. That is why the confirmation step
-shows the exact sentence that will persist, and why memory is redacted again on
-its way into a request.
+shows the exact sentence that will persist, and why a stored memory will be
+redacted again on its way into a request once recall ships.
 
 **A newer schema.** Opening a store written by a newer build fails with the
 marker path and both versions and changes nothing. Upgrade Damaian, or point
