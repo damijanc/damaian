@@ -653,6 +653,19 @@ compares it automatically. The dismissal rate and the false-positive rate on
 real repository files need real use. Every other acceptance criterion has a test
 or scenario named in `tasks.md`.
 
+**Two limits that remain, recorded rather than hidden.** Evidence attribution is
+declared by the model: `propose_memory` takes an optional `evidence_path`, and a
+model that omits it can propose a benign sentence that was in fact derived from
+an ignored or protected file. The gate checks every path it is given and refuses
+an instruction-shaped non-user statement, but it cannot prove derivation from an
+undeclared source; the confirmation card is the remaining control, and #30's
+evals should inspect the turn's reads. Second, an evidence path is checked as a
+string, so a symlink with an eligible name can point at a protected or ignored
+file; only the path and a content hash are stored and the statement is scanned,
+but a future hardening should resolve the final path before the eligibility
+check. Both are inherited from #28's path-based evidence rule, not introduced
+here, and neither is a weakening of a boundary this spec established.
+
 **Checks.** Scoped local checks passed: `scripts/quality-gate.sh fmt node lint
 typos deny`, scoped clippy for `workspace-engine`, `desktop-shell` and
 `eval-harness` with `-D warnings`, `cargo nextest` for the memory suite and the
