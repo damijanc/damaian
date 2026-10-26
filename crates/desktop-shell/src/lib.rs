@@ -14,20 +14,20 @@ use workspace_engine::hooks::{
 use workspace_engine::{
     AgentCheckBatch, AgentFallbackProposal, AgentPlanProposal, AgentQuestionProposal,
     AgentRoundBudgetProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage,
-    ChatTurnOptions, ChatTurnResult, Config, CostEstimate, CurlModelTransport, DataSchemaOutcome,
-    EffectivePolicy, ExportFormat, GeneratedSecretWarning, HookActivation, HookEvent,
-    LanguageServerStatus, McpClient, McpServerConfig, McpTokenResolver, McpTransport, ModelAdapter,
-    ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
-    ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState, RepositoryConfigReport,
-    ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus,
-    SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink,
-    VerificationReport, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
-    allow_always_eligible, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
-    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
-    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
-    select_profile,
+    ChatTurnOptions, ChatTurnResult, CommitError, Config, CostEstimate, CurlModelTransport,
+    DataSchemaOutcome, EffectivePolicy, ExportFormat, GeneratedSecretWarning, HookActivation,
+    HookEvent, LanguageServerStatus, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
+    ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns,
+    PlanRevisionStep, ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState,
+    RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session,
+    SessionMode, StepStatus, SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnNotes, TurnPhase,
+    TurnProgress, TurnSink, VerificationReport, WebDiagnosticCall, WebDiagnosticKind,
+    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
+    WorkspaceEngine, allow_always_eligible, command_approval_prompt, custom_profile_ids,
+    ensure_data_dir_schema, export_profile, import_profile, normalize_mcp_server_id,
+    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
+    review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -302,6 +302,9 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("GET", "/api/model-key-status") => handle_model_key_status(stream, &request),
         ("GET", "/api/git-status") => handle_git_status(stream, &request),
         ("POST", "/api/commit-message") => handle_commit_message(stream, &request),
+        ("GET", "/api/commit-status") => handle_commit_status(stream, &request),
+        ("GET", "/api/commit-preparation") => handle_commit_preparation(stream, &request),
+        ("POST", "/api/commit") => handle_commit(stream, &request),
         ("GET", "/api/terminal-cwd") => handle_terminal_cwd(stream, &request),
         ("POST", "/api/terminal-run") => handle_terminal_run(stream, &request),
         ("GET", "/api/sessions") => handle_sessions(stream, &request),
@@ -1192,6 +1195,132 @@ fn handle_git_status(stream: &mut TcpStream, request: &Request) -> Result<(), St
             json_nullable_str(github_url.as_deref()),
         ),
     )
+}
+
+fn handle_commit_status(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let session = required_param(request, "session")?;
+    let engine = engine_for_repo(&repo)?;
+    let status = engine
+        .commit
+        .status(&repo, &session)
+        .map_err(|error| error.to_string())?;
+    let body = serde_json::to_string(&status).map_err(|error| error.to_string())?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+fn handle_commit_preparation(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let session = required_param(request, "session")?;
+    let engine = engine_for_repo(&repo)?;
+    let preparation = engine
+        .commit
+        .prepare(&repo, &session)
+        .map_err(|error| error.to_string())?;
+    let body = serde_json::to_string(&preparation).map_err(|error| error.to_string())?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `POST /api/commit`: the typed approval. Its own field, its own audit event
+/// and no "always"; a question or a command approval never satisfies it.
+fn handle_commit(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    if form.get("approval").map(String::as_str) != Some("commit") {
+        return write_response(
+            stream,
+            request,
+            400,
+            "application/json",
+            "{\"error\":\"A commit needs its own approval.\",\"code\":\"approval_required\"}",
+        );
+    }
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let prepare_id = required_form(&form, "prepare_id")?;
+    let message = required_form(&form, "message")?;
+    let paths = form
+        .get("paths")
+        .map(|paths| {
+            paths
+                .lines()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let engine = engine_for_repo(&repo)?;
+    let outcome = engine.commit.commit(
+        &repo,
+        &workspace_engine::CommitRequest {
+            session_id,
+            prepare_id,
+            selected_paths: paths,
+            message,
+            allow_generated_secrets: form.get("allow_generated_secrets").map(String::as_str)
+                == Some("true"),
+            approved_by: "desktop_user".to_string(),
+        },
+        &CancelToken::new(),
+    );
+    match outcome {
+        Ok(outcome) => {
+            let body = serde_json::to_string(&outcome).map_err(|error| error.to_string())?;
+            write_response(stream, request, 200, "application/json", &body)
+        }
+        Err(error) => {
+            let (status, body) = commit_error_response(&error);
+            write_response(stream, request, status, "application/json", &body)
+        }
+    }
+}
+
+fn commit_error_response(error: &CommitError) -> (u16, String) {
+    match error {
+        CommitError::Refused { code, message } => (
+            409,
+            format!(
+                "{{\"error\":\"{}\",\"code\":\"{}\",\"message\":\"{}\"}}",
+                escape_json(message),
+                escape_json(code),
+                escape_json(message),
+            ),
+        ),
+        CommitError::HookFailed {
+            name,
+            exit_code,
+            termination,
+            stdout,
+            stderr,
+        } => (
+            409,
+            format!(
+                "{{\"error\":\"{}\",\"code\":\"commit_hook_failed\",\"hook\":\"{}\",\"exitCode\":{},\"termination\":\"{}\",\"stdout\":\"{}\",\"stderr\":\"{}\"}}",
+                escape_json(&error.message()),
+                escape_json(name),
+                exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+                escape_json(termination),
+                escape_json(stdout),
+                escape_json(stderr),
+            ),
+        ),
+        CommitError::MessageRewritten { message } => (
+            409,
+            format!(
+                "{{\"error\":\"A commit-message hook rewrote the message. Review it and commit again.\",\"code\":\"commit_message_rewritten\",\"message\":\"{}\"}}",
+                escape_json(message),
+            ),
+        ),
+        CommitError::Engine(message) => (
+            500,
+            format!(
+                "{{\"error\":\"{}\",\"code\":\"commit_engine_error\"}}",
+                escape_json(message),
+            ),
+        ),
+    }
 }
 
 /// `POST /api/commit-message`: a model-drafted commit message, with the
@@ -5475,7 +5604,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use workspace_engine::CheckpointRestoreResult;
@@ -7606,6 +7735,14 @@ mod tests {
             .map(|(key, value)| format!("{key}={}", percent_encode_for_test(value)))
             .collect::<Vec<_>>()
             .join("&")
+    }
+
+    fn response_json(response: &str) -> serde_json::Value {
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or(response);
+        serde_json::from_str(body).unwrap_or_else(|error| panic!("{error}: {body}"))
     }
 
     fn post_fields_for_test(port: u16, token: &str, path: &str, fields: &[(&str, &str)]) -> String {
@@ -12656,6 +12793,299 @@ exec /bin/cat > /dev/null
         assert!(lint_marker.exists(), "the reviewed hook did not run");
 
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    struct CommitRouteFixture {
+        repo: PathBuf,
+        session_id: String,
+        engine: WorkspaceEngine,
+    }
+
+    fn git_in(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A real repository with one accepted change and a Code-mode session. The
+    /// data directory is the test binary's isolated one, which the shell's own
+    /// `engine_for_repo` also resolves, so the route sees the same session and
+    /// patch the test created.
+    fn commit_route_fixture(name: &str) -> CommitRouteFixture {
+        let data_dir = isolated_data_dir().to_path_buf();
+        let repo = temp_path(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        git_in(&repo, &["init", "--quiet", "--initial-branch=main"]);
+        git_in(&repo, &["config", "user.email", "test@damaian.local"]);
+        git_in(&repo, &["config", "user.name", "Damaian Test"]);
+        git_in(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("a.txt"), "original\n").unwrap();
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let engine = WorkspaceEngine::new(Config {
+            data_dir,
+            enable_index_watcher: false,
+            ..Config::default()
+        });
+        let repository_id = workspace_engine::repository_id_for_root(&repo);
+        let session = engine
+            .session_store
+            .create_session(&repository_id, "Commit routes")
+            .unwrap();
+        engine
+            .session_store
+            .append_message(&session.id, None, "user", "Add a file")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "Add a file", "test", "test")
+            .unwrap();
+        std::fs::write(repo.join("a.txt"), "damaian\n").unwrap();
+        let patch = engine
+            .patch_engine
+            .create_patch(
+                &repo,
+                &[workspace_engine::ProposedChange {
+                    path: "a.txt".to_string(),
+                    new_content: "damaian\n".to_string(),
+                    status: None,
+                    allow_restricted: false,
+                }],
+                Some(&task.id),
+                "test",
+            )
+            .unwrap();
+        let mut patch = patch;
+        patch.session_id = session.id.clone();
+        patch.origin_session_id = session.id.clone();
+        engine.patch_store.save(&patch).unwrap();
+        engine
+            .edit_orchestrator
+            .apply_stored_patch(&repo, &patch.id, None, None, "tester", false)
+            .unwrap();
+        CommitRouteFixture {
+            repo,
+            session_id: session.id,
+            engine,
+        }
+    }
+
+    #[test]
+    fn commit_status_and_preparation_are_served() {
+        let fixture = commit_route_fixture("commit-status");
+        let (port, token) = serve_for_test();
+        let repo = percent_encode_for_test(&fixture.repo.to_string_lossy());
+        let status = get_for_test(
+            port,
+            &token,
+            &format!(
+                "/api/commit-status?repo={repo}&session={}",
+                fixture.session_id
+            ),
+        );
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let status = response_json(&status);
+        assert_eq!(status["candidateCount"], 1);
+        assert_eq!(status["selectedCount"], 1);
+        assert_eq!(status["canCommit"], true);
+
+        let preparation = get_for_test(
+            port,
+            &token,
+            &format!(
+                "/api/commit-preparation?repo={repo}&session={}",
+                fixture.session_id
+            ),
+        );
+        assert!(preparation.starts_with("HTTP/1.1 200"), "{preparation}");
+        let preparation = response_json(&preparation);
+        assert_eq!(preparation["diffRedacted"], true);
+        assert!(preparation["hooks"]["hooks"].is_array());
+        assert_eq!(preparation["candidates"][0]["path"], "a.txt");
+        assert_eq!(preparation["candidates"][0]["selectedByDefault"], true);
+        let _ = std::fs::remove_dir_all(&fixture.repo);
+    }
+
+    #[test]
+    fn a_commit_needs_its_own_approval() {
+        let fixture = commit_route_fixture("commit-approval");
+        let (port, token) = serve_for_test();
+        let repo_text = fixture.repo.to_string_lossy().to_string();
+        let repo = percent_encode_for_test(&repo_text);
+        let preparation = response_json(&get_for_test(
+            port,
+            &token,
+            &format!(
+                "/api/commit-preparation?repo={repo}&session={}",
+                fixture.session_id
+            ),
+        ));
+        let prepare_id = preparation["prepareId"].as_str().unwrap();
+        let before = git_in(&fixture.repo, &["rev-parse", "HEAD"]);
+
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/commit",
+            &[
+                ("repo", repo_text.as_str()),
+                ("session_id", fixture.session_id.as_str()),
+                ("prepare_id", prepare_id),
+                ("paths", "a.txt"),
+                ("message", "Commit a"),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        let body = response_json(&response);
+        assert_eq!(body["code"], "approval_required");
+        assert_eq!(git_in(&fixture.repo, &["rev-parse", "HEAD"]), before);
+        let _ = std::fs::remove_dir_all(&fixture.repo);
+    }
+
+    #[test]
+    fn a_commit_is_refused_in_ask_mode() {
+        let fixture = commit_route_fixture("commit-ask");
+        fixture
+            .engine
+            .session_store
+            .set_session_mode(&fixture.session_id, SessionMode::Ask, "user")
+            .unwrap();
+        let (port, token) = serve_for_test();
+        let repo_text = fixture.repo.to_string_lossy().to_string();
+        let repo = percent_encode_for_test(&repo_text);
+        let preparation = response_json(&get_for_test(
+            port,
+            &token,
+            &format!(
+                "/api/commit-preparation?repo={repo}&session={}",
+                fixture.session_id
+            ),
+        ));
+        let prepare_id = preparation["prepareId"].as_str().unwrap();
+        assert_eq!(preparation["canCommit"], false);
+        assert!(
+            preparation["refusals"][0]
+                .as_str()
+                .unwrap()
+                .contains("Code mode")
+        );
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/commit",
+            &[
+                ("repo", repo_text.as_str()),
+                ("session_id", fixture.session_id.as_str()),
+                ("prepare_id", prepare_id),
+                ("approval", "commit"),
+                ("paths", "a.txt"),
+                ("message", "Commit a"),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        let body = response_json(&response);
+        assert_eq!(body["code"], "commit_not_allowed");
+        let _ = std::fs::remove_dir_all(&fixture.repo);
+    }
+
+    #[test]
+    fn a_commit_route_creates_the_commit_and_reports_the_sha() {
+        let fixture = commit_route_fixture("commit-ok");
+        let (port, token) = serve_for_test();
+        let repo_text = fixture.repo.to_string_lossy().to_string();
+        let repo = percent_encode_for_test(&repo_text);
+        let preparation = response_json(&get_for_test(
+            port,
+            &token,
+            &format!(
+                "/api/commit-preparation?repo={repo}&session={}",
+                fixture.session_id
+            ),
+        ));
+        let prepare_id = preparation["prepareId"].as_str().unwrap();
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/commit",
+            &[
+                ("repo", repo_text.as_str()),
+                ("session_id", fixture.session_id.as_str()),
+                ("prepare_id", prepare_id),
+                ("approval", "commit"),
+                ("paths", "a.txt"),
+                ("message", "Commit a"),
+                ("allow_generated_secrets", "false"),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = response_json(&response);
+        let sha = body["commitSha"].as_str().expect("a SHA");
+        assert_eq!(git_in(&fixture.repo, &["rev-parse", "HEAD"]), sha);
+        assert_eq!(git_in(&fixture.repo, &["show", "HEAD:a.txt"]), "damaian");
+        let _ = std::fs::remove_dir_all(&fixture.repo);
+    }
+
+    #[test]
+    fn a_rewritten_message_is_returned_with_a_code() {
+        let fixture = commit_route_fixture("commit-rewrite");
+        let hook = fixture.repo.join(".git/hooks/commit-msg");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\ngrep -q '^Reviewed-by: Test$' \"$1\" || printf '\\nReviewed-by: Test\\n' >> \"$1\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+
+        let (port, token) = serve_for_test();
+        let repo_text = fixture.repo.to_string_lossy().to_string();
+        let repo = percent_encode_for_test(&repo_text);
+        let preparation = response_json(&get_for_test(
+            port,
+            &token,
+            &format!(
+                "/api/commit-preparation?repo={repo}&session={}",
+                fixture.session_id
+            ),
+        ));
+        let prepare_id = preparation["prepareId"].as_str().unwrap();
+        let before = git_in(&fixture.repo, &["rev-parse", "HEAD"]);
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/commit",
+            &[
+                ("repo", repo_text.as_str()),
+                ("session_id", fixture.session_id.as_str()),
+                ("prepare_id", prepare_id),
+                ("approval", "commit"),
+                ("paths", "a.txt"),
+                ("message", "Commit a"),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        let body = response_json(&response);
+        assert_eq!(body["code"], "commit_message_rewritten");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("Reviewed-by: Test")
+        );
+        assert_eq!(git_in(&fixture.repo, &["rev-parse", "HEAD"]), before);
+        let _ = std::fs::remove_dir_all(&fixture.repo);
     }
 }
 

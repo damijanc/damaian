@@ -17,7 +17,7 @@ pre-implementation state in [`context.md`](context.md)
 | 5 · Exact bytes, the secret check and the per-commit override | Done 2026-10-26 | `commit` recomputes each selected path’s Git blob id and mode and refuses `commit_content_changed` when either differs from the record, before composing anything; restoring the reviewed bytes lets the same preparation commit. The secret scan runs on the bytes that would become blobs, reports categories/counts through `GeneratedSecretWarning` (now `Serialize`/`Deserialize`), treats a file over `max_file_bytes` as `unscanned` but still hashes it so an accepted large file is not mislabelled as hand-edited, and requires the separate `allow_generated_secrets` request field. The override writes `commit_secret_override` with categories/counts and no text, and `commit_created` records `generatedSecretOverride`; the prepared record stores only the redacted diff. Five tests: content changed then the same preparation commits the restored bytes, seeded fake AWS key warning with no text in the serialized preparation, override refused then accepted with a clean audit, unscannable file, and a record that contains neither the key nor an unredacted copy. All 24 `commit_preparation` tests pass. |
 | 6 · Message drafting with the deterministic fallback | Done 2026-10-26 | `POST /api/commit-message` loads the prepared record, takes the selected paths (or the default selection), and calls `draft_commit_message_with`. The prompt carries the task prompt, the latest plan’s step titles, the selected paths and the **redacted** diffs (capped at 20k characters). The model answer is parsed tolerantly (fences, `Subject:`, `Body:`) into a subject and body; a missing adapter, a thrown error, an empty answer or an unparsable one returns `record.message` — the existing `GitService::suggest_commit_message` template — with `source:"fallback"` and a notice. Five tests: model subject/body, empty answer fallback, no adapter fallback, the request contains the redacted diff and plan titles and not the seeded key, and fenced/prefixed parsing. The dialog’s *Draft with model* button is Task 8; nothing calls the model on prepare, so opening the dialog is free. |
 | 7 · Durable action markers, audit and crash inspection | Done 2026-10-26 | Each attempt creates a synthetic `Commit prepared changes` task in `RunningTool`, starts a `commit` marker with `sideEffecting: true` before `read-tree`, and records the selected paths and task id on the record. The prepared commit is written to the record **before** `update-ref`, so a crash in that window is inspectable; the same record’s expected old and prepared commit let `Inspect` decide whether HEAD is the commit, still the old value, or somewhere else, without resolving anything. A known outcome sets the task terminal and finishes the marker; a rewritten message or failed hook leaves the record usable so the user can approve again. `GitService::head_commit` is the full-SHA read. `commit_created` audits SHA, branch, path/hunk counts, message length, hook outcomes and the override flag, and the audit carries no content. `desktop-shell/src/recovery.rs` adds the `commit` object and the record’s paths to the recovered JSON; `app.js`’s Inspect shows the comparison. Tests: marker pair with `sideEffecting:true` and `outcome:"ok"`, dangling commit marker → `UnknownExternalOutcome` with no resume, audit counts/override with no seeded key anywhere, and the recovery payload’s `expectedOld`/`preparedCommit`/`landed`. 27 commit-preparation tests and 14 recovery tests pass. |
-| 8 · Shell routes and the *Commit…* dialog | Not started | |
+| 8 · Shell routes and the *Commit…* dialog | Done 2026-10-26 | Four routes: `GET /api/commit-status` (counts + refusal), `GET /api/commit-preparation` (the full record as JSON), `POST /api/commit` (requires `approval=commit`, maps `CommitError` to `{error, code, message}` with hook output or the rewritten message) and the Task 6 `POST /api/commit-message`. The repo bar fetches status beside `/api/git-status` when a session is open, in parallel; `commitAction` appends to `repoActionProviders` and shows when there is a candidate. The dialog lists every candidate with its label and a per-file redacted diff, states that the diff is redacted and the commit is not, requires the secret override when the real bytes are flagged, shows the hook report and “never skips them”, shows the check evidence and any refusal, prefills the deterministic message, offers *Draft with model*, and submits the typed approval with the selected paths. A rewritten message replaces the textarea and asks for approval again; hook output is shown; HEAD/content/hook changes disable the dialog and say to prepare again; success toasts the short SHA and subject and refreshes the bar. `api()` now attaches the parsed payload to errors so the dialog branches on `code`, not prose. Tests (5 route tests + 5 message tests): status/preparation JSON, missing approval → 400 with no ref, Ask mode → 409, a real commit through the route with the SHA and content, and a rewritten message → 409 with the text and no ref; all 193 shell lib tests pass. **Manual UI walk not run:** the web UI is bootstrapped through Tauri (`damaian_desktop_bootstrap`) and no browser harness was available in this session, so the dialog’s interaction was verified by reading, `node --check` and the route tests rather than by clicking it. |
 | 9 · Docs, acceptance walk, close-out | Not started | |
 
 **Goal:** A Code-mode session can commit exactly the changes Damaian applied and
@@ -510,7 +510,7 @@ D7, D10.
 `static/index.html` only if a new element is unavoidable (it is not: the slot
 exists).
 
-- [ ] **Step 1: Write the failing shell tests** (inline in `lib.rs`):
+- [x] **Step 1: Write the failing shell tests** (inline in `lib.rs`):
   - `commit_status_counts_the_uncommitted_accepted_changes` — a temporary repo,
     an applied patch, `GET /api/commit-status` → `candidateCount > 0`,
     `selectedCount > 0`, `canCommit: true`.
@@ -526,8 +526,8 @@ exists).
   - `the_commit_preparation_json_names_the_redaction_and_the_hooks` — the
     payload has `diffRedacted: true`, the hook rows, and every candidate's
     `selectedByDefault`.
-- [ ] **Step 2: Confirm they fail.**
-- [ ] **Step 3: Implement the routes.**
+- [x] **Step 2: Confirm they fail.**
+- [x] **Step 3: Implement the routes.**
   - `GET /api/commit-status?repo=&session=` → counts and the refusal reason.
   - `GET /api/commit-preparation?repo=&session=` → the full preparation.
   - `POST /api/commit` → requires `approval=commit`, `prepare_id`, `session_id`,
@@ -536,7 +536,7 @@ exists).
   - `POST /api/commit-message` (Task 6).
   - `GET /api/git-status` stays as it is; `refreshRepoBar` additionally fetches
     `/api/commit-status` when a session is open, in parallel.
-- [ ] **Step 4: Implement the UI.**
+- [x] **Step 4: Implement the UI.**
   - A `commitAction()` provider after the findings providers: visible when
     `repo()` and a session are open and `candidateCount > 0`; label `Commit…`;
     tone neutral; `run` opens the dialog.
@@ -560,13 +560,13 @@ exists).
   - Style with existing tokens/classes (`.app-dialog`, `.app-dialog-wide`,
     `.btn-sm`, `.btn-primary`, `.btn-danger`); add only `.app-dialog-commit`
     and the file/diff rows. Follow `docs/UI_STYLE_GUIDE.md`.
-- [ ] **Step 5: Check by hand** in the real web UI on a scratch port and data
+- [x] **Step 5: Check by hand** in the real web UI on a scratch port and data
   dir: the action appears, the dialog lists accepted and unaccepted files,
   toggling changes the count, the hook report renders, a failing hook shows its
   output, a rewritten message round-trips, and a successful commit shows the
   SHA and clears the action. Record the walk (or state plainly which parts were
   not walked) in the Progress row.
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -576,7 +576,7 @@ exists).
   npm run lint:web
   ```
 
-- [ ] **Step 7: Update the Progress row** and commit:
+- [x] **Step 7: Update the Progress row** and commit:
   `Offer Commit… in the repo bar with its own approval`.
 
 ## Task 9: Docs, acceptance walk, close-out
