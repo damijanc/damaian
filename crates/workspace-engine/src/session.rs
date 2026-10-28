@@ -3332,20 +3332,34 @@ fn latest_seq(content: &str) -> u64 {
 }
 
 /// The events that are part of the active conversation: everything up to the
-/// newest `conversation_rewound` marker's `throughEventSeq`. A later rewind to
-/// an earlier point supersedes an earlier one, so the newest marker wins even
-/// when it points further back.
+/// newest `conversation_rewound` marker's `throughEventSeq`, plus everything
+/// appended after that marker.
+///
+/// Events *between* the rewound-to point and the marker are what the rewind
+/// removed. Events after the marker are the conversation continuing — the next
+/// turn's messages, plans, notes, findings, diagnostics and memory — and must
+/// stay active, or a restore would make the rest of the session invisible to
+/// every reader that replays the log. A later rewind to an earlier point
+/// supersedes an earlier one, so the newest marker wins even when it points
+/// further back.
 fn active_events(content: &str) -> Vec<SessionEvent> {
     let (events, _) = parsed_events(content);
-    let limit = events
+    let marker = events
         .iter()
-        .filter(|event| event.event_type == "conversation_rewound")
-        .filter_map(|event| event.number("throughEventSeq"))
-        .next_back()
-        .and_then(|value| u64::try_from(value).ok());
+        .rfind(|event| event.event_type == "conversation_rewound");
+    let Some(marker) = marker else {
+        return events;
+    };
+    let Some(limit) = marker
+        .number("throughEventSeq")
+        .and_then(|value| u64::try_from(value).ok())
+    else {
+        return events;
+    };
+    let marker_seq = marker.seq;
     events
         .into_iter()
-        .filter(|event| limit.is_none_or(|limit| event.seq <= limit))
+        .filter(|event| event.seq <= limit || event.seq > marker_seq)
         .collect()
 }
 
