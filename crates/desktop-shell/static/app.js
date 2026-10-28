@@ -1510,6 +1510,7 @@ async function openCommitDialog() {
   try {
     preparation = await api(
       `/api/commit-preparation?repo=${encodeURIComponent(repoPath)}&session=${encodeURIComponent(sessionId)}`,
+      { method: "POST" },
     );
   } catch (error) {
     toast(error.message);
