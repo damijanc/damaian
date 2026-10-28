@@ -409,6 +409,36 @@ per request, so this is consistent; if Task 6's numbers show it, the place for
 a cache is the orchestrator, not the store. The Task 4 tests live in
 `tests/memory.rs`, beside Task 2's recall tests.
 
+**C17 — Task 5's stylesheet is `style.css`, and memory rows need an explicit
+manifest index.** The draft names `crates/desktop-shell/static/app.css`; the
+tree has `crates/desktop-shell/static/style.css`, which is the file
+`desktop-shell/src/lib.rs` embeds. There is no `app.css` to edit.
+
+The manifest remains content-free (C3), so the inspector cannot render a
+statement from it. The engine read call is
+`ChatOrchestrator::resolve_memory_display` in `chat.rs`: it takes the manifest's
+`MemoryRecallRef` rows (entry id, match reason, recall-time verification),
+resolves each id against the store scopes this repository and session may read,
+and returns the store fields (statement, scope, category, provenance, creation
+date, current verification) plus the match reason it was given. The route is
+`POST /api/context-memory`, with `repo`, `session_id` and `memory` as the JSON
+ref list. The match reason travels with the ref because it is derived from the
+prompt at recall time and is not stored on the entry.
+
+`manifest.memory` is 1:1 with included `Memory` items in item order (C14), so
+the panel maps the k-th ref to the k-th included memory index. The existing
+`contextItemIndex` matches category, kind, path and range; every memory item has
+the same category, kind and no path, so it cannot distinguish them and would
+always remove the first. Memory rows therefore remove by the explicit manifest
+index. This is a correction to the draft's "using the existing ... item index"
+wording, not a change of mechanism: the route and `PreparedContext` behaviour
+are the same.
+
+A missing id, an id owned by another project, a user-scope entry while that
+scope is off, and a `Deleted` entry all resolve to `deleted` with no statement.
+Every resolved statement is passed through the secret scanner before it leaves
+the engine, because a memory file edited outside Damaian may hold a credential
+even though the store refuses one at write time (C13.2).
 
 ## 3. Open questions for the owner
 

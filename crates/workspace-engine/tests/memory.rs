@@ -3535,8 +3535,8 @@ use std::rc::Rc;
 use workspace_engine::context_manager::ExclusionReason;
 use workspace_engine::{
     CancelToken, ChatTurnResult, ContextCategory, ContextDecision, ContextManifest,
-    MockModelAdapter, ModelAdapter, RecallExclusionReason, TaskStatus, TurnProgress, TurnSink,
-    WorkspaceEngine,
+    MemoryMatchReason, MemoryRecallRef, MockModelAdapter, ModelAdapter, RecallExclusionReason,
+    TaskStatus, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 type ProgressLog = Rc<RefCell<Vec<TurnProgress>>>;
@@ -3945,6 +3945,194 @@ fn a_send_time_recheck_names_what_it_drops() {
         "withdrawal is not deletion"
     );
     assert!(audit_text(&root).contains("memory_recall_withdrawn"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The inspector's display read (spec 30 Task 5).
+// ---------------------------------------------------------------------------
+
+fn display_ref(entry_id: &str) -> MemoryRecallRef {
+    MemoryRecallRef {
+        entry_id: entry_id.to_string(),
+        match_reason: MemoryMatchReason {
+            matched_terms: vec!["integration".to_string()],
+            category_boost: false,
+        },
+        verification: Verification::UserConfirmed,
+    }
+}
+
+#[test]
+fn a_display_read_resolves_only_entries_this_project_and_session_may_see() {
+    let root = repo_with_a_commit("display-scope");
+    let other_root = repo_with_a_commit("display-other");
+    let engine = turn_engine(&root, false);
+    let identity = turn_identity(&engine, &root);
+    let other_identity = turn_identity(&engine, &other_root);
+    let visible = insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let hidden_statement = "The other project deploys on Friday.";
+    let hidden = engine
+        .memory_store
+        .insert(
+            &other_root,
+            Some(&other_identity),
+            project_entry(&other_identity.key, hidden_statement),
+        )
+        .unwrap();
+    let audited_before = audit_text(&root).matches(hidden_statement).count();
+
+    let entries = engine
+        .chat_orchestrator
+        .resolve_memory_display(
+            &root,
+            "session_display",
+            &[
+                display_ref(&visible),
+                display_ref(&hidden.id),
+                display_ref("entry_missing"),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(entries.len(), 3);
+    assert!(!entries[0].deleted);
+    assert_eq!(entries[0].statement.as_deref(), Some(TURN_STATEMENT));
+    assert_eq!(entries[0].scope, Some(MemoryScope::Project));
+    assert_eq!(entries[0].category, Some(MemoryCategory::Convention));
+    assert!(entries[0].provenance.is_some());
+    assert_eq!(entries[0].match_reason.matched_terms, vec!["integration"]);
+    assert!(
+        entries[1].deleted,
+        "another project's entry must not resolve"
+    );
+    assert!(entries[1].statement.is_none());
+    assert!(entries[2].deleted, "a missing id reads as deleted");
+    assert!(entries[2].statement.is_none());
+    let serialized = serde_json::to_string(&entries).unwrap();
+    assert!(!serialized.contains(hidden_statement));
+    assert_eq!(
+        audit_text(&root).matches(hidden_statement).count(),
+        audited_before,
+        "a display read must not add the statement to the audit log"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(other_root).unwrap();
+}
+
+#[test]
+fn a_deleted_entry_reads_as_deleted_in_the_inspector() {
+    let root = repo_with_a_commit("display-deleted");
+    let engine = turn_engine(&root, false);
+    let identity = turn_identity(&engine, &root);
+    let entry_id = insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    engine
+        .memory_store
+        .mark_state(
+            MemoryTarget::Project(&identity),
+            &entry_id,
+            MemoryState::Deleted,
+        )
+        .unwrap();
+
+    let entries = engine
+        .chat_orchestrator
+        .resolve_memory_display(&root, "session_display", &[display_ref(&entry_id)])
+        .unwrap();
+    assert!(entries[0].deleted);
+    assert!(entries[0].statement.is_none());
+    assert!(
+        !serde_json::to_string(&entries)
+            .unwrap()
+            .contains(TURN_STATEMENT)
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_credential_in_the_memory_file_is_redacted_for_the_inspector() {
+    let root = repo_with_a_commit("display-secret");
+    let engine = turn_engine(&root, false);
+    let identity = turn_identity(&engine, &root);
+    let stored = engine
+        .memory_store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Deploy uses a harmless token."),
+        )
+        .unwrap();
+    let poisoned = tampered(
+        stored,
+        serde_json::json!({
+            "statement": format!("Deploy with {SEEDED_SECRET} token."),
+            "sensitivity": "ordinary",
+        }),
+    );
+    write_lines(
+        &engine.memory_store.project_path(&identity.key),
+        &[serde_json::to_string(&poisoned).unwrap()],
+    );
+
+    let entries = engine
+        .chat_orchestrator
+        .resolve_memory_display(&root, "session_display", &[display_ref(&poisoned.id)])
+        .unwrap();
+    assert!(entries[0].redacted);
+    let statement = entries[0].statement.as_deref().unwrap();
+    assert!(!statement.contains(SEEDED_SECRET));
+    assert!(statement.contains("[REDACTED_"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_memory_removed_in_the_review_is_absent_from_the_resumed_request() {
+    let root = repo_with_a_commit("remove-before-send");
+    let engine = turn_engine(&root, true);
+    let identity = turn_identity(&engine, &root);
+    insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (paused, _) = ask_collecting(&engine, &root, TURN_PROMPT, &mut adapter);
+    let review = paused.context_review.expect("the review is present");
+    assert_eq!(review.manifest.memory.len(), 1);
+    let index = review
+        .manifest
+        .included
+        .iter()
+        .position(|item| item.category == ContextCategory::Memory)
+        .expect("the memory item is included");
+
+    let amended = engine
+        .chat_orchestrator
+        .remove_context_item(&review.id, index)
+        .unwrap();
+    assert!(amended.memory.is_empty(), "{:?}", amended.memory);
+    assert!(
+        amended
+            .excluded
+            .iter()
+            .any(|record| record.reason == ExclusionReason::UserRemoved),
+        "{:?}",
+        amended.excluded
+    );
+
+    let (resumed, progress) =
+        resume_collecting(&engine, &review.id, ContextDecision::Send, &mut adapter);
+    let resumed = resumed.expect("the amended review should send");
+    assert_eq!(adapter.requests.len(), 1);
+    let sent = &adapter.requests[0].messages[1].content;
+    assert!(!sent.contains(TURN_STATEMENT), "{sent}");
+    assert!(last_manifest(&progress).memory.is_empty());
+    assert!(
+        !audit_text(&root).contains("memory_recalled"),
+        "a removed entry was not sent, so it was not recalled"
+    );
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
 
     fs::remove_dir_all(root).unwrap();
 }

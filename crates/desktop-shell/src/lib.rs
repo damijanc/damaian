@@ -18,9 +18,9 @@ use workspace_engine::{
     ClientError, CommitError, Config, ContextDecision, ContextManifest, CostEstimate,
     CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExportFormat, FetchDecision,
     GeneratedSecretWarning, GitMutation, HookActivation, HookEvent, LanguageServerStatus,
-    LineRange, McpClient, McpServerConfig, McpTokenResolver, McpTransport, MemoryScope,
-    ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns,
-    PlanRevisionStep, ProcessRegistry, ProfileId, ProjectIdentity, ProposedFilePatch,
+    LineRange, McpClient, McpServerConfig, McpTokenResolver, McpTransport, MemoryRecallRef,
+    MemoryScope, ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter,
+    PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId, ProjectIdentity, ProposedFilePatch,
     QuestionState, RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision,
     SearchOptions, Session, SessionMode, StepStatus, SymbolRef, TaskPlan, TaskUsage, TokenUsage,
     TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationReport,
@@ -349,6 +349,9 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/context-restriction") => handle_context_restriction(stream, &request),
         ("POST", "/api/context-remove") => handle_context_remove(stream, &request),
         ("POST", "/api/context-remove-summary") => handle_context_remove_summary(stream, &request),
+        // The manifest names memory entries but never their statements (spec 30
+        // C3); the panel resolves the rows it was shown through this read.
+        ("POST", "/api/context-memory") => handle_context_memory(stream, &request),
         ("POST", "/api/resume-context-stream") => handle_resume_context_stream(stream, &request),
         // Spec 29: the pending proposals and the two user actions. There is no
         // accept-all route and no route that takes a statement.
@@ -1224,6 +1227,40 @@ fn handle_context_remove_summary(stream: &mut TcpStream, request: &Request) -> R
         &format!(
             "{{\"manifest\":{}}}",
             serde_json::to_string(&manifest).unwrap_or_else(|_| "null".to_string())
+        ),
+    )
+}
+
+/// Resolves the memory rows an inspector manifest names (spec 30 §5.4, C17).
+///
+/// The manifest carries entry ids, match reasons and recall-time verification,
+/// never statements (C3), so the panel posts the rows it was shown and the
+/// engine reads the statements from the scopes this repository and session own.
+/// A client cannot send a statement, and an id from another project resolves to
+/// `deleted` rather than exposing it.
+fn handle_context_memory(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let references: Vec<MemoryRecallRef> = match form.get("memory") {
+        Some(value) if !value.is_empty() => serde_json::from_str(value)
+            .map_err(|_| "memory must be a JSON list of recalled entries".to_string())?,
+        _ => Vec::new(),
+    };
+    let engine = engine_for_repo(&repo)?;
+    require_memory_session_in_repository(&engine, &session_id, &repo)?;
+    let entries = engine
+        .chat_orchestrator
+        .resolve_memory_display(Path::new(&repo), &session_id, &references)
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"entries\":{}}}",
+            serde_json::to_string(&entries).map_err(|error| error.to_string())?
         ),
     )
 }
@@ -15484,7 +15521,13 @@ mod memory_route_tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&repo).unwrap();
-        fs::write(repo.join("README.md"), "# Memory route fixture\n").unwrap();
+        // The name goes into the tree so two fixtures never mint the same root
+        // commit (and therefore the same project key) within one second.
+        fs::write(
+            repo.join("README.md"),
+            format!("# Memory route fixture {name}\n"),
+        )
+        .unwrap();
         for args in [
             vec!["init", "-q"],
             vec!["config", "user.email", "route@example.invalid"],
@@ -15804,6 +15847,141 @@ mod memory_route_tests {
             1,
             "a mismatched decision leaves the proposal pending"
         );
+    }
+
+    /// Spec 30 Task 5: the inspector's memory read. The manifest names an entry,
+    /// never its statement (C3), so the panel posts the rows it was shown and
+    /// this route resolves them. An id owned by another project must read as
+    /// deleted rather than exposing that project's statement.
+    #[test]
+    fn the_context_memory_route_resolves_ids_without_crossing_projects() {
+        let data_dir = isolated_data_dir();
+        let repo = repo_fixture("context-memory");
+        let other = repo_fixture("context-memory-other");
+        let sessions = SessionStore::new(data_dir);
+        let session = sessions
+            .create_session(&repository_id_for_root(&repo), "memory display")
+            .unwrap();
+        let store = engine(data_dir);
+        let identity = ProjectIdentity::resolve_for_root(&repo, &store.git).unwrap();
+        let other_identity = ProjectIdentity::resolve_for_root(&other, &store.git).unwrap();
+        let visible = store
+            .memory_store
+            .propose(
+                &repo,
+                fixture_proposal(
+                    &session.id,
+                    "task_display",
+                    MemoryScope::Project,
+                    "Integration tests use nextest.",
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        let visible = store
+            .memory_store
+            .confirm_proposal(
+                &repo,
+                Some(&identity),
+                &session.id,
+                &visible.id,
+                UserConfirmation::new(&visible.id),
+            )
+            .unwrap();
+        let hidden = store
+            .memory_store
+            .propose(
+                &other,
+                fixture_proposal(
+                    &session.id,
+                    "task_other",
+                    MemoryScope::Project,
+                    "The other project deploys on Friday.",
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        let hidden = store
+            .memory_store
+            .confirm_proposal(
+                &other,
+                Some(&other_identity),
+                &session.id,
+                &hidden.id,
+                UserConfirmation::new(&hidden.id),
+            )
+            .unwrap();
+
+        let references = serde_json::json!([
+            {
+                "entryId": visible.id.clone(),
+                "matchReason": {"matchedTerms": ["integration"], "categoryBoost": false},
+                "verification": "user_confirmed"
+            },
+            {
+                "entryId": hidden.id.clone(),
+                "matchReason": {"matchedTerms": ["friday"], "categoryBoost": false},
+                "verification": "user_confirmed"
+            }
+        ]);
+        let (port, token) = serve();
+        let response = post(
+            port,
+            &token,
+            "/api/context-memory",
+            &[
+                ("repo", &repo.to_string_lossy()),
+                ("session_id", &session.id),
+                ("memory", &references.to_string()),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let listed = body_json(&response);
+        let entries = listed["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["entryId"], visible.id);
+        assert_eq!(entries[0]["statement"], "Integration tests use nextest.");
+        assert_eq!(entries[0]["scope"], "project");
+        assert_eq!(entries[0]["category"], "convention");
+        assert_eq!(entries[0]["provenance"]["type"], "suggestedAndConfirmed");
+        assert!(entries[0]["createdAtMs"].is_number());
+        assert_eq!(entries[0]["verification"], "user_confirmed");
+        assert_eq!(entries[0]["matchReason"]["matchedTerms"][0], "integration");
+        assert_eq!(entries[0]["redacted"], false);
+        assert_eq!(entries[0]["deleted"], false);
+        assert_eq!(entries[1]["deleted"], true);
+        assert!(entries[1]["statement"].is_null());
+        assert!(
+            !response.contains("The other project deploys on Friday."),
+            "{response}"
+        );
+    }
+
+    /// Spec 30 Task 5: the panel's labels and the stale count are the two
+    /// pieces the route tests cannot see. This checks the source shape the
+    /// panel is built from, as the other JS-only assertions in this module do.
+    #[test]
+    fn the_inspector_labels_memory_and_reports_its_stale_entries() {
+        let app = include_str!("../static/app.js");
+        let labels = app
+            .split("const CONTEXT_CATEGORY_LABELS = {")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .expect("the category labels");
+        assert!(labels.contains("memory: \"Memory\""), "{labels}");
+        let reasons = app
+            .split("const CONTEXT_REASON_LABELS = {")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .expect("the reason labels");
+        assert!(reasons.contains("memory_no_longer_active:"), "{reasons}");
+        let category = app
+            .split("function contextCategoryRow")
+            .nth(1)
+            .and_then(|rest| rest.split("function syncContextRestrictionField").next())
+            .expect("the category row");
+        assert!(category.contains("evidence_stale"), "{category}");
+        assert!(category.contains("context-category-stale"), "{category}");
     }
 
     /// The one surface with no browser assertion in the ordinary suite. Run:

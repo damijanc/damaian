@@ -5893,6 +5893,12 @@ body.worker-view #chat-model-menu {
   font-variant-numeric: tabular-nums;
 }
 
+.context-category-stale {
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 400;
+}
+
 .context-locked {
   color: var(--muted);
   font-size: 10px;
@@ -5937,6 +5943,36 @@ body.worker-view #chat-model-menu {
   color: var(--muted);
   font-size: 11px;
   white-space: nowrap;
+}
+
+.context-memory-item {
+  display: grid;
+  gap: 1px;
+  padding: 3px 0;
+  border-top: 1px solid var(--line);
+}
+
+.context-memory-item:first-child {
+  border-top: 0;
+}
+
+.context-memory-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.context-memory-statement {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.context-memory-meta {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
 }
 
 .context-item-action {

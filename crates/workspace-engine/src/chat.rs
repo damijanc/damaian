@@ -15,7 +15,7 @@ use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::compaction::ConversationSummary;
 use crate::config::{Config, ConfigOverlay, CostEstimate, McpTransport};
 use crate::context_manager::{
-    ContextManager, ContextManifest, ContextPlan, ContextRequest, PreparedContext,
+    ContextManager, ContextManifest, ContextPlan, ContextRequest, MemoryRecallRef, PreparedContext,
     PromptSectionName, TokenEstimate,
 };
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
@@ -37,8 +37,9 @@ use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::language::detect_language;
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
 use crate::memory::{
-    EvidenceRef as MemoryEvidence, MemoryCategory, MemoryEntry, MemoryProposal, MemoryScope,
-    MemoryStore, ProjectIdentity, ProposalOrigin, RecalledMemory,
+    EvidenceRef as MemoryEvidence, MemoryCategory, MemoryEntry, MemoryMatchReason, MemoryProposal,
+    MemoryProvenance, MemoryScope, MemoryState, MemoryStore, ProjectIdentity, ProposalOrigin,
+    RecalledMemory, Verification,
 };
 use crate::mode::{Permission, SessionMode, permits, refusal_message};
 use crate::model::{
@@ -735,6 +736,33 @@ pub struct ResumeDecisionOptions {
 enum FetchDispatch {
     Result(String, String, ActionOutcome),
     NeedsApproval(Inspection),
+}
+
+/// One recalled memory resolved for the context inspector (spec 30 §5.4, C3).
+///
+/// The manifest carries only the entry id, match reason and recall-time
+/// verification because it is written to the audit log. This is the display-time
+/// read that turns a row back into the fields a user can inspect. The statement
+/// is `None` when the id no longer resolves in a scope this project and session
+/// may read, or when the entry has been deleted, so a deleted entry reads as
+/// "deleted" without leaving its text in the panel.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryDisplayEntry {
+    pub entry_id: String,
+    pub statement: Option<String>,
+    pub scope: Option<MemoryScope>,
+    pub category: Option<MemoryCategory>,
+    pub provenance: Option<MemoryProvenance>,
+    pub created_at_ms: Option<u128>,
+    pub verification: Verification,
+    pub match_reason: MemoryMatchReason,
+    /// Whether the secret scanner removed a detected credential from
+    /// `statement`. The stored record is not rewritten (spec 30 C13.2).
+    pub redacted: bool,
+    /// True for an id that no longer resolves here, including one owned by
+    /// another project or a `Deleted` entry.
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1979,6 +2007,70 @@ impl ChatOrchestrator {
         )?;
         self.save_context_review(&pending, review.clone())?;
         Ok(review.prepared.manifest)
+    }
+
+    /// Resolves the manifest's memory rows against the store for the inspector
+    /// (spec 30 §5.4, C3, C17).
+    ///
+    /// The manifest is content-free and is written to the audit log, so this is
+    /// the only place a recalled statement is reconstructed for display. It
+    /// reads exactly the scopes recall reads — this project, this session, and
+    /// user scope only while that scope is enabled — so an id owned by another
+    /// project cannot resolve and is reported as `deleted` rather than exposed.
+    /// Every resolved statement passes the secret scanner, because a memory
+    /// file edited outside Damaian may hold a credential even though the store
+    /// refuses one at write time (C13.2). Nothing here is written or audited.
+    pub fn resolve_memory_display(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        references: &[MemoryRecallRef],
+    ) -> Result<Vec<MemoryDisplayEntry>> {
+        if references.is_empty() {
+            return Ok(Vec::new());
+        }
+        let identity = ProjectIdentity::resolve_for_root(repository_root, &self.git)?;
+        let project_entries = self.memory_store.project_entries(&identity)?;
+        let session_entries = self.memory_store.session_entries(session_id)?;
+        let user_entries = self.memory_store.user_entries()?;
+        let mut entries: HashMap<&str, &MemoryEntry> = HashMap::new();
+        for entry in project_entries
+            .iter()
+            .chain(session_entries.iter())
+            .chain(user_entries.iter())
+        {
+            entries.insert(entry.id.as_str(), entry);
+        }
+        Ok(references
+            .iter()
+            .map(|reference| {
+                let entry = entries
+                    .get(reference.entry_id.as_str())
+                    .copied()
+                    .filter(|entry| entry.state != MemoryState::Deleted);
+                let (statement, redacted) = match entry {
+                    Some(entry) => {
+                        let redaction = self.scanner.redact(&entry.statement);
+                        (Some(redaction.text), !redaction.findings.is_empty())
+                    }
+                    None => (None, false),
+                };
+                MemoryDisplayEntry {
+                    entry_id: reference.entry_id.clone(),
+                    statement,
+                    scope: entry.map(|entry| entry.scope),
+                    category: entry.map(|entry| entry.category),
+                    provenance: entry.map(|entry| entry.provenance.clone()),
+                    created_at_ms: entry.map(|entry| entry.created_at_ms),
+                    verification: entry
+                        .map(|entry| entry.verification)
+                        .unwrap_or(reference.verification),
+                    match_reason: reference.match_reason.clone(),
+                    redacted,
+                    deleted: entry.is_none(),
+                }
+            })
+            .collect())
     }
 
     fn save_context_review(

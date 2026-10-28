@@ -36,6 +36,11 @@ let contextRestriction = null;
 // True while the restriction textarea holds text the user typed but has not
 // applied. Re-rendering must not overwrite it with the stored restriction.
 let contextRestrictionDirty = false;
+// Memory statements are not in the manifest (spec 30 C3), so the panel asks
+// the engine for them by id. Cached per manifest so re-rendering does not
+// re-ask, and keyed by the ids so a removal or a new turn fetches again.
+const memoryDisplayCache = new Map();
+const memoryDisplayRequests = new Set();
 let terminalOpen = false;
 let term = null;
 let termFit = null;
@@ -2736,6 +2741,7 @@ const CONTEXT_CATEGORY_LABELS = {
   findings: "Findings",
   conversation_summary: "Summary",
   external_reference: "Reference pages",
+  memory: "Memory",
 };
 
 const CONTEXT_REASON_LABELS = {
@@ -2750,6 +2756,7 @@ const CONTEXT_REASON_LABELS = {
   user_removed: "removed by you",
   path_not_selected: "outside this session's paths",
   missing: "file missing",
+  memory_no_longer_active: "memory was no longer active",
 };
 
 function formatContextTokens(value) {
@@ -2838,6 +2845,144 @@ function contextCanRemove() {
   );
 }
 
+function memoryDisplayKey(manifest) {
+  const references = manifest?.memory || [];
+  if (!references.length) return "";
+  return [
+    currentSessionId,
+    manifest.taskId || "",
+    manifest.assembledAtMs || 0,
+    references.map((reference) => reference.entryId).join(","),
+  ].join("|");
+}
+
+function memoryDisplayFor(manifest) {
+  const key = memoryDisplayKey(manifest);
+  return key ? memoryDisplayCache.get(key) : undefined;
+}
+
+function ensureMemoryDisplay(manifest) {
+  const key = memoryDisplayKey(manifest);
+  if (!key || memoryDisplayCache.has(key) || memoryDisplayRequests.has(key)) return;
+  memoryDisplayRequests.add(key);
+  api(
+    "/api/context-memory",
+    form({
+      repo: repo(),
+      session_id: currentSessionId,
+      memory: JSON.stringify(manifest.memory || []),
+    }),
+  )
+    .then((payload) => {
+      memoryDisplayCache.set(
+        key,
+        new Map((payload.entries || []).map((entry) => [entry.entryId, entry])),
+      );
+    })
+    .catch((error) => {
+      memoryDisplayCache.set(key, new Map([["error", error.message]]));
+    })
+    .finally(() => {
+      memoryDisplayRequests.delete(key);
+      if (lastContextManifest === manifest) renderContextPanel();
+    });
+}
+
+function memoryVerificationLabel(verification) {
+  if (verification === "evidence_stale") return "may be out of date";
+  if (verification === "evidence_current") return "evidence current";
+  return "user-confirmed";
+}
+
+function memoryProvenanceLabel(provenance) {
+  if (!provenance) return "";
+  if (provenance.type === "repositoryEvidence") {
+    const paths = (provenance.paths || []).map((item) => item.path).filter(Boolean);
+    return paths.length ? `derived from ${paths.join(", ")}` : "derived from repository evidence";
+  }
+  if (provenance.type === "suggestedAndConfirmed") return "confirmed after a task";
+  if (provenance.type === "userRequest") return "you asked for it";
+  return "";
+}
+
+function memoryDateLabel(ms) {
+  if (!ms) return "";
+  const date = new Date(Number(ms));
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString();
+}
+
+function memoryMatchReasonLabel(reason) {
+  const terms = reason?.matchedTerms || [];
+  const matched = terms.length ? `matched ${terms.join(", ")}` : "recalled";
+  return reason?.categoryBoost ? `${matched}; category fitted the task` : matched;
+}
+
+function memoryEntryMeta(display) {
+  return [
+    display.scope,
+    memoryProvenanceLabel(display.provenance),
+    memoryDateLabel(display.createdAtMs),
+    memoryVerificationLabel(display.verification),
+    memoryMatchReasonLabel(display.matchReason),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function renderMemoryItems(list, manifest) {
+  const references = manifest.memory || [];
+  const indices = [];
+  (manifest.included || []).forEach((item, index) => {
+    if (item.category === "memory") indices.push(index);
+  });
+  const display = memoryDisplayFor(manifest);
+  references.forEach((reference, position) => {
+    const row = document.createElement("div");
+    row.className = "context-memory-item";
+    const head = document.createElement("div");
+    head.className = "context-memory-head";
+    const statement = document.createElement("span");
+    statement.className = "context-memory-statement";
+    const displayEntry = display instanceof Map ? display.get(reference.entryId) : undefined;
+    const loadError = display instanceof Map ? display.get("error") : undefined;
+    if (displayEntry?.deleted) {
+      statement.textContent = "deleted";
+    } else if (displayEntry?.statement) {
+      statement.textContent = displayEntry.statement;
+    } else if (loadError) {
+      statement.textContent = "Memory details unavailable";
+    } else {
+      statement.textContent = "Resolving…";
+    }
+    head.append(statement);
+    const index = indices[position];
+    if (contextCanRemove() && index !== undefined) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn-icon context-item-action context-remove";
+      remove.title = "Remove from this turn";
+      remove.setAttribute("aria-label", `Remove ${reference.entryId} from this turn`);
+      remove.textContent = "×";
+      remove.addEventListener("click", () =>
+        removeContextIndex(index).catch((error) => toast(error.message)),
+      );
+      head.append(remove);
+    }
+    row.append(head);
+    const meta = document.createElement("span");
+    meta.className = "context-memory-meta";
+    if (displayEntry?.deleted) {
+      meta.textContent = memoryMatchReasonLabel(reference.matchReason);
+    } else if (displayEntry) {
+      meta.textContent = memoryEntryMeta(displayEntry);
+    } else if (loadError) {
+      meta.textContent = loadError;
+    }
+    if (meta.textContent) row.append(meta);
+    list.append(row);
+  });
+}
+
 function contextCategoryRow(manifest, category) {
   const items = (manifest.included || []).filter((item) => item.category === category);
   const usage = (manifest.categories || []).find((entry) => entry.category === category);
@@ -2853,7 +2998,12 @@ function contextCategoryRow(manifest, category) {
   tokens.textContent = `${formatContextTokens(usage?.used ?? 0)} tokens`;
   const count = document.createElement("span");
   count.className = "context-category-count";
-  count.textContent = `${usage?.items ?? items.length} item${(usage?.items ?? items.length) === 1 ? "" : "s"}`;
+  // Memory is counted in entries, matching what the panel lists below it;
+  // every other category is a list of context items.
+  const countValue =
+    category === "memory" ? (manifest.memory || []).length : (usage?.items ?? items.length);
+  const countNoun = category === "memory" ? "entry" : "item";
+  count.textContent = `${countValue} ${countNoun}${countValue === 1 ? "" : "s"}`;
   summary.append(label, tokens, count);
   if (category === "required") {
     const locked = document.createElement("span");
@@ -2867,10 +3017,29 @@ function contextCategoryRow(manifest, category) {
     provenance.textContent = `${manifest.symbolProvenance.total} symbols (${manifest.symbolProvenance.heuristic} heuristic)`;
     summary.append(provenance);
   }
+  if (category === "memory") {
+    // The stale count is the signal a user needs without expanding (proposal
+    // §5.4): three memories, one of them questionable.
+    const stale = (manifest.memory || []).filter(
+      (reference) => reference.verification === "evidence_stale",
+    ).length;
+    if (stale) {
+      const staleLabel = document.createElement("span");
+      staleLabel.className = "context-category-stale";
+      staleLabel.textContent = `${stale} stale`;
+      summary.append(staleLabel);
+    }
+  }
   details.append(summary);
 
   const list = document.createElement("div");
   list.className = "context-items";
+  if (category === "memory") {
+    ensureMemoryDisplay(manifest);
+    renderMemoryItems(list, manifest);
+    details.append(list);
+    return details;
+  }
   items.forEach((item) => {
     const row = document.createElement("div");
     row.className = "context-item";
@@ -3170,10 +3339,11 @@ function contextItemIndex(item) {
   );
 }
 
-async function removeContextItem(item) {
+async function removeContextIndex(index) {
   if (!currentContextReview) throw new Error("No context review is open");
-  const index = contextItemIndex(item);
-  if (index < 0) throw new Error("That item is no longer in the review");
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error("That item is no longer in the review");
+  }
   const proposalId = currentContextReview.proposalId;
   const payload = await api(
     "/api/context-remove",
@@ -3181,6 +3351,12 @@ async function removeContextItem(item) {
   );
   applyContextReviewManifest(proposalId, payload.manifest);
   setContextManifest(payload.manifest, `review:${proposalId}`);
+}
+
+async function removeContextItem(item) {
+  const index = contextItemIndex(item);
+  if (index < 0) throw new Error("That item is no longer in the review");
+  await removeContextIndex(index);
 }
 
 async function removeContextSummary() {
