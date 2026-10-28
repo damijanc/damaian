@@ -24,13 +24,15 @@
 //!
 //! The body is untrusted data. It is decoded lossily, redacted and returned to
 //! the caller; nothing here executes or interprets it, and it is never logged.
-//! Content-type gating and HTML conversion belong to the fetch layer's next
-//! stage (Task 5), which is why this module records the type rather than
-//! deciding what to do with it.
+//! A response whose content type §5.5 does not convert is withheld here — its
+//! body is cleared and it is never cached — because this is the last point
+//! before a binary body could be stored or handed on as text. Reducing HTML to
+//! text and the second redaction belong to
+//! [`crate::external_reference::ConvertedResponse`].
 
 use crate::cancel::CancelToken;
 use crate::error::{ClientError, Result};
-use crate::external_reference::{ExternalUrl, RedirectTarget, redirect_target};
+use crate::external_reference::{ContentKind, ExternalUrl, RedirectTarget, redirect_target};
 use crate::hash::{create_id, now_millis, sha256, sha256_hex};
 use crate::model::escape_curl_config_value;
 use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
@@ -76,16 +78,21 @@ pub struct FetchOutcome {
     /// The `content-type` header verbatim, parameters included. `None` when the
     /// server sent none.
     pub content_type: Option<String>,
-    /// The length of `body` in bytes: what was retained after the cap and
-    /// redaction, not the server's declared length.
+    /// The response's retained size: what was read after the cap and redaction,
+    /// not the server's declared length. For a withheld non-text body this is
+    /// the size the caller reports, and `body` is empty.
     pub bytes: usize,
     pub truncated: bool,
     /// Why the body is not the whole response, when it is not.
     pub truncation_reason: Option<String>,
     /// The target of a 3xx, named and never followed (D10).
     pub redirect_to: Option<RedirectTarget>,
-    /// Redacted, bounded text. The caller must treat this as data.
+    /// Redacted, bounded text. The caller must treat this as data. Empty when
+    /// [`Self::body_withheld`] is true.
     pub body: String,
+    /// True when the content type is not one §5.5 converts, so the body was
+    /// cleared before it could be cached or returned as text.
+    pub body_withheld: bool,
     /// When the response was fetched. A cache hit reports the original fetch,
     /// so a caller can tell how old the page is.
     pub fetched_at_ms: u64,
@@ -171,9 +178,12 @@ impl CurlFetchTransport {
     pub fn fetch(&self, url: &ExternalUrl, cancel: &CancelToken) -> Result<FetchOutcome> {
         cancel.check()?;
         if let Some(cached) = self.read_cache(url) {
-            return Ok(cached);
+            return Ok(withhold_unless_convertible(cached));
         }
         let outcome = self.fetch_uncached(url, cancel)?;
+        // Before the write: a binary body must never reach the cache, and a
+        // caller must never receive one as text.
+        let outcome = withhold_unless_convertible(outcome);
         self.write_cache(url, &outcome);
         Ok(outcome)
     }
@@ -270,6 +280,7 @@ impl CurlFetchTransport {
             truncation_reason,
             redirect_to,
             body,
+            body_withheld: false,
             fetched_at_ms: now_millis() as u64,
             cached: false,
         })
@@ -314,6 +325,7 @@ impl CurlFetchTransport {
             truncation_reason: record.truncation_reason,
             redirect_to: None,
             body: record.body,
+            body_withheld: false,
             fetched_at_ms: record.fetched_at_ms,
             cached: true,
         })
@@ -323,7 +335,7 @@ impl CurlFetchTransport {
     /// a failed fetch. Redirects are never stored, because there is no content
     /// to serve and the next call must be a fresh decision.
     fn write_cache(&self, url: &ExternalUrl, outcome: &FetchOutcome) {
-        if outcome.is_redirect() {
+        if outcome.is_redirect() || outcome.body_withheld {
             return;
         }
         let Some(path) = self.cache_path(url) else {
@@ -350,6 +362,22 @@ impl CurlFetchTransport {
 
 /// curl's exit code for "maximum file size exceeded".
 const FILESIZE_EXCEEDED: i32 = 63;
+
+/// Clear the body of a response §5.5 does not convert, keeping its size.
+///
+/// A redirect carries no content and is left alone; a 200 whose type is
+/// `application/octet-stream` (or is missing) keeps its recorded size and loses
+/// its bytes. This is the gate the cache and the caller both sit behind.
+fn withhold_unless_convertible(mut outcome: FetchOutcome) -> FetchOutcome {
+    if outcome.is_redirect()
+        || ContentKind::classify(outcome.content_type.as_deref()).is_supported()
+    {
+        return outcome;
+    }
+    outcome.body_withheld = true;
+    outcome.body.clear();
+    outcome
+}
 
 fn truncation_reason(
     truncated: bool,
