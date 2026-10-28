@@ -4,9 +4,13 @@
 //! The module's whole reason for existing is that a commit is the one action
 //! where being approximately right is unsafe:
 //!
-//! - **The user's staging area is theirs.** Nothing here reads or writes
-//!   `.git/index`. Every tree is built through a private `GIT_INDEX_FILE`, so a
-//!   failure leaves nothing to restore because nothing was changed.
+//! - **The user's staging area is theirs.** No tree is ever built from
+//!   `.git/index`: every tree goes through a private `GIT_INDEX_FILE`, so a
+//!   failure before the ref moves leaves the repository as it was. After the
+//!   ref moves, the committed paths' entries in the real index are updated to
+//!   match the new `HEAD` — only where the user has not staged anything else
+//!   there, and exactly as `git commit --only` leaves them. Leaving them stale
+//!   would make the user's next plain `git commit` revert the commit.
 //! - **The preview is redacted; the commit is not.** The prepared record stores
 //!   each candidate's exact blob identity, and `commit` recomputes it. A file
 //!   that changed after review refuses the commit, so there is no window in
@@ -412,6 +416,12 @@ struct GitState {
     refusal: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexEntry {
+    mode: String,
+    oid: String,
+}
+
 #[derive(Debug, Clone)]
 struct BlobInfo {
     oid: String,
@@ -577,6 +587,7 @@ impl CommitEngine {
     /// Load a prepared record. The shell uses this after a restart and the
     /// recovery sweep uses it for a dangling action.
     pub fn load_record(&self, prepare_id: &str) -> Result<CommitRecord> {
+        validate_prepare_id(prepare_id)?;
         let content = fs::read_to_string(self.record_path(prepare_id))?;
         serde_json::from_str(&content).map_err(|error| {
             ClientError::Io(format!("Commit record {prepare_id} is unreadable: {error}"))
@@ -595,6 +606,14 @@ impl CommitEngine {
         let root = root.as_ref();
         if let Some(refusal) = self.refusal(root, &request.session_id)? {
             return Err(CommitError::refused("commit_not_allowed", refusal));
+        }
+        if validate_prepare_id(&request.prepare_id).is_err() {
+            // The id names both a record file and a directory this module
+            // deletes, so `../` is refused before it reaches either.
+            return Err(CommitError::refused(
+                "commit_not_prepared",
+                "That is not a commit preparation this session created.",
+            ));
         }
         let mut record = self
             .load_record(&request.prepare_id)
@@ -676,7 +695,8 @@ impl CommitEngine {
         if record.branch.as_deref() != Some(branch.as_str()) {
             return Err(CommitError::refused(
                 "commit_head_moved",
-                "The checked-out branch changed since you reviewed this commit.                  Nothing was committed; prepare it again.",
+                "The checked-out branch changed since you reviewed this commit. Nothing was \
+                 committed; prepare it again.",
             ));
         }
         // A hook added or changed after the report was shown would run against
@@ -685,7 +705,8 @@ impl CommitEngine {
         if hooks_now != record.hooks {
             return Err(CommitError::refused(
                 "commit_hooks_changed",
-                "The repository's Git hooks changed since you reviewed this commit.                  Nothing was committed; prepare it again.",
+                "The repository's Git hooks changed since you reviewed this commit. Nothing was \
+                 committed; prepare it again.",
             ));
         }
         // The redacted-preview trap: the preview was redacted, so the bytes
@@ -694,6 +715,12 @@ impl CommitEngine {
         let mut secret_warnings = Vec::new();
         let mut unscanned = Vec::new();
         let file_mode = self.file_mode_enabled(root).map_err(CommitError::from)?;
+        // `git hash-object` applies clean and EOL filters, so the working-tree
+        // file is not always the bytes Git stores. The blob is hashed and read
+        // back from this throwaway object directory: the scan sees exactly the
+        // committed bytes, and nothing reaches `.git/objects` before the
+        // override is granted.
+        let scan_objects = ScanObjects::create(&self.config.data_dir, &record.prepare_id)?;
         for candidate in &selected {
             let blob = self
                 .blob_info(root, &candidate.path, file_mode)
@@ -723,16 +750,25 @@ impl CommitEngine {
                 if blob.size > self.config.max_file_bytes {
                     unscanned.push(candidate.path.clone());
                 } else {
-                    let bytes = fs::read(root.join(&candidate.path))
-                        .map_err(|error| CommitError::Engine(error.to_string()))?;
-                    let warnings = self.scan_bytes(&candidate.path, &bytes);
-                    secret_warnings.extend(warnings);
+                    match self
+                        .blob_bytes(root, scan_objects.path(), &candidate.path, &blob.oid)
+                        .map_err(CommitError::from)?
+                    {
+                        Some(bytes) => {
+                            secret_warnings.extend(self.scan_bytes(&candidate.path, &bytes));
+                        }
+                        // A clean filter can expand a small file past the
+                        // scan limit; that is the same "unscanned" case as a
+                        // large file rather than a silent scan of nothing.
+                        None => unscanned.push(candidate.path.clone()),
+                    }
                 }
                 fresh.push((candidate.clone(), Some(blob.clone())));
             } else {
                 fresh.push((candidate.clone(), None));
             }
         }
+        drop(scan_objects);
         for path in &unscanned {
             secret_warnings.push(GeneratedSecretWarning {
                 path: path.clone(),
@@ -976,12 +1012,29 @@ impl CommitEngine {
             .map_err(CommitError::from)?;
         let final_message = fs::read_to_string(&message_path)
             .map_err(|error| CommitError::Engine(error.to_string()))?;
-        let final_message = final_message.trim_end().to_string();
-        if final_message != message.trim_end() {
+        // `git commit` cleans the message before writing it: trailing
+        // whitespace, blank-line runs and `#` comment lines are dropped.
+        // `commit-tree -F` does none of that, so a hook that appends a comment
+        // would differ from the approved text on every attempt and the commit
+        // could never be made.
+        let approved_message = self.cleanup_message(root, message)?;
+        let final_message = self.cleanup_message(root, &final_message)?;
+        if final_message != approved_message {
             return Err(CommitError::MessageRewritten {
                 message: final_message,
             });
         }
+        if final_message.is_empty() {
+            return Err(CommitError::refused(
+                "commit_message_required",
+                "The commit message is empty once comment lines are removed. Nothing was \
+                 committed.",
+            ));
+        }
+        // `commit-tree` writes the file verbatim, so give it the cleaned text
+        // that was approved rather than the hook's commented-up copy.
+        fs::write(&message_path, format!("{final_message}\n"))
+            .map_err(|error| CommitError::Engine(error.to_string()))?;
         let mut outcomes = hooks;
         if let Some(failure) = outcomes.iter().find(|hook| hook.outcome != "ok") {
             return Err(CommitError::HookFailed {
@@ -1072,29 +1125,56 @@ impl CommitEngine {
                 ),
             ));
         }
-        let head_now = self
-            .git_line(root, &["rev-parse", "HEAD"])
-            .map_err(CommitError::from)?
-            .unwrap_or_default();
-        if head_now != commit {
-            // update-ref succeeded, so the commit exists; failing here would
-            // report a false negative for a commit that is real.
+        // From here the commit exists: the ref moved. Everything that follows
+        // is reported as a warning, never raised, because an error now would
+        // mark a real commit as failed and skip its record and audit entry.
+        //
+        // The user's index still describes the old HEAD at every committed
+        // path, so a plain `git commit` would stage the reversal of this one
+        // (and delete the files it added). Update those entries the way
+        // `git commit --only` does, and only where the user has not staged
+        // something else at that path.
+        if let Err(error) = self.sync_user_index(root, selected, head, &commit) {
             warnings.push(format!(
-                "The commit was created as {commit}, but HEAD did not read back as it.                  Check the repository before relying on it."
+                "The commit was created as {commit}, but the staged copy of the committed \
+                 paths could not be updated ({error}). Run `git status` before your next \
+                 plain `git commit`."
             ));
+        }
+        match self.git_line(root, &["rev-parse", "HEAD"]) {
+            Ok(Some(head_now)) if head_now == commit => {}
+            Ok(Some(head_now)) => warnings.push(format!(
+                "The commit was created as {commit}, but HEAD reads back as {head_now}. \
+                 Check the repository before relying on it."
+            )),
+            Ok(None) => warnings.push(format!(
+                "The commit was created as {commit}, but HEAD could not be read back. \
+                 Check the repository before relying on it."
+            )),
+            Err(error) => warnings.push(format!(
+                "The commit was created as {commit}, but HEAD could not be read back \
+                 ({error}). Check the repository before relying on it."
+            )),
         }
         // post-commit runs after the ref moves. A failure is a warning: the
         // commit is real, and pretending otherwise would be worse.
-        if let Some(post) = self.run_post_commit(root, &index, cancel, record)? {
-            outcomes.push(post.clone());
-            if post.outcome == "failed" {
-                warnings.push(format!(
-                    "The post-commit hook failed ({}). The commit was created.",
-                    post.exit_code
-                        .map(|code| format!("exit code {code}"))
-                        .unwrap_or_else(|| post.termination.clone())
-                ));
+        match self.run_post_commit(root, &index, cancel, record) {
+            Ok(Some(post)) => {
+                if post.outcome == "failed" {
+                    warnings.push(format!(
+                        "The post-commit hook failed ({}). The commit was created.",
+                        post.exit_code
+                            .map(|code| format!("exit code {code}"))
+                            .unwrap_or_else(|| post.termination.clone())
+                    ));
+                }
+                outcomes.push(post);
             }
+            Ok(None) => {}
+            Err(error) => warnings.push(format!(
+                "The post-commit hook could not be run ({}). The commit was created.",
+                error.message()
+            )),
         }
         let hunk_count = selected
             .iter()
@@ -1170,7 +1250,9 @@ impl CommitEngine {
                 return Err(CommitError::refused(
                     "commit_rename_incomplete",
                     format!(
-                        "{} is the target of a rename from {source}. Select the deletion of                          {source} too, or neither; committing only the target would leave the                          old path behind.",
+                        "{} is the target of a rename from {source}. Select the deletion of \
+                         {source} too, or neither; committing only the target would leave the \
+                         old path behind.",
                         candidate.path
                     ),
                 ));
@@ -1181,7 +1263,8 @@ impl CommitEngine {
                 return Err(CommitError::refused(
                     "commit_rename_incomplete",
                     format!(
-                        "{} is the source of a rename to {target}. Select {target} too, or                          neither.",
+                        "{} is the source of a rename to {target}. Select {target} too, or \
+                         neither.",
                         candidate.path
                     ),
                 ));
@@ -1981,6 +2064,7 @@ impl CommitEngine {
     }
 
     fn private_dir(&self, prepare_id: &str) -> Result<PathBuf> {
+        validate_prepare_id(prepare_id)?;
         let dir = self.config.data_dir.join("commits").join(prepare_id);
         if dir.exists() {
             fs::remove_dir_all(&dir)?;
@@ -2001,6 +2085,7 @@ impl CommitEngine {
     }
 
     fn save_record(&self, record: &CommitRecord) -> Result<()> {
+        validate_prepare_id(&record.prepare_id)?;
         let path = self.record_path(&record.prepare_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -2124,6 +2209,189 @@ impl CommitEngine {
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// The exact bytes Git will store for `path`, hashed and read back from a
+    /// throwaway object directory. `hash-object` applies clean and EOL
+    /// filters, so the working-tree file is not always the committed blob;
+    /// the secret check has to see the blob itself. `None` when the blob is
+    /// over `max_file_bytes` and therefore cannot be scanned.
+    fn blob_bytes(
+        &self,
+        root: &Path,
+        objects: &Path,
+        path: &str,
+        expected_oid: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut command = git(root, None);
+        command.env("GIT_OBJECT_DIRECTORY", objects);
+        command.args(["hash-object", "-w", "--"]).arg(path);
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(ClientError::Git(format!(
+                "hash-object failed for {path}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if oid != expected_oid {
+            return Err(ClientError::Git(format!(
+                "The blob for {path} changed while it was being scanned."
+            )));
+        }
+        let mut command = git(root, None);
+        command.env("GIT_OBJECT_DIRECTORY", objects);
+        command.args(["cat-file", "-s", expected_oid]);
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(ClientError::Git(format!(
+                "cat-file failed for {path}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let size = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0);
+        if size > self.config.max_file_bytes {
+            return Ok(None);
+        }
+        let mut command = git(root, None);
+        command.env("GIT_OBJECT_DIRECTORY", objects);
+        command.args(["cat-file", "blob", expected_oid]);
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(ClientError::Git(format!(
+                "cat-file failed for {path}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(Some(output.stdout))
+    }
+
+    /// `git commit`'s message cleanup: trailing whitespace, blank-line runs
+    /// and `#` comment lines are removed. `commit-tree -F` writes the file
+    /// verbatim, so the comparison and the committed text both need this.
+    fn cleanup_message(
+        &self,
+        root: &Path,
+        message: &str,
+    ) -> std::result::Result<String, CommitError> {
+        let mut command = git(root, None);
+        command.args(["stripspace", "--strip-comments"]);
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| CommitError::Engine(error.to_string()))?;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin was piped")
+            .write_all(message.as_bytes())
+            .map_err(|error| CommitError::Engine(error.to_string()))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| CommitError::Engine(error.to_string()))?;
+        if !output.status.success() {
+            return Err(CommitError::Engine(format!(
+                "stripspace failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string())
+    }
+
+    /// The stage-0 entry the user's real index holds for `path`, if exactly
+    /// one. An unmerged path has several and is left alone.
+    fn index_entry(&self, root: &Path, path: &str) -> Result<Option<IndexEntry>> {
+        let output = self.git_output(root, &["ls-files", "-s", "-z", "--", path])?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let mut entries = Vec::new();
+        for record in output.stdout.split(|&byte| byte == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(record);
+            let Some((meta, _name)) = text.split_once('\t') else {
+                continue;
+            };
+            let mut fields = meta.split_whitespace();
+            let mode = fields.next().unwrap_or_default().to_string();
+            let oid = fields.next().unwrap_or_default().to_string();
+            let stage = fields.next().unwrap_or_default();
+            entries.push((mode, oid, stage.to_string()));
+        }
+        match entries.as_slice() {
+            [(mode, oid, stage)] if stage == "0" => Ok(Some(IndexEntry {
+                mode: mode.clone(),
+                oid: oid.clone(),
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    /// Make the real index agree with the new commit for the committed paths,
+    /// the way `git commit --only` leaves it. An entry is only rewritten when
+    /// it still equals the old HEAD's entry; a path the user staged
+    /// differently is theirs and stays untouched.
+    fn sync_user_index(
+        &self,
+        root: &Path,
+        selected: &[CommitCandidate],
+        old_head: Option<&str>,
+        new_commit: &str,
+    ) -> Result<()> {
+        if selected.is_empty() {
+            return Ok(());
+        }
+        let old = self.tree_entries_for(root, old_head)?;
+        let new = self.tree_entries_for(root, Some(new_commit))?;
+        let zero = "0".repeat(new_commit.len());
+        let mut info = String::new();
+        for candidate in selected {
+            let path = &candidate.path;
+            let current = self.index_entry(root, path)?;
+            let matches_old = match (&current, old.get(path)) {
+                (Some(entry), Some((mode, oid))) => &entry.mode == mode && &entry.oid == oid,
+                (None, None) => true,
+                _ => false,
+            };
+            if !matches_old {
+                continue;
+            }
+            match new.get(path) {
+                Some((mode, oid)) => info.push_str(&format!("{mode} {oid}\t{path}\0")),
+                None => info.push_str(&format!("0 {zero}\t{path}\0")),
+            }
+        }
+        if info.is_empty() {
+            return Ok(());
+        }
+        let mut command = git(root, None);
+        command.args(["update-index", "-z", "--index-info"]);
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin was piped")
+            .write_all(info.as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(ClientError::Git(format!(
+                "update-index failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
     }
 
     fn head_entry(&self, root: &Path, path: &str) -> Result<Option<(String, String)>> {
@@ -2267,6 +2535,54 @@ fn verification_summary(report: &VerificationReport) -> String {
         parts.push(format!("{} skipped", report.skipped.len()));
     }
     format!("Verification: {}.", parts.join(", "))
+}
+
+/// A preparation id is Damaian's own file name, never a path. It arrives from
+/// the shell and names both a record file and a directory this module deletes,
+/// so `../` must be refused rather than resolved.
+fn validate_prepare_id(prepare_id: &str) -> Result<()> {
+    let valid = prepare_id.strip_prefix("commit_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.len() <= 128
+            && rest
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidInput(format!(
+            "Invalid commit preparation id: {prepare_id}"
+        )))
+    }
+}
+
+/// A throwaway object directory. `git hash-object -w` writes the filtered blob
+/// here so the secret scan can read exactly the bytes Git would store, without
+/// putting an unapproved secret into the repository's own object store.
+struct ScanObjects {
+    path: PathBuf,
+}
+
+impl ScanObjects {
+    fn create(data_dir: &Path, prepare_id: &str) -> Result<Self> {
+        let path = data_dir
+            .join("commits")
+            .join(prepare_id)
+            .join("scan-objects");
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScanObjects {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 fn git(root: &Path, index: Option<&Path>) -> Command {

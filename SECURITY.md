@@ -214,14 +214,20 @@ it is treated as a capability rather than a convenience:
   Plan and Review, and whenever the resolved `allow_git_commits` capability is
   false. The built-in **Read-only** profile turns it off. Repository config may
   turn it off and may never turn it on, like every other capability key.
-- **The user's index is never used.** The tree is composed through a private
-  `GIT_INDEX_FILE` under the data directory, verified with `ls-tree` before
-  `commit-tree`, and the branch moves with an `update-ref` compare-and-swap
+- **The user's index is not the commit's base.** The tree is composed through a
+  private `GIT_INDEX_FILE` under the data directory, verified with `ls-tree`
+  before `commit-tree`, and the branch moves with an `update-ref` compare-and-swap
   against the `HEAD` that was reviewed. A failure before the ref moves leaves
-  the user's index and working tree untouched.
+  the user's index and working tree untouched. After a success, each committed
+  path's entry in the real index is rewritten to the new `HEAD`, only where it
+  still equals the old `HEAD`'s entry — so staged work at another path, or a
+  different staged version of that path, is never overwritten. Leaving those
+  entries stale would make the user's next plain `git commit` revert the commit.
 - **The preview is redacted; the commit is not.** The displayed diff goes
-  through `SecretScanner`. Before the commit, the scanner runs on the exact
-  bytes that will become blobs. A finding is reported as categories and counts
+  through `SecretScanner`. Before the commit, the scanner runs on the committed
+  blob itself — hashed into a throwaway object directory and read back, so a
+  clean or end-of-line filter cannot make the scanned bytes differ from the
+  committed bytes. A finding is reported as categories and counts
   — never matched text — and requires a separate per-commit override that is
   audited. Files too large to scan are treated as unscanned and need the same
   override. The prepared record stores each candidate's exact blob id, so a

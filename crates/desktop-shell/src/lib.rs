@@ -306,7 +306,10 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("GET", "/api/git-status") => handle_git_status(stream, &request),
         ("POST", "/api/commit-message") => handle_commit_message(stream, &request),
         ("GET", "/api/commit-status") => handle_commit_status(stream, &request),
-        ("GET", "/api/commit-preparation") => handle_commit_preparation(stream, &request),
+        // A preparation writes a durable record and an audit entry, so it is a
+        // `POST`: a safe-looking `GET` with side effects is a cache and retry
+        // hazard (review finding 3h).
+        ("POST", "/api/commit-preparation") => handle_commit_preparation(stream, &request),
         ("POST", "/api/commit") => handle_commit(stream, &request),
         // Spec 36: branch state, the prepared operation, its typed approval,
         // and two read-only reports. There is deliberately no route that runs
@@ -1734,6 +1737,9 @@ fn handle_commit_status(stream: &mut TcpStream, request: &Request) -> Result<(),
     write_response(stream, request, 200, "application/json", &body)
 }
 
+/// `POST /api/commit-preparation`: build and persist the preparation. A
+/// `POST` because it writes a record and an audit entry; a `GET` would invite
+/// caches and retries to repeat those side effects.
 fn handle_commit_preparation(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
     let session = required_param(request, "session")?;
@@ -14411,13 +14417,14 @@ exec /bin/cat > /dev/null
         assert_eq!(status["selectedCount"], 1);
         assert_eq!(status["canCommit"], true);
 
-        let preparation = get_for_test(
+        let preparation = post_fields_for_test(
             port,
             &token,
             &format!(
                 "/api/commit-preparation?repo={repo}&session={}",
                 fixture.session_id
             ),
+            &[],
         );
         assert!(preparation.starts_with("HTTP/1.1 200"), "{preparation}");
         let preparation = response_json(&preparation);
@@ -14434,13 +14441,14 @@ exec /bin/cat > /dev/null
         let (port, token) = serve_for_test();
         let repo_text = fixture.repo.to_string_lossy().to_string();
         let repo = percent_encode_for_test(&repo_text);
-        let preparation = response_json(&get_for_test(
+        let preparation = response_json(&post_fields_for_test(
             port,
             &token,
             &format!(
                 "/api/commit-preparation?repo={repo}&session={}",
                 fixture.session_id
             ),
+            &[],
         ));
         let prepare_id = preparation["prepareId"].as_str().unwrap();
         let before = git_in(&fixture.repo, &["rev-parse", "HEAD"]);
@@ -14475,13 +14483,14 @@ exec /bin/cat > /dev/null
         let (port, token) = serve_for_test();
         let repo_text = fixture.repo.to_string_lossy().to_string();
         let repo = percent_encode_for_test(&repo_text);
-        let preparation = response_json(&get_for_test(
+        let preparation = response_json(&post_fields_for_test(
             port,
             &token,
             &format!(
                 "/api/commit-preparation?repo={repo}&session={}",
                 fixture.session_id
             ),
+            &[],
         ));
         let prepare_id = preparation["prepareId"].as_str().unwrap();
         assert_eq!(preparation["canCommit"], false);
@@ -14516,13 +14525,14 @@ exec /bin/cat > /dev/null
         let (port, token) = serve_for_test();
         let repo_text = fixture.repo.to_string_lossy().to_string();
         let repo = percent_encode_for_test(&repo_text);
-        let preparation = response_json(&get_for_test(
+        let preparation = response_json(&post_fields_for_test(
             port,
             &token,
             &format!(
                 "/api/commit-preparation?repo={repo}&session={}",
                 fixture.session_id
             ),
+            &[],
         ));
         let prepare_id = preparation["prepareId"].as_str().unwrap();
         let response = post_fields_for_test(
@@ -14564,13 +14574,14 @@ exec /bin/cat > /dev/null
         let (port, token) = serve_for_test();
         let repo_text = fixture.repo.to_string_lossy().to_string();
         let repo = percent_encode_for_test(&repo_text);
-        let preparation = response_json(&get_for_test(
+        let preparation = response_json(&post_fields_for_test(
             port,
             &token,
             &format!(
                 "/api/commit-preparation?repo={repo}&session={}",
                 fixture.session_id
             ),
+            &[],
         ));
         let prepare_id = preparation["prepareId"].as_str().unwrap();
         let before = git_in(&fixture.repo, &["rev-parse", "HEAD"]);

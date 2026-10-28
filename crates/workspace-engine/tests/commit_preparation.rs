@@ -491,17 +491,23 @@ fn a_command_changed_file_is_shown_labelled_and_unselected() {
 }
 
 #[test]
-fn the_users_index_and_working_tree_are_unchanged_by_a_commit() {
+fn a_commit_updates_the_committed_paths_in_the_users_index() {
     let fixture = Fixture::new("index");
     fixture.write("a.txt", "original\n");
     fixture.commit_all("initial");
     fixture.write("staged.txt", "the user staged this\n");
     fixture.git(&["add", "staged.txt"]);
-    let index_before = fixture.index_bytes();
     let staged_before = fs::read(fixture.repository.join("staged.txt")).unwrap();
     let (session, task) = fixture.session();
     fixture.write("a.txt", "damaian\n");
-    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    fixture.write("new.txt", "a new file\n");
+    fixture.apply(
+        &session,
+        &task,
+        &[("a.txt", "damaian\n"), ("new.txt", "a new file\n")],
+        None,
+        None,
+    );
 
     let preparation = fixture.prepare(&session);
     fixture
@@ -514,22 +520,133 @@ fn the_users_index_and_working_tree_are_unchanged_by_a_commit() {
         )
         .unwrap();
 
-    assert_eq!(
-        fixture.index_bytes(),
-        index_before,
-        "the index must not change"
-    );
+    // The user's own staging is still theirs.
     assert_eq!(
         fs::read(fixture.repository.join("staged.txt")).unwrap(),
         staged_before,
         "the working tree must not change"
     );
+    let staged = fixture.git(&["diff", "--cached", "--name-only"]);
+    assert_eq!(staged, "staged.txt", "only the user's staging is staged");
+    // The committed paths now agree with the new HEAD, so nothing shows as a
+    // staged reversal of the commit (the defect that made the next plain
+    // `git commit` undo it).
     assert!(
-        fixture
-            .git(&["diff", "--cached", "--name-only"])
-            .contains("staged.txt")
+        !staged.contains("a.txt") && !staged.contains("new.txt"),
+        "{staged}"
+    );
+    assert_eq!(
+        fixture.git(&["status", "--porcelain"]),
+        "A  staged.txt",
+        "the index must agree with the new HEAD at every committed path"
     );
     assert!(!fixture.tree_paths().contains(&"staged.txt".to_string()));
+    fixture.cleanup();
+}
+
+#[test]
+fn a_plain_commit_after_a_damaian_commit_does_not_revert_it() {
+    let fixture = Fixture::new("follow-up-commit");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.write("new.txt", "a new file\n");
+    fixture.apply(
+        &session,
+        &task,
+        &[("a.txt", "damaian\n"), ("new.txt", "a new file\n")],
+        None,
+        None,
+    );
+    let preparation = fixture.prepare(&session);
+    let first = fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            "Damaian commit",
+            false,
+        )
+        .unwrap();
+
+    fixture.write("user.txt", "the user's own work\n");
+    fixture.git(&["add", "user.txt"]);
+    assert_eq!(
+        fixture.git(&["status", "--porcelain"]),
+        "A  user.txt",
+        "the commit must leave no staged reversal behind"
+    );
+
+    // The user's next plain `git commit` stages whatever was in the index. If
+    // the index still described the old HEAD, this commit would revert
+    // Damaian's change and delete the file it added.
+    fixture.git(&["commit", "--quiet", "-m", "user work"]);
+    assert_eq!(fixture.show("a.txt"), "damaian\n");
+    assert_eq!(fixture.show("new.txt"), "a new file\n");
+    assert!(
+        fixture.repository.join("new.txt").exists(),
+        "the follow-up commit deleted the file Damaian added"
+    );
+    assert_eq!(
+        fixture.git(&["rev-parse", "HEAD~1"]),
+        first.commit_sha,
+        "Damaian's commit must still be the parent"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_prepare_id_cannot_escape_the_commit_state_directory() {
+    let fixture = Fixture::new("prepare-id");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    let preparation = fixture.prepare(&session);
+
+    // A valid record planted one directory above the records directory, so a
+    // `..` id would load it, plus a directory the private-index cleanup would
+    // delete on the way.
+    let record_path = fixture
+        .data_dir
+        .join("commits")
+        .join(format!("{}.json", preparation.prepare_id));
+    let mut record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+    record["prepareId"] = serde_json::Value::String("../victim".to_string());
+    fs::write(
+        fixture.data_dir.join("victim.json"),
+        serde_json::to_string(&record).unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.data_dir.join("victim")).unwrap();
+    fs::write(fixture.data_dir.join("victim/keep.txt"), "keep\n").unwrap();
+    let before = fixture.head();
+
+    let outcome = fixture.engine.commit.commit(
+        &fixture.repository,
+        &CommitRequest {
+            session_id: session.id.clone(),
+            prepare_id: "../victim".to_string(),
+            selected_paths: vec!["a.txt".to_string()],
+            message: "Commit a".to_string(),
+            allow_generated_secrets: false,
+            approved_by: "tester".to_string(),
+        },
+        &CancelToken::new(),
+    );
+    match outcome {
+        Err(error) => assert_eq!(error.code(), "commit_not_prepared", "{error:?}"),
+        Ok(outcome) => panic!("a traversal prepare id committed: {outcome:?}"),
+    }
+    assert!(
+        fixture.data_dir.join("victim/keep.txt").exists(),
+        "a traversal prepare id deleted a directory outside commits/"
+    );
+    assert_eq!(fixture.head(), before);
+    assert!(fixture.engine.commit.load_record("../victim").is_err());
     fixture.cleanup();
 }
 
@@ -867,6 +984,37 @@ fn a_commit_msg_hook_that_rewrites_the_message_is_shown_before_the_commit() {
 }
 
 #[test]
+fn a_commit_msg_hook_that_only_adds_comments_does_not_block_the_commit() {
+    let fixture = Fixture::new("commit-msg-comment");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    // Git strips comment lines before writing the message, so a hook that
+    // adds one has not changed the message the user approved.
+    fixture.write_hook(
+        "commit-msg",
+        "#!/bin/sh\nprintf '\\n# reviewed by the hook\\n' >> \"$1\"\n",
+        true,
+    );
+    let preparation = fixture.prepare(&session);
+    let outcome = fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            "Commit a",
+            false,
+        )
+        .expect("a comment line is not a message rewrite");
+    assert_eq!(outcome.message, "Commit a");
+    let log = fixture.git(&["log", "-1", "--pretty=%B"]);
+    assert_eq!(log, "Commit a", "the comment did not reach the commit");
+    fixture.cleanup();
+}
+
+#[test]
 fn a_prepare_commit_msg_hook_is_run_and_its_rewrite_is_shown() {
     let fixture = Fixture::new("prepare-msg-rewrite");
     fixture.write("a.txt", "original\n");
@@ -893,6 +1041,50 @@ fn a_prepare_commit_msg_hook_is_run_and_its_rewrite_is_shown() {
         }
         other => panic!("expected a rewritten message, got {other:?}"),
     }
+    fixture.cleanup();
+}
+
+#[test]
+fn a_staged_copy_that_cannot_be_updated_is_a_warning_after_the_commit() {
+    let fixture = Fixture::new("index-lock");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "damaian\n");
+    fixture.apply(&session, &task, &[("a.txt", "damaian\n")], None, None);
+    let preparation = fixture.prepare(&session);
+    // The same failure a concurrent `git add` produces: the real index cannot
+    // be written. The commit is real, so this must not be reported as a failed
+    // commit, and its record, event and audit entry must still be written.
+    fs::write(fixture.repository.join(".git/index.lock"), "").unwrap();
+    let before = fixture.head();
+    let outcome = fixture
+        .commit(
+            &session,
+            &preparation,
+            &fixture.default_paths(&preparation),
+            "Commit a",
+            false,
+        )
+        .expect("the commit exists even though the index could not be updated");
+    assert_ne!(fixture.head(), before);
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("staged copy")),
+        "{:?}",
+        outcome.warnings
+    );
+    let record = fixture
+        .engine
+        .commit
+        .load_record(&preparation.prepare_id)
+        .unwrap();
+    assert_eq!(record.state, "created");
+    let audit = fs::read_to_string(fixture.data_dir.join("audit/events.jsonl")).unwrap();
+    assert!(audit.contains("commit_created"), "{audit}");
+    fs::remove_file(fixture.repository.join(".git/index.lock")).unwrap();
     fixture.cleanup();
 }
 
@@ -1141,6 +1333,48 @@ fn the_approved_content_is_the_committed_content() {
         )
         .expect("the reviewed bytes are committed once they are back");
     assert_eq!(fixture.show("a.txt"), "damaian\n");
+    fixture.cleanup();
+}
+
+#[test]
+fn the_secret_scan_reads_the_blob_that_will_be_committed() {
+    let fixture = Fixture::new("filtered-secret");
+    fixture.write("filtered.txt", "original\n");
+    fixture.commit_all("initial");
+    // A clean filter that injects a credential: the working-tree bytes are
+    // clean, the blob Git will store is not.
+    fixture.git(&[
+        "config",
+        "filter.inject.clean",
+        &format!("sed s/PLACEHOLDER/{FAKE_AWS_KEY}/"),
+    ]);
+    fixture.write(".gitattributes", "filtered.txt filter=inject\n");
+    let (session, task) = fixture.session();
+    let content = "PLACEHOLDER\n";
+    fixture.write("filtered.txt", content);
+    fixture.apply(&session, &task, &[("filtered.txt", content)], None, None);
+    let preparation = fixture.prepare(&session);
+    let selected = fixture.default_paths(&preparation);
+    assert_eq!(selected, vec!["filtered.txt".to_string()]);
+
+    // Scanning the working tree would see no secret and commit one.
+    let refused = fixture.commit(&session, &preparation, &selected, "Commit", false);
+    assert!(
+        matches!(
+            refused,
+            Err(CommitError::Refused {
+                code: "commit_secrets_require_override",
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    // With the override, the committed bytes are the bytes that were scanned.
+    let outcome = fixture
+        .commit(&session, &preparation, &selected, "Commit", true)
+        .expect("the override commits");
+    assert!(outcome.generated_secret_override);
+    assert_eq!(fixture.show("filtered.txt"), format!("{FAKE_AWS_KEY}\n"));
     fixture.cleanup();
 }
 
