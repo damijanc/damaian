@@ -22,10 +22,10 @@ use std::time::{Duration, Instant};
 use workspace_engine::{
     CancelToken, ChatTurnOptions, ChatTurnResult, ClientError, Config, ConfigOverlay, ContentKind,
     ConvertedResponse, CurlFetchTransport, Decision, EXTERNAL_CONTENT_NOTICE, ExternalUrl,
-    FetchOutcome, InjectionCategory, InspectionFlags, MockModelAdapter, ModelProviderConfig,
-    ProcessIdentity, ProcessKind, ProcessRegistry, ReadFileContent, RefusalReason, SecretScanner,
-    ToolCall, TurnProgress, TurnSink, UrlScheme, WorkspaceEngine, html_to_text, inspect,
-    redirect_target,
+    FetchDecision, FetchOutcome, InjectionCategory, InspectionFlags, MockModelAdapter,
+    ModelAdapter, ModelProviderConfig, ProcessIdentity, ProcessKind, ProcessRegistry,
+    ReadFileContent, RefusalReason, RepositoryKeyClass, SecretScanner, TaskStatus, ToolCall,
+    TurnProgress, TurnSink, UrlScheme, WorkspaceEngine, html_to_text, inspect, redirect_target,
 };
 
 fn hosts(entries: &[&str]) -> Vec<String> {
@@ -1239,6 +1239,471 @@ fn live_fetch_reads_a_documentation_page() {
 // Spec 51 Task 7 · the `fetch_url` tool in a real turn
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Spec 51 Task 8 · the host approval pause and its decision
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unapproved_host_pauses_with_the_host_and_full_url() {
+    let stub = stub::Stub::start(|_| stub::Response::ok("text/plain", b"body".to_vec()));
+    let repo = scratch_dir("pause");
+    let engine = fetch_engine(&repo, &[], 8);
+    let url = format!("{}/guide?page=2", stub.base_url());
+    let fetch = format!("{{\"url\":\"{url}\"}}");
+
+    let mut adapter = calls_then_answer(&[("fetch_url", &fetch)]);
+    let result = fetch_turn(&engine, &repo, None, &mut adapter);
+
+    assert_eq!(
+        stub.requests(),
+        0,
+        "the pause must happen before any request is built"
+    );
+    let proposal = result
+        .fetch_proposal
+        .as_ref()
+        .expect("an unapproved host pauses for the user");
+    assert_eq!(proposal.host, "127.0.0.1");
+    assert_eq!(
+        proposal.url, url,
+        "the dialog payload carries the URL exactly as the model wrote it"
+    );
+    assert_eq!(proposal.approval_key, stub.url("/").approval_key());
+    assert!(proposal.long_components.is_empty());
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+
+    // The marker is finished rather than dangling: this is a decision, not a
+    // crash with an unknown outcome.
+    let log = std::fs::read_to_string(format!(
+        "{}/.damaian/sessions/{}.jsonl",
+        repo.display(),
+        result.session.id
+    ))
+    .expect("the session log is written");
+    let finished: Vec<_> = session_events(&log, "action_finished")
+        .into_iter()
+        .filter(|event| event["payload"]["action"] == "fetch_url")
+        .collect();
+    assert_eq!(finished.len(), 1, "{log}");
+    assert_eq!(finished[0]["payload"]["outcome"], "awaiting_approval");
+    assert!(
+        engine
+            .session_store
+            .dangling_actions(&result.session.id)
+            .unwrap()
+            .is_empty(),
+        "the pause finishes its marker"
+    );
+}
+
+#[test]
+fn approving_once_fetches_and_approving_always_persists_the_host() {
+    let stub =
+        stub::Stub::start(|_| stub::Response::ok("text/plain", b"the approved page".to_vec()));
+    let repo = scratch_dir("decision");
+    let engine = fetch_engine(&repo, &[], 8);
+    let url = format!("{}/docs?page=2", stub.base_url());
+    let fetch = format!("{{\"url\":\"{url}\"}}");
+
+    // Once: the request happens, but nothing is written to user config.
+    let mut adapter = calls_then_answer(&[("fetch_url", &fetch)]);
+    let paused = fetch_turn(&engine, &repo, None, &mut adapter);
+    let once_id = paused.fetch_proposal.as_ref().expect("paused").id.clone();
+    let mut adapter = MockModelAdapter::new("Read it.");
+    let resumed = resume_fetch(&engine, &once_id, FetchDecision::Once, &mut adapter);
+    assert_eq!(stub.requests(), 1, "allowing once performs the request");
+    assert!(
+        resumed.response.contains("Read it."),
+        "{}",
+        resumed.response
+    );
+    let results = fetch_tool_results(&engine, &resumed.session.id);
+    assert!(
+        results
+            .last()
+            .is_some_and(|result| result.contains("> the approved page")),
+        "{results:?}"
+    );
+    assert!(
+        !engine.config.user_config_path().exists(),
+        "allow once must not write user config"
+    );
+
+    // Always: the same host pauses again because once did not remember it,
+    // then the grant is written for this checkout only.
+    let mut adapter = calls_then_answer(&[("fetch_url", &fetch)]);
+    let paused = fetch_turn(&engine, &repo, None, &mut adapter);
+    assert_eq!(stub.requests(), 1, "an unremembered host pauses again");
+    let always_id = paused.fetch_proposal.as_ref().expect("paused").id.clone();
+    let mut adapter = MockModelAdapter::new("Read it.");
+    let resumed = resume_fetch(&engine, &always_id, FetchDecision::Always, &mut adapter);
+    assert_eq!(stub.requests(), 2, "allowing always performs the request");
+
+    let user_config = std::fs::read_to_string(engine.config.user_config_path())
+        .expect("allow always writes user config");
+    let repository_id = &resumed.session.repository_id;
+    assert!(
+        user_config.contains(&format!(
+            "web_domain_allowlist.{repository_id}={}",
+            stub.url("/").approval_key()
+        )),
+        "{user_config}"
+    );
+    let overlay = ConfigOverlay::load(engine.config.user_config_path()).unwrap();
+    assert!(
+        overlay.web_domain_allowlist.is_none(),
+        "allow always must never write the machine-wide list: {user_config}"
+    );
+    assert_eq!(
+        overlay
+            .web_domain_allowlist_by_repository
+            .get(repository_id)
+            .map(Vec::as_slice),
+        Some([stub.url("/").approval_key()].as_slice())
+    );
+
+    let audit = std::fs::read_to_string(repo.join(".damaian/audit/events.jsonl"))
+        .expect("the audit log is written");
+    let decision = session_events(&audit, "web_fetch_approval_decision")
+        .pop()
+        .expect("the decision is audited");
+    assert_eq!(decision["host"], "127.0.0.1");
+    assert_eq!(decision["decision"], "approved_always");
+    assert_eq!(decision["repositoryId"], repository_id.as_str());
+    assert!(
+        !decision.to_string().contains("page=2"),
+        "the audit names the host, never the query string: {decision}"
+    );
+
+    // The next fetch of that host in this checkout does not pause.
+    let mut adapter = calls_then_answer(&[("fetch_url", &fetch)]);
+    let result = fetch_turn(&engine, &repo, None, &mut adapter);
+    assert_eq!(stub.requests(), 3);
+    assert!(
+        result.fetch_proposal.is_none(),
+        "an always-approved host does not ask again"
+    );
+
+    // A different checkout sharing the data directory still asks. The id is
+    // per checkout, so the grant must not leak to another repository.
+    let other_repo = scratch_dir("decision-other");
+    let other_engine = fetch_engine_in(&other_repo, &repo.join(".damaian"), &[], 8);
+    let mut adapter = calls_then_answer(&[("fetch_url", &fetch)]);
+    let other = fetch_turn(&other_engine, &other_repo, None, &mut adapter);
+    assert!(
+        other.fetch_proposal.is_some(),
+        "a grant for one checkout must not approve another"
+    );
+    assert_eq!(stub.requests(), 3, "the other checkout requested nothing");
+}
+
+#[test]
+fn a_refused_host_is_not_requested_and_the_model_is_told() {
+    let stub = stub::Stub::start(|_| stub::Response::ok("text/plain", b"never sent".to_vec()));
+    let repo = scratch_dir("deny");
+    let engine = fetch_engine(&repo, &[], 8);
+    let url = format!("{}/private", stub.base_url());
+    let fetch = format!("{{\"url\":\"{url}\"}}");
+
+    let mut adapter = calls_then_answer(&[("fetch_url", &fetch)]);
+    let paused = fetch_turn(&engine, &repo, None, &mut adapter);
+    let id = paused.fetch_proposal.as_ref().expect("paused").id.clone();
+    let mut adapter = MockModelAdapter::new("I could not read the page.");
+    let resumed = resume_fetch(&engine, &id, FetchDecision::Deny, &mut adapter);
+
+    assert_eq!(stub.requests(), 0, "a refusal makes no request");
+    assert!(
+        resumed.response.contains("could not read"),
+        "the turn continues honestly: {}",
+        resumed.response
+    );
+    let results = fetch_tool_results(&engine, &resumed.session.id);
+    let refusal = results.last().expect("the refusal is a tool result");
+    assert!(refusal.contains("127.0.0.1"), "{refusal}");
+    assert!(refusal.contains("refused"), "{refusal}");
+    assert!(refusal.contains("Nothing was requested"), "{refusal}");
+    assert!(
+        !engine.config.user_config_path().exists(),
+        "a refusal writes no grant"
+    );
+
+    let audit = std::fs::read_to_string(repo.join(".damaian/audit/events.jsonl")).unwrap();
+    let decision = session_events(&audit, "web_fetch_approval_decision")
+        .pop()
+        .expect("the refusal is audited");
+    assert_eq!(decision["decision"], "denied");
+}
+
+#[test]
+fn a_repository_cannot_pre_approve_the_host() {
+    let stub = stub::Stub::start(|_| stub::Response::ok("text/plain", b"not requested".to_vec()));
+    let repo = scratch_dir("repo-preapproval");
+    std::fs::create_dir_all(repo.join(".damaian")).unwrap();
+    std::fs::write(
+        repo.join(".damaian/config.conf"),
+        format!("web_domain_allowlist={}\n", stub.url("/").approval_key()),
+    )
+    .unwrap();
+    let base = fetch_config(&repo, &repo.join(".damaian"), &[], 8);
+    let user_path = base.user_config_path();
+    let admin_path = base.admin_config_path();
+    let (config, report) = Config::load_scoped(
+        base,
+        Some(&user_path),
+        Some(&Config::repository_config_path(&repo)),
+        Some(&admin_path),
+        Some(&repo),
+    )
+    .expect("the repository config is read but not honoured");
+    assert!(
+        !config
+            .web_domain_allowlist
+            .iter()
+            .any(|entry| entry == &stub.url("/").approval_key()),
+        "a repository cannot add a host: {:?}",
+        config.web_domain_allowlist
+    );
+    assert!(
+        report.rejected_keys.iter().any(|key| {
+            key.key == "web_domain_allowlist" && key.class == RepositoryKeyClass::Forbidden
+        }),
+        "the rejection is reported: {:?}",
+        report.rejected_keys
+    );
+
+    let engine = WorkspaceEngine::new(config);
+    let fetch = format!("{{\"url\":\"{}\"}}", stub.base_url());
+    let mut adapter = calls_then_answer(&[("fetch_url", &fetch)]);
+    let result = fetch_turn(&engine, &repo, None, &mut adapter);
+    assert!(
+        result.fetch_proposal.is_some(),
+        "the pause point still asks, whatever the repository shipped"
+    );
+    assert_eq!(stub.requests(), 0);
+}
+
+#[test]
+fn the_long_parameter_flag_reaches_the_dialog_payload() {
+    let stub = stub::Stub::start(|_| stub::Response::ok("text/plain", b"body".to_vec()));
+    let repo = scratch_dir("long-flag");
+    let engine = fetch_engine(&repo, &[], 8);
+    let long = format!("q={}", "a".repeat(198));
+    let url = format!("{}/docs?{long}", stub.base_url());
+    let fetch = format!("{{\"url\":\"{url}\"}}");
+
+    let mut adapter = calls_then_answer(&[("fetch_url", &fetch)]);
+    let paused = fetch_turn(&engine, &repo, None, &mut adapter);
+    let proposal = paused.fetch_proposal.as_ref().expect("paused");
+    assert_eq!(proposal.url, url, "the whole URL still reaches the dialog");
+    assert_eq!(proposal.long_components.len(), 1, "{proposal:?}");
+    assert_eq!(proposal.long_components[0].component, "query");
+    assert_eq!(proposal.long_components[0].bytes, 200);
+    assert_eq!(proposal.query.as_deref(), Some(long.as_str()));
+    assert_eq!(stub.requests(), 0);
+}
+
+#[test]
+fn a_resumed_fetch_names_a_redirect_and_requests_nothing_more() {
+    let stub = stub::Stub::start(|_| stub::Response::redirect("https://evil.example/collect"));
+    let repo = scratch_dir("resumed-redirect");
+    let engine = fetch_engine(&repo, &[], 8);
+    let fetch = format!("{{\"url\":\"{}\"}}", stub.base_url());
+
+    let mut adapter = calls_then_answer(&[("fetch_url", &fetch)]);
+    let paused = fetch_turn(&engine, &repo, None, &mut adapter);
+    let id = paused.fetch_proposal.as_ref().expect("paused").id.clone();
+    let mut adapter = MockModelAdapter::new("It redirected.");
+    let resumed = resume_fetch(&engine, &id, FetchDecision::Once, &mut adapter);
+
+    assert_eq!(
+        stub.requests(),
+        1,
+        "the resumed call makes one request and follows nothing"
+    );
+    let results = fetch_tool_results(&engine, &resumed.session.id);
+    let result = results.last().expect("the redirect is a tool result");
+    assert!(
+        result.contains("does not follow redirects"),
+        "the resumed call names the target instead of following it: {result}"
+    );
+    assert!(result.contains("https://evil.example/collect"), "{result}");
+    let log = std::fs::read_to_string(format!(
+        "{}/.damaian/sessions/{}.jsonl",
+        repo.display(),
+        resumed.session.id
+    ))
+    .unwrap();
+    assert!(
+        session_events(&log, "external_reference_fetched").is_empty(),
+        "a redirect is not a page and must not enter context"
+    );
+}
+
+#[test]
+fn another_pause_kind_cannot_resume_a_fetch_and_vice_versa() {
+    let stub = stub::Stub::start(|_| stub::Response::ok("text/plain", b"body".to_vec()));
+    let repo = scratch_dir("matrix");
+    let engine = fetch_engine(&repo, &[], 8);
+    let fetch = format!("{{\"url\":\"{}\"}}", stub.base_url());
+    let mut adapter = calls_then_answer(&[("fetch_url", &fetch)]);
+    let paused = fetch_turn(&engine, &repo, None, &mut adapter);
+    let id = paused.fetch_proposal.as_ref().expect("paused").id.clone();
+
+    // Every other entry point refuses the fetch pause and puts it back, so the
+    // right route can still take it.
+    let mut adapter = MockModelAdapter::new("Done.");
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let errors = [
+        engine
+            .chat_orchestrator
+            .resume_after_command_decision(&id, true, "tester", &mut adapter, &mut sink)
+            .unwrap_err()
+            .to_string(),
+        engine
+            .chat_orchestrator
+            .resume_after_plan_decision(&id, true, None, "tester", &mut adapter, &mut sink)
+            .unwrap_err()
+            .to_string(),
+        engine
+            .chat_orchestrator
+            .resume_after_answer(&id, "yes", None, &mut adapter, &mut sink)
+            .unwrap_err()
+            .to_string(),
+        engine
+            .chat_orchestrator
+            .resume_after_fallback_decision(&id, true, "tester", &mut adapter, &mut sink)
+            .unwrap_err()
+            .to_string(),
+        engine
+            .chat_orchestrator
+            .resume_round_budget(
+                &id,
+                workspace_engine::RoundBudgetDecision::Continue,
+                "tester",
+                &mut adapter,
+                &mut sink,
+            )
+            .unwrap_err()
+            .to_string(),
+        engine
+            .chat_orchestrator
+            .resume_after_check_decision(&id, &[], "tester", &mut adapter, &mut sink)
+            .unwrap_err()
+            .to_string(),
+        engine
+            .chat_orchestrator
+            .resume_after_context_decision(
+                &id,
+                workspace_engine::ContextDecision::Decline,
+                "tester",
+                &mut adapter,
+                &mut sink,
+            )
+            .unwrap_err()
+            .to_string(),
+    ];
+    for error in errors {
+        assert!(
+            error.contains("a fetch approval"),
+            "the refusal names the pause it is: {error}"
+        );
+        assert!(
+            error.contains("resume_after_fetch_decision"),
+            "the refusal names the route that owns it: {error}"
+        );
+    }
+    let pending = std::fs::read_to_string(fetch_pending_path(&engine, &id)).unwrap();
+    assert!(
+        pending.contains("\"fetch_call\""),
+        "a refused resume puts the pause back: {pending}"
+    );
+
+    // And the fetch route refuses every other kind. A marker is set on the
+    // saved pause, one at a time.
+    let original: serde_json::Value = serde_json::from_str(&pending).unwrap();
+    let path = fetch_pending_path(&engine, &id);
+    let mut cases: Vec<(&str, serde_json::Value)> = vec![
+        ("a command or patch approval", serde_json::json!({})),
+        (
+            "a plan review",
+            serde_json::json!({"plan_review": {"deferred_action": "apply a patch"}}),
+        ),
+        (
+            "a provider fallback offer",
+            serde_json::json!({"provider_fallback": {
+                "refused_provider": "a",
+                "refused_model": "m",
+                "fallback_provider": "b",
+                "fallback_model": "n",
+                "refusal_code": "provider_refused",
+                "message": "no",
+            }}),
+        ),
+        (
+            "a round-budget pause",
+            serde_json::json!({"round_budget": {"rounds_used": 1, "rounds_granted": 0}}),
+        ),
+        (
+            "a question",
+            serde_json::json!({"question": {"question_id": "question_1"}}),
+        ),
+        (
+            "a check approval",
+            serde_json::json!({"check_batch": {
+                "checks": [],
+                "due_task_id": "task",
+                "patch_id": "patch",
+                "attempt": 1,
+                "files_changed": [],
+                "file_hashes": {},
+            }}),
+        ),
+    ];
+    for (expected, marker) in cases.drain(..) {
+        let mut value = original.clone();
+        value.as_object_mut().unwrap().remove("fetch_call");
+        for (key, field) in marker.as_object().unwrap() {
+            value[key] = field.clone();
+        }
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+        let error = fetch_resume_error(&engine, &id);
+        assert!(
+            error.contains(expected),
+            "the fetch route refuses {expected}: {error}"
+        );
+        assert!(
+            error.contains("resume it with"),
+            "the refusal names the route that owns it: {error}"
+        );
+    }
+
+    // A context review is a full pause struct rather than one field, so it is
+    // produced by a real pause instead of being fabricated.
+    let mut review_config = fetch_config(&repo, &engine.config.data_dir, &[], 8);
+    review_config.pause_for_context_review = true;
+    let review_engine = WorkspaceEngine::new(review_config);
+    let mut adapter = MockModelAdapter::new("Done.");
+    let review = fetch_turn(&review_engine, &repo, None, &mut adapter);
+    let review_id = review.context_review.as_ref().expect("review").id.clone();
+    let error = fetch_resume_error(&review_engine, &review_id);
+    assert!(error.contains("a context review"), "{error}");
+
+    // Two markers at once are ambiguous and refused outright.
+    let mut value = original.clone();
+    value["question"] = serde_json::json!({"question_id": "question_1"});
+    std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+    let error = fetch_resume_error(&engine, &id);
+    assert!(error.contains("more than one kind of pause"), "{error}");
+}
+
 fn fetch_provider() -> ModelProviderConfig {
     ModelProviderConfig {
         id: "openai".to_string(),
@@ -1260,9 +1725,9 @@ fn fetch_provider() -> ModelProviderConfig {
 /// A throwaway repository with the native provider on and the given host
 /// approvals. The action-round budget is raised because the cap test makes nine
 /// fetches in one turn.
-fn fetch_engine(repo: &Path, allowlist: &[&str], cap: u32) -> WorkspaceEngine {
+fn fetch_config(_repo: &Path, data_dir: &Path, allowlist: &[&str], cap: u32) -> Config {
     let mut config = Config {
-        data_dir: repo.join(".damaian"),
+        data_dir: data_dir.to_path_buf(),
         enable_index_watcher: false,
         agent_max_tool_rounds: 30,
         web_fetch_max_per_turn: cap,
@@ -1271,7 +1736,72 @@ fn fetch_engine(repo: &Path, allowlist: &[&str], cap: u32) -> WorkspaceEngine {
     config.model_providers.push(fetch_provider());
     config.web_domain_allowlist = hosts(allowlist);
     assert!(config.supports_native_tools());
-    WorkspaceEngine::new(config)
+    config
+}
+
+fn fetch_engine(repo: &Path, allowlist: &[&str], cap: u32) -> WorkspaceEngine {
+    fetch_engine_in(repo, &repo.join(".damaian"), allowlist, cap)
+}
+
+/// The same engine with an explicit data directory, so one test can point two
+/// checkouts at one user config and prove a grant stays with its own id.
+fn fetch_engine_in(repo: &Path, data_dir: &Path, allowlist: &[&str], cap: u32) -> WorkspaceEngine {
+    WorkspaceEngine::new(fetch_config(repo, data_dir, allowlist, cap))
+}
+
+fn fetch_pending_path(engine: &WorkspaceEngine, proposal_id: &str) -> PathBuf {
+    engine
+        .config
+        .data_dir
+        .join("chat")
+        .join("pending")
+        .join(format!("{proposal_id}.json"))
+}
+
+fn resume_fetch(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    decision: FetchDecision,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_fetch_decision(proposal_id, decision, "tester", adapter, &mut sink)
+        .expect("the fetch decision should resume the turn")
+}
+
+/// The refusal a fetch decision gets for a pause of another kind.
+fn fetch_resume_error(engine: &WorkspaceEngine, proposal_id: &str) -> String {
+    let mut adapter = MockModelAdapter::new("Done.");
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_fetch_decision(
+            proposal_id,
+            FetchDecision::Once,
+            "tester",
+            &mut adapter,
+            &mut sink,
+        )
+        .unwrap_err()
+        .to_string()
 }
 
 fn fetch_turn(
@@ -1391,7 +1921,7 @@ fn a_url_with_a_secret_or_repository_content_is_refused_and_nothing_is_fetched()
 }
 
 #[test]
-fn an_unapproved_host_is_refused_by_this_task_and_an_approved_host_is_fetched() {
+fn an_unapproved_host_pauses_and_an_approved_host_is_fetched() {
     let stub = stub::Stub::start(|_| {
         stub::Response::ok(
             "text/plain; charset=utf-8",
@@ -1401,19 +1931,19 @@ fn an_unapproved_host_is_refused_by_this_task_and_an_approved_host_is_fetched() 
     let repo = scratch_dir("approval");
     let fetch = format!("{{\"url\":\"{}\"}}", stub.base_url());
 
+    // Task 8 replaces Task 7's refused tool result with the approval pause:
+    // nothing is requested and the turn waits on the user.
     let unapproved = fetch_engine(&repo, &[], 8);
     let mut adapter = calls_then_answer(&[("fetch_url", &fetch)]);
     let result = fetch_turn(&unapproved, &repo, None, &mut adapter);
     assert_eq!(stub.requests(), 0, "no request without an approved host");
-    let results = fetch_tool_results(&unapproved, &result.session.id);
-    let refusal = results.last().expect("the fetch call has a result");
     assert!(
-        refusal.contains("needs the user's approval"),
-        "the refusal must say a host approval is required: {refusal}"
+        result.fetch_proposal.is_some(),
+        "an unapproved host pauses for approval rather than answering"
     );
     assert!(
-        refusal.contains("web_domain_allowlist"),
-        "the refusal must say how to approve it: {refusal}"
+        fetch_tool_results(&unapproved, &result.session.id).is_empty(),
+        "nothing was dispatched, so the model has no tool result yet"
     );
 
     // The same URL, with the host approved in user scope.

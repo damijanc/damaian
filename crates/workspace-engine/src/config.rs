@@ -2621,6 +2621,60 @@ impl Config {
         }
     }
 
+    /// Records one host as this checkout's `Allow Always` grant (spec 51 §5.3
+    /// constraint 1, D8).
+    ///
+    /// The entry is `web_domain_allowlist.<repository id>` in the **user's**
+    /// config, never the machine-wide `web_domain_allowlist` and never
+    /// `<repo>/.damaian/config.conf`: the grant is the user's decision about one
+    /// checkout, and a repository config entry would be indistinguishable from
+    /// one that arrived with a clone (spec 34 §5.4). The id is per checkout, so
+    /// the same host in another clone still asks.
+    ///
+    /// `approval_key` is [`crate::external_reference::ExternalUrl::approval_key`],
+    /// the host plus a non-default port. It is shape-validated as one host
+    /// before it is stored, so a wildcard or a path cannot become an approval.
+    pub fn grant_web_domain_always(
+        config: &Config,
+        repository_root: &Path,
+        approval_key: &str,
+    ) -> Result<PathBuf> {
+        let approval_key = approval_key.trim();
+        if approval_key.is_empty() {
+            return Err(ClientError::InvalidInput(
+                "A host approval needs a host".to_string(),
+            ));
+        }
+        // `HostAllowlist` is the one parser that decides what an entry means.
+        // An entry it would ignore must never be written, because it would look
+        // like an approval in the file and approve nothing.
+        let parsed =
+            crate::external_reference::HostAllowlist::from_config(&[approval_key.to_string()]);
+        if !parsed.ignored_entries().is_empty() {
+            return Err(ClientError::InvalidInput(format!(
+                "Not a single host approval: {approval_key}"
+            )));
+        }
+        let repository_id = repository_id_for_root(repository_root);
+        let path = config.user_config_path();
+        let mut overlay = ConfigOverlay::load_or_default(&path)?;
+        let mut entries = overlay
+            .web_domain_allowlist_by_repository
+            .remove(&repository_id)
+            .unwrap_or_default();
+        if !entries
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(approval_key))
+        {
+            entries.push(approval_key.to_string());
+        }
+        overlay
+            .web_domain_allowlist_by_repository
+            .insert(repository_id, entries);
+        overlay.save(&path)?;
+        Ok(path)
+    }
+
     /// The resolved values spec 31's refusal points consult.
     pub fn profile_capabilities(&self) -> ProfileCapabilities {
         ProfileCapabilities {

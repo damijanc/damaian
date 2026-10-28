@@ -3427,6 +3427,99 @@ code.command-approval-command {
   background: var(--surface);
 }
 
+/* Spec 51 §5.3's host approval. This is a consent surface, so it is a solid
+   card like `.command-approval` rather than the dashed question prompt: the
+   host is the first thing read, the URL is shown in full and wraps instead of
+   scrolling or eliding, and a flagged component is broken out below it. */
+.fetch-approval {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px 14px;
+}
+
+.fetch-approval-eyebrow {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.fetch-approval-host {
+  margin: 0;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 750;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.fetch-approval-lead {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* Unshortened and uncapped on purpose: the user is approving this exact
+   string, so it wraps and grows the card rather than truncating. The `code`
+   element selector ties with `.message-body code` and wins on source order,
+   the same arrangement as `code.command-approval-command`. */
+code.fetch-approval-url {
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  padding: 7px 9px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.fetch-approval-flag {
+  display: grid;
+  gap: 4px;
+  border-left: 2px solid var(--warn);
+  padding-left: 8px;
+}
+
+.fetch-approval-flag-label {
+  margin: 0;
+  color: var(--warn);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+code.fetch-approval-flag-value {
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  padding: 7px 9px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.fetch-approval-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 /* The crash recovery prompt (docs/specs/45_crash_recovery_prompt.md). It sits
    at the top of the conversation of the session it belongs to, so it is a card
    in the log rather than docked chrome. */

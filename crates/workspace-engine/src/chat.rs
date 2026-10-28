@@ -13,7 +13,7 @@ use crate::command_policy::{
 use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::compaction::ConversationSummary;
-use crate::config::{Config, CostEstimate, McpTransport};
+use crate::config::{Config, ConfigOverlay, CostEstimate, McpTransport};
 use crate::context_manager::{
     ContextManager, ContextManifest, ContextPlan, ContextRequest, PreparedContext,
     PromptSectionName,
@@ -21,8 +21,8 @@ use crate::context_manager::{
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
 use crate::error::{ClientError, ProviderRefusal, Result};
 use crate::external_reference::{
-    ConvertedResponse, Decision, ExternalReference, ExternalUrl, HostAllowlist, ReadFileContent,
-    inspect,
+    ConvertedResponse, Decision, ExternalReference, ExternalUrl, HostAllowlist, Inspection,
+    ReadFileContent, inspect,
 };
 use crate::fetch::CurlFetchTransport;
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
@@ -31,7 +31,7 @@ use crate::finding::{
     findings_from_web_record, resolve_finding_path,
 };
 use crate::git_service::{DiffOptions, GitService, GitStatus, WorktreeListing};
-use crate::hash::{create_id, file_hash, now_millis};
+use crate::hash::{create_id, file_hash, now_millis, repository_id_for_root};
 use crate::hooks::{HookContext, HookDispatcher, HookEvent, HookOutcome, Verdict};
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::language::detect_language;
@@ -465,6 +465,47 @@ pub struct AgentQuestionProposal {
     pub allow_free_text: bool,
 }
 
+/// One host approval the model asked for mid-turn (spec 51 §5.3 constraint 1).
+///
+/// Carries the host, the URL exactly as the model wrote it, and the display
+/// flags the guard computed. The URL is never shortened here: the dialog is a
+/// consent surface, and a user approving a request has to be able to read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentFetchProposal {
+    /// The id to hand back to [`ChatOrchestrator::resume_after_fetch_decision`].
+    pub id: String,
+    pub host: String,
+    /// The raw URL, verbatim. The dialog shows this string and nothing derived
+    /// from it.
+    pub url: String,
+    /// What `Allow Always` stores (D8): the host plus a non-default port.
+    pub approval_key: String,
+    /// A query or fragment over the display threshold, so the dialog can break
+    /// it out rather than leave it inside a long line.
+    pub long_components: Vec<FetchComponentFlag>,
+    pub query: Option<String>,
+    pub fragment: Option<String>,
+}
+
+/// One over-long URL component, as the dialog renders it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchComponentFlag {
+    /// `"query"` or `"fragment"`.
+    pub component: String,
+    pub bytes: usize,
+}
+
+/// What the user decided about a fetch pause (spec 51 §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchDecision {
+    /// Read this URL now, without remembering the host.
+    Once,
+    /// Read this URL now and remember the host for this checkout.
+    Always,
+    /// Read nothing. The model is told the host was refused.
+    Deny,
+}
+
 /// A one-shot offer to answer a refused turn with a different configured
 /// provider (spec 56). Declined by default: nothing switches until the user
 /// approves this one occurrence, and there is no "always".
@@ -551,6 +592,10 @@ pub struct ChatTurnResult {
     /// user's answer. Resumed through
     /// [`ChatOrchestrator::resume_after_answer`] (spec 50).
     pub question_proposal: Option<AgentQuestionProposal>,
+    /// The turn stopped before a request because the host has no approval.
+    /// Resumed through [`ChatOrchestrator::resume_after_fetch_decision`]
+    /// (spec 51 §5.3).
+    pub fetch_proposal: Option<AgentFetchProposal>,
     /// The provider refused and a different configured provider could answer.
     /// The turn is paused, not failed, until
     /// [`ChatOrchestrator::resume_after_fallback_decision`] decides.
@@ -631,6 +676,7 @@ struct TurnProposals {
     patch: Option<AgentPatchProposal>,
     plan: Option<AgentPlanProposal>,
     question: Option<AgentQuestionProposal>,
+    fetch: Option<AgentFetchProposal>,
     checks: Option<AgentCheckBatch>,
 }
 
@@ -679,6 +725,16 @@ pub struct ChatTurnOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResumeDecisionOptions {
     pub allow_browser_diagnostics_for_session: bool,
+}
+
+/// What `dispatch_fetch_url` concluded (spec 51 §5.3).
+///
+/// A host with no approval is not a failure: it is a pause. Keeping it as a
+/// separate case is what makes "no request before the dialog" structural —
+/// the request path is only reachable through `Result`.
+enum FetchDispatch {
+    Result(String, String, ActionOutcome),
+    NeedsApproval(Inspection),
 }
 
 #[derive(Debug, Clone)]
@@ -1403,6 +1459,7 @@ impl ChatOrchestrator {
             round_budget: None,
             question: None,
             check_batch: None,
+            fetch_call: None,
             context_review: Some(PendingContextReview {
                 prepared,
                 conversation,
@@ -1466,6 +1523,7 @@ impl ChatOrchestrator {
             patch_proposal: None,
             plan_proposal: None,
             question_proposal: None,
+            fetch_proposal: None,
             fallback_proposal: None,
             round_budget_proposal: None,
             check_batch: None,
@@ -1563,6 +1621,7 @@ impl ChatOrchestrator {
                 patch_proposal: None,
                 plan_proposal: None,
                 question_proposal: None,
+                fetch_proposal: None,
                 fallback_proposal: None,
                 round_budget_proposal: None,
                 check_batch: None,
@@ -2446,6 +2505,7 @@ impl ChatOrchestrator {
                 files_changed: changed.clone(),
                 file_hashes,
             }),
+            fetch_call: None,
             context_review: None,
         })?;
         self.note_pending_approvals(
@@ -2893,6 +2953,7 @@ impl ChatOrchestrator {
             patch_proposal: None,
             plan_proposal: None,
             question_proposal: None,
+            fetch_proposal: None,
             fallback_proposal: None,
             round_budget_proposal: None,
             check_batch,
@@ -3627,6 +3688,329 @@ impl ChatOrchestrator {
             sink,
             pending.turn_options,
         )
+    }
+
+    /// Continues a turn paused on a host approval before a fetch (spec 51
+    /// §5.3).
+    ///
+    /// `Once` and `Always` perform the request the dialog showed; `Deny`
+    /// performs none and records a tool result telling the model the host was
+    /// refused, so it can answer honestly rather than retrying. `Always` writes
+    /// the per-repository key to **user** config through
+    /// [`Config::grant_web_domain_always`] before the request, so the
+    /// same host does not pause again in this checkout while another checkout
+    /// still does.
+    pub fn resume_after_fetch_decision(
+        &self,
+        proposal_id: &str,
+        decision: FetchDecision,
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let pending = self.pending_commands.take(proposal_id)?;
+        let mut turn_notes = TurnNotesState::from_pending(&pending);
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::Fetch)?;
+        let Some(fetch_call) = pending.fetch_call.clone() else {
+            // `refuse_unless_paused_for` just proved the pause is a fetch.
+            unreachable!("a fetch pause must carry its call");
+        };
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let repository_id = pending.session.repository_id.clone();
+        let decision_name = match decision {
+            FetchDecision::Once => "approved_once",
+            FetchDecision::Always => "approved_always",
+            FetchDecision::Deny => "denied",
+        };
+        if decision == FetchDecision::Always {
+            // A failed write must not consume the pause: the user's decision is
+            // still unanswered, so it is put back for the same route to retry
+            // (the command route writes before resuming for the same reason).
+            if let Err(error) = Config::grant_web_domain_always(
+                &self.config,
+                &repository_root,
+                &fetch_call.approval_key,
+            ) {
+                self.pending_commands.save(&pending)?;
+                return Err(error);
+            }
+        }
+        // The host, the decision and the checkout only. The URL's query is the
+        // part that could carry data out, and the audit does not need it.
+        self.audit_log.record(
+            "web_fetch_approval_decision",
+            &[
+                ("actor", approved_by.to_string()),
+                ("sessionId", pending.session.id.clone()),
+                ("taskId", pending.task.id.clone()),
+                ("proposalId", proposal_id.to_string()),
+                ("host", fetch_call.host.clone()),
+                ("decision", decision_name.to_string()),
+                ("repositoryId", repository_id),
+            ],
+        )?;
+
+        let mut messages = pending.messages.clone();
+        let mut after_tool: Option<(ToolAction, ActionOutcome)> = None;
+        let (assistant_summary, tool_result_content) = if decision == FetchDecision::Deny {
+            (
+                format!("Attempted to fetch from {}.", fetch_call.host),
+                format!(
+                    "The user refused to let this task read from {}. Nothing was requested. \
+                     Do not ask for this host again in this turn; answer with what you already \
+                     know, and say the page could not be read if it matters.",
+                    fetch_call.host
+                ),
+            )
+        } else {
+            // Re-run the egress guard against the stored URL before the request.
+            // The string cannot have changed since the pause, but user config
+            // and the files this task read can, and a refusal is still a
+            // refusal — the approval is not a way around constraint 3.
+            let guard_content =
+                self.read_files_for_egress_guard(&repository_root, &pending.session, &pending.task);
+            let files_read: Vec<ReadFileContent<'_>> = guard_content
+                .iter()
+                .map(|(path, content)| ReadFileContent { path, content })
+                .collect();
+            let allowed = self.web_domain_allowlist_for(&repository_root);
+            let inspection = match inspect(&fetch_call.url, &allowed, &self.scanner, &files_read) {
+                Ok(inspection) => inspection,
+                Err(error) => {
+                    let result = format!(
+                        "Cannot fetch that URL: {}. Nothing was requested.",
+                        error.reason()
+                    );
+                    self.append_fetch_exchange(
+                        &pending,
+                        &mut messages,
+                        &mut turn_notes,
+                        "Attempted to fetch a URL.".to_string(),
+                        &result,
+                        None,
+                        &repository_root,
+                    )?;
+                    return self.resume_fetch_turn(
+                        pending,
+                        messages,
+                        turn_notes,
+                        model_adapter,
+                        sink,
+                    );
+                }
+            };
+            if let Decision::Refused(reason) = &inspection.decision {
+                let result = format!(
+                    "Cannot fetch from {}: {}. Nothing was requested.",
+                    inspection.url.host,
+                    reason.message()
+                );
+                self.append_fetch_exchange(
+                    &pending,
+                    &mut messages,
+                    &mut turn_notes,
+                    format!("Attempted to fetch from {}.", inspection.url.host),
+                    &result,
+                    None,
+                    &repository_root,
+                )?;
+                return self.resume_fetch_turn(pending, messages, turn_notes, model_adapter, sink);
+            }
+            // A host that was approved meanwhile is a standing grant; a host
+            // the user approved just now is a one-off unless `Always` wrote it.
+            let decision_basis = match (&inspection.decision, decision) {
+                (Decision::AlreadyAllowed, _) | (_, FetchDecision::Always) => None,
+                _ => Some("approved_once"),
+            };
+            let (summary, content, action_outcome) = self.fetch_after_inspection(
+                &repository_root,
+                &pending.session,
+                &pending.task,
+                &inspection.url,
+                decision_basis,
+                sink.cancel,
+            )?;
+            after_tool = Some((
+                ToolAction::FetchUrl {
+                    url: fetch_call.url.clone(),
+                },
+                action_outcome,
+            ));
+            (summary, content)
+        };
+
+        self.append_fetch_exchange(
+            &pending,
+            &mut messages,
+            &mut turn_notes,
+            assistant_summary,
+            &tool_result_content,
+            after_tool.as_ref(),
+            &repository_root,
+        )?;
+        self.resume_fetch_turn(pending, messages, turn_notes, model_adapter, sink)
+    }
+
+    /// Feeds a fetch decision back to the model and continues the turn.
+    ///
+    /// Split from [`Self::resume_after_fetch_decision`] because every refusal
+    /// path and both approvals need the identical tail: one assistant summary,
+    /// one tool result, the pending link cleared, and the loop resumed one round
+    /// on.
+    fn resume_fetch_turn(
+        &self,
+        pending: PendingChatTurn,
+        messages: Vec<ModelMessage>,
+        turn_notes: TurnNotesState,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let repository_root = PathBuf::from(&pending.repository_root);
+        self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+        let task = self.session_store.update_task_status(
+            &pending.task,
+            TaskStatus::PreparingContext,
+            None,
+        )?;
+        let result = self.run_agentic_turn(
+            &repository_root,
+            pending.session,
+            task,
+            pending.context_files,
+            messages,
+            pending.round + 1,
+            pending.exploration_rounds,
+            turn_notes,
+            pending.step_evidence,
+            pending.plan_reminder_sent,
+            model_adapter,
+            sink,
+            pending.turn_options,
+        )?;
+        if pending.turn_options.verification_turn {
+            return self.close_verification_resume(&repository_root, result);
+        }
+        Ok(result)
+    }
+
+    /// Appends one fetch call's assistant summary and tool result, and records
+    /// the call so the per-turn cap and the repeat check see it.
+    ///
+    /// A fetch pause happens before the call is fed back, so the main loop never
+    /// records it. Without this the resumed call would not count toward
+    /// `web_fetch_max_per_turn` and an identical retry would not be a repeat.
+    #[allow(clippy::too_many_arguments)]
+    fn append_fetch_exchange(
+        &self,
+        pending: &PendingChatTurn,
+        messages: &mut Vec<ModelMessage>,
+        turn_notes: &mut TurnNotesState,
+        assistant_summary: String,
+        tool_result: &str,
+        after_tool: Option<&(ToolAction, ActionOutcome)>,
+        repository_root: &Path,
+    ) -> Result<()> {
+        let mut tool_result = tool_result.to_string();
+        if let Some((action, outcome)) = after_tool {
+            let payload = tool_event_payload(&self.scanner, action, Some(outcome), None);
+            let after = self.dispatch_tool_event(
+                HookEvent::AfterTool,
+                &pending.session,
+                &pending.task,
+                repository_root,
+                payload,
+            );
+            if let Some(note) = hook_after_note(&after) {
+                tool_result.push_str("\n\n");
+                tool_result.push_str(&note);
+            }
+            self.record_after_refusal(
+                &pending.session.id,
+                &pending.task.id,
+                HookEvent::AfterTool,
+                &after,
+            );
+        }
+
+        self.session_store.append_message(
+            &pending.session.id,
+            Some(&pending.task.id),
+            "assistant",
+            &assistant_summary,
+        )?;
+        self.session_store.append_message(
+            &pending.session.id,
+            Some(&pending.task.id),
+            "tool",
+            &tool_result,
+        )?;
+
+        let message_index = if let Some(call) = &pending.matched_tool_call {
+            let round_message = pending
+                .round_calls_fed_back
+                .then(|| messages.iter().rposition(|m| !m.tool_calls.is_empty()))
+                .flatten();
+            match round_message {
+                Some(index) => {
+                    messages[index].tool_calls.push(call.clone());
+                    index
+                }
+                None => {
+                    let index = messages.len();
+                    messages.push(ModelMessage::assistant_with_tool_calls(
+                        pending.last_content.clone(),
+                        vec![call.clone()],
+                        pending.reasoning_content.clone(),
+                    ));
+                    index
+                }
+            }
+        } else {
+            // `fetch_url` exists only as a native call, so this is unreachable.
+            // It mirrors the command resume's text fallback rather than
+            // inventing a second rule.
+            messages.push(
+                ModelMessage::assistant(pending.last_content.clone())
+                    .with_reasoning_content(pending.reasoning_content.clone()),
+            );
+            messages.push(ModelMessage::user(format!("Fetch result:\n{tool_result}")));
+            0
+        };
+        if pending.matched_tool_call.is_some() {
+            messages.push(ModelMessage::tool(
+                pending
+                    .matched_tool_call
+                    .as_ref()
+                    .map(|call| call.id.clone())
+                    .unwrap_or_default(),
+                tool_result,
+            ));
+        }
+
+        if pending.matched_tool_call.is_some() {
+            let url = pending
+                .fetch_call
+                .as_ref()
+                .map(|call| call.url.clone())
+                .unwrap_or_default();
+            let line = self
+                .render_call_line(repository_root, &ToolAction::FetchUrl { url: url.clone() })
+                .map(|line| {
+                    truncate_for_prompt(
+                        &single_line(&self.scanner.redact(&line).text),
+                        CALL_LINE_MAX_CHARS,
+                    )
+                })
+                .unwrap_or_default();
+            turn_notes.calls.push(RecordedCall {
+                round: pending.round + pending.exploration_rounds + 1,
+                message_index,
+                line,
+                key: Some(vec!["fetch_url".to_string(), url]),
+                writes: true,
+            });
+        }
+        Ok(())
     }
 
     /// Decides a provider-fallback offer (spec 56).
@@ -6160,6 +6544,7 @@ impl ChatOrchestrator {
                         round_budget: None,
                         question: None,
                         check_batch: None,
+                        fetch_call: None,
                         context_review: None,
                     })?;
                     self.note_pending_approvals(
@@ -6457,6 +6842,7 @@ impl ChatOrchestrator {
                                     round_budget: None,
                                     question: None,
                                     check_batch: None,
+                                    fetch_call: None,
                                     context_review: None,
                                 })?;
                                 self.note_pending_approvals(
@@ -6829,14 +7215,112 @@ impl ChatOrchestrator {
                         }
                         ToolAction::FetchUrl { url } => {
                             let cancel = sink.cancel;
-                            self.dispatch_fetch_url(
+                            match self.dispatch_fetch_url(
                                 repository_root,
                                 &session,
                                 &task,
                                 &url,
                                 &turn_notes.calls,
                                 cancel,
-                            )?
+                            )? {
+                                FetchDispatch::Result(summary, content, outcome) => {
+                                    (summary, content, outcome)
+                                }
+                                // Spec 51 §5.3 constraint 1: an unapproved host
+                                // pauses before the request is built. The turn
+                                // ends cleanly, not as a failure — nothing has
+                                // left the machine and the user has a decision
+                                // to make.
+                                FetchDispatch::NeedsApproval(inspection) => {
+                                    let host = inspection.url.host.clone();
+                                    let response = format!(
+                                        "Fetching from {host} needs your approval before \
+                                         anything is requested."
+                                    );
+                                    let proposal_id = create_id("fetch");
+                                    let proposal = AgentFetchProposal {
+                                        id: proposal_id.clone(),
+                                        host: host.clone(),
+                                        url: inspection.url.raw.clone(),
+                                        approval_key: inspection.url.approval_key(),
+                                        long_components: inspection
+                                            .flags
+                                            .long_components
+                                            .iter()
+                                            .map(|flag| FetchComponentFlag {
+                                                component: flag.component.as_str().to_string(),
+                                                bytes: flag.bytes,
+                                            })
+                                            .collect(),
+                                        query: inspection.url.query.clone(),
+                                        fragment: inspection.url.fragment.clone(),
+                                    };
+                                    self.pending_commands.save(&PendingChatTurn {
+                                        proposal_id: proposal_id.clone(),
+                                        session: session.clone(),
+                                        task: task.clone(),
+                                        repository_root: repository_root
+                                            .to_string_lossy()
+                                            .to_string(),
+                                        context_files: context_files.clone(),
+                                        round: action_rounds,
+                                        exploration_rounds,
+                                        turn_notes: turn_notes.text.clone(),
+                                        turn_notes_carried: turn_notes.carried,
+                                        calls: turn_notes.calls.clone(),
+                                        step_evidence: step_evidence.clone(),
+                                        plan_reminder_sent,
+                                        messages: messages.clone(),
+                                        matched_tool_call: matched_tool_call.clone(),
+                                        last_content: redacted.clone(),
+                                        turn_options,
+                                        reasoning_content: model_run.reasoning_content.clone(),
+                                        round_calls_fed_back: round_message.is_some(),
+                                        mcp_call: None,
+                                        web_diagnostic_call: None,
+                                        plan_review: None,
+                                        provider_fallback: None,
+                                        round_budget: None,
+                                        question: None,
+                                        check_batch: None,
+                                        fetch_call: Some(PendingFetchCall {
+                                            host: host.clone(),
+                                            url: proposal.url.clone(),
+                                            approval_key: proposal.approval_key.clone(),
+                                            long_components: proposal.long_components.clone(),
+                                            query: proposal.query.clone(),
+                                            fragment: proposal.fragment.clone(),
+                                        }),
+                                        context_review: None,
+                                    })?;
+                                    self.note_pending_approvals(
+                                        &session,
+                                        &task,
+                                        vec![PendingApproval {
+                                            kind: "fetch".to_string(),
+                                            proposal_id: proposal_id.clone(),
+                                        }],
+                                    );
+                                    // A clean stop for a human decision, not a
+                                    // crash: nothing was dispatched, so the
+                                    // marker is finished rather than left
+                                    // dangling.
+                                    self.session_store
+                                        .finish_action(action_marker, "awaiting_approval")?;
+                                    let mut proposal_run = model_run;
+                                    proposal_run.content = response.clone();
+                                    terminal = Some((
+                                        proposal_run,
+                                        response,
+                                        TurnProposals {
+                                            fetch: Some(proposal),
+                                            ..Default::default()
+                                        },
+                                        StopReason::Answered,
+                                    ));
+                                    break;
+                                }
+                            }
                         }
                         ToolAction::WebDiagnostic(call) => {
                             let call = call.with_context(&session.id, &task.id);
@@ -6883,6 +7367,7 @@ impl ChatOrchestrator {
                                     round_budget: None,
                                     question: None,
                                     check_batch: None,
+                                    fetch_call: None,
                                     context_review: None,
                                 })?;
                                 self.note_pending_approvals(
@@ -7006,6 +7491,7 @@ impl ChatOrchestrator {
                                     round_budget: None,
                                     question: None,
                                     check_batch: None,
+                                    fetch_call: None,
                                     context_review: None,
                                 })?;
                                 self.note_pending_approvals(
@@ -7285,6 +7771,7 @@ impl ChatOrchestrator {
                                             question_id: question.question_id().to_string(),
                                         }),
                                         check_batch: None,
+                                        fetch_call: None,
                                         context_review: None,
                                     })?;
                                     // A clean stop for a human decision, not a
@@ -7541,6 +8028,15 @@ impl ChatOrchestrator {
                         kind: "plan".to_string(),
                         proposal_id: proposal.id.clone(),
                     })
+            })
+            .or_else(|| {
+                proposals
+                    .fetch
+                    .as_ref()
+                    .map(|proposal| crate::session::PendingApprovalRef {
+                        kind: "fetch".to_string(),
+                        proposal_id: proposal.id.clone(),
+                    })
             });
         let pending_question = proposals
             .question
@@ -7627,6 +8123,8 @@ impl ChatOrchestrator {
                         "plan_review_required".to_string()
                     } else if proposals.question.is_some() {
                         "question_pending".to_string()
+                    } else if proposals.fetch.is_some() {
+                        "fetch_approval_required".to_string()
                     } else if stop_reason == StopReason::ToolBudget {
                         "tool_budget_exhausted".to_string()
                     } else if stop_reason == StopReason::TokenBudget {
@@ -7640,12 +8138,17 @@ impl ChatOrchestrator {
             ],
         )?;
         // A turn waiting on a command decision is not over: it resumes through
-        // `resume_after_command_decision` and seals then. A plan review and a
-        // question are the same shape — nothing has happened yet and the turn
-        // continues through `resume_after_plan_decision` or
-        // `resume_after_answer`. Anything else has left the repository in the
-        // state a rewind must compare against.
-        if proposals.command.is_none() && proposals.plan.is_none() && proposals.question.is_none() {
+        // `resume_after_command_decision` and seals then. A plan review, a
+        // question and a fetch approval are the same shape — nothing has
+        // happened yet and the turn continues through
+        // `resume_after_plan_decision`, `resume_after_answer` or
+        // `resume_after_fetch_decision`. Anything else has left the repository
+        // in the state a rewind must compare against.
+        if proposals.command.is_none()
+            && proposals.plan.is_none()
+            && proposals.question.is_none()
+            && proposals.fetch.is_none()
+        {
             self.seal_turn_checkpoint(repository_root, &session, &task);
         }
         // From the log, not from a running total: the number the client shows
@@ -7673,6 +8176,7 @@ impl ChatOrchestrator {
             patch_proposal: proposals.patch,
             plan_proposal: proposals.plan,
             question_proposal: proposals.question,
+            fetch_proposal: proposals.fetch,
             fallback_proposal: None,
             round_budget_proposal: None,
             check_batch: proposals.checks,
@@ -7737,6 +8241,7 @@ impl ChatOrchestrator {
             round_budget: None,
             question: None,
             check_batch: None,
+            fetch_call: None,
             context_review: None,
         })?;
         self.note_pending_approvals(
@@ -7792,6 +8297,7 @@ impl ChatOrchestrator {
             patch_proposal: None,
             plan_proposal: None,
             question_proposal: None,
+            fetch_proposal: None,
             fallback_proposal: Some(AgentFallbackProposal {
                 id: proposal_id,
                 refused_provider: offer.refused_provider,
@@ -7872,6 +8378,7 @@ impl ChatOrchestrator {
             round_budget: Some(pause),
             question: None,
             check_batch: None,
+            fetch_call: None,
             context_review: None,
         })?;
         self.note_pending_approvals(
@@ -7935,6 +8442,7 @@ impl ChatOrchestrator {
             patch_proposal: None,
             plan_proposal: None,
             question_proposal: None,
+            fetch_proposal: None,
             fallback_proposal: None,
             round_budget_proposal: Some(AgentRoundBudgetProposal {
                 id: proposal_id,
@@ -8039,6 +8547,7 @@ impl ChatOrchestrator {
             patch_proposal: None,
             plan_proposal: None,
             question_proposal: None,
+            fetch_proposal: None,
             fallback_proposal: None,
             round_budget_proposal: None,
             check_batch: None,
@@ -8345,7 +8854,7 @@ impl ChatOrchestrator {
         url: &str,
         calls: &[RecordedCall],
         cancel: &CancelToken,
-    ) -> Result<(String, String, ActionOutcome)> {
+    ) -> Result<FetchDispatch> {
         // Spec 51 §5.6: the cap is read from config and counted from this
         // turn's own call list, which a pause carries, so a resumed turn cannot
         // refresh it.
@@ -8359,7 +8868,7 @@ impl ChatOrchestrator {
             })
             .count();
         if used >= cap {
-            return Ok((
+            return Ok(FetchDispatch::Result(
                 "Attempted to fetch a URL.".to_string(),
                 format!(
                     "A fetch was not made: this turn has already fetched {used} of {cap} pages. \
@@ -8377,15 +8886,14 @@ impl ChatOrchestrator {
             .iter()
             .map(|(path, content)| ReadFileContent { path, content })
             .collect();
-        let inspection = match inspect(
-            url,
-            &self.config.web_domain_allowlist,
-            &self.scanner,
-            &files_read,
-        ) {
+        // The allowlist is read afresh for this checkout, because `Allow
+        // Always` writes user config during the session and the loaded config
+        // is a snapshot from before that write (D8, spec 34 §5.4).
+        let allowed = self.web_domain_allowlist_for(repository_root);
+        let inspection = match inspect(url, &allowed, &self.scanner, &files_read) {
             Ok(inspection) => inspection,
             Err(error) => {
-                return Ok((
+                return Ok(FetchDispatch::Result(
                     "Attempted to fetch a URL.".to_string(),
                     format!(
                         "Cannot fetch that URL: {}. Nothing was requested.",
@@ -8397,42 +8905,104 @@ impl ChatOrchestrator {
         };
         let host = inspection.url.host.clone();
         match &inspection.decision {
-            Decision::Refused(reason) => {
-                return Ok((
-                    format!("Attempted to fetch from {host}."),
-                    format!(
-                        "Cannot fetch from {host}: {}. Nothing was requested.",
-                        reason.message()
-                    ),
-                    ActionOutcome::Failed,
-                ));
+            Decision::Refused(reason) => Ok(FetchDispatch::Result(
+                format!("Attempted to fetch from {host}."),
+                format!(
+                    "Cannot fetch from {host}: {}. Nothing was requested.",
+                    reason.message()
+                ),
+                ActionOutcome::Failed,
+            )),
+            // Nothing has been requested: the turn pauses before the transport
+            // is built, and `FetchDecision` decides what happens next.
+            Decision::NeedsApproval => Ok(FetchDispatch::NeedsApproval(inspection)),
+            Decision::AlreadyAllowed => {
+                let (summary, content, outcome) = self.fetch_after_inspection(
+                    repository_root,
+                    session,
+                    task,
+                    &inspection.url,
+                    None,
+                    cancel,
+                )?;
+                Ok(FetchDispatch::Result(summary, content, outcome))
             }
-            // Task 8 replaces this with the approval pause. Until then the
-            // model is told how the user approves the host rather than the
-            // fetch silently proceeding or the turn stopping on a decision
-            // nobody can make.
-            Decision::NeedsApproval => {
-                return Ok((
-                    format!("Attempted to fetch from {host}."),
-                    format!(
-                        "Fetching from {host} needs the user's approval first, and this task \
-                         cannot ask for it. Add `{}` to the `web_domain_allowlist` setting in \
-                         user config, then call fetch_url again. Nothing was requested.",
-                        inspection.url.approval_key()
-                    ),
-                    ActionOutcome::Failed,
-                ));
-            }
-            Decision::AlreadyAllowed => {}
         }
+    }
 
+    /// The hosts approved for this checkout, from the config this engine
+    /// loaded plus the user config on disk.
+    ///
+    /// `Allow Always` writes `web_domain_allowlist.<repository id>` to user
+    /// config, and the engine's `Config` was built before that write. Re-reading
+    /// the map here is what makes the next fetch in the same session honour the
+    /// grant. Only user config is read, and only the map keyed by this
+    /// checkout's id, so a repository config still cannot add a host (Task 2
+    /// refuses that key at repository scope).
+    fn web_domain_allowlist_for(&self, repository_root: &Path) -> Vec<String> {
+        let mut entries = self.config.web_domain_allowlist.clone();
+        for entry in self.repository_web_domains_for(repository_root) {
+            if !entries
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&entry))
+            {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    /// The `Allow Always` grants recorded for one checkout, newest source
+    /// first: user config on disk, then the map the engine loaded.
+    fn repository_web_domains_for(&self, repository_root: &Path) -> Vec<String> {
+        let repository_id = repository_id_for_root(repository_root);
+        let mut entries: Vec<String> = Vec::new();
+        if let Ok(overlay) = ConfigOverlay::load_or_default(self.config.user_config_path())
+            && let Some(granted) = overlay
+                .web_domain_allowlist_by_repository
+                .get(&repository_id)
+        {
+            entries.extend(granted.iter().cloned());
+        }
+        if let Some(granted) = self
+            .config
+            .web_domain_allowlist_by_repository
+            .get(&repository_id)
+        {
+            for entry in granted {
+                if !entries
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(entry))
+                {
+                    entries.push(entry.clone());
+                }
+            }
+        }
+        entries
+    }
+
+    /// Runs the request for an allowed or just-approved URL and records it.
+    ///
+    /// `decision_basis` is `Some` only when the reason is not in the allowlist
+    /// — a one-off approval — so the audit names what actually happened rather
+    /// than claiming a standing grant.
+    fn fetch_after_inspection(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        url: &ExternalUrl,
+        decision_basis: Option<&str>,
+        cancel: &CancelToken,
+    ) -> Result<(String, String, ActionOutcome)> {
+        let host = url.host.clone();
         let transport = CurlFetchTransport::new(
             ProcessRegistry::open(&self.config.data_dir)?,
             &self.config.data_dir,
             &session.id,
             SecretScanner::new(self.config.secret_patterns.clone()),
         );
-        let outcome = match transport.fetch(&inspection.url, cancel) {
+        let outcome = match transport.fetch(url, cancel) {
             Ok(outcome) => outcome,
             // A stop belongs to the turn: the caller closes the marker and ends
             // the turn cancelled instead of recording a result (spec 08).
@@ -8462,7 +9032,7 @@ impl ChatOrchestrator {
                     ("actor", "assistant".to_string()),
                     ("sessionId", session.id.clone()),
                     ("taskId", task.id.clone()),
-                    ("url", inspection.url.request_url()),
+                    ("url", url.request_url()),
                     ("host", host.clone()),
                     ("status", outcome.status.to_string()),
                     ("location", location.clone()),
@@ -8485,7 +9055,7 @@ impl ChatOrchestrator {
             ));
         }
 
-        let converted = ConvertedResponse::from_outcome(&inspection.url, &outcome, &self.scanner);
+        let converted = ConvertedResponse::from_outcome(url, &outcome, &self.scanner);
         // D5: the page enters the next assembly as the lowest-priority context
         // category. The payload is the converted, redacted, bounded text and
         // never the raw body; `contentHash` lets a reader verify the stored
@@ -8497,15 +9067,16 @@ impl ChatOrchestrator {
         // The audit basis is the per-repository grant, read now rather than
         // snapshotted at load, so an `Allow Always` write in this session is
         // visible to the next fetch (context.md §4).
-        let approval_basis = match self
-            .config
-            .web_domain_allowlist_by_repository
-            .get(&session.repository_id)
-        {
-            Some(entries) if HostAllowlist::from_config(entries).permits(&inspection.url) => {
-                "repository_allowlist"
+        let approval_basis = match decision_basis {
+            Some(basis) => basis.to_string(),
+            None => {
+                let repository_entries = self.repository_web_domains_for(repository_root);
+                if HostAllowlist::from_config(&repository_entries).permits(url) {
+                    "repository_allowlist".to_string()
+                } else {
+                    "user_allowlist".to_string()
+                }
             }
-            _ => "user_allowlist",
         };
         self.audit_log.record(
             "web_fetch",
@@ -8513,7 +9084,7 @@ impl ChatOrchestrator {
                 ("actor", "assistant".to_string()),
                 ("sessionId", session.id.clone()),
                 ("taskId", task.id.clone()),
-                ("url", inspection.url.request_url()),
+                ("url", url.request_url()),
                 ("host", host.clone()),
                 ("status", converted.status.to_string()),
                 ("bytes", converted.bytes.to_string()),
@@ -8522,7 +9093,7 @@ impl ChatOrchestrator {
                     converted.content_type.clone().unwrap_or_default(),
                 ),
                 ("cached", converted.cached.to_string()),
-                ("approval", approval_basis.to_string()),
+                ("approval", approval_basis),
                 ("contentHash", content_hash),
             ],
         )?;
@@ -8949,6 +9520,10 @@ enum PausedFor {
     /// (spec 23).
     CheckBatch,
     Question,
+    /// A host approval before a `fetch_url` request (spec 51 §5.3). Nothing
+    /// was requested, and the only route that may continue it is
+    /// `resume_after_fetch_decision`.
+    Fetch,
     /// A pre-send context review (spec 27 §5.1). Nothing was sent, and the
     /// only route that may continue it is
     /// `resume_after_context_decision`.
@@ -8968,6 +9543,7 @@ impl PausedFor {
             Self::RoundBudget => "a round-budget pause",
             Self::CheckBatch => "a check approval",
             Self::Question => "a question",
+            Self::Fetch => "a fetch approval",
             Self::ContextReview => "a context review",
             Self::Conflicting => "more than one kind of pause",
         }
@@ -8981,6 +9557,7 @@ impl PausedFor {
             Self::RoundBudget => "resume_round_budget",
             Self::CheckBatch => "resume_after_check_decision",
             Self::Question => "resume_after_answer",
+            Self::Fetch => "resume_after_fetch_decision",
             Self::ContextReview => "resume_after_context_decision",
             Self::Conflicting => "",
         }
@@ -8995,6 +9572,26 @@ struct PendingQuestion {
     question_id: String,
 }
 
+/// What a fetch pause is waiting for (spec 51 §5.3).
+///
+/// The URL is stored verbatim because the resumed request is the one the user
+/// approved: re-deriving it from parsed parts could change it, and a dialog
+/// that showed a different string than the request carries would be asking a
+/// different question. The host and approval key are kept alongside so neither
+/// the decision route nor the audit has to parse it again.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingFetchCall {
+    host: String,
+    url: String,
+    approval_key: String,
+    #[serde(default)]
+    long_components: Vec<FetchComponentFlag>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    fragment: Option<String>,
+}
+
 /// The kind of pause a saved turn represents. Every writer sets at most one
 /// marker; the tuple match makes a new field on [`PendingChatTurn`] a compile
 /// error here, which is where each resume's decision starts.
@@ -9005,15 +9602,17 @@ fn paused_for(pending: &PendingChatTurn) -> PausedFor {
         pending.round_budget.is_some(),
         pending.question.is_some(),
         pending.check_batch.is_some(),
+        pending.fetch_call.is_some(),
         pending.context_review.is_some(),
     ) {
-        (false, false, false, false, false, false) => PausedFor::Action,
-        (true, false, false, false, false, false) => PausedFor::PlanReview,
-        (false, true, false, false, false, false) => PausedFor::ProviderFallback,
-        (false, false, true, false, false, false) => PausedFor::RoundBudget,
-        (false, false, false, true, false, false) => PausedFor::Question,
-        (false, false, false, false, true, false) => PausedFor::CheckBatch,
-        (false, false, false, false, false, true) => PausedFor::ContextReview,
+        (false, false, false, false, false, false, false) => PausedFor::Action,
+        (true, false, false, false, false, false, false) => PausedFor::PlanReview,
+        (false, true, false, false, false, false, false) => PausedFor::ProviderFallback,
+        (false, false, true, false, false, false, false) => PausedFor::RoundBudget,
+        (false, false, false, true, false, false, false) => PausedFor::Question,
+        (false, false, false, false, true, false, false) => PausedFor::CheckBatch,
+        (false, false, false, false, false, true, false) => PausedFor::Fetch,
+        (false, false, false, false, false, false, true) => PausedFor::ContextReview,
         _ => PausedFor::Conflicting,
     }
 }
@@ -9176,6 +9775,12 @@ struct PendingChatTurn {
     /// finishes the report without re-deriving what the check saw.
     #[serde(default)]
     check_batch: Option<PendingCheckBatch>,
+    /// Present when the pause is a host approval before a fetch (spec 51
+    /// §5.3). Nothing was requested: an unapproved host stops the turn before
+    /// the request is built. `#[serde(default)]` keeps pending turns written
+    /// before the pause existed loadable.
+    #[serde(default)]
+    fetch_call: Option<PendingFetchCall>,
     /// Present when the pause is a pre-send context review (spec 27 §5.1).
     /// `#[serde(default)]` keeps pending turns written before the review
     /// existed loadable.

@@ -60,10 +60,11 @@ pub use audit::AuditLog;
 pub use cancel::CancelToken;
 pub use chat::{
     AgentCheckBatch, AgentCommandProposal, AgentContextReview, AgentFallbackProposal,
-    AgentPatchProposal, AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal,
-    ChatOrchestrator, ChatTurnOptions, ChatTurnResult, ContextDecision, McpTokenResolver,
-    PausedTurns, PhaseKind, PlanRevisionStep, ResumeDecisionOptions, RoundBudgetDecision,
-    RoundBudgetPause, TurnPhase, TurnProgress, TurnSink,
+    AgentFetchProposal, AgentPatchProposal, AgentPlanProposal, AgentQuestionProposal,
+    AgentRoundBudgetProposal, ChatOrchestrator, ChatTurnOptions, ChatTurnResult, ContextDecision,
+    FetchComponentFlag, FetchDecision, McpTokenResolver, PausedTurns, PhaseKind, PlanRevisionStep,
+    ResumeDecisionOptions, RoundBudgetDecision, RoundBudgetPause, TurnPhase, TurnProgress,
+    TurnSink,
 };
 pub use checkpoint::{
     CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,

@@ -10676,6 +10676,196 @@ function createQuestionCard(question, questionRepo, { answered = null } = {}) {
   return wrapper;
 }
 
+// Spec 51 §5.3: the first fetch of a host asks before anything leaves the
+// machine. The host is the headline and the URL is shown exactly as the model
+// wrote it — wrapped, never shortened — because a user approving a request has
+// to be able to read all of it. An over-long query or fragment is broken out
+// and marked, since a long opaque parameter is the shape exfiltration takes and
+// nobody spots it inside a long line.
+//
+// "Always allow" persists beyond this turn, so it goes in the overflow rather
+// than beside the one-shot action (UI_STYLE_GUIDE §4).
+function createFetchApproval(proposal, proposalRepo) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "fetch-approval";
+  wrapper.dataset.fetchProposalId = proposal.proposalId || "";
+
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "fetch-approval-eyebrow";
+  eyebrow.textContent = "Read an external page";
+
+  const host = document.createElement("p");
+  host.className = "fetch-approval-host";
+  host.textContent = proposal.host || "";
+
+  const lead = document.createElement("p");
+  lead.className = "fetch-approval-lead";
+  lead.textContent =
+    "The agent wants to request this address. Nothing has been sent, and the request " +
+    "carries no credentials or cookies.";
+
+  const url = document.createElement("code");
+  url.className = "fetch-approval-url";
+  url.textContent = proposal.url || "";
+
+  wrapper.append(eyebrow, host, lead, url);
+
+  const flags = Array.isArray(proposal.longComponents) ? proposal.longComponents : [];
+  for (const flag of flags) {
+    const component = flag.component === "fragment" ? "fragment" : "query";
+    const value = component === "fragment" ? proposal.fragment : proposal.query;
+    const box = document.createElement("div");
+    box.className = "fetch-approval-flag";
+    const label = document.createElement("p");
+    label.className = "fetch-approval-flag-label";
+    label.textContent = `Long ${component} — ${flag.bytes} bytes. Read it before allowing this.`;
+    const code = document.createElement("code");
+    code.className = "fetch-approval-flag-value";
+    code.textContent = value || "";
+    box.append(label, code);
+    wrapper.append(box);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "command-approval-actions";
+  const once = document.createElement("button");
+  once.type = "button";
+  once.className = "btn-sm btn-primary";
+  once.textContent = "Allow once";
+  const deny = document.createElement("button");
+  deny.type = "button";
+  deny.className = "btn-sm btn-quiet";
+  deny.textContent = "Don't fetch";
+  actions.append(once, deny);
+
+  let overflowButton = null;
+  if (proposal.approvalKey) {
+    overflowButton = document.createElement("button");
+    overflowButton.type = "button";
+    overflowButton.className = "btn-icon";
+    overflowButton.dataset.menuId = `fetch-approval-${proposal.proposalId}`;
+    overflowButton.setAttribute("aria-haspopup", "menu");
+    overflowButton.setAttribute("aria-expanded", "false");
+    overflowButton.setAttribute("aria-label", "More fetch options");
+    overflowButton.title = "More fetch options";
+    overflowButton.innerHTML = '<span class="dots-icon" aria-hidden="true"></span>';
+    overflowButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleApprovalMenu(
+        [
+          {
+            label: "Always allow this host in this project",
+            hint: "Writes web_domain_allowlist to user config — persists after this turn",
+            onSelect: () => void decide("always", "Allowed for this project"),
+          },
+        ],
+        overflowButton,
+      );
+    });
+    actions.append(overflowButton);
+  }
+
+  const status = document.createElement("p");
+  status.className = "fetch-approval-status";
+  status.hidden = true;
+
+  wrapper.append(actions, status);
+
+  const controls = [once, deny, ...(overflowButton ? [overflowButton] : [])];
+  const setDisabled = (disabled) => {
+    controls.forEach((control) => {
+      control.disabled = disabled;
+    });
+  };
+
+  once.addEventListener("click", () => void decide("once", "Allowed once"));
+  deny.addEventListener("click", () => void decide("deny", "Not fetched"));
+
+  async function decide(decision, settledText) {
+    if (chatSubmitting) {
+      toast("A turn is already running");
+      return;
+    }
+    setDisabled(true);
+    closeApprovalMenu();
+    status.hidden = false;
+    status.textContent = decision === "deny" ? "Refusing…" : "Reading…";
+
+    const assistantMessage = appendChatMessage("assistant", "");
+    const indicator = startTurnIndicator(assistantMessage);
+    let assistantText = "";
+    let streamError = null;
+    chatSubmitting = true;
+    setComposerBusy(true);
+    try {
+      await streamResumeFetchRequest(
+        {
+          repo: proposalRepo,
+          proposal_id: proposal.proposalId,
+          decision,
+          session_id: currentSessionId || "",
+        },
+        {
+          phase(payload) {
+            indicator.phase(payload);
+          },
+          plan(planPayload) {
+            renderPlanPanel(assistantMessage, planPayload);
+          },
+          webDiagnostic(record) {
+            sessionHasRecordedDiagnostics = true;
+            renderWebDiagnosticCard(assistantMessage, record);
+          },
+          token(token) {
+            assistantText += token;
+            updateChatMessage(assistantMessage, assistantText);
+            indicator.streaming();
+          },
+          done(payload) {
+            if (payload.response && payload.response !== assistantText) {
+              assistantText = payload.response;
+              updateChatMessage(assistantMessage, assistantText);
+            }
+            appendProposals(assistantMessage, payload, proposalRepo);
+            if (payload.sessionId) {
+              currentSessionId = payload.sessionId;
+              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+            }
+            appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            appendTurnNotes(assistantMessage.body, payload.turnNotes);
+            markMessageUsage(assistantMessage, payload.usage);
+            indicator.finish(chatCompletionState(payload));
+            markMessageTurnStop(assistantMessage, payload);
+          },
+          error(payload) {
+            streamError = new Error(payload.error || "The fetch decision failed");
+          },
+        },
+      );
+    } catch (error) {
+      streamError = error;
+    } finally {
+      indicator.finish("failed");
+      chatSubmitting = false;
+      setComposerBusy(false);
+    }
+    if (streamError) {
+      // The engine puts the pause back on a refusal, so a second attempt is
+      // still the same decision rather than a new one.
+      renderChatMessageError(assistantMessage, streamError);
+      status.textContent = streamError.message;
+      setDisabled(false);
+      return;
+    }
+    status.textContent = settledText;
+    await loadSessions(currentSessionId, false);
+    await refreshFindings();
+    void refreshRepoBar();
+  }
+
+  return wrapper;
+}
+
 // One verification continuation, streamed into a fresh assistant bubble. Used
 // by the patch card's settle trigger, the recovery offer, and the check card,
 // so all three render the report and any repair patch the same way.
@@ -11032,6 +11222,9 @@ function appendProposals(message, payload, repo) {
   }
   if (payload.questionProposal) {
     message.body.append(createQuestionCard(payload.questionProposal, repo));
+  }
+  if (payload.fetchProposal) {
+    message.body.append(createFetchApproval(payload.fetchProposal, repo));
   }
   if (payload.contextReview) {
     message.body.append(createContextReview(payload.contextReview, repo));
@@ -12524,6 +12717,12 @@ async function streamChatRequest(data, handlers, signal) {
 async function streamResumeCommandRequest(data, handlers) {
   const fallbackPath = data.approved === "true" ? "/api/run-command" : "/api/reject-command";
   return streamRequest("/api/resume-command-stream", fallbackPath, data, handlers);
+}
+
+// A fetch decision resumes the turn, so the non-streaming fallback carries the
+// same decision and answers with the whole turn result.
+async function streamResumeFetchRequest(data, handlers) {
+  return streamRequest("/api/resume-fetch-stream", "/api/fetch-decision", data, handlers);
 }
 
 // No non-streaming fallback: resuming a plan decision *is* a turn, and there is

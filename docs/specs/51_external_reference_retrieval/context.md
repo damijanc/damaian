@@ -267,6 +267,20 @@ be presented as current.
   compared exactly, so `Allow Always` must store
   `ExternalUrl::approval_key()`. A default-port URL and the same host on a
   non-default port remain different approvals (D8).
+- **A crash during a fetch pause is not reattachable (Task 8 finding).** The
+  pause registers a `fetch` pending approval and writes the whole paused turn,
+  but `recovery.rs` has no branch for that kind, so the next launch fails the
+  task with "unknown pending approval kind fetch" instead of re-presenting the
+  dialog. This matches a browser-diagnostic or MCP pause, which are also
+  unrecoverable, and adding a reattachment branch would reach beyond Task 8's
+  files. The paused turn carries everything a card would need (`fetch_call`),
+  so a later change can add `ReattachedApproval::Fetch` and the shell card
+  without changing the pause format.
+- **`Allow Always` is read back from user config on every fetch (Task 8).**
+  `ChatOrchestrator::web_domain_allowlist_for` unions the loaded list with
+  `web_domain_allowlist.<repository id>` read from `user.conf`, because the
+  engine's `Config` predates the write. Only user config is read; repository
+  config still cannot write that map.
 
 ## 5. What later tasks inherit
 
@@ -280,6 +294,11 @@ be presented as current.
   the same change as the behaviour.
 - Task 10's injection scenarios are the evidence for requirement 4. A design
   argument is not evidence; record which fixtures ever succeeded.
+- Task 9's deterministic scenarios must pre-approve their loopback stub's
+  `host:port` in `web_domain_allowlist`: every unapproved fetch now pauses, and
+  the eval harness has no action that answers a fetch approval. Assert the
+  `web_fetch_approval_decision` and `web_fetch` audit events, and assert that no
+  `fetch_url` result appears when a URL was refused.
 - Task 3's `external_reference::inspect` reports an unparsable URL as
   `Err(UrlParseError)` and a secret or repository-content match as
   `Ok(Inspection { decision: Decision::Refused(..) })`. Task 7 maps both to a
