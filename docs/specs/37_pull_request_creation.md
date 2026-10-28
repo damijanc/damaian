@@ -8,8 +8,8 @@ reference is a name rather than a link; this spec is self-contained.
 Depends on: [#33](33_mcp_management_and_deferred_discovery.md) (the MCP client
 it publishes through) — **not built**; [#35](35_commit_preparation/proposal.md) (commit
 preparation) — built (Done 2026-10-26); [#36](36_branch_and_worktree_delivery/proposal.md) (branch
-delivery) — **not built**. Everything else named below is a cross-reference,
-not a prerequisite.
+delivery) — built (Done 2026-10-28; CI run outstanding). Everything else named
+below is a cross-reference, not a prerequisite. #37 stays blocked on #33.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.8 (risk classification and approval), section 7.10
 (secret detection). Related implementation specs:

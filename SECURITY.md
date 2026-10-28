@@ -238,6 +238,42 @@ it is treated as a capability rather than a convenience:
   `sideEffecting: true`; a crash between them classifies as an unknown external
   outcome and recovery offers inspection, never an automatic re-commit.
 
+## Git Branches
+
+Branch creation, switching and deletion are Git mutations and therefore separate
+capabilities from committing (spec 36):
+
+- **One typed approval per operation.** `GitMutation` has one variant per
+  operation — `CreateBranch`, `SwitchBranch`, `DeleteBranch` — and no catch-all,
+  so an approval can never be reused across operations. The route requires
+  `approval=branch` and the exact prepared mutation; a commit approval, a command
+  approval or an answer to a question never satisfies it. The durable record is
+  consumed once and a second apply is refused. There is no “always allow”.
+- **Code mode and a profile that permits it.** Every prepare and every apply is
+  refused in Ask, Plan and Review, and whenever the resolved
+  `allow_git_branches` is false. The built-in **Read-only** profile turns it off.
+  Repository config may turn it off and may never turn it on, like every other
+  capability key.
+- **No force, merge, rebase or cherry-pick is executable here.** Creation runs
+  `git branch <name> <resolved-sha>`; switching runs `git switch --no-guess`;
+  deletion runs `git branch -d`, or `-D` only after the separate confirmation
+  that names the unmerged count and subjects. No command this feature constructs
+  contains `-f` or `--force`. Merge and rebase preparation run only
+  `git merge-tree --write-tree --name-only` and reads, which touch neither the
+  index, the working tree nor `HEAD`; there is no real-merge fallback and no
+  route that executes a merge, rebase or cherry-pick.
+- **Names come from redacted text.** A suggested name is derived from the
+  session title or request only after `SecretScanner` redaction, and Git —
+  `git check-ref-format --branch` — is authoritative about the final name. A
+  collision is reported with a free alternative rather than silently changed.
+- **Restricted paths stay out of reports.** Conflicted, changed and
+  dirty-switch path lists pass through `PathPolicy`, so a restricted file such
+  as `.env` is never named in a merge report or a refusal.
+- **A mutation is a side-effecting action.** It is bracketed by #17's markers
+  with `sideEffecting: true` and audited with the refs and outcome, never commit
+  bodies. Recovery compares the recorded ref with the repository now and never
+  retries.
+
 ## Repository Config Trust Boundary
 
 Configuration comes from three files, applied in order: user (`<data_dir>/config/user.conf`), repository (`<repo>/.damaian/config.conf`), and admin (`DAMAIAN_ADMIN_CONFIG` or `<data_dir>/config/admin.conf`). Only the repository file arrives with a clone, so **repository config is untrusted input**: it may add restrictions and never remove one.
@@ -246,7 +282,7 @@ A repository cannot set `shell`, `data_dir`, `allowed_roots`, `secret_patterns`,
 
 `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are unioned with the user's, so a repository may add a restriction but never drop one. `require_approval_for_file_edits`, `require_approval_for_risky_commands`, and `require_approval_for_all_commands` may be turned on by a repository, never off. `mcp_enabled` and a server's `enabled` may be turned off, never on, and `mcp_server_allowlist` may only be narrowed. A repository may *define* an MCP server — a useful suggestion — but the definition is created disabled and approval-gated, and it cannot redefine a server the user has already configured. The same holds for hooks: a repository may define a hook of its own, but it arrives pending review at a definition hash, cannot record its own review, and cannot change a hook the user or admin config already defines.
 
-Limits on how much one tool call, command or turn may read, run or spend may be lowered by a repository and never raised: `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, `agent_max_turn_notes_chars`, and `allow_git_commits`. Raising one would widen what leaves your machine or how long a command may run.
+Limits on how much one tool call, command or turn may read, run or spend may be lowered by a repository and never raised: `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, `agent_max_turn_notes_chars`, `allow_git_commits`, and `allow_git_branches`. Raising one would widen what leaves your machine or how long a command may run.
 
 `command_allowlist` is never taken from repository config. An `Allow Always` decision is the user's decision about a repository, so it is stored in user config as `command_allowlist.<repository_id>`, keyed per checkout. The repository's own file cannot grant its commands no-approval execution, and a `command_allowlist` already present in a repository file is offered once for itemised keep-or-discard rather than honoured.
 

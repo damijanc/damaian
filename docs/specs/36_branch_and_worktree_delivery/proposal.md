@@ -1,6 +1,7 @@
 # Feature Spec: Branch and Worktree Delivery
 
-Status: In progress (planned 2026-10-28; see `tasks.md`)
+Status: Done 2026-10-28. The full seven-check gate has **not** run for this
+branch yet; scoped checks passed locally (see `tasks.md` and §7).
 Order: 36 of 37
 Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 2 (Must). That directory is local-only and not committed, so the
@@ -375,17 +376,114 @@ unavailable on an older Git, and where branch operations appear in the audit log
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+### What shipped
 
-- The minimum Git version `merge-tree --write-tree` required in practice, and
-  how often the fallback path was taken. If most users hit the fallback,
-  conflict prediction is effectively absent and that should be known rather than
-  assumed working.
-- Whether Phase 2 WP4 had shipped, and therefore whether §5.7 was implemented or
-  left dormant. If it was left dormant, say so explicitly so a later reader does
-  not assume worktree support exists.
-- Any repository state that had to be refused rather than handled — detached
-  `HEAD`, mid-rebase, submodules — and the message shown for each.
+The engine surface is `crates/workspace-engine/src/branch.rs` (naming,
+`GitMutation`, the prepared-record store under `<data_dir>/branches/`, and the
+mutation and report paths) plus additions to `git_service.rs`: `BranchInfo`,
+`branch_info`, a public `merge_base`, `check_branch_name`, `local_branches`,
+`branch_exists`, `merge_tree` and `diff_names`. `allow_git_branches` and
+`git_branch_prefix` are in `config.rs`, with the capability resolved in
+`profile.rs` and labelled in `effective_policy.rs`; `WorkspaceEngine` exposes a
+`branch` engine.
+
+The shell surface is five routes in `desktop-shell/src/lib.rs` — branch info
+(`repo`, `session`; returns `BranchInfo` plus the local branch names),
+suggestion (`repo`, `session_id`, optional `source`), prepare
+(`operation=create|switch|delete`), the typed apply (`approval=branch`, the
+prepared `GitMutation` as JSON, optional `confirm_unmerged=true`), and
+merge/rebase preparation (`mode=merge|rebase`, `base`) — plus a folder-menu
+*Branch…* dialog in `app.js` and `style.css`. No route accepts a raw command,
+and no route runs a merge, rebase or cherry-pick.
+
+Tests: 37 integration tests in `workspace-engine/tests/branch_delivery.rs`,
+four `merge-tree` parser unit tests in `branch.rs`, the capability and config
+tests in `permission_profiles.rs`, and ten route tests in `desktop-shell`.
+
+### Worktrees (§5.7)
+
+Phase 2 WP4 had **not** shipped, so §5.7 stayed dormant and the four worktree
+criteria in §6 are conditional. Nothing in this work package creates, moves or
+removes a worktree, and §5.7 added no new mutation. What exists elsewhere is not
+this spec's work: spec 57 creates worker worktrees and refuses a dirty removal
+without a second confirmation naming the affected paths; spec 60's
+`GitService::worktrees`/`list_worktrees` already reports each worktree's path,
+`HEAD` and branch; and `worktree_access.rs` labels a path Git no longer considers
+a valid worktree as prunable. This spec added no externally-deleted-worktree
+message of its own, so a later reader must not assume the §5.7 checkpoint and
+worktree-deletion criteria were implemented here.
+
+### Repository states refused rather than handled
+
+- **Not a repository:** "This folder is not a Git repository."
+- **Unknown session:** "Unknown session. Open a session before changing branches."
+- **Not Code mode:** "Branch changes are available in Code mode only. This
+  session is in <mode> mode."
+- **Capability off:** "The permission profile does not allow Git branch changes
+  (allow_git_branches=false). Switching mode will not allow it."
+- **Merge, rebase, cherry-pick, revert, sequencer or bisect in progress:** "A Git
+  operation is in progress (<operation>). Finish or abort it before creating a
+  branch." Switching and deleting have the same sentence with their own verb.
+  The state comes from the same `branch_info` read, so all six markers are
+  refused, not only a conflicted merge.
+- **Detached `HEAD` for creation without a start point:** "HEAD is detached. Give
+  an explicit start point to create a branch from."
+- **Unborn `HEAD`:** "This repository has no commits yet. Commit something before
+  creating a branch."
+- **Dirty switch:** "Switching to `<name>` would overwrite uncommitted changes
+  in: <paths>. Commit or stash them, or switch after the working tree matches."
+- **Existing or invalid name:** "A branch named `<name>` already exists; it was
+  not changed. Try `<alternative>` instead." or Git's `check-ref-format` reason.
+- **Deleting the current branch or a branch checked out in a worktree:** a named
+  refusal before Git runs.
+- **Stale approval:** "HEAD moved from … to … since you reviewed this. Nothing
+  ran; prepare again." A moved ref has the same shape, per operation.
+- **Unmerged deletion without the second confirmation:**
+  `branch_unmerged_confirmation_required`, carrying the count (or the unknown
+  notice) and the subjects; the record stays `prepared`.
+
+Submodules are not refused as a repository. Branch operations behave as Git's
+own commands do, and no submodule-specific behaviour was added, as §4 says.
+
+### Deviations from the proposal
+
+- **`BranchInfo.head_oid` is `Option<String>`** rather than `String`, so an
+  unborn branch is representable (D5).
+- **Switching runs `git switch --no-guess`, not `symbolic-ref`.** The proposal's
+  command moves only `HEAD`; it would leave the index and working tree behind
+  (D6, context §3.17).
+- **The unmerged count uses one `--not`.** The proposal's literal
+  `--not --remotes --not <default>` is wrong: a second `--not` toggles the
+  revision walk back to positive and counts the default branch's own history.
+  The implementation runs `git rev-list --count <branch> --not --remotes
+  <default>` and the matching `git log --format=%s`.
+- **`DeleteBranch.unmerged_commits` is `Option<u32>`** (D11), so "the default
+  branch could not be resolved" is a state rather than a false zero.
+- **`apply` takes `confirm_unmerged`**; only that flag turns `git branch -d` into
+  `-D`, and only for a branch the preparation found unmerged or uncountable.
+- **The prefix is validated in Rust before Git sees the composed name.** Git
+  2.56's `check-ref-format` rejects `--end-of-options`, so the leading-`-`
+  protection cannot live in its argv (context §3.14). The composed name still
+  goes through `git check-ref-format --branch`.
+- **Apply re-checks the dirty-switch paths.** The task asked for the check before
+  switching; re-checking at apply is stricter because the tree can change
+  between review and approval.
+- **The approval names the resolved commit.** `GitMutation::CreateBranch`
+  carries the resolved SHA; the preparation and record separately report the
+  start point the user typed.
+- **The preparation refusal is HTTP 409 with the preparation attached**, rather
+  than a 200 carrying a refusal field, so the dialog can show the reason, the
+  collision alternative and the state in one answer. The apply route sends the
+  prepared mutation back as JSON rather than rebuilding it from form fields, so
+  the approval names exactly what was reviewed.
+- **`branch-info` requires `session`** and returns the local branch names the
+  dialog needs for switching and deletion.
+- **A branch checked out in any worktree cannot be deleted**, not only the
+  current checkout.
+- **`inspect` is engine-level.** A dangling branch action can be classified as
+  `landed`, `not_landed` or `other_ref_state`, and no path retries. The desktop
+  recovery card does not currently offer a branch-specific **Inspect** row, so
+  the durable record and session marker are the evidence a user can read.
 
 ### Task 6: merge and rebase preparation
 
@@ -409,3 +507,39 @@ To be completed during implementation. Record:
   preparation with a resolvable merge base in the tests took the
   `merge-tree --write-tree` path; only the synthetic parser tests take the
   unavailable branch.
+
+### Acceptance walk
+
+Every criterion in §6 is listed below. Test names without a path are in
+`crates/workspace-engine/tests/branch_delivery.rs`; `branch_route_tests` are in
+`crates/desktop-shell/src/lib.rs`; `permission_profiles` tests are in
+`crates/workspace-engine/tests/permission_profiles.rs`.
+
+| §6 criterion | Status | Evidence |
+|---|---|---|
+| Branch creation requires approval and reports the created ref and its start point. | Met | `creating_a_branch_leaves_head_and_the_index_unchanged` asserts `created_ref` and the start OID; `a_branch_change_needs_its_own_branch_approval_not_a_commit_one` proves the approval is required. |
+| Creating and switching are separate decisions; creation alone leaves `HEAD` unchanged. | Met | `creating_a_branch_leaves_head_and_the_index_unchanged`; `create_then_switch_moves_head_and_the_working_tree` (two separate records and approvals). |
+| A switch refused by Git for a dirty working tree is refused earlier, naming the paths. | Met | `a_dirty_switch_names_the_paths_it_would_overwrite`, which names the path at prepare; `apply` re-checks the same paths. |
+| Creation and switching are refused during a merge, rebase, cherry-pick or bisect, and from a detached `HEAD` without an explicit start point. | Met | `a_mid_merge_or_detached_head_refuses_creation_with_a_reason` proves the merge and detached cases. Rebase, cherry-pick, revert, sequencer and bisect use the same `in_progress_operation` gate; its marker parsing is asserted only for a real merge plus the clean/unborn states. |
+| A suggested name is validated with `git check-ref-format --branch`; a collision is reported, not silently suffixed. | Met | `git_is_authoritative_about_a_branch_name`; `a_suggestion_uses_the_configured_prefix_and_reports_a_collision` (name unchanged, free `-2` offered). |
+| No command this work package constructs contains `-f` or `--force`. | Met | The `no_force_flag` assertion is used by the creation, switch and deletion tests, including `a_merged_branch_deletes_with_d_and_no_force`; `-D` appears only after the unmerged confirmation. |
+| A conflicting merge is detected and reported without being attempted; index, working tree and `HEAD` are byte-identical before and after. | Met | `an_overlapping_merge_is_reported_as_a_conflict_without_merging`; `merge_and_rebase_preparation_leave_the_index_head_and_status_identical` compares index bytes, `HEAD` and `status --porcelain=v2` through the route. |
+| The merge report names the merge base, incoming commits, changed files, conflicted paths and whether it would fast-forward. | Met | `a_clean_merge_is_planned_without_merging`; `a_fast_forward_merge_is_reported_as_fast_forward`; `merge_and_rebase_preparation_leave_the_index_head_and_status_identical`. |
+| On a Git without `merge-tree --write-tree`, prediction reports unavailable and no merge is attempted. | Met with a stated limitation | `interpret_merge_tree` unit tests use synthetic exit 129 / `unknown option 'write-tree'` output; `an_unrelated_or_unresolvable_base_reports_prediction_unavailable` proves the end-to-end unavailable report with no `merge-tree` process. No Git older than 2.38 was available, so the decision is proved at the parser and report boundaries, not on an old binary. |
+| No merge, rebase or cherry-pick is executable from this work package. | Met | `no_route_executes_a_merge_rebase_or_cherry_pick` (404 for `/api/merge`, `/api/rebase`, `/api/cherry-pick` and variants, with `HEAD`, status and `.git/MERGE_HEAD` unchanged); the engine has only the two report methods and no merge/rebase/cherry-pick command. |
+| Deleting a branch with unmerged commits requires a distinct confirmation naming the count and subjects; `git branch -d` is used in every other case. | Met | `an_unmerged_branch_needs_a_distinct_confirmation` (plain approval 409 with count and subjects, `-D` only after `confirm_unmerged`); `a_merged_branch_deletes_with_d_and_no_force`; `an_unknown_default_branch_still_requires_the_unmerged_confirmation`; `the_delete_route_keeps_the_two_step_confirmation`. |
+| The current branch cannot be deleted. | Met | `the_current_branch_and_a_checked_out_branch_cannot_be_deleted` (also refuses a branch checked out in another worktree); `the_delete_route_keeps_the_two_step_confirmation` covers the route. |
+| An approval for one `GitMutation` cannot be reused for another. | Met | `an_approval_cannot_be_retargeted_and_is_consumed_once`; `a_branch_change_needs_its_own_branch_approval_not_a_commit_one`. |
+| Each mutation is bracketed by side-effecting action markers, and an interrupted creation is resolved by comparing the ref, never by retrying. | Met at the engine level | `a_branch_apply_is_bracketed_by_a_marker_pair_and_audited`; `inspect_reports_a_dangling_record_truthfully`; `a_delete_that_already_landed_is_inspected_not_retried`. The desktop recovery card has no branch-specific **Inspect** row; the record and marker are the evidence. |
+| Branch operations are refused in Ask, Plan and Review modes and under a profile denying Git mutation; repository config cannot enable them. | Met | `mode_and_capability_refusals_name_the_reason_at_prepare_and_apply` (also at apply); `ask_mode_is_refused_before_a_record_or_a_ref_exists` through the route; `every_capability_key_resists_weakening_from_repository_scope`, `a_repository_may_deny_git_branches_and_may_not_grant_them`, `each_built_in_profile_resolves_to_its_table_row` and `allow_git_branches_is_a_capability_key_with_a_human_name` in `permission_profiles`. |
+| **Conditional on Phase 2 WP4:** worktree-to-branch mapping is reported; a checkpoint restore in a worktree touches only that worktree; deleting a dirty worktree needs a distinct confirmation naming the dirty paths; an externally deleted worktree is reported, not crashed on. | Conditional — not this spec's work | Phase 2 WP4 did not ship, so §5.7 is dormant (D7). Spec 60's `GitService::worktrees`/`list_worktrees` reports the mapping, spec 57 owns dirty-worktree removal, and `worktree_access.rs` reports a prunable worktree. Spec 36 added no worktree mutation and no externally-deleted-worktree message, and does not test a worktree checkpoint restore. |
+| Every quality-gate command from `AGENTS.md` passes, and the spec 18 baseline shows no regression. | **Outstanding** | Scoped checks passed locally: `scripts/quality-gate.sh fmt node lint typos deny`; `cargo clippy -p workspace-engine -p desktop-shell --all-targets --locked -- -D warnings`; `cargo nextest run -p workspace-engine --test branch_delivery`; `cargo nextest run -p desktop-shell --lib`; `node --check`; `npm run lint:web`. The workspace clippy and nextest gate is left to CI, and no CI run exists for this branch yet, so the full gate has **not** passed. |
+
+### Manual walk
+
+No manual browser walk was performed. The web UI bootstraps through the Tauri
+desktop API token, so it cannot be driven from a plain browser in this
+environment. The dialog's route contract is covered by `branch_route_tests`;
+its rendering was checked by `node --check` and Biome only. The visual layout and
+the two-card delete flow are unverified in a running app until someone opens
+*Branch…* there.
