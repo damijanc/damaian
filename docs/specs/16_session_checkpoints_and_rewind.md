@@ -310,10 +310,14 @@ audit trail and break replay, so rewind appends:
  "throughEventSeq":412,"restoredAtMs":…}
 ```
 
-`read_messages` and `read_task_statuses` gain a replay rule: events after the
-newest `conversation_rewound`'s `throughEventSeq` are inert — they stay in the
-log, are still auditable, and are not part of the active conversation. A later
-rewind to an earlier point supersedes an earlier one, so the newest marker wins.
+`read_messages` and `read_task_statuses` gain a replay rule: events between the
+newest `conversation_rewound`'s `throughEventSeq` and the marker itself are
+inert — they stay in the log, are still auditable, and are not part of the
+active conversation. Events appended *after* the marker are the conversation
+continuing after the restore and are active again, so a session can carry on;
+without that half, a restore would hide every later message and every later
+event, memory included. A later rewind to an earlier point supersedes an earlier
+one, so the newest marker wins.
 
 This requires the log to have a per-event sequence number, which it does not
 have today. Add a monotonic `seq` to every appended event.

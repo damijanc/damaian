@@ -1,7 +1,7 @@
 # Feature Spec: Memory Model and Storage
 
 Status: Done 2026-10-26 (planned and built on 2026-10-26; Tasks 1–8; the full
-seven-check gate passed in CI on 2026-10-26 for the `main` push at `4abbf1f`).
+seven-check gate passed in CI on 2026-10-26 for the `main` push).
 Order: 28 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -213,7 +213,7 @@ Introduce a separate `project_key`, resolved in order:
 
 | Order | Source | Stable across |
 |---|---|---|
-| 1 | Root commit hash: `git rev-list --max-parents=0 HEAD`, first entry | Clones, moves, renames, remote changes, forks |
+| 1 | The lexicographically smallest root commit (`git rev-list --max-parents=0 HEAD`) | Clones, moves, renames, remote changes, forks |
 | 2 | Normalized `origin` remote URL (host + path, scheme and credentials stripped, `.git` suffix removed) | Clones and moves; not remote renames |
 | 3 | `repository_id` — the existing path hash | Nothing. Per-checkout fallback |
 
@@ -222,6 +222,15 @@ history rather than of where it sits or what it is called, and it survives
 everything a user is likely to do. A repository with no commits, or no Git at
 all, falls to 2 then 3, and the fallback is recorded on the entry so a later
 upgrade can tell path-keyed entries from identity-keyed ones.
+
+A merged history can have several roots — a `git subtree add`, a merge of
+unrelated histories, an orphan branch — and `git rev-list --max-parents=0 HEAD`
+reports them in commit-time order, so the first entry is not stable. The key
+uses the lexicographically smallest root instead: it is a property of the set of
+roots only, so adding an unrelated history or editing a timestamp cannot move
+it. The limit that remains is that removing a root changes the set, so a
+rewritten history resolves to a different key and does not see memory written
+under the old one.
 
 Two consequences to state plainly rather than discover later:
 
@@ -235,8 +244,9 @@ Two consequences to state plainly rather than discover later:
   over-isolation, which is the safe direction.
 
 Requirement 2's second half — "two different repositories cannot share memory" —
-holds at every level, and is the half that carries the security weight. It is
-asserted by test at each resolution tier.
+holds for repositories without shared history and is asserted by test at each
+resolution tier. A fork is the one stated exception: it shares because it shares
+a root commit, and that is the same property that makes clones share.
 
 **Tier 1 is skipped in a shallow clone.** `git rev-list --max-parents=0 HEAD`
 reports the grafted boundary commit there, which changes with `--depth` and
@@ -272,6 +282,14 @@ becomes a skipped middle line instead of swallowing the next record; the
 fragment itself is retained. This gives supersession and deletion history for
 free — requirement 4's audit trail is the file itself — and means no update ever
 rewrites a file.
+
+A middle line that does not parse is skipped rather than failing the whole
+store, and the skip count is audited as `memory_records_unreadable` (scope,
+source, count) once per process run. No recovery is attempted in band: a corrupt
+record's intent is unreadable, so the honest consequences are that a corrupted
+delete record leaves the entry active and that the audit line is what tells a
+user why. The count is content-free and does not repeat on every read, because
+recall will read the store every turn.
 
 Mode `0700` on the directory, consistent with the rest of the data directory.
 
@@ -591,5 +609,34 @@ memory to be recalled into a `ContextItem` and a rendered request, and #28 does
 not touch `chat.rs` or `context_manager.rs`. The layer that makes it true is
 unchanged — context assembly redacts every item — and #30's test should assert
 it end to end. "Every quality-gate command passes" passed in CI on 2026-10-26
-for the `main` push at `4abbf1f`; the scoped local checks are recorded in
+for the `main` push; the scoped local checks are recorded in
 [`tasks.md`](tasks.md).
+
+### Review fixes (2026-10-28)
+
+A review of the finished spec found three defects here and two documentation
+overclaims; each is recorded in [`tasks.md`](tasks.md), and the code findings
+each have a test.
+
+- **The root-commit tier read `rev-list`'s first line** (`6c`), which is ordered
+  by commit time: a subtree add, an unrelated-history merge or an orphan branch
+  can reorder it and move the key. `GitService::root_commit` now returns the
+  lexicographically smallest root, which depends only on the set of roots. The
+  limit that remains is recorded in §5.2 and in `TROUBLESHOOTING.md`: a rewritten
+  history removes a root and therefore changes the key.
+- **A session memory written after a checkpoint restore was invisible** (`6f`).
+  `active_events` dropped everything after the newest `conversation_rewound`
+  marker, when it should drop only the events *between* the rewound-to point and
+  the marker. Events appended after the marker are the session continuing; the
+  rule now keeps them, and the same fix covers messages, plans, notes, findings
+  and diagnostics. Spec 16 §5.5 was corrected with it.
+- **A corrupt record was skipped silently** (`6g`), so a corrupted delete record
+  could bring an entry back with nothing recorded. The skip count is now audited
+  as `memory_records_unreadable` with scope, source and count, once per process
+  run. No in-band recovery was invented: the record's intent is unreadable, so
+  the audit line is the durable evidence and §5.3 and `TROUBLESHOOTING.md` say
+  how to restore a decision by appending a record.
+- **Documentation overclaimed** (`6b`, `6h`). `USER_GUIDE.md` said two
+  repositories never share memory, which a fork contradicts, and presented the
+  instruction check as a guarantee; both now state what is true. Commit SHAs are
+  gone from the specs and the README, per the project rule.

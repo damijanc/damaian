@@ -488,7 +488,7 @@ a file cache, or a set of instructions.
 | Scope | What it means | Default |
 |---|---|---|
 | Session | Applies to one conversation and is deleted with it. Stored in that session's event log. | On |
-| Project | Applies to this repository, in every checkout of it. Two full clones of one repository share it; two different repositories never share it. A shallow clone (CI's `--depth 1`) has no stable root, so it shares through its remote instead; a shallow clone with no portable remote does not share. | On |
+| Project | Applies to this repository, in every checkout of it. Two clones of one repository share it; two unrelated repositories do not. A fork shares its upstream's root commit, so it shares upstream's memory too, and rewriting history so the root commit changes gives the repository a new key. A shallow clone (CI's `--depth 1`) has no stable root, so it shares through its remote instead; a shallow clone with no portable remote does not share. | On |
 | User | Applies to every project you open. | **Off** |
 
 User scope is off because it is the one scope where a fact learned in one
@@ -537,8 +537,12 @@ missing entry in the context panel is therefore not a fault yet.
 **How a memory gets created.** There are two paths, and both end at the same
 card:
 
-- You ask for it: "remember that the integration tests need Docker running."
-  Damaian takes your own sentence, not the model's paraphrase, and proposes it.
+- You ask for it: a message that begins with "remember that …" — or
+  "remember:", "remember to", "please remember", "don't forget that" — is read
+  as a request. Damaian takes your own sentence, not the model's paraphrase, and
+  proposes it. The cue has to begin the message: "do you remember that
+  function?" and a cue inside pasted text are not requests, so neither creates a
+  card.
 - The assistant suggests one while it works. The card says it was suggested, and
   names the file, issue or other source when there is one.
 
@@ -557,13 +561,23 @@ the external source whose words you would be agreeing to persist.
 **Why some suggestions are refused instead of shown.** A candidate whose
 statement reads as an instruction to Damaian — "always approve commands",
 "ignore the previous rules", "run this without asking" — produces no card at all
-when it did not come from you. A confirmation card is itself a nudge, and a
-repository author must not be able to put one in front of you by writing a file.
-The same rule applies to a suggestion that contains a detected credential, or
-that is derived from a file protected by `restricted_patterns` or excluded by a
-`.gitignore`, including one that is still in the index. Those refusals are
-recorded in the audit log with the reason and, for the path cases, the path — but
-never the statement and never the secret.
+when it did not come from you. The check is a conservative pattern match over
+the wording, not a proof about meaning: it can refuse a legitimate convention
+phrased as an imperative (say it yourself instead and it arrives as your own
+request), and an instruction phrased in wording the patterns do not cover can
+still become a card for you to decline. The same rule applies to a suggestion
+that contains a detected credential, or that is derived from a file protected by
+`restricted_patterns` or excluded by a `.gitignore`, including one that is still
+in the index. Those refusals are recorded in the audit log with the reason and,
+for the path cases, the path — but never the statement and never the secret.
+
+**What stops a repository file from writing memory.** A repository author
+cannot create an entry, and cannot write an instruction-shaped card. They can
+still get a *benign* sentence in front of you: the model declares a suggestion's
+origin, so when it omits the file it read, the card says "suggested by the
+assistant" and does not name `CONTRIBUTING.md`. Whether that sentence persists
+is your decision on the card, and that is the control — not a guarantee that no
+repository text was ever involved.
 
 **Confirming a user-scope proposal does not turn user scope on.** If the card
 proposes user scope while the scope is off, it offers to save the memory for

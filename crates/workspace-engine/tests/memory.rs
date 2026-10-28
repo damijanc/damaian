@@ -9,6 +9,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::{
@@ -169,6 +171,102 @@ fn a_fork_shares_its_upstream_root_commit_deliberately() {
     );
 
     assert_eq!(identity(&upstream).key, identity(&fork).key);
+}
+
+fn git_with_date(root: &Path, args: &[&str], date: &str) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .status()
+        .expect("git should run");
+    assert!(
+        status.success(),
+        "git {args:?} failed in {}",
+        root.display()
+    );
+}
+
+fn root_commits(root: &Path) -> Vec<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-list", "--max-parents=0", "HEAD"])
+        .output()
+        .expect("git should run");
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Adds one unrelated history to `HEAD`, so a fixture can have several roots.
+fn merge_an_orphan_root(root: &Path, branch: &str, date: &str) {
+    git_with_date(root, &["checkout", "-q", "--orphan", branch], date);
+    git(root, &["rm", "-rqf", "."]);
+    fs::write(root.join(format!("{branch}.md")), format!("# {branch}\n")).unwrap();
+    let file = format!("{branch}.md");
+    git(root, &["add", &file]);
+    git_with_date(
+        root,
+        &["commit", "-q", "-m", &format!("orphan root {branch}")],
+        date,
+    );
+    git(root, &["checkout", "-q", "main"]);
+    git_with_date(
+        root,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--allow-unrelated-histories",
+            "-m",
+            &format!("merge {branch}"),
+            branch,
+        ],
+        date,
+    );
+}
+
+#[test]
+fn several_root_commits_resolve_to_the_lexicographically_smallest() {
+    // §5.2: `rev-list --max-parents=0 HEAD` has no stable order once a
+    // repository has several unrelated histories. Adding another orphan
+    // history, or merging one, reorders the output; the key must not move.
+    let root = temp_dir("identity-multiple-roots");
+    init_repo(&root);
+    commit(&root, "README.md", "# Fixture\n");
+    git(&root, &["branch", "-m", "main"]);
+
+    // Keep adding roots until `rev-list`'s first line is not the smallest id,
+    // which is exactly the ordering the old "take the first line" rule read.
+    // The dates increase, so each new orphan is reported first.
+    let mut smallest = String::new();
+    for index in 0..8 {
+        let branch = format!("orphan-root-{index}");
+        let date = format!("2026-01-{:02}T00:00:00+0000", index + 1);
+        merge_an_orphan_root(&root, &branch, &date);
+        let roots = root_commits(&root);
+        assert!(roots.len() >= 2, "the fixture should have several roots");
+        smallest = roots.iter().min().cloned().expect("a smallest root");
+        if roots[0] != smallest {
+            break;
+        }
+    }
+
+    let roots = root_commits(&root);
+    assert_ne!(
+        roots[0], smallest,
+        "the fixture must report the smallest root last, or it does not exercise the order"
+    );
+    let resolved = identity(&root);
+    assert_eq!(resolved.source, ProjectKeySource::RootCommit);
+    assert_eq!(resolved.key, format!("root_{smallest}"));
 }
 
 #[test]
@@ -408,6 +506,59 @@ fn a_complete_entry_round_trips_through_the_file() {
 
     let loaded = store.project_entries(&identity).unwrap();
     assert_eq!(loaded, vec![entry]);
+}
+
+#[test]
+fn unreadable_record_is_counted_and_audited_instead_of_silently_dropped() {
+    // A corrupted record is unreadable by construction, so there is no safe
+    // in-band recovery: a corrupted delete record cannot be applied, and the
+    // entry it deleted is read as active again. What must not happen is the
+    // skip going unrecorded, because then nothing tells the user why a memory
+    // came back.
+    let root = temp_dir("store-unreadable");
+    let store = memory_store(&root, false);
+    let identity = ProjectIdentity {
+        key: "root_unreadable".to_string(),
+        source: ProjectKeySource::RootCommit,
+        repository_id: "repo_fixture".to_string(),
+    };
+    store.ensure_schema().unwrap();
+
+    let entry = full_entry(&identity.key);
+    let complete = serde_json::to_string(&entry).unwrap();
+    let path = store.project_path(&identity.key);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // A newline-terminated fragment is not a torn tail: it is a middle record
+    // that cannot be read, which is the case that can resurrect an entry.
+    fs::write(
+        &path,
+        format!("{complete}\n{{\"id\":\"{}\",\"state\":\"dele\n", entry.id),
+    )
+    .unwrap();
+
+    let loaded = store.project_entries(&identity).unwrap();
+    assert_eq!(
+        loaded,
+        vec![entry],
+        "the unreadable delete record cannot be applied"
+    );
+    let audit = audit_text(&root);
+    assert!(audit.contains("memory_records_unreadable"));
+    assert!(audit.contains(&path.display().to_string()));
+    assert!(audit.contains("\"unreadable\":\"1\""));
+
+    // Recall reads the store every turn once #30 lands; the finding is one
+    // line per process run, not one per read.
+    let before = audit_text(&root)
+        .lines()
+        .filter(|line| line.contains("memory_records_unreadable"))
+        .count();
+    store.project_entries(&identity).unwrap();
+    let after = audit_text(&root)
+        .lines()
+        .filter(|line| line.contains("memory_records_unreadable"))
+        .count();
+    assert_eq!(before, after);
 }
 
 #[test]
@@ -909,6 +1060,34 @@ fn session_memory_is_private_to_its_session_and_dies_with_it() {
 
     sessions.delete_session(&first.id).unwrap();
     assert!(store.session_entries(&first.id).unwrap().is_empty());
+}
+
+#[test]
+fn session_memory_written_after_a_rewind_is_still_read() {
+    // A rewind makes events *between* the rewind point and the marker inert.
+    // Events appended after the marker are the conversation continuing, so a
+    // session memory written then must remain readable; otherwise the store
+    // drops memories for the rest of the session.
+    let root = temp_dir("session-after-rewind");
+    let sessions = SessionStore::new(root.join(".damaian"));
+    let session = sessions
+        .create_session("repo_fixture", "rewind then remember")
+        .unwrap();
+    sessions
+        .append_message(&session.id, None, "user", "first")
+        .unwrap();
+    let through = sessions.latest_event_seq(&session.id).unwrap();
+    sessions.rewind_conversation(&session.id, through).unwrap();
+
+    let store = memory_store(&root, false);
+    let stored = store
+        .insert(
+            &root,
+            None,
+            session_entry(&session.id, "Written after the rewind."),
+        )
+        .unwrap();
+    assert_eq!(store.session_entries(&session.id).unwrap(), vec![stored]);
 }
 
 #[test]
@@ -1973,6 +2152,101 @@ fn a_second_confirmation_is_refused() {
         error,
         MemoryError::Refused(MemoryRefusal::ProposalAlreadyDecided)
     ));
+}
+
+#[test]
+fn a_confirmation_and_a_dismissal_of_one_proposal_record_one_decision() {
+    // The shell handles each route on its own thread and builds a store per
+    // request, so two clicks can read "undecided" before either writes. A
+    // proposal must still receive exactly one decision, and a dismissal that
+    // loses must leave no entry behind.
+    let root = temp_dir("proposal-decision-race");
+    let session = fixture_session(&root);
+    let identity = project_identity("root_decision_race");
+    let barrier = Arc::new(Barrier::new(2));
+
+    for round in 0..8 {
+        let statement = format!("Convention number {round}.");
+        let store = memory_store(&root, false);
+        let created = store
+            .propose(
+                &root,
+                model_suggestion(
+                    MemoryScope::Project,
+                    &statement,
+                    &session,
+                    &format!("task_race_{round}"),
+                ),
+            )
+            .unwrap()
+            .expect("the suggestion should become a proposal");
+        let id = created.id.clone();
+
+        let confirm = {
+            let root = root.clone();
+            let session = session.clone();
+            let id = id.clone();
+            let identity = identity.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let store = memory_store(&root, false);
+                barrier.wait();
+                store
+                    .confirm_proposal(
+                        &root,
+                        Some(&identity),
+                        &session,
+                        &id,
+                        UserConfirmation::new(id.clone()),
+                    )
+                    .is_ok()
+            })
+        };
+        let dismiss = {
+            let root = root.clone();
+            let session = session.clone();
+            let id = id.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let store = memory_store(&root, false);
+                barrier.wait();
+                store.dismiss_proposal(&session, &id).is_ok()
+            })
+        };
+
+        let confirmed = confirm.join().unwrap();
+        let dismissed = dismiss.join().unwrap();
+        assert_ne!(
+            confirmed, dismissed,
+            "round {round}: exactly one of the two decisions should land"
+        );
+
+        let reopened = memory_store(&root, false);
+        let decisions = fs::read_to_string(
+            root.join(".damaian")
+                .join("sessions")
+                .join(format!("{session}.jsonl")),
+        )
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            line.contains("memory_proposal_decided")
+                && line.contains(&format!("\"proposalId\":\"{id}\""))
+        })
+        .count();
+        assert_eq!(decisions, 1, "round {round}: one decision event");
+
+        let entries = reopened.project_entries(&identity).unwrap();
+        let stored = entries
+            .iter()
+            .filter(|entry| entry.statement == statement)
+            .count();
+        assert_eq!(
+            stored,
+            usize::from(confirmed),
+            "round {round}: an entry exists exactly when the confirmation won"
+        );
+    }
 }
 
 #[test]

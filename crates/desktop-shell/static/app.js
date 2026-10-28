@@ -6646,10 +6646,16 @@ function createMemoryProposalCard(proposal) {
   confirm.className = "btn-primary";
   confirm.textContent = "Remember";
   confirm.addEventListener("click", () => {
-    confirm.disabled = true;
+    // One decision per proposal. Disabling only this button let a quick second
+    // click on Dismiss race the confirmation, and the store then had a
+    // Remember and a Dismiss for one card.
+    setCardDeciding(controls, true);
     decideMemoryProposal(proposal, "confirm", scopeSelect.value).catch((error) => {
-      confirm.disabled = false;
+      setCardDeciding(controls, false);
       toast(error.message);
+      // A decision may have landed from a click that raced this one; re-read
+      // the pending list so an already-decided card does not stay on screen.
+      void refreshMemoryProposals(currentSessionId);
     });
   });
   controls.append(confirm);
@@ -6659,10 +6665,11 @@ function createMemoryProposalCard(proposal) {
   dismiss.className = "btn-secondary";
   dismiss.textContent = "Dismiss";
   dismiss.addEventListener("click", () => {
-    dismiss.disabled = true;
+    setCardDeciding(controls, true);
     decideMemoryProposal(proposal, "dismiss").catch((error) => {
-      dismiss.disabled = false;
+      setCardDeciding(controls, false);
       toast(error.message);
+      void refreshMemoryProposals(currentSessionId);
     });
   });
   controls.append(dismiss);
@@ -6679,6 +6686,15 @@ function createMemoryProposalCard(proposal) {
     card.append(note);
   }
   return card;
+}
+
+// One decision per card. While a decision is in flight both buttons and the
+// scope picker stop accepting input, so a second click cannot race the first;
+// a failed request re-enables them because nothing was decided.
+function setCardDeciding(controls, deciding) {
+  controls.querySelectorAll("button, select").forEach((control) => {
+    control.disabled = deciding;
+  });
 }
 
 async function decideMemoryProposal(proposal, decision, scope) {

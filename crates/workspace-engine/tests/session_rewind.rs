@@ -3,8 +3,9 @@
 //!
 //! Rewind must not truncate the log: tasks are replayed from it and it is the
 //! audit trail. So it appends a `conversation_rewound` marker and every reader
-//! treats later events as inert. These tests hold that line — the log keeps
-//! every byte, and the active conversation moves back.
+//! treats the events between the rewound-to point and the marker as inert.
+//! These tests hold that line — the log keeps every byte, and the active
+//! conversation moves back, then continues from the marker.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -94,6 +95,38 @@ fn messages_after_the_rewind_point_leave_the_active_conversation() {
         lines_before + 1
     );
     assert!(session_log(&data_dir, &session.id).contains("still wrong"));
+}
+
+#[test]
+fn messages_appended_after_the_rewind_marker_are_part_of_the_conversation() {
+    // §5.5: the marker removes the events between the rewound-to point and
+    // itself. Everything appended after it is the conversation continuing, and
+    // a restore that hid those too would make the session unusable from the
+    // next turn on.
+    let data_dir = temp_data_dir("continue");
+    let store = SessionStore::new(&data_dir);
+    let session = store.create_session("repo_1", "Continue").unwrap();
+    store
+        .append_message(&session.id, None, "user", "keep me")
+        .unwrap();
+    let rewind_to = store.latest_event_seq(&session.id).unwrap();
+    store
+        .append_message(&session.id, None, "assistant", "wrong direction")
+        .unwrap();
+    store.rewind_conversation(&session.id, rewind_to).unwrap();
+    store
+        .append_message(&session.id, None, "user", "second try")
+        .unwrap();
+
+    let messages = store.read_messages(&session.id).unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["keep me", "second try"]
+    );
+    assert!(session_log(&data_dir, &session.id).contains("wrong direction"));
 }
 
 #[test]
