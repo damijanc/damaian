@@ -386,3 +386,26 @@ To be completed during implementation. Record:
   not assume worktree support exists.
 - Any repository state that had to be refused rather than handled — detached
   `HEAD`, mid-rebase, submodules — and the message shown for each.
+
+### Task 6: merge and rebase preparation
+
+- **Observed Git version:** 2.56.0. On it,
+  `merge-tree --write-tree --name-only <base> HEAD` produced the D12 shape
+  exactly: a tree id on the first line, conflicted paths up to the first blank
+  line, informational text after it, exit 0 for a clean merge, and exit 1 for
+  conflicts. Git's release notes place the rewritten `merge-tree --write-tree`
+  at Git 2.38; only 2.56.0 was available here, so the practical floor is
+  documented rather than measured on an older Git.
+- **Fallback exercise:** the unsupported-`--write-tree` decision is exercised at
+  the parser boundary with synthetic Git output (exit 129 and
+  `error: unknown option 'write-tree'`), because the installed Git supports the
+  flag; the test therefore does not depend on the installed version. The
+  end-to-end unavailable path in `prepare_merge` is exercised with unrelated
+  histories and an unresolvable base, where no `merge-tree` process runs at all.
+  Honest limitation: no Git without `--write-tree` was available, so a real old
+  Git never reached `prepare_merge`; the unit test proves the decision and the
+  report, not an old binary.
+- **How often the fallback was taken:** zero times on this machine. Every
+  preparation with a resolvable merge base in the tests took the
+  `merge-tree --write-tree` path; only the synthetic parser tests take the
+  unavailable branch.

@@ -234,6 +234,17 @@ pub struct BranchNameCheck {
     pub reason: Option<String>,
 }
 
+/// The outcome of the read-only `git merge-tree --write-tree` probe
+/// (spec 36 §5.4). Exit status 1 is a normal answer — the merge conflicts — so
+/// the status travels beside the output instead of using [`git_output`]'s
+/// success-only contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergeTreeRun {
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
 /// Parses an `origin` URL into a GitHub owner and repository name.
 ///
 /// Accepts only `https://github.com/o/r`, `git@github.com:o/r` and
@@ -897,6 +908,55 @@ impl GitService {
             )));
         }
         Ok(sha)
+    }
+
+    /// `git merge-tree --write-tree --name-only <base> HEAD`. The merge is
+    /// computed in Git's object store: the index, the working tree and `HEAD`
+    /// are not touched, and no merge state file is created (spec 36 decision
+    /// D12). Exit 1 means conflicts and is an answer, not an error.
+    pub(crate) fn merge_tree(&self, root: &Path, base: &str) -> Result<MergeTreeRun> {
+        validate_base(base)?;
+        let output = git_output(
+            root,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--end-of-options",
+                base,
+                "HEAD",
+            ],
+        )?;
+        Ok(MergeTreeRun {
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    /// Root-relative paths that differ between two commits or trees. This
+    /// belongs beside [`read_git`] rather than a shell runner because
+    /// `diff.autoRefreshIndex=false` is what keeps `git diff` from rewriting
+    /// the user's index as a side effect of reading it.
+    pub(crate) fn diff_names(&self, root: &Path, from: &str, to: &str) -> Result<Vec<String>> {
+        let output = git_output(
+            root,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                from,
+                to,
+            ],
+        )?;
+        Ok(output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).to_string())
+            .collect())
     }
 
     /// How many of `lines` fit under both caps, counting each with its newline.

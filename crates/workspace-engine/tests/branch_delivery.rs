@@ -591,6 +591,18 @@ impl EngineFixture {
         self.run(&["--no-optional-locks", "status", "--porcelain=v2"])
     }
 
+    /// Everything a merge or rebase preparation must leave untouched, plus the
+    /// marker a real merge would create. `false` in the last slot is the "no
+    /// `.git/MERGE_HEAD` was created" assertion.
+    fn read_only_snapshot(&self) -> (Vec<u8>, String, String, bool) {
+        (
+            self.index_bytes(),
+            self.head(),
+            self.status(),
+            self.repo.join(".git").join("MERGE_HEAD").exists(),
+        )
+    }
+
     fn commit(&self, path: &str, content: &str, message: &str) {
         self.write(path, content);
         self.run(&["add", "."]);
@@ -619,6 +631,20 @@ impl EngineFixture {
         self.engine
             .branch
             .prepare_delete(&self.repo, name, &self.session_id)
+            .unwrap()
+    }
+
+    fn prepare_merge(&self, base: &str) -> workspace_engine::MergePreparation {
+        self.engine
+            .branch
+            .prepare_merge(&self.repo, base, &self.session_id)
+            .unwrap()
+    }
+
+    fn prepare_rebase(&self, onto: &str) -> workspace_engine::RebasePreparation {
+        self.engine
+            .branch
+            .prepare_rebase(&self.repo, onto, &self.session_id)
             .unwrap()
     }
 
@@ -1871,6 +1897,275 @@ fn a_delete_that_already_landed_is_inspected_not_retried() {
             .iter()
             .all(|event| event["eventType"] != "git_branch_deleted"),
         "a delete that already landed must not be retried"
+    );
+    fixture.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: merge and rebase preparation, which must execute neither.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_clean_merge_is_planned_without_merging() {
+    let fixture = EngineFixture::new("merge-clean");
+    fixture.run(&["switch", "-q", "-c", "feature"]);
+    fixture.write("feature.txt", "feature\n");
+    fixture.run(&["add", "."]);
+    fixture.run(&[
+        "commit",
+        "-q",
+        "-m",
+        "feature change",
+        "-m",
+        "body-only-text-that-must-not-be-audited",
+    ]);
+    fixture.run(&["switch", "-q", "main"]);
+    fixture.commit("main.txt", "main\n", "main change");
+    let fork = fixture.run(&["merge-base", "main", "feature"]);
+    let before = fixture.read_only_snapshot();
+
+    let plan = fixture.prepare_merge("feature");
+    assert_eq!(plan.problem, None);
+    assert!(
+        plan.conflict_prediction_available,
+        "{:?}",
+        plan.conflict_prediction_unavailable_reason
+    );
+    assert_eq!(plan.merge_tree_exit_status, Some(0));
+    assert_eq!(plan.merge_base.as_deref(), Some(fork.as_str()));
+    assert_eq!(plan.head_oid.as_deref(), Some(fixture.head().as_str()));
+    assert!(!plan.fast_forward, "main and feature diverged");
+    assert!(
+        plan.conflicted_paths.is_empty(),
+        "{:?}",
+        plan.conflicted_paths
+    );
+    assert_eq!(plan.changed_files, vec!["feature.txt".to_string()]);
+    assert_eq!(
+        plan.incoming_commits.len(),
+        1,
+        "{:?}",
+        plan.incoming_commits
+    );
+    assert_eq!((plan.ahead, plan.behind), (1, 1), "{plan:?}");
+    assert!(
+        plan.incoming_commits[0].ends_with("feature change"),
+        "{:?}",
+        plan.incoming_commits
+    );
+
+    assert_eq!(fixture.read_only_snapshot(), before);
+    assert!(!fixture.repo.join(".git").join("MERGE_HEAD").exists());
+
+    let audit = fixture.audit_events();
+    let prepared = audit
+        .iter()
+        .find(|event| event["eventType"] == "git_merge_prepared")
+        .expect("a merge preparation audit event");
+    assert_eq!(prepared["base"], "feature");
+    assert_eq!(prepared["mergeBase"], fork);
+    assert_eq!(prepared["incomingCommits"], "1");
+    assert_eq!(prepared["behind"], "1");
+    assert_eq!(prepared["changedFiles"], "1");
+    assert_eq!(prepared["conflictedPaths"], "0");
+    assert_eq!(prepared["conflictPredictionAvailable"], "true");
+    assert_eq!(prepared["outcome"], "prepared");
+    let audit_text =
+        fs::read_to_string(fixture.data_dir.join("audit").join("events.jsonl")).unwrap();
+    assert!(
+        !audit_text.contains("body-only-text-that-must-not-be-audited"),
+        "the audit must never contain a commit body"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn an_overlapping_merge_is_reported_as_a_conflict_without_merging() {
+    let fixture = EngineFixture::new("merge-conflict");
+    fixture.commit("conflict.txt", "a\nb\nc\n", "base");
+    fixture.run(&["switch", "-q", "-c", "feature"]);
+    fixture.commit("conflict.txt", "a\nX\nc\n", "feature side");
+    fixture.run(&["switch", "-q", "main"]);
+    fixture.commit("conflict.txt", "a\nY\nc\n", "main side");
+    let before = fixture.read_only_snapshot();
+
+    let plan = fixture.prepare_merge("feature");
+    assert_eq!(plan.problem, None);
+    assert!(plan.conflict_prediction_available, "{plan:?}");
+    assert_eq!(plan.merge_tree_exit_status, Some(1));
+    assert_eq!(plan.conflicted_paths, vec!["conflict.txt".to_string()]);
+    assert!(!plan.fast_forward);
+    assert_eq!((plan.ahead, plan.behind), (1, 1), "{plan:?}");
+    assert!(
+        plan.changed_files.contains(&"conflict.txt".to_string()),
+        "{:?}",
+        plan.changed_files
+    );
+
+    assert_eq!(fixture.read_only_snapshot(), before);
+    assert!(
+        !fixture.repo.join(".git").join("MERGE_HEAD").exists(),
+        "a real merge would have created MERGE_HEAD"
+    );
+
+    let audit = fixture.audit_events();
+    let prepared = audit
+        .iter()
+        .find(|event| event["eventType"] == "git_merge_prepared")
+        .expect("a merge preparation audit event");
+    assert_eq!(prepared["conflictedPaths"], "1");
+    assert_eq!(prepared["conflictPredictionAvailable"], "true");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_fast_forward_merge_is_reported_as_fast_forward() {
+    let fixture = EngineFixture::new("merge-fast-forward");
+    fixture.run(&["switch", "-q", "-c", "feature"]);
+    fixture.commit("feature.txt", "feature\n", "feature change");
+    fixture.run(&["switch", "-q", "main"]);
+    let before = fixture.read_only_snapshot();
+
+    let plan = fixture.prepare_merge("feature");
+    assert_eq!(plan.problem, None);
+    assert!(plan.conflict_prediction_available, "{plan:?}");
+    assert!(plan.fast_forward, "{plan:?}");
+    assert_eq!(plan.merge_tree_exit_status, Some(0));
+    assert_eq!(plan.merge_base.as_deref(), Some(fixture.head().as_str()));
+    assert_eq!(plan.changed_files, vec!["feature.txt".to_string()]);
+    assert_eq!((plan.ahead, plan.behind), (0, 1), "{plan:?}");
+
+    assert_eq!(fixture.read_only_snapshot(), before);
+    assert!(!fixture.repo.join(".git").join("MERGE_HEAD").exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn an_unrelated_or_unresolvable_base_reports_prediction_unavailable() {
+    let fixture = EngineFixture::new("merge-unavailable");
+    fixture.run(&["switch", "-q", "--orphan", "unrelated"]);
+    let _ = fixture.try_run(&["rm", "-rf", "."]);
+    fixture.write("unrelated.txt", "unrelated\n");
+    fixture.run(&["add", "."]);
+    fixture.run(&["commit", "-q", "-m", "unrelated root"]);
+    fixture.run(&["switch", "-q", "main"]);
+    let before = fixture.read_only_snapshot();
+
+    for base in ["unrelated", "damaian/does-not-exist"] {
+        let plan = fixture.prepare_merge(base);
+        assert!(
+            !plan.conflict_prediction_available,
+            "{base}: prediction must be unavailable"
+        );
+        assert!(plan.problem.is_some(), "{base}: {:?}", plan.problem);
+        assert_eq!(plan.merge_base, None, "{base}");
+        assert!(
+            plan.merge_tree_exit_status.is_none(),
+            "{base}: merge-tree must not run without a merge base"
+        );
+        assert_eq!((plan.ahead, plan.behind), (0, 0), "{base}");
+        assert!(plan.conflicted_paths.is_empty(), "{base}");
+        assert!(plan.changed_files.is_empty(), "{base}");
+        assert_eq!(fixture.read_only_snapshot(), before, "{base}");
+        assert!(!fixture.repo.join(".git").join("MERGE_HEAD").exists());
+    }
+
+    // An option-shaped base is refused before Git sees it, exactly as the
+    // merge-base read does.
+    let refused = fixture
+        .engine
+        .branch
+        .prepare_merge(&fixture.repo, "--output=/tmp/x", &fixture.session_id)
+        .unwrap_err();
+    assert!(
+        matches!(refused, ClientError::InvalidInput(ref message) if message.contains("not a branch name")),
+        "{refused:?}"
+    );
+
+    let unavailable = fixture
+        .audit_events()
+        .into_iter()
+        .filter(|event| event["eventType"] == "git_merge_prepared")
+        .collect::<Vec<_>>();
+    assert_eq!(unavailable.len(), 2, "{unavailable:?}");
+    assert!(
+        unavailable
+            .iter()
+            .all(|event| event["conflictPredictionAvailable"] == "false"),
+        "{unavailable:?}"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_rebase_plan_lists_the_replayed_commits_and_says_prediction_is_unavailable() {
+    let fixture = EngineFixture::new("rebase-plan");
+    let fork = fixture.head();
+    fixture.run(&["switch", "-q", "-c", "topic"]);
+    fixture.commit("one.txt", "one\n", "topic one");
+    fixture.commit("two.txt", "two\n", "topic two");
+    let head = fixture.head();
+    let before = fixture.read_only_snapshot();
+
+    let plan = fixture.prepare_rebase("main");
+    assert_eq!(plan.problem, None);
+    assert_eq!(plan.onto, "main");
+    assert_eq!(plan.onto_oid.as_deref(), Some(fork.as_str()));
+    assert_eq!(plan.merge_base.as_deref(), Some(fork.as_str()));
+    assert_eq!(plan.head_oid.as_deref(), Some(head.as_str()));
+    assert_eq!(
+        plan.commits_to_replay.len(),
+        2,
+        "{:?}",
+        plan.commits_to_replay
+    );
+    assert!(
+        plan.commits_to_replay
+            .iter()
+            .any(|commit| commit.ends_with("topic one")),
+        "{:?}",
+        plan.commits_to_replay
+    );
+    assert!(
+        plan.commits_to_replay
+            .iter()
+            .any(|commit| commit.ends_with("topic two")),
+        "{:?}",
+        plan.commits_to_replay
+    );
+    assert!(!plan.conflict_prediction_available);
+    assert!(
+        plan.conflict_prediction_unavailable_reason
+            .to_lowercase()
+            .contains("replaying"),
+        "{}",
+        plan.conflict_prediction_unavailable_reason
+    );
+    assert!(
+        plan.conflict_prediction_unavailable_reason
+            .contains("Nothing was replayed"),
+        "{}",
+        plan.conflict_prediction_unavailable_reason
+    );
+
+    assert_eq!(fixture.read_only_snapshot(), before);
+    assert!(!fixture.repo.join(".git").join("MERGE_HEAD").exists());
+    assert!(!fixture.repo.join(".git").join("rebase-merge").exists());
+
+    let audit = fixture.audit_events();
+    let prepared = audit
+        .iter()
+        .find(|event| event["eventType"] == "git_rebase_prepared")
+        .expect("a rebase preparation audit event");
+    assert_eq!(prepared["onto"], "main");
+    assert_eq!(prepared["commitsToReplay"], "2");
+    assert_eq!(prepared["conflictPredictionAvailable"], "false");
+    assert_eq!(prepared["outcome"], "prepared");
+    let audit_text =
+        fs::read_to_string(fixture.data_dir.join("audit").join("events.jsonl")).unwrap();
+    assert!(
+        !audit_text.contains("topic one") && !audit_text.contains("topic two"),
+        "the audit must not repeat commit subjects"
     );
     fixture.cleanup();
 }

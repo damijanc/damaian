@@ -43,6 +43,13 @@ const BRANCH_PREFIX_MAX_CHARS: usize = 200;
 /// collision this deep is almost certainly a naming loop, not a branch.
 const MAX_COLLISION_SUFFIX: u32 = 99;
 
+/// Decision D13: a rebase replays commits one at a time, which `merge-tree`
+/// does not model, so the report says so rather than inventing a prediction.
+const REBASE_CONFLICT_PREDICTION_UNAVAILABLE: &str = concat!(
+    "Conflict prediction for a rebase is unavailable because it would require replaying ",
+    "the commits one by one. Nothing was replayed."
+);
+
 /// A suggested branch name and what the user needs to know before accepting it.
 /// The name is never silently changed (spec 36 §5.2): a collision leaves `name`
 /// as it was and offers `alternative`.
@@ -344,6 +351,68 @@ pub struct BranchInspection {
     pub actual_oid: Option<String>,
     pub current_branch: Option<String>,
     pub message: String,
+}
+
+/// What a merge would do, computed without attempting one (spec 36 §5.4).
+///
+/// The only Git command behind the conflict list is
+/// `merge-tree --write-tree --name-only`, which computes in the object store
+/// and touches neither the index, the working tree, nor `HEAD` (decision D12).
+/// `problem` is set when the merge base itself could not be resolved, in which
+/// case no prediction is claimed at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergePreparation {
+    pub repository_root: String,
+    pub session_id: String,
+    pub base: String,
+    pub head_oid: Option<String>,
+    pub merge_base: Option<String>,
+    /// `HEAD..base` as `<abbrev> <subject>`, newest first.
+    pub incoming_commits: Vec<String>,
+    /// Commits on `HEAD` that `base` does not have (`base..HEAD`).
+    pub ahead: u32,
+    /// Commits on `base` that `HEAD` does not have (`HEAD..base`), which are
+    /// the incoming commits. Equal to `incoming_commits.len()` when the merge
+    /// base resolved; both stay 0 when it did not.
+    pub behind: u32,
+    /// Paths that would differ between `HEAD` and the merged tree.
+    pub changed_files: Vec<String>,
+    /// Conflicted paths, restricted paths omitted like every other path this
+    /// engine reports.
+    pub conflicted_paths: Vec<String>,
+    pub fast_forward: bool,
+    pub conflict_prediction_available: bool,
+    /// Git's error when `merge-tree --write-tree` is unsupported or its output
+    /// shape is unrecognised. The fallback never runs a real merge.
+    pub conflict_prediction_unavailable_reason: Option<String>,
+    /// `merge-tree`'s exit status when it ran: 0 clean, 1 conflicts.
+    pub merge_tree_exit_status: Option<i32>,
+    /// Why the plan could not be computed: an unresolvable base or unrelated
+    /// histories. `None` when the merge base resolved.
+    pub problem: Option<String>,
+}
+
+/// What a rebase would replay, without replaying it (spec 36 decision D13).
+/// Conflict prediction is always unavailable here: `merge-tree` models one
+/// merge, not a sequential replay, so claiming a result would be dishonest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RebasePreparation {
+    pub repository_root: String,
+    pub session_id: String,
+    pub onto: String,
+    pub onto_oid: Option<String>,
+    pub head_oid: Option<String>,
+    pub merge_base: Option<String>,
+    /// `merge-base..HEAD` as `<abbrev> <subject>`, newest first.
+    pub commits_to_replay: Vec<String>,
+    /// Always false; kept so the shell reads both reports the same way.
+    pub conflict_prediction_available: bool,
+    pub conflict_prediction_unavailable_reason: String,
+    /// Why the plan could not be computed: an unresolvable onto ref or
+    /// unrelated histories.
+    pub problem: Option<String>,
 }
 
 /// Why a branch mutation did not happen, as a value the shell can branch on.
@@ -689,6 +758,131 @@ impl BranchEngine {
             Vec::new(),
             unmerged_subjects,
         )
+    }
+
+    /// Report what merging `base` into the current `HEAD` would do.
+    ///
+    /// Read-only: the only computation is `merge-tree --write-tree`, which
+    /// writes tree objects and touches neither the index, the working tree, nor
+    /// `HEAD` (spec 36 §5.4, decision D12). A merge base that does not resolve
+    /// is reported as a problem with conflict prediction unavailable; it never
+    /// falls back to a real merge.
+    pub fn prepare_merge(
+        &self,
+        root: impl AsRef<Path>,
+        base: &str,
+        session_id: &str,
+    ) -> Result<MergePreparation> {
+        let root = root.as_ref();
+        let info = self.git.branch_info(root)?;
+        let mut preparation = MergePreparation {
+            repository_root: root.to_string_lossy().to_string(),
+            session_id: session_id.to_string(),
+            base: base.to_string(),
+            head_oid: info.head_oid,
+            merge_base: None,
+            incoming_commits: Vec::new(),
+            ahead: 0,
+            behind: 0,
+            changed_files: Vec::new(),
+            conflicted_paths: Vec::new(),
+            fast_forward: false,
+            conflict_prediction_available: false,
+            conflict_prediction_unavailable_reason: None,
+            merge_tree_exit_status: None,
+            problem: None,
+        };
+        let merge_base = match self.git.merge_base(root, base) {
+            Ok(sha) => sha,
+            Err(ClientError::InvalidInput(message)) => {
+                return Err(ClientError::InvalidInput(message));
+            }
+            Err(ClientError::Git(message)) => {
+                let problem = format!(
+                    "`{base}` and HEAD have no merge base, so a merge cannot be planned: {message}"
+                );
+                preparation.problem = Some(problem.clone());
+                preparation.conflict_prediction_unavailable_reason = Some(problem);
+                self.audit_merge_preparation(&preparation, 0, 0, 0)?;
+                return Ok(preparation);
+            }
+            Err(error) => return Err(error),
+        };
+        preparation.merge_base = Some(merge_base);
+        preparation.incoming_commits = self.commit_summaries(root, &format!("HEAD..{base}"))?;
+        preparation.behind = u32::try_from(preparation.incoming_commits.len()).unwrap_or(u32::MAX);
+        preparation.ahead = self.commit_count(root, &format!("{base}..HEAD"))?;
+        preparation.fast_forward = self.is_ancestor(root, "HEAD", base);
+
+        let run = self.git.merge_tree(root, base)?;
+        preparation.merge_tree_exit_status = run.exit_code;
+        let prediction = interpret_merge_tree(run.exit_code, &run.stdout, &run.stderr);
+        let raw_conflicts = prediction.conflicted_paths.len();
+        if let Some(tree) = &prediction.tree {
+            preparation.changed_files =
+                self.visible_paths(self.git.diff_names(root, "HEAD", tree)?);
+        }
+        preparation.conflicted_paths = self.visible_paths(prediction.conflicted_paths);
+        preparation.conflict_prediction_available = prediction.unavailable_reason.is_none();
+        preparation.conflict_prediction_unavailable_reason = prediction.unavailable_reason;
+        self.audit_merge_preparation(
+            &preparation,
+            preparation.incoming_commits.len(),
+            preparation.changed_files.len(),
+            raw_conflicts,
+        )?;
+        Ok(preparation)
+    }
+
+    /// Report what rebasing the current `HEAD` onto `onto` would replay.
+    ///
+    /// Read-only: it resolves the merge base and lists commits, and replays
+    /// nothing. Conflict prediction is unavailable by construction because it
+    /// would require the replay itself (decision D13).
+    pub fn prepare_rebase(
+        &self,
+        root: impl AsRef<Path>,
+        onto: &str,
+        session_id: &str,
+    ) -> Result<RebasePreparation> {
+        let root = root.as_ref();
+        let info = self.git.branch_info(root)?;
+        let mut preparation = RebasePreparation {
+            repository_root: root.to_string_lossy().to_string(),
+            session_id: session_id.to_string(),
+            onto: onto.to_string(),
+            onto_oid: None,
+            head_oid: info.head_oid,
+            merge_base: None,
+            commits_to_replay: Vec::new(),
+            conflict_prediction_available: false,
+            conflict_prediction_unavailable_reason: REBASE_CONFLICT_PREDICTION_UNAVAILABLE
+                .to_string(),
+            problem: None,
+        };
+        let merge_base = match self.git.merge_base(root, onto) {
+            Ok(sha) => sha,
+            Err(ClientError::InvalidInput(message)) => {
+                return Err(ClientError::InvalidInput(message));
+            }
+            Err(ClientError::Git(message)) => {
+                preparation.problem = Some(format!(
+                    "`{onto}` and HEAD have no merge base, so a rebase cannot be planned: {message}"
+                ));
+                self.audit_rebase_preparation(&preparation)?;
+                return Ok(preparation);
+            }
+            Err(error) => return Err(error),
+        };
+        preparation.merge_base = Some(merge_base.clone());
+        match self.resolve_ref_commit(root, &format!("{onto}^{{commit}}")) {
+            Ok(sha) => preparation.onto_oid = Some(sha),
+            Err(error) => preparation.problem = Some(error.to_string()),
+        }
+        preparation.commits_to_replay =
+            self.commit_summaries(root, &format!("{merge_base}..HEAD"))?;
+        self.audit_rebase_preparation(&preparation)?;
+        Ok(preparation)
     }
 
     /// Apply an approved preparation exactly once. The approved mutation must
@@ -1240,6 +1434,118 @@ impl BranchEngine {
         Ok(sha)
     }
 
+    /// Paths that may leave the engine: restricted paths are omitted, as in
+    /// `BranchInfo` and the switch's dirty-path report. Sorted and de-duplicated
+    /// so a report is stable across runs.
+    fn visible_paths(&self, paths: impl IntoIterator<Item = String>) -> Vec<String> {
+        paths
+            .into_iter()
+            .filter(|path| !self.path_policy.is_restricted(path, false))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// `<abbrev> <subject>` per commit in `range`, newest first. Commit bodies
+    /// are never read, so they cannot reach a report or the audit.
+    fn commit_summaries(&self, root: &Path, range: &str) -> Result<Vec<String>> {
+        let output = run_user_git(root, &["log", "--format=%h %s", range])?;
+        Ok(String::from_utf8_lossy(&output)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// The number of commits in `range`, for the ahead/behind counts that keep
+    /// the merge report useful when conflict prediction is unavailable.
+    fn commit_count(&self, root: &Path, range: &str) -> Result<u32> {
+        let output = run_user_git(root, &["rev-list", "--count", range])?;
+        let raw = String::from_utf8_lossy(&output).trim().to_string();
+        raw.parse::<u32>().map_err(|_| {
+            ClientError::Git(format!(
+                "git rev-list returned an unreadable commit count: {raw}"
+            ))
+        })
+    }
+
+    /// Whether `ancestor` is reachable from `descendant`, i.e. a merge would
+    /// fast-forward. Git exits 1 for "no", which is a false answer rather than
+    /// an error here.
+    fn is_ancestor(&self, root: &Path, ancestor: &str, descendant: &str) -> bool {
+        run_user_git(root, &["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
+    }
+
+    /// The merge report's audit: base, merge base, three counts, and whether
+    /// conflict prediction ran. Never the incoming subjects (D12).
+    fn audit_merge_preparation(
+        &self,
+        preparation: &MergePreparation,
+        incoming: usize,
+        changed: usize,
+        conflicts: usize,
+    ) -> Result<()> {
+        let outcome = if preparation.conflict_prediction_available {
+            "prepared"
+        } else {
+            "unavailable"
+        };
+        self.audit_log.record(
+            "git_merge_prepared",
+            &[
+                ("actor", "user".to_string()),
+                ("sessionId", preparation.session_id.clone()),
+                ("base", preparation.base.clone()),
+                (
+                    "mergeBase",
+                    preparation.merge_base.clone().unwrap_or_default(),
+                ),
+                ("incomingCommits", incoming.to_string()),
+                ("ahead", preparation.ahead.to_string()),
+                ("behind", preparation.behind.to_string()),
+                ("changedFiles", changed.to_string()),
+                ("conflictedPaths", conflicts.to_string()),
+                (
+                    "conflictPredictionAvailable",
+                    preparation.conflict_prediction_available.to_string(),
+                ),
+                ("outcome", outcome.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The rebase report's audit: onto, merge base, how many commits would be
+    /// replayed, and that conflict prediction did not run. Never subjects.
+    fn audit_rebase_preparation(&self, preparation: &RebasePreparation) -> Result<()> {
+        let outcome = if preparation.problem.is_some() {
+            "unavailable"
+        } else {
+            "prepared"
+        };
+        self.audit_log.record(
+            "git_rebase_prepared",
+            &[
+                ("actor", "user".to_string()),
+                ("sessionId", preparation.session_id.clone()),
+                ("onto", preparation.onto.clone()),
+                ("ontoOid", preparation.onto_oid.clone().unwrap_or_default()),
+                (
+                    "mergeBase",
+                    preparation.merge_base.clone().unwrap_or_default(),
+                ),
+                (
+                    "commitsToReplay",
+                    preparation.commits_to_replay.len().to_string(),
+                ),
+                ("conflictPredictionAvailable", "false".to_string()),
+                ("outcome", outcome.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// The commits on `name` that are not on any remote and not on the
     /// repository's default branch, and their subject lines. The count is
     /// `None` when decision D11's resolution order finds no default branch;
@@ -1578,6 +1884,84 @@ fn unmerged_subjects_text(subjects: &[String]) -> String {
         .join(", ")
 }
 
+/// The interpreted output of `merge-tree --write-tree --name-only`, where the
+/// first line is the resulting tree id, the following lines up to the first
+/// blank line are conflicted paths, and everything after that is informational
+/// (decision D12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeTreePrediction {
+    /// The tree id, when the output shape was recognised. `None` whenever the
+    /// prediction is unavailable, so no changed-file diff is taken from an
+    /// output this version does not understand.
+    tree: Option<String>,
+    conflicted_paths: Vec<String>,
+    unavailable_reason: Option<String>,
+}
+
+fn interpret_merge_tree(exit_code: Option<i32>, stdout: &str, stderr: &str) -> MergeTreePrediction {
+    let mut lines = stdout.lines();
+    let tree = lines.next().map(str::trim).unwrap_or_default();
+    if !is_object_id(tree) {
+        return unavailable_prediction(
+            "git merge-tree did not print a tree id, so conflict prediction is unavailable",
+            stderr,
+        );
+    }
+    let mut conflicted_paths = Vec::new();
+    for line in lines {
+        let path = line.trim();
+        if path.is_empty() {
+            // The rest is informational text about the merge, not paths.
+            break;
+        }
+        conflicted_paths.push(path.to_string());
+    }
+    match exit_code {
+        Some(0) if conflicted_paths.is_empty() => MergeTreePrediction {
+            tree: Some(tree.to_string()),
+            conflicted_paths,
+            unavailable_reason: None,
+        },
+        Some(1) if !conflicted_paths.is_empty() => MergeTreePrediction {
+            tree: Some(tree.to_string()),
+            conflicted_paths,
+            unavailable_reason: None,
+        },
+        Some(status) => unavailable_prediction(
+            &format!(
+                "git merge-tree exited with status {status} for an output shape this version does \
+                 not recognise"
+            ),
+            stderr,
+        ),
+        None => unavailable_prediction(
+            "git merge-tree reported no exit status, so conflict prediction is unavailable",
+            stderr,
+        ),
+    }
+}
+
+fn unavailable_prediction(reason: &str, stderr: &str) -> MergeTreePrediction {
+    let stderr = stderr.trim();
+    let reason = if stderr.is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason}: {stderr}")
+    };
+    MergeTreePrediction {
+        tree: None,
+        conflicted_paths: Vec::new(),
+        unavailable_reason: Some(reason),
+    }
+}
+
+/// A Git object id is the only thing the tree line may contain. Accepting only
+/// hex of the two hash lengths keeps the value safe to pass to `git diff`
+/// without it ever looking like an option.
+fn is_object_id(line: &str) -> bool {
+    matches!(line.len(), 40 | 64) && line.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Guard the shape before Git sees an argument that it would read as an option
 /// or expand as a previous-branch expression. Git remains authoritative about
 /// the rest through `check-ref-format --branch`.
@@ -1602,4 +1986,73 @@ fn validate_start_point(start_point: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{interpret_merge_tree, is_object_id};
+
+    /// SHA-1 length, so the parser accepts it without the test depending on
+    /// the fixture repository's object format.
+    const TREE: &str = "4341faceb9b742bb1b5b0345ff991e671581ae19";
+
+    #[test]
+    fn the_first_line_is_the_tree_and_the_next_lines_are_conflicted_paths() {
+        let stdout = format!("{TREE}\nconflict.txt\n\nAuto-merging conflict.txt\n");
+        let prediction = interpret_merge_tree(Some(1), &stdout, "");
+        assert_eq!(prediction.tree.as_deref(), Some(TREE));
+        assert_eq!(
+            prediction.conflicted_paths,
+            vec!["conflict.txt".to_string()]
+        );
+        assert_eq!(prediction.unavailable_reason, None);
+
+        let clean = interpret_merge_tree(Some(0), &format!("{TREE}\n"), "");
+        assert_eq!(clean.tree.as_deref(), Some(TREE));
+        assert!(clean.conflicted_paths.is_empty());
+        assert_eq!(clean.unavailable_reason, None);
+    }
+
+    #[test]
+    fn an_unsupported_write_tree_reports_unavailable_with_gits_reason() {
+        // This is what Git prints when it has no `--write-tree`; the test is
+        // version-independent because the decision is the parser's.
+        let prediction = interpret_merge_tree(
+            Some(129),
+            "",
+            "error: unknown option `write-tree'\nusage: git merge-tree ...",
+        );
+        assert_eq!(prediction.tree, None);
+        assert!(prediction.conflicted_paths.is_empty());
+        let reason = prediction.unavailable_reason.expect("a reason");
+        assert!(reason.contains("write-tree"), "{reason}");
+    }
+
+    #[test]
+    fn an_output_shape_that_contradicts_the_exit_status_is_unavailable() {
+        // Exit 0 promises a clean merge; a named path contradicts that.
+        let clean_but_listed = interpret_merge_tree(Some(0), &format!("{TREE}\npath.txt\n"), "");
+        assert_eq!(clean_but_listed.tree, None);
+        assert!(clean_but_listed.conflicted_paths.is_empty());
+        assert!(clean_but_listed.unavailable_reason.is_some());
+
+        // Exit 1 promises conflicts; naming none contradicts that.
+        let conflict_but_empty = interpret_merge_tree(Some(1), &format!("{TREE}\n"), "");
+        assert_eq!(conflict_but_empty.tree, None);
+        assert!(conflict_but_empty.unavailable_reason.is_some());
+
+        // A first line that is not an object id is not a tree to diff.
+        let not_a_tree = interpret_merge_tree(Some(0), "not-a-tree\n", "");
+        assert_eq!(not_a_tree.tree, None);
+        assert!(not_a_tree.unavailable_reason.is_some());
+    }
+
+    #[test]
+    fn only_full_object_ids_are_accepted_as_the_tree_line() {
+        assert!(is_object_id(TREE));
+        assert!(is_object_id(&"a".repeat(64)));
+        assert!(!is_object_id("--output=/tmp/x"));
+        assert!(!is_object_id(&"a".repeat(39)));
+        assert!(!is_object_id(&"g".repeat(40)));
+    }
 }
