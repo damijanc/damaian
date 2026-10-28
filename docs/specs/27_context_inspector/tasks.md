@@ -21,6 +21,8 @@ the resolved §7 open question in [`context.md`](context.md)
 | 9 · The web panel and review card | Done 2026-10-26 | Header control shows `total / limit`; `#context-panel` renders category details (Required locked, symbols heuristic count, summary row), included paths/ranges, a session-pin list with unpin, an excluded `<details>` with every reason, a pin form, restriction textarea, and remove controls only on an open review. Every path opens through `/api/open-vscode-file`. `createContextReview` offers Review context / Send / Decline and streams `/api/resume-context-stream`; `context` SSE events and done payloads update the panel; past turns get a Context link from each task's manifest. Added the settings checkbox and `refreshPauseForContextReview`. Recovery re-presents a paused review (`a_reattached_context_review_carries_its_manifest`). Scoped: `desktop-shell --lib` 205 passed / 5 skipped, clippy on both crates passed, `node --check` and `npm run lint:web` passed, fast five passed after fixing one typo in this record. **Manual walk is Task 10.** **Review 2026-10-26 (findings 1, 3, 4):** the `context` SSE event is handled centrally in `processSseEvent`, so every stream path gets it (plain prompt, ask-again, resume, verification), not only `streamResumeContextRequest`; the redundant per-card handler was removed. The restriction textarea is populated from `contextRestriction` on panel render and session load, guarded by a dirty flag so typed text is not clobbered; an empty Apply is refused with a message pointing at Clear paths; the label and hint say empty means no file content and name the symbols exemption. The two debug `eprintln!`s in `recovery.rs` were removed. **Pause-off browser walk (2026-10-26):** shell on port 4899 against a throwaway data dir and the inspection fixture, `DAMAIAN_MOCK_MODEL_RESPONSE`, pause off. The `context` SSE event arrived before any `token`/`done` with `chatSubmitting` true; the header read `123 / 16.0k` and the panel listed Required 6, Repository map 63, Symbols 43 and File ranges 11 while the answer streamed. A window marker set before the send was still there afterwards, so this was the live event, not a reload. After Apply `retry.rs` and `loadSession`, the field read `retry.rs`; an empty Apply toasted the refusal and the restriction stayed; Clear paths emptied both. |
 | 10 · Docs, manual walk, close-out | Done 2026-10-26 | User guide gained **Inspecting and controlling context**; troubleshooting gained the panel-first diagnosis section and the three new exclusion reasons; the `pinned` and `conversation_summary` category rows were corrected. §7 records the resolved open question, the walk and honest "not measured" answers. #32 §7.1's inspector criterion is closed. **Manual walk:** shell on port 4899 against a throwaway data dir and the inspection fixture with `DAMAIAN_MOCK_MODEL_RESPONSE`; `apiToken` + `setRepository()` from the console. First turn paused at 74 tokens (Required 4, map 63, file ranges 7); `Required` refused at the API; removing the file range took it to 67 and recorded `user_removed`; Send completed; after reload a **Context · 67 tokens** link opened the amended read-only manifest with the exclusion; a ranged pin, a restriction, and their clears were applied and read back from `/api/session`. Not walked: the Tauri window and an actual editor launch. **Deviations:** recovery reattachment for a paused review was added (not in the original plan) because the launch sweep would otherwise call the pause an unknown approval kind and fail the task; #26's "no producer yields a line range" note and test name were corrected because session pins are now the first producer; summary removal is API/manifest-tested but not walked through a live #55 summary; the record-count test was rewritten in the review to pin that a paused or declined review records nothing and a send records exactly one. **Checks:** `scripts/quality-gate.sh fmt node lint typos deny` passed; scoped clippy on `workspace-engine` and `desktop-shell` passed; `nextest` on context_inspector/context_assembly/permission_profiles/prompt_cache/round_budget/foundation **340 passed, 3 skipped**; `desktop-shell --lib` **205 passed, 5 skipped**; the deterministic eval tier **30/30 scenarios pass**, completion 1.000, 0 approval-policy violations, 0 restricted-path/secret violations, 0 unrelated files changed, recovery 1.000 (check pass 0.686 against the 30-scenario tier; the figure is not comparable to #26's 23-scenario run); `npm run specs:check` passed (66 specs). **Review 2026-10-26 (findings 5, 6, 7):** proposal §5.3 now says the record is written at send, not at assembly; §5.4 and `context.md` C10/§5 state the symbols exemption; `context.md`'s `remove_context_item` sentence no longer claims it appends an event; USER_GUIDE's restriction paragraph covers the populated field, the refused empty Apply and the symbols exemption; §7's Known gaps records that `/api/session` parses the whole global audit log and attaches a manifest to every task with no bounded reader; spec 26 §5.5 and the README's #26 row no longer say the event is `once per assembly`. **Review checks:** `scripts/quality-gate.sh fmt node lint typos deny` passed; scoped clippy on `workspace-engine` and `desktop-shell` passed; `context_inspector` 30 passed; `desktop-shell --lib` 205 passed, 5 skipped; `npm run specs:check` passed. **CI:** the full seven-check gate passed in CI on 2026-10-26 (Quality run 40340511717). |
 
+| Review fixes · 2026-10-28 | Done 2026-10-28 | Post-merge review findings 5a–5d. **5a confirmed at the source:** `createContextReview` reopened the panel from the review object it was created with, so after one removal the next removal computed its index in the pre-removal manifest and hit the wrong item. The card now owns one live review, refreshed from every removal route's returned manifest, and `two_removals_across_a_reopen_use_the_manifest_each_call_returns` removes an item, reopens through `PausedTurns::context_review_manifest` and removes a second from the reopened manifest. **5b documented, not enforced:** the restriction filters only assembled context; `read_file`, `list_directory` and the search tools ignore it. Enforcing it belongs in `chat.rs`, which spec 51 owns until it merges, so the panel hint, `index.html` and the user guide now state the coverage and the gap exactly. **5c documented:** `run_repair_turn` and the one-shot edit flow do not pause, although the guide said "every turn"; the guide and the settings hint name both exemptions. **5d:** directory entries (`src/`, or a resolved `src`) prefix-match (`a_restriction_to_a_directory_includes_everything_under_it`), the repository map is listed as exempt beside the symbols row, the finding-repair dialog counts `kept.length` rather than every requested id, and the file-bearing-source test pins a fourth file so the keyword/semantic hit on `src/other.rs` is no longer masked by a pin on that path. Checks: fast five passed, scoped clippy on both crates passed, `context_inspector` 32/32, `desktop-shell --lib` 210 passed / 6 skipped, `node --check` and `npm run lint:web` passed. CI outstanding. |
+
 **Goal:** Make "the user can see what context the agent uses" true. The panel
 renders #26's sanitized manifest pre- and post-send, and the user can pin a file
 or range, remove optional context for a paused turn, restrict the session to
@@ -838,3 +840,86 @@ the pause matrix test lives there.
   them. Record every result in the Progress row and say "CI outstanding".
 - [x] **Step 7: Update the Progress row** and commit the close-out.
   Subject: `Close out the context inspector`.
+
+---
+
+## Review fixes (2026-10-28)
+
+Post-merge review of the shipped inspector. Each finding is treated as a claim:
+confirmed by reading the code or by a failing test, or recorded as disproved.
+None was disproved.
+
+- [x] **5a · The review card reopened the original manifest.** Confirmed at
+  `app.js`'s `createContextReview`: the *Review context* button assigned the
+  `review` object the card was created with, while removal updates
+  `currentContextReview` and is by index. After one removal, reopening restored
+  the removed item and the next removal addressed the wrong entry. The card now
+  registers in `contextReviewCards` and owns one live review; removals apply the
+  manifest the route returned to both the card and the open panel, and the
+  card's token line and excluded count re-render. `contextReviewCards` is
+  cleared on a repository change and the entry removed when a decision settles.
+  Test: `two_removals_across_a_reopen_use_the_manifest_each_call_returns`
+  removes one item, reopens through `PausedTurns::context_review_manifest`, and
+  removes a second by its index in the reopened manifest. **Falsified:** making
+  `save_context_review` a no-op made the reopen read 4 items instead of 3 and the
+  test fail. The web UI has no JavaScript test runner, so the JS state bug is
+  confirmed by reading and the regression test pins the engine contract the card
+  now uses.
+- [x] **5b · The restriction filters assembly only.** Confirmed:
+  `context_restriction` is read at the three assembly sites (`chat.rs` twice,
+  `edit.rs` once) and nowhere in tool dispatch, so `read_file`,
+  `list_directory` and the search tools ignore it. Enforcing it touches
+  `chat.rs`, which spec 51 owns until it merges; the finding asks for wording
+  instead of a conflicting edit. The panel hint, the `index.html` restriction
+  label and `USER_GUIDE.md` now say the restriction applies to what is assembled
+  and sent, not to what tools a turn may use; proposal §5.4 and `context.md` §5
+  record the same and name tool-dispatch enforcement as a follow-up.
+- [x] **5c · Two send paths skip the pause.** Confirmed: `run_repair_turn`
+  (`chat.rs:2563`) and the edit flow (`edit.rs:526`) build and send without
+  consulting `pause_for_context_review`; both still pass the session's pins and
+  restriction. Touching `chat.rs` is deferred, so `USER_GUIDE.md` no longer says
+  "every turn" and names the two exemptions, the settings hint says the same,
+  and proposal §5.1 records pause parity for those paths as a follow-up.
+- [x] **5d · Four nits.**
+  - Directory entries now prefix-match. `build_context` marks an entry that
+    resolves to a directory with a trailing `/`; `add_file` admits either an
+    exact path or anything under a marked directory. Test:
+    `a_restriction_to_a_directory_includes_everything_under_it` covers `src/`
+    and a resolved `src`. **Falsified:** restoring exact equality made `src/`
+    admit nothing and the test fail.
+  - The **repository map** was exempt but unlisted. It is now named beside the
+    symbols row in the panel hint, the user guide, proposal §5.4 and
+    `context.md` §5.
+  - The finding-repair dialog counted `ids.length`; it now counts `kept.length`,
+    the findings the server actually put in the prompt. The server's own
+    exclusion toast still reports what was left out.
+  - The file-bearing-source restriction test pinned `src/other.rs`, the same
+    path the keyword/semantic hit reaches, so the pin's `PathNotSelected`
+    satisfied the assertion even if search were unfiltered. The pin is now on
+    `src/pinned_only.rs` and the test asserts the hit on `src/other.rs` too.
+    **Falsified:** exempting `RetrievedFile` from the restriction made
+    `src/other.rs` disappear from the excluded list and the test fail. (Exempting
+    only `KeywordHit` did not, because the same file is also a semantic hit;
+    both reach `RetrievedFile`.)
+
+**Checks** (scoped, 2026-10-28):
+
+```bash
+scripts/quality-gate.sh fmt node lint typos deny
+cargo clippy -p workspace-engine -p desktop-shell --all-targets --locked -- -D warnings
+cargo nextest run -p workspace-engine --test context_inspector --test context_assembly
+cargo nextest run -p desktop-shell --lib
+node --check crates/desktop-shell/static/app.js
+npm run lint:web
+```
+
+Results: fast five passed; scoped clippy passed; `context_inspector` 32 passed
+and `context_assembly` 48 passed (80 run, 2 skipped); `desktop-shell --lib` 210
+passed / 6 skipped; `node --check` and `npm run lint:web` passed;
+`npm run specs:check` passed (67 specs). The workspace clippy and test suite were
+left to CI; CI is outstanding.
+
+**Deferred:** enforcing the path restriction in tool dispatch (5b) and giving
+the verification repair turn and the one-shot edit flow the pre-send pause (5c)
+both edit `chat.rs`/`edit.rs`; spec 51 owns `chat.rs` until it merges, so both
+are follow-ups, not silent omissions.

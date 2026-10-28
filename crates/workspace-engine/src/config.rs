@@ -257,7 +257,7 @@ pub struct Config {
     /// Whether a turn pauses after assembly and before its first model call so
     /// the user can review and edit its context (spec 27 §5.1). Off by default:
     /// a confirmation on every message would be abandoned within a day. Forbidden
-    /// to repository and profile config, because it decides whether every turn
+    /// to repository and profile config, because it decides whether a chat turn
     /// waits for a human, which is neither a restriction nor a repository's
     /// business.
     pub pause_for_context_review: bool,
@@ -3297,7 +3297,7 @@ classify_overlay_fields! {
     // capabilities rather than preferences.
     conversation_auto_compact => Capability,
     conversation_window_share => Capability,
-    // Spec 27 §5.1: waits for a human on every turn; neither direction is a
+    // Spec 27 §5.1: waits for a human on a chat turn; neither direction is a
     // restriction, so repository and profile config may not set it.
     pause_for_context_review => Capability,
     // Spec 28 §5.6: cross-project recall widens where knowledge comes from, and

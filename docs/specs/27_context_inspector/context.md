@@ -164,9 +164,15 @@ later turns" and the current turn's manifest stays truthful.
   (C10). The symbols block is not filtered either: it is a path-less index
   lookup built from the prompt's own identifiers, not file content, so a
   restriction narrows which files are sent but a symbol match can still name a
-  location outside the selection. The panel says so beside the restriction
-  rather than leaving it implicit. The filter runs after normalisation, so
-  `./src/x` and `src/x` cannot disagree.
+  location outside the selection. Neither is the repository map: it is a
+  rendered overview of the index and lists paths across the whole repository.
+  The panel says so beside the restriction rather than leaving it implicit. The
+  filter runs after normalisation, so `./src/x` and `src/x` cannot disagree. An
+  entry that normalises to a directory is stored with a trailing `/` and
+  prefix-matches, so `src/` selects everything under it; before that correction
+  a directory entry selected nothing at all. The restriction filters assembly
+  only — `read_file`, `list_directory` and the search tools ignore it — and the
+  proposal §5.4 and the user guide say so.
 - **Removal is only available on a paused review.** `remove_context_item` loads
   the pending turn, refuses anything that is not `PausedFor::ContextReview`, and
   then refuses a `Required` item. It removes the item, appends a `UserRemoved`
