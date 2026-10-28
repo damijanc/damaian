@@ -445,7 +445,17 @@ dependency.
 Where the model call fails but the structured half succeeded, §5.2's split allows
 a **facts-only summary** — objective, files, steps, approvals, validation, with
 the narrative fields empty. That is strictly better than the eight-message cliff
-and is worth taking rather than discarding.
+and is worth taking rather than discarding. When an earlier summary already
+covers part of the conversation, its model-written narrative (constraints,
+decisions, failed approaches and uncertainty) is carried into the new summary
+instead of being dropped: those statements were true before this call and a
+failed call says nothing about them (review fix 4b). Because the carried lists
+make `is_facts_only()` false, the summary also carries
+`narrative_carried_forward`, the `conversation_compacted` audit event records
+`narrativeCarriedForward`, and the panel shows "narrative carried forward"; a
+reply that is not a usable narrative is audited as
+`conversation_compaction_narrative_failed` like a provider failure instead of
+being silent.
 
 ### 5.8 Versioning
 
@@ -757,8 +767,17 @@ Known limits recorded rather than fixed in this pass:
   it means either bounding the boundary to the material actually sent or
   recording the gap in the summary format, and neither is contained enough for a
   review fix.
-- **4b, carrying previous summary facts forward on a failed call, is deferred.**
-  It touches `chat.rs`, which spec 51 owns until it merges. The failure path
-  currently produces a facts-only summary whose facts are re-read from the log up
-  to the boundary, so the loss is the narrative half of the previous summary, not
-  its facts.
+- **4b, carrying the previous summary's narrative forward on a failed call, is
+  fixed (2026-10-28; flag added 2026-10-28).** The failure path used to produce a
+  facts-only summary, losing the model-written constraints, decisions, failed
+  approaches and uncertainty an earlier summary had recorded. Those four lists
+  now carry forward from the previous summary when the call fails or a reply is
+  not a usable narrative, while the facts are still re-read from the log to the
+  new boundary. `narrative_carried_forward` keeps the failure visible after the
+  carry makes `is_facts_only()` false: it is on the summary, the
+  `conversation_compacted` audit event and the panel. An unparsable reply is
+  audited as `conversation_compaction_narrative_failed`.
+  `a_failed_second_summarisation_carries_the_first_narrative_forward` asserts
+  all four narrative fields survive and the flag is set;
+  `an_unparsable_summarisation_reply_is_audited_and_marked` covers the silent
+  reply path.

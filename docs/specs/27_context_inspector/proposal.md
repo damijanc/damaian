@@ -155,12 +155,15 @@ available — a control showing the token total, openable during or after the tu
 — and the turn proceeds. A user who wants to inspect before every send can
 enable a `pause_for_context_review` setting, off by default.
 
-**The pause covers chat turns.** A verification repair turn
-(`run_repair_turn` in `chat.rs`) and a one-shot edit request (`edit.rs`) assemble
-and send in one path and are not held for review, even with the setting on.
-They still read the session's pins and restriction; giving them the pause too is
-a follow-up, recorded in `tasks.md`'s Review fixes and stated in the user guide
-rather than left for the user to discover.
+**The pause covers chat turns and verification repair turns.** A verification
+repair turn (`run_repair_turn` in `chat.rs`) assembles and sends through the same
+route, so the setting holds it too; its resume closes a repair that answers
+without a patch through `close_verification_resume`. One path remains exempt: a
+one-shot edit request (`edit.rs`) is a plain `POST /api/propose-edit` with no
+pending-turn record and no resume route, so a pause there would leave the
+request waiting with nothing that could send or decline it. That exemption is
+stated in the user guide and the settings hint rather than left for the user to
+discover. Giving the edit flow a resume route is a follow-up.
 
 This is the design decision most likely to be got wrong in the other direction.
 A pre-send view that blocks is technically closer to the requirement's wording
@@ -281,7 +284,7 @@ Post-send is a record and is read-only.
 | Pin file or range | Enters the `Pinned` category on every subsequent turn | Session |
 | Unpin / clear pins | Removes them | Session |
 | Remove optional item | Excluded from this turn, reason `UserRemoved` | This turn |
-| Restrict session to paths | Only these paths' file content is eligible for context; the symbols row is still looked up across the repository | Session |
+| Restrict session to paths | Only these paths' file content is eligible for context, and the file-content tools (`read_file`, `list_directory`, the search tools, `read_git_diff`) may read or list only these paths; the symbols row is still looked up across the repository | Session |
 | Open referenced content | Opens in app or configured editor | — |
 
 Pins and restrictions persist as appended session events, following the
@@ -329,13 +332,25 @@ the restriction, and
 exemption, so changing it is a deliberate decision rather than a silent
 regression.
 
-**It filters assembly, not capability.** `read_file`, `list_directory` and the
-search tools still run anywhere the path policy allows, so a turn can read a
-file outside the selection when the model asks for it. The restriction decides
-what a turn is *handed*, not what it may *do*; enforcing it in tool dispatch
-would change the second, and is a follow-up in `chat.rs` rather than part of
-this control. This is recorded again in `context.md` §5 because the sentence
-"only these paths are eligible for context" could be read more broadly.
+**It filters assembly and tool dispatch.** `read_file`, `list_directory`, the
+search tools and `read_git_diff` run only on paths the restriction admits. A
+read or listing outside it is refused with a plain tool result naming the
+session's path restriction rather than reading the file; a search is refused
+when its literal path is outside, and otherwise searches only admitted files, so
+the match cap is spent on admitted hits rather than on hits that would be
+discarded; `read_git_diff` refuses a whole-repository request and any request
+naming a path outside the selection. The refusal is a tool result, so the turn
+continues and the model can ask for an admitted path instead. This is still an
+intersection with `path_policy.rs` and `restricted_patterns`, never an override:
+a restriction cannot make a protected path readable.
+
+**What remains exempt.** An auto-approved read-only shell command (`ls`, including
+`ls -R <dir>`) is bounded by `restricted_patterns` and the path policy but not by
+the session restriction, so it can list names outside the selection. The path
+lists returned by `read_git_status`, `read_git_log` and `list_worktrees` are not
+filtered either; they name paths but return no file content. The file-content
+tools and `read_git_diff` are the enforced set, and the panel and user guide name
+this boundary rather than saying "every read".
 
 A pinned file that later becomes restricted, or is deleted, is reported in the
 excluded list with the reason rather than silently dropped from the pin list:
@@ -530,13 +545,13 @@ What was walked, and what was seen:
   said no collection source yields a `LineRange`; a pinned range does, and #26's
   note and test name were corrected on the same day. Automatic collection is
   still whole-file.
-- The session restriction filters file-bearing collection only; `AGENTS.md`,
+- The session restriction filters file-bearing collection; `AGENTS.md`,
   `Required`, the path-less symbols lookup and the repository map are exempt
   (`context.md` C10). That was a planning decision, not an oversight, and the
   user guide and the panel both state it. Review fixes on 2026-10-28 added the
   map to that list, made a directory entry (`src/`) prefix-match instead of
-  selecting nothing, and stated in the panel, the guide and §5.4 that the
-  restriction filters assembly rather than the tools a turn may use.
+  selecting nothing, and extended the restriction to tool dispatch (5b) so a
+  turn cannot read outside the selection it was handed.
 
 ### Review fixes (2026-10-28)
 
@@ -548,15 +563,22 @@ section has the evidence and falsifications.
   panel's manifest, so a second removal after a reopen addressed the wrong item.
   The card now owns one live review refreshed from every removal route's
   returned manifest, and a test removes two items across a reopen.
-- **The restriction does not reach tool dispatch (5b).** `read_file`,
-  `list_directory` and the search tools ignore it. Enforcing it belongs in
-  `chat.rs`, which spec 51 owns until it merges, so the behaviour is unchanged
-  and the panel hint, the user guide and §5.4 now describe exactly what the
-  restriction does and does not cover.
-- **Two send paths skip the pause (5c).** `run_repair_turn` and the one-shot
-  edit flow send without `pause_for_context_review`; the user guide said "every
-  turn". The guide and the settings hint now name both exemptions, and pause
-  parity for those paths is a follow-up.
+- **The restriction now reaches tool dispatch (5b).** `read_file`,
+  `list_directory`, the search tools and `read_git_diff` enforce the session's
+  path restriction: an outside read or listing is refused with a plain tool
+  result naming the restriction, a literal search path outside it is refused,
+  `read_git_diff` refuses a whole-repository request or an outside path, and
+  searches check admission before their match cap. The same normalization is
+  used as assembly, so a spelling cannot be admitted by a tool after the panel
+  refused it. An auto-approved `ls` and the path lists of the git read tools stay
+  unfiltered and are named as exemptions. The panel hint, `index.html`, the user
+  guide and §5.4 describe the enforced behaviour.
+- **The pause covers verification repair turns (5c).** `run_repair_turn` now
+  goes through `pause_for_context_review`, carries `verification_turn` on the
+  pending turn, and `resume_after_context_decision` closes a resumed repair
+  through `close_verification_resume`. The one-shot edit flow stays exempt and
+  the guide and settings hint now name only that path, because it has no
+  pending-turn resume route (see §5.1).
 - **Four smaller corrections (5d).** A directory entry such as `src/`
   prefix-matches (it previously selected nothing); the repository map is named
   as exempt beside the symbols row; the finding-repair dialog counts the

@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -82,6 +83,7 @@ fn summary() -> ConversationSummary {
         decisions: Vec::new(),
         failed_approaches: Vec::new(),
         uncertainty: Vec::new(),
+        narrative_carried_forward: false,
         model_run_id: None,
         message_count: 4,
     }
@@ -1458,6 +1460,329 @@ fn the_inspector_lists_the_category() {
         app_js.contains(r#"external_reference: "Reference pages""#),
         "the inspector has no label for the new category"
     );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// ---- Review fix 5b: the restriction reaches tool dispatch ----
+
+fn native_tool_provider() -> workspace_engine::ModelProviderConfig {
+    workspace_engine::ModelProviderConfig {
+        id: "openai".to_string(),
+        label: "OpenAI".to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
+        provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
+    }
+}
+
+fn tool_results_in_session(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: &str,
+    calls: &[(&str, &str)],
+) -> Vec<String> {
+    let calls = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (name, arguments))| ToolCall {
+            id: format!("call_{index}"),
+            name: name.to_string(),
+            arguments_json: arguments.to_string(),
+        })
+        .collect();
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![calls, Vec::new()],
+    );
+    let cancel = CancelToken::new();
+    let mut tokens = |_token: &str| {};
+    let mut progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut tokens,
+        on_progress: &mut progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .ask_with_session(
+            repo,
+            "Inspect the files.",
+            &[],
+            Some(session_id),
+            &mut adapter,
+            &mut sink,
+        )
+        .expect("the tool turn should run");
+    engine
+        .session_store
+        .read_messages(session_id)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.content)
+        .collect()
+}
+
+#[test]
+fn the_session_restriction_refuses_reads_lists_and_searches_outside_it() {
+    let repo = fixture_repo("restricted-tools");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let session = engine
+        .session_store
+        .create_session(&index.repository_id, "Restricted")
+        .unwrap();
+    engine
+        .session_store
+        .set_context_restriction(&session.id, &["src/other.rs".to_string()])
+        .unwrap();
+
+    let results = tool_results_in_session(
+        &engine,
+        &repo,
+        &session.id,
+        &[
+            ("read_file", r#"{"path":"src/upload.rs"}"#),
+            ("list_directory", r#"{"dir":"src"}"#),
+            ("list_directory", "{}"),
+            (
+                "search_content",
+                r#"{"pattern":"fn","path_glob":"src/upload.rs"}"#,
+            ),
+            ("search_content", r#"{"pattern":"fn"}"#),
+            ("search_codebase", r#"{"query":"upload_retry"}"#),
+            ("read_file", r#"{"path":"src/other.rs"}"#),
+        ],
+    );
+
+    assert!(
+        results[0].contains("outside this session's path restriction"),
+        "an outside read is refused: {:?}",
+        results
+    );
+    assert!(
+        results[1].contains("outside this session's path restriction"),
+        "listing a directory that would reveal outside paths is refused: {:?}",
+        results
+    );
+    assert!(
+        results[2].contains("outside this session's path restriction"),
+        "listing the root is refused while a restriction is active: {:?}",
+        results
+    );
+    assert!(
+        results[3].contains("outside this session's path restriction"),
+        "a literal search path outside the restriction is refused: {:?}",
+        results
+    );
+    assert!(
+        results[4].contains("src/other.rs") && !results[4].contains("src/upload.rs"),
+        "a content search returns only the selected path: {:?}",
+        results
+    );
+    assert!(
+        !results[5].contains("src/upload.rs"),
+        "a codebase search does not return the outside path: {:?}",
+        results
+    );
+    assert!(
+        results[6].contains("other_marker_zzq"),
+        "the selected file is still readable: {:?}",
+        results
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn an_empty_restriction_refuses_every_read_but_not_a_plain_answer() {
+    let repo = fixture_repo("restricted-none");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let session = engine
+        .session_store
+        .create_session(&index.repository_id, "No files")
+        .unwrap();
+    engine
+        .session_store
+        .set_context_restriction(&session.id, &[])
+        .unwrap();
+
+    let results = tool_results_in_session(
+        &engine,
+        &repo,
+        &session.id,
+        &[
+            ("read_file", r#"{"path":"README.md"}"#),
+            ("search_content", r#"{"pattern":"Fixture"}"#),
+            ("search_codebase", r#"{"query":"Fixture"}"#),
+        ],
+    );
+
+    assert!(
+        results[0].contains("outside this session's path restriction"),
+        "{:?}",
+        results
+    );
+    assert!(
+        results[1].contains("0 matches") && !results[1].contains("README.md"),
+        "{:?}",
+        results
+    );
+    assert!(
+        results[2].contains("No matching files found"),
+        "{:?}",
+        results
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+fn git_fixture(name: &str) -> PathBuf {
+    let repo = fixture_repo(name);
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    ]);
+    fs::write(repo.join("src/upload.rs"), "pub fn upload_after() {}\n").unwrap();
+    fs::write(repo.join("src/other.rs"), "pub fn other_after() {}\n").unwrap();
+    repo
+}
+
+#[test]
+fn read_git_diff_refuses_paths_outside_the_session_restriction() {
+    let repo = git_fixture("restricted-diff");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let session = engine
+        .session_store
+        .create_session(&index.repository_id, "Restricted diff")
+        .unwrap();
+    engine
+        .session_store
+        .set_context_restriction(&session.id, &["src/other.rs".to_string()])
+        .unwrap();
+
+    let results = tool_results_in_session(
+        &engine,
+        &repo,
+        &session.id,
+        &[
+            ("read_git_diff", r#"{"paths":["src/upload.rs"]}"#),
+            ("read_git_diff", "{}"),
+            (
+                "read_git_diff",
+                r#"{"paths":["src/other.rs","src/upload.rs"]}"#,
+            ),
+            ("read_git_diff", r#"{"paths":["src/other.rs"]}"#),
+        ],
+    );
+
+    assert!(
+        results[0].contains("outside this session's path restriction"),
+        "an outside path is refused: {:?}",
+        results
+    );
+    assert!(
+        results[1].contains("restricted to selected paths"),
+        "a whole-repository diff is refused while restricted: {:?}",
+        results
+    );
+    assert!(
+        results[2].contains("outside this session's path restriction"),
+        "one outside path refuses the mixed request: {:?}",
+        results
+    );
+    assert!(
+        results[3].contains("other_after") && !results[3].contains("upload_after"),
+        "the admitted diff is returned: {:?}",
+        results
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn the_search_cap_counts_only_matches_inside_the_restriction() {
+    let repo = fixture_repo("restricted-search-cap");
+    for index in 0..20 {
+        write_fixture(&repo, &format!("aaa{index:02}.rs"), "needle outside\n");
+    }
+    write_fixture(&repo, "zzz_keep.rs", "needle inside\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let session = engine
+        .session_store
+        .create_session(&index.repository_id, "Restricted search cap")
+        .unwrap();
+    engine
+        .session_store
+        .set_context_restriction(&session.id, &["zzz_keep.rs".to_string()])
+        .unwrap();
+
+    let results = tool_results_in_session(
+        &engine,
+        &repo,
+        &session.id,
+        &[
+            ("search_content", r#"{"pattern":"needle","max_matches":2}"#),
+            ("search_codebase", r#"{"query":"needle","limit":2}"#),
+            (
+                "search_codebase",
+                r#"{"query":"needle","mode":"semantic","limit":2}"#,
+            ),
+        ],
+    );
+
+    for (index, result) in results.iter().enumerate() {
+        assert!(
+            result.contains("zzz_keep.rs"),
+            "search {index} spends its cap on the admitted file: {result}"
+        );
+        assert!(
+            !result.contains("aaa"),
+            "search {index} never returns an outside match: {result}"
+        );
+    }
 
     fs::remove_dir_all(repo).unwrap();
 }

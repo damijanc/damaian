@@ -66,10 +66,24 @@ pub struct RepositoryIndex {
 
 impl RepositoryIndex {
     pub fn keyword_search(&self, query: &str, limit: usize) -> Vec<SearchResult> {
+        self.keyword_search_allowed(query, limit, &|_| true)
+    }
+
+    /// [`Self::keyword_search`] over files `allowed` admits.
+    ///
+    /// The filter runs before scoring and before the cap, so a hit outside the
+    /// caller's selection cannot consume one of the returned slots.
+    pub fn keyword_search_allowed(
+        &self,
+        query: &str,
+        limit: usize,
+        allowed: &dyn Fn(&str) -> bool,
+    ) -> Vec<SearchResult> {
         let query_terms = tokenize(query);
         let mut scored = self
             .files
             .iter()
+            .filter(|record| allowed(&record.path))
             .filter_map(|record| {
                 let score = score_record(record, &query_terms);
                 (score > 0).then(|| SearchResult {
@@ -97,9 +111,22 @@ impl RepositoryIndex {
     }
 
     pub fn semantic_search(&self, query: &str, limit: usize) -> Vec<SearchResult> {
+        self.semantic_search_allowed(query, limit, &|_| true)
+    }
+
+    /// [`Self::semantic_search`] over files `allowed` admits.
+    ///
+    /// As with [`Self::keyword_search_allowed`], the filter runs before the
+    /// cap, so outside hits cannot crowd out admitted ones.
+    pub fn semantic_search_allowed(
+        &self,
+        query: &str,
+        limit: usize,
+        allowed: &dyn Fn(&str) -> bool,
+    ) -> Vec<SearchResult> {
         let query_terms = tokenize(query);
         let mut scored = Vec::new();
-        for record in &self.files {
+        for record in self.files.iter().filter(|record| allowed(&record.path)) {
             for chunk in &record.chunks {
                 let chunk_terms = tokenize(&format!(
                     "{} {} {}",

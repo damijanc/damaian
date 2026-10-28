@@ -706,21 +706,23 @@ pub struct ExplicitMemoryRequest {
     pub scope: MemoryScope,
 }
 
-/// Reads one explicit remember-this request from the user's message.
+/// What [`explicit_memory_request_outcome`] found in a message.
 ///
-/// The cue has to begin the message. A cue anywhere in the text made pasted
-/// content into a "you asked for this" card, and made "do you remember that
-/// function?" persist a sentence about a function. Requiring the request to be
-/// the first thing the user wrote keeps the detection a request rather than a
-/// substring: a follow-up question or a pasted issue cannot create a proposal,
-/// and the worst case is a real request phrased differently, which the user can
-/// restate or the model can suggest.
-///
-/// Deliberately narrow otherwise: the first recognized cue, the first sentence
-/// after it, and nothing inferred. The statement is the user's words rather
-/// than a model's paraphrase, and the confirmation card still shows it before
-/// it can become an entry.
-pub fn explicit_memory_request(prompt: &str) -> Option<ExplicitMemoryRequest> {
+/// The request parser can refuse a cue that it did find: a statement over the
+/// ceiling is rejected rather than truncated, and the user is told why instead
+/// of the request silently looking ignored (spec 29 §5.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExplicitMemoryRequestOutcome {
+    /// No cue at the start of the message.
+    Absent,
+    /// A usable request.
+    Request(ExplicitMemoryRequest),
+    /// A cue was found but the request cannot become a proposal.
+    Refused(MemoryRefusal),
+}
+
+/// The outcome of reading an explicit request, including its refusal reason.
+pub fn explicit_memory_request_outcome(prompt: &str) -> ExplicitMemoryRequestOutcome {
     // The cues are ASCII, and matching only at the start means no search
     // offsets: the one slice taken is at a char boundary, so a multi-byte
     // first character cannot split a character the way a `to_lowercase`
@@ -739,10 +741,13 @@ pub fn explicit_memory_request(prompt: &str) -> Option<ExplicitMemoryRequest> {
     let body = &lowered[start_of_message..];
     // The longest matching cue wins, so "please remember that " is not read as
     // "please remember " with "that" left in the statement.
-    let cue = CUES
+    let Some(cue) = CUES
         .iter()
         .filter(|cue| body.starts_with(**cue))
-        .max_by_key(|cue| cue.len())?;
+        .max_by_key(|cue| cue.len())
+    else {
+        return ExplicitMemoryRequestOutcome::Absent;
+    };
     let start = start_of_message + cue.len();
     let rest = &prompt[start..];
     let line = rest.lines().next().unwrap_or_default();
@@ -766,11 +771,14 @@ pub fn explicit_memory_request(prompt: &str) -> Option<ExplicitMemoryRequest> {
         .trim_end_matches(['.', '!', '?'])
         .trim_end();
     if statement.is_empty() {
-        return None;
+        return ExplicitMemoryRequestOutcome::Absent;
     }
     let normalized = normalize_statement(statement);
-    if normalized.is_empty() || normalized.chars().count() > STATEMENT_MAX_CHARS {
-        return None;
+    if normalized.is_empty() {
+        return ExplicitMemoryRequestOutcome::Absent;
+    }
+    if normalized.chars().count() > STATEMENT_MAX_CHARS {
+        return ExplicitMemoryRequestOutcome::Refused(MemoryRefusal::StatementTooLong);
     }
     let lower = normalized.to_lowercase();
     let category =
@@ -791,11 +799,36 @@ pub fn explicit_memory_request(prompt: &str) -> Option<ExplicitMemoryRequest> {
     } else {
         MemoryScope::Project
     };
-    Some(ExplicitMemoryRequest {
+    ExplicitMemoryRequestOutcome::Request(ExplicitMemoryRequest {
         statement: normalized,
         category,
         scope,
     })
+}
+
+/// Reads one explicit remember-this request from the user's message.
+///
+/// The cue has to begin the message. A cue anywhere in the text made pasted
+/// content into a "you asked for this" card, and made "do you remember that
+/// function?" persist a sentence about a function. Requiring the request to be
+/// the first thing the user wrote keeps the detection a request rather than a
+/// substring: a follow-up question or a pasted issue cannot create a proposal,
+/// and the worst case is a real request phrased differently, which the user can
+/// restate or the model can suggest.
+///
+/// Deliberately narrow otherwise: the first recognized cue, the first sentence
+/// after it, and nothing inferred. The statement is the user's words rather
+/// than a model's paraphrase, and the confirmation card still shows it before
+/// it can become an entry.
+///
+/// This convenience form drops a refusal. The turn path uses
+/// [`explicit_memory_request_outcome`] so the user is told why a request
+/// became no proposal.
+pub fn explicit_memory_request(prompt: &str) -> Option<ExplicitMemoryRequest> {
+    match explicit_memory_request_outcome(prompt) {
+        ExplicitMemoryRequestOutcome::Request(request) => Some(request),
+        ExplicitMemoryRequestOutcome::Absent | ExplicitMemoryRequestOutcome::Refused(_) => None,
+    }
 }
 
 /// Collapse whitespace runs and trim. A stored statement is the sentence the
@@ -1344,6 +1377,18 @@ pub enum MemoryError {
     Invalid(String),
 }
 
+/// What a proposal write did, including why it produced no card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalOutcome {
+    /// The proposal was recorded and awaits a decision.
+    Proposed(MemoryProposal),
+    /// The candidate was screened out; the reason is already audited.
+    Refused(MemoryRefusal),
+    /// An assistant suggestion reached the per-task cap. Explicit user
+    /// requests are never capped.
+    SuggestionCapReached,
+}
+
 impl std::fmt::Display for MemoryError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1728,12 +1773,37 @@ impl MemoryStore {
     pub fn propose(
         &self,
         root: &Path,
-        mut proposal: MemoryProposal,
+        proposal: MemoryProposal,
     ) -> MemoryResult<Option<MemoryProposal>> {
+        match self.propose_reporting_refusal(root, proposal)? {
+            ProposalOutcome::Proposed(proposal) => Ok(Some(proposal)),
+            ProposalOutcome::Refused(_) | ProposalOutcome::SuggestionCapReached => Ok(None),
+        }
+    }
+
+    /// [`Self::propose`] with the refusal reason preserved.
+    ///
+    /// The turn path needs the reason to tell the user why an explicit
+    /// "remember that…" produced no card (spec 29 §5.5). `propose` still
+    /// returns `None` for every refusal, because most callers only need
+    /// whether a proposal was created.
+    pub fn propose_reporting_refusal(
+        &self,
+        root: &Path,
+        mut proposal: MemoryProposal,
+    ) -> MemoryResult<ProposalOutcome> {
         let gate = self.proposal_gate(root, None);
         if let Err(error) = proposal.screen(&gate) {
-            self.audit_proposal_refused(&proposal, &error)?;
-            return Ok(None);
+            // A refusal is audited by the store. Any other screening error is
+            // not a refusal; it reaches the caller, which records it once as
+            // `memory_proposal_failed`, so it is never audited twice.
+            return match error {
+                MemoryError::Refused(refusal) => {
+                    self.audit_proposal_refused(&proposal, &MemoryError::Refused(refusal.clone()))?;
+                    Ok(ProposalOutcome::Refused(refusal))
+                }
+                other => Err(other),
+            };
         }
         // The card and the proposal event must carry the exact sentence that
         // `confirm` will persist. Screening deliberately sees the raw candidate
@@ -1746,14 +1816,14 @@ impl MemoryStore {
         {
             let error = MemoryError::Refused(MemoryRefusal::SuggestionCapReached);
             self.audit_proposal_refused(&proposal, &error)?;
-            return Ok(None);
+            return Ok(ProposalOutcome::SuggestionCapReached);
         }
         let encoded = serde_json::to_string(&proposal)
             .map_err(|error| MemoryError::Invalid(error.to_string()))?;
         self.session_store
             .append_memory_proposal(proposal.origin.session_id(), &encoded)?;
         self.audit_proposal_created(&proposal)?;
-        Ok(Some(proposal))
+        Ok(ProposalOutcome::Proposed(proposal))
     }
 
     /// [`Self::propose`] for a repository observation. The evidence path is
@@ -2991,6 +3061,23 @@ mod tests {
             explicit_memory_request("Remember to run make fmt before committing.").expect("a cue");
         assert_eq!(command.category, MemoryCategory::Convention);
         assert!(explicit_memory_request("What does this function do?").is_none());
+    }
+
+    #[test]
+    fn an_over_long_explicit_request_reports_why_it_was_refused() {
+        let prompt = format!("Remember that {}", "a".repeat(STATEMENT_MAX_CHARS + 1));
+        assert_eq!(
+            explicit_memory_request_outcome(&prompt),
+            ExplicitMemoryRequestOutcome::Refused(MemoryRefusal::StatementTooLong)
+        );
+        assert!(
+            explicit_memory_request(&prompt).is_none(),
+            "the convenience form still drops the refusal"
+        );
+        assert_eq!(
+            explicit_memory_request_outcome("How does indexing work?"),
+            ExplicitMemoryRequestOutcome::Absent
+        );
     }
 
     #[test]

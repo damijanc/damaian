@@ -2977,7 +2977,11 @@ function renderContextPanel() {
     const count = document.createElement("span");
     count.className = "context-category-count";
     count.textContent = `${manifest.conversationSummary.messages} messages${
-      manifest.conversationSummary.factsOnly ? " · facts only" : ""
+      manifest.conversationSummary.factsOnly
+        ? " · facts only"
+        : manifest.conversationSummary.narrativeCarriedForward
+          ? " · narrative carried forward"
+          : ""
     }`;
     row.append(label, tokens, count);
     if (contextCanRemove()) {
@@ -3039,8 +3043,8 @@ function renderContextPanel() {
     const restriction = document.createElement("p");
     restriction.className = "context-panel-hint";
     restriction.textContent = contextRestriction.length
-      ? `This session is restricted to ${contextRestriction.length} path(s). Only those paths' file content is assembled for a turn; the assistant can still read other files with its own tools during a turn, and the symbols row and repository map are still built from the whole repository.`
-      : "This session is restricted to no paths, so no file content is assembled for a turn. The assistant can still read files with its own tools during a turn, and the symbols row and repository map are still built from the whole repository.";
+      ? `This session is restricted to ${contextRestriction.length} path(s). Only those paths' file content is assembled for a turn, and the file-content tools (read_file, list_directory, searches and read_git_diff) can use only those paths. A one-off shell command such as ls -R can still list names outside it, and the symbols row and repository map are still built from the whole repository.`
+      : "This session is restricted to no paths, so no file content is assembled for a turn and the file-content tools cannot read or list any path. A one-off shell command such as ls -R can still list names outside it, and the symbols row and repository map are still built from the whole repository.";
     body.append(restriction);
   }
 
@@ -6272,7 +6276,9 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
       // The engine's one plan reminder is a user-role message in the request but
       // not something the user typed. Render it as a system line, and not as an
       // answer, a rewind anchor, or a question (spec 66 `context.md` D10).
-      if (message.kind === "plan_reminder") {
+      // A memory refusal is the same kind of engine line: it explains why a
+      // "remember that…" became no card (spec 29 §5.5).
+      if (message.kind === "plan_reminder" || message.kind === "memory_refusal") {
         const bubble = appendChatMessage("system", message.content);
         if (message.seq) bubble.message.dataset.seq = message.seq;
         return { message, bubble };
@@ -6412,6 +6418,13 @@ function summaryBody(summary) {
   section("Decisions", summary.decisions);
   section("Failed approaches", summary.failedApproaches);
   section("Remaining uncertainty", summary.uncertainty);
+  if (summary.narrativeCarriedForward) {
+    const note = document.createElement("p");
+    note.className = "compaction-summary-note";
+    note.textContent =
+      "The last summarisation call failed, so these model-written fields are carried forward from the previous summary.";
+    container.append(note);
+  }
   section("Files changed", summary.filesChanged);
   section(
     "Plan steps",

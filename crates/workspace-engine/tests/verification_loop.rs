@@ -16,14 +16,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
-    CancelToken, CheckId, CheckOutcome, CommandPurpose, Config, Evidence, HookConfig, HookEvent,
-    HookMode, HookSource, MockModelAdapter, PausedTurns, PlanReport, PlanStep, ReattachedApproval,
-    RoundBudgetDecision, Selection, SessionStore, SkipReason, TaskPlan, TaskStatus, TurnProgress,
-    TurnSink, VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
-    WebDiagnosticCall, WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport,
-    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, fold_verification,
-    is_documentation, pending_verifications, propose_checks, reattach_pending_approvals,
-    select_roots,
+    CancelToken, ChatTurnResult, CheckId, CheckOutcome, CommandPurpose, Config, ContextDecision,
+    Evidence, HookConfig, HookEvent, HookMode, HookSource, MockModelAdapter, PausedTurns,
+    PlanReport, PlanStep, ReattachedApproval, RoundBudgetDecision, Selection, SessionStore,
+    SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink, VerificationEvent,
+    VerificationOutcome, VerificationReport, VerificationState, WebDiagnosticCall,
+    WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
+    WebDiagnosticsRunnerHandle, WorkspaceEngine, fold_verification, is_documentation,
+    pending_verifications, propose_checks, reattach_pending_approvals, select_roots,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -1334,6 +1334,30 @@ fn run_verification(
         .expect("the verification turn should run")
 }
 
+fn resume_context_review(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    decision: ContextDecision,
+    adapter: &mut dyn workspace_engine::ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.resume_after_context_decision(
+        proposal_id,
+        decision,
+        "tester",
+        adapter,
+        &mut sink,
+    )
+}
+
 fn resume_checks(
     engine: &WorkspaceEngine,
     batch_id: &str,
@@ -2418,6 +2442,53 @@ fn a_repair_turn_that_hits_the_round_budget_pauses_instead_of_failing() {
         "a continuation is not another attempt"
     );
     assert_eq!(adapter.requests.len(), 2, "Continue runs one more round");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_repair_turn_pauses_for_context_review_and_resumes_as_a_repair() {
+    let root = temp_dir("repair-context-review");
+    let data_dir = temp_dir("repair-context-review-data");
+    cargofile(&root);
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: data_dir.clone(),
+        enable_index_watcher: false,
+        shell: "/usr/bin/false".to_string(),
+        command_allowlist: vec!["cargo test".to_string()],
+        agent_tool_retry_limit: 2,
+        pause_for_context_review: true,
+        ..Config::default()
+    });
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("I cannot fix this.");
+
+    let paused = run_verification(&engine, &root, &session, &mut adapter);
+    let review = paused
+        .context_review
+        .as_ref()
+        .expect("the repair turn pauses before sending");
+    assert!(
+        adapter.requests.is_empty(),
+        "a paused repair turn must not call the model"
+    );
+    assert!(
+        paused.verification_report.is_none(),
+        "a pause is not the end of the attempt"
+    );
+
+    let resumed = resume_context_review(&engine, &review.id, ContextDecision::Send, &mut adapter)
+        .expect("Send resumes the repair turn");
+    assert_eq!(
+        resumed.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::NoRepairApplied),
+        "a resumed repair that answers without a patch closes as no repair"
+    );
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);

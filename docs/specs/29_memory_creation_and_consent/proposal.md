@@ -291,7 +291,10 @@ from reaching the audit trail as a refused proposal. A user should not see their
 own API key rendered in a "shall I remember this?" prompt.
 
 Refusal is reported plainly — "that looks like a credential; Damaian will not
-store it" — and the refusal itself is audited without the statement.
+store it" — and the refusal itself is audited without the statement. An explicit
+"remember that…" that is refused is shown the same way, as an engine line in the
+conversation, and an over-long statement is reported rather than dropped before
+the audit (§5.5's ceiling, review fix `6a`).
 
 "Unnecessary file content" in requirement 4 is bounded structurally rather than
 by judgement: a `statement` is a single normalized sentence with a length
@@ -681,11 +684,18 @@ are stored and the statement is scanned, but a future hardening should resolve
 the final path before the eligibility check. The path-based rule is shared with
 #28's store check; the model-declared label is not.
 
-**Deferred, not fixed here (`6a`).** A refused explicit "remember that" is
-silent: `chat.rs` audits `memory_proposal_failed` but shows the user nothing, so
-a request that hits a refusal looks like it was ignored. The turn path is
-`chat.rs`, which spec 51 owns until it merges, so the fix waits rather than
-editing a file another spec is changing.
+**Review fix `6a` (2026-10-28).** A refused explicit "remember that" used to be
+silent: `chat.rs` audited `memory_proposal_failed` but showed the user nothing, so
+a request that hit a refusal looked like it was ignored. The turn path now
+appends the store's plain refusal sentence to the conversation as a
+`memory_refusal` engine line ("that looks like a credential; Damaian will not
+store it" and the other sentences in §5.5). Statements over the 280-character
+ceiling are refused by the request parser before a proposal exists; that case is
+now audited as `memory_proposal_failed` with reason `statement_too_long` and
+shown with the same plain explanation, instead of being dropped silently. Tests:
+`a_refused_explicit_request_says_why_instead_of_looking_ignored` and
+`an_over_long_explicit_request_says_why_and_is_audited` (orchestrator) and
+`an_over_long_explicit_request_reports_why_it_was_refused` (parser).
 
 **Checks.** Scoped local checks passed: `scripts/quality-gate.sh fmt node lint
 typos deny`, scoped clippy for `workspace-engine`, `desktop-shell` and
@@ -721,6 +731,8 @@ clippy and test suite were left to CI; the full seven-check gate passed in CI on
 - **`6h` — commit SHAs removed** from both specs, their `tasks.md` and
   `docs/specs/README.md`, per the project rule; the date and "the `main` push"
   identify the CI run.
-- **`6a` deferred** — a refused explicit request is silent in `chat.rs`, which
-  spec 51 owns until it merges.
+- **`6a` fixed (2026-10-28)** — a refused explicit request now shows the
+  store's plain refusal sentence as an engine line, and an over-long statement
+  is audited as `memory_proposal_failed` / `statement_too_long` and explained
+  rather than dropped before the audit. See the note above and §5.5.
 

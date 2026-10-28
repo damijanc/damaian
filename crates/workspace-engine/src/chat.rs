@@ -38,7 +38,7 @@ use crate::language::detect_language;
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
 use crate::memory::{
     EvidenceRef as MemoryEvidence, MemoryCategory, MemoryProposal, MemoryScope, MemoryStore,
-    ProposalOrigin, explicit_memory_request,
+    ProposalOrigin,
 };
 use crate::mode::{Permission, SessionMode, permits, refusal_message};
 use crate::model::{
@@ -838,16 +838,32 @@ impl ChatOrchestrator {
     /// Turns the user's own "remember that…" into a proposal. The statement is
     /// the user's sentence, not a model paraphrase, and the store still
     /// screens and caps it. A refused request is audited by the store and does
-    /// not fail the turn.
+    /// not fail the turn; it is also shown to the user, because a request that
+    /// looks ignored is indistinguishable from one Damaian silently dropped
+    /// (spec 29 §5.5).
     fn propose_explicit_memory(
         &self,
         root: &Path,
         session_id: &str,
+        task_id: Option<&str>,
         message_id: &str,
         prompt: &str,
     ) -> Result<()> {
-        let Some(request) = explicit_memory_request(prompt) else {
-            return Ok(());
+        let request = match crate::memory::explicit_memory_request_outcome(prompt) {
+            crate::memory::ExplicitMemoryRequestOutcome::Absent => return Ok(()),
+            crate::memory::ExplicitMemoryRequestOutcome::Request(request) => request,
+            crate::memory::ExplicitMemoryRequestOutcome::Refused(refusal) => {
+                // The parser drops an over-long statement before a proposal
+                // exists, so this is its only audit record.
+                self.audit_log.record(
+                    "memory_proposal_failed",
+                    &[
+                        ("sessionId", session_id.to_string()),
+                        ("reason", refusal.reason_code().to_string()),
+                    ],
+                )?;
+                return self.announce_memory_refusal(session_id, task_id, &refusal);
+            }
         };
         let proposal = MemoryProposal::new(
             request.scope,
@@ -860,17 +876,53 @@ impl ChatOrchestrator {
             Vec::new(),
             None,
         );
-        if let Err(error) = self.memory_store.propose(root, proposal) {
-            // A failure here is the store refusing or the log refusing the
-            // write. Neither is a reason to fail the user's turn.
-            self.audit_log.record(
-                "memory_proposal_failed",
-                &[
-                    ("sessionId", session_id.to_string()),
-                    ("reason", error.to_string()),
-                ],
-            )?;
+        match self.memory_store.propose_reporting_refusal(root, proposal) {
+            Ok(crate::memory::ProposalOutcome::Proposed(_)) => Ok(()),
+            Ok(crate::memory::ProposalOutcome::Refused(refusal)) => {
+                self.announce_memory_refusal(session_id, task_id, &refusal)
+            }
+            // An explicit request is never capped, so this is a suggestion-only
+            // path and should not be reachable from here.
+            Ok(crate::memory::ProposalOutcome::SuggestionCapReached) => Ok(()),
+            Err(error) => {
+                // A failure here is the log refusing the write. Neither is a
+                // reason to fail the user's turn.
+                self.audit_log.record(
+                    "memory_proposal_failed",
+                    &[
+                        ("sessionId", session_id.to_string()),
+                        ("reason", error.to_string()),
+                    ],
+                )?;
+                let message = format!("Damaian could not save that memory. {error}");
+                self.session_store.append_message_with_kind(
+                    session_id,
+                    task_id,
+                    "assistant",
+                    &message,
+                    Some("memory_refusal"),
+                )?;
+                Ok(())
+            }
         }
+    }
+
+    /// Appends the store's plain refusal sentence to the conversation as an
+    /// engine line, not as something the model said.
+    fn announce_memory_refusal(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        refusal: &crate::memory::MemoryRefusal,
+    ) -> Result<()> {
+        let message = crate::memory::MemoryError::Refused(refusal.clone()).to_string();
+        self.session_store.append_message_with_kind(
+            session_id,
+            task_id,
+            "assistant",
+            &message,
+            Some("memory_refusal"),
+        )?;
         Ok(())
     }
 
@@ -1227,7 +1279,13 @@ impl ChatOrchestrator {
         // Spec 29 §5.2: an explicit request is still a proposal. The user's own
         // sentence is the statement, so no model paraphrase or extra round trip
         // sits between what they asked and what the card will show.
-        self.propose_explicit_memory(repository_root, &session.id, &user_message.id, prompt)?;
+        self.propose_explicit_memory(
+            repository_root,
+            &session.id,
+            Some(&task.id),
+            &user_message.id,
+            prompt,
+        )?;
         self.take_turn_checkpoint(
             repository_root,
             &session,
@@ -1687,8 +1745,10 @@ impl ChatOrchestrator {
             .record("context_assembled", &context_fields)?;
         sink.context(&plan.manifest);
 
-        self.run_agentic_turn(
-            &PathBuf::from(&pending.repository_root),
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let verification_turn = pending.turn_options.verification_turn;
+        let result = self.run_agentic_turn(
+            &repository_root,
             pending.session,
             task,
             plan.files,
@@ -1701,7 +1761,14 @@ impl ChatOrchestrator {
             model_adapter,
             sink,
             pending.turn_options,
-        )
+        )?;
+        // A paused repair turn resumes here rather than in `run_repair_turn`,
+        // so the attempt has to be closed by the same rule the other resume
+        // paths use: an answer with no patch is `no_repair_applied`.
+        if verification_turn {
+            return self.close_verification_resume(&repository_root, result);
+        }
+        Ok(result)
     }
 
     /// Removes one optional item from a paused review and returns the amended
@@ -2726,13 +2793,13 @@ impl ChatOrchestrator {
             // (spec 51 D5).
             external_references: &[],
         })?;
-        let mut fields = vec![
-            ("actor", "system".to_string()),
-            ("sessionId", session.id.clone()),
-        ];
-        fields.extend(context.manifest.audit_fields());
-        self.audit_log.record("context_assembled", &fields)?;
-        sink.context(&context.manifest);
+        let turn_notes = self.carry_notes_from_the_previous_turn(&session.id, &task)?;
+        let prompt_conversation = build_conversation(
+            &conversation.messages,
+            conversation.summary.as_ref(),
+            self.conversation_window_tokens(),
+            &self.scanner,
+        );
         let messages = vec![
             ModelMessage::system(system_prompt_for_session(
                 SessionMode::Code,
@@ -2740,19 +2807,40 @@ impl ChatOrchestrator {
                 false,
                 &self.config.shell,
             )),
-            ModelMessage::user(build_model_prompt(
+            ModelMessage::user(build_model_prompt_with_conversation(
                 &context,
-                &conversation.messages,
-                conversation.summary.as_ref(),
-                self.conversation_window_tokens(),
-                &self.scanner,
+                &prompt_conversation,
                 None,
             )),
         ];
-        // Notes carry across the continuation as they do for any new task
-        // (spec 65 §5.5); the repair turn starts with no accrued step evidence
-        // and has not sent a plan reminder.
-        let turn_notes = self.carry_notes_from_the_previous_turn(&session.id, &task)?;
+        let options = ChatTurnOptions {
+            verification_turn: true,
+            ..Default::default()
+        };
+        // Spec 27 §5.1: a repair turn is a turn, so the pre-send review holds it
+        // too. `resume_after_context_decision` carries `verification_turn` and
+        // closes a resumed repair that answers without a patch through
+        // `close_verification_resume`.
+        if self.config.pause_for_context_review {
+            return self.pause_for_context_review(
+                repository_root,
+                session,
+                task,
+                context,
+                prompt_conversation,
+                conversation.summary.clone(),
+                messages,
+                turn_notes,
+                options,
+            );
+        }
+        let mut fields = vec![
+            ("actor", "system".to_string()),
+            ("sessionId", session.id.clone()),
+        ];
+        fields.extend(context.manifest.audit_fields());
+        self.audit_log.record("context_assembled", &fields)?;
+        sink.context(&context.manifest);
         let result = self.run_agentic_turn(
             repository_root,
             session,
@@ -2766,10 +2854,7 @@ impl ChatOrchestrator {
             false,
             model_adapter,
             sink,
-            ChatTurnOptions {
-                verification_turn: true,
-                ..Default::default()
-            },
+            options,
         )?;
         // A pause is not the end of the attempt: a command approval or a round
         // budget resumes the same turn and still counts as this attempt.
@@ -5154,10 +5239,32 @@ impl ChatOrchestrator {
         if cancel.is_cancelled() {
             return Ok(crate::compaction::CompactionOutcome::Cancelled);
         }
+        // Review fix 4b: the previous summary already holds model-written
+        // constraints, decisions, failed approaches and uncertainty. When this
+        // call cannot produce a new narrative, those are still true unless the
+        // conversation says otherwise, so they travel into the facts-only
+        // summary rather than disappearing. `narrative_carried_forward` keeps
+        // the failure visible even though the four lists are no longer empty.
+        let previous_narrative = view.summary.as_ref().map(ConversationSummary::narrative);
+        let carried_forward = previous_narrative
+            .as_ref()
+            .is_some_and(|narrative| !narrative.is_empty());
         let narrative = match &run {
-            Ok(run) => {
-                crate::compaction::parse_narrative(&run.content, &self.scanner).unwrap_or_default()
-            }
+            Ok(run) => match crate::compaction::parse_narrative(&run.content, &self.scanner) {
+                Some(narrative) => narrative,
+                None => {
+                    let _ = self.audit_log.record(
+                        "conversation_compaction_narrative_failed",
+                        &[
+                            ("actor", "system".to_string()),
+                            ("sessionId", session_id.to_string()),
+                            ("reason", "the reply was not a usable narrative".to_string()),
+                            ("throughSeq", through_seq.to_string()),
+                        ],
+                    );
+                    previous_narrative.unwrap_or_default()
+                }
+            },
             Err(error) => {
                 let _ = self.audit_log.record(
                     "conversation_compaction_narrative_failed",
@@ -5168,7 +5275,7 @@ impl ChatOrchestrator {
                         ("throughSeq", through_seq.to_string()),
                     ],
                 );
-                crate::compaction::Narrative::default()
+                previous_narrative.unwrap_or_default()
             }
         };
         let model_run_id = run.as_ref().ok().map(|run| run.run_id.clone());
@@ -5185,6 +5292,7 @@ impl ChatOrchestrator {
             decisions: narrative.decisions,
             failed_approaches: narrative.failed_approaches,
             uncertainty: narrative.uncertainty,
+            narrative_carried_forward: carried_forward,
             model_run_id: model_run_id.clone(),
             message_count: facts.message_count,
         };
@@ -5227,6 +5335,10 @@ impl ChatOrchestrator {
                     model_run_id.clone().unwrap_or_else(|| "none".to_string()),
                 ),
                 ("factsOnly", summary.is_facts_only().to_string()),
+                (
+                    "narrativeCarriedForward",
+                    summary.narrative_carried_forward.to_string(),
+                ),
                 (
                     "inputTokens",
                     usage
@@ -9217,8 +9329,37 @@ impl ChatOrchestrator {
             .and_then(|worktree| worktree.canonical.as_deref())
             .unwrap_or(repository_root);
         let scope = in_worktree(worktree);
+        // Spec 27 §5.4: the session's path restriction is part of capability,
+        // not only assembly. A failure to read it fails the call rather than
+        // falling back to an unrestricted read.
+        let context_restriction = match self.session_store.context_restriction(&session.id) {
+            Ok(restriction) => restriction,
+            Err(error) => {
+                return (
+                    "Could not check the session's path restriction.".to_string(),
+                    format!("Cannot run this read-only tool: {error}"),
+                    ActionOutcome::Failed,
+                );
+            }
+        };
+        let outside_restriction = |path: Option<&str>| -> bool {
+            context_restriction.as_deref().is_some_and(|paths| {
+                !self
+                    .context_manager
+                    .restriction_admits_path(repository_root, paths, path)
+            })
+        };
         match action {
             ToolAction::ReadFile { path, range, .. } => {
+                if outside_restriction(Some(path)) {
+                    return (
+                        format!("Read `{path}`{scope}"),
+                        format!(
+                            "Cannot read {path}{scope}: the path is outside this session's path restriction."
+                        ),
+                        ActionOutcome::Failed,
+                    );
+                }
                 let window = match range {
                     Some(range) => ReadWindow::Range(*range),
                     None => ReadWindow::Default,
@@ -9269,6 +9410,16 @@ impl ChatOrchestrator {
                 (format!("Read `{path}`{scope}"), content, outcome)
             }
             ToolAction::ListDirectory { dir, depth, .. } => {
+                if outside_restriction(dir.as_deref()) {
+                    let listed = dir.as_deref().unwrap_or(".");
+                    return (
+                        format!("Listed {listed}{scope}"),
+                        format!(
+                            "Cannot list {listed}{scope}: the path is outside this session's path restriction."
+                        ),
+                        ActionOutcome::Failed,
+                    );
+                }
                 match self.navigation.list_directory_in(
                     repository_root,
                     worktree,
@@ -9312,6 +9463,22 @@ impl ChatOrchestrator {
                 max_matches,
                 ..
             } => {
+                // A literal glob is a path request, so it can be refused
+                // outright. A pattern with wildcards is filtered while walking,
+                // below, because no single path can answer it.
+                if let Some(glob) = path_glob
+                    && !glob.contains(['*', '?', '[', '{'])
+                    && outside_restriction(Some(glob))
+                {
+                    return (
+                        format!("Searched for \"{pattern}\"{scope}"),
+                        format!(
+                            "Cannot search {glob}{scope}: the path is outside this session's path restriction."
+                        ),
+                        ActionOutcome::Failed,
+                    );
+                }
+                let allowed = |path: &str| !outside_restriction(Some(path));
                 match self.navigation.search_content_in(
                     repository_root,
                     worktree,
@@ -9320,6 +9487,7 @@ impl ChatOrchestrator {
                     *max_matches,
                     Some(&task.id),
                     Some(&session.repository_id),
+                    Some(&allowed),
                 ) {
                     Ok(found) => {
                         let mut lines = found
@@ -9331,8 +9499,13 @@ impl ChatOrchestrator {
                         if !lines.is_empty() {
                             lines.push('\n');
                         }
+                        let note = if context_restriction.is_some() {
+                            " (limited to this session's path restriction)"
+                        } else {
+                            ""
+                        };
                         let content = format!(
-                            "{} matches for \"{}\" across {} files{scope} (showing {}):\n{}",
+                            "{} matches for \"{}\" across {} files{scope}{note} (showing {}):\n{}",
                             found.total_found,
                             pattern,
                             found.files_searched,
@@ -9370,23 +9543,30 @@ impl ChatOrchestrator {
                         );
                     }
                 };
+                let allowed = |path: &str| !outside_restriction(Some(path));
                 let results = if *semantic {
                     if self.config.enable_semantic_search {
-                        VectorIndexCache::semantic_search(
+                        VectorIndexCache::semantic_search_allowed(
                             &self.config.data_dir,
                             &index,
                             query,
                             *limit,
+                            &allowed,
                         )
                     } else {
-                        index.semantic_search(query, *limit)
+                        index.semantic_search_allowed(query, *limit, &allowed)
                     }
                 } else {
-                    index.keyword_search(query, *limit)
+                    index.keyword_search_allowed(query, *limit, &allowed)
+                };
+                let note = if context_restriction.is_some() {
+                    "\n\n(Results are limited to this session's path restriction.)"
+                } else {
+                    ""
                 };
                 (
                     format!("Searched codebase for \"{query}\""),
-                    format_search_results(&results),
+                    format!("{}{note}", format_search_results(&results)),
                     // A search that matched nothing still ran. "No results"
                     // is an answer, not a failure.
                     ActionOutcome::Ok,
@@ -9413,6 +9593,39 @@ impl ChatOrchestrator {
                 base,
                 ..
             } => {
+                // Spec 27 §5.4: a diff is file content, so it is bounded by the
+                // session restriction like `read_file`. Refusing is clearer
+                // than silently dropping hunks: the model can name an admitted
+                // path instead of believing it saw every change.
+                if context_restriction.is_some() {
+                    if paths.is_empty() {
+                        return (
+                            format!(
+                                "Read git diff{}{scope}",
+                                if *staged { " (staged)" } else { "" }
+                            ),
+                            "Cannot read the whole repository's diff: this session is restricted \
+                             to selected paths. Name paths inside the restriction."
+                                .to_string(),
+                            ActionOutcome::Failed,
+                        );
+                    }
+                    if let Some(path) = paths
+                        .iter()
+                        .find(|path| outside_restriction(Some(path.as_str())))
+                    {
+                        return (
+                            format!(
+                                "Read git diff{}{scope}",
+                                if *staged { " (staged)" } else { "" }
+                            ),
+                            format!(
+                                "Cannot read git diff for {path}{scope}: the path is outside this session's path restriction."
+                            ),
+                            ActionOutcome::Failed,
+                        );
+                    }
+                }
                 let options = DiffOptions {
                     staged: *staged,
                     paths: paths.clone(),
@@ -10423,6 +10636,7 @@ fn build_conversation(
     }
 }
 
+#[cfg(test)]
 fn build_model_prompt(
     plan: &ContextPlan,
     prior_messages: &[ChatMessage],
@@ -15820,6 +16034,7 @@ mod approval_prompt_wording_tests {
             decisions: Vec::new(),
             failed_approaches: Vec::new(),
             uncertainty: Vec::new(),
+            narrative_carried_forward: false,
             model_run_id: None,
             message_count: 8,
         };
@@ -15887,6 +16102,7 @@ mod approval_prompt_wording_tests {
             decisions: Vec::new(),
             failed_approaches: Vec::new(),
             uncertainty: Vec::new(),
+            narrative_carried_forward: false,
             model_run_id: None,
             message_count: 8,
         };
@@ -16139,7 +16355,7 @@ mod memory_proposal_tests {
             .unwrap();
         engine
             .chat_orchestrator
-            .propose_explicit_memory(&repo, &session.id, &message.id, prompt)
+            .propose_explicit_memory(&repo, &session.id, None, &message.id, prompt)
             .unwrap();
 
         let pending = engine.memory_store.pending_proposals(&session.id).unwrap();
@@ -16173,7 +16389,13 @@ mod memory_proposal_tests {
             .unwrap();
         engine
             .chat_orchestrator
-            .propose_explicit_memory(&repo, &session.id, &message.id, "How does indexing work?")
+            .propose_explicit_memory(
+                &repo,
+                &session.id,
+                None,
+                &message.id,
+                "How does indexing work?",
+            )
             .unwrap();
         assert!(
             engine
@@ -16181,6 +16403,90 @@ mod memory_proposal_tests {
                 .pending_proposals(&session.id)
                 .unwrap()
                 .is_empty()
+        );
+        assert!(
+            refusal_messages(&engine, &session.id).is_empty(),
+            "a message with no request is not refused; there was nothing to refuse"
+        );
+    }
+
+    fn refusal_messages(engine: &WorkspaceEngine, session_id: &str) -> Vec<String> {
+        engine
+            .session_store
+            .read_messages(session_id)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.kind.as_deref() == Some("memory_refusal"))
+            .map(|message| message.content)
+            .collect()
+    }
+
+    fn audit_text(repo: &Path) -> String {
+        fs::read_to_string(repo.join(".damaian").join("audit").join("events.jsonl"))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_refused_explicit_request_says_why_instead_of_looking_ignored() {
+        let repo = temp_repo("refused-secret");
+        let engine = engine_with(&repo);
+        let sessions = SessionStore::new(repo.join(".damaian"));
+        let session = sessions.create_session("repo_fixture", "refused").unwrap();
+        let prompt = "Remember that the deployment key is AKIAIOSFODNN7EXAMPLE.";
+        let message = sessions
+            .append_message(&session.id, None, "user", prompt)
+            .unwrap();
+        engine
+            .chat_orchestrator
+            .propose_explicit_memory(&repo, &session.id, None, &message.id, prompt)
+            .unwrap();
+
+        assert!(
+            engine
+                .memory_store
+                .pending_proposals(&session.id)
+                .unwrap()
+                .is_empty(),
+            "a secret-bearing request produces no card"
+        );
+        let messages = refusal_messages(&engine, &session.id);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("credential") && messages[0].contains("will not store"),
+            "the plain refusal says why: {}",
+            messages[0]
+        );
+        let audit = audit_text(&repo);
+        assert!(audit.contains("memory_proposal_refused"), "{audit}");
+        assert!(audit.contains("\"reason\":\"secret\""), "{audit}");
+    }
+
+    #[test]
+    fn an_over_long_explicit_request_says_why_and_is_audited() {
+        let repo = temp_repo("refused-long");
+        let engine = engine_with(&repo);
+        let sessions = SessionStore::new(repo.join(".damaian"));
+        let session = sessions.create_session("repo_fixture", "long").unwrap();
+        let prompt = format!("Remember that {}", "a".repeat(300));
+        let message = sessions
+            .append_message(&session.id, None, "user", &prompt)
+            .unwrap();
+        engine
+            .chat_orchestrator
+            .propose_explicit_memory(&repo, &session.id, None, &message.id, &prompt)
+            .unwrap();
+
+        let messages = refusal_messages(&engine, &session.id);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("280") && messages[0].contains("not truncated"),
+            "the plain refusal names the ceiling: {}",
+            messages[0]
+        );
+        let audit = audit_text(&repo);
+        assert!(
+            audit.contains("memory_proposal_failed") && audit.contains("statement_too_long"),
+            "the parser refusal is audited even though no proposal was created: {audit}"
         );
     }
 }

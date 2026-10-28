@@ -432,12 +432,13 @@ refused before it could be shown, not lost. The audit log has the reason:
 | `memory_proposal_refused` | No card was shown. `reason` is `secret`, `instruction_shaped`, `evidence_restricted`, `evidence_ignored`, `evidence_not_relative`, `statement_too_long` or `suggestion_cap_reached`. A `path` field is present only when the candidate cited evidence. |
 | `memory_proposal_confirmed` | You pressed Remember and the entry was written. |
 | `memory_proposal_dismissed` | You dismissed the card. Nothing was written. |
-| `memory_proposal_failed` | The proposal could not be recorded at all; the turn continued. |
+| `memory_proposal_failed` | The proposal could not be recorded at all, or an explicit request's statement was over the 280-character ceiling before a proposal existed (`reason=statement_too_long`); the turn continued and the conversation states why. |
 | `memory_records_unreadable` | A stored memory file has lines that do not parse. `scope`, `source` and `unreadable` (the count) are recorded once per run. |
 
 A non-user suggestion is capped at three per task. The fourth produces
 `reason=suggestion_cap_reached` rather than a card. An explicit "remember that…"
-from you is not capped.
+from you is not capped. A refused explicit request is shown in the conversation
+as a plain refusal line, so it no longer looks as if your request was ignored.
 
 The pending cards themselves are session-log events, `memory_proposal_proposed`
 and `memory_proposal_decided`, so a reload or restart shows what is still
@@ -928,10 +929,12 @@ same manifest, without a shell.
   paths** if that was not what you meant. An entry selects a file, or a
   directory with a trailing slash and everything under it. The restriction never
   overrides `restricted_patterns`, so selecting a restricted path does not
-  include it. It filters what is assembled and sent, not what a turn may read:
-  the assistant's own file-reading, directory and search tools are not limited
-  by it. The symbols row and the repository map are still built from the whole
-  repository.
+  include it. It filters what is assembled and sent, and the file-content tools
+  enforce it too: a read, directory listing or diff outside the selection is
+  refused as a tool result, and searches count only admitted matches. An
+  auto-approved shell command such as `ls -R`, and the path lists from
+  `read_git_status`, `read_git_log` and `list_worktrees`, are not filtered. The
+  symbols row and the repository map are still built from the whole repository.
 - **An item you removed is still listed.** On a paused turn, an item removed in
   the panel appears under Excluded as `user_removed` and the token total falls.
   Removal is per turn; a pin or restriction is what changes later turns.

@@ -61,6 +61,7 @@ fn summary(id: &str, through_seq: u64, messages: usize) -> ConversationSummary {
         decisions: Vec::new(),
         failed_approaches: Vec::new(),
         uncertainty: Vec::new(),
+        narrative_carried_forward: false,
         model_run_id: Some("modelrun_1".to_string()),
         message_count: messages,
     }
@@ -962,6 +963,132 @@ fn a_second_compaction_summarises_the_first_one_plus_what_followed() {
             .filter(|(seq, _)| *seq <= summaries[0].through_seq)
             .count(),
         "the first summary's count is exact too"
+    );
+}
+
+#[test]
+fn a_failed_second_summarisation_carries_the_first_narrative_forward() {
+    let repo = temp_repo("carry-narrative");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Carry");
+    seed_long_conversation(&engine, &session, &task, "Do not touch the public API.");
+
+    let mut first = MockModelAdapter::new(
+        r#"{"constraints":["do not touch the public API"],"decisions":["kept the parser"],"failed_approaches":["rewriting the lexer"],"uncertainty":["the retry bound is unverified"]}"#,
+    );
+    engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut first, &cancel())
+        .unwrap();
+    let first_summary = engine
+        .session_store
+        .read_conversation_compactions(&session.id)
+        .unwrap()
+        .pop()
+        .expect("the first compaction was recorded");
+
+    // More conversation after the first boundary, so a second compaction runs.
+    for index in 0..8 {
+        engine
+            .session_store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("later {index} {}", "y".repeat(200)),
+            )
+            .unwrap();
+    }
+    let mut failing = FailingAdapter;
+    let outcome = engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut failing, &cancel())
+        .unwrap();
+    let second = outcome.summary().expect("facts still produce a summary");
+
+    assert_eq!(
+        second.constraints, first_summary.constraints,
+        "constraints survive a failed summarisation call"
+    );
+    assert_eq!(
+        second.decisions, first_summary.decisions,
+        "decisions survive a failed summarisation call"
+    );
+    assert_eq!(
+        second.failed_approaches, first_summary.failed_approaches,
+        "failed approaches survive a failed summarisation call"
+    );
+    assert_eq!(
+        second.uncertainty, first_summary.uncertainty,
+        "uncertainty survives a failed summarisation call"
+    );
+    assert!(
+        second.narrative_carried_forward,
+        "the failed call is marked as carrying its narrative forward"
+    );
+    assert!(
+        !second.is_facts_only(),
+        "the carried narrative means the summary is not facts-only"
+    );
+    assert!(
+        second.model_run_id.is_none(),
+        "no model run produced this narrative"
+    );
+    let audit = fs::read_to_string(engine.config.data_dir.join("audit").join("events.jsonl"))
+        .unwrap_or_default();
+    assert!(
+        audit.contains("\"eventType\":\"conversation_compaction_narrative_failed\""),
+        "the provider failure is audited: {audit}"
+    );
+    assert!(
+        audit.contains("\"narrativeCarriedForward\":\"true\""),
+        "the compaction record names the carry-forward: {audit}"
+    );
+}
+
+#[test]
+fn an_unparsable_summarisation_reply_is_audited_and_marked() {
+    let repo = temp_repo("unparsable-narrative");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Unparsable");
+    seed_long_conversation(&engine, &session, &task, "Do not touch the public API.");
+
+    let mut first = MockModelAdapter::new(
+        r#"{"constraints":["do not touch the public API"],"decisions":["kept the parser"],"failed_approaches":[],"uncertainty":[]}"#,
+    );
+    engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut first, &cancel())
+        .unwrap();
+    for index in 0..8 {
+        engine
+            .session_store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("later {index} {}", "y".repeat(200)),
+            )
+            .unwrap();
+    }
+
+    let mut not_json = MockModelAdapter::new("I could not produce a summary.");
+    let outcome = engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut not_json, &cancel())
+        .unwrap();
+    let second = outcome.summary().expect("facts still produce a summary");
+    assert_eq!(
+        second.constraints,
+        vec!["do not touch the public API"],
+        "the previous narrative is kept"
+    );
+    assert!(second.narrative_carried_forward);
+    let audit = fs::read_to_string(engine.config.data_dir.join("audit").join("events.jsonl"))
+        .unwrap_or_default();
+    assert!(
+        audit.contains("the reply was not a usable narrative"),
+        "an unparsable reply is audited, not silent: {audit}"
     );
 }
 
