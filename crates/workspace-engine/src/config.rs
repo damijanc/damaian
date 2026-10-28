@@ -375,6 +375,12 @@ pub struct Config {
     /// How many `ask_user` questions one turn may ask (spec 50). `0` means the
     /// tool is not offered at all, rather than offered and always refused.
     pub agent_max_questions_per_turn: u32,
+    /// How many `fetch_url` requests one turn may make (spec 51 §5.6, D12).
+    /// `0` means the tool is not offered at all, rather than offered and
+    /// always refused. Restrict-only, lower wins: a repository may lower it,
+    /// never raise it, because each fetch leaves the machine on the
+    /// repository's behalf.
+    pub web_fetch_max_per_turn: u32,
     /// Total tokens one task may spend before it is stopped at a step boundary.
     ///
     /// `None` means no ceiling, which is the default so that upgrading cannot
@@ -1197,6 +1203,7 @@ impl Config {
             agent_web_debug_max_tool_rounds,
             agent_tool_retry_limit,
             agent_max_questions_per_turn,
+            web_fetch_max_per_turn,
             agent_max_task_tokens,
             agent_max_turn_messages,
             agent_max_turn_notes_chars,
@@ -1701,6 +1708,20 @@ impl Config {
             )
         {
             outcome.record(scope, "agent_max_exploration_rounds", None, loosened);
+        }
+
+        // Spec 51 D12: a repository may lower how many pages leave the machine
+        // in one turn, never raise it.
+        if let Some(value) = web_fetch_max_per_turn
+            && let Some(loosened) = restrict_only_u32(
+                &mut self.web_fetch_max_per_turn,
+                value,
+                "web_fetch_max_per_turn",
+                trusted,
+                rejected,
+            )
+        {
+            outcome.record(scope, "web_fetch_max_per_turn", None, loosened);
         }
 
         // Restrict-only like the token ceiling: a repository may shrink the
@@ -2835,6 +2856,11 @@ impl Config {
             "agent_max_questions_per_turn",
             &self.agent_max_questions_per_turn.to_string(),
         );
+        push_line(
+            &mut output,
+            "web_fetch_max_per_turn",
+            &self.web_fetch_max_per_turn.to_string(),
+        );
         // Only when set. Printing `0` for "no ceiling" would read as a ceiling
         // of zero, which is a different and much worse configuration than the
         // default — and `config-show` is one of the two touch points the
@@ -2959,6 +2985,9 @@ impl Default for Config {
             agent_web_debug_max_tool_rounds: 12,
             agent_tool_retry_limit: 2,
             agent_max_questions_per_turn: 2,
+            // Spec 51 D12: a model that fetches twelve pages has lost the
+            // thread, and the cap turns that into a refusal it can read.
+            web_fetch_max_per_turn: 8,
             // Three times the action budget, so a discovery turn can read
             // roughly what the motivating session needed several times over
             // (spec 59 §5.4). The number is a starting point; the long-task
@@ -3066,6 +3095,9 @@ pub struct ConfigOverlay {
     pub agent_web_debug_max_tool_rounds: Option<u32>,
     pub agent_tool_retry_limit: Option<u32>,
     pub agent_max_questions_per_turn: Option<u32>,
+    /// Spec 51 §5.6, D12: page fetches one turn may make. Restrict-only, and
+    /// `0` withholds the tool.
+    pub web_fetch_max_per_turn: Option<u32>,
     pub agent_max_task_tokens: Option<u64>,
     pub agent_max_turn_messages: Option<usize>,
     pub agent_max_turn_notes_chars: Option<usize>,
@@ -3241,6 +3273,9 @@ classify_overlay_fields! {
     // Asking widens no capability; validation holds it under a hard ceiling
     // (spec 50 `context.md` §8).
     agent_max_questions_per_turn => Preference,
+    // Spec 51 D12: each fetch leaves the machine, so the per-turn cap is a
+    // capability a repository may lower but never raise.
+    web_fetch_max_per_turn => Capability,
     agent_max_task_tokens => Capability,
     agent_max_turn_messages => Capability,
     // Spec 65: restrict-only like the request window, and sent on every later
@@ -3525,6 +3560,9 @@ impl ConfigOverlay {
             }
             "agent_max_questions_per_turn" => {
                 self.agent_max_questions_per_turn = Some(parse_question_cap(key, value)?)
+            }
+            "web_fetch_max_per_turn" => {
+                self.web_fetch_max_per_turn = Some(parse_web_fetch_cap(key, value)?)
             }
             "agent_max_task_tokens" => {
                 self.agent_max_task_tokens = Some(parse_task_token_ceiling(key, value)?)
@@ -3925,6 +3963,7 @@ impl ConfigOverlay {
             agent_web_debug_max_tool_rounds,
             agent_tool_retry_limit,
             agent_max_questions_per_turn,
+            web_fetch_max_per_turn,
             agent_max_task_tokens,
             agent_max_turn_messages,
             agent_max_turn_notes_chars,
@@ -4173,6 +4212,9 @@ impl ConfigOverlay {
                 "agent_max_questions_per_turn",
                 &value.to_string(),
             );
+        }
+        if let Some(value) = web_fetch_max_per_turn {
+            push_line(&mut output, "web_fetch_max_per_turn", &value.to_string());
         }
         if let Some(value) = agent_max_turn_messages {
             push_line(&mut output, "agent_max_turn_messages", &value.to_string());
@@ -5418,6 +5460,22 @@ fn parse_question_cap(key: &str, value: &str) -> Result<u32> {
     } else {
         Err(ClientError::InvalidInput(format!(
             "{key} must be between 0 and {MAX_QUESTIONS_PER_TURN_CEILING}"
+        )))
+    }
+}
+
+/// Absolute upper bound for `web_fetch_max_per_turn` (spec 51 D12). The default
+/// is 8; the ceiling exists so a hand-edited config cannot turn one turn into
+/// an unbounded number of outbound requests.
+pub const WEB_FETCH_MAX_PER_TURN_CEILING: u32 = 20;
+
+fn parse_web_fetch_cap(key: &str, value: &str) -> Result<u32> {
+    let parsed = parse_u64(key, value)?;
+    if parsed <= u64::from(WEB_FETCH_MAX_PER_TURN_CEILING) {
+        Ok(parsed as u32)
+    } else {
+        Err(ClientError::InvalidInput(format!(
+            "{key} must be between 0 and {WEB_FETCH_MAX_PER_TURN_CEILING}"
         )))
     }
 }

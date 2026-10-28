@@ -385,6 +385,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "agent_max_turn_notes_chars=16000\n",
             Reported("agent_max_turn_notes_chars"),
         ),
+        // Spec 51 D12: each fetch leaves the machine, so a repository may lower
+        // the per-turn page cap but never raise it.
+        case(
+            "web_fetch_max_per_turn",
+            "web_fetch_max_per_turn=4\n",
+            "web_fetch_max_per_turn=16\n",
+            Reported("web_fetch_max_per_turn"),
+        ),
         case(
             "shell",
             "shell=/bin/zsh\n",

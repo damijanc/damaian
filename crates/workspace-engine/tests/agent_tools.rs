@@ -12,8 +12,9 @@ use workspace_engine::file_access::{FileAccessController, LineRange, ReadWindow}
 use workspace_engine::navigation::NavigationController;
 use workspace_engine::tree_walk::{self, WalkEvent};
 use workspace_engine::{
-    AuditLog, ClientError, CommandPolicy, Config, MockModelAdapter, ModelProviderConfig,
-    PatchEngine, PathPolicy, ProposedChange, SecretScanner, ToolCall, WorkspaceEngine,
+    AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, ClientError, CommandPolicy, Config,
+    MockModelAdapter, ModelProviderConfig, PatchEngine, PathPolicy, ProposedChange, SecretScanner,
+    SessionMode, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1431,6 +1432,113 @@ fn a_network_command_reaches_the_card_with_its_cause_and_the_models_reason() {
         .expect("a network command stops for approval");
     assert_eq!(proposal.reason, reason);
     assert_eq!(proposal.cause, "Asks first: may use the network (`curl`)");
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Spec 51 Task 7 · fetch_url in the tool list
+// ---------------------------------------------------------------------------
+
+fn fetch_turn(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: Option<&str>,
+    user_present: bool,
+    adapter: &mut MockModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .ask_with_session_with_options(
+            repo,
+            "Go ahead.",
+            &[],
+            session_id,
+            adapter,
+            &mut sink,
+            ChatTurnOptions {
+                user_present,
+                ..ChatTurnOptions::default()
+            },
+        )
+        .expect("the turn should run")
+}
+
+/// Requirement 5 and `ask_user`'s precedent: a fetch asks the user to approve a
+/// host the first time, so it is Code-only and withheld where nobody can answer.
+/// The mode matrix and profile axis are covered in `mode.rs`; this is the offer
+/// list the model actually receives.
+#[test]
+fn fetch_url_is_offered_in_code_mode_only() {
+    let repo = temp_dir("fetch-offer");
+    write_fixture(&repo, "src/lib.rs", "pub fn go() {}\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let session = fetch_turn(
+        &engine,
+        &repo,
+        None,
+        true,
+        &mut MockModelAdapter::new("Ready."),
+    )
+    .session
+    .id;
+
+    for (mode, expected) in [
+        (SessionMode::Ask, false),
+        (SessionMode::Plan, false),
+        (SessionMode::Code, true),
+        (SessionMode::Review, false),
+    ] {
+        engine
+            .session_store
+            .set_session_mode(&session, mode, "user")
+            .unwrap();
+        let mut adapter = MockModelAdapter::new("Done.");
+        fetch_turn(&engine, &repo, Some(&session), true, &mut adapter);
+        let offered: Vec<String> = adapter.requests[0]
+            .tools
+            .as_ref()
+            .expect("the native provider offers tools")
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        assert_eq!(
+            offered.iter().any(|tool| tool == "fetch_url"),
+            expected,
+            "{mode:?}: {offered:?}"
+        );
+    }
+
+    // Code with nobody to answer: the first fetch of a new host could not be
+    // approved, so the tool is withheld exactly as `ask_user` is.
+    engine
+        .session_store
+        .set_session_mode(&session, SessionMode::Code, "user")
+        .unwrap();
+    let mut adapter = MockModelAdapter::new("Done.");
+    fetch_turn(&engine, &repo, Some(&session), false, &mut adapter);
+    let offered: Vec<String> = adapter.requests[0]
+        .tools
+        .as_ref()
+        .expect("the native provider offers tools")
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
+    assert!(
+        !offered.iter().any(|tool| tool == "fetch_url"),
+        "a turn with nobody to answer offered fetch_url: {offered:?}"
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }

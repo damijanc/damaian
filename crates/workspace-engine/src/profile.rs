@@ -382,6 +382,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         agent_web_debug_max_tool_rounds,
         agent_tool_retry_limit,
         agent_max_questions_per_turn,
+        web_fetch_max_per_turn,
         agent_max_task_tokens,
         agent_max_turn_messages,
         agent_max_turn_notes_chars,
@@ -617,6 +618,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         agent_max_turn_messages,
         agent_max_turn_notes_chars,
         agent_max_exploration_rounds,
+        web_fetch_max_per_turn,
         mcp_enabled,
         mcp_server_allowlist,
         mcp_servers: carried_servers,
@@ -757,6 +759,9 @@ fn equals_base_limit(key: &str, carried: &ConfigOverlay, base: &Config) -> bool 
         }
         "agent_max_exploration_rounds" => {
             carried.agent_max_exploration_rounds == Some(base.agent_max_exploration_rounds)
+        }
+        "web_fetch_max_per_turn" => {
+            carried.web_fetch_max_per_turn == Some(base.web_fetch_max_per_turn)
         }
         "agent_max_task_tokens" => {
             carried.agent_max_task_tokens.is_some()

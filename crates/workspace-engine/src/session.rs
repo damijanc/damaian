@@ -2,7 +2,7 @@ use crate::audit::escape_json;
 use crate::clarification::{
     AskUserInput, PendingDecision, PendingQuestionRef, QuestionState, validate_answer,
 };
-use crate::error::Result;
+use crate::error::{ClientError, Result};
 use crate::external_reference::ExternalReference;
 use crate::file_access::LineRange;
 use crate::hash::{create_id, now_millis};
@@ -1311,6 +1311,52 @@ impl SessionStore {
             .into_iter()
             .filter(|event| event.event_type == "external_reference_fetched")
             .filter_map(|event| serde_json::from_value(event.payload).ok())
+            .collect())
+    }
+
+    /// Records one fetched page for the next assembly (spec 51 §5.4, D5).
+    ///
+    /// The event payload is exactly [`ExternalReference`]'s serialised form —
+    /// the converted, redacted, bounded text and its provenance, never the raw
+    /// body — plus `contentHash`, the SHA-256 of that text, so a reader can
+    /// tell whether the stored page still matches what the tool returned.
+    /// Unknown keys are ignored by [`serde_json::from_value`] in
+    /// [`Self::read_external_references`].
+    pub fn record_external_reference(
+        &self,
+        session_id: &str,
+        reference: &ExternalReference,
+    ) -> Result<()> {
+        let mut payload = serde_json::to_value(reference)
+            .map_err(|error| ClientError::InvalidInput(error.to_string()))?;
+        payload["contentHash"] =
+            serde_json::json!(crate::hash::sha256_hex(reference.text.as_bytes()));
+        self.append_session_event(
+            session_id,
+            "external_reference_fetched",
+            &payload.to_string(),
+        )
+    }
+
+    /// The repository paths `read_file` returned during `task_id`, in the order
+    /// they were read (spec 51 D9).
+    ///
+    /// The egress guard compares a URL's query and fragment against the content
+    /// of these files. It uses `active_events`, so a rewind discards a read
+    /// whose result is no longer in the conversation. Only `read_file` is
+    /// recorded: files reached through `search_content`, `read_git_diff` or a
+    /// command are deliberately outside this check (`context.md` §4).
+    pub fn read_files_in_task(&self, session_id: &str, task_id: &str) -> Result<Vec<String>> {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(Vec::new());
+        };
+        Ok(active_events(&content)
+            .into_iter()
+            .filter(|event| event.event_type == "action_started")
+            .filter(|event| event.text("action").as_deref() == Some("read_file"))
+            .filter(|event| event.text("taskId").as_deref() == Some(task_id))
+            .filter_map(|event| event.text("ref"))
             .collect())
     }
 
