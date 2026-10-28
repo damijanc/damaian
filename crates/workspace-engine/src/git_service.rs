@@ -996,13 +996,18 @@ impl GitService {
         git_line(root_path.as_ref(), &["rev-parse", "--verify", "-q", "HEAD"])
     }
 
-    /// The repository's first root commit, or `None` when it has no history.
+    /// The repository's identity root commit, or `None` when it has no
+    /// history.
     ///
     /// Tier 1 of spec 28 §5.2's project identity: a property of the
     /// repository's history rather than of where it sits, so it survives a
-    /// clone, move or rename. A merged history can have more than one root;
-    /// the first line is taken, and the result is stable because Git reports
-    /// them in a deterministic order.
+    /// clone, move or rename. A merged history can have more than one root
+    /// (`git subtree add`, an unrelated-history merge, an orphan branch), and
+    /// `rev-list` reports them in commit-time order, so taking the first line
+    /// would move the key whenever another root is merged or a timestamp is
+    /// edited. The lexicographically smallest root depends only on the set of
+    /// roots, so the same history always resolves to the same key; a rewrite
+    /// that removes a root still changes it.
     ///
     /// Not audited, like [`Self::head_commit`]: the memory store audits the
     /// lifecycle this enables, and a lookup that happens on every open would
@@ -1015,7 +1020,8 @@ impl GitService {
         Ok(output
             .lines()
             .map(str::trim)
-            .find(|line| !line.is_empty())
+            .filter(|line| !line.is_empty())
+            .min()
             .map(str::to_string))
     }
 
