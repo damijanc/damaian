@@ -120,6 +120,9 @@ impl ProfileId {
                 // A commit writes to the repository, which a read-only
                 // checkout does not permit (spec 35 §5.8).
                 allow_git_commits: Some(false),
+                // Branch mutation writes refs and can move the working tree
+                // (spec 36 §5.8).
+                allow_git_branches: Some(false),
                 ..ConfigOverlay::default()
             },
             ProfileId::SafeLocal => ConfigOverlay {
@@ -162,8 +165,8 @@ fn is_valid_custom_name(name: &str) -> bool {
             .all(|character| matches!(character, 'a'..='z' | '0'..='9' | '_'))
 }
 
-/// The resolved values the refusal points consult (spec 31 Task 5): the four
-/// profile keys plus the MCP kill-switch.
+/// The resolved values the refusal points consult (spec 31 Task 5): the
+/// profile capability keys plus the MCP kill-switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileCapabilities {
     pub allow_file_edits: bool,
@@ -172,6 +175,9 @@ pub struct ProfileCapabilities {
     pub allow_mutating_mcp_tools: bool,
     /// Spec 35 §5.8: whether this checkout may create commits.
     pub allow_git_commits: bool,
+    /// Spec 36 §5.8: whether this checkout may create, switch, or delete
+    /// branches.
+    pub allow_git_branches: bool,
     pub mcp_enabled: bool,
 }
 
@@ -367,6 +373,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         allow_browser_diagnostics,
         allow_mutating_mcp_tools,
         allow_git_commits,
+        allow_git_branches,
         git_branch_prefix,
         block_generated_secrets,
         audit_enabled,
@@ -596,6 +603,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         allow_browser_diagnostics,
         allow_mutating_mcp_tools,
         allow_git_commits,
+        allow_git_branches,
         audit_retention_days,
         checkpoint_retention_days,
         agent_max_task_tokens,

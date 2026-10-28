@@ -16,7 +16,7 @@ wins.
 |---|---|---|
 | 1 · Read-only branch information | Done 2026-10-28 | Added `BranchInfo` (camelCase serde) and `GitService::branch_info` in `git_service.rs`: current branch, full `HEAD`, detached, upstream via `rev-parse @{upstream}`, ahead/behind through the existing helper, in-progress operation from Git-resolved marker paths including `BISECT_LOG`, and unmerged paths via `git diff --diff-filter=U -z` filtered by the restricted-path rule. `merge_base` is now public and validates `base` before git runs. `head_oid` is `Option<String>` because an unborn branch has no commit (context §3.13/D5). Audit is `git_branch_read` with counts and no restricted path names. New `tests/branch_delivery.rs` has 10 tests: upstream 0/0 → 1/0 → 0/1 → 1/1, detached, unborn, real conflicted merge, clean state, merge-base and option-shaped base refusal, byte-identical index/HEAD/status across reads, restricted conflicting `.env` omitted, non-repository refusal, and camelCase JSON. Falsified by swapping ahead/behind (test failed) and by skipping the `MERGE_HEAD` scan (test failed), then restoring. Scoped checks: `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest -p workspace-engine --test branch_delivery --test worktree_reads` 58 passed. No `chat.rs` change. |
 | 2 · Suggested branch name | Done 2026-10-28 | Added `git_branch_prefix` (`Config` default `damaian/`, `ConfigOverlay` field, parse/serialise, `ConfigKeyKind::Preference`, repository-scope `preference()` merge, policy text, profile split refuses it) and the config-key record updates. New `branch.rs` has `slugify_branch_title` (lowercase ASCII, separator runs, 50-char cap, `change` fallback), `validate_branch_prefix` (empty allowed; rejects `@{`, `..`, `//`, leading `-`/`/`, control/special characters, `.lock` components, trailing `.`), `BranchSuggestion`, and `suggest_branch_name`, which redirects the source through `SecretScanner::redact` before slugging (D10). `GitService` gained `check_branch_name` (authoritative `git check-ref-format --branch`) and `local_branches` (one `for-each-ref`); a collision keeps the name unchanged and offers the first free `-2`/`-3` alternative. Six new branch tests: slug bounds/unicode, default prefix, collision and alternative, empty/invalid prefixes including `feature@{1}/`, Git-authoritative valid/invalid names, and a seeded AWS key absent from the name. One new permission test proves a repository may choose the prefix and a profile may not. Falsified by removing the redaction call: the secret test failed with `damaian/rotate-akiaiosfodnn7example-before-release`, then restored. Scoped checks: `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest -p workspace-engine --test branch_delivery --test permission_profiles --test foundation` 268 passed (1 skipped); fast gate `fmt node typos` clean. `cargo deny check` fails on RUSTSEC-2026-0414 in `pulldown-cmark` 0.13.4, a dependency this task does not touch (context §6). Discovery recorded in context §3.14: Git 2.56's `check-ref-format` rejects `--end-of-options`, so leading-`-` refusal stays in Rust. No `chat.rs` change. |
-| 3 · The `allow_git_branches` capability | Not started | — |
+| 3 · The `allow_git_branches` capability | Done 2026-10-28 | Added `allow_git_branches` through the same four-file pattern as `allow_git_commits`: `Config` default `true`, `ConfigOverlay` field with parse/serialise, `ConfigKeyKind::Capability`, restrict-only in `apply_overlay_scoped`, `Config::to_policy_text`, `ProfileCapabilities.allow_git_branches` and `Config::profile_capabilities`, the Read-only overlay turns it off, `split_profile_keys` carries it, and `rule_label` gives it "Git branches allowed". Tests in `tests/permission_profiles.rs`: the weakening case (repository `true` over user `false` refused as restrict-only), a new two-load `a_repository_may_deny_git_branches_and_may_not_grant_them`, `allow_git_branches_is_a_capability_key_with_a_human_name`, default `true`, the Read-only row in `each_built_in_profile_resolves_to_its_table_row` now expects false (all other built-ins true), and `EVERY_PROFILE_KEY` carries the new key. Falsified by passing `restrictive = true` for the new key in `apply_overlay_scoped`: `every_capability_key_resists_weakening_from_repository_scope` failed with "repository value was not refused as allow_git_branches; got []" and the denial test failed at `!denied.allow_git_branches`; restored and both pass. Scoped checks: `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest -p workspace-engine --test permission_profiles --test branch_delivery --test foundation` 270 passed (1 skipped); `cargo nextest -p workspace-engine --lib` 579 passed (5 skipped). No behaviour is wired, per the task and D1: no branch mutation entry point exists yet (Task 4 adds `prepare_*`/`apply`), and the only existing branch-creating path, spec 57's `worktree.rs` `git worktree add -b`, is its own `enable_worker_sessions` facility, not this capability. Task 4 must gate every `prepare_*` on `config.profile_capabilities().allow_git_branches` and Code mode. Observation, not changed: `EVERY_PROFILE_KEY` never gained `allow_git_commits` in spec 35; only the new key was added here. The repeated `rev-parse --git-path` calls noted in review were left alone as instructed. No `chat.rs` change. |
 | 4 · Branch creation and switching | Not started | — |
 | 5 · Branch deletion with the unmerged confirmation | Not started | — |
 | 6 · Merge and rebase preparation without executing either | Not started | — |
@@ -249,23 +249,23 @@ collision reported and a free suffixed alternative offered. It changes no ref.
 **Goal:** branch mutation is a capability a profile or repository can deny, and
 repository config cannot grant it. No behaviour is wired until Task 4.
 
-- [ ] Add `allow_git_branches` beside `allow_git_commits`: `Config` default
+- [x] Add `allow_git_branches` beside `allow_git_commits`: `Config` default
       `true`, `ConfigOverlay` field, parse, serialise, `to_policy_text`,
       `ConfigKeyKind::Capability`, restrict-only in `apply_overlay_scoped`, and
       the effective-policy label "Git branches allowed".
-- [ ] Add it to `ProfileCapabilities`, `Config::profile_capabilities`, the
+- [x] Add it to `ProfileCapabilities`, `Config::profile_capabilities`, the
       Read-only profile (`false`), profile split/import plumbing, and every
       exhaustive table in `profile.rs`.
-- [ ] Tests: the weakening case in `tests/permission_profiles.rs` proves a
+- [x] Tests: the weakening case in `tests/permission_profiles.rs` proves a
       repository can set it false but not true; the Read-only profile resolves
       false; the built-in profile table expects the new column; the capability
       has a human-readable label.
-- [ ] Run `cargo fmt --all`; scoped checks:
+- [x] Run `cargo fmt --all`; scoped checks:
       `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`
       and `cargo nextest run -p workspace-engine --test permission_profiles`.
-- [ ] Falsify: make the repository overlay accept `true`, confirm the weakening
+- [x] Falsify: make the repository overlay accept `true`, confirm the weakening
       test fails, restore.
-- [ ] Update the progress row and commit.
+- [x] Update the progress row and commit.
 
 ### Task 4 · Branch creation and switching
 

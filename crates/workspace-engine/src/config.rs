@@ -310,6 +310,11 @@ pub struct Config {
     /// commit is the first write to the user's repository, so it is a
     /// capability like file edits, and a repository may turn it down.
     pub allow_git_commits: bool,
+    /// Whether this checkout may create, switch, or delete branches
+    /// (spec 36 §5.8). Branches are a separate capability from commits because
+    /// each approval is action-specific (context.md D1), and a repository may
+    /// turn it down.
+    pub allow_git_branches: bool,
     /// The prefix a suggested branch name uses (spec 36 §5.2), default
     /// `damaian/`. This is naming, not permission, so it is a preference rather
     /// than a capability; the composed name is validated by Git regardless.
@@ -1177,6 +1182,7 @@ impl Config {
             allow_browser_diagnostics,
             allow_mutating_mcp_tools,
             allow_git_commits,
+            allow_git_branches,
             git_branch_prefix,
             block_generated_secrets,
             audit_enabled,
@@ -1490,6 +1496,12 @@ impl Config {
                 "allow_git_commits",
                 &mut self.allow_git_commits,
                 allow_git_commits,
+                false,
+            ),
+            (
+                "allow_git_branches",
+                &mut self.allow_git_branches,
+                allow_git_branches,
                 false,
             ),
             ("mcp_enabled", &mut self.mcp_enabled, mcp_enabled, false),
@@ -2550,6 +2562,7 @@ impl Config {
             allow_browser_diagnostics: self.allow_browser_diagnostics,
             allow_mutating_mcp_tools: self.allow_mutating_mcp_tools,
             allow_git_commits: self.allow_git_commits,
+            allow_git_branches: self.allow_git_branches,
             mcp_enabled: self.mcp_enabled,
         }
     }
@@ -2706,6 +2719,11 @@ impl Config {
             &mut output,
             "allow_git_commits",
             &self.allow_git_commits.to_string(),
+        );
+        push_line(
+            &mut output,
+            "allow_git_branches",
+            &self.allow_git_branches.to_string(),
         );
         push_line(&mut output, "git_branch_prefix", &self.git_branch_prefix);
         push_line(
@@ -2882,6 +2900,7 @@ impl Default for Config {
             allow_browser_diagnostics: true,
             allow_mutating_mcp_tools: true,
             allow_git_commits: true,
+            allow_git_branches: true,
             git_branch_prefix: "damaian/".to_string(),
             block_generated_secrets: true,
             audit_enabled: true,
@@ -2982,6 +3001,9 @@ pub struct ConfigOverlay {
     pub allow_browser_diagnostics: Option<bool>,
     pub allow_mutating_mcp_tools: Option<bool>,
     pub allow_git_commits: Option<bool>,
+    /// Spec 36 D1: branch mutation is its own capability, beside commits, so a
+    /// repository may deny it and may never grant it.
+    pub allow_git_branches: Option<bool>,
     /// Spec 36 §5.2: the prefix a suggested branch name uses. Preference: a
     /// repository may name its own convention, and a profile does not configure
     /// naming.
@@ -3147,6 +3169,9 @@ classify_overlay_fields! {
     // Spec 35: a commit is the first write to the user's repository, so a
     // clone may refuse it and may never grant it.
     allow_git_commits => Capability,
+    // Spec 36 D1: the same direction as commits, as a separate key because an
+    // approval for one operation may not authorize another.
+    allow_git_branches => Capability,
     // Spec 36 §5.2: a naming convention, not a permission. The composed name
     // is validated by git, so a repository choosing its own prefix widens
     // nothing.
@@ -3419,6 +3444,7 @@ impl ConfigOverlay {
                 self.allow_mutating_mcp_tools = Some(parse_bool(key, value)?)
             }
             "allow_git_commits" => self.allow_git_commits = Some(parse_bool(key, value)?),
+            "allow_git_branches" => self.allow_git_branches = Some(parse_bool(key, value)?),
             "git_branch_prefix" => {
                 let prefix = value.trim();
                 if prefix.len() > 200 {
@@ -3821,6 +3847,7 @@ impl ConfigOverlay {
             allow_browser_diagnostics,
             allow_mutating_mcp_tools,
             allow_git_commits,
+            allow_git_branches,
             git_branch_prefix,
             block_generated_secrets,
             audit_enabled,
@@ -4006,6 +4033,9 @@ impl ConfigOverlay {
         }
         if let Some(value) = allow_git_commits {
             push_line(&mut output, "allow_git_commits", &value.to_string());
+        }
+        if let Some(value) = allow_git_branches {
+            push_line(&mut output, "allow_git_branches", &value.to_string());
         }
         if let Some(value) = git_branch_prefix {
             push_line(&mut output, "git_branch_prefix", value);
