@@ -243,12 +243,12 @@ be presented as current.
   escape only). Reconstructing "files read in this task" from it would mean a new
   parser; D9 uses the session's `action_started` markers instead and records the
   narrower scope.
-- **`cargo deny check` fails on this checkout for an unrelated advisory.** On
-  2026-10-28 it reports `RUSTSEC-2026-0414` against `pulldown-cmark v0.13.4`
+- **`cargo deny check` failed at planning time for an unrelated advisory.** On
+  2026-10-28 it reported `RUSTSEC-2026-0414` against `pulldown-cmark v0.13.4`
   (fixed in 0.13.5), reached through `workspace-engine`. No task here touches
-  that dependency, so planning left it alone; the first task that runs the fast
-  gate should expect the same failure until the dependency is bumped in its own
-  change.
+  that dependency, so planning left it alone. It was fixed on `main` the same
+  day as its own change (`ec9f7ea`), and this branch was rebased onto that
+  commit, so the check now passes here.
 
 ## 5. What later tasks inherit
 
