@@ -347,7 +347,7 @@ impl MemoryMatchReason {
 /// `verification` repeats `entry.verification` deliberately: it is the state
 /// after this recall's evidence check, and the manifest records it beside the
 /// entry id without carrying the statement (spec 30 C3).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecalledMemory {
     pub entry: MemoryEntry,
     pub match_reason: MemoryMatchReason,
@@ -358,6 +358,58 @@ pub struct RecalledMemory {
     /// this to report the item as `redacted` rather than `clean`; the stored
     /// record is not rewritten.
     pub redacted: bool,
+}
+
+/// Why an entry recalled at assembly may no longer be sent (spec 30 §5.6).
+///
+/// Kept separate from [`ExclusionReason`](crate::context_manager::ExclusionReason)
+/// because this is the store's finding about an entry, not the manifest's
+/// rendering decision; the turn maps it to one exclusion reason and a
+/// content-free detail line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallExclusionReason {
+    /// No record with that id exists in the entry's scope any more.
+    Missing,
+    /// The entry was superseded, expired by an explicit action, or deleted.
+    NotActive,
+    /// Its own expiry or the retention window passed after assembly.
+    Expired,
+    /// An evidence path became restricted or ignored after assembly.
+    EvidenceWithdrawn,
+}
+
+impl RecallExclusionReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Missing => "no longer exists",
+            Self::NotActive => "is no longer active",
+            Self::Expired => "has expired",
+            Self::EvidenceWithdrawn => {
+                "is withdrawn because its evidence is now restricted or ignored"
+            }
+        }
+    }
+}
+
+/// One recalled entry the send-time re-check refuses, with the reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallExclusion {
+    pub entry_id: String,
+    pub reason: RecallExclusionReason,
+}
+
+impl RecallExclusion {
+    /// The manifest's content-free detail for the dropped item.
+    ///
+    /// The entry id, never the statement: the manifest is written to the audit
+    /// log (spec 30 C3).
+    pub fn detail(&self) -> String {
+        format!(
+            "memory entry {} {}; it was not sent",
+            self.entry_id,
+            self.reason.describe()
+        )
+    }
 }
 
 /// Where a proposal came from. The user's own request is the only trusted
@@ -2332,6 +2384,85 @@ impl MemoryStore {
             });
         }
         Ok(recalled)
+    }
+
+    /// Re-checks entries recalled during assembly immediately before a send
+    /// (spec 30 §5.6, C9).
+    ///
+    /// The world can change between a paused review and the model call: an
+    /// entry may be deleted, superseded, expired, or have its evidence path
+    /// restricted or ignored. Such an entry must not be sent, and this is the
+    /// one place that decides it. The entries still eligible are not returned;
+    /// the caller keeps the rendered copies it assembled, so the request it
+    /// sends is the one the review showed.
+    ///
+    /// The only writes are the transitions ordinary recall would also perform:
+    /// an expiry through [`Self::mark_state`] and the once-per-entry withdrawal
+    /// audit. Nothing creates or rewrites a statement.
+    pub fn recheck_recall(
+        &self,
+        root: &Path,
+        identity: &ProjectIdentity,
+        session_id: &str,
+        recalled: &[RecalledMemory],
+    ) -> MemoryResult<Vec<RecallExclusion>> {
+        if recalled.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = now_millis();
+        // One read per scope rather than one per recalled entry: the store is
+        // a file and a turn may carry the full cap.
+        let session_entries = self.session_entries(session_id)?;
+        let project_entries = self.project_entries(identity)?;
+        let user_entries = if self.config.user_scope_enabled {
+            self.user_entries()?
+        } else {
+            Vec::new()
+        };
+
+        let mut exclusions = Vec::new();
+        for recalled in recalled {
+            let (target, entries) = match recalled.entry.scope {
+                MemoryScope::Session => (
+                    MemoryTarget::Session(session_id),
+                    session_entries.as_slice(),
+                ),
+                MemoryScope::Project => {
+                    (MemoryTarget::Project(identity), project_entries.as_slice())
+                }
+                MemoryScope::User => (MemoryTarget::User, user_entries.as_slice()),
+            };
+            let Some(entry) = entries.iter().find(|entry| entry.id == recalled.entry.id) else {
+                exclusions.push(RecallExclusion {
+                    entry_id: recalled.entry.id.clone(),
+                    reason: RecallExclusionReason::Missing,
+                });
+                continue;
+            };
+            if entry.state != MemoryState::Active {
+                exclusions.push(RecallExclusion {
+                    entry_id: entry.id.clone(),
+                    reason: RecallExclusionReason::NotActive,
+                });
+                continue;
+            }
+            if self.expiry_due(entry, now) {
+                self.mark_state(target, &entry.id, MemoryState::Expired)?;
+                exclusions.push(RecallExclusion {
+                    entry_id: entry.id.clone(),
+                    reason: RecallExclusionReason::Expired,
+                });
+                continue;
+            }
+            if let Some((path, reason)) = self.withdrawal_reason(root, entry) {
+                self.audit_withdrawal(entry, &path, reason)?;
+                exclusions.push(RecallExclusion {
+                    entry_id: entry.id.clone(),
+                    reason: RecallExclusionReason::EvidenceWithdrawn,
+                });
+            }
+        }
+        Ok(exclusions)
     }
 
     /// Whether an entry's own expiry or the store-wide retention window has

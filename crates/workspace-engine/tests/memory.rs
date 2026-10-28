@@ -3525,3 +3525,426 @@ fn a_credential_added_directly_to_the_memory_file_is_redacted_on_recall() {
         "the audit log redacts a recalled statement too"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Turn wiring and the send-time re-check (spec 30 Task 4).
+// ---------------------------------------------------------------------------
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use workspace_engine::context_manager::ExclusionReason;
+use workspace_engine::{
+    CancelToken, ChatTurnResult, ContextCategory, ContextDecision, ContextManifest,
+    MockModelAdapter, ModelAdapter, RecallExclusionReason, TaskStatus, TurnProgress, TurnSink,
+    WorkspaceEngine,
+};
+
+type ProgressLog = Rc<RefCell<Vec<TurnProgress>>>;
+
+fn turn_engine(root: &Path, pause: bool) -> WorkspaceEngine {
+    let mut config = test_config(root);
+    config.pause_for_context_review = pause;
+    WorkspaceEngine::new(config)
+}
+
+fn turn_identity(engine: &WorkspaceEngine, root: &Path) -> ProjectIdentity {
+    ProjectIdentity::resolve_for_root(root, &engine.git).expect("the fixture has an identity")
+}
+
+fn insert_recalled(
+    engine: &WorkspaceEngine,
+    root: &Path,
+    identity: &ProjectIdentity,
+    statement: &str,
+) -> String {
+    engine
+        .memory_store
+        .insert(
+            root,
+            Some(identity),
+            project_entry(&identity.key, statement),
+        )
+        .expect("the fixture entry should be stored")
+        .id
+}
+
+fn ask_collecting(
+    engine: &WorkspaceEngine,
+    root: &Path,
+    prompt: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> (ChatTurnResult, ProgressLog) {
+    let cancel = CancelToken::new();
+    let mut tokens = |_token: &str| {};
+    let progress: ProgressLog = Rc::new(RefCell::new(Vec::new()));
+    let collected = Rc::clone(&progress);
+    let mut on_progress = move |event: TurnProgress| collected.borrow_mut().push(event);
+    let mut sink = TurnSink {
+        on_token: &mut tokens,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let result = engine
+        .chat_orchestrator
+        .ask_with_session(root, prompt, &[], None, adapter, &mut sink)
+        .expect("the turn should run or pause");
+    (result, progress)
+}
+
+fn resume_collecting(
+    engine: &WorkspaceEngine,
+    proposal: &str,
+    decision: ContextDecision,
+    adapter: &mut dyn ModelAdapter,
+) -> (workspace_engine::Result<ChatTurnResult>, ProgressLog) {
+    let cancel = CancelToken::new();
+    let mut tokens = |_token: &str| {};
+    let progress: ProgressLog = Rc::new(RefCell::new(Vec::new()));
+    let collected = Rc::clone(&progress);
+    let mut on_progress = move |event: TurnProgress| collected.borrow_mut().push(event);
+    let mut sink = TurnSink {
+        on_token: &mut tokens,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let result = engine.chat_orchestrator.resume_after_context_decision(
+        proposal,
+        decision,
+        "desktop_user",
+        adapter,
+        &mut sink,
+    );
+    (result, progress)
+}
+
+fn last_manifest(progress: &ProgressLog) -> ContextManifest {
+    progress
+        .borrow()
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            TurnProgress::Context(manifest) => Some((**manifest).clone()),
+            _ => None,
+        })
+        .expect("the turn emitted its context manifest")
+}
+
+const TURN_STATEMENT: &str = "Integration tests require Docker to be running.";
+const TURN_PROMPT: &str = "How do I run the integration tests?";
+
+#[test]
+fn a_turn_sends_recalled_memory_as_a_context_item_and_records_it_once() {
+    let root = repo_with_a_commit("turn-recall");
+    let engine = turn_engine(&root, false);
+    let identity = turn_identity(&engine, &root);
+    let entry_id = insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (result, progress) = ask_collecting(&engine, &root, TURN_PROMPT, &mut adapter);
+
+    assert_eq!(adapter.requests.len(), 1);
+    let sent = &adapter.requests[0].messages[1].content;
+    assert!(sent.contains("--- memory ---"), "{sent}");
+    assert!(
+        sent.contains("Remembered about this project (user-confirmed, "),
+        "{sent}"
+    );
+    assert!(sent.contains(TURN_STATEMENT), "{sent}");
+    assert_eq!(
+        sent.matches(TURN_STATEMENT).count(),
+        1,
+        "memory must not be duplicated elsewhere in the request: {sent}"
+    );
+
+    let manifest = last_manifest(&progress);
+    assert_eq!(manifest.memory.len(), 1);
+    assert_eq!(manifest.memory[0].entry_id, entry_id);
+    assert!(
+        !serde_json::to_string(&manifest)
+            .unwrap()
+            .contains(TURN_STATEMENT),
+        "the manifest names the entry, never its statement"
+    );
+
+    let audit = audit_text(&root);
+    let recalled_events: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains("\"eventType\":\"memory_recalled\""))
+        .collect();
+    assert_eq!(
+        recalled_events.len(),
+        1,
+        "one send is one recall record: {audit}"
+    );
+    assert!(recalled_events[0].contains(&entry_id), "{audit}");
+    assert_eq!(result.task.status, TaskStatus::Complete);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_declined_review_records_no_recall() {
+    let root = repo_with_a_commit("decline-no-recall");
+    let engine = turn_engine(&root, true);
+    let identity = turn_identity(&engine, &root);
+    insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (paused, _) = ask_collecting(&engine, &root, TURN_PROMPT, &mut adapter);
+    assert!(adapter.requests.is_empty(), "a pause sends nothing");
+    let review = paused.context_review.expect("the review is present");
+    assert_eq!(review.manifest.memory.len(), 1);
+    assert!(
+        !audit_text(&root).contains("memory_recalled"),
+        "assembly alone is not a recall"
+    );
+
+    let (declined, _) =
+        resume_collecting(&engine, &review.id, ContextDecision::Decline, &mut adapter);
+    let declined = declined.expect("declining is a result, not an error");
+    assert!(declined.cancelled);
+    assert!(adapter.requests.is_empty());
+    assert!(
+        !audit_text(&root).contains("memory_recalled"),
+        "a declined review sends nothing, so nothing was recalled"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn an_entry_deleted_between_assembly_and_send_is_absent_from_the_request() {
+    let root = repo_with_a_commit("delete-before-send");
+    let engine = turn_engine(&root, true);
+    let identity = turn_identity(&engine, &root);
+    let entry_id = insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (paused, _) = ask_collecting(&engine, &root, TURN_PROMPT, &mut adapter);
+    let review = paused.context_review.expect("the review is present");
+    assert_eq!(review.manifest.memory.len(), 1);
+    assert_eq!(review.manifest.memory[0].entry_id, entry_id);
+
+    engine
+        .memory_store
+        .mark_state(
+            MemoryTarget::Project(&identity),
+            &entry_id,
+            MemoryState::Deleted,
+        )
+        .unwrap();
+
+    let (resumed, progress) =
+        resume_collecting(&engine, &review.id, ContextDecision::Send, &mut adapter);
+    let resumed = resumed.expect("the amended context should send");
+
+    assert_eq!(adapter.requests.len(), 1);
+    let sent = &adapter.requests[0].messages[1].content;
+    assert!(
+        !sent.contains(TURN_STATEMENT),
+        "a deleted entry reached the model: {sent}"
+    );
+
+    let manifest = last_manifest(&progress);
+    assert!(
+        manifest.memory.is_empty(),
+        "the send-time drop must remove the manifest row too: {:?}",
+        manifest.memory
+    );
+    let dropped = manifest
+        .excluded
+        .iter()
+        .find(|record| record.reason == ExclusionReason::MemoryNoLongerActive)
+        .expect("the drop is recorded as an exclusion");
+    assert_eq!(dropped.category, ContextCategory::Memory);
+    assert!(
+        dropped
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(&entry_id) && detail.contains("no longer active")),
+        "{:?}",
+        dropped.detail
+    );
+    assert!(
+        !audit_text(&root).contains("memory_recalled"),
+        "an entry that was not sent is not recorded as recalled"
+    );
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_continuation_keeps_the_entries_the_turn_recalled_and_does_not_recall_again() {
+    let root = repo_with_a_commit("continuation-memory");
+    let engine = turn_engine(&root, true);
+    let identity = turn_identity(&engine, &root);
+    let reviewed_id = insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (paused, _) = ask_collecting(&engine, &root, TURN_PROMPT, &mut adapter);
+    let review = paused.context_review.expect("the review is present");
+    assert_eq!(review.manifest.memory.len(), 1);
+
+    // Relevant, but added after assembly. A second recall would pick it up; a
+    // continuation must send what the review showed instead.
+    let late_statement = "Integration tests run against a staging database.";
+    let late_id = insert_recalled(&engine, &root, &identity, late_statement);
+
+    let (resumed, progress) =
+        resume_collecting(&engine, &review.id, ContextDecision::Send, &mut adapter);
+    let resumed = resumed.expect("the reviewed context should send");
+
+    assert_eq!(adapter.requests.len(), 1);
+    let sent = &adapter.requests[0].messages[1].content;
+    assert!(sent.contains(TURN_STATEMENT), "{sent}");
+    assert!(
+        !sent.contains(late_statement),
+        "the continuation recalled again instead of keeping the reviewed entries: {sent}"
+    );
+
+    let manifest = last_manifest(&progress);
+    assert_eq!(manifest.memory.len(), 1);
+    assert_eq!(manifest.memory[0].entry_id, reviewed_id);
+
+    let audit = audit_text(&root);
+    let recalled_events: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains("\"eventType\":\"memory_recalled\""))
+        .collect();
+    assert_eq!(recalled_events.len(), 1, "{audit}");
+    assert!(recalled_events[0].contains(&reviewed_id), "{audit}");
+    assert!(!recalled_events[0].contains(&late_id), "{audit}");
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_send_time_recheck_names_what_it_drops() {
+    let root = temp_dir("recall-recheck");
+    fs::create_dir_all(root.join("deploy")).unwrap();
+    fs::write(root.join("deploy/settings.yml"), "port: 5433\n").unwrap();
+    let identity = project_identity("root_recall_recheck");
+    let open = memory_store(&root, false);
+
+    let active = open
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Docker is available on every build agent."),
+        )
+        .unwrap();
+    let deleted = open
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Docker publishes the deploy port."),
+        )
+        .unwrap();
+    let expiring = open
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "The deploy port is temporary.").with_expiry(
+                MemoryExpiry {
+                    expires_at_ms: Some(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis()
+                            + 3_600_000,
+                    ),
+                    revalidate_on_evidence_change: false,
+                },
+            ),
+        )
+        .unwrap();
+    let withdrawn = open
+        .insert(
+            &root,
+            Some(&identity),
+            evidence_entry(
+                &root,
+                &identity,
+                "The deploy settings define the Docker port.",
+                &["deploy/settings.yml"],
+            ),
+        )
+        .unwrap();
+
+    let recalled = recall_for(
+        &open,
+        &root,
+        &identity,
+        "session_missing",
+        "docker deploy port settings",
+        10,
+    );
+    assert_eq!(recalled.len(), 4, "{recalled:?}");
+
+    // The world changes after assembly: one entry is deleted and one has its
+    // expiry moved into the past. Rewriting the replay file is how a clock
+    // passes without the test sleeping.
+    open.mark_state(
+        MemoryTarget::Project(&identity),
+        &deleted.id,
+        MemoryState::Deleted,
+    )
+    .unwrap();
+    let mut entries = open.project_entries(&identity).unwrap();
+    for entry in &mut entries {
+        if entry.id == expiring.id {
+            entry.expiry = Some(MemoryExpiry {
+                expires_at_ms: Some(0),
+                revalidate_on_evidence_change: false,
+            });
+        }
+    }
+    let lines: Vec<String> = entries
+        .iter()
+        .map(|entry| serde_json::to_string(entry).unwrap())
+        .collect();
+    write_lines(&open.project_path(&identity.key), &lines);
+
+    let restricted = memory_store_with(&root, false, |config| {
+        config
+            .restricted_patterns
+            .push("deploy/settings.yml".to_string());
+    });
+    let exclusions = restricted
+        .recheck_recall(&root, &identity, "session_missing", &recalled)
+        .unwrap();
+
+    let reason = |id: &str| {
+        exclusions
+            .iter()
+            .find(|exclusion| exclusion.entry_id == id)
+            .map(|exclusion| exclusion.reason)
+    };
+    assert_eq!(reason(&active.id), None, "a live entry is still sent");
+    assert_eq!(reason(&deleted.id), Some(RecallExclusionReason::NotActive));
+    assert_eq!(reason(&expiring.id), Some(RecallExclusionReason::Expired));
+    assert_eq!(
+        reason(&withdrawn.id),
+        Some(RecallExclusionReason::EvidenceWithdrawn)
+    );
+    assert!(exclusions.iter().all(|exclusion| {
+        let detail = exclusion.detail();
+        !detail.contains("Docker") && detail.contains(&exclusion.entry_id)
+    }));
+
+    let loaded = restricted.project_entries(&identity).unwrap();
+    let stored = |id: &str| loaded.iter().find(|entry| entry.id == id).unwrap();
+    assert_eq!(stored(&expiring.id).state, MemoryState::Expired);
+    assert_eq!(
+        stored(&withdrawn.id).state,
+        MemoryState::Active,
+        "withdrawal is not deletion"
+    );
+    assert!(audit_text(&root).contains("memory_recall_withdrawn"));
+
+    fs::remove_dir_all(root).unwrap();
+}

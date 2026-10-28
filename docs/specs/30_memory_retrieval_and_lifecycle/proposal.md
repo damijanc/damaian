@@ -1,6 +1,6 @@
 # Feature Spec: Memory Retrieval, Lifecycle, and Injection Resistance
 
-Status: In progress (started 2026-10-28; Task 3 of 8 done).
+Status: In progress (started 2026-10-28; Task 4 of 8 done).
 Order: 30 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 4 (Must). That directory is local-only and not committed, so the

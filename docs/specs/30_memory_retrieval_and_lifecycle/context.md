@@ -361,6 +361,55 @@ existing behaviour changes for a non-zero share. Spec 26's §5.2 gained one
 sentence recording the rule; the code is the single `allocation`/`carry`
 expression in `apply_budget`.
 
+**C16 — Task 4's plan named three files; the send-time re-check needs four
+more.**
+
+1. **`workspace_engine.rs` needs no change.** Task 2 already fills
+   `MemoryStoreConfig` from the configuration and Task 28/29's constructor
+   already hands the store to `ChatOrchestrator`, so the orchestrator can
+   recall without a new field or a new wiring step.
+2. **The store needs a re-check that is not `recall`.** Re-running `recall` at
+   send would re-rank, re-apply the cap, re-audit withdrawals, and could return
+   entries the user never reviewed. `MemoryStore::recheck_recall` therefore
+   asks one question of the entries already chosen: may this entry still be
+   sent? It reads each scope once, and the only writes are the expiry
+   transition and the once-per-entry withdrawal audit. Its result is a new
+   `RecallExclusion { entry_id, reason }` with `RecallExclusionReason`
+   (`Missing`, `NotActive`, `Expired`, `EvidenceWithdrawn`), re-exported from
+   `lib.rs`; `detail()` names the entry id and never the statement.
+3. **Manifest bookkeeping belongs beside `remove_optional`.** The drop has to
+   remove the item, its `memory` row, recompute the category use, and append an
+   exclusion, which is what `PreparedContext` already does. `remove_item` is now
+   the shared private path; `remove_memory(entry_id, detail)` addresses the
+   entry by id because a paused review survives a resume, and `remove_optional`
+   keeps its index-based API. `ExclusionReason` gains
+   `MemoryNoLongerActive`; the shell's `CONTEXT_REASON_LABELS` row for it is
+   Task 5's, because that file is Task 5's.
+4. **The paused review must persist the recalled rows.** `PendingContextReview`
+   gains `recalled_memory: Vec<RecalledMemory>` (`#[serde(default)]`), which is
+   why `RecalledMemory` now derives serde. This is not a new exposure class:
+   the same pending file already holds `messages`, including the rendered
+   statement. Without it the resumed send could only re-recall, which would put
+   entries in the request that the user never reviewed.
+5. **Ordering is part of the guarantee.** In the default path the re-check runs
+   immediately after assembly and *before* `sink.context`, so the manifest the
+   user is shown is the manifest of the request. On `Send` it runs after the
+   review's gap, before the message is rebuilt and before `sink.context`.
+   Neither path re-checks on `Decline`, and `record_recall` reads
+   `manifest.memory` rather than the recalled list, so a budget drop, a user
+   removal and a send-time rejection are all recorded as not sent.
+6. **The repair continuation still passes an empty slice.** It is a new request
+   built from check findings, not the reviewed turn, and its task already sent
+   the recall it recorded. `edit.rs` also stays empty; the edit flow has no
+   session turn to recall for.
+
+The turn now resolves `ProjectIdentity` per turn (two `git` reads when a root
+commit exists). No cache exists and the shell's memory routes already resolve
+per request, so this is consistent; if Task 6's numbers show it, the place for
+a cache is the orchestrator, not the store. The Task 4 tests live in
+`tests/memory.rs`, beside Task 2's recall tests.
+
+
 ## 3. Open questions for the owner
 
 1. **`memory_max_entries` default.** Proposal §5.3 asks for "a small maximum".

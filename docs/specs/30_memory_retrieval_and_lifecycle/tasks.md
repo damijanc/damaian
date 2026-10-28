@@ -42,7 +42,7 @@ corrections planning found, before starting any task.
 | 1 · Types and configuration | Done 2026-10-28 | **Landed:** `ContextCategory::Memory` is the thirteenth variant and twelfth budgeted category, **after** spec 51's `ExternalReference` (plan correction: the draft said "after `ConversationSummary`", which would have left fetched pages lower than memory and violated this spec's own "memory drops first" acceptance criterion). `BUDGETED`/`shares` are `[_; 12]`; `apply_budget`'s `indices` is `[_; 13]` and its capacity is 13. The default table totals 10,000 with memory at 300, funded by lowering `findings` 500 → 200 — `findings` has no producer in the tree, and `search_results` had already paid for `external_reference`. `ContextKind::Memory` maps `"memory"` to the category. New keys: `memory_max_entries` (u32, default 5, restrict-only lower-wins through `restrict_only_u32`), `memory_retention_days` (u64, default 0 = no expiry, `Forbidden` to repository and profile) and `context_budget.memory` (restrict-only share). All three are `Capability`, not `Preference` as the draft said: spec 31 defines a capability as a key repository scope does not apply freely, and its preference test requires free application. Both overlay writers and the resolved policy text print them; `rule_label` names them; `split_profile_keys` carries the cap and share and refuses retention; `equals_base_limit` knows the cap. **Tests:** `permission_profiles` 87/87 (three new weakening cases and two new tests: profile direction, user-only retention); `context_assembly` 52/52; `config::tests` 3/3; full `workspace-engine` 2,039 passed, 28 skipped. **Discoveries:** two consequences lay outside the draft's file list — `apply_budget`'s index array had no compile-time link to the enum size (a 13th variant would have panicked at runtime, not failed the build), and `context_assembly.rs` pinned the old count/last category in three places, including `an_external_reference_is_the_last_category_and_drops_first`, renamed `an_external_reference_drops_before_repository_content`. **Intermediate state:** the inspector shows the new empty `memory` row with its raw key label until Task 3 adds the label map and Task 5 the row, as planned. **Docs:** proposal §5.1 and Status, context.md C2/C12 and §1.2/§1.5/§3 Q2, spec 26 §5.1–§5.2 defaults, and the README row/current-state paragraph were corrected. Scoped checks: fast gate (`fmt`, `node`, `lint`, `typos`, `deny`) passed; scoped clippy clean; `npm run specs:check` passed. Workspace clippy and the full suite are left to CI. |
 | 2 · Recall engine | Done 2026-10-28 | **Landed:** `MemoryStore::recall(root, identity, session_id, prompt, explicit_paths, cap)` in `memory.rs`, returning `RecalledMemory { entry, match_reason, verification, redacted }`. Order: scope (session / project / user only when enabled), `Active` only, expiry through `mark_state(.., Expired)` (own `MemoryExpiry` or `memory_retention_days`), evidence withdrawal, lexical scoring, cap, then hash revalidation and redaction for the selected entries only. `MemoryMatchReason { matched_terms, category_boost }` with `describe()`, serde-ready for Task 3's manifest. Scoring is `tokenize` plus a stopword filter and a trailing `.`/`/` trim; explicit paths contribute the whole path and its split parts; the +1 category boost from a small running/editing keyword test never makes an entry eligible. Verification: `set_verification` appends and audits `memory_verification_changed` without `mark_state`; any hash difference or unreadable/missing path is `EvidenceStale`, equality is `EvidenceCurrent`, so a revert works. Restricted, ignored or non-relative evidence is withdrawn with `memory_recall_withdrawn` (once per entry+reason per process); the entry stays `Active` and returns when the rule narrows. `MemoryStoreConfig` gains `retention_days`, filled from `config.memory_retention_days` in `workspace_engine.rs` — the task's file list omitted that file. Recall redacts a credential edited into the memory file and reports `redacted`, leaving the stored line unchanged (C13.2). `tokenize` is `pub(crate)`. **Tests:** `tests/memory.rs` 95/95 including 14 new: scope and session isolation, user scope off, state filter, cap and match reason, category boost, explicit paths, stopword-only overlap, stale/revert, deleted evidence, restricted+ignored withdrawal/restore, project-key mismatch at recall, all three project-key tiers, retention and entry expiry, and a file-injected credential redacted on read and in audit. Full `workspace-engine` 2,053 passed, 28 skipped. **Discoveries:** `tokenize` keeps `.` inside a term, so a statement-final `commas.` could never match a prompt saying `commas`; scoring trims edge punctuation. `Config`'s retention key had no store field. Withdrawal needed an audit report because recall's return type has no excluded list. **Checks:** `fmt`, `node`, `lint`, `typos`, `deny`; scoped clippy; `nextest -p workspace-engine`. |
 | 3 · Context assembly | Done 2026-10-28 | **Landed:** `ContextRequest.memory: &'a [RecalledMemory]`; one `ContextItem` per entry, `kind: memory`, no path, content in the §5.2 frame with the entry's own `created_at_ms` date — user-confirmed, `evidence unchanged` for current evidence, or `may be out of date — that file has changed since` when stale (plural wording for several paths). Memory is collected after external references, so it is the last prompt block. `ContextManifest.memory: Vec<MemoryRecallRef>` (`entryId`, `matchReason` as `MemoryMatchReason`, `verification`, `#[serde(default)]`) records only included entries, never the statement; `PreparedContext::remove_optional` drops the matching ref by counting earlier `Memory` items (C14). Redaction runs in `add_text`, and `RecalledMemory.redacted` restores the status the second scan cannot see (C13.2). The §5.2 date reuses spec 51's calendar arithmetic through the new `external_reference::utc_date` rather than a second conversion. **Plan corrections:** the seam reaches eight more files — `chat.rs` (2 sites), `edit.rs` (1), five `workspace-engine` test files, two `desktop-shell` manifest fixtures (C14), plus `external_reference.rs` for the date helper and `lib.rs` for the re-export; all unlisted in the draft. Steps 4 and 5 were already satisfied by Task 1 (C14); and `context_budget.memory=0` did **not** switch memory off, because every category accepted the released carry, so `apply_budget` now treats a zero share as off and passes the carry through (C15, with one clarifying sentence in spec 26 §5.2). **Tests:** `context_manager` inline 15/15, six new — delivery and frame, zero share, memory dropped before file content at exact shares, stale/current markers and manifest verification, credential redaction and the recall-flag path, removal including ref alignment; full `workspace-engine` 2,059 passed, 28 skipped (including `prompt_cache`); `desktop-shell` 224 passed, 18 skipped; deterministic eval tier exit 0 with every scenario passing and approval-policy, restricted-path and secret violations all 0. **Discoveries:** a dropped or send-time-rejected memory needs its `memory` ref removed as well as an exclusion record, or the inspector shows a statement the request no longer carries; Task 4 takes that up. **Checks:** fast gate `fmt node lint typos deny` ok; scoped clippy `-D warnings` for `workspace-engine` and `desktop-shell`; scoped nextest for both crates. Workspace clippy/tests left to CI. |
-| 4 · Turn wiring and send-time re-check | Not started | — |
+| 4 · Turn wiring and send-time re-check | Done 2026-10-28 | **Landed:** the turn resolves `ProjectIdentity` and recalls before assembly, so `ContextRequest.memory` carries the entries as ordinary items (`recall_memory_for_turn`, cap from `memory_max_entries`). `recheck_memory_before_send` runs after assembly and before `sink.context`, and again on `Send`, so the streamed manifest is the request's manifest and an entry deleted, expired, superseded or withdrawn during a pause never reaches the model; its `memory` row goes too. `record_memory_recall` reads `manifest.memory`, not the recalled list, so a budget drop, a user removal and a send-time rejection are all recorded as *not* sent; it runs once after the `context_assembled` commit in the default path and once on `Send`, never on decline. A paused review persists its `RecalledMemory` rows (`PendingContextReview.recalled_memory`, serde-backfilled), so the continuation sends what the user reviewed and does not recall again. `edit.rs` and the repair continuation still pass an empty slice — the repair request is built from check findings, not the reviewed turn. **Plan corrections (C16):** the draft named three files; the re-check also needed `memory.rs` (`recheck_recall`, `RecallExclusion`/`RecallExclusionReason`), `context_manager.rs` (`remove_item` extracted, `remove_memory`, `ExclusionReason::MemoryNoLongerActive`), `lib.rs` (re-exports) and `tests/memory.rs`; `workspace_engine.rs` needed nothing because Task 2 already passes the store. `RecalledMemory` gained serde. **Tests:** `tests/memory.rs` 100/100, five new — turn delivery in the §5.2 frame with one `memory_recalled` and a content-free manifest, decline records none, deleted-before-send absent with its ref dropped and a `memory_no_longer_active` exclusion naming the id, continuation keeps the reviewed entry while a later matching insert is neither sent nor recorded, and a store-level re-check covering `NotActive`/`Expired`/`EvidenceWithdrawn`; `context_manager` inline 16/16 with the ref-alignment case for a send-time drop; full `workspace-engine` 2,065 passed, 28 skipped; deterministic eval tier exit 0 with every scenario passing and approval-policy, restricted-path and secret violations all 0. **Discoveries:** the re-check must run before `sink.context` or the panel shows a manifest the request no longer matches; re-checking only the plan-carried entries avoids expiring something the budget never sent; identity now resolves per turn (two `git` reads with a root commit) and has no cache; Task 5 must label `memory_no_longer_active` in `CONTEXT_REASON_LABELS` (added to its steps). The record drift Task 3 left in `proposal.md`'s `Status:` line and `README.md` (both still said Task 2/an older correction count) is corrected with this row. **Checks:** fast gate `fmt node lint typos deny` ok; scoped clippy `-D warnings` for `workspace-engine`; scoped nextest for `workspace-engine`. Workspace clippy/tests left to CI. |
 | 5 · Inspector and shell | Not started | — |
 | 6 · Evaluation harness and metrics | Not started | — |
 | 7 · Documentation | Not started | — |
@@ -214,31 +214,44 @@ entry deleted between assembly and the call.
 
 **Files:** `crates/workspace-engine/src/chat.rs`,
 `crates/workspace-engine/src/edit.rs` (empty slice only),
-`crates/workspace-engine/src/workspace_engine.rs` (pass the store to the
-orchestrator).
+`crates/workspace-engine/src/memory.rs` (the send-time re-check; unlisted in
+the draft),
+`crates/workspace-engine/src/context_manager.rs` (`remove_memory` and its
+exclusion reason; unlisted),
+`crates/workspace-engine/src/lib.rs` (re-exports; unlisted),
+`crates/workspace-engine/tests/memory.rs` (unlisted), and
+`crates/workspace-engine/src/workspace_engine.rs` — which needed no change
+because Task 2 already passes the store to the orchestrator. See context.md
+C16.
 
 **Steps**
 
-- [ ] Read identity, session and prompt before assembly in `chat.rs:1250` and
+- [x] Read identity, session and prompt before assembly in `chat.rs:1250` and
       pass the recalled entries through `ContextRequest.memory`.
-- [ ] Pass an empty slice from `edit.rs:526` and `chat.rs:2627` unless the
+- [x] Pass an empty slice from `edit.rs:526` and `chat.rs:2627` unless the
       continuation is the same turn (the continuation must keep what the turn
-      recalled, not recall again).
-- [ ] Call `record_recall` once, at send: the default path after
+      recalled, not recall again). The paused review now persists its
+      `RecalledMemory` rows; the repair continuation stays empty because it is
+      a new request for check findings.
+- [x] Call `record_recall` once, at send: the default path after
       `sink.context`, the paused path on `Send` in
       `resume_after_context_decision` (`chat.rs:1479`), never on decline.
-- [ ] Re-check each memory entry's state immediately before the model call and
+      Recording reads `manifest.memory`, so budget drops, user removals and
+      send-time rejections are all excluded.
+- [x] Re-check each memory entry's state immediately before the model call and
       drop any that is no longer `Active` and eligible, recording the exclusion
       as a dropped item with a reason (proposal §5.6). Drop its
       `manifest.memory` row too, or the inspector names a statement the request
-      no longer carries (Task 3 C14).
-- [ ] Tests (inline or `tests/`): a turn sends memory only as items; a
+      no longer carries (Task 3 C14). Implemented as
+      `MemoryStore::recheck_recall` plus `PreparedContext::remove_memory`
+      (C16), before `sink.context` in both send paths.
+- [x] Tests (inline or `tests/`): a turn sends memory only as items; a
       declined review records no recall; an entry deleted between assembly and
       send is absent from the request; a continuation keeps the original
-      entries.
+      entries. Plus a store-level test for each re-check reason.
 
 **Checks:** `cargo fmt --all`; scoped clippy; the chat-path tests touched by the
-change.
+change (`cargo nextest run -p workspace-engine --test memory`, then the crate).
 
 **Done when:** the turn path is complete and the only remaining work is
 presentation, measurement and documentation.
@@ -261,7 +274,10 @@ presentation, measurement and documentation.
       (`lib.rs:338`).
 - [ ] Render the `Memory` category row with its entry count and stale count, and
       each entry with its details and a remove control using the existing
-      `context-remove` path and item index (`app.js:2311`, `:2373`).
+      `context-remove` path and item index (`app.js:2311`, `:2373`). Add the
+      `memory_no_longer_active` row to `CONTEXT_REASON_LABELS` (`app.js:2741`)
+      so a send-time rejection reads as a sentence rather than its wire name
+      (Task 4 added the reason; context.md C16).
 - [ ] Keep removal available only while the pre-send review is paused, per
       spec 27's existing rules; post-send shows the entries without a remove
       control.

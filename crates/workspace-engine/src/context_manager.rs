@@ -475,6 +475,10 @@ pub enum ExclusionReason {
     /// A pinned file no longer reads: it was deleted, or became unreadable.
     /// Recorded instead of dropping the pin silently (spec 27 §5.4).
     Missing,
+    /// A memory recalled at assembly was deleted, expired, superseded, or had
+    /// its evidence withdrawn before the request was sent (spec 30 §5.6). The
+    /// item and its `memory` manifest row are both dropped.
+    MemoryNoLongerActive,
 }
 
 /// One item that did not enter the plan, with the reason. Never content.
@@ -769,13 +773,70 @@ impl PreparedContext {
                 "Required context cannot be removed".to_string(),
             ));
         }
+        Ok(self.remove_item(
+            index,
+            ExclusionReason::UserRemoved,
+            "removed for this turn by the user".to_string(),
+        ))
+    }
+
+    /// Drops a memory item whose entry may no longer be sent (spec 30 §5.6).
+    ///
+    /// The send-time re-check names the entry id, not an item index, because
+    /// the turn may have paused and resumed since assembly. Its `memory`
+    /// manifest row goes with the item (C14), so the inspector cannot name a
+    /// statement the request no longer carries. An entry already removed from
+    /// the review, or one the budget never included, has no row and yields
+    /// `None`.
+    pub fn remove_memory(
+        &mut self,
+        entry_id: &str,
+        detail: String,
+    ) -> Result<Option<ExclusionRecord>> {
+        let Some(position) = self
+            .manifest
+            .memory
+            .iter()
+            .position(|reference| reference.entry_id == entry_id)
+        else {
+            return Ok(None);
+        };
+        let index = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.category == ContextCategory::Memory)
+            .nth(position)
+            .map(|(index, _)| index)
+            .ok_or_else(|| {
+                ClientError::InvalidInput(format!(
+                    "the manifest names memory entry {entry_id} but the plan has no such item"
+                ))
+            })?;
+        Ok(Some(self.remove_item(
+            index,
+            ExclusionReason::MemoryNoLongerActive,
+            detail,
+        )))
+    }
+
+    /// The one removal path. Callers decide the reason and the detail; the
+    /// manifest bookkeeping is identical for a user removal and a send-time
+    /// rejection.
+    fn remove_item(
+        &mut self,
+        index: usize,
+        reason: ExclusionReason,
+        detail: String,
+    ) -> ExclusionRecord {
+        let item = &self.items[index];
         let category = item.category;
         let record = ExclusionRecord {
-            reason: ExclusionReason::UserRemoved,
+            reason,
             path: item.path.clone(),
             range: item.range,
             category,
-            detail: Some("removed for this turn by the user".to_string()),
+            detail: Some(detail),
         };
         // A memory ref exists only for an included `Memory` item and the refs
         // are 1:1 with those items in item order (C14), so the ref for this
@@ -812,7 +873,7 @@ impl PreparedContext {
         }
         self.manifest.included = self.items.iter().map(IncludedRef::from_item).collect();
         self.manifest.total_tokens = self.items.iter().map(|item| item.tokens).sum();
-        Ok(record)
+        record
     }
 
     /// Removes the #55 conversation summary for this turn.
@@ -3492,6 +3553,59 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains(SECOND_STATEMENT), "{prompt}");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn a_send_time_drop_removes_the_memory_item_and_its_ref() {
+        let (engine, repo) = memory_repo("send-drop", |_| {});
+        let first = user_confirmed("mem_first", MEMORY_STATEMENT);
+        let second = user_confirmed("mem_second", SECOND_STATEMENT);
+        let limit = engine.config.context_token_budget();
+        let plan = assemble(&engine, &repo, &[first, second], &[], limit);
+        let mut prepared = PreparedContext::from_plan(&plan);
+
+        let record = prepared
+            .remove_memory(
+                "mem_first",
+                "memory entry mem_first was deleted; it was not sent".to_string(),
+            )
+            .expect("the entry has a manifest row")
+            .expect("the row names an item");
+        assert_eq!(record.reason, ExclusionReason::MemoryNoLongerActive);
+        assert_eq!(record.category, ContextCategory::Memory);
+        assert!(record.path.is_none(), "memory has no file identity");
+
+        // The ref goes with the item, and the row for the entry that stayed is
+        // still the right one (C14).
+        assert_eq!(prepared.manifest.memory.len(), 1);
+        assert_eq!(prepared.manifest.memory[0].entry_id, "mem_second");
+        let prompt = prepared
+            .sections()
+            .into_iter()
+            .map(|section| section.text)
+            .collect::<String>();
+        assert!(!prompt.contains(MEMORY_STATEMENT), "{prompt}");
+        assert!(prompt.contains(SECOND_STATEMENT), "{prompt}");
+        assert!(
+            prepared
+                .manifest
+                .included
+                .iter()
+                .filter(|row| row.category == ContextCategory::Memory)
+                .count()
+                == 1
+        );
+
+        // A second rejection, or one for an entry the budget never included,
+        // has nothing to remove.
+        assert!(
+            prepared
+                .remove_memory("mem_first", "again".to_string())
+                .expect("a missing row is not an error")
+                .is_none()
+        );
 
         fs::remove_dir_all(repo).unwrap();
     }

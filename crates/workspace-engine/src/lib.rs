@@ -165,9 +165,10 @@ pub use memory::{
     MemoryExpiry, MemoryMatchReason, MemoryProposal, MemoryProposalGate, MemoryProvenance,
     MemoryRefusal, MemoryResult, MemorySchemaOutcome, MemoryScope, MemoryState, MemoryStore,
     MemoryStoreConfig, MemoryTarget, ProjectIdentity, ProjectKeySource, ProposalOrigin,
-    ProposalOutcome, RecalledMemory, STATEMENT_MAX_CHARS, Sensitivity, UserConfirmation,
-    Verification, evidence_ref_for, explicit_memory_request, explicit_memory_request_outcome,
-    is_instruction_shaped, normalize_remote_url, normalize_statement,
+    ProposalOutcome, RecallExclusion, RecallExclusionReason, RecalledMemory, STATEMENT_MAX_CHARS,
+    Sensitivity, UserConfirmation, Verification, evidence_ref_for, explicit_memory_request,
+    explicit_memory_request_outcome, is_instruction_shaped, normalize_remote_url,
+    normalize_statement,
 };
 pub use mode::SessionMode;
 pub use model::{
