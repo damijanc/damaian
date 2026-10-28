@@ -116,10 +116,35 @@ fn the_preference_keys_are_exactly_spec_34s_free_keys() {
         // whether it needs approval (24 context.md §6).
         "project_roots_added",
         "project_roots_removed",
+        // Spec 36: a branch-name prefix is naming, and git validates the
+        // composed name, so a repository choosing its own convention widens
+        // nothing.
+        "git_branch_prefix",
     ]
     .into_iter()
     .collect();
     assert_eq!(fields_of(ConfigKeyKind::Preference), free);
+}
+
+#[test]
+fn a_repository_may_choose_its_branch_prefix_but_a_profile_may_not() {
+    let (config, report) = load("branch-prefix", "", "git_branch_prefix=team/\n");
+    assert_eq!(config.git_branch_prefix, "team/");
+    assert!(report.rejected_keys.is_empty(), "{report:?}");
+
+    let overlay = ConfigOverlay {
+        git_branch_prefix: Some("feature/".to_string()),
+        ..ConfigOverlay::default()
+    };
+    let (carried, refused) = split_profile_keys(overlay);
+    assert!(carried.git_branch_prefix.is_none());
+    assert!(
+        refused
+            .iter()
+            .any(|rejected| rejected.key == "git_branch_prefix"
+                && rejected.class == RepositoryKeyClass::Forbidden),
+        "{refused:?}"
+    );
 }
 
 #[test]
@@ -698,6 +723,11 @@ fn every_preference_key_applies_from_repository_scope() {
             field: "project_roots_removed",
             repository: "project_roots_removed=examples/legacy\n",
             applied: |c| c.project_roots_removed == ["examples/legacy"],
+        },
+        PreferenceCase {
+            field: "git_branch_prefix",
+            repository: "git_branch_prefix=team/\n",
+            applied: |c| c.git_branch_prefix == "team/",
         },
     ];
     let covered: BTreeSet<&str> = cases.iter().map(|c| c.field).collect();

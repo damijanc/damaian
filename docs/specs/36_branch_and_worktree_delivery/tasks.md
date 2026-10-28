@@ -15,7 +15,7 @@ wins.
 | Task | State | Notes |
 |---|---|---|
 | 1 · Read-only branch information | Done 2026-10-28 | Added `BranchInfo` (camelCase serde) and `GitService::branch_info` in `git_service.rs`: current branch, full `HEAD`, detached, upstream via `rev-parse @{upstream}`, ahead/behind through the existing helper, in-progress operation from Git-resolved marker paths including `BISECT_LOG`, and unmerged paths via `git diff --diff-filter=U -z` filtered by the restricted-path rule. `merge_base` is now public and validates `base` before git runs. `head_oid` is `Option<String>` because an unborn branch has no commit (context §3.13/D5). Audit is `git_branch_read` with counts and no restricted path names. New `tests/branch_delivery.rs` has 10 tests: upstream 0/0 → 1/0 → 0/1 → 1/1, detached, unborn, real conflicted merge, clean state, merge-base and option-shaped base refusal, byte-identical index/HEAD/status across reads, restricted conflicting `.env` omitted, non-repository refusal, and camelCase JSON. Falsified by swapping ahead/behind (test failed) and by skipping the `MERGE_HEAD` scan (test failed), then restoring. Scoped checks: `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest -p workspace-engine --test branch_delivery --test worktree_reads` 58 passed. No `chat.rs` change. |
-| 2 · Suggested branch name | Not started | — |
+| 2 · Suggested branch name | Done 2026-10-28 | Added `git_branch_prefix` (`Config` default `damaian/`, `ConfigOverlay` field, parse/serialise, `ConfigKeyKind::Preference`, repository-scope `preference()` merge, policy text, profile split refuses it) and the config-key record updates. New `branch.rs` has `slugify_branch_title` (lowercase ASCII, separator runs, 50-char cap, `change` fallback), `validate_branch_prefix` (empty allowed; rejects `@{`, `..`, `//`, leading `-`/`/`, control/special characters, `.lock` components, trailing `.`), `BranchSuggestion`, and `suggest_branch_name`, which redirects the source through `SecretScanner::redact` before slugging (D10). `GitService` gained `check_branch_name` (authoritative `git check-ref-format --branch`) and `local_branches` (one `for-each-ref`); a collision keeps the name unchanged and offers the first free `-2`/`-3` alternative. Six new branch tests: slug bounds/unicode, default prefix, collision and alternative, empty/invalid prefixes including `feature@{1}/`, Git-authoritative valid/invalid names, and a seeded AWS key absent from the name. One new permission test proves a repository may choose the prefix and a profile may not. Falsified by removing the redaction call: the secret test failed with `damaian/rotate-akiaiosfodnn7example-before-release`, then restored. Scoped checks: `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest -p workspace-engine --test branch_delivery --test permission_profiles --test foundation` 268 passed (1 skipped); fast gate `fmt node typos` clean. `cargo deny check` fails on RUSTSEC-2026-0414 in `pulldown-cmark` 0.13.4, a dependency this task does not touch (context §6). Discovery recorded in context §3.14: Git 2.56's `check-ref-format` rejects `--end-of-options`, so leading-`-` refusal stays in Rust. No `chat.rs` change. |
 | 3 · The `allow_git_branches` capability | Not started | — |
 | 4 · Branch creation and switching | Not started | — |
 | 5 · Branch deletion with the unmerged confirmation | Not started | — |
@@ -198,13 +198,13 @@ tree.
 configurable pattern, validated with `git check-ref-format --branch`, with a
 collision reported and a free suffixed alternative offered. It changes no ref.
 
-- [ ] Add `git_branch_prefix` to `Config` (default `damaian/`) and
+- [x] Add `git_branch_prefix` to `Config` (default `damaian/`) and
       `ConfigOverlay` (`Option<String>`); parse and serialise it; classify it as
       `Preference`; apply it through `preference()` so a repository may set it
       and a profile may not; include it in `to_policy_text`. Update
       `the_preference_keys_are_exactly_spec_34s_free_keys` by adding the key, and
       add a repository-scope load test proving it is honoured.
-- [ ] Add `branch.rs` with:
+- [x] Add `branch.rs` with:
       `slugify_branch_title(text) -> String` (lowercase ASCII alphanumerics,
       every other run collapsed to `-`, leading/trailing `-` trimmed, at most 50
       characters, `change` when empty);
@@ -214,30 +214,30 @@ collision reported and a free suffixed alternative offered. It changes no ref.
       trailing `.`; context §3.14);
       and `BranchSuggestion { name, valid, refusal: Option<String>, exists,
       alternative: Option<String> }`.
-- [ ] Add `branch::suggest_branch_name(git, scanner, root, prefix, source)`.
+- [x] Add `branch::suggest_branch_name(git, scanner, root, prefix, source)`.
       Redact `source` through `scanner.redact(...).text` before slugging (D10),
       compose `<prefix><slug>`, validate the prefix in Rust, validate the
       composed name with `git check-ref-format --branch <name>`, and check
       collisions against the local branch list. On collision keep `name`
       unchanged, set `exists: true`, and set `alternative` to the first free
       `<name>-2`, `<name>-3`, ….
-- [ ] Add `GitService::check_branch_name` (runs `check-ref-format --branch` and
+- [x] Add `GitService::check_branch_name` (runs `check-ref-format --branch` and
       returns the reason on failure), `local_branches` (one
       `for-each-ref --format=%(refname:short) refs/heads/`), and
       `branch_exists`. All go through `read_git`; none mutates.
-- [ ] Tests: slug lowercases and collapses punctuation; truncation; empty source
+- [x] Tests: slug lowercases and collapses punctuation; truncation; empty source
       falls back to `change`; a configured prefix is used; a prefix containing
       `@{` is refused before git runs; a name git rejects (for example one ending
       in `.lock`) is reported invalid with a reason; a colliding name is
       reported with the `-2` alternative and is not silently changed; a source
       containing a seeded fake AWS key produces a name with no key fragment and
       no audit line containing the key.
-- [ ] Run `cargo fmt --all`; scoped checks:
+- [x] Run `cargo fmt --all`; scoped checks:
       `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`,
       `cargo nextest run -p workspace-engine --test branch_delivery`, and
       `cargo nextest run -p workspace-engine --test permission_profiles`.
-- [ ] Falsify: remove the redaction call and confirm the key test fails; restore.
-- [ ] Update the progress row and commit.
+- [x] Falsify: remove the redaction call and confirm the key test fails; restore.
+- [x] Update the progress row and commit.
 
 ### Task 3 · The `allow_git_branches` capability
 

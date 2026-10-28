@@ -11,7 +11,8 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, BranchInfo, ClientError, Config, GitReadCaps, GitService, PathPolicy, SecretScanner,
+    AuditLog, BRANCH_SLUG_MAX_CHARS, BranchInfo, ClientError, Config, GitReadCaps, GitService,
+    PathPolicy, SecretScanner, slugify_branch_title, suggest_branch_name, validate_branch_prefix,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -293,4 +294,167 @@ fn branch_info_is_serialisable_for_the_shell() {
     assert!(json.get("headOid").is_some(), "{json}");
     assert!(json.get("inProgressOperation").is_some(), "{json}");
     assert!(json.get("conflictedPaths").is_some(), "{json}");
+}
+
+#[test]
+fn a_slug_is_lowercase_hyphenated_and_bounded() {
+    assert_eq!(
+        slugify_branch_title("Fix the Retry Loop!"),
+        "fix-the-retry-loop"
+    );
+    assert_eq!(slugify_branch_title("  --Hello__World--  "), "hello-world");
+    assert_eq!(slugify_branch_title(""), "change");
+    assert_eq!(slugify_branch_title("!!!"), "change");
+    assert_eq!(slugify_branch_title("fix 日本 now"), "fix-now");
+
+    let long = slugify_branch_title(&"a".repeat(120));
+    assert_eq!(long.len(), BRANCH_SLUG_MAX_CHARS);
+    let trailing_separator = slugify_branch_title(&format!("{} broken", "x".repeat(49)));
+    assert!(trailing_separator.len() <= BRANCH_SLUG_MAX_CHARS);
+    assert!(!trailing_separator.ends_with('-'), "{trailing_separator}");
+}
+
+#[test]
+fn the_default_branch_prefix_is_damaian() {
+    assert_eq!(Config::default().git_branch_prefix, "damaian/");
+}
+
+#[test]
+fn a_suggestion_uses_the_configured_prefix_and_reports_a_collision() {
+    let fixture = fixture("suggestion", true);
+    let scanner = SecretScanner::new(Vec::new());
+    let suggestion = suggest_branch_name(
+        &fixture.git,
+        &scanner,
+        &fixture.repo,
+        "team/",
+        "Fix the retry loop",
+    )
+    .unwrap();
+    assert_eq!(suggestion.name, "team/fix-the-retry-loop");
+    assert!(suggestion.valid);
+    assert!(!suggestion.exists);
+    assert_eq!(suggestion.alternative, None);
+
+    fixture.run(&["branch", &suggestion.name]);
+    let colliding = suggest_branch_name(
+        &fixture.git,
+        &scanner,
+        &fixture.repo,
+        "team/",
+        "Fix the retry loop",
+    )
+    .unwrap();
+    assert_eq!(colliding.name, "team/fix-the-retry-loop");
+    assert!(colliding.exists);
+    assert_eq!(
+        colliding.alternative.as_deref(),
+        Some("team/fix-the-retry-loop-2")
+    );
+    // The original name was not silently changed or suffixed.
+    assert_eq!(
+        fixture.git.local_branches(&fixture.repo).unwrap().len(),
+        2,
+        "main plus the original suggestion only"
+    );
+
+    fixture.run(&["branch", "team/fix-the-retry-loop-2"]);
+    let twice = suggest_branch_name(
+        &fixture.git,
+        &scanner,
+        &fixture.repo,
+        "team/",
+        "Fix the retry loop",
+    )
+    .unwrap();
+    assert_eq!(
+        twice.alternative.as_deref(),
+        Some("team/fix-the-retry-loop-3")
+    );
+}
+
+#[test]
+fn an_empty_prefix_is_allowed_and_a_previous_branch_expression_is_refused() {
+    let fixture = fixture("prefix", true);
+    let scanner = SecretScanner::new(Vec::new());
+    let suggestion =
+        suggest_branch_name(&fixture.git, &scanner, &fixture.repo, "", "Fix the parser").unwrap();
+    assert_eq!(suggestion.name, "fix-the-parser");
+
+    let error = suggest_branch_name(
+        &fixture.git,
+        &scanner,
+        &fixture.repo,
+        "feature@{1}/",
+        "Fix the parser",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ClientError::InvalidInput(ref message) if message.contains("not a branch-name prefix")),
+        "{error:?}"
+    );
+    for prefix in [
+        "bad prefix/",
+        "../escape/",
+        "/absolute/",
+        "double//slash/",
+        ".hidden/",
+        "trailing./",
+    ] {
+        assert!(
+            validate_branch_prefix(prefix).is_err(),
+            "{prefix} should be refused"
+        );
+    }
+    assert!(validate_branch_prefix("damaian/").is_ok());
+    assert!(validate_branch_prefix("team/sub/").is_ok());
+}
+
+#[test]
+fn git_is_authoritative_about_a_branch_name() {
+    let fixture = fixture("name-check", true);
+    let valid = fixture
+        .git
+        .check_branch_name(&fixture.repo, "topic/lock")
+        .unwrap();
+    assert!(valid.valid, "{valid:?}");
+    assert_eq!(valid.reason, None);
+
+    let invalid = fixture
+        .git
+        .check_branch_name(&fixture.repo, "topic.lock")
+        .unwrap();
+    assert!(!invalid.valid, "{invalid:?}");
+    assert!(
+        invalid
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not a valid branch name")),
+        "{invalid:?}"
+    );
+}
+
+#[test]
+fn a_secret_is_redacted_before_it_can_become_a_branch_name() {
+    let fixture = fixture("secret-name", true);
+    let scanner = SecretScanner::new(Vec::new());
+    let suggestion = suggest_branch_name(
+        &fixture.git,
+        &scanner,
+        &fixture.repo,
+        "damaian/",
+        "rotate AKIAIOSFODNN7EXAMPLE before release",
+    )
+    .unwrap();
+    assert!(suggestion.valid, "{suggestion:?}");
+    assert!(
+        !suggestion.name.to_ascii_lowercase().contains("akia"),
+        "the key reached the branch name: {}",
+        suggestion.name
+    );
+    assert!(
+        !suggestion.name.contains("iosfodnn7example"),
+        "the key reached the branch name: {}",
+        suggestion.name
+    );
 }

@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod branch;
 pub mod cancel;
 pub mod chat;
 pub mod checkpoint;
@@ -55,6 +56,10 @@ pub mod worktree;
 pub mod worktree_access;
 
 pub use audit::AuditLog;
+pub use branch::{
+    BRANCH_SLUG_MAX_CHARS, BranchSuggestion, slugify_branch_title, suggest_branch_name,
+    validate_branch_prefix,
+};
 pub use cancel::CancelToken;
 pub use chat::{
     AgentCheckBatch, AgentCommandProposal, AgentContextReview, AgentFallbackProposal,
@@ -118,8 +123,8 @@ pub use effective_policy::{
 pub use error::{ClientError, ProviderRefusal, Result};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};
 pub use git_service::{
-    BranchInfo, DiffOptions, GitFileStatus, GitHubRepo, GitReadCaps, GitService, GitStatus,
-    GitSummary, WorktreeListing, WorktreeListingEntry, parse_github_remote,
+    BranchInfo, BranchNameCheck, DiffOptions, GitFileStatus, GitHubRepo, GitReadCaps, GitService,
+    GitStatus, GitSummary, WorktreeListing, WorktreeListingEntry, parse_github_remote,
 };
 pub use hash::repository_id_for_root;
 pub use hooks::{

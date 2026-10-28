@@ -167,6 +167,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "allow_browser_diagnostics" => "Browser diagnostics allowed",
         "allow_mutating_mcp_tools" => "MCP tools that change things allowed",
         "allow_git_commits" => "Git commits allowed",
+        "git_branch_prefix" => "Suggested branch name prefix",
         "block_generated_secrets" => "Stop changes that add a secret",
         "audit_enabled" => "Audit log on",
         "audit_retention_days" => "Audit files kept (days)",

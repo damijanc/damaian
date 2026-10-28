@@ -223,6 +223,17 @@ const IN_PROGRESS_MARKERS: [(&str, &str); 7] = [
     ("BISECT_LOG", "bisect"),
 ];
 
+/// Whether Git accepts a branch name, and why not when it does not
+/// (spec 36 §5.2). The check is `git check-ref-format --branch`, never a
+/// hand-written pattern, so a name this says is valid is one Git will accept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchNameCheck {
+    pub valid: bool,
+    /// Git's own refusal text, when invalid.
+    pub reason: Option<String>,
+}
+
 /// Parses an `origin` URL into a GitHub owner and repository name.
 ///
 /// Accepts only `https://github.com/o/r`, `git@github.com:o/r` and
@@ -664,6 +675,51 @@ impl GitService {
             .filter(|path| !self.path_is_restricted(path))
             .collect();
         Ok(paths.into_iter().collect())
+    }
+
+    /// `git check-ref-format --branch <name>`, the authoritative answer about
+    /// whether a branch name is acceptable (spec 36 §5.2). The name is passed
+    /// as one argument; a name starting with `-` is refused by the caller
+    /// before this runs, and Git would reject it as an option otherwise.
+    pub fn check_branch_name(
+        &self,
+        root_path: impl AsRef<Path>,
+        name: &str,
+    ) -> Result<BranchNameCheck> {
+        let output = git_output(root_path.as_ref(), &["check-ref-format", "--branch", name])?;
+        if output.status.success() {
+            return Ok(BranchNameCheck {
+                valid: true,
+                reason: None,
+            });
+        }
+        Ok(BranchNameCheck {
+            valid: false,
+            reason: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        })
+    }
+
+    /// Every local branch, short names, in Git's order (spec 36 §5.2). One
+    /// process, so a collision search does not start one per candidate.
+    pub fn local_branches(
+        &self,
+        root_path: impl AsRef<Path>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let output = git_output(
+            root_path.as_ref(),
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        )?;
+        if !output.status.success() {
+            return Err(ClientError::Git(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     /// The working tree's (or with `staged`, the index's) diff, with

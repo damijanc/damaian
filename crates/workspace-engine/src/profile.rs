@@ -367,6 +367,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         allow_browser_diagnostics,
         allow_mutating_mcp_tools,
         allow_git_commits,
+        git_branch_prefix,
         block_generated_secrets,
         audit_enabled,
         audit_retention_days,
@@ -463,6 +464,9 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         ),
         ("project_roots_added", project_roots_added.is_some()),
         ("project_roots_removed", project_roots_removed.is_some()),
+        // Spec 36 §5.2: naming, not capability; a profile narrows capability
+        // and does not configure naming.
+        ("git_branch_prefix", git_branch_prefix.is_some()),
     ] {
         if present {
             refuse(key.to_string(), RepositoryKeyClass::Forbidden);

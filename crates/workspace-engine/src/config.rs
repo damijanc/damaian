@@ -310,6 +310,10 @@ pub struct Config {
     /// commit is the first write to the user's repository, so it is a
     /// capability like file edits, and a repository may turn it down.
     pub allow_git_commits: bool,
+    /// The prefix a suggested branch name uses (spec 36 §5.2), default
+    /// `damaian/`. This is naming, not permission, so it is a preference rather
+    /// than a capability; the composed name is validated by Git regardless.
+    pub git_branch_prefix: String,
     pub block_generated_secrets: bool,
     pub audit_enabled: bool,
     pub audit_retention_days: u64,
@@ -1173,6 +1177,7 @@ impl Config {
             allow_browser_diagnostics,
             allow_mutating_mcp_tools,
             allow_git_commits,
+            git_branch_prefix,
             block_generated_secrets,
             audit_enabled,
             audit_retention_days,
@@ -1902,6 +1907,10 @@ impl Config {
         if let Some(value) = preference(max_file_bytes, "max_file_bytes", scope, rejected) {
             self.max_file_bytes = value;
             outcome.record(scope, "max_file_bytes", None, false);
+        }
+        if let Some(value) = preference(git_branch_prefix, "git_branch_prefix", scope, rejected) {
+            self.git_branch_prefix = value;
+            outcome.record(scope, "git_branch_prefix", None, false);
         }
         if let Some(value) = preference(
             max_command_output_bytes,
@@ -2698,6 +2707,7 @@ impl Config {
             "allow_git_commits",
             &self.allow_git_commits.to_string(),
         );
+        push_line(&mut output, "git_branch_prefix", &self.git_branch_prefix);
         push_line(
             &mut output,
             "block_generated_secrets",
@@ -2872,6 +2882,7 @@ impl Default for Config {
             allow_browser_diagnostics: true,
             allow_mutating_mcp_tools: true,
             allow_git_commits: true,
+            git_branch_prefix: "damaian/".to_string(),
             block_generated_secrets: true,
             audit_enabled: true,
             audit_retention_days: 90,
@@ -2971,6 +2982,10 @@ pub struct ConfigOverlay {
     pub allow_browser_diagnostics: Option<bool>,
     pub allow_mutating_mcp_tools: Option<bool>,
     pub allow_git_commits: Option<bool>,
+    /// Spec 36 §5.2: the prefix a suggested branch name uses. Preference: a
+    /// repository may name its own convention, and a profile does not configure
+    /// naming.
+    pub git_branch_prefix: Option<String>,
     pub block_generated_secrets: Option<bool>,
     pub audit_enabled: Option<bool>,
     pub audit_retention_days: Option<u64>,
@@ -3132,6 +3147,10 @@ classify_overlay_fields! {
     // Spec 35: a commit is the first write to the user's repository, so a
     // clone may refuse it and may never grant it.
     allow_git_commits => Capability,
+    // Spec 36 §5.2: a naming convention, not a permission. The composed name
+    // is validated by git, so a repository choosing its own prefix widens
+    // nothing.
+    git_branch_prefix => Preference,
     block_generated_secrets => Capability,
     audit_enabled => Capability,
     // Free at repository scope in spec 34, so a preference here. Whether a
@@ -3400,6 +3419,15 @@ impl ConfigOverlay {
                 self.allow_mutating_mcp_tools = Some(parse_bool(key, value)?)
             }
             "allow_git_commits" => self.allow_git_commits = Some(parse_bool(key, value)?),
+            "git_branch_prefix" => {
+                let prefix = value.trim();
+                if prefix.len() > 200 {
+                    return Err(ClientError::InvalidInput(format!(
+                        "{key} must be at most 200 characters"
+                    )));
+                }
+                self.git_branch_prefix = Some(prefix.to_string());
+            }
             "block_generated_secrets" => {
                 self.block_generated_secrets = Some(parse_bool(key, value)?)
             }
@@ -3793,6 +3821,7 @@ impl ConfigOverlay {
             allow_browser_diagnostics,
             allow_mutating_mcp_tools,
             allow_git_commits,
+            git_branch_prefix,
             block_generated_secrets,
             audit_enabled,
             audit_retention_days,
@@ -3977,6 +4006,9 @@ impl ConfigOverlay {
         }
         if let Some(value) = allow_git_commits {
             push_line(&mut output, "allow_git_commits", &value.to_string());
+        }
+        if let Some(value) = git_branch_prefix {
+            push_line(&mut output, "git_branch_prefix", value);
         }
         if let Some(value) = block_generated_secrets {
             push_line(&mut output, "block_generated_secrets", &value.to_string());

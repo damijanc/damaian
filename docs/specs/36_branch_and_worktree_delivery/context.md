@@ -144,7 +144,9 @@ is still read-only: there is no branch, ref, merge, or rebase mutation in
     contains `@{` could therefore be interpreted as a previous-branch expression
     instead of validated as text. The prefix must be checked in Rust before the
     composed name reaches git; the composed name is then checked with
-    `check-ref-format` as §5.2 requires.
+    `check-ref-format` as §5.2 requires. Git 2.56's `check-ref-format` also
+    rejects `--end-of-options` (it prints usage and exits 129), so the leading-`-`
+    protection lives in the Rust prefix check rather than in the git argv.
 15. **Branch names can carry a secret.** A suggestion derived from a task title
     or the user's request can contain an API key; slugging preserves alphanumeric
     runs and hyphens, so a key such as `sk-live-...` would become part of a ref
@@ -291,3 +293,9 @@ stop and report rather than breaking the parallel `chat.rs` track.
   spec constructs. Spec 57's `worktree remove --force` is a different,
   already-built path with its own confirmation and is not reachable from spec
   36's branch commands.
+- **`cargo deny check` fails on this branch for a dependency this spec does not
+  touch.** On 2026-10-28 it reports RUSTSEC-2026-0414 against
+  `pulldown-cmark v0.13.4` (fixed in 0.13.5, via `cargo update -p
+  pulldown-cmark`). The workspace is unchanged by spec 36 here; the upgrade is
+  for a dependency-maintenance change, not a branch-delivery one, and is left
+  out of this diff deliberately.
