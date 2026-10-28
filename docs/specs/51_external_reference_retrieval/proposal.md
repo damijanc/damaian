@@ -1,30 +1,33 @@
 # Feature Spec: External Reference Retrieval
 
-Status: Not started
+Status: In progress (planned 2026-10-28; no implementation task has landed yet).
 Order: 51 of 53
 Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 8 (Should). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#20](20_working_modes/proposal.md) (the mode that gates the tool) —
-built; [#26](26_context_assembly/proposal.md) (the category and budget fetched content
+Depends on: [#20](../20_working_modes/proposal.md) (the mode that gates the tool) —
+built; [#26](../26_context_assembly/proposal.md) (the category and budget fetched content
 enters) — built (Done 2026-10-25). Everything else named below is a cross-reference, not
 a prerequisite.
+Also in this spec: [`context.md`](context.md) (the pre-implementation state and
+the corrections planning found) and [`tasks.md`](tasks.md) (execution order and
+progress).
 Related spec sections: `ai_coding_assistant_specification.md` section 7.10
 (secret detection), section 19 (open gaps).
 Related implementation specs:
-[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting/proposal.md) (browser
+[`12_web_app_troubleshooting.md`](../12_web_app_troubleshooting/proposal.md) (browser
 diagnostics for the user's own local app — a different capability with a
 different trust model, see §4),
-[`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (the category and budget this
+[`26_context_assembly/proposal.md`](../26_context_assembly/proposal.md) (the category and budget this
 content enters through),
-[`27_context_inspector.md`](27_context_inspector/proposal.md) (where a user sees and
+[`27_context_inspector.md`](../27_context_inspector/proposal.md) (where a user sees and
 removes it),
-[`30_memory_retrieval_and_lifecycle.md`](30_memory_retrieval_and_lifecycle.md)
+[`30_memory_retrieval_and_lifecycle.md`](../30_memory_retrieval_and_lifecycle.md)
 (the injection-resistance pattern this follows rather than reinvents),
-[`10_persistent_command_approval.md`](10_persistent_command_approval.md) and
-[`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
+[`10_persistent_command_approval.md`](../10_persistent_command_approval.md) and
+[`34_repository_config_trust_boundary.md`](../34_repository_config_trust_boundary.md)
 (the approval scope rules the allowlist obeys),
-[`33_mcp_management_and_deferred_discovery.md`](33_mcp_management_and_deferred_discovery.md)
+[`33_mcp_management_and_deferred_discovery.md`](../33_mcp_management_and_deferred_discovery.md)
 (the alternative this spec argues against in §5.1).
 
 ## 1. Motivation
@@ -37,7 +40,7 @@ Every task touching a third-party API therefore runs on whatever the model
 remembers, and what a model remembers about a fast-moving library is a mixture
 of several versions with no marker saying which. The failure is not that the
 agent says "I don't know" — it is that it writes a confident call against an API
-that changed, and the user finds out at `cargo build`. [Spec 23](23_verification_loop/proposal.md)
+that changed, and the user finds out at `cargo build`. [Spec 23](../23_verification_loop/proposal.md)
 will catch a compile error; it will not catch a semantically valid call to a
 deprecated endpoint.
 
@@ -56,7 +59,7 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
   `read_file`, `search_codebase`, `run_command`, `propose_patch`,
   `read_git_diff`, `read_git_status`, `inspect_web_page`, `run_web_scenario`,
   `propose_plan`, `complete_step`. The two web tools drive a browser against the
-  user's own running application ([spec 12](12_web_app_troubleshooting/proposal.md)); they
+  user's own running application ([spec 12](../12_web_app_troubleshooting/proposal.md)); they
   are diagnostics, not a reader.
 - **`run_command` is the accidental path.** A user who has approved `curl` once
   has given the agent the whole internet through the command allowlist, with no
@@ -67,7 +70,7 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
   `kind` is a free string and `path` is an `Option<String>`, so a non-file source
   has somewhere to live, but nothing distinguishes trusted repository content
   from anything else.
-- **Config scope is enforced.** [Spec 34](34_repository_config_trust_boundary.md)
+- **Config scope is enforced.** [Spec 34](../34_repository_config_trust_boundary.md)
   gave `apply_overlay_scoped` a `ConfigScope` of `User`, `Repository` or `Admin`,
   a forbidden-key list, and restrict-only merges for repository scope. The
   machinery a domain allowlist needs already exists.
@@ -85,7 +88,7 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
    configures a search provider, and is never a prerequisite for requirement 1.
 3. Fetched content enters the model's context as a distinct, provenance-labelled
    category at the lowest priority, is visible and removable in
-   [spec 27](27_context_inspector/proposal.md), and counts against the same context and
+   [spec 27](../27_context_inspector/proposal.md), and counts against the same context and
    token budgets as everything else.
 4. **Fetched content is data and can never be an instruction.** This is proven
    by prompt-injection evaluations, not by a design argument.
@@ -103,7 +106,7 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
 - **Crawling.** One URL, one request, one response. Requirement 7 is what keeps
   this a reader rather than a crawler, and it is also why robots directives are
   out of scope: there is nothing to crawl.
-- **Rendering pages in a browser.** [Spec 12](12_web_app_troubleshooting/proposal.md)'s
+- **Rendering pages in a browser.** [Spec 12](../12_web_app_troubleshooting/proposal.md)'s
   browser drives the user's own application on localhost. Pointing it at
   arbitrary internet pages would run untrusted JavaScript in a context that has
   the user's repository open, which is a categorically larger risk than an HTTP
@@ -112,11 +115,11 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
   session reuse. A page behind a login is out of reach, and that is the correct
   answer rather than a limitation to fix later.
 - **Replacing MCP.** A user who prefers an MCP fetch server may still add one;
-  [spec 33](33_mcp_management_and_deferred_discovery.md) governs it. §5.1 says
+  [spec 33](../33_mcp_management_and_deferred_discovery.md) governs it. §5.1 says
   why a native tool is specified anyway.
 - **Caching as a knowledge base.** Fetched pages are cached to avoid re-fetching
   within a session, not to build a corpus. No index, no embeddings, no recall
-  across sessions — that is memory, and it has [spec 29](29_memory_creation_and_consent/proposal.md)'s
+  across sessions — that is memory, and it has [spec 29](../29_memory_creation_and_consent/proposal.md)'s
   consent rules, which content from a web page cannot satisfy.
 - **Downloading files.** The tool returns text. It does not write to the
   repository, and it is not a package installer.
@@ -129,7 +132,7 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
 
 ### 5.1 Why a native tool rather than an MCP server
 
-[Spec 33](33_mcp_management_and_deferred_discovery.md) makes MCP servers
+[Spec 33](../33_mcp_management_and_deferred_discovery.md) makes MCP servers
 manageable, and a fetch server is available off the shelf. Specifying a native
 tool anyway is a deliberate choice with three reasons, each of which is a
 property this spec needs and MCP cannot give:
@@ -141,8 +144,8 @@ property this spec needs and MCP cannot give:
   enforced by the thing that builds the request.
 - **Provenance has to survive into context.** Requirement 3 needs the content
   labelled at the point it is produced. An MCP tool result is a string.
-- **Accounting.** [Spec 19](19_token_and_cost_accounting/proposal.md) and
-  [spec 26](26_context_assembly/proposal.md) budget what enters a request. Content
+- **Accounting.** [Spec 19](../19_token_and_cost_accounting/proposal.md) and
+  [spec 26](../26_context_assembly/proposal.md) budget what enters a request. Content
   arriving through a generic tool result is outside both.
 
 A user who adds an MCP fetch server still gets spec 33's treatment. This spec
@@ -166,7 +169,7 @@ pub struct SearchWebInput {
 `search_web` is registered only when the user has configured a search provider —
 an endpoint and an API key in user scope, on the same footing as a model
 provider. Absent that, the tool is not in the tool list at all, for the reason
-[spec 50](50_model_initiated_clarification/proposal.md) §5.4 gives: a tool the model can
+[spec 50](../50_model_initiated_clarification/proposal.md) §5.4 gives: a tool the model can
 see is a tool it plans around.
 
 `search_web` returns titles, URLs and snippets. It never returns page bodies —
@@ -193,7 +196,7 @@ of the response is irrelevant to the attacker. The threat is not hypothetical in
 the way it sounds, because the instruction to make it need not come from the
 user: it can come from a repository file, an `AGENTS.md`, an MCP tool
 description, or — once this spec exists — a previously fetched page. That is the
-prompt-injection chain [spec 30](30_memory_retrieval_and_lifecycle.md) already
+prompt-injection chain [spec 30](../30_memory_retrieval_and_lifecycle.md) already
 takes seriously for memory, and this is the same chain with a network endpoint at
 the end of it.
 
@@ -202,7 +205,7 @@ Five constraints, and none of them is optional:
 1. **Host approval, per host, in user scope.** The first fetch of a host asks.
    The dialog shows the **host prominently and the full URL verbatim**, not a
    shortened or prettified form. `Allow Always` records the host in user config
-   keyed by repository, exactly as [spec 34](34_repository_config_trust_boundary.md)
+   keyed by repository, exactly as [spec 34](../34_repository_config_trust_boundary.md)
    relocated `command_allowlist`. `web_domain_allowlist` joins the
    forbidden-for-repository key list, so a repository can never add a host —
    this is the same defect class spec 34 closed for `model_base_url`, and it
@@ -238,18 +241,18 @@ with no credential field makes that unrepresentable rather than merely untrue.
 
 ### 5.4 Fetched content is data
 
-Requirement 4, following [spec 30](30_memory_retrieval_and_lifecycle.md)'s
+Requirement 4, following [spec 30](../30_memory_retrieval_and_lifecycle.md)'s
 treatment of memory rather than inventing a second approach:
 
 - It enters as a `ContextItem` with a distinct kind and an explicit provenance
   label naming the URL and the fetch time, in the **lowest-priority category**
-  of [spec 26](26_context_assembly/proposal.md)'s allocation — so a crowded context drops
+  of [spec 26](../26_context_assembly/proposal.md)'s allocation — so a crowded context drops
   a fetched page before it drops repository code.
 - It is delimited and labelled in the request as retrieved external content,
   never merged into the system prompt, never presented as instructions, and
-  never placed where repository instructions ([spec 11](11_agents_md_support.md))
+  never placed where repository instructions ([spec 11](../11_agents_md_support.md))
   live.
-- It is visible in [spec 27](27_context_inspector/proposal.md)'s inspector with its URL,
+- It is visible in [spec 27](../27_context_inspector/proposal.md)'s inspector with its URL,
   and removable there.
 - **Instruction-shaped fetched content is not obeyed and is reported.** A page
   containing "ignore previous instructions", a fake tool call, or text
@@ -260,7 +263,7 @@ treatment of memory rather than inventing a second approach:
 
 And the rule spec 30 establishes, restated because it is the acceptance
 criterion: this is settled by **prompt-injection evaluations in
-[spec 18](18_local_evaluation_harness/proposal.md)'s harness**, with fixture
+[spec 18](../18_local_evaluation_harness/proposal.md)'s harness**, with fixture
 pages that attempt to redirect the agent, exfiltrate a seeded credential, and
 induce an unapproved command. A design argument is not evidence.
 
@@ -273,7 +276,7 @@ induce an unapproved command. A design argument is not evidence.
 | Conversion | HTML reduced to text deterministically — headings, paragraphs, lists, code blocks, link text; scripts, styles, and attributes dropped |
 | Redaction | `SecretScanner` before storage and before the content reaches the model |
 | Timeout | A connect and a total ceiling, as `CurlModelTransport` already sets |
-| Cancellation | `CancelToken` polled, so a stop interrupts a fetch ([spec 08](08_stop_and_progress.md)) |
+| Cancellation | `CancelToken` polled, so a stop interrupts a fetch ([spec 08](../08_stop_and_progress.md)) |
 
 Inbound redaction is not paranoia about the page — it is that a code sample on a
 documentation site frequently contains a key-shaped string, and an unredacted
@@ -287,9 +290,9 @@ whole spec exists to prevent.
 
 ### 5.6 Budget
 
-Fetched content counts against [spec 26](26_context_assembly/proposal.md)'s context
+Fetched content counts against [spec 26](../26_context_assembly/proposal.md)'s context
 budget in its own category, and the tool call counts a round against
-[spec 21](21_task_plan_progress_and_budget/proposal.md)'s ceiling. A per-turn cap
+[spec 21](../21_task_plan_progress_and_budget/proposal.md)'s ceiling. A per-turn cap
 on fetches bounds the worst case — a model that fetches twelve pages has lost
 the thread, and the cap turns that into a refusal the model can read rather than
 a bill.

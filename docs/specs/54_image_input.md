@@ -225,7 +225,7 @@ paste one that a text message would have had cleaned.
 |---|---|
 | Formats | PNG, JPEG, WebP, GIF (first frame). Anything else is refused by type, not attempted |
 | Source | A local file the user chose, a pasted or dropped image, or a diagnostic artifact under the data directory |
-| **Never** | An image fetched from a URL, including one named by a fetched page ([spec 51](51_external_reference_retrieval.md) §5.3 constraint 5 forbids sub-resource loading, and an image is a sub-resource) |
+| **Never** | An image fetched from a URL, including one named by a fetched page ([spec 51](51_external_reference_retrieval/proposal.md) §5.3 constraint 5 forbids sub-resource loading, and an image is a sub-resource) |
 | Size | A byte cap and a dimension cap; a larger image is downscaled with the downscaling stated, or refused where it cannot be |
 | Storage | Copied under the data directory keyed by content hash, so the transcript is stable if the user moves or deletes the original |
 | Provenance | Recorded as user-attached or agent-captured, and shown as such in [spec 27](27_context_inspector/proposal.md) |

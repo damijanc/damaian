@@ -79,7 +79,7 @@ directory was renamed from `ROADMAP` to `PLAN` because it was never a roadmap:
 
 ## What to build next, and what may run in parallel
 
-### Current state (2026-10-26)
+### Current state (2026-10-28)
 
 A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
@@ -97,7 +97,9 @@ seven-check gate passed in CI on 2026-10-26 (Quality run 40340511717); #28 and
 presentation follow-up to #41, #42 and #66; it edits no `chat.rs`, so it did not
 constrain #29.
 
-- **In progress:** none. #29 memory creation and consent finished on 2026-10-26
+- **In progress:** #51 external reference retrieval, planned as a folder spec on
+  2026-10-28; no implementation task has landed yet, so it is in progress
+  without being built. #29 memory creation and consent finished on 2026-10-26
   with the seven-check gate green in CI. #49 prompt cache's accounting slice is
   done and the reuse slice (requirement 4) is still unbuilt; #26's ordering
   exists, and #55
@@ -108,14 +110,16 @@ constrain #29.
 - **Ready, not started:** #30 memory retrieval and lifecycle (promoted by #29 on
   2026-10-26); #33 MCP management; #36 branch and worktree delivery (#35 finished
   on 2026-10-26; Phase 2 WP4 is optional and the spec is written to work without
-  it); #51 external reference retrieval.
+  it).
 - **Blocked:** #37 on #33 and #36; #52 on #33;
   #39 on #38; #40 on #38 and #39; #54 on Phase 1 WP3 (provider capability
   validation), which is unspecified.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
 - **Pairing:** two specs may run together only if at most one of them edits
   `chat.rs`, and #49's reuse slice is a solo `chat.rs` track while it rewrites
-  the request around `build_model_prompt`. #26, #27, #28, #29, #35, #55, #65 and
+  the request around `build_model_prompt`. #51 is now an in-progress `chat.rs`
+  track too (its Tasks 7 and 8), so it may pair only with a spec that does not
+  edit that file. #26, #27, #28, #29, #35, #55, #65 and
   #66 are Done and no longer constrain anything. See
   [Parallel work](#parallel-work).
 - **Open decision:** the priority table below predates #59–#64 and does not
@@ -137,7 +141,7 @@ plus [#56](56_provider_fallback_consent/proposal.md) and [#38](38_subagent_model
 (which depends on nothing here, but is explicitly speculative — its own §1
 allows abandoning it). #20 also cleared one of the dependencies of
 [#33](33_mcp_management_and_deferred_discovery.md) and
-[#51](51_external_reference_retrieval.md), but both still wait on #26, and #33
+[#51](51_external_reference_retrieval/proposal.md), but both still wait on #26, and #33
 waits on #31 as well.
 [#49](49_prompt_cache_accounting_and_reuse/proposal.md)'s accounting slice
 shipped on 2026-09-23; its one remaining requirement (the reuse slice) is
@@ -329,7 +333,7 @@ the app.
 Re-derived on 2026-10-24, when [#50](50_model_initiated_clarification/proposal.md)
 and [#32](32_hooks/proposal.md) were finished and, with #25, #59 and #62, merged
 into `main`. No `Depends on:` line names #50 (only
-[#51](51_external_reference_retrieval.md) cites its §5.4 as a cross-reference)
+[#51](51_external_reference_retrieval/proposal.md) cites its §5.4 as a cross-reference)
 or #32, so nothing further is promoted. The ready set is #23, #26 and #65;
 #66 was built afterwards, on 2026-10-25.
 
@@ -377,11 +381,24 @@ with #65 and #66 Done on 2026-10-25, #23 becomes the next priority and is still
 the last thing in front of #35. No `Depends on:` line names #65 or #66, so
 nothing is promoted by their completion.
 
+Re-checked on 2026-10-28, when [#51](51_external_reference_retrieval/proposal.md)
+was planned. It moved from the ready set into **In progress** without being
+built: the flat spec became a folder,
+[`context.md`](51_external_reference_retrieval/context.md) records the current
+context, tool and config pipeline plus the corrections planning found, and
+[`tasks.md`](51_external_reference_retrieval/tasks.md) holds ten tasks. No
+dependency line changes, because nothing waits on #51 until it is Done. Two
+facts matter to the order: **#51 edits `chat.rs`** (Tasks 7 and 8), so it is now
+a `chat.rs` track under the pairing rule; and its content reaches the model
+through a new eleventh context category, so it also edits
+`context_manager.rs`, `config.rs` and spec 26's default share table. The ready
+set is #30, #33 and #36.
+
 | | Build | Why here |
 |---|---|---|
 | 1 | #23 verification | Ready now that #22 is done, and the next priority with #65 finished; the last thing in front of #35. Its loop lives in `chat.rs` |
 | 2 | #55 compaction | **Done 2026-10-26.** Replaced the eight-message window with a token budget plus an append-only summary, so #49's reuse slice now has a stable conversation block to measure |
-| 3 | #28, #33, #51 | The fan-out #26 unblocked. **#27 is Done (2026-10-26)** and promoted #28 |
+| 3 | #28, #33, #51 | The fan-out #26 unblocked. **#27 is Done (2026-10-26)** and promoted #28; **#51 is in progress** (planned 2026-10-28) |
 | 4 | #29 → #30 | Memory, strictly serial behind #27. **#29 is Done (2026-10-26)** and promoted #30, now the next memory step |
 | 5 | #36/#37; #33 → #52 | Delivery and extensibility clusters. #35 is Done (2026-10-26) and promoted #36 |
 | 6 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not". #38 is deferred; #57 is done, so its stage 1 is due for re-evaluation |
@@ -684,7 +701,7 @@ is ready.
 | 48 | [48_provider_limits_and_backpressure/proposal.md](48_provider_limits_and_backpressure/proposal.md) | **Done.** Roadmap Phase 1 WP7. A provider rate limit ends the turn, and the code written to prevent that cannot see it: a 429 arrives as a parsed error body and returns immediately with no retry, while `is_retryable_message`'s `"rate limit"` and `"429"` arms are reachable only from the transport-failure path — where they never fire, because `curl -sS` exits zero on a 4xx. Captures status and headers via `dump-header` rather than a stdout sentinel a model could emit, classifies refusals from status first and never from prose, honours `Retry-After` under both an attempt count and a wall-clock ceiling, and makes the outcome a `failureKind` on the existing failed state rather than a fourteenth state — three fewer kill-matrix cells for the same information. A refused call records measured zero, so it cannot inflate #19's totals through the estimate written before the call. |
 | 49 | [49_prompt_cache_accounting_and_reuse/](49_prompt_cache_accounting_and_reuse/proposal.md) | **In progress.** Split into a folder and planned on 2026-09-18. Roadmap Phase 1 WP8. The **accounting slice** (requirements 1, 2, 3, 6, 8, plus requirement 5's guard) is **Done as of 2026-09-23**: `cached_input_tokens` and a cached rate, so cost is no longer overstated for providers that cache automatically. The **reuse slice** (requirement 4) is the only unbuilt requirement. #26's stable-to-volatile ordering now exists, but the conversation section is still a **sliding window of the last eight messages** that changes the prefix every turn, so the slice waits on #55's replacement; the spec's own `Depends on:` line also names Phase 1 WP3 as unspecified. |
 | 50 | [50_model_initiated_clarification/](50_model_initiated_clarification/proposal.md) | **Done 2026-10-24** (planned 2026-10-07; Tasks 1–8, the last on 2026-10-24; the live usage measurement was not run, see its §7). Roadmap Phase 2 WP8. An `ask_user` tool whose load-bearing rule is that an answer can never satisfy an approval, enforced by types rather than discipline. It reuses the existing waiting state and reattach machinery, is bounded to two questions per turn, and is absent from the tool list where no user can answer. |
-| 51 | [51_external_reference_retrieval.md](51_external_reference_retrieval.md) | **Not started.** Roadmap Phase 3 WP8. Damaian cannot read a page, so every task against a third-party API runs on what the model remembers about an unnamed version of it. `fetch_url` and an optional `search_web`, with fetched content entering as a lowest-priority provenance-labelled `ContextItem` proven non-authoritative by injection evals rather than by argument — #30's treatment of memory, reused. Its §5.3 is the reason it is Should-tier: a URL is the first place the model chooses what leaves the machine, so host approval lives in user scope on the forbidden-for-repository list, a URL carrying repository content or a secret is refused *before* the approval dialog rather than by it, and cross-host redirects are not followed. |
+| 51 | [51_external_reference_retrieval/](51_external_reference_retrieval/proposal.md) | **In progress** (planned 2026-10-28). Roadmap Phase 3 WP8. Damaian cannot read a page, so every task against a third-party API runs on what the model remembers about an unnamed version of it. `fetch_url` and an optional `search_web`, with fetched content entering as a lowest-priority provenance-labelled `ContextItem` proven non-authoritative by injection evals rather than by argument — #30's treatment of memory, reused. Its §5.3 is the reason it is Should-tier: a URL is the first place the model chooses what leaves the machine, so host approval lives in user scope on the forbidden-for-repository list, a URL carrying repository content or a secret is refused *before* the approval dialog rather than by it, and cross-host redirects are not followed. |
 | 52 | [52_mcp_server_mode.md](52_mcp_server_mode.md) | **Not started.** Roadmap Phase 4 WP6. #06 and #33 are client-side only, so Damaian's indexed search, redaction and path policy are reachable only from its own window — the alternative being to give another tool raw filesystem access. Exposes a read-only subset over stdio, with the set computed as the intersection of read-only and profile-permitted rather than listed, so a tool added later is excluded until classified. The repository is fixed at launch and unreachable from the wire; a server has no user, therefore no approval, therefore nothing that writes. |
 | 53 | [53_session_search_and_export/proposal.md](53_session_search_and_export/proposal.md) | **Done.** Roadmap Phase 1 WP9. A rescope, not greenfield: listing, renaming and deleting already work end to end, and what is missing is finding anything and getting anything out. A bounded scan through #17's parse-first reader rather than a second index, anchored on `seq` because it survives rewinds. Its sharp edge is inherited from #16: `append_message` stores content verbatim and deliberately does not redact, so that a rewind restores what was actually said — which makes export a display path that writes a file, and redaction on the way out mandatory, with the redaction count stated rather than silently applied. |
 | 54 | [54_image_input.md](54_image_input.md) | **Not started.** Roadmap Phase 3 WP9. Lets a user paste a picture into the composer and lets the model see #12's diagnostic screenshots, which today it receives only as a file reference. Its hard part is that **an image defeats `SecretScanner`** and OCR is rejected, so the guarantee becomes informed consent: no unseen image is ever sent, and no setting can make screenshot inclusion automatic. |
