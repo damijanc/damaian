@@ -11944,6 +11944,7 @@ mod tests {
                 excluded: Vec::new(),
                 conversation_summary: None,
                 symbol_provenance: None,
+                memory: Vec::new(),
             },
         );
 
@@ -11976,6 +11977,7 @@ mod tests {
             excluded: Vec::new(),
             conversation_summary: None,
             symbol_provenance: None,
+            memory: Vec::new(),
         };
         let event = crate::turn_progress_event(TurnProgress::Context(Box::new(manifest)));
         assert!(matches!(event, Some(crate::TurnEvent::Context(_))));

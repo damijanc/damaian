@@ -308,6 +308,7 @@ fn a_required_item_that_does_not_fit_is_an_error() {
         restriction: None,
         conversation_summary: None,
         external_references: &[],
+        memory: &[],
     });
     assert!(
         matches!(&direct, Err(ClientError::InvalidInput(message)) if message.contains(&limit.to_string())),
@@ -549,6 +550,7 @@ fn assemble_with_limit(
             restriction: None,
             conversation_summary: None,
             external_references: &[],
+            memory: &[],
         })
         .expect("the assembly should succeed")
 }
@@ -2817,6 +2819,7 @@ fn assemble_with_references(
             restriction: None,
             conversation_summary: None,
             external_references,
+            memory: &[],
         })
         .expect("the assembly should succeed")
 }

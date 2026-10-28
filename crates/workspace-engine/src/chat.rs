@@ -1398,6 +1398,9 @@ impl ChatOrchestrator {
             restriction: context_restriction.as_deref(),
             conversation_summary: conversation.summary.as_ref(),
             external_references: &external_references,
+            // Recall is wired to the turn in Task 4; this task proves the
+            // delivery path (spec 30 Task 3).
+            memory: &[],
         })?;
         // What this turn is about to send (spec 27 §5.1, C9). Sent before the
         // first call, so the default (no pause) still gives the user a
@@ -2792,6 +2795,9 @@ impl ChatOrchestrator {
             // ordinary turn's assembly is where the session's references enter
             // (spec 51 D5).
             external_references: &[],
+            // A repair continuation assembles with no memory of its own; Task 4
+            // decides whether it carries the turn's recalled entries through.
+            memory: &[],
         })?;
         let turn_notes = self.carry_notes_from_the_previous_turn(&session.id, &task)?;
         let prompt_conversation = build_conversation(
@@ -15832,6 +15838,7 @@ mod approval_prompt_wording_tests {
                 excluded: Vec::new(),
                 conversation_summary: None,
                 symbol_provenance: None,
+                memory: Vec::new(),
             },
         };
         let with_result = build_model_prompt(
@@ -15904,6 +15911,7 @@ mod approval_prompt_wording_tests {
                 excluded: Vec::new(),
                 conversation_summary: None,
                 symbol_provenance: None,
+                memory: Vec::new(),
             },
         };
         let prompt = build_model_prompt(
@@ -15953,6 +15961,7 @@ mod approval_prompt_wording_tests {
                 excluded: Vec::new(),
                 conversation_summary: None,
                 symbol_provenance: None,
+                memory: Vec::new(),
             },
         }
     }

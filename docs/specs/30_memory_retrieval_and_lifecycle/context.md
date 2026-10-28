@@ -310,6 +310,57 @@ because Task 3 and Task 4 depend on them.**
    point and only orders entries that already have a term match, never makes an
    entry eligible, so a wrong guess cannot pull in an unrelated memory.
 
+**C14 — Task 3's file list was one file, but the seam reaches six more.** Adding
+`memory` to `ContextRequest` and `ContextManifest` is a struct-literal change,
+and Rust has no defaulted fields in literals even where serde has
+`#[serde(default)]`:
+
+- `ContextRequest` is constructed in `chat.rs` twice (`:1387`, `:2778`),
+  `edit.rs` once (`:526`) and in five test files (`tests/context_assembly.rs`,
+  `tests/context_inspector.rs`, `tests/repository_map.rs`, `tests/hooks.rs`,
+  `tests/symbol_index.rs`). Task 3 passes `&[]` at every call site; Task 4
+  replaces the turn's empty slice with the recalled entries.
+- `ContextManifest` is constructed in three `chat.rs` test fixtures
+  (`:15824`, `:15896`, `:15945`) and two `desktop-shell` test fixtures
+  (`lib.rs:11927`, `:11968`), so both crates are touched for one field. The
+  engine's `lib.rs` also re-exports `MemoryRecallRef`, because the manifest row
+  is public API a shell reader will name.
+- The date in the §5.2 frame reuses spec 51's `civil_date_from_days`
+  (`external_reference.rs:1756`), which becomes `pub(crate)`; writing a second
+  calendar conversion would be the duplicate this spec avoids elsewhere.
+
+The two remaining differences from the written task are not defects in it:
+
+1. **Steps 4 and 5 are already satisfied by Task 1.** `Memory` is the last
+   `BUDGETED` entry, `ContextBudget.shares[11]` is the 300-basis-point memory
+   allocation, and `CategoryUsage` is produced in `BUDGETED` order, so Task 3
+   adds tests that prove the ordering rather than code that establishes it.
+   The inspector's JS label map is Task 5's, per C2.
+2. **A `MemoryRecallRef` exists only for an item that was included.**
+   `ExclusionRecord` carries no entry id (C10 refuses per-entry detail there),
+   so a budget-dropped memory is visible as an exclusion in the `Memory`
+   category but not by id. Refs are therefore 1:1 with included `Memory` items
+   in item order, and `PreparedContext::remove_optional` drops the matching ref
+   by counting the `Memory` items before the removed index. Without that, a
+   removed entry would leave a ref whose statement is no longer in the request.
+
+**C15 — A zero share did not switch a category off, and Task 3 has to fix that.**
+`apply_budget` added the released carry to every category's nominal share, so
+`context_budget.memory=0` still included memory whenever an earlier category
+under-used its allocation — on a normal turn there is a lot of unused
+allocation, so the key could not disable the category at all. Task 3's own
+criterion ("with ... its share zero, no memory text appears") and the
+`ZERO_CONTEXT_SHARES` helper's comment ("see only that category compete")
+both assume the opposite.
+
+**Decision:** a category with a zero share receives no allocation and passes
+the released carry through to the next enabled category, rather than
+intercepting it. This keeps spec 26 §5.2's redistribution for every enabled
+category and makes `context_budget.*=0` mean "do not spend budget here". No
+existing behaviour changes for a non-zero share. Spec 26's §5.2 gained one
+sentence recording the rule; the code is the single `allocation`/`carry`
+expression in `apply_budget`.
+
 ## 3. Open questions for the owner
 
 1. **`memory_max_entries` default.** Proposal §5.3 asks for "a small maximum".

@@ -372,7 +372,10 @@ Two rules make the allocation useful rather than merely tidy:
   share releases the remainder to later categories in pipeline order. Without
   this, a repository with no findings, no pinned context and no conversation
   summary wastes up to 30% of the window on nothing — strict per-category caps
-  would make the common case worse than today's flat budget.
+  would make the common case worse than today's flat budget. A category whose
+  configured share is zero is switched off: it receives no allocation and
+  passes the released remainder on rather than intercepting it, so
+  `context_budget.*=0` means "do not spend budget here" (spec 30 C15).
 - **A category over its share is truncated within itself**, dropping its
   lowest-priority members (§5.3) rather than stealing from another category. A
   block item (map, symbols, plan state) is first re-rendered at the smaller

@@ -3206,6 +3206,7 @@ impl Repo {
                 restriction: None,
                 conversation_summary: None,
                 external_references: &[],
+                memory: &[],
             })
             .expect("the symbols assembly should run")
     }

@@ -109,8 +109,9 @@ pub use config::{
 pub use context_manager::{
     CategoryUsage, CollectionSource, ContextBudget, ContextCategory, ContextItem, ContextKind,
     ContextManager, ContextManifest, ContextPlan, ContextRequest, ConversationSummaryUsage,
-    EffectiveLimit, ExclusionRecord, IncludedRef, LimitSource, PreparedContext, PromptSection,
-    PromptSectionName, RepositoryMapSource, SymbolProvenanceCounts, SymbolSource, TokenEstimate,
+    EffectiveLimit, ExclusionRecord, IncludedRef, LimitSource, MemoryRecallRef, PreparedContext,
+    PromptSection, PromptSectionName, RepositoryMapSource, SymbolProvenanceCounts, SymbolSource,
+    TokenEstimate,
 };
 pub use data_schema::{
     CURRENT_DATA_SCHEMA_VERSION, DataSchemaError, DataSchemaOutcome, ensure_data_dir_schema,
