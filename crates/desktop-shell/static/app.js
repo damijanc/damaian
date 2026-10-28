@@ -2149,6 +2149,7 @@ function showBranchDialog(info, suggestion, repoPath, sessionId) {
       "/api/branch",
       form({
         repo: repoPath,
+        session_id: sessionId,
         prepare_id: preparation.prepareId,
         mutation: JSON.stringify(preparation.mutation),
         approval: "branch",
@@ -2259,6 +2260,7 @@ function showBranchDialog(info, suggestion, repoPath, sessionId) {
     const name = preparation.mutation.name;
     const subjects = preparation.unmergedSubjects || [];
     const count = preparation.unmergedCommits;
+    const reason = preparation.unmergedReason;
     if (count === 0) {
       renderBranchCard(deleteCard, {
         title: `Delete ${name}`,
@@ -2277,21 +2279,26 @@ function showBranchDialog(info, suggestion, repoPath, sessionId) {
       : `${count} commit${count === 1 ? "" : "s"}`;
     renderBranchCard(deleteCard, {
       title: `${name} has unmerged commits`,
-      message: counted
-        ? `Damaian could not determine the default branch, so it cannot count what deleting ` +
-          `${name} would lose. The commit subjects are below. Nothing has been deleted; ` +
-          "Continue leads to a second confirmation."
-        : `Deleting ${name} would lose ${lost} that are not on the default branch or any ` +
-          "remote. Nothing has been deleted; Continue leads to a second confirmation.",
+      message: reason
+        ? `${reason}, so Git will not delete ${name} with a plain delete. ` +
+          "Nothing has been deleted; Continue leads to a second confirmation."
+        : counted
+          ? `Damaian could not determine the default branch, so it cannot count what deleting ` +
+            `${name} would lose. The commit subjects are below. Nothing has been deleted; ` +
+            "Continue leads to a second confirmation."
+          : `Deleting ${name} would lose ${lost} that are not on the default branch or any ` +
+            "remote. Nothing has been deleted; Continue leads to a second confirmation.",
       lines: subjects,
       confirmLabel: "Continue…",
       onConfirm: () => {
         deleteCard.hidden = true;
         renderBranchCard(confirmCard, {
-          title: counted ? `Delete ${name} anyway?` : `Delete ${name} and lose ${lost}?`,
-          message:
-            "This is the second confirmation. Damaian will run git branch -D; the commits " +
-            "below will no longer be reachable from any branch.",
+          title: reason || counted ? `Delete ${name} anyway?` : `Delete ${name} and lose ${lost}?`,
+          message: reason
+            ? `This is the second confirmation. ${reason}, and the commits below are not ` +
+              `reachable from that reference. Damaian will run git branch -D.`
+            : "This is the second confirmation. Damaian will run git branch -D; the commits " +
+              "below will no longer be reachable from this branch.",
           lines: subjects,
           confirmLabel: counted ? "Delete anyway" : `Delete and lose ${lost}`,
           danger: true,

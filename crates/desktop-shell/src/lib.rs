@@ -2324,6 +2324,7 @@ fn handle_branch_change(stream: &mut TcpStream, request: &Request) -> Result<(),
         );
     }
     let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
     let prepare_id = required_form(&form, "prepare_id")?;
     let mutation = required_form(&form, "mutation")?;
     let mutation = match serde_json::from_str::<GitMutation>(&mutation) {
@@ -2343,8 +2344,8 @@ fn handle_branch_change(stream: &mut TcpStream, request: &Request) -> Result<(),
     };
     let engine = engine_for_repo(&repo)?;
     match engine.branch.load_record(&prepare_id) {
-        Ok(record) if record.repository_root == repo => {}
-        Ok(_) => {
+        Ok(record) if record.repository_root == repo && record.session_id == session_id => {}
+        Ok(record) if record.repository_root != repo => {
             return write_response(
                 stream,
                 request,
@@ -2353,6 +2354,18 @@ fn handle_branch_change(stream: &mut TcpStream, request: &Request) -> Result<(),
                 &branch_error_body(
                     "branch_repository_mismatch",
                     "That branch preparation belongs to a different folder. Nothing ran.",
+                ),
+            );
+        }
+        Ok(_) => {
+            return write_response(
+                stream,
+                request,
+                400,
+                "application/json",
+                &branch_error_body(
+                    "branch_session_mismatch",
+                    "That branch preparation belongs to a different session. Nothing ran.",
                 ),
             );
         }
@@ -2386,6 +2399,23 @@ fn handle_merge_preparation(stream: &mut TcpStream, request: &Request) -> Result
     let mode = required_param(request, "mode")?;
     let base = required_param(request, "base")?;
     let engine = engine_for_repo(&repo)?;
+    if engine
+        .session_store
+        .read_session(&session)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return write_response(
+            stream,
+            request,
+            400,
+            "application/json",
+            &branch_error_body(
+                "branch_unknown_session",
+                "Unknown session. Open a session before preparing a merge or rebase.",
+            ),
+        );
+    }
     match mode.as_str() {
         "merge" => match engine.branch.prepare_merge(&repo, &base, &session) {
             Ok(plan) => {
@@ -15776,6 +15806,7 @@ mod branch_route_tests {
         port: u16,
         token: &str,
         repo: &Path,
+        session_id: &str,
         prepared: &serde_json::Value,
         confirm_unmerged: bool,
     ) -> String {
@@ -15785,6 +15816,7 @@ mod branch_route_tests {
             "/api/branch",
             &[
                 ("repo", &repo.to_string_lossy()),
+                ("session_id", session_id),
                 ("prepare_id", prepared["prepareId"].as_str().unwrap()),
                 ("mutation", &prepared["mutation"].to_string()),
                 ("approval", "branch"),
@@ -15954,9 +15986,30 @@ mod branch_route_tests {
         );
         assert!(!ref_exists(&repo, "refs/heads/damaian/approval"));
         // A refused approval does not consume the preparation.
-        let applied = approve(port, &token, &repo, &prepared, false);
+        let applied = approve(port, &token, &repo, &session_id, &prepared, false);
         assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
         assert!(ref_exists(&repo, "refs/heads/damaian/approval"));
+    }
+
+    #[test]
+    fn a_branch_approval_is_bound_to_the_preparing_session() {
+        let repo = repo_fixture("session-binding");
+        let preparing = session(&repo, "Branch binding");
+        let other = session(&repo, "Another session");
+        let (port, token) = serve();
+        let prepared = prepare(port, &token, &repo, &preparing, "create", "damaian/bound");
+        assert!(prepared.starts_with("HTTP/1.1 200"), "{prepared}");
+        let prepared = body_json(&prepared);
+
+        let refused = approve(port, &token, &repo, &other, &prepared, false);
+        assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+        let body = body_json(&refused);
+        assert_eq!(body["code"], "branch_session_mismatch");
+        assert!(!ref_exists(&repo, "refs/heads/damaian/bound"));
+
+        let applied = approve(port, &token, &repo, &preparing, &prepared, false);
+        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
+        assert!(ref_exists(&repo, "refs/heads/damaian/bound"));
     }
 
     #[test]
@@ -15987,7 +16040,7 @@ mod branch_route_tests {
         );
         assert_eq!(prepared["suggestion"]["name"], "damaian/route-create");
 
-        let applied = approve(port, &token, &repo, &prepared, false);
+        let applied = approve(port, &token, &repo, &session_id, &prepared, false);
         assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
         let outcome = body_json(&applied);
         assert_eq!(outcome["branch"], "damaian/route-create");
@@ -16023,7 +16076,7 @@ mod branch_route_tests {
         assert!(prepared.starts_with("HTTP/1.1 200"), "{prepared}");
         let prepared = body_json(&prepared);
         assert_eq!(prepared["mutation"]["kind"], "switchBranch");
-        let applied = approve(port, &token, &repo, &prepared, false);
+        let applied = approve(port, &token, &repo, &session_id, &prepared, false);
         assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
         let outcome = body_json(&applied);
         assert_eq!(outcome["branch"], "side");
@@ -16051,7 +16104,7 @@ mod branch_route_tests {
         let merged = body_json(&merged);
         assert_eq!(merged["unmergedCommits"], 0);
         assert_eq!(merged["mutation"]["kind"], "deleteBranch");
-        let deleted = approve(port, &token, &repo, &merged, false);
+        let deleted = approve(port, &token, &repo, &session_id, &merged, false);
         assert!(deleted.starts_with("HTTP/1.1 200"), "{deleted}");
         let deleted = body_json(&deleted);
         let commands = deleted["gitCommands"]
@@ -16078,7 +16131,7 @@ mod branch_route_tests {
         assert_eq!(unmerged["unmergedCommits"], 1);
         assert_eq!(unmerged["unmergedSubjects"][0], "unmerged work");
 
-        let refused = approve(port, &token, &repo, &unmerged, false);
+        let refused = approve(port, &token, &repo, &session_id, &unmerged, false);
         assert!(refused.starts_with("HTTP/1.1 409"), "{refused}");
         let refused = body_json(&refused);
         assert_eq!(refused["code"], "branch_unmerged_confirmation_required");
@@ -16087,9 +16140,9 @@ mod branch_route_tests {
         assert!(ref_exists(&repo, "refs/heads/unmerged"));
         // The record survives the refusal, so the second decision can still be
         // made without preparing again.
-        let still_refused = approve(port, &token, &repo, &unmerged, false);
+        let still_refused = approve(port, &token, &repo, &session_id, &unmerged, false);
         assert!(still_refused.starts_with("HTTP/1.1 409"), "{still_refused}");
-        let confirmed = approve(port, &token, &repo, &unmerged, true);
+        let confirmed = approve(port, &token, &repo, &session_id, &unmerged, true);
         assert!(confirmed.starts_with("HTTP/1.1 200"), "{confirmed}");
         let confirmed = body_json(&confirmed);
         let commands = confirmed["gitCommands"]
@@ -16215,6 +16268,17 @@ mod branch_route_tests {
         );
         assert_eq!(git(&repo, &["rev-parse", "HEAD"]), before_head);
         assert!(!repo.join(".git/REBASE_HEAD").exists());
+
+        let unknown = get(
+            port,
+            &token,
+            &format!(
+                "/api/merge-preparation?repo={}&session=missing-session&mode=merge&base={base}",
+                encode(&repo.to_string_lossy()),
+            ),
+        );
+        assert!(unknown.starts_with("HTTP/1.1 400"), "{unknown}");
+        assert_eq!(body_json(&unknown)["code"], "branch_unknown_session");
 
         let refused_mode = get(
             port,
