@@ -371,8 +371,13 @@ session's log, so it is deleted with the session.
 
 **Read one.** Each line is a complete record; the last record for an `id` wins,
 which is how an edit, supersession, expiry or deletion is represented without
-rewriting the file. A torn final line is ignored on read. To see the current
-project entries:
+rewriting the file. A torn final line is ignored on read. A line in the middle
+that does not parse is skipped and the count is recorded in the
+`memory_records_unreadable` audit event; it is not repaired automatically,
+because the record's intent is unreadable. That is how a corrupted delete record
+brings the entry it deleted back as active. Re-appending a complete record with
+the same `id` and the intended `state` restores the decision, since replay is
+last-wins. To see the current project entries:
 
 ```bash
 jq -r 'select(.state=="active") | "\(.category)\t\(.created_at_ms)\t\(.statement)"' \
@@ -390,14 +395,22 @@ prefix names the tier that produced it:
 
 | Prefix | Resolved from | Survives |
 |---|---|---|
-| `root_<40-hex>` | `git rev-list --max-parents=0 HEAD` | clone, move, rename, remote change, fork |
+| `root_<40-hex>` | the lexicographically smallest root commit (`git rev-list --max-parents=0 HEAD`, sorted) | clone, move, rename, remote change, fork |
 | `remote_<16-hex>` | normalized `origin` URL (host + path) hashed | clone, move; not a remote rename |
 | `path_repo_sha256_<hex>` | the existing path-derived `repository_id`, with its colon mapped to `_` | nothing; per-checkout fallback |
 
 The root commit is preferred because it belongs to the repository's history
-rather than to where it sits. A fork shares its upstream's root commit and
-therefore its memory — deliberate, since the conventions usually still apply. A
-**shallow clone** (`git clone --depth 1`) has no true root: Git reports the
+rather than to where it sits. A repository can have several roots — a
+`git subtree add`, a merge of unrelated histories, an orphan branch — and Git
+reports them in commit-time order, so the key uses the lexicographically
+smallest of them: the same set of roots always resolves to the same key, no
+matter which one was merged last. **A history rewrite that removes a root
+changes the key**, and memory written under the old key is not seen under the
+new one; that is the price of deriving identity from history. A fork shares its
+upstream's roots and therefore its memory — deliberate, since the conventions
+usually still apply.
+
+A **shallow clone** (`git clone --depth 1`) has no true root: Git reports the
 grafted boundary, whose value depends on the depth and changes on
 `git fetch --unshallow`, so the root-commit tier is skipped and the remote is
 used. Two shallow clones of one repository therefore share through `origin`,
@@ -418,6 +431,7 @@ refused before it could be shown, not lost. The audit log has the reason:
 | `memory_proposal_confirmed` | You pressed Remember and the entry was written. |
 | `memory_proposal_dismissed` | You dismissed the card. Nothing was written. |
 | `memory_proposal_failed` | The proposal could not be recorded at all; the turn continued. |
+| `memory_records_unreadable` | A stored memory file has lines that do not parse. `scope`, `source` and `unreadable` (the count) are recorded once per run. |
 
 A non-user suggestion is capped at three per task. The fourth produces
 `reason=suggestion_cap_reached` rather than a card. An explicit "remember that…"

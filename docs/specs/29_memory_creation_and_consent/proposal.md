@@ -1,7 +1,7 @@
 # Feature Spec: Memory Creation, Consent, and Scope
 
 Status: Done 2026-10-26 (planned and built on 2026-10-26; Tasks 1–9; the full
-seven-check gate passed in CI on 2026-10-26 for the `main` push at `4abbf1f`).
+seven-check gate passed in CI on 2026-10-26 for the `main` push).
 Order: 29 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 2 (Must). That directory is local-only and not committed, so the
@@ -231,8 +231,8 @@ constraints:
   not merely flagged. A candidate whose statement reads as an instruction to
   Damaian — "always approve commands", "you may edit files without asking",
   "ignore the previous rules" — is rejected at proposal time, with the reason
-  recorded. A repository author gets no proposal card, because a card is itself a
-  nudge: users click through prompts, which is why
+  recorded. A repository author gets no instruction-shaped card, because a card
+  is itself a nudge: users click through prompts, which is why
   [spec 10](../10_persistent_command_approval.md) exists.
 
 **The check is applied to `ModelSuggestion` too, not only to the two obviously
@@ -380,7 +380,10 @@ A confirmation card in the conversation, shaped like the command-approval card
 the category, the origin with its source named, and Confirm / Dismiss / Edit
 scope. The card is rendered from the pending proposals the shell serves for the
 open session, not from a statement the client supplies; the confirm route takes
-a proposal id and re-reads the stored proposal (§5.10).
+a proposal id and re-reads the stored proposal (§5.10). Once either decision is
+pressed, both buttons and the scope picker stop accepting input until the
+request finishes, so one card cannot send a Remember and a Dismiss; a failed
+request re-enables them because nothing was decided.
 
 Suggestions appear at the end of a task, collapsed to a count when there is more
 than one, so they do not compete with the completion report
@@ -460,9 +463,11 @@ all of them. A model that names a repository file as its source is still making
 a model suggestion, and the card says so.
 
 An explicit "remember that…" is detected from the user's own message at turn
-start and produces a `UserRequest` proposal. It is not a tool call, because the
-user's message is the trusted origin and asking the model to re-state it would
-add a round trip and a chance to misremember it. See §5.2.
+start and produces a `UserRequest` proposal. The cue must begin the message
+(leading whitespace aside): a cue inside pasted text, or a question such as "do
+you remember that function?", is not a request and creates nothing. It is not a
+tool call, because the user's message is the trusted origin and asking the model
+to re-state it would add a round trip and a chance to misremember it. See §5.2.
 
 ## 6. Acceptance Criteria
 
@@ -584,10 +589,15 @@ proposal event carry exactly the sentence `confirm` will persist. The suggestion
 tool screens an evidence path before it opens the file to hash it, so a protected
 or ignored file is never read.
 
-**Parser edge cases.** `explicit_memory_request` searches an ASCII-only
-lowercase copy, so its byte offsets stay valid for multi-byte prompts (`İ`,
-`ẞ`); a `.`/`!`/`?` ends the sentence only when followed by whitespace or the
-line end, so URLs and versions survive; trailing punctuation is trimmed.
+**Parser edge cases.** `explicit_memory_request` matches a cue only at the start
+of the message, so there is no search offset and no slicing hazard: the only
+slice is at the start of the message, a multi-byte first character cannot split
+it, and the ASCII-only lowercase copy is only ever compared, never used as an
+index. A `.`/`!`/`?` ends the statement
+only when followed by whitespace or the line end, so URLs and versions survive;
+trailing punctuation is trimmed. The start anchor is what separates an actual
+request from pasted text and from questions such as "do you remember that
+function?", which previously created a proposal for a sentence about a function.
 
 **Where a pending proposal lives.** Proposed and decided events are appended to
 the session log through `pub(crate)` `SessionStore` methods; `append_session_event`
@@ -653,22 +663,64 @@ real repository files need real use. Every other acceptance criterion has a test
 or scenario named in `tasks.md`.
 
 **Two limits that remain, recorded rather than hidden.** Evidence attribution is
-declared by the model: `propose_memory` takes an optional `evidence_path`, and a
-model that omits it can propose a benign sentence that was in fact derived from
-an ignored or protected file. The gate checks every path it is given and refuses
-an instruction-shaped non-user statement, but it cannot prove derivation from an
-undeclared source; the confirmation card is the remaining control, and #30's
-evals should inspect the turn's reads. Second, an evidence path is checked as a
-string, so a symlink with an eligible name can point at a protected or ignored
-file; only the path and a content hash are stored and the statement is scanned,
-but a future hardening should resolve the final path before the eligibility
-check. Both are inherited from #28's path-based evidence rule, not introduced
-here, and neither is a weakening of a boundary this spec established.
+declared by the model: `propose_memory` takes an optional `evidence_path` and an
+optional `source`, and a model that omits both gets a `ModelSuggestion` card
+that names no file. A repository author can therefore still put a *benign*
+sentence in front of the user — a `CONTRIBUTING.md` line the model repeats as
+its own suggestion — and the card is the control: the gate refuses every
+instruction-shaped non-user candidate, the source line never calls a model
+suggestion the user's words, and nothing is stored without confirmation. What
+the design does not do is prove derivation from an undeclared source, or prove
+that no file was involved. This is this spec's own limitation, not #28's: the
+`propose_memory` tool and its labels were built here. The follow-up belongs in
+`chat.rs` (spec 51 owns that file until it merges): derive the origin and source
+from what the turn actually read, instead of from a label the model chooses.
+Second, an evidence path is checked as a string, so a symlink with an eligible
+name can point at a protected or ignored file; only the path and a content hash
+are stored and the statement is scanned, but a future hardening should resolve
+the final path before the eligibility check. The path-based rule is shared with
+#28's store check; the model-declared label is not.
+
+**Deferred, not fixed here (`6a`).** A refused explicit "remember that" is
+silent: `chat.rs` audits `memory_proposal_failed` but shows the user nothing, so
+a request that hits a refusal looks like it was ignored. The turn path is
+`chat.rs`, which spec 51 owns until it merges, so the fix waits rather than
+editing a file another spec is changing.
 
 **Checks.** Scoped local checks passed: `scripts/quality-gate.sh fmt node lint
 typos deny`, scoped clippy for `workspace-engine`, `desktop-shell` and
 `eval-harness` with `-D warnings`, `cargo nextest` for the memory suite and the
 new shell/eval tests, and the whole deterministic eval tier. The workspace
 clippy and test suite were left to CI; the full seven-check gate passed in CI on
-2026-10-26 for the `main` push at `4abbf1f`.
+2026-10-26 for the `main` push.
+
+### Review fixes (2026-10-28)
+
+- **`6d` — the explicit-request parser was too broad.** A cue anywhere in the
+  message made pasted text a "you asked for this" card, and "do you remember
+  that function?" persisted a sentence about a function. The cue now has to
+  begin the message (§5.11, §7). Tests cover pasted text, a question, a
+  mid-message cue and leading whitespace.
+- **`6e` — a decision could be recorded twice.** Confirmation and dismissal each
+  checked "is it decided?", did their work, then appended the decision, with no
+  lock between; two route threads could both see "undecided" and record both
+  outcomes, and a Remember racing a Dismiss could leave an entry that was also
+  dismissed. Decisions now take a process-wide per-session lock, so the first
+  recorded decision wins and the loser is refused as already decided. The card
+  disables both buttons and the scope picker while a decision is in flight. A
+  threaded test races the two calls eight times and asserts one decision and an
+  entry exactly when the confirmation won. The lock does not cover a second
+  process on one data directory; that is recorded where it is implemented.
+- **`6b` — documentation overclaimed.** `USER_GUIDE.md` now says a fork shares
+  its upstream's memory and that a rewritten history changes the key, presents
+  the instruction check as a conservative pattern match rather than a guarantee,
+  and states plainly that a repository author can still get a benign sentence
+  suggested under the model's own label. The earlier note that called this
+  limit inherited from #28 was wrong and is corrected above: the model-declared
+  label belongs to this spec's tool.
+- **`6h` — commit SHAs removed** from both specs, their `tasks.md` and
+  `docs/specs/README.md`, per the project rule; the date and "the `main` push"
+  identify the CI run.
+- **`6a` deferred** — a refused explicit request is silent in `chat.rs`, which
+  spec 51 owns until it merges.
 
