@@ -5,10 +5,12 @@
 //! validation, not another Git read. The delivery half is the prepared record
 //! and the three mutations this spec owns: creating a branch, switching to one,
 //! and deleting one. Creation runs `git branch` and never switches; switching
-//! runs `git switch --no-guess`, so the index and working tree move with `HEAD`
-//! (spec 36 `context.md` §3.17, decision D6). Deletion runs `git branch -d`
-//! unless the commits that would be lost were separately confirmed, in which
-//! case `-D` is the one exception (proposal §5.6).
+//! runs `git switch --no-guess --no-overwrite-ignore`, so the index and working
+//! tree move with `HEAD` and an ignored local file is never silently replaced
+//! by a tracked file on the target branch (spec 36 `context.md` §3.17, decision
+//! D6). Deletion runs `git branch -d` unless the commits that would be lost were
+//! separately confirmed, in which case `-D` is the one exception (proposal
+//! §5.6).
 //!
 //! Every mutation is a Code-mode capability (`allow_git_branches`), is
 //! approved as one exact [`GitMutation`] value, and is consumed once. The
@@ -109,6 +111,15 @@ pub fn slugify_branch_title(text: &str) -> String {
 pub fn validate_branch_prefix(prefix: &str) -> Result<()> {
     if prefix.is_empty() {
         return Ok(());
+    }
+    // `refs/` is the full-ref namespace, not a naming convention. Accepting it
+    // would compose `refs/heads/refs/heads/<slug>` as a branch name.
+    if prefix == "refs" || prefix.starts_with("refs/") {
+        return Err(ClientError::InvalidInput(
+            "A branch prefix cannot start with `refs/`; that prefix is reserved for full ref \
+             names."
+                .to_string(),
+        ));
     }
     let invalid = prefix.chars().count() > BRANCH_PREFIX_MAX_CHARS
         || prefix.starts_with('-')
@@ -280,6 +291,12 @@ pub struct BranchPreparation {
     /// For a deletion: the subjects of those commits, so the dialog can name
     /// what the separate confirmation would lose.
     pub unmerged_subjects: Vec<String>,
+    /// For a deletion: why the separate confirmation is required when the
+    /// count alone would read as "fully merged". Git's own `-d` check uses the
+    /// branch's upstream, or `HEAD` when there is none; this is set when that
+    /// check refuses even though every commit is on the default branch or a
+    /// remote. `None` for the ordinary default-branch count.
+    pub unmerged_reason: Option<String>,
 }
 
 /// The durable record behind a preparation (decision D3). Recovery reads it to
@@ -308,7 +325,9 @@ pub struct BranchRecord {
     /// exist; after a successful creation it holds the created commit.
     pub expected_ref_oid: Option<String>,
     pub info: BranchInfo,
-    /// `prepared`, `applied` or `failed`. Only `prepared` can be applied.
+    /// `prepared`, `applying`, `applied` or `failed`. Only `prepared` can be
+    /// applied; `applying` is written before Git runs, so a concurrent or
+    /// repeated request cannot start a second mutation.
     pub state: String,
     /// The ref a successful creation created (`refs/heads/<name>`).
     pub created_ref: Option<String>,
@@ -316,6 +335,10 @@ pub struct BranchRecord {
     /// bodies are never read or audited.
     #[serde(default)]
     pub unmerged_subjects: Vec<String>,
+    /// For a deletion: why Git's own `-d` check requires the separate
+    /// confirmation even though the default-branch count is zero.
+    #[serde(default)]
+    pub unmerged_reason: Option<String>,
     pub applied_at_ms: Option<u128>,
     /// Every git command actually run, exactly as it ran.
     pub git_commands: Vec<String>,
@@ -413,6 +436,16 @@ pub struct RebasePreparation {
     /// Why the plan could not be computed: an unresolvable onto ref or
     /// unrelated histories.
     pub problem: Option<String>,
+}
+
+/// Git's own plain-delete check for a branch, when it disagrees with the
+/// default-branch/remote count. `reason` names the reference Git checks and is
+/// shown in the dialog, so the second confirmation can explain itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlainDeleteReport {
+    count: u32,
+    subjects: Vec<String>,
+    reason: String,
 }
 
 /// Why a branch mutation did not happen, as a value the shell can branch on.
@@ -556,13 +589,15 @@ impl BranchEngine {
             refusal,
             Vec::new(),
             Vec::new(),
+            None,
         )
     }
 
     /// Prepare switching to the existing branch `name`. The switch runs
-    /// `git switch --no-guess`, which moves the index and working tree with
-    /// `HEAD`; a dirty tree that would lose work is refused with the paths
-    /// named (decision D15).
+    /// `git switch --no-guess --no-overwrite-ignore`, which moves the index and
+    /// working tree with `HEAD` without replacing an ignored local file that
+    /// the target branch tracks; a dirty tree that would lose work is refused
+    /// with the paths named (decision D15).
     pub fn prepare_switch(
         &self,
         root: impl AsRef<Path>,
@@ -652,14 +687,17 @@ impl BranchEngine {
             refusal,
             dirty_paths,
             Vec::new(),
+            None,
         )
     }
 
     /// Prepare deleting the existing local branch `name`.
     ///
-    /// A branch whose commits are all on the default branch and the remotes is
-    /// fully merged and deletes with `git branch -d`. A branch with unmerged
-    /// commits is prepared with the count and subjects that would be lost;
+    /// A branch whose commits are all on the default branch and the remotes,
+    /// and which Git's own `-d` check accepts, is fully merged and deletes with
+    /// `git branch -d`. A branch with unmerged commits — or one Git would not
+    /// delete with `-d` because its upstream or `HEAD` does not contain it — is
+    /// prepared with the count and subjects that would be lost;
     /// [`BranchEngine::apply`] then refuses a plain approval and runs
     /// `git branch -D` only after the separate `confirm_unmerged` confirmation
     /// (proposal §5.6).
@@ -691,6 +729,7 @@ impl BranchEngine {
         let mut resolved = None;
         let mut unmerged_commits = None;
         let mut unmerged_subjects = Vec::new();
+        let mut unmerged_reason = None;
         if refusal.is_none() {
             if let Some(operation) = &info.in_progress_operation {
                 refusal = Some(format!(
@@ -731,6 +770,23 @@ impl BranchEngine {
                             Ok((count, subjects)) => {
                                 unmerged_commits = count;
                                 unmerged_subjects = subjects;
+                                // A count of zero only answers the default
+                                // branch/remote question. Git's `-d` also
+                                // asks whether the branch is merged into its
+                                // upstream, or into `HEAD` when it has none; a
+                                // disagreement must take the confirmation path
+                                // rather than fail at the `-d` itself.
+                                if count == Some(0) {
+                                    match self.plain_delete_report(root, name) {
+                                        Ok(Some(plain)) => {
+                                            unmerged_commits = Some(plain.count);
+                                            unmerged_subjects = plain.subjects;
+                                            unmerged_reason = Some(plain.reason);
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => refusal = Some(error.to_string()),
+                                    }
+                                }
                             }
                             Err(error) => refusal = Some(error.to_string()),
                         }
@@ -757,6 +813,7 @@ impl BranchEngine {
             refusal,
             Vec::new(),
             unmerged_subjects,
+            unmerged_reason,
         )
     }
 
@@ -943,9 +1000,11 @@ impl BranchEngine {
         }
         // Deletion has two extra decisions: a branch that is checked out
         // somewhere cannot be deleted, and commits that are not on the default
-        // branch or a remote require the separate confirmation. Both are
-        // re-checked here because the checkout or the branch can change after
-        // the review. `git branch -D` is reachable only through `force_delete`.
+        // branch or a remote — or that Git's own `-d` check would not accept —
+        // require the separate confirmation. Both are re-checked here because
+        // the checkout, the branch or its upstream can change after the review.
+        // `git branch -D` is reachable only through `force_delete`, which only a
+        // record prepared as unmerged sets.
         let mut force_delete = false;
         if let GitMutation::DeleteBranch {
             name,
@@ -975,17 +1034,48 @@ impl BranchEngine {
                     ),
                 ));
             }
+            // A record prepared as fully merged can still disagree with Git if
+            // the branch's upstream moved, or if `HEAD` changed in a way the
+            // expected-state check did not catch (for example a new upstream was
+            // configured). Refuse and ask for a fresh preparation rather than
+            // letting `git branch -d` fail the record or running `-D` against
+            // an approval that reviewed the merged card.
+            if *unmerged_commits == Some(0)
+                && let Some(plain) = self
+                    .plain_delete_report(&root, name)
+                    .map_err(BranchError::from)?
+            {
+                let listed = unmerged_subjects_text(&plain.subjects);
+                return Err(self.refuse_apply(
+                    &record,
+                    "branch_unmerged_confirmation_required",
+                    format!(
+                        "Deleting `{name}` now needs the separate confirmation because {}. The \
+                         {} commit{} {} not reachable from that reference: {listed}. Nothing ran; \
+                         prepare the deletion again to review the second confirmation.",
+                        plain.reason,
+                        plain.count,
+                        if plain.count == 1 { "" } else { "s" },
+                        if plain.count == 1 { "is" } else { "are" },
+                    ),
+                ));
+            }
             if *unmerged_commits != Some(0) && !confirm_unmerged {
                 let listed = unmerged_subjects_text(&record.unmerged_subjects);
-                let message = match unmerged_commits {
-                    Some(count) => format!(
+                let message = match (&record.unmerged_reason, unmerged_commits) {
+                    (Some(reason), _) => format!(
+                        "Deleting `{name}` needs the separate confirmation because {reason}. The \
+                         commits involved are: {listed}. A plain approval is not enough: confirm \
+                         explicitly that those commits may be lost."
+                    ),
+                    (None, Some(count)) => format!(
                         "Deleting `{name}` would lose {count} commit{} that {} not on the default \
                          branch or any remote: {listed}. A plain approval is not enough: confirm \
                          explicitly that those commits may be lost.",
                         if *count == 1 { "" } else { "s" },
                         if *count == 1 { "is" } else { "are" },
                     ),
-                    None => format!(
+                    (None, None) => format!(
                         "Damaian could not determine the default branch, so it cannot count what \
                          deleting `{name}` would lose. The commit subjects are: {listed}. A plain \
                          approval is not enough: confirm explicitly that those commits may be lost."
@@ -1044,7 +1134,22 @@ impl BranchEngine {
             .start_action(&task, record.mutation.action(), &record.prepare_id, true)
             .map_err(BranchError::from)?;
         record.task_id = Some(task.id.clone());
-        let _ = self.save_record(&record);
+        // Consume the preparation before Git runs. The shell serves requests
+        // one at a time, but the record itself must say `applying` so a second
+        // request — or a restart after a crash — cannot start the mutation
+        // twice; it never depends on the caller being single-threaded.
+        record.state = "applying".to_string();
+        if let Err(error) = self.save_record(&record) {
+            let _ = self.session_store.finish_action(marker, "failed");
+            let _ = self.session_store.update_task_status(
+                &task,
+                TaskStatus::Failed,
+                Some(&error.to_string()),
+            );
+            return Err(BranchError::Engine(format!(
+                "The branch preparation could not be marked as applying: {error}. Nothing ran."
+            )));
+        }
         let args = mutation_args(&record.mutation, force_delete);
         let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
         record
@@ -1246,6 +1351,7 @@ impl BranchEngine {
         refusal: Option<String>,
         dirty_paths: Vec<String>,
         unmerged_subjects: Vec<String>,
+        unmerged_reason: Option<String>,
     ) -> Result<BranchPreparation> {
         let prepare_id = create_id("branch");
         let can_apply = refusal.is_none();
@@ -1283,6 +1389,7 @@ impl BranchEngine {
                 state: "prepared".to_string(),
                 created_ref: None,
                 unmerged_subjects: unmerged_subjects.clone(),
+                unmerged_reason: unmerged_reason.clone(),
                 applied_at_ms: None,
                 git_commands: Vec::new(),
             };
@@ -1302,6 +1409,7 @@ impl BranchEngine {
             dirty_paths,
             unmerged_commits,
             unmerged_subjects,
+            unmerged_reason,
         })
     }
 
@@ -1325,6 +1433,7 @@ impl BranchEngine {
             Some(reason.to_string()),
             Vec::new(),
             Vec::new(),
+            None,
         )
     }
 
@@ -1454,7 +1563,7 @@ impl BranchEngine {
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .map(str::to_string)
+            .map(|line| self.scanner.redact(line).text)
             .collect())
     }
 
@@ -1589,11 +1698,70 @@ impl BranchEngine {
                 if subject.is_empty() {
                     "(no subject)".to_string()
                 } else {
-                    subject.to_string()
+                    // Subjects reach the dialog and the preparation report, so
+                    // they leave through the same scanner as every other text
+                    // that can carry a credential (spec 36 decision D10).
+                    self.scanner.redact(subject).text
                 }
             })
             .collect();
         Ok((count, subjects))
+    }
+
+    /// What Git's own `git branch -d` check would say, which is not the same
+    /// question as [`Self::unmerged_report`]: `-d` asks whether the branch is
+    /// merged into its upstream, or into `HEAD` when it has none. When the two
+    /// disagree, the branch needs the separate confirmation; otherwise `-d`
+    /// refuses and the record would fail with no way to confirm `-D`.
+    ///
+    /// `None` means Git would accept `-d`.
+    fn plain_delete_report(&self, root: &Path, name: &str) -> Result<Option<PlainDeleteReport>> {
+        let reference = format!("refs/heads/{name}");
+        let output = run_user_git(root, &["for-each-ref", "--format=%(upstream)", &reference])?;
+        let upstream = String::from_utf8_lossy(&output).trim().to_string();
+        // A configured upstream that no longer resolves is treated like no
+        // upstream, which is what Git does for the `-d` check.
+        let target = if !upstream.is_empty() && self.ref_oid(root, &upstream)?.is_some() {
+            upstream
+        } else {
+            "HEAD".to_string()
+        };
+        let output = run_user_git(root, &["rev-list", "--count", &reference, "--not", &target])?;
+        let raw = String::from_utf8_lossy(&output).trim().to_string();
+        let count = raw.parse::<u32>().map_err(|_| {
+            ClientError::Git(format!(
+                "git rev-list returned an unreadable commit count: {raw}"
+            ))
+        })?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let output = run_user_git(root, &["log", "--format=%s", &reference, "--not", &target])?;
+        let subjects = String::from_utf8_lossy(&output)
+            .lines()
+            .map(|line| {
+                let subject = line.trim();
+                if subject.is_empty() {
+                    "(no subject)".to_string()
+                } else {
+                    self.scanner.redact(subject).text
+                }
+            })
+            .collect();
+        let display = if target == "HEAD" {
+            "the checked-out branch".to_string()
+        } else {
+            target
+                .strip_prefix("refs/remotes/")
+                .or_else(|| target.strip_prefix("refs/heads/"))
+                .unwrap_or(&target)
+                .to_string()
+        };
+        Ok(Some(PlainDeleteReport {
+            count,
+            subjects,
+            reason: format!("Git does not consider it fully merged into {display}"),
+        }))
     }
 
     /// Decision D11: `refs/remotes/origin/HEAD`'s symbolic target, then local
@@ -1852,18 +2020,23 @@ impl BranchEngine {
 }
 
 /// The exact argv for a mutation. Creation uses `git branch`, which refuses an
-/// existing ref; switching uses `git switch --no-guess` so the index and
-/// working tree move with `HEAD` (decision D6); deletion uses `git branch -d`
-/// unless `force_delete` is set, which only the separately confirmed unmerged
-/// path in `apply` does. No branch here constructs `-f` or `--force`.
+/// existing ref; switching uses `git switch --no-guess --no-overwrite-ignore` so
+/// the index and working tree move with `HEAD` and an ignored local file is
+/// never silently replaced by a tracked file on the target branch (decision D6);
+/// deletion uses `git branch -d` unless `force_delete` is set, which only the
+/// separately confirmed unmerged path in `apply` does. No branch here constructs
+/// `-f` or `--force`.
 fn mutation_args(mutation: &GitMutation, force_delete: bool) -> Vec<String> {
     match mutation {
         GitMutation::CreateBranch { name, start_point } => {
             vec!["branch".to_string(), name.clone(), start_point.clone()]
         }
-        GitMutation::SwitchBranch { name } => {
-            vec!["switch".to_string(), "--no-guess".to_string(), name.clone()]
-        }
+        GitMutation::SwitchBranch { name } => vec![
+            "switch".to_string(),
+            "--no-guess".to_string(),
+            "--no-overwrite-ignore".to_string(),
+            name.clone(),
+        ],
         GitMutation::DeleteBranch { name, .. } => vec![
             "branch".to_string(),
             if force_delete { "-D" } else { "-d" }.to_string(),

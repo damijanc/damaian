@@ -409,6 +409,22 @@ fn an_empty_prefix_is_allowed_and_a_previous_branch_expression_is_refused() {
     }
     assert!(validate_branch_prefix("damaian/").is_ok());
     assert!(validate_branch_prefix("team/sub/").is_ok());
+    let refs_error = validate_branch_prefix("refs/heads/").unwrap_err();
+    assert!(
+        matches!(refs_error, ClientError::InvalidInput(ref message) if message.contains("refs/")),
+        "{refs_error:?}"
+    );
+    assert!(
+        suggest_branch_name(
+            &fixture.git,
+            &scanner,
+            &fixture.repo,
+            "refs/heads/",
+            "Fix the parser"
+        )
+        .is_err(),
+        "a reserved refs/ prefix must not compose a branch name"
+    );
 }
 
 #[test]
@@ -1124,6 +1140,68 @@ fn a_dirty_switch_names_the_paths_it_would_overwrite() {
 }
 
 #[test]
+fn switching_never_overwrites_an_ignored_local_file() {
+    let fixture = EngineFixture::new("ignored-switch");
+    // The target branch tracks a file that the current branch ignores. A
+    // working-tree copy is therefore invisible to `git status` and to the
+    // dirty-path check, but Git would replace it on a plain switch.
+    fixture.write(".gitignore", "private.settings\n");
+    fixture.write("private.settings", "committed defaults\n");
+    fixture.run(&["add", ".gitignore"]);
+    fixture.run(&["add", "-f", "private.settings"]);
+    fixture.run(&["commit", "-q", "-m", "track an ignored settings file"]);
+    fixture.run(&["branch", "damaian/tracks-ignored"]);
+    fixture.run(&["rm", "-q", "--cached", "private.settings"]);
+    fixture.run(&["commit", "-q", "-m", "stop tracking the settings file"]);
+    fixture.write("private.settings", "user local secret\n");
+    assert_eq!(
+        fixture.status(),
+        "",
+        "the ignored file must not appear as a working-tree change"
+    );
+
+    let preparation = fixture.prepare_switch("damaian/tracks-ignored");
+    assert_eq!(preparation.dirty_paths, Vec::<String>::new());
+    let refused = fixture
+        .engine
+        .branch
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
+        .unwrap_err();
+    assert!(
+        refused.message().contains("would be overwritten"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fixture.read("private.settings"),
+        "user local secret\n",
+        "an ignored local file must never be silently replaced"
+    );
+    assert_eq!(fixture.current_branch(), "main");
+
+    let record = fixture
+        .engine
+        .branch
+        .load_record(&preparation.prepare_id)
+        .unwrap();
+    assert_eq!(record.state, "failed", "the switch did not run");
+    assert!(
+        record
+            .git_commands
+            .iter()
+            .any(|command| has_token(command, "--no-overwrite-ignore")),
+        "{:?}",
+        record.git_commands
+    );
+    no_force_flag(&record.git_commands);
+    fixture.cleanup();
+}
+
+#[test]
 fn an_approval_cannot_be_retargeted_and_is_consumed_once() {
     let fixture = EngineFixture::new("consumed");
     let preparation = fixture.prepare_create("damaian/once", None);
@@ -1182,6 +1260,49 @@ fn an_approval_cannot_be_retargeted_and_is_consumed_once() {
             .lines()
             .count(),
         1
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_record_that_is_applying_cannot_be_applied_again() {
+    // `apply` writes `applying` before Git runs; a second request therefore
+    // observes a state that is not `prepared` even while the first is still
+    // running. Injecting the state proves the guard without a Git command that
+    // can be paused.
+    let fixture = EngineFixture::new("applying");
+    let preparation = fixture.prepare_create("damaian/applying", None);
+    let path = fixture
+        .data_dir
+        .join("branches")
+        .join(format!("{}.json", preparation.prepare_id));
+    let mut record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    record["state"] = serde_json::json!("applying");
+    fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+    let refused = fixture
+        .engine
+        .branch
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code(), "branch_not_prepared");
+    assert!(
+        refused.message().contains("no longer current"),
+        "{refused:?}"
+    );
+    assert!(
+        fixture
+            .try_run(&["show-ref", "--verify", "refs/heads/damaian/applying"])
+            .status
+            .code()
+            != Some(0),
+        "an applying record must not run git"
     );
     fixture.cleanup();
 }
@@ -1549,6 +1670,114 @@ fn an_unmerged_branch_needs_a_distinct_confirmation() {
         )
         .unwrap_err();
     assert_eq!(consumed.code(), "branch_not_prepared");
+    fixture.cleanup();
+}
+
+#[test]
+fn a_branch_merged_into_main_but_not_into_head_needs_the_confirmation() {
+    let fixture = EngineFixture::new("delete-not-merged-into-head");
+    fixture.run(&["switch", "-q", "-c", "other"]);
+    fixture.run(&["switch", "-q", "main"]);
+    fixture.run(&["switch", "-q", "-c", "topic"]);
+    fixture.commit("topic.txt", "topic\n", "topic work");
+    fixture.run(&["switch", "-q", "main"]);
+    fixture.run(&["merge", "-q", "--no-ff", "-m", "merge topic", "topic"]);
+    fixture.run(&["switch", "-q", "other"]);
+
+    // Damaian's default-branch count calls this merged: the only commit is on
+    // main. Git's `branch -d`, however, checks the checked-out branch because
+    // there is no upstream, and `other` does not contain it.
+    assert_eq!(
+        fixture
+            .run(&[
+                "rev-list",
+                "--count",
+                "refs/heads/topic",
+                "--not",
+                "--remotes",
+                "refs/heads/main",
+            ])
+            .trim(),
+        "0"
+    );
+    let git_refusal = fixture.run_failing(&["branch", "-d", "topic"]);
+    assert!(git_refusal.contains("not fully merged"), "{git_refusal}");
+    let topic_sha = fixture.branch_sha("topic");
+
+    let preparation = fixture.prepare_delete("topic");
+    assert!(preparation.can_apply, "{:?}", preparation.refusal);
+    assert_eq!(preparation.unmerged_commits, Some(1));
+    assert_eq!(
+        preparation.unmerged_subjects,
+        vec!["topic work".to_string()]
+    );
+    let reason = preparation.unmerged_reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("checked-out branch"),
+        "the dialog must name what Git checks: {reason}"
+    );
+
+    let refused = fixture
+        .engine
+        .branch
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code(), "branch_unmerged_confirmation_required");
+    let message = refused.message();
+    assert!(message.contains("checked-out branch"), "{message}");
+    assert!(message.contains("topic work"), "{message}");
+    assert_eq!(
+        fixture.branch_sha("topic"),
+        topic_sha,
+        "a refused approval must not delete the branch"
+    );
+    let record = fixture
+        .engine
+        .branch
+        .load_record(&preparation.prepare_id)
+        .unwrap();
+    assert_eq!(record.state, "prepared");
+    assert!(record.git_commands.is_empty());
+
+    let outcome = fixture
+        .engine
+        .branch
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            true,
+        )
+        .expect("the separate confirmation deletes the branch");
+    no_force_flag(&outcome.git_commands);
+    assert!(
+        outcome
+            .git_commands
+            .iter()
+            .any(|command| has_arguments(command, &["branch", "-D", "topic"])),
+        "{:?}",
+        outcome.git_commands
+    );
+    assert_ne!(
+        fixture
+            .try_run(&["show-ref", "--verify", "refs/heads/topic"])
+            .status
+            .code(),
+        Some(0)
+    );
+
+    let audit = fixture.audit_events();
+    let deleted = audit
+        .iter()
+        .find(|event| event["eventType"] == "git_branch_deleted")
+        .expect("a deletion audit event");
+    assert_eq!(deleted["unmergedCommits"], "1");
+    assert_eq!(deleted["confirmedUnmerged"], "true");
     fixture.cleanup();
 }
 
@@ -2166,6 +2395,70 @@ fn a_rebase_plan_lists_the_replayed_commits_and_says_prediction_is_unavailable()
     assert!(
         !audit_text.contains("topic one") && !audit_text.contains("topic two"),
         "the audit must not repeat commit subjects"
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn commit_subjects_are_redacted_before_the_dialog_sees_them() {
+    let fixture = EngineFixture::new("subject-redaction");
+    fixture.run(&["switch", "-q", "-c", "leaky"]);
+    fixture.commit(
+        "leaky.txt",
+        "leaky\n",
+        "rotate AKIAIOSFODNN7EXAMPLE before release",
+    );
+    fixture.run(&["switch", "-q", "main"]);
+
+    let plan = fixture.prepare_merge("leaky");
+    assert_eq!(plan.incoming_commits.len(), 1, "{plan:?}");
+    assert!(
+        !plan.incoming_commits[0].contains("AKIAIOSFODNN7EXAMPLE"),
+        "{:?}",
+        plan.incoming_commits
+    );
+    assert!(
+        plan.incoming_commits[0].contains("[REDACTED_AWS_ACCESS_KEY_"),
+        "{:?}",
+        plan.incoming_commits
+    );
+
+    let preparation = fixture.prepare_delete("leaky");
+    assert_eq!(preparation.unmerged_commits, Some(1));
+    assert!(
+        !preparation
+            .unmerged_subjects
+            .iter()
+            .any(|subject| subject.contains("AKIAIOSFODNN7EXAMPLE")),
+        "{:?}",
+        preparation.unmerged_subjects
+    );
+    assert!(
+        preparation
+            .unmerged_subjects
+            .iter()
+            .any(|subject| subject.contains("[REDACTED_AWS_ACCESS_KEY_")),
+        "{:?}",
+        preparation.unmerged_subjects
+    );
+
+    fixture.run(&["switch", "-q", "leaky"]);
+    let rebase = fixture.prepare_rebase("main");
+    assert!(
+        !rebase
+            .commits_to_replay
+            .iter()
+            .any(|commit| commit.contains("AKIAIOSFODNN7EXAMPLE")),
+        "{:?}",
+        rebase.commits_to_replay
+    );
+    assert_eq!(rebase.commits_to_replay.len(), 1, "{rebase:?}");
+
+    let audit_text =
+        fs::read_to_string(fixture.data_dir.join("audit").join("events.jsonl")).unwrap();
+    assert!(
+        !audit_text.contains("AKIAIOSFODNN7EXAMPLE"),
+        "the audit must never carry the unredacted subject"
     );
     fixture.cleanup();
 }
