@@ -69,6 +69,13 @@ permission_profiles` passed (104), and `--lib` passed (582, 5 skipped);
 `cargo check -p desktop-shell --all-targets` compiled (no shell code changed).
 The workspace clippy and test suites and the seven-check gate are left to CI.
 
+**Merge note (planner, 2026-10-28).** Two of the fixed 4e items edit `chat.rs` —
+charging the summary to the window, and recording a failed manual compaction —
+while spec 51 owned that file when this branch was cut. The hunks are confined to
+`compact_conversation` and the request slice, but this branch must be rebased
+onto the #51 merge and those hunks re-checked rather than merged blindly. 4b is
+deferred for the same reason and lands after that merge.
+
 ## Global Constraints
 
 Every task's requirements implicitly include this section.
