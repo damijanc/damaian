@@ -1298,6 +1298,44 @@ impl ContextManager {
             .unwrap_or_else(|_| path.to_string())
     }
 
+    /// Normalise stored restriction entries exactly as assembly does: a path
+    /// that resolves to a directory gains a trailing `/`, so the same entry
+    /// selects the same files in tool dispatch and in the context panel.
+    pub fn normalise_restriction(&self, repository_root: &Path, paths: &[String]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| {
+                let normalised = self.normalise_candidate(repository_root, path, false);
+                if normalised.is_empty() {
+                    String::new()
+                } else if repository_root.join(&normalised).is_dir() {
+                    format!("{}/", normalised.trim_end_matches('/'))
+                } else {
+                    normalised
+                }
+            })
+            .collect()
+    }
+
+    /// Whether a repository-relative path is admitted by the session's path
+    /// restriction (spec 27 §5.4).
+    ///
+    /// `None` is the repository root. The comparison is the same one assembly
+    /// uses, so a tool cannot accept a spelling that the panel would refuse.
+    pub fn restriction_admits_path(
+        &self,
+        repository_root: &Path,
+        paths: &[String],
+        path: Option<&str>,
+    ) -> bool {
+        let normalised = path
+            .map(|path| self.normalise_candidate(repository_root, path, false))
+            .unwrap_or_default();
+        self.normalise_restriction(repository_root, paths)
+            .iter()
+            .any(|selected| restriction_admits(&normalised, selected))
+    }
+
     pub fn build_context(&self, request: ContextRequest<'_>) -> Result<ContextPlan> {
         let ContextRequest {
             repository_root,
@@ -1322,21 +1360,8 @@ impl ContextManager {
         // keeps a trailing `/` so `add_file` can prefix-match it; without the
         // marker every entry would have to be treated as a prefix, and a typo
         // like `src/up` would admit `src/upload.rs`.
-        let restriction = restriction.map(|paths| {
-            paths
-                .iter()
-                .map(|path| {
-                    let normalised = self.normalise_candidate(repository_root, path, false);
-                    if normalised.is_empty() {
-                        String::new()
-                    } else if repository_root.join(&normalised).is_dir() {
-                        format!("{}/", normalised.trim_end_matches('/'))
-                    } else {
-                        normalised
-                    }
-                })
-                .collect::<Vec<_>>()
-        });
+        let restriction =
+            restriction.map(|paths| self.normalise_restriction(repository_root, paths));
         let restriction = restriction.as_deref();
         let summary_usage = conversation_summary.map(|summary| {
             let rendered = self.scanner.redact(&summary.render_for_model()).text;
@@ -2215,11 +2240,14 @@ fn build_manifest(
 /// match exactly. The empty entry is the repository root and admits everything.
 /// Exact equality for a directory would have made the most natural way to
 /// restrict — `src/` — select nothing, which reads as "no file content" rather
-/// than "everything under `src`".
+/// than "everything under `src`". The directory entry itself is admitted too,
+/// so `list_directory` can show the directory the user selected rather than
+/// refusing the only listing that is entirely inside the restriction.
 fn restriction_admits(path: &str, selected: &str) -> bool {
     selected.is_empty()
         || path == selected
-        || (selected.ends_with('/') && path.starts_with(selected))
+        || (selected.ends_with('/')
+            && (path == selected.trim_end_matches('/') || path.starts_with(selected)))
 }
 
 /// Record an exclusion once per `(reason, path, range)`. The same restricted

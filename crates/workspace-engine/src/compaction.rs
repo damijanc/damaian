@@ -164,13 +164,21 @@ impl ConversationSummary {
     /// kept anyway (proposal §5.7). Strictly better than the eight-message
     /// cliff, so it is taken rather than discarded.
     pub fn is_facts_only(&self) -> bool {
-        let narrative = Narrative {
+        self.narrative().is_empty()
+    }
+
+    /// The model-written half as one [`Narrative`].
+    ///
+    /// A failed summarisation call carries this forward from the previous
+    /// summary instead of dropping what an earlier model already recorded
+    /// (review fix 4b).
+    pub fn narrative(&self) -> Narrative {
+        Narrative {
             constraints: self.constraints.clone(),
             decisions: self.decisions.clone(),
             failed_approaches: self.failed_approaches.clone(),
             uncertainty: self.uncertainty.clone(),
-        };
-        narrative.is_empty()
+        }
     }
 
     /// The delimited record the model receives in place of the covered span.
@@ -508,15 +516,23 @@ pub fn conversation_tokens(view: &ConversationView) -> usize {
     let messages = view
         .messages
         .iter()
-        .filter(|message| message.kind.as_deref() != Some("plan_reminder"))
+        .filter(|message| !is_engine_notice(message.kind.as_deref()))
         .map(|message| TokenEstimate::Prose.tokens(&message.content))
         .sum::<usize>();
     summary + messages
 }
 
+/// Whether a stored message is one of the engine's own lines rather than words
+/// a person or the model wrote. These render as system lines and are skipped by
+/// the prompt and the window.
+fn is_engine_notice(kind: Option<&str>) -> bool {
+    matches!(kind, Some("plan_reminder" | "memory_refusal"))
+}
+
 /// The messages a request may send from the conversation: everything except
-/// the engine's own plan reminder, which is a nudge rather than the user's
-/// words (spec 66 `context.md` D10).
+/// the engine's own lines — the plan reminder, which is a nudge rather than the
+/// user's words (spec 66 `context.md` D10), and a memory refusal notice
+/// (spec 29 §5.5).
 ///
 /// One definition, used by the prompt and by the shell's boundary counts, so
 /// the marker cannot report a different window from the one the model got.
@@ -525,7 +541,7 @@ pub fn sendable_messages<'a>(
 ) -> Vec<&'a crate::session::ChatMessage> {
     messages
         .iter()
-        .filter(|message| message.kind.as_deref() != Some("plan_reminder"))
+        .filter(|message| !is_engine_notice(message.kind.as_deref()))
         .copied()
         .collect()
 }
@@ -573,7 +589,7 @@ pub fn window_start(
     let candidates: Vec<&(u64, crate::session::ChatMessage)> = messages
         .iter()
         .filter(|(seq, message)| {
-            *seq > previous_through && message.kind.as_deref() != Some("plan_reminder")
+            *seq > previous_through && !is_engine_notice(message.kind.as_deref())
         })
         .collect();
     if candidates.len() <= 1 {
@@ -638,9 +654,7 @@ pub fn facts_for_span(inputs: FactInputs<'_>, through_seq: u64) -> Option<Summar
         .collect();
     let objective = covered
         .iter()
-        .find(|(_, message)| {
-            message.role == "user" && message.kind.as_deref() != Some("plan_reminder")
-        })
+        .find(|(_, message)| message.role == "user" && !is_engine_notice(message.kind.as_deref()))
         .map(|(_, message)| bound_objective(&message.content))?;
     let task_ids: std::collections::HashSet<&str> = covered
         .iter()

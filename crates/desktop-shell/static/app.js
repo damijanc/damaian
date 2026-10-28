@@ -3039,8 +3039,8 @@ function renderContextPanel() {
     const restriction = document.createElement("p");
     restriction.className = "context-panel-hint";
     restriction.textContent = contextRestriction.length
-      ? `This session is restricted to ${contextRestriction.length} path(s). Only those paths' file content is assembled for a turn; the assistant can still read other files with its own tools during a turn, and the symbols row and repository map are still built from the whole repository.`
-      : "This session is restricted to no paths, so no file content is assembled for a turn. The assistant can still read files with its own tools during a turn, and the symbols row and repository map are still built from the whole repository.";
+      ? `This session is restricted to ${contextRestriction.length} path(s). Only those paths' file content is assembled for a turn, and the assistant's file tools can read or list only those paths. The symbols row and repository map are still built from the whole repository.`
+      : "This session is restricted to no paths, so no file content is assembled for a turn and the assistant's file tools cannot read or list any path. The symbols row and repository map are still built from the whole repository.";
     body.append(restriction);
   }
 
@@ -6272,7 +6272,9 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
       // The engine's one plan reminder is a user-role message in the request but
       // not something the user typed. Render it as a system line, and not as an
       // answer, a rewind anchor, or a question (spec 66 `context.md` D10).
-      if (message.kind === "plan_reminder") {
+      // A memory refusal is the same kind of engine line: it explains why a
+      // "remember that…" became no card (spec 29 §5.5).
+      if (message.kind === "plan_reminder" || message.kind === "memory_refusal") {
         const bubble = appendChatMessage("system", message.content);
         if (message.seq) bubble.message.dataset.seq = message.seq;
         return { message, bubble };

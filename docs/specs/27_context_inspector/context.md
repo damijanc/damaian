@@ -98,7 +98,7 @@ Numbered so a task can cite one. Each was checked against the code on
 | C7 | `ExclusionReason` covers the acceptance list | It does not cover `UserRemoved`, a path outside a session restriction, or a deleted pinned file. The first two are this spec's own controls; the third is required by its acceptance criteria. |
 | C8 | The pre-send/mid-turn state can live in a `PreparedContext` alone | A pause must also carry the request messages, the conversation block and the summary, because a removal has to re-render the user message before sending. `PreparedContext` is the plan half; `PendingContextReview` is the persistence half (§4). |
 | C9 | The pre-send view is one thing | It is the same manifest on two paths: a live `context` event when the pause is off, and a paused review card when it is on. Building only one would leave either the default or the requirement unmet. |
-| C10 | "Restrict the session to selected paths" | The sentence is broader than the safe reading. This spec restricts **file-bearing collection** (explicit, mention, keyword/semantic hits, project rules, pins) and leaves `Instructions` and `Required` alone. The symbols block is not filtered either: it is one path-less item built from the prompt's own identifiers, so a match can still name a symbol and location outside the selection. See §5. |
+| C10 | "Restrict the session to selected paths" | The sentence is broader than the safe reading. This spec restricts **file-bearing collection** (explicit, mention, keyword/semantic hits, project rules, pins) and leaves `Instructions` and `Required` alone. The symbols block is not filtered either: it is one path-less item built from the prompt's own identifiers, so a match can still name a symbol and location outside the selection. Review fix 5b extends the same restriction to the file tools; it does not change these collection exemptions. See §5. |
 | C11 | Every path in the view is clickable, including a restricted one | `/api/open-vscode-file` (`lib.rs:977`) opens any path by name and line. The existing `/api/context-file` route validates a path *for context*, which is the wrong gate for a restricted path the user wants to read. Use the open route. |
 | C12 | `PendingChatTurn` is a command-approval payload | It is the one persisted shape for every pause kind (`chat.rs:8125`); with this spec there are eight, including `ContextReview`, and `paused_for` (`:8055`) is the exhaustive tuple match that keeps each resume in its lane. A new field there is a compile-time decision. |
 
@@ -170,9 +170,11 @@ later turns" and the current turn's manifest stays truthful.
   filter runs after normalisation, so `./src/x` and `src/x` cannot disagree. An
   entry that normalises to a directory is stored with a trailing `/` and
   prefix-matches, so `src/` selects everything under it; before that correction
-  a directory entry selected nothing at all. The restriction filters assembly
-  only — `read_file`, `list_directory` and the search tools ignore it — and the
-  proposal §5.4 and the user guide say so.
+  a directory entry selected nothing at all. The restriction also reaches tool
+  dispatch: `read_file` and `list_directory` refuse a path outside it, a literal
+  search path outside it is refused, and wildcard or whole-repository searches
+  return only matches inside the selection (review fix 5b). The proposal §5.4
+  and the user guide say so.
 - **Removal is only available on a paused review.** `remove_context_item` loads
   the pending turn, refuses anything that is not `PausedFor::ContextReview`, and
   then refuses a `Required` item. It removes the item, appends a `UserRemoved`

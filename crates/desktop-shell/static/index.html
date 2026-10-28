@@ -211,10 +211,10 @@
             </p>
             <label class="context-restriction-label" for="context-restriction-paths">
               Restrict this session to these paths (one per line). Only those paths' file
-              content is assembled for a turn; the tools a turn may use are not limited. A
-              directory with a trailing slash selects everything under it. An empty list
-              admits no file content; use <strong>Clear paths</strong> to remove the
-              restriction.
+              content is assembled for a turn, and the assistant's file tools can read or list
+              only those paths. A directory with a trailing slash selects everything under it.
+              An empty list admits no file content and refuses every file read; use
+              <strong>Clear paths</strong> to remove the restriction.
             </label>
             <textarea
               id="context-restriction-paths"
@@ -541,10 +541,11 @@
               <span>Pause before sending to review context</span>
             </label>
             <p class="settings-page-hint pause-for-context-review-hint">
-              Holds each chat turn after its context is assembled so you can pin, remove or
-              restrict it before anything is sent. Verification repair turns and one-shot edit
-              requests are sent without pausing. Off by default; user-only, so a repository or
-              profile cannot set it.
+              Holds each chat turn and each verification repair turn after its context is
+              assembled so you can pin, remove or restrict it before anything is sent. One-shot
+              edit requests are sent without pausing because that route has no pending-turn
+              review to resume. Off by default; user-only, so a repository or profile cannot set
+              it.
             </p>
           </section>
           <section class="settings-section">

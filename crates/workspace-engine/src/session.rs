@@ -304,11 +304,12 @@ pub struct ChatMessage {
     pub task_id: Option<String>,
     pub role: String,
     pub content: String,
-    /// What wrote this entry, when it was not an ordinary chat turn. The only
-    /// value today is `"plan_reminder"` (spec 66 §5.5): the engine's nudge is a
-    /// user-role message in the request but must render as a system line and
-    /// must not seed the next turn as the user's own words. `None` for every
-    /// message a person or the model wrote.
+    /// What wrote this entry, when it was not an ordinary chat turn. The values
+    /// today are `"plan_reminder"` (spec 66 §5.5), the engine's nudge, and
+    /// `"memory_refusal"` (spec 29 §5.5), the plain reason an explicit
+    /// "remember that…" became no proposal. Both render as system lines and
+    /// must not seed the next turn as the user's or the assistant's words.
+    /// `None` for every message a person or the model wrote.
     pub kind: Option<String>,
     pub created_at_ms: u128,
 }

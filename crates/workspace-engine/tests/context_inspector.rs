@@ -1461,3 +1461,191 @@ fn the_inspector_lists_the_category() {
 
     fs::remove_dir_all(repo).unwrap();
 }
+
+// ---- Review fix 5b: the restriction reaches tool dispatch ----
+
+fn native_tool_provider() -> workspace_engine::ModelProviderConfig {
+    workspace_engine::ModelProviderConfig {
+        id: "openai".to_string(),
+        label: "OpenAI".to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
+        provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
+    }
+}
+
+fn tool_results_in_session(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: &str,
+    calls: &[(&str, &str)],
+) -> Vec<String> {
+    let calls = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (name, arguments))| ToolCall {
+            id: format!("call_{index}"),
+            name: name.to_string(),
+            arguments_json: arguments.to_string(),
+        })
+        .collect();
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![calls, Vec::new()],
+    );
+    let cancel = CancelToken::new();
+    let mut tokens = |_token: &str| {};
+    let mut progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut tokens,
+        on_progress: &mut progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .ask_with_session(
+            repo,
+            "Inspect the files.",
+            &[],
+            Some(session_id),
+            &mut adapter,
+            &mut sink,
+        )
+        .expect("the tool turn should run");
+    engine
+        .session_store
+        .read_messages(session_id)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.content)
+        .collect()
+}
+
+#[test]
+fn the_session_restriction_refuses_reads_lists_and_searches_outside_it() {
+    let repo = fixture_repo("restricted-tools");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let session = engine
+        .session_store
+        .create_session(&index.repository_id, "Restricted")
+        .unwrap();
+    engine
+        .session_store
+        .set_context_restriction(&session.id, &["src/other.rs".to_string()])
+        .unwrap();
+
+    let results = tool_results_in_session(
+        &engine,
+        &repo,
+        &session.id,
+        &[
+            ("read_file", r#"{"path":"src/upload.rs"}"#),
+            ("list_directory", r#"{"dir":"src"}"#),
+            ("list_directory", "{}"),
+            (
+                "search_content",
+                r#"{"pattern":"fn","path_glob":"src/upload.rs"}"#,
+            ),
+            ("search_content", r#"{"pattern":"fn"}"#),
+            ("search_codebase", r#"{"query":"upload_retry"}"#),
+            ("read_file", r#"{"path":"src/other.rs"}"#),
+        ],
+    );
+
+    assert!(
+        results[0].contains("outside this session's path restriction"),
+        "an outside read is refused: {:?}",
+        results
+    );
+    assert!(
+        results[1].contains("outside this session's path restriction"),
+        "listing a directory that would reveal outside paths is refused: {:?}",
+        results
+    );
+    assert!(
+        results[2].contains("outside this session's path restriction"),
+        "listing the root is refused while a restriction is active: {:?}",
+        results
+    );
+    assert!(
+        results[3].contains("outside this session's path restriction"),
+        "a literal search path outside the restriction is refused: {:?}",
+        results
+    );
+    assert!(
+        results[4].contains("src/other.rs") && !results[4].contains("src/upload.rs"),
+        "a content search returns only the selected path: {:?}",
+        results
+    );
+    assert!(
+        !results[5].contains("src/upload.rs"),
+        "a codebase search does not return the outside path: {:?}",
+        results
+    );
+    assert!(
+        results[6].contains("other_marker_zzq"),
+        "the selected file is still readable: {:?}",
+        results
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn an_empty_restriction_refuses_every_read_but_not_a_plain_answer() {
+    let repo = fixture_repo("restricted-none");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let session = engine
+        .session_store
+        .create_session(&index.repository_id, "No files")
+        .unwrap();
+    engine
+        .session_store
+        .set_context_restriction(&session.id, &[])
+        .unwrap();
+
+    let results = tool_results_in_session(
+        &engine,
+        &repo,
+        &session.id,
+        &[
+            ("read_file", r#"{"path":"README.md"}"#),
+            ("search_content", r#"{"pattern":"Fixture"}"#),
+            ("search_codebase", r#"{"query":"Fixture"}"#),
+        ],
+    );
+
+    assert!(
+        results[0].contains("outside this session's path restriction"),
+        "{:?}",
+        results
+    );
+    assert!(
+        results[1].contains("0 matches") && !results[1].contains("README.md"),
+        "{:?}",
+        results
+    );
+    assert!(
+        results[2].contains("No matching files found"),
+        "{:?}",
+        results
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}

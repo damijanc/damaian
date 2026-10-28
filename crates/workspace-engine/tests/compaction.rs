@@ -966,6 +966,72 @@ fn a_second_compaction_summarises_the_first_one_plus_what_followed() {
 }
 
 #[test]
+fn a_failed_second_summarisation_carries_the_first_narrative_forward() {
+    let repo = temp_repo("carry-narrative");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Carry");
+    seed_long_conversation(&engine, &session, &task, "Do not touch the public API.");
+
+    let mut first = MockModelAdapter::new(
+        r#"{"constraints":["do not touch the public API"],"decisions":["kept the parser"],"failed_approaches":["rewriting the lexer"],"uncertainty":["the retry bound is unverified"]}"#,
+    );
+    engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut first, &cancel())
+        .unwrap();
+    let first_summary = engine
+        .session_store
+        .read_conversation_compactions(&session.id)
+        .unwrap()
+        .pop()
+        .expect("the first compaction was recorded");
+
+    // More conversation after the first boundary, so a second compaction runs.
+    for index in 0..8 {
+        engine
+            .session_store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!("later {index} {}", "y".repeat(200)),
+            )
+            .unwrap();
+    }
+    let mut failing = FailingAdapter;
+    let outcome = engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut failing, &cancel())
+        .unwrap();
+    let second = outcome.summary().expect("facts still produce a summary");
+
+    assert_eq!(
+        second.constraints, first_summary.constraints,
+        "constraints survive a failed summarisation call"
+    );
+    assert_eq!(
+        second.decisions, first_summary.decisions,
+        "decisions survive a failed summarisation call"
+    );
+    assert_eq!(
+        second.failed_approaches, first_summary.failed_approaches,
+        "failed approaches survive a failed summarisation call"
+    );
+    assert_eq!(
+        second.uncertainty, first_summary.uncertainty,
+        "uncertainty survives a failed summarisation call"
+    );
+    assert!(
+        !second.is_facts_only(),
+        "the carried narrative means the summary is not facts-only"
+    );
+    assert!(
+        second.model_run_id.is_none(),
+        "no model run produced this narrative"
+    );
+}
+
+#[test]
 fn a_failed_compaction_is_recorded_for_the_user_and_not_only_in_the_audit_log() {
     let data_dir = temp_data_dir("failure-note");
     let store = SessionStore::new(&data_dir);

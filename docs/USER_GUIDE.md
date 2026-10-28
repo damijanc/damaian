@@ -371,27 +371,27 @@ panel opens. The restriction narrows; it never widens. `restricted_patterns` and
 the path policy still apply on top, so selecting a restricted path does not
 include it.
 
-The restriction filters what is **assembled and sent**, not what a turn may do.
-The assistant's own `read_file`, `list_directory` and search tools are not
-restricted by it, so a turn can still read a file outside your selection when
-the model asks for one; that behaviour is unchanged and would need a separate
-enforcement change. The `AGENTS.md` hierarchy and your own message are still
-included: repository instructions are policy rather than one of the content
-files you are choosing between, and your message is required. The **symbols**
-row and the **repository map** are not filtered either: the symbols row is a
-lookup from the identifiers in your message, and the map is a rendering of the
-repository index that lists paths across the whole repository, not file
-content. An empty list is a restriction that admits no file content, not "no
-restriction": applying an empty field is refused, and **Clear paths** removes
-the restriction.
+The restriction filters what is **assembled and sent**, and the assistant's file
+tools. `read_file` and `list_directory` refuse a path outside your selection with
+a plain tool result rather than reading it; a search with a literal path outside
+it is refused, and a wildcard or whole-repository search returns only matches
+inside it. The `AGENTS.md` hierarchy and your own message are still included:
+repository instructions are policy rather than one of the content files you are
+choosing between, and your message is required. The **symbols** row and the
+**repository map** are not filtered either: the symbols row is a lookup from the
+identifiers in your message, and the map is a rendering of the repository index
+that lists paths across the whole repository, not file content. An empty list is
+a restriction that admits no file content, not "no restriction": applying an
+empty field is refused, and **Clear paths** removes the restriction. While an
+empty restriction is active, every file read is refused.
 
 **Reviewing before sending.** By default a turn sends as soon as its context is
 assembled; the panel shows the manifest while the turn runs. Turn on **Pause
 before sending to review context** in **Settings › Conversation** to hold each
-chat turn at that point instead. Two paths are not held: a verification repair
-turn, which Damaian starts after a failed check, and a one-shot edit request.
-Both assemble and send in one step even with the setting on. The turn card then
-offers **Review context**, **Send** and **Decline**. While it is paused,
+chat turn and each verification repair turn at that point instead. A one-shot
+edit request is the one path not held: it is a plain request with no pending-turn
+review to resume, so it assembles and sends in one step even with the setting on.
+The turn card then offers **Review context**, **Send** and **Decline**. While it is paused,
 expanding a category gives each optional item a **×** to remove it from this
 turn only; the removal appears under **Excluded** as **removed by you**, and the
 token total falls. **Send** sends the amended context, and **Decline** sends
@@ -519,6 +519,12 @@ source: when recall ships, a remembered sentence will reach the model as a dated
 claim with its provenance, never as an instruction, and the context panel will
 show it so you can remove it from that turn. Today memory is stored and
 inspectable in the store, but nothing is recalled into a request yet.
+
+**A refused request is reported, not ignored.** If an explicit "remember that…"
+cannot become a memory — it contains a detected credential, asks for user scope
+while that scope is off, or its sentence exceeds 280 characters — the
+conversation states the reason and the refusal is audited without the statement.
+An over-long statement is rejected rather than truncated.
 
 **A secret is refused, not redacted.** If a candidate statement contains
 something the secret scanner recognises, Damaian refuses it and says so. It does
