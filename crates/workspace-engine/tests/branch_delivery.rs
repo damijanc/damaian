@@ -615,6 +615,13 @@ impl EngineFixture {
             .unwrap()
     }
 
+    fn prepare_delete(&self, name: &str) -> workspace_engine::BranchPreparation {
+        self.engine
+            .branch
+            .prepare_delete(&self.repo, name, &self.session_id)
+            .unwrap()
+    }
+
     fn session_events(&self) -> Vec<serde_json::Value> {
         let path = self
             .data_dir
@@ -652,6 +659,17 @@ fn no_force_flag(commands: &[String]) {
     }
 }
 
+/// Whether a recorded command line contains `args` as consecutive tokens.
+fn has_arguments(command: &str, args: &[&str]) -> bool {
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    tokens.windows(args.len()).any(|window| window == args)
+}
+
+/// Whether a recorded command line contains the token `flag`.
+fn has_token(command: &str, flag: &str) -> bool {
+    command.split_whitespace().any(|token| token == flag)
+}
+
 #[test]
 fn creating_a_branch_leaves_head_and_the_index_unchanged() {
     let fixture = EngineFixture::new("create");
@@ -674,7 +692,12 @@ fn creating_a_branch_leaves_head_and_the_index_unchanged() {
     let outcome = fixture
         .engine
         .branch
-        .apply(&preparation.prepare_id, &preparation.mutation, "tester")
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
         .expect("create should apply");
 
     assert_eq!(outcome.branch, "damaian/fix-retry");
@@ -718,7 +741,7 @@ fn create_then_switch_moves_head_and_the_working_tree() {
     let created = fixture
         .engine
         .branch
-        .apply(&create.prepare_id, &create.mutation, "tester")
+        .apply(&create.prepare_id, &create.mutation, "tester", false)
         .unwrap();
     no_force_flag(&created.git_commands);
 
@@ -731,7 +754,7 @@ fn create_then_switch_moves_head_and_the_working_tree() {
     let switched = fixture
         .engine
         .branch
-        .apply(&switch.prepare_id, &switch.mutation, "tester")
+        .apply(&switch.prepare_id, &switch.mutation, "tester", false)
         .unwrap();
 
     assert_eq!(switched.branch, "damaian/feature");
@@ -767,7 +790,12 @@ fn switching_an_existing_branch_updates_files() {
     fixture
         .engine
         .branch
-        .apply(&preparation.prepare_id, &preparation.mutation, "tester")
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
         .unwrap();
 
     assert_eq!(fixture.current_branch(), "topic");
@@ -857,7 +885,7 @@ fn mode_and_capability_refusals_name_the_reason_at_prepare_and_apply() {
     let refused = fixture
         .engine
         .branch
-        .apply(&prepared.prepare_id, &prepared.mutation, "tester")
+        .apply(&prepared.prepare_id, &prepared.mutation, "tester", false)
         .unwrap_err();
     assert!(
         matches!(refused, BranchError::Refused { .. }),
@@ -883,7 +911,7 @@ fn mode_and_capability_refusals_name_the_reason_at_prepare_and_apply() {
     let denied_at_apply = fixture
         .engine
         .branch
-        .apply(&prepared.prepare_id, &prepared.mutation, "tester")
+        .apply(&prepared.prepare_id, &prepared.mutation, "tester", false)
         .unwrap_err();
     assert_eq!(denied_at_apply.code(), "branch_not_allowed");
 
@@ -893,7 +921,7 @@ fn mode_and_capability_refusals_name_the_reason_at_prepare_and_apply() {
     fixture
         .engine
         .branch
-        .apply(&prepared.prepare_id, &prepared.mutation, "tester")
+        .apply(&prepared.prepare_id, &prepared.mutation, "tester", false)
         .expect("the record was still prepared");
     assert_eq!(fixture.branch_sha("damaian/policy"), fixture.head());
     fixture.cleanup();
@@ -940,7 +968,7 @@ fn a_mid_merge_or_detached_head_refuses_creation_with_a_reason() {
     fixture
         .engine
         .branch
-        .apply(&explicit.prepare_id, &explicit.mutation, "tester")
+        .apply(&explicit.prepare_id, &explicit.mutation, "tester", false)
         .unwrap();
     assert_eq!(fixture.branch_sha("damaian/from-detached"), head);
     assert_eq!(fixture.head(), head, "HEAD stays detached after creation");
@@ -1061,7 +1089,7 @@ fn a_dirty_switch_names_the_paths_it_would_overwrite() {
     let refused = fixture
         .engine
         .branch
-        .apply(&clean.prepare_id, &clean.mutation, "tester")
+        .apply(&clean.prepare_id, &clean.mutation, "tester", false)
         .unwrap_err();
     assert_eq!(refused.code(), "branch_dirty_switch");
     assert!(refused.message().contains("shared.txt"), "{refused:?}");
@@ -1083,6 +1111,7 @@ fn an_approval_cannot_be_retargeted_and_is_consumed_once() {
                 name: "damaian/once".to_string(),
             },
             "tester",
+            false,
         )
         .unwrap_err();
     assert_eq!(mismatched.code(), "branch_mutation_mismatch");
@@ -1098,13 +1127,23 @@ fn an_approval_cannot_be_retargeted_and_is_consumed_once() {
     fixture
         .engine
         .branch
-        .apply(&preparation.prepare_id, &preparation.mutation, "tester")
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
         .expect("the correct mutation applies");
 
     let second = fixture
         .engine
         .branch
-        .apply(&preparation.prepare_id, &preparation.mutation, "tester")
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
         .unwrap_err();
     assert_eq!(second.code(), "branch_not_prepared");
     assert_eq!(
@@ -1165,7 +1204,12 @@ fn inspect_reports_a_dangling_record_truthfully() {
     fixture
         .engine
         .branch
-        .apply(&preparation.prepare_id, &preparation.mutation, "tester")
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
         .expect("the record was still prepared");
     let landed = fixture
         .engine
@@ -1185,7 +1229,12 @@ fn a_branch_apply_is_bracketed_by_a_marker_pair_and_audited() {
     fixture
         .engine
         .branch
-        .apply(&preparation.prepare_id, &preparation.mutation, "tester")
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
         .unwrap();
 
     let events = fixture.session_events();
@@ -1227,6 +1276,601 @@ fn a_branch_apply_is_bracketed_by_a_marker_pair_and_audited() {
     assert_eq!(
         created[0]["reference"],
         serde_json::json!("refs/heads/damaian/audited")
+    );
+    fixture.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: deletion, with the separate unmerged confirmation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_merged_branch_deletes_with_d_and_no_force() {
+    let fixture = EngineFixture::new("delete-merged");
+    let head = fixture.head();
+    fixture.run(&["branch", "damaian/done"]);
+
+    let preparation = fixture.prepare_delete("damaian/done");
+    assert!(preparation.can_apply, "{:?}", preparation.refusal);
+    assert_eq!(
+        preparation.mutation,
+        GitMutation::DeleteBranch {
+            name: "damaian/done".to_string(),
+            unmerged_commits: Some(0),
+        }
+    );
+    assert_eq!(preparation.unmerged_commits, Some(0));
+    assert!(preparation.unmerged_subjects.is_empty());
+    assert_eq!(preparation.start_point_sha.as_deref(), Some(head.as_str()));
+
+    let outcome = fixture
+        .engine
+        .branch
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
+        .expect("a merged branch deletes with a plain approval");
+
+    assert_eq!(outcome.branch, "damaian/done");
+    assert_eq!(outcome.created_ref, None);
+    assert_eq!(outcome.head_after.as_deref(), Some(head.as_str()));
+    assert_eq!(fixture.head(), head, "deleting a branch must not move HEAD");
+    assert_eq!(fixture.current_branch(), "main");
+    assert_ne!(
+        fixture
+            .try_run(&["show-ref", "--verify", "refs/heads/damaian/done"])
+            .status
+            .code(),
+        Some(0),
+        "the deleted ref must be absent"
+    );
+
+    no_force_flag(&outcome.git_commands);
+    assert!(
+        outcome
+            .git_commands
+            .iter()
+            .any(|command| has_arguments(command, &["branch", "-d", "damaian/done"])),
+        "the merged case must use -d: {:?}",
+        outcome.git_commands
+    );
+    assert!(
+        outcome
+            .git_commands
+            .iter()
+            .all(|command| !has_token(command, "-D")),
+        "the merged case must never use -D: {:?}",
+        outcome.git_commands
+    );
+
+    let audit = fixture.audit_events();
+    let deleted = audit
+        .iter()
+        .filter(|event| event["eventType"] == "git_branch_deleted")
+        .collect::<Vec<_>>();
+    assert_eq!(deleted.len(), 1, "{deleted:?}");
+    assert_eq!(deleted[0]["approvedBy"], "tester");
+    assert_eq!(deleted[0]["branch"], "damaian/done");
+    assert_eq!(deleted[0]["reference"], "refs/heads/damaian/done");
+    assert_eq!(deleted[0]["unmergedCommits"], "0");
+    assert_eq!(deleted[0]["confirmedUnmerged"], "false");
+    assert_eq!(deleted[0]["outcome"], "ok");
+
+    let inspection = fixture
+        .engine
+        .branch
+        .inspect(&preparation.prepare_id)
+        .unwrap();
+    assert_eq!(inspection.outcome, "landed");
+    assert_eq!(inspection.state, "applied");
+    assert_eq!(inspection.actual_oid, None);
+    assert_eq!(inspection.expected_oid.as_deref(), Some(head.as_str()));
+    fixture.cleanup();
+}
+
+#[test]
+fn an_unmerged_branch_needs_a_distinct_confirmation() {
+    let fixture = EngineFixture::new("delete-unmerged");
+    fixture.run(&["switch", "-q", "-c", "damaian/lost"]);
+    fixture.commit("lost.txt", "lost\n", "only on the lost branch");
+    fixture.write("lost.txt", "lost again\n");
+    fixture.run(&["add", "."]);
+    fixture.run(&[
+        "commit",
+        "-q",
+        "-m",
+        "second lost subject",
+        "-m",
+        "body-only-text-that-must-not-be-audited",
+    ]);
+    let lost_sha = fixture.branch_sha("damaian/lost");
+    fixture.run(&["switch", "-q", "main"]);
+
+    let preparation = fixture.prepare_delete("damaian/lost");
+    assert!(preparation.can_apply, "{:?}", preparation.refusal);
+    assert_eq!(
+        preparation.mutation,
+        GitMutation::DeleteBranch {
+            name: "damaian/lost".to_string(),
+            unmerged_commits: Some(2),
+        }
+    );
+    assert_eq!(preparation.unmerged_commits, Some(2));
+    assert!(
+        preparation
+            .unmerged_subjects
+            .contains(&"second lost subject".to_string()),
+        "{:?}",
+        preparation.unmerged_subjects
+    );
+    assert!(
+        preparation
+            .unmerged_subjects
+            .contains(&"only on the lost branch".to_string()),
+        "{:?}",
+        preparation.unmerged_subjects
+    );
+
+    let refused = fixture
+        .engine
+        .branch
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code(), "branch_unmerged_confirmation_required");
+    let message = refused.message();
+    assert!(message.contains("2 commits"), "{message}");
+    assert!(message.contains("second lost subject"), "{message}");
+    assert!(message.contains("only on the lost branch"), "{message}");
+    assert!(
+        message.contains("plain approval is not enough"),
+        "{message}"
+    );
+    assert_eq!(
+        fixture.branch_sha("damaian/lost"),
+        lost_sha,
+        "a refused approval must not delete the branch"
+    );
+    let still_prepared = fixture
+        .engine
+        .branch
+        .load_record(&preparation.prepare_id)
+        .unwrap();
+    assert_eq!(still_prepared.state, "prepared");
+    assert!(still_prepared.git_commands.is_empty());
+    assert!(
+        fixture.session_events().iter().all(|event| {
+            event["eventType"] != "action_started"
+                || event["payload"]["action"] != "git_branch_delete"
+        }),
+        "a refused plain approval must not start the deletion action"
+    );
+    let audit_before = fixture.audit_events();
+    assert!(
+        audit_before
+            .iter()
+            .all(|event| event["eventType"] != "git_branch_deleted"),
+        "nothing was deleted yet"
+    );
+
+    let outcome = fixture
+        .engine
+        .branch
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            true,
+        )
+        .expect("the separate confirmation deletes the branch");
+    assert_eq!(outcome.branch, "damaian/lost");
+    assert_ne!(
+        fixture
+            .try_run(&["show-ref", "--verify", "refs/heads/damaian/lost"])
+            .status
+            .code(),
+        Some(0)
+    );
+    no_force_flag(&outcome.git_commands);
+    assert!(
+        outcome
+            .git_commands
+            .iter()
+            .any(|command| has_arguments(command, &["branch", "-D", "damaian/lost"])),
+        "the confirmed unmerged case must use -D: {:?}",
+        outcome.git_commands
+    );
+
+    let audit = fixture.audit_events();
+    let deleted = audit
+        .iter()
+        .filter(|event| event["eventType"] == "git_branch_deleted")
+        .collect::<Vec<_>>();
+    assert_eq!(deleted.len(), 1, "{deleted:?}");
+    assert_eq!(deleted[0]["unmergedCommits"], "2");
+    assert_eq!(deleted[0]["confirmedUnmerged"], "true");
+    assert_eq!(deleted[0]["outcome"], "ok");
+    let audit_text =
+        fs::read_to_string(fixture.data_dir.join("audit").join("events.jsonl")).unwrap();
+    assert!(
+        !audit_text.contains("body-only-text-that-must-not-be-audited"),
+        "the audit must never contain a commit body"
+    );
+
+    let inspection = fixture
+        .engine
+        .branch
+        .inspect(&preparation.prepare_id)
+        .unwrap();
+    assert_eq!(inspection.outcome, "landed");
+    assert_eq!(inspection.actual_oid, None);
+
+    let consumed = fixture
+        .engine
+        .branch
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(consumed.code(), "branch_not_prepared");
+    fixture.cleanup();
+}
+
+#[test]
+fn an_unknown_default_branch_still_requires_the_unmerged_confirmation() {
+    let fixture = EngineFixture::new("delete-unknown-default");
+    fixture.run(&["branch", "-m", "trunk"]);
+    fixture.run(&["switch", "--orphan", "topic"]);
+    let _ = fixture.try_run(&["rm", "-rf", "."]);
+    fixture.write("orphan.txt", "orphan\n");
+    fixture.run(&["add", "."]);
+    fixture.run(&["commit", "-q", "-m", "orphan work"]);
+    fixture.run(&["switch", "-q", "trunk"]);
+
+    let preparation = fixture.prepare_delete("topic");
+    assert!(preparation.can_apply, "{:?}", preparation.refusal);
+    assert_eq!(
+        preparation.mutation,
+        GitMutation::DeleteBranch {
+            name: "topic".to_string(),
+            unmerged_commits: None,
+        }
+    );
+    assert_eq!(preparation.unmerged_commits, None);
+    assert!(
+        preparation
+            .unmerged_subjects
+            .contains(&"orphan work".to_string()),
+        "{:?}",
+        preparation.unmerged_subjects
+    );
+
+    let refused = fixture
+        .engine
+        .branch
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code(), "branch_unmerged_confirmation_required");
+    let message = refused.message();
+    assert!(
+        message.contains("could not determine the default branch"),
+        "{message}"
+    );
+    assert!(message.contains("orphan work"), "{message}");
+    assert_eq!(
+        fixture
+            .try_run(&["show-ref", "--verify", "refs/heads/topic"])
+            .status
+            .code(),
+        Some(0)
+    );
+
+    let outcome = fixture
+        .engine
+        .branch
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            true,
+        )
+        .unwrap();
+    no_force_flag(&outcome.git_commands);
+    assert!(
+        outcome
+            .git_commands
+            .iter()
+            .any(|command| has_arguments(command, &["branch", "-D", "topic"])),
+        "{:?}",
+        outcome.git_commands
+    );
+    assert_ne!(
+        fixture
+            .try_run(&["show-ref", "--verify", "refs/heads/topic"])
+            .status
+            .code(),
+        Some(0)
+    );
+    let audit = fixture.audit_events();
+    let deleted = audit
+        .iter()
+        .find(|event| event["eventType"] == "git_branch_deleted")
+        .expect("a deletion audit event");
+    assert_eq!(deleted["unmergedCommits"], "unknown");
+    assert_eq!(deleted["confirmedUnmerged"], "true");
+    fixture.cleanup();
+}
+
+#[test]
+fn the_current_branch_and_a_checked_out_branch_cannot_be_deleted() {
+    let fixture = EngineFixture::new("delete-checkouts");
+    fixture.run(&["branch", "damaian/linked"]);
+
+    let current = fixture.prepare_delete("main");
+    assert!(!current.can_apply);
+    assert!(
+        current
+            .refusal
+            .as_deref()
+            .is_some_and(|refusal| refusal.contains("current branch")),
+        "{:?}",
+        current.refusal
+    );
+    assert!(
+        fixture
+            .engine
+            .branch
+            .load_record(&current.prepare_id)
+            .is_err()
+    );
+
+    let prepared = fixture.prepare_delete("damaian/linked");
+    assert!(prepared.can_apply, "{:?}", prepared.refusal);
+
+    let worktree = fixture.base.join("linked-worktree");
+    let worktree_text = worktree.to_str().unwrap();
+    fixture.run(&["worktree", "add", worktree_text, "damaian/linked"]);
+
+    let at_apply = fixture
+        .engine
+        .branch
+        .apply(&prepared.prepare_id, &prepared.mutation, "tester", false)
+        .unwrap_err();
+    assert_eq!(at_apply.code(), "branch_delete_checked_out");
+    assert!(at_apply.message().contains(worktree_text), "{at_apply:?}");
+    assert_eq!(
+        fixture
+            .try_run(&["show-ref", "--verify", "refs/heads/damaian/linked"])
+            .status
+            .code(),
+        Some(0),
+        "a checked-out branch must survive"
+    );
+
+    let at_prepare = fixture.prepare_delete("damaian/linked");
+    assert!(!at_prepare.can_apply);
+    assert!(
+        at_prepare
+            .refusal
+            .as_deref()
+            .is_some_and(|refusal| refusal.contains("checked out in the worktree")),
+        "{:?}",
+        at_prepare.refusal
+    );
+
+    fixture.run(&["worktree", "remove", worktree_text]);
+    fixture
+        .engine
+        .branch
+        .apply(&prepared.prepare_id, &prepared.mutation, "tester", false)
+        .expect("the refusal did not consume the record and the branch is free");
+    assert_ne!(
+        fixture
+            .try_run(&["show-ref", "--verify", "refs/heads/damaian/linked"])
+            .status
+            .code(),
+        Some(0)
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_missing_branch_and_a_policy_refusal_are_reported_before_git() {
+    let mut fixture = EngineFixture::new("delete-refusals");
+    fixture.run(&["branch", "damaian/policy"]);
+
+    let missing = fixture.prepare_delete("damaian/missing");
+    assert!(!missing.can_apply);
+    assert!(
+        missing
+            .refusal
+            .as_deref()
+            .is_some_and(|refusal| refusal.contains("no local branch")),
+        "{:?}",
+        missing.refusal
+    );
+    assert!(
+        fixture
+            .engine
+            .branch
+            .load_record(&missing.prepare_id)
+            .is_err()
+    );
+
+    fixture.commit("conflict.txt", "a\nb\nc\n", "base");
+    fixture.run(&["switch", "-q", "-c", "other"]);
+    fixture.commit("conflict.txt", "a\nX\nc\n", "other");
+    fixture.run(&["switch", "-q", "main"]);
+    fixture.commit("conflict.txt", "a\nY\nc\n", "main");
+    fixture.run_failing(&["merge", "other"]);
+    let mid_merge = fixture.prepare_delete("other");
+    assert!(!mid_merge.can_apply);
+    assert!(
+        mid_merge
+            .refusal
+            .as_deref()
+            .is_some_and(|refusal| refusal.contains("in progress")),
+        "{:?}",
+        mid_merge.refusal
+    );
+    fixture.run(&["merge", "--abort"]);
+
+    let session_id = fixture.session_id.clone();
+    for mode in [SessionMode::Ask, SessionMode::Plan, SessionMode::Review] {
+        fixture
+            .engine
+            .session_store
+            .set_session_mode(&session_id, mode, "user")
+            .unwrap();
+        let refused = fixture.prepare_delete("damaian/policy");
+        assert!(!refused.can_apply);
+        assert!(
+            refused
+                .refusal
+                .as_deref()
+                .is_some_and(|refusal| refusal.contains("Code mode")),
+            "{:?}",
+            refused.refusal
+        );
+    }
+    fixture
+        .engine
+        .session_store
+        .set_session_mode(&session_id, SessionMode::Code, "user")
+        .unwrap();
+    fixture.rebuild(|config| config.allow_git_branches = false);
+    let denied = fixture.prepare_delete("damaian/policy");
+    assert!(!denied.can_apply);
+    assert!(
+        denied
+            .refusal
+            .as_deref()
+            .is_some_and(|refusal| refusal.contains("allow_git_branches")),
+        "{:?}",
+        denied.refusal
+    );
+    fixture.rebuild(|_| {});
+
+    let prepared = fixture.prepare_delete("damaian/policy");
+    assert!(prepared.can_apply, "{:?}", prepared.refusal);
+    fixture
+        .engine
+        .session_store
+        .set_session_mode(&session_id, SessionMode::Ask, "user")
+        .unwrap();
+    let at_apply = fixture
+        .engine
+        .branch
+        .apply(&prepared.prepare_id, &prepared.mutation, "tester", false)
+        .unwrap_err();
+    assert_eq!(at_apply.code(), "branch_not_allowed");
+    assert_eq!(
+        fixture
+            .try_run(&["show-ref", "--verify", "refs/heads/damaian/policy"])
+            .status
+            .code(),
+        Some(0)
+    );
+
+    fixture
+        .engine
+        .session_store
+        .set_session_mode(&session_id, SessionMode::Code, "user")
+        .unwrap();
+    fixture
+        .engine
+        .branch
+        .apply(&prepared.prepare_id, &prepared.mutation, "tester", false)
+        .expect("a policy refusal does not consume the prepared record");
+    assert_ne!(
+        fixture
+            .try_run(&["show-ref", "--verify", "refs/heads/damaian/policy"])
+            .status
+            .code(),
+        Some(0)
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_delete_that_already_landed_is_inspected_not_retried() {
+    let fixture = EngineFixture::new("delete-inspect");
+    fixture.run(&["branch", "damaian/done"]);
+    let preparation = fixture.prepare_delete("damaian/done");
+
+    let prepared = fixture
+        .engine
+        .branch
+        .inspect(&preparation.prepare_id)
+        .unwrap();
+    assert_eq!(prepared.state, "prepared");
+    assert_eq!(prepared.outcome, "not_landed");
+    assert!(
+        prepared.message.contains("still at"),
+        "{}",
+        prepared.message
+    );
+
+    // The crash-after-delete case: the ref is gone but the record never reached
+    // `applied`. That is `landed`, and a later apply must not retry it.
+    fixture.run(&["branch", "-d", "damaian/done"]);
+    let landed = fixture
+        .engine
+        .branch
+        .inspect(&preparation.prepare_id)
+        .unwrap();
+    assert_eq!(landed.state, "prepared");
+    assert_eq!(landed.outcome, "landed");
+    assert_eq!(landed.actual_oid, None);
+    assert!(
+        landed.message.contains("deletion landed"),
+        "{}",
+        landed.message
+    );
+
+    let retried = fixture
+        .engine
+        .branch
+        .apply(
+            &preparation.prepare_id,
+            &preparation.mutation,
+            "tester",
+            false,
+        )
+        .unwrap_err();
+    assert_eq!(retried.code(), "branch_state_changed");
+    assert!(
+        retried.message().contains("no longer exists"),
+        "{retried:?}"
+    );
+    let record = fixture
+        .engine
+        .branch
+        .load_record(&preparation.prepare_id)
+        .unwrap();
+    assert_eq!(record.state, "prepared");
+    assert!(record.git_commands.is_empty(), "nothing may run again");
+    let audit = fixture.audit_events();
+    assert!(
+        audit
+            .iter()
+            .all(|event| event["eventType"] != "git_branch_deleted"),
+        "a delete that already landed must not be retried"
     );
     fixture.cleanup();
 }
