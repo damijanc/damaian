@@ -1286,11 +1286,23 @@ impl ContextManager {
         // Normalise the restriction once, with the read path's own resolver,
         // so `./src/x` and `src/x` cannot disagree about what is selected.
         // A path that does not resolve keeps its spelling: it selects nothing,
-        // which is the narrowing direction.
+        // which is the narrowing direction. A path that resolves to a directory
+        // keeps a trailing `/` so `add_file` can prefix-match it; without the
+        // marker every entry would have to be treated as a prefix, and a typo
+        // like `src/up` would admit `src/upload.rs`.
         let restriction = restriction.map(|paths| {
             paths
                 .iter()
-                .map(|path| self.normalise_candidate(repository_root, path, false))
+                .map(|path| {
+                    let normalised = self.normalise_candidate(repository_root, path, false);
+                    if normalised.is_empty() {
+                        String::new()
+                    } else if repository_root.join(&normalised).is_dir() {
+                        format!("{}/", normalised.trim_end_matches('/'))
+                    } else {
+                        normalised
+                    }
+                })
                 .collect::<Vec<_>>()
         });
         let restriction = restriction.as_deref();
@@ -1918,10 +1930,14 @@ impl ContextManager {
         // The session restriction narrows file-bearing collection only
         // (spec 27 §5.4, context.md C10). `AGENTS.md` is repository policy, not
         // one of the files the user is choosing between, so it is exempt; the
-        // policy check below still applies to it.
+        // policy check below still applies to it. A restriction entry that names
+        // a directory carries a trailing `/` from `build_context`, and selects
+        // everything under it; without that, `src/` selected nothing at all.
         if kind != ContextKind::AgentInstruction
             && let Some(allowed) = restriction
-            && !allowed.iter().any(|selected| selected == path)
+            && !allowed
+                .iter()
+                .any(|selected| restriction_admits(path, selected))
         {
             push_exclusion(
                 excluded,
@@ -2146,6 +2162,20 @@ fn build_manifest(
         conversation_summary,
         symbol_provenance,
     }
+}
+
+/// Whether a normalised path is admitted by one entry of the session's path
+/// restriction (spec 27 §5.4).
+///
+/// `build_context` marks a directory entry with a trailing `/`; a file must
+/// match exactly. The empty entry is the repository root and admits everything.
+/// Exact equality for a directory would have made the most natural way to
+/// restrict — `src/` — select nothing, which reads as "no file content" rather
+/// than "everything under `src`".
+fn restriction_admits(path: &str, selected: &str) -> bool {
+    selected.is_empty()
+        || path == selected
+        || (selected.ends_with('/') && path.starts_with(selected))
 }
 
 /// Record an exclusion once per `(reason, path, range)`. The same restricted

@@ -25,6 +25,11 @@ let lastContextManifest = null;
 let contextPanelTaskId = "";
 // The paused pre-send review, while one is open.
 let currentContextReview = null;
+// Review cards by proposal id. Removal is by manifest index, so a card that
+// reopened the panel from the review it was created with would restore removed
+// items and make the next removal hit the wrong one. Every card therefore keeps
+// one live review object, and a removal refreshes it from the returned manifest.
+const contextReviewCards = new Map();
 // Session pins and restriction from `/api/session` or a control route.
 let contextPins = [];
 let contextRestriction = null;
@@ -2287,6 +2292,20 @@ function setContextManifest(manifest, target = "") {
   if (!$("context-panel").hidden) renderContextPanel();
 }
 
+// Adopt a manifest the removal route returned. The card and the open review
+// must both move to it, because removal is by index in the manifest the panel
+// is showing.
+function applyContextReviewManifest(proposalId, manifest) {
+  const card = contextReviewCards.get(proposalId);
+  if (card) {
+    card.review = { ...card.review, manifest };
+    card.refresh();
+  }
+  if (currentContextReview && currentContextReview.proposalId === proposalId) {
+    currentContextReview = { ...currentContextReview, manifest };
+  }
+}
+
 function openContextPanel(manifest, target = "") {
   if (manifest) setContextManifest(manifest, target);
   const panel = $("context-panel");
@@ -2501,8 +2520,8 @@ function renderContextPanel() {
     const restriction = document.createElement("p");
     restriction.className = "context-panel-hint";
     restriction.textContent = contextRestriction.length
-      ? `This session is restricted to ${contextRestriction.length} path(s); file content outside them is not sent. The symbols row is still looked up across the repository.`
-      : "This session is restricted to no paths, so no file content is eligible. The symbols row is still looked up across the repository.";
+      ? `This session is restricted to ${contextRestriction.length} path(s). Only those paths' file content is assembled for a turn; the assistant can still read other files with its own tools during a turn, and the symbols row and repository map are still built from the whole repository.`
+      : "This session is restricted to no paths, so no file content is assembled for a turn. The assistant can still read files with its own tools during a turn, and the symbols row and repository map are still built from the whole repository.";
     body.append(restriction);
   }
 
@@ -2632,22 +2651,21 @@ async function removeContextItem(item) {
   if (!currentContextReview) throw new Error("No context review is open");
   const index = contextItemIndex(item);
   if (index < 0) throw new Error("That item is no longer in the review");
+  const proposalId = currentContextReview.proposalId;
   const payload = await api(
     "/api/context-remove",
-    form({ proposal_id: currentContextReview.proposalId, index: String(index) }),
+    form({ proposal_id: proposalId, index: String(index) }),
   );
-  currentContextReview = { ...currentContextReview, manifest: payload.manifest };
-  setContextManifest(payload.manifest, `review:${currentContextReview.proposalId}`);
+  applyContextReviewManifest(proposalId, payload.manifest);
+  setContextManifest(payload.manifest, `review:${proposalId}`);
 }
 
 async function removeContextSummary() {
   if (!currentContextReview) throw new Error("No context review is open");
-  const payload = await api(
-    "/api/context-remove-summary",
-    form({ proposal_id: currentContextReview.proposalId }),
-  );
-  currentContextReview = { ...currentContextReview, manifest: payload.manifest };
-  setContextManifest(payload.manifest, `review:${currentContextReview.proposalId}`);
+  const proposalId = currentContextReview.proposalId;
+  const payload = await api("/api/context-remove-summary", form({ proposal_id: proposalId }));
+  applyContextReviewManifest(proposalId, payload.manifest);
+  setContextManifest(payload.manifest, `review:${proposalId}`);
 }
 
 function noteContextPayload(payload) {
@@ -2655,6 +2673,11 @@ function noteContextPayload(payload) {
     setContextManifest(payload.context, payload.taskId || "");
   }
   if (payload.contextReview) {
+    const card = contextReviewCards.get(payload.contextReview.proposalId);
+    if (card) {
+      card.review = payload.contextReview;
+      card.refresh();
+    }
     currentContextReview = payload.contextReview;
     setContextManifest(
       payload.contextReview.manifest,
@@ -2697,6 +2720,7 @@ function applyRepositoryState(value, persist = true) {
   loadPinnedContextFiles("");
   lastContextManifest = null;
   currentContextReview = null;
+  contextReviewCards.clear();
   contextPins = [];
   contextRestriction = null;
   contextRestrictionDirty = false;
@@ -9619,7 +9643,7 @@ async function repairFindings(ids) {
     const environmentOnly =
       kept.length > 0 && kept.every((finding) => finding.source === "command" && !finding.range);
     const send = await showAppDialog({
-      title: `Fix ${ids.length} finding${ids.length === 1 ? "" : "s"}?`,
+      title: `Fix ${kept.length} finding${kept.length === 1 ? "" : "s"}?`,
       message: environmentOnly
         ? "This is a command that could not run, which is often an environment or PATH problem rather than a code defect. Review the prompt; Cancel if the fix belongs outside the repository."
         : "This sends the prompt below as a new turn. Review it before sending.",
@@ -11213,11 +11237,6 @@ function createFallbackOffer(proposal, proposalRepo) {
 // panel is the detail. Removal happens in the panel, so Send reads the amended
 // manifest the panel last received.
 function createContextReview(review, reviewRepo) {
-  const manifest = review.manifest || {};
-  const total = formatContextTokens(manifest.totalTokens || 0);
-  const limit = formatContextTokens(manifest.limit?.tokens || 0);
-  const excluded = manifest.excluded?.length || 0;
-
   const wrapper = document.createElement("div");
   wrapper.className = "command-approval context-review";
 
@@ -11227,15 +11246,31 @@ function createContextReview(review, reviewRepo) {
   title.textContent = "Review the context before sending";
   const meta = document.createElement("span");
   meta.className = "command-approval-risk";
-  meta.textContent = `${total} / ${limit} tokens`;
   meta.dataset.blocked = "false";
   header.append(title, meta);
 
   const note = document.createElement("p");
   note.className = "plan-review-note";
-  note.textContent = `Nothing has been sent yet. ${excluded} item${
-    excluded === 1 ? "" : "s"
-  } were left out; open the panel to see why or to pin something for later turns.`;
+
+  // The card owns the live review: Send reads the manifest the panel last
+  // showed, so this is the same object the panel's removals amend.
+  const card = {
+    review,
+    refresh: () => renderReviewState(),
+  };
+  contextReviewCards.set(review.proposalId, card);
+  renderReviewState();
+
+  function renderReviewState() {
+    const manifest = card.review.manifest || {};
+    meta.textContent = `${formatContextTokens(manifest.totalTokens || 0)} / ${formatContextTokens(
+      manifest.limit?.tokens || 0,
+    )} tokens`;
+    const excluded = manifest.excluded?.length || 0;
+    note.textContent = `Nothing has been sent yet. ${excluded} item${
+      excluded === 1 ? "" : "s"
+    } were left out; open the panel to see why or to pin something for later turns.`;
+  }
 
   const actions = document.createElement("div");
   actions.className = "command-approval-actions";
@@ -11245,11 +11280,8 @@ function createContextReview(review, reviewRepo) {
   reviewButton.className = "btn-sm btn-quiet";
   reviewButton.textContent = "Review context";
   reviewButton.addEventListener("click", () => {
-    currentContextReview = review;
-    openContextPanel(
-      currentContextReview.manifest || review.manifest,
-      `review:${review.proposalId}`,
-    );
+    currentContextReview = card.review;
+    openContextPanel(card.review.manifest, `review:${card.review.proposalId}`);
   });
 
   const sendButton = document.createElement("button");
@@ -11336,6 +11368,7 @@ function createContextReview(review, reviewRepo) {
       return;
     }
     currentContextReview = null;
+    contextReviewCards.delete(review.proposalId);
     closeContextPanel();
     output.textContent =
       decision === "send" ? "Sent the reviewed context." : "No request was sent.";

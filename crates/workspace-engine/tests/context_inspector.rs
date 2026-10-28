@@ -13,8 +13,9 @@ use workspace_engine::compaction::ConversationSummary;
 use workspace_engine::context_manager::ExclusionReason;
 use workspace_engine::{
     CancelToken, ChatTurnResult, Config, ContextCategory, ContextDecision, ContextKind, ContextPin,
-    ContextRequest, LineRange, MockModelAdapter, ModelAdapter, Provenance, Symbol,
-    SymbolIndexStore, TaskStatus, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
+    ContextRequest, IncludedRef, LineRange, MockModelAdapter, ModelAdapter, PausedTurns,
+    Provenance, Symbol, SymbolIndexStore, TaskStatus, ToolCall, TurnProgress, TurnSink,
+    WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -131,6 +132,16 @@ fn included_paths(plan: &workspace_engine::ContextPlan) -> Vec<&str> {
         .iter()
         .filter_map(|included| included.path.as_deref())
         .collect()
+}
+
+/// The identity the review card uses to find an item again: category, kind,
+/// path and range. Two items with the same identity are the same row.
+fn same_item(a: &IncludedRef, b: &IncludedRef) -> bool {
+    a.category == b.category && a.kind == b.kind && a.path == b.path && a.range == b.range
+}
+
+fn index_of(items: &[IncludedRef], wanted: &IncludedRef) -> Option<usize> {
+    items.iter().position(|item| same_item(item, wanted))
 }
 
 #[test]
@@ -331,20 +342,33 @@ fn a_restriction_filters_each_file_bearing_source() {
     let repo = fixture_repo("restriction");
     let engine = WorkspaceEngine::new(test_config(&repo));
     write_fixture(&repo, "src/mentioned.rs", "pub fn mentioned_zzq() {}\n");
+    write_fixture(&repo, "src/pinned_only.rs", "pub fn pinned_zzq() {}\n");
     let restriction = vec!["src/upload.rs".to_string()];
 
+    // The pin is on a fourth file: pinning `src/other.rs` (the keyword hit)
+    // would put `PathNotSelected` in the manifest whether or not the keyword
+    // source is filtered, and the assertion below would pass without testing it.
     let plan = assemble(
         &engine,
         &repo,
         "Look at src/upload.rs and src/mentioned.rs and other_marker_zzq",
         &[ContextPin {
-            path: "src/other.rs".to_string(),
+            path: "src/pinned_only.rs".to_string(),
             range: None,
         }],
         Some(&restriction),
     );
 
-    for path in ["src/mentioned.rs", "src/other.rs", "README.md"] {
+    for path in [
+        // a prompt mention
+        "src/mentioned.rs",
+        // the keyword hit on `other_marker_zzq`
+        "src/other.rs",
+        // the session pin
+        "src/pinned_only.rs",
+        // the root project rule
+        "README.md",
+    ] {
         assert_eq!(
             excluded_reason(&plan, path),
             Some(ExclusionReason::PathNotSelected),
@@ -357,6 +381,43 @@ fn a_restriction_filters_each_file_bearing_source() {
         "{:?}",
         included_paths(&plan)
     );
+}
+
+#[test]
+fn a_restriction_to_a_directory_includes_everything_under_it() {
+    let repo = fixture_repo("restriction-directory");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+
+    // Both spellings name the same existing directory; the normalising step is
+    // what makes them agree, and `src/` used to select nothing at all.
+    for entry in ["src/", "src"] {
+        let restriction = vec![entry.to_string()];
+        let plan = assemble(
+            &engine,
+            &repo,
+            "Look at src/upload.rs and other_marker_zzq",
+            &[],
+            Some(&restriction),
+        );
+
+        let included = included_paths(&plan);
+        assert!(
+            included.contains(&"src/upload.rs"),
+            "{entry}: {:?}",
+            plan.manifest.excluded
+        );
+        assert!(
+            included.contains(&"src/other.rs"),
+            "{entry}: the keyword hit is under the selected directory: {:?}",
+            plan.manifest.excluded
+        );
+        assert_eq!(
+            excluded_reason(&plan, "README.md"),
+            Some(ExclusionReason::PathNotSelected),
+            "{entry}: {:?}",
+            plan.manifest.excluded
+        );
+    }
 }
 
 #[test]
@@ -809,6 +870,81 @@ fn removing_an_instruction_changes_the_request_that_is_sent() {
         "the removed instruction was still sent: {sent}"
     );
     assert!(sent.contains("What is this?"));
+}
+
+#[test]
+fn two_removals_across_a_reopen_use_the_manifest_each_call_returns() {
+    let repo = fixture_repo("reopen-removal");
+    let engine = WorkspaceEngine::new(pause_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let (result, _) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+    let review = result.context_review.expect("the review is present");
+
+    let removable = review
+        .manifest
+        .included
+        .iter()
+        .filter(|item| item.category != ContextCategory::Required)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        removable.len() >= 2,
+        "the fixture should give two removable items: {:?}",
+        review.manifest.included
+    );
+    let first = removable[0].clone();
+    let second = removable[1].clone();
+    assert!(!same_item(&first, &second), "the two items must differ");
+
+    let first_index =
+        index_of(&review.manifest.included, &first).expect("the first item is in the review");
+    let after_first = engine
+        .chat_orchestrator
+        .remove_context_item(&review.id, first_index)
+        .expect("the first item is removable");
+    assert!(
+        !after_first
+            .included
+            .iter()
+            .any(|item| same_item(item, &first))
+    );
+
+    // A reopened card reads the persisted review rather than the manifest it
+    // was created with. Removal is by index, so the next index has to come from
+    // this manifest; the pre-removal one would name the item after the gap.
+    let reopened = PausedTurns::new(&engine.config.data_dir)
+        .context_review_manifest(&review.id)
+        .expect("the paused review is still on disk");
+    assert_eq!(
+        reopened.included.len(),
+        after_first.included.len(),
+        "reopening must show the amended review"
+    );
+    assert!(
+        !reopened.included.iter().any(|item| same_item(item, &first)),
+        "reopening must not restore the removed item: {:?}",
+        reopened.included
+    );
+    let second_index =
+        index_of(&reopened.included, &second).expect("the second item survived the first removal");
+    engine
+        .chat_orchestrator
+        .remove_context_item(&review.id, second_index)
+        .expect("the second item is removable");
+
+    let reopened_again = PausedTurns::new(&engine.config.data_dir)
+        .context_review_manifest(&review.id)
+        .expect("the paused review is still on disk");
+    for removed in [&first, &second] {
+        assert!(
+            !reopened_again
+                .included
+                .iter()
+                .any(|item| same_item(item, removed)),
+            "{removed:?} is still in the review: {:?}",
+            reopened_again.included
+        );
+    }
 }
 
 #[test]
