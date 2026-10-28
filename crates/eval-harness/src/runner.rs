@@ -1,17 +1,21 @@
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::{
     AgentCommandProposal, AgentPatchProposal, CancelToken, ChatTurnOptions, ClientError, Config,
-    CurlModelTransport, MockModelAdapter, ModelAdapter, ModelProviderConfig, ModelRequest,
-    OpenAICompatibleAdapter, ProcessRegistry, Result, RoundBudgetDecision, SecretScanner,
-    SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink, UsageSource,
-    VerificationReport, WorkspaceEngine, classify_session, resume,
+    ContextCategory, ContextDecision, CurlModelTransport, MemoryProposal, MemoryScope, MemoryState,
+    MemoryStore, MemoryStoreConfig, MemoryTarget, MockModelAdapter, ModelAdapter,
+    ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, ProcessRegistry, ProjectIdentity,
+    ProjectKeySource, ProposalOrigin, Result, RoundBudgetDecision, SecretScanner, SessionStore,
+    Task, TaskStatus, ToolCall, TurnProgress, TurnSink, UsageSource, UserConfirmation,
+    VerificationReport, WorkspaceEngine, classify_session, evidence_ref_for, resume,
 };
 
 use crate::fixture::{self, Materialized};
 use crate::record::{
-    CacheUsage, RecordedApproval, RecordedCheck, RecordedPlan, RecordedRecovery, RunRecord, Tokens,
+    CacheUsage, MemoryRecallCounts, RecordedApproval, RecordedCheck, RecordedPlan,
+    RecordedRecovery, RunRecord, Tokens,
 };
 use crate::scenario::{
     CrashMidAction, RoundBudgetDecision as ScenarioRoundBudgetDecision, STUB_BASE_PLACEHOLDER,
@@ -19,6 +23,12 @@ use crate::scenario::{
 };
 use crate::stub::StubServer;
 use crate::trace::{self, Trace};
+
+/// The synthetic origin a seeded memory records. A seed is a fixture for a
+/// confirmation that happened before the run; there is no earlier session to
+/// name, and the provenance is only ever shown, never re-read.
+const SEED_ORIGIN_SESSION: &str = "eval-seed";
+const SEED_ORIGIN_MESSAGE: &str = "eval-seed-message";
 
 #[derive(Debug)]
 pub struct Run {
@@ -68,6 +78,14 @@ pub struct Run {
     /// (spec 51 Task 9). Captured before the server is dropped, because the
     /// count is a measurement of the run rather than of a live listener.
     pub stub_requests: u64,
+    /// The first model request's message contents, joined (spec 30 Task 6).
+    /// Only the deterministic tier can supply it: the mock adapter records its
+    /// requests. This is the rendered context the model actually received, so
+    /// the memory delivery assertions read it rather than the manifest.
+    pub request: Option<String>,
+    /// The system message of that same request, kept separately so an assertion
+    /// can prove a memory never became an instruction.
+    pub system_prompt: Option<String>,
     pub trace: Trace,
 }
 
@@ -169,6 +187,17 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     run.continuation_request = continuation_request(&run.trace, &adapter.requests);
     run.answer_request = answer_request(&run.trace, &adapter.requests);
     (run.compacted_request, run.compacted_system_prompt) = compacted_requests(&adapter.requests);
+    run.request = adapter.requests.first().map(flattened_request);
+    run.system_prompt = adapter
+        .requests
+        .first()
+        .and_then(|request| {
+            request
+                .messages
+                .iter()
+                .find(|message| message.role == "system")
+        })
+        .map(|message| message.content.clone());
     Ok(run)
 }
 
@@ -464,6 +493,8 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
         conversation_compactions: 0,
         compaction_facts_only: false,
         stub_requests: 0,
+        request: None,
+        system_prompt: None,
         trace: Trace::default(),
     })
 }
@@ -513,6 +544,290 @@ fn apply_scenario_config(config: &mut Config, scenario: &Scenario) {
     config.data_dir = data_dir;
 }
 
+/// One entry [`seed_memory`] stored, kept for the review hook and the metric.
+///
+/// The identity travels with the entry because a review deletion must address
+/// the scope the entry actually lives in, and a project entry planted under
+/// another project key lives in that key's file.
+struct SeededMemoryEntry {
+    id: String,
+    statement: String,
+    identity: Option<ProjectIdentity>,
+}
+
+impl SeededMemoryEntry {
+    fn target(&self) -> MemoryTarget<'_> {
+        match &self.identity {
+            Some(identity) => MemoryTarget::Project(identity),
+            None => MemoryTarget::User,
+        }
+    }
+}
+
+/// Writes a scenario's declared memories through the production confirmation
+/// path (spec 30 Task 6).
+///
+/// The store is built with user scope enabled for the seeding write even when
+/// the run itself has it off. That is exactly the state the "user scope off"
+/// scenario needs: an entry that was stored while the scope was on, which a
+/// later run must not read. The run's own engine keeps its configured switch,
+/// so nothing is widened for the turn.
+fn seed_memory(
+    engine: &WorkspaceEngine,
+    root: &Path,
+    scenario: &Scenario,
+) -> Result<Vec<SeededMemoryEntry>> {
+    if scenario.seed_memory.is_empty() {
+        return Ok(Vec::new());
+    }
+    let identity = ProjectIdentity::resolve_for_root(root, &engine.git)?;
+    let store = MemoryStore::new(
+        MemoryStoreConfig {
+            data_dir: engine.config.data_dir.clone(),
+            user_scope_enabled: true,
+            ignore_patterns: engine.config.ignore_patterns.clone(),
+            retention_days: engine.config.memory_retention_days,
+        },
+        engine.audit_log.clone(),
+        engine.scanner.clone(),
+        engine.path_policy.clone(),
+        engine.session_store.clone(),
+    );
+
+    let mut seeded = Vec::with_capacity(scenario.seed_memory.len());
+    for seed in &scenario.seed_memory {
+        let entry_identity = match seed.scope {
+            MemoryScope::Project => {
+                let key = seed
+                    .project_key
+                    .clone()
+                    .unwrap_or_else(|| identity.key.clone());
+                Some(ProjectIdentity {
+                    source: ProjectIdentity::source_of_key(&key)
+                        .unwrap_or(ProjectKeySource::RootCommit),
+                    key,
+                    repository_id: identity.repository_id.clone(),
+                })
+            }
+            MemoryScope::User => None,
+            MemoryScope::Session => {
+                return Err(ClientError::InvalidInput(format!(
+                    "{}: session-scope memory cannot be seeded before the turn creates its session",
+                    scenario.name
+                )));
+            }
+        };
+        // The origin decides the provenance the user sees and the verification
+        // the entry starts in: an evidence-backed entry is `EvidenceCurrent`,
+        // everything else is `UserConfirmed`. Both are entries a user could
+        // legitimately have confirmed; the instruction shape is allowed only
+        // because `UserRequest` is the trusted origin (spec 29 §5.3).
+        let (origin, evidence) = match &seed.evidence_path {
+            Some(path) => (
+                ProposalOrigin::RepositoryObservation {
+                    session_id: SEED_ORIGIN_SESSION.to_string(),
+                },
+                vec![evidence_ref_for(root, path)?],
+            ),
+            None => (
+                ProposalOrigin::UserRequest {
+                    session_id: SEED_ORIGIN_SESSION.to_string(),
+                    message_id: SEED_ORIGIN_MESSAGE.to_string(),
+                },
+                Vec::new(),
+            ),
+        };
+        let proposal = MemoryProposal::new(
+            seed.scope,
+            seed.category,
+            seed.statement.clone(),
+            origin,
+            evidence,
+            None,
+        );
+        let confirmation = UserConfirmation::new(proposal.id.clone());
+        let entry = proposal.confirm(
+            confirmation,
+            store.proposal_gate(root, entry_identity.as_ref()),
+        )?;
+        let stored = store.insert(root, entry_identity.as_ref(), entry)?;
+        seeded.push(SeededMemoryEntry {
+            id: stored.id,
+            statement: stored.statement,
+            identity: entry_identity,
+        });
+    }
+    Ok(seeded)
+}
+
+/// The declared seed a scenario names by statement, or a clear error.
+fn seeded_entry<'a>(
+    seeded: &'a [SeededMemoryEntry],
+    statement: &str,
+) -> Result<&'a SeededMemoryEntry> {
+    seeded
+        .iter()
+        .find(|entry| entry.statement == statement)
+        .ok_or_else(|| {
+            ClientError::InvalidInput(format!("no seed_memory statement matches {statement:?}"))
+        })
+}
+
+/// A run's recall counts, from the store and the run's own output (spec 30
+/// Task 6, context.md C11).
+///
+/// **Proxy, deliberately.** "Useful" means a statement term reappeared in the
+/// answer or in a file the run changed. That is evidence the memory was not
+/// inert; it is not proof the agent acted on it, and it cannot see a memory the
+/// model correctly ignored. The correction half is C11's: an entry the user
+/// removed from the review, or one edited or superseded during the run. A
+/// verification transition and a world-state deletion are lifecycle events, not
+/// corrections of what the user was shown, so they are not counted. The phase's
+/// real validation is the elapsed-time observation in the proposal's §7.
+fn memory_counts(
+    data_dir: &Path,
+    root: &Path,
+    recalled: &HashSet<String>,
+    corrected: &HashSet<String>,
+    response: &str,
+    files_changed: &[String],
+) -> MemoryRecallCounts {
+    if recalled.is_empty() {
+        return MemoryRecallCounts::default();
+    }
+    let statements = memory_statements(data_dir);
+    let mut haystack = content_terms(response);
+    for path in files_changed {
+        if let Ok(text) = std::fs::read_to_string(root.join(path)) {
+            haystack.extend(content_terms(&text));
+        }
+    }
+    let useful = recalled
+        .iter()
+        .filter(|id| {
+            statements.get(*id).is_some_and(|statement| {
+                let terms = content_terms(statement);
+                !terms.is_empty() && terms.iter().any(|term| haystack.contains(term))
+            })
+        })
+        .count() as u64;
+    MemoryRecallCounts {
+        recalled: recalled.len() as u64,
+        useful,
+        corrected: recalled.intersection(corrected).count() as u64,
+    }
+}
+
+/// Every stored memory statement, keyed by entry id, across project files, the
+/// user file and session logs.
+///
+/// Read from the store rather than from the audit: the manifest and every audit
+/// event are deliberately content-free (spec 30 C3), so the statement is only
+/// available where the user's store keeps it. Later records win, which is how
+/// the append-only format expresses an edit or a state change.
+fn memory_statements(data_dir: &Path) -> HashMap<String, String> {
+    let mut statements = HashMap::new();
+    let memory = data_dir.join("memory");
+    if let Ok(entries) = std::fs::read_dir(memory.join("project")) {
+        for entry in entries.flatten() {
+            read_memory_lines(&entry.path(), &mut statements);
+        }
+    }
+    read_memory_lines(&memory.join("user.jsonl"), &mut statements);
+
+    // Session-scope entries live in the session log as `memory_recorded` rows.
+    if let Ok(entries) = std::fs::read_dir(data_dir.join("sessions")) {
+        for entry in entries.flatten() {
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            for line in text.lines() {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if value.get("eventType").and_then(|kind| kind.as_str()) != Some("memory_recorded")
+                {
+                    continue;
+                }
+                if let Some(payload) = value.get("payload")
+                    && let Some((id, statement)) = memory_record(payload)
+                {
+                    statements.insert(id, statement);
+                }
+            }
+        }
+    }
+    statements
+}
+
+fn read_memory_lines(path: &Path, statements: &mut HashMap<String, String>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if let Some((id, statement)) = memory_record(&value) {
+            statements.insert(id, statement);
+        }
+    }
+}
+
+fn memory_record(value: &serde_json::Value) -> Option<(String, String)> {
+    let id = value.get("id")?.as_str()?.to_string();
+    let statement = value.get("statement")?.as_str()?.to_string();
+    Some((id, statement))
+}
+
+/// Terms a statement or an answer is scored on.
+///
+/// A copy of the recall tokeniser's shape, not a shared function: the engine
+/// keeps `tokenize` crate-private on purpose (spec 30 C1), and widening the
+/// production API for an eval proxy is the wrong trade. Same separators and the
+/// same common-word filter, so a statement made only of `the`/`project` does not
+/// count as useful merely because the answer said "the project".
+fn content_terms(text: &str) -> BTreeSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "a", "about", "after", "again", "all", "also", "an", "and", "any", "are", "as", "at", "be",
+        "because", "been", "before", "being", "between", "both", "but", "by", "can", "could",
+        "did", "do", "does", "done", "down", "during", "each", "every", "for", "from", "further",
+        "had", "has", "have", "here", "how", "i", "if", "in", "into", "is", "it", "its", "just",
+        "may", "me", "might", "more", "most", "must", "my", "no", "nor", "not", "of", "off", "on",
+        "once", "only", "or", "other", "our", "out", "over", "own", "project", "projects", "same",
+        "shall", "should", "so", "some", "such", "than", "that", "the", "their", "them", "then",
+        "there", "these", "they", "this", "those", "through", "to", "too", "under", "up", "us",
+        "use", "used", "uses", "using", "very", "was", "we", "were", "what", "when", "where",
+        "which", "who", "why", "will", "with", "within", "without", "would", "you", "your",
+    ];
+    let mut terms = BTreeSet::new();
+    let mut current = String::new();
+    let mut push = |current: &mut String| {
+        let term = current.trim_end_matches(['.', '/']).to_ascii_lowercase();
+        current.clear();
+        if term.len() > 1 && !STOP_WORDS.contains(&term.as_str()) {
+            terms.insert(term);
+        }
+    };
+    // The cap keeps a pathological file from making an eval run quadratic; a
+    // fixture file that matters is far below it.
+    for character in text
+        .chars()
+        .take(1_000_000)
+        .flat_map(|character| character.to_lowercase())
+    {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '$' | '/' | '-') {
+            current.push(character);
+        } else if !current.is_empty() {
+            push(&mut current);
+        }
+    }
+    if !current.is_empty() {
+        push(&mut current);
+    }
+    terms
+}
+
 /// Drives one turn and builds its record. Shared by both tiers so there is one
 /// implementation of "what a run record means" rather than two that drift.
 #[allow(clippy::too_many_arguments)]
@@ -540,7 +855,15 @@ fn drive(
     // long enough to compact, and `compact_before_prompt` runs the public
     // manual path before the ask. The compaction consumes the first scripted
     // turn, which a scenario therefore writes as its narrative reply.
-    let seeded_session = if !scenario.seed_conversation.is_empty() || scenario.compact_before_prompt
+    //
+    // Spec 30 Task 6 adds two more reasons to create the session up front: a
+    // scenario that sets a working mode needs a session to set it on, and a
+    // seeded-memory deletion needs the paused review's session to still be the
+    // one the resumed send uses.
+    let seeded_entries = seed_memory(engine, &materialized.root, scenario)?;
+    let seeded_session = if !scenario.seed_conversation.is_empty()
+        || scenario.compact_before_prompt
+        || scenario.mode.is_some()
     {
         let repository_id = engine
             .indexer
@@ -549,6 +872,11 @@ fn drive(
         let session = engine
             .session_store
             .create_session(&repository_id, &scenario.prompt)?;
+        if let Some(mode) = scenario.mode {
+            engine
+                .session_store
+                .set_session_mode(&session.id, mode, "eval-harness")?;
+        }
         for message in &scenario.seed_conversation {
             engine.session_store.append_message(
                 &session.id,
@@ -569,6 +897,15 @@ fn drive(
     } else {
         None
     };
+    // Spec 30 Task 6: a file changed after its memory was stored is what makes
+    // the entry stale. Written here, after seeding and before the turn, so recall
+    // compares the recorded hash with the new content.
+    if let Some((path, content)) = &scenario.modify_after_memory_seed {
+        let target = materialized.root.join(path);
+        std::fs::write(&target, content).map_err(|error| {
+            ClientError::Io(format!("{}: seed change: {error}", target.display()))
+        })?;
+    }
     let outcome = engine.chat_orchestrator.ask_with_session_with_options(
         &materialized.root,
         &scenario.prompt,
@@ -596,6 +933,114 @@ fn drive(
     // the denied path is exercised end to end rather than stopping at the
     // proposal.
     let mut resumed = None;
+    // Spec 30 Task 6's metric inputs. Distinct ids, because one entry recalled
+    // twice in a session is one observation for a rate. The review rows are
+    // captured before the review is amended: an entry the user removes, or the
+    // world deletes before the send, was still recalled into the review and
+    // belongs in the denominator.
+    let mut recalled_ids: HashSet<String> = HashSet::new();
+    let mut corrected_ids: HashSet<String> = HashSet::new();
+    if !scenario.delete_recalled_memory_before_send.is_empty()
+        || !scenario.remove_recalled_memory_before_send.is_empty()
+    {
+        let review = outcome
+            .as_ref()
+            .ok()
+            .and_then(|result| result.context_review.as_ref())
+            .ok_or_else(|| {
+                ClientError::InvalidInput(format!(
+                    "{}: a before-send memory mutation requires a paused context review; set \
+                     `pause_for_context_review = true` in config_overlay",
+                    scenario.name
+                ))
+            })?;
+        recalled_ids.extend(
+            review
+                .manifest
+                .memory
+                .iter()
+                .map(|row| row.entry_id.clone()),
+        );
+        // Indices in `manifest.included`, not in `manifest.memory`: the review's
+        // removal route addresses items, and every memory item is pathless with
+        // the same kind, so only its position identifies it.
+        let mut removals: Vec<usize> = Vec::new();
+        for statement in &scenario.remove_recalled_memory_before_send {
+            let entry = seeded_entry(&seeded_entries, statement)?;
+            let position = review
+                .manifest
+                .memory
+                .iter()
+                .position(|row| row.entry_id == entry.id)
+                .ok_or_else(|| {
+                    ClientError::InvalidInput(format!(
+                        "{}: {statement:?} was not recalled, so it cannot be removed from the review",
+                        scenario.name
+                    ))
+                })?;
+            let item_index = review
+                .manifest
+                .included
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.category == ContextCategory::Memory)
+                .nth(position)
+                .map(|(index, _)| index)
+                .ok_or_else(|| {
+                    ClientError::InvalidInput(format!(
+                        "{}: the review manifest has no item for {statement:?}",
+                        scenario.name
+                    ))
+                })?;
+            removals.push(item_index);
+            corrected_ids.insert(entry.id.clone());
+        }
+        // Highest index first, so an earlier removal cannot shift a later one.
+        removals.sort_unstable_by(|left, right| right.cmp(left));
+        for index in removals {
+            engine
+                .chat_orchestrator
+                .remove_context_item(&review.id, index)?;
+        }
+        for statement in &scenario.delete_recalled_memory_before_send {
+            let entry = seeded_entry(&seeded_entries, statement)?;
+            if !review
+                .manifest
+                .memory
+                .iter()
+                .any(|row| row.entry_id == entry.id)
+            {
+                return Err(ClientError::InvalidInput(format!(
+                    "{}: {statement:?} was not recalled, so it cannot be deleted before the send",
+                    scenario.name
+                )));
+            }
+            engine
+                .memory_store
+                .mark_state(entry.target(), &entry.id, MemoryState::Deleted)?;
+            // Not a correction under C11: the world changed, the user did not
+            // correct what the review showed. It stays in the denominator
+            // because it was recalled into the review.
+        }
+
+        let cancel = CancelToken::new();
+        let mut on_resume_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_resume_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        resumed = Some(engine.chat_orchestrator.resume_after_context_decision(
+            &review.id,
+            ContextDecision::Send,
+            "eval-harness",
+            adapter,
+            &mut sink,
+        ));
+    }
+
     if let Some(approved) = scenario.approval_decision
         && let Some(proposal) = &original_command_proposal
     {
@@ -925,6 +1370,24 @@ fn drive(
     }
     run_record.files_changed = files_changed;
 
+    // Spec 30 Task 6: the audit is the source for what the model was actually
+    // sent, so a `memory_recalled` event is the recall observation. C11's
+    // correction half is narrower than "anything that changed": an edit or a
+    // supersede is a correction of what was recalled; a plain state change or a
+    // verification transition is not, and is left out.
+    for event in trace.of_type("memory_recalled") {
+        if let Some(id) = event.field("entryId") {
+            recalled_ids.insert(id.to_string());
+        }
+    }
+    for event_type in ["memory_edited", "memory_superseded"] {
+        for event in trace.of_type(event_type) {
+            if let Some(id) = event.field("entryId") {
+                corrected_ids.insert(id.to_string());
+            }
+        }
+    }
+
     // Spec 62 §5.5: the prompt's deciding cause is the first name in the
     // event's `causes` field, which `validation.rs::store_proposal` writes in
     // classifier order. Empty for a proposal that ran without asking, so
@@ -1130,6 +1593,14 @@ fn drive(
         })
     });
     run_record.sanitize(scanner);
+    run_record.memory = memory_counts(
+        &materialized.data_dir,
+        &materialized.root,
+        &recalled_ids,
+        &corrected_ids,
+        &response,
+        &run_record.files_changed,
+    );
 
     // Read from the log rather than from the scripted replies: a scenario that
     // claims a compaction happened is checked against what the engine wrote.
@@ -1171,6 +1642,8 @@ fn drive(
         conversation_compactions,
         compaction_facts_only,
         stub_requests: 0,
+        request: None,
+        system_prompt: None,
         trace,
     })
 }

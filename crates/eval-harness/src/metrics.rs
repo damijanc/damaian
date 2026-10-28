@@ -55,10 +55,11 @@ impl MetricSet {
     ///
     /// Sixteen keys for §5.6's fifteen rows. Latency is one row reported as two
     /// values (median and p90, as that row itself asks for), and the two memory
-    /// rows are kept separate even though both carry the same
-    /// `notApplicable: "phase-3b"` marker — merging them would leave one of the
-    /// spec's named measures absent from the output, which is the exact failure
-    /// requirement 5 guards against.
+    /// rows are kept separate rather than merged into one, because merging
+    /// would leave one of the spec's named measures absent from the output,
+    /// which is the exact failure requirement 5 guards against. Both are
+    /// measured proxies from spec 30 Task 6 — not the phase-3b placeholders
+    /// they were when this set was first written.
     ///
     /// The next four are spec 21's plan rows, then spec 49's
     /// `cache_hit_rate`, spec 63's `exploration_findings`, and spec 62's
@@ -345,19 +346,26 @@ impl MetricSet {
                 ),
             },
         );
+        // Spec 30 Task 6, context.md C11. Both are proxies and the labels say
+        // so: "useful" is a statement term reappearing in the answer or a file
+        // the run changed, and "corrected" is an entry the user removed from the
+        // review or that was superseded or edited in the run. Neither can prove
+        // the agent acted on a memory, and the phase's real validation is the
+        // elapsed-time observation (spec 30 §7).
+        let recalled: u64 = runnable.iter().map(|record| record.memory.recalled).sum();
+        let useful: u64 = runnable.iter().map(|record| record.memory.useful).sum();
+        let corrected: u64 = runnable.iter().map(|record| record.memory.corrected).sum();
         push(
             "memory_recall_usefulness",
-            "Memory recall usefulness",
-            MetricValue::NotApplicable {
-                phase: "phase-3b".to_string(),
-            },
+            "Memory recall usefulness (proxy: recalled entries whose terms reappear in the answer \
+             or a changed file)",
+            rate_or_no_data(useful as usize, recalled as usize, "no-recalled-memory"),
         );
         push(
             "memory_correction_rate",
-            "Memory correction and stale rate",
-            MetricValue::NotApplicable {
-                phase: "phase-3b".to_string(),
-            },
+            "Memory correction and stale rate (proxy: recalled entries removed, edited or \
+             superseded)",
+            rate_or_no_data(corrected as usize, recalled as usize, "no-recalled-memory"),
         );
 
         // Spec 21 §5.6, counted only over runs that actually produced a plan.

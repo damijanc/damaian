@@ -253,14 +253,23 @@ explicit. Every row of the roadmap's metric set, and where its value comes from:
 | Provider cost | Live tier only. `null` in the deterministic tier |
 | Manual repair rate | **Not machine-derivable.** A human-entered field in the baseline, defined as tasks needing correction after completion, recorded from live-tier runs with the sample size stated |
 | Patch acceptance rate | Accepted files and hunks over proposed, from live-tier runs where a human accepted |
-| Memory recall usefulness | `notApplicable: "phase-3b"` |
-| Memory correction / stale rate | `notApplicable: "phase-3b"` |
+| Memory recall usefulness | A measured proxy (spec 30 §5.8, `context.md` C11): of the entries a run recalled, the share whose statement terms reappear in the final answer or in a file the run changed. It cannot prove the agent acted on a memory, and the phase's real validation is the elapsed-time observation in spec 30 §7 |
+| Memory correction / stale rate | A measured proxy (spec 30 §5.8, `context.md` C11): of the entries a run recalled, the share the user removed from the review or that were edited or superseded during the run. A measured zero is a real value: nothing was corrected |
 
 Two rows are honest exceptions rather than gaps. Manual repair rate and patch
 acceptance rate both require a human decision as their input; the harness cannot
 synthesise one, and a machine-generated value for either would be a fiction
 compared against in later phases. They are recorded with an explicit
 `source: "human"` and a sample size, or `null` with a reason — never computed.
+
+The two memory rows are **proxies**, not the phase-3b validation. Spec 30 §5.8
+asks for them so retrieval quality has a number that moves, but the definitions
+in its `context.md` C11 are deliberately mechanical: term reappearance cannot
+tell "the agent used this" from "the answer happened to contain the same word",
+and a correction is an observable lifecycle event rather than a judgement about
+whether the memory was wrong. The phase's actual validation is the elapsed-time
+observation across real repositories in spec 30 §7; a poor proxy there is
+evidence to investigate, not a decision by itself.
 
 ### 5.7 Output and baseline
 

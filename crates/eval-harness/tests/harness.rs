@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use eval_harness::assertions;
 use eval_harness::metrics::{MetricSet, MetricValue};
 use eval_harness::record::{
-    AssertionOutcome, CacheUsage, FindingsByPurpose, PurposeTally, RecordedApproval, RecordedPlan,
-    RecordedRecovery, RecordedToolCall, RunRecord, Tokens,
+    AssertionOutcome, CacheUsage, FindingsByPurpose, MemoryRecallCounts, PurposeTally,
+    RecordedApproval, RecordedPlan, RecordedRecovery, RecordedToolCall, RunRecord, Tokens,
 };
 use eval_harness::report;
 use eval_harness::scenario::{self, Tier};
@@ -635,6 +635,112 @@ fn retrieval_scenarios_pass() {
     }
 }
 
+/// Spec 30 §5.8: the retrieval and injection claims, one scenario each. The
+/// tier test below also runs them; naming them here means a regression reports
+/// the claim it broke rather than only a failing file.
+#[test]
+fn memory_recall_scenarios_pass() {
+    for name in [
+        "memory_instruction_shaped_still_requires_approval",
+        "memory_does_not_widen_ask_mode",
+        "memory_does_not_outrank_instructions",
+        "memory_staleness_is_marked",
+        "memory_deleted_before_send",
+        "memory_project_isolation",
+        "memory_user_scope_off",
+    ] {
+        let (_run, results) = run_and_evaluate(name);
+        assert_all_passed(name, &results);
+    }
+}
+
+/// A new assertion is only worth having if it can fail. The request assertions
+/// read a rendered string, so the cheapest proof they are not vacuous is to ask
+/// for a marker that is deliberately absent and to reverse a deliberately
+/// ordered pair.
+#[test]
+fn the_request_assertions_fail_when_their_claim_is_false() {
+    let (run, _) = run_and_evaluate("memory_staleness_is_marked");
+    let absent = scenario::Asserts {
+        request_contains: Some(vec!["a sentence no scenario wrote".to_string()]),
+        ..Default::default()
+    };
+    let results = assertions::evaluate(&run, &absent, Tier::Deterministic, &[]);
+    assert!(
+        !results[0].passed,
+        "request_contains passed on a marker that is not in the request"
+    );
+
+    let (run, _) = run_and_evaluate("memory_does_not_outrank_instructions");
+    let reversed = scenario::Asserts {
+        request_precedes: Some((
+            "--- memory ---".to_string(),
+            "--- agent_instruction: AGENTS.md ---".to_string(),
+        )),
+        ..Default::default()
+    };
+    let results = assertions::evaluate(&run, &reversed, Tier::Deterministic, &[]);
+    assert!(
+        !results[0].passed,
+        "request_precedes passed with the two markers in the wrong order"
+    );
+}
+
+/// The recall count is an exact count, not a boolean, so a run that recalled
+/// nothing cannot satisfy a scenario expecting one entry.
+#[test]
+fn the_recall_count_is_not_satisfied_by_zero() {
+    let (run, _) = run_and_evaluate("one_file_patch");
+    let asserts = scenario::Asserts {
+        memory_recalls: Some(1),
+        ..Default::default()
+    };
+    let results = assertions::evaluate(&run, &asserts, Tier::Deterministic, &[]);
+    assert!(
+        !results[0].passed,
+        "a memory_recalls assertion passed without a recall"
+    );
+}
+
+/// The seeding boundary refuses declarations that could only fail later or
+/// pass without measuring the claim: an evidence path outside project scope, a
+/// forbidden session seed, and a deletion naming no seed.
+#[test]
+fn the_loader_refuses_a_seeded_memory_that_could_not_mean_what_it_says() {
+    let dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+    let base =
+        "name = \"a\"\nfixture = \"memory-recall\"\ntier = \"deterministic\"\nprompt = \"p\"\n";
+    let write = |body: &str| {
+        let path = dir.join(format!("seed-{}.toml", body.len()));
+        std::fs::write(&path, body).expect("write");
+        path
+    };
+    for (label, body) in [
+        (
+            "user-scoped evidence",
+            format!(
+                "{base}[[seed_memory]]\nstatement = \"x\"\nscope = \"user\"\nevidence_path = \"README.md\"\n"
+            ),
+        ),
+        (
+            "session-scoped seed",
+            format!("{base}[[seed_memory]]\nstatement = \"x\"\nscope = \"session\"\n"),
+        ),
+        (
+            "a deletion naming no seed",
+            format!("{base}delete_recalled_memory_before_send = [\"never declared\"]\n"),
+        ),
+        (
+            "a staleness hook over no evidence",
+            format!(
+                "{base}modify_after_memory_seed = {{ path = \"README.md\", content = \"x\" }}\n"
+            ),
+        ),
+    ] {
+        scenario::load(&write(&body)).expect_err(&format!("{label} must be refused"));
+    }
+}
+
 /// The mechanism note in conceptual_feature.toml is load-bearing: if semantic
 /// search ever becomes the deterministic default, the note is wrong and this
 /// test says so.
@@ -1222,10 +1328,11 @@ fn a_blocked_scenario_is_still_skipped_and_says_why() {
 }
 
 /// Guards the count in spec 18 §6, now that spec 17 has landed: every scenario
-/// runs and none is blocked. Twenty-eight: spec 59 added `long_discovery` and
+/// runs and none is blocked. Forty-seven: spec 59 added `long_discovery` and
 /// `read_loop`, spec 62 added `approval_causes`, spec 50 added
 /// `answered_question`, spec 23 added `verified_repair` and
-/// `repair_limit_exhausted`, and spec 66 added `plan_left_open`.
+/// `repair_limit_exhausted`, spec 66 added `plan_left_open`, and spec 30 added
+/// seven memory-recall scenarios.
 #[test]
 fn every_scenario_runs_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
@@ -1242,9 +1349,10 @@ fn every_scenario_runs_and_none_is_blocked() {
     );
     assert_eq!(
         all.len(),
-        40,
-        "forty scenarios should run: the two compaction scenarios, six memory-consent \
-         scenarios, three external-reference injection scenarios, and the live injection twin"
+        47,
+        "forty-seven scenarios should run: the two compaction scenarios, thirteen memory \
+         scenarios (six consent, seven recall), three external-reference injection scenarios, and \
+         the live injection twin"
     );
 }
 
@@ -1433,14 +1541,36 @@ fn the_human_sourced_metrics_are_never_computed() {
     }
 }
 
+/// Spec 30 Task 6 replaced the two phase-3b placeholders with measured proxies.
+/// A run that recalled nothing reports no data rather than a fabricated zero;
+/// a run with observations reports the share the record actually carries.
 #[test]
-fn the_memory_metrics_name_the_phase_that_will_supply_them() {
-    let set = MetricSet::compute(&[]);
+fn the_memory_metrics_report_the_counts_the_run_recorded() {
+    let none = MetricSet::compute(&[]);
     for key in ["memory_recall_usefulness", "memory_correction_rate"] {
-        match &set.get(key).expect(key).value {
-            MetricValue::NotApplicable { phase } => assert_eq!(phase, "phase-3b"),
-            other => panic!("{key} should be notApplicable, got {other:?}"),
+        match &none.get(key).expect(key).value {
+            MetricValue::NotApplicable { phase } => {
+                assert_eq!(phase, "no-recalled-memory", "{key}")
+            }
+            other => panic!("{key} with no recalls must be notApplicable, got {other:?}"),
         }
+    }
+
+    let mut record = RunRecord::new("a", "1", "deterministic", "mock", "mock");
+    record.memory = MemoryRecallCounts {
+        recalled: 4,
+        useful: 2,
+        corrected: 1,
+    };
+    let set = MetricSet::compute(&[record]);
+
+    match &set.get("memory_recall_usefulness").expect("metric").value {
+        MetricValue::Number { value } => assert_eq!(*value, 0.5),
+        other => panic!("expected a measured rate, got {other:?}"),
+    }
+    match &set.get("memory_correction_rate").expect("metric").value {
+        MetricValue::Number { value } => assert_eq!(*value, 0.25),
+        other => panic!("expected a measured rate, got {other:?}"),
     }
 }
 
@@ -1532,8 +1662,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        39,
-        "all thirty-nine deterministic scenario files should be accounted for; the live \
+        46,
+        "all forty-six deterministic scenario files should be accounted for; the live \
          injection twin is credential-gated"
     );
     assert_eq!(
@@ -1554,8 +1684,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
 
     // Spec 29 §5.8's invariant over the full run, checked here rather than in a
-    // scenario: no scenario confirms a proposal, so every record must report
-    // zero stored memory entries.
+    // scenario: no scenario confirms a proposal through the model, so every
+    // record must report exactly the entries its own `seed_memory` declared.
     let invariants: Vec<&eval_harness::record::AssertionOutcome> = built
         .records
         .iter()

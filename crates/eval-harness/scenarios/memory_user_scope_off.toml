@@ -1,0 +1,25 @@
+name = "memory_user_scope_off"
+fixture = "memory-recall"
+tier = "deterministic"
+prompt = "What indentation should I use?"
+
+# The user entry was stored while user scope was on; this run has it off, the
+# default. The project entry proves the prompt did match something, so a zero
+# recall cannot pass by accident.
+[[seed_memory]]
+statement = "The user prefers tab indentation."
+category = "preference"
+scope = "user"
+
+[[seed_memory]]
+statement = "Indentation in this repository uses four spaces."
+category = "convention"
+
+[[turn]]
+content = "Use four spaces for indentation; your personal preference is not used while user scope is off."
+
+[assert]
+memory_recalls = 1
+request_contains = ["Indentation in this repository uses four spaces."]
+request_excludes = ["The user prefers tab indentation."]
+deterministic_only = ["memory_recalls", "request_contains", "request_excludes"]

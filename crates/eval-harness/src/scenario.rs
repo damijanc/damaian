@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use workspace_engine::{ClientError, ConfigOverlay, Result};
+use workspace_engine::{
+    ClientError, ConfigOverlay, MemoryCategory, MemoryScope, Result, SessionMode,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -98,6 +100,47 @@ pub struct SeedMessage {
 pub struct SeedFile {
     pub path: String,
     pub content: String,
+}
+
+/// One confirmed memory entry written into the run's store before the turn
+/// starts (spec 30 Task 6).
+///
+/// Seeding goes through [`workspace_engine::MemoryProposal::confirm`] and
+/// [`workspace_engine::MemoryStore::insert`], the production confirmation path,
+/// rather than writing the JSONL by hand. A scenario therefore starts from the
+/// same state a user's earlier confirmation would have left, including the
+/// evidence hash and the derived sensitivity.
+///
+/// A statement that reads like an instruction is allowed here only because the
+/// origin is the user's own request. That is the entry the injection scenarios
+/// need: one the user legitimately confirmed, which must still not function as
+/// an instruction when recalled.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct SeedMemory {
+    pub statement: String,
+    #[serde(default = "default_memory_category")]
+    pub category: MemoryCategory,
+    #[serde(default = "default_memory_scope")]
+    pub scope: MemoryScope,
+    /// A repository-relative file the entry was derived from. Set makes the
+    /// entry a `RepositoryEvidence` proposal, whose hash is what staleness
+    /// compares. Unset makes it a user-requested entry.
+    #[serde(default)]
+    pub evidence_path: Option<String>,
+    /// Store the entry under this project key instead of the repository's own
+    /// identity. Used only to plant another project's memory and prove recall
+    /// cannot see it.
+    #[serde(default)]
+    pub project_key: Option<String>,
+}
+
+fn default_memory_category() -> MemoryCategory {
+    MemoryCategory::Fact
+}
+
+fn default_memory_scope() -> MemoryScope {
+    MemoryScope::Project
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -238,6 +281,32 @@ pub struct Asserts {
     pub memory_absent: Option<Vec<String>>,
     /// Strings the audit log must contain, such as a refusal reason.
     pub memory_audit_contains: Option<Vec<String>>,
+    /// Exactly how many `memory_recalled` audit events the run wrote (spec 30
+    /// Task 6). One per entry the model was actually sent, so a run that
+    /// assembled a memory and then dropped it reads zero. Counted rather than
+    /// asserted as a boolean so "the wrong entry was recalled" and "nothing was
+    /// recalled" are distinguishable in the report.
+    pub memory_recalls: Option<u64>,
+    /// Strings the first model request's rendered context must contain.
+    ///
+    /// Unlike `context_contains`, which matches repository paths, this reads the
+    /// text the model actually received, so it can assert a frame sentence, a
+    /// memory statement or an instruction. Read from the mock adapter's
+    /// recorded request, so it is scripted: list it in `deterministic_only`.
+    pub request_contains: Option<Vec<String>>,
+    /// Strings that first request must not contain. This is the exclusion half:
+    /// a deleted, isolated or scope-disabled entry must be absent from the
+    /// rendered text, not merely absent from the manifest.
+    pub request_excludes: Option<Vec<String>>,
+    /// Strings the first request's system message must not contain. A memory
+    /// that reached the system prompt would be an instruction rather than data,
+    /// so this is the mechanical half of "memory does not outrank" (spec 30
+    /// §5.2).
+    pub request_system_excludes: Option<Vec<String>>,
+    /// Two markers that must appear in the first request in this order. Used to
+    /// prove a lower-priority delivery path: an instruction block before the
+    /// memory block, for example.
+    pub request_precedes: Option<(String, String)>,
     /// How many HTTP requests the scenario's loopback page server received
     /// (spec 51 Task 9). An exact count, not an upper bound: the claim a fetch
     /// scenario makes is "nothing left the machine", and zero is the answer
@@ -325,6 +394,25 @@ pub struct Scenario {
     /// prove the file is still index-resident, because the index is built after
     /// these writes.
     pub seed_files: Vec<SeedFile>,
+    /// Confirmed memory entries written into the store before the turn (spec 30
+    /// Task 6). This is the state a user's earlier recall left behind; seeding
+    /// is the only way a deterministic scenario can exercise retrieval without
+    /// clicking Confirm.
+    pub seed_memory: Vec<SeedMemory>,
+    /// A file and new content written *after* the seeded memories were stored,
+    /// which is how the staleness scenario makes an evidence hash differ without
+    /// reaching into the store. Analogous to `modify_after_proposal`.
+    pub modify_after_memory_seed: Option<(String, String)>,
+    /// The session's working mode, set before the turn. `None` keeps the
+    /// default, Code (spec 20 §5.4).
+    pub mode: Option<SessionMode>,
+    /// Seeded memory statements deleted after context assembly and before the
+    /// resumed send. Requires `pause_for_context_review`; used by the
+    /// deleted-before-send scenario.
+    pub delete_recalled_memory_before_send: Vec<String>,
+    /// Seeded memory statements the user removes from the paused review. The
+    /// entry is not deleted; it leaves this request only.
+    pub remove_recalled_memory_before_send: Vec<String>,
     /// Whether to compact the seeded conversation before the ask.
     pub compact_before_prompt: bool,
     /// Config this run needs beyond the defaults, in the same `key=value` form
@@ -386,6 +474,18 @@ struct RawScenario {
     /// Files written after the baseline commit, never committed.
     #[serde(default)]
     seed_files: Vec<SeedFile>,
+    /// Confirmed entries written before the turn (spec 30 Task 6).
+    #[serde(default, rename = "seed_memory")]
+    seed_memory: Vec<SeedMemory>,
+    #[serde(default)]
+    modify_after_memory_seed: Option<ModifyAfterProposal>,
+    /// The session's working mode before the turn.
+    #[serde(default)]
+    mode: Option<SessionMode>,
+    #[serde(default)]
+    delete_recalled_memory_before_send: Vec<String>,
+    #[serde(default)]
+    remove_recalled_memory_before_send: Vec<String>,
     /// Compact the seeded conversation before the first ask, through the same
     /// public path the manual control uses. The compaction consumes the first
     /// scripted `[[turn]]`, which is therefore its narrative reply.
@@ -554,6 +654,14 @@ pub fn load(path: &Path) -> Result<Scenario> {
         }
     }
 
+    validate_seeded_memory(
+        path,
+        &raw.seed_memory,
+        raw.modify_after_memory_seed.as_ref(),
+        &raw.delete_recalled_memory_before_send,
+        &raw.remove_recalled_memory_before_send,
+    )?;
+
     Ok(Scenario {
         name: raw.name,
         fixture: raw.fixture,
@@ -572,6 +680,13 @@ pub fn load(path: &Path) -> Result<Scenario> {
         follow_up_prompt: raw.follow_up_prompt,
         seed_conversation: raw.seed_conversation,
         seed_files: raw.seed_files,
+        seed_memory: raw.seed_memory,
+        modify_after_memory_seed: raw
+            .modify_after_memory_seed
+            .map(|change| (change.path, change.content)),
+        mode: raw.mode,
+        delete_recalled_memory_before_send: raw.delete_recalled_memory_before_send,
+        remove_recalled_memory_before_send: raw.remove_recalled_memory_before_send,
         compact_before_prompt: raw.compact_before_prompt,
         config_overlay: match raw.config_overlay {
             Some(text) => Some(ConfigOverlay::parse(&text).map_err(|error| {
@@ -585,6 +700,74 @@ pub fn load(path: &Path) -> Result<Scenario> {
         turns,
         asserts: raw.asserts,
     })
+}
+
+/// Refuses a seeded-memory declaration that could not mean what it says.
+///
+/// These are boundary errors rather than runtime surprises: a scope that cannot
+/// carry an evidence path, a deletion naming a statement no seed contains, or a
+/// staleness hook whose path no seed observed would all leave a scenario
+/// passing while measuring nothing.
+fn validate_seeded_memory(
+    path: &Path,
+    seeds: &[SeedMemory],
+    modify_after_memory_seed: Option<&ModifyAfterProposal>,
+    deleted: &[String],
+    removed: &[String],
+) -> Result<()> {
+    for seed in seeds {
+        if seed.scope == MemoryScope::Session {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: seed_memory statement {:?} is session-scoped, but a seed exists before the \
+                 turn creates its session",
+                path.display(),
+                seed.statement
+            )));
+        }
+        if seed.project_key.is_some() && seed.scope != MemoryScope::Project {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: seed_memory statement {:?} sets project_key but its scope is {:?}; only \
+                 project-scope memory carries a project key",
+                path.display(),
+                seed.statement,
+                seed.scope
+            )));
+        }
+        if seed.evidence_path.is_some() && seed.scope != MemoryScope::Project {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: seed_memory statement {:?} sets evidence_path but its scope is {:?}; only \
+                 project-scope memory can be repository-derived",
+                path.display(),
+                seed.statement,
+                seed.scope
+            )));
+        }
+    }
+    for (label, statements) in [("delete", deleted), ("remove", removed)] {
+        for statement in statements {
+            if !seeds.iter().any(|seed| &seed.statement == statement) {
+                return Err(ClientError::InvalidInput(format!(
+                    "{}: {label}_recalled_memory_before_send names {statement:?}, which is not a \
+                     declared seed_memory statement",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if let Some(change) = modify_after_memory_seed {
+        let observed = seeds
+            .iter()
+            .any(|seed| seed.evidence_path.as_deref() == Some(change.path.as_str()));
+        if !observed {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: modify_after_memory_seed names {:?}, but no seed_memory was derived from it, \
+                 so the change could not make anything stale",
+                path.display(),
+                change.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn value_contains_placeholder(value: &serde_json::Value) -> bool {

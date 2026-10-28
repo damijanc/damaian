@@ -124,11 +124,13 @@ directory, the audit log, or that a memory store exists.
   assertions are `memory_entries`, `memory_proposals`, `memory_user_entries`,
   `memory_absent` and `memory_audit_contains` (`scenario.rs:185–203`).
 - Six memory scenarios exist for spec 29. The fixtures live under
-  `crates/eval-harness/fixtures/memory-injection`.
-- `memory_recall_usefulness` and `memory_correction_rate` exist as metric keys
-  and are deliberately `notApplicable: "phase-3b"`
-  (`docs/specs/18_local_evaluation_harness/proposal.md:190`). This spec is what
-  fills them.
+  `crates/eval-harness/fixtures/memory-injection`. Task 6 adds seven recall
+  scenarios on a separate `memory-recall` fixture, because a recall scenario
+  starts from confirmed entries rather than from a proposal.
+- `memory_recall_usefulness` and `memory_correction_rate` exist as metric keys.
+  They were `notApplicable: "phase-3b"` placeholders when this spec was planned
+  (`docs/specs/18_local_evaluation_harness/proposal.md:190`); Task 6 fills them
+  (C18).
 
 ## 2. Corrections
 
@@ -439,6 +441,64 @@ scope is off, and a `Deleted` entry all resolve to `deleted` with no statement.
 Every resolved statement is passed through the secret scanner before it leaves
 the engine, because a memory file edited outside Damaian may hold a credential
 even though the store refuses one at write time (C13.2).
+
+**C18 — Task 6's plan named four harness files; the measurement seam reaches
+three more, and the harness needed a way to start from confirmed memory.**
+
+1. **A scenario had no way to begin with stored memory.** The harness never
+   clicks Confirm, so every existing memory scenario starts empty. Task 6 adds
+   `[[seed_memory]]`, which writes each declared entry through
+   `MemoryProposal::confirm` and `MemoryStore::insert` — the production
+   confirmation path — before the turn starts. A seed can be project- or
+   user-scoped, can carry an `evidence_path` (making it `RepositoryEvidence`
+   with a real content hash), and can name a `project_key` to plant another
+   project's entry for the isolation scenario. Session-scoped seeds are refused
+   at load: a session does not exist yet.
+2. **The scope-off state needs a store whose scope is on.** `insert` refuses a
+   user entry while the scope is disabled, so seeding builds a second
+   `MemoryStore` with `user_scope_enabled: true` and writes through it. The run's
+   engine keeps its configured switch (off by default), which is exactly the
+   "stored earlier, not read now" state the scenario needs. This is a seeding
+   boundary, not a runtime widening.
+3. **The `memory_unconfirmed_persistence` invariant had to become
+   seed-aware.** It was "zero stored entries, because no scenario confirms".
+   The expected count is now the scenario's declared seed count; anything more
+   is still an entry the user never saw. The check also had to count *distinct
+   ids* rather than JSONL lines: the store is append-only, so a verification
+   transition or a `Deleted` transition adds a record for an entry that already
+   existed. Counting lines made a stale entry read as a second unconfirmed one
+   (2 vs 1, and 3 vs 2) before this was fixed.
+4. **Deleted-before-send needs the harness to drive a context review.** No
+   scenario had used `pause_for_context_review`. The runner now resumes the
+   review after applying two scenario hooks: `remove_recalled_memory_before_send`
+   removes an item through `remove_context_item` (the user path) and
+   `delete_recalled_memory_before_send` marks the entry `Deleted` (the world
+   path). The removal also gives the correction metric its one real non-zero
+   observation, since that audit event carries a category but not an entry id.
+5. **The metrics need counts in the run record, not statements.** The statement
+   is deliberately absent from the manifest and the audit (C3), so the runner
+   reads it back from the store, computes the two aggregates, and records only
+   `recalled` / `useful` / `corrected` in `RunRecord.memory`. A baseline stays
+   content-free. `metrics.rs` sums those counts, and `metric` labels say
+   "proxy".
+6. **The request assertions read the mock adapter's first request.**
+   `request_contains`, `request_excludes`, `request_system_excludes` and
+   `request_precedes` are the only way to assert on the rendered text the model
+   received, which is what §5.8 requires for the staleness marker and what
+   "memory does not outrank" needs mechanically. They are deterministic-only;
+   a live provider records no request. `memory_recalls` reads the audit and works
+   in both tiers.
+7. **Files beyond the draft's list:** `crates/eval-harness/src/record.rs` (the
+   counts), `crates/eval-harness/src/lib.rs` (the seed-aware invariant),
+   `crates/eval-harness/tests/harness.rs` (scenario counts, metric tests, and
+   falsifiability tests), and the two spec-18 rows this task is required to
+   change. The draft's `fixtures/memory-recall/` was correct.
+8. **Observed values, deterministic tier, 2026-10-28:** usefulness 0.750 and
+   correction 0.125 over eight recalled-entry observations. The approval-pause
+   scenario contributes a non-useful observation because the turn has no final
+   answer, which is the proxy behaving as defined rather than a defect. The one
+   correction is the entry the user removes in the deleted-before-send review;
+   the other deletion is a world-state change, which C11 does not count.
 
 ## 3. Open questions for the owner
 

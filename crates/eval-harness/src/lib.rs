@@ -81,15 +81,21 @@ pub fn run_scenarios(scenarios: &[scenario::Scenario], tier: Tier) -> Result<rep
         if record.not_applicable.is_none() {
             record.assertions = assertions::evaluate(&run, &scenario.asserts, tier, &patch_paths);
             // Spec 29 §5.8's invariant is over the whole run, not one scenario:
-            // no scenario confirms a proposal, so any stored entry is an
-            // unconfirmed persistence bug. Kept as an assertion on every record
-            // so a future scenario that forgets its own check still fails.
+            // no scenario confirms a proposal through the model, so a stored
+            // entry is an unconfirmed persistence bug. Spec 30 Task 6 lets a
+            // scenario *declare* confirmed seeds, so the expected count is the
+            // scenario's own declaration. Anything beyond it is still a run
+            // that confirmed something the user never saw.
             let entries = assertions::memory_entry_count(&run);
+            let expected = scenario.seed_memory.len() as u64;
             record.assertions.push(crate::record::AssertionOutcome {
                 name: "memory_unconfirmed_persistence".to_string(),
-                passed: entries == 0,
+                passed: entries == expected,
                 skipped: false,
-                expected: "0 stored memory entries (no scenario confirms one)".to_string(),
+                expected: format!(
+                    "{expected} stored memory entr{} (the scenario's declared seeds)",
+                    if expected == 1 { "y" } else { "ies" }
+                ),
                 actual: format!(
                     "{entries} stored memory entr{}",
                     if entries == 1 { "y" } else { "ies" }

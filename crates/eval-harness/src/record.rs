@@ -167,6 +167,25 @@ pub struct AssertionOutcome {
     pub actual: String,
 }
 
+/// One run's memory-recall counts (spec 30 Task 6, context.md C11).
+///
+/// `recalled` counts distinct entries that reached the review or the model, so
+/// an entry recalled twice in a session is one observation. `useful` is the
+/// subset whose statement terms reappeared in the answer or in a file the run
+/// changed. `corrected` is the subset the user removed from the review or that
+/// was superseded or edited in the session (context.md C11).
+///
+/// Counts only: the statements stay in the store, and a baseline made of this
+/// record can never quote one. Both rates these feed are proxies (C11); the
+/// spec's real validation is the elapsed-time observation in §7.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRecallCounts {
+    pub recalled: u64,
+    pub useful: u64,
+    pub corrected: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRecord {
@@ -265,6 +284,10 @@ pub struct RunRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheUsage>,
     pub findings_by_purpose: FindingsByPurpose,
+    /// Spec 30 Task 6's recall counts. Counts only, so the record and the
+    /// baseline stay content-free; see [`MemoryRecallCounts`].
+    #[serde(default)]
+    pub memory: MemoryRecallCounts,
 }
 
 impl RunRecord {
@@ -312,6 +335,7 @@ impl RunRecord {
             native_tools: false,
             cache: None,
             findings_by_purpose: FindingsByPurpose::default(),
+            memory: MemoryRecallCounts::default(),
         }
     }
 
