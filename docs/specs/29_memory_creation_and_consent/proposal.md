@@ -16,7 +16,7 @@ and secret policy), section 7.8 (risk classification and approval), section 7.10
 memory sits below), [`20_working_modes/proposal.md`](../20_working_modes/proposal.md) (mode is a
 capability boundary memory cannot widen),
 [`28_memory_model_and_storage/proposal.md`](../28_memory_model_and_storage/proposal.md) (the record
-this spec creates), [`30_memory_retrieval_and_lifecycle.md`](../30_memory_retrieval_and_lifecycle.md).
+this spec creates), [`30_memory_retrieval_and_lifecycle/proposal.md`](../30_memory_retrieval_and_lifecycle/proposal.md).
 See also [`SECURITY.md`](../../../SECURITY.md).
 
 ## 1. Motivation
@@ -93,7 +93,7 @@ ignored file content, which the roadmap does not address at all.
   this phase's minimum slice.
 - Contradiction detection between entries — also WP3.
 - Retrieval and staleness —
-  [spec 30](../30_memory_retrieval_and_lifecycle.md).
+  [spec 30](../30_memory_retrieval_and_lifecycle/proposal.md).
 - Bulk confirmation of many suggestions in one action. §5.4 explains why.
 - Import as a creation path — WP3, and it carries its own untrusted-input rules.
 - A memory that can change mode, approval policy, or path policy. Requirement 5
@@ -253,7 +253,7 @@ an instruction-shaped memory in front of the user for confirmation. The patterns
 are recorded in §7.
 
 Requirement 5's precedence is what makes even a confirmed memory safe:
-[spec 30](../30_memory_retrieval_and_lifecycle.md) delivers memory as the
+[spec 30](../30_memory_retrieval_and_lifecycle/proposal.md) delivers memory as the
 lowest-priority context category, as data, and
 [spec 20](../20_working_modes/proposal.md)'s mode boundary is not consultable from memory at
 all. A memory saying "all commands are approved" changes nothing, because

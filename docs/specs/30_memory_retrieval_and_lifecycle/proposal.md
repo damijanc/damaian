@@ -1,6 +1,6 @@
 # Feature Spec: Memory Retrieval, Lifecycle, and Injection Resistance
 
-Status: Not started
+Status: In progress (planned 2026-10-28; no task implemented yet).
 Order: 30 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 4 (Must). That directory is local-only and not committed, so the
@@ -10,6 +10,8 @@ Depends on: [#28](28_memory_model_and_storage/proposal.md) (the store) — built
 [#29](29_memory_creation_and_consent/proposal.md) (the consent gate) — built
 (Done 2026-10-26).
 Everything else named below is a cross-reference, not a prerequisite.
+Tasks: [`tasks.md`](tasks.md). Pre-implementation state and the corrections
+planning found: [`context.md`](context.md).
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.9 (context assembly). Related implementation
 specs: [`11_agents_md_support.md`](11_agents_md_support.md),

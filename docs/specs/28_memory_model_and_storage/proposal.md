@@ -19,7 +19,7 @@ user-owned model memory should imitate),
 [`27_context_inspector/proposal.md`](../27_context_inspector/proposal.md) (memory
 is delivered and inspected through these, never around them),
 [`29_memory_creation_and_consent/proposal.md`](../29_memory_creation_and_consent/proposal.md),
-[`30_memory_retrieval_and_lifecycle.md`](../30_memory_retrieval_and_lifecycle.md).
+[`30_memory_retrieval_and_lifecycle/proposal.md`](../30_memory_retrieval_and_lifecycle/proposal.md).
 See also [`SECURITY.md`](../../../SECURITY.md).
 
 The pre-implementation state this proposal was written against, including where
@@ -43,7 +43,7 @@ that — not less.
 This work package is the storage layer only, and it is deliberately the first of
 three because the shape of the record determines whether the safety properties in
 [spec 29](../29_memory_creation_and_consent/proposal.md) and
-[spec 30](../30_memory_retrieval_and_lifecycle.md) are expressible at all. A record
+[spec 30](../30_memory_retrieval_and_lifecycle/proposal.md) are expressible at all. A record
 with no provenance cannot be attributed; one with no state cannot be superseded;
 one with no scope cannot be isolated. Those fields are not bookkeeping, they are
 the mechanism.
@@ -76,7 +76,7 @@ where that either becomes controllable or does not.
 - Cloud, cross-device, or cross-user memory synchronization.
 - Deciding what to remember — [spec 29](../29_memory_creation_and_consent/proposal.md).
 - Retrieval, ranking, or staleness detection —
-  [spec 30](../30_memory_retrieval_and_lifecycle.md).
+  [spec 30](../30_memory_retrieval_and_lifecycle/proposal.md).
 - A management UI, export, or import — Phase 3b WP3, Should-tier and outside
   this phase's minimum slice.
 - Contradiction detection — also WP3.
@@ -175,7 +175,7 @@ spec is enforced by this type having nowhere to put an unconfirmed entry.
 **`Verification` folds confidence and staleness into one enum** rather than a
 float plus a boolean. A stale evidence-derived memory and a user-confirmed one
 are categorically different, not different by degree, and
-[spec 30](../30_memory_retrieval_and_lifecycle.md) needs exactly this distinction to
+[spec 30](../30_memory_retrieval_and_lifecycle/proposal.md) needs exactly this distinction to
 decide what to label as uncertain. A numeric confidence would invite arithmetic
 that means nothing.
 
@@ -343,7 +343,7 @@ and the second is the one that actually covers the undetectable case:
    hunter2" will not confirm it. This is why the consent gate is a
    confidentiality control and not only a consent control.
 3. **Redaction on the way out.** Memory reaches the model only as a
-   `ContextItem` ([spec 30](../30_memory_retrieval_and_lifecycle.md) §5.1), and
+   `ContextItem` ([spec 30](../30_memory_retrieval_and_lifecycle/proposal.md) §5.1), and
    context assembly redacts every item before measuring or storing it
    ([spec 26](../26_context_assembly/proposal.md) §5.6). So a credential that somehow got
    stored — written before a scanner pattern existed, say — is still redacted
@@ -365,7 +365,7 @@ pub struct EvidenceRef {
 ```
 
 The hash is what makes staleness detectable
-([spec 30](../30_memory_retrieval_and_lifecycle.md) §5.5): a memory derived from
+([spec 30](../30_memory_retrieval_and_lifecycle/proposal.md) §5.5): a memory derived from
 `docker-compose.yml` is `EvidenceStale` once that file's hash changes. This is
 the same hash-comparison mechanism `patch_engine.rs:291` uses for conflict
 detection, reused rather than reinvented.

@@ -26,7 +26,7 @@ different trust model, see §4),
 content enters through),
 [`27_context_inspector.md`](../27_context_inspector/proposal.md) (where a user sees and
 removes it),
-[`30_memory_retrieval_and_lifecycle.md`](../30_memory_retrieval_and_lifecycle.md)
+[`30_memory_retrieval_and_lifecycle/proposal.md`](../30_memory_retrieval_and_lifecycle/proposal.md)
 (the injection-resistance pattern this follows rather than reinvents),
 [`10_persistent_command_approval.md`](../10_persistent_command_approval.md) and
 [`34_repository_config_trust_boundary.md`](../34_repository_config_trust_boundary.md)
@@ -200,7 +200,7 @@ of the response is irrelevant to the attacker. The threat is not hypothetical in
 the way it sounds, because the instruction to make it need not come from the
 user: it can come from a repository file, an `AGENTS.md`, an MCP tool
 description, or — once this spec exists — a previously fetched page. That is the
-prompt-injection chain [spec 30](../30_memory_retrieval_and_lifecycle.md) already
+prompt-injection chain [spec 30](../30_memory_retrieval_and_lifecycle/proposal.md) already
 takes seriously for memory, and this is the same chain with a network endpoint at
 the end of it.
 
@@ -265,7 +265,7 @@ with no credential field makes that unrepresentable rather than merely untrue.
 
 ### 5.4 Fetched content is data
 
-Requirement 4, following [spec 30](../30_memory_retrieval_and_lifecycle.md)'s
+Requirement 4, following [spec 30](../30_memory_retrieval_and_lifecycle/proposal.md)'s
 treatment of memory rather than inventing a second approach:
 
 - It enters as a `ContextItem` with a distinct kind and an explicit provenance

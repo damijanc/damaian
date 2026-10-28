@@ -29,7 +29,7 @@ safe to do at all, and owns the rewind that must survive it),
 worse), [`26_context_assembly/proposal.md`](../26_context_assembly/proposal.md) (owns the budget this
 is measured against),
 [`27_context_inspector.md`](../27_context_inspector/proposal.md) (where a summary is seen),
-[`30_memory_retrieval_and_lifecycle.md`](../30_memory_retrieval_and_lifecycle.md)
+[`30_memory_retrieval_and_lifecycle/proposal.md`](../30_memory_retrieval_and_lifecycle/proposal.md)
 (the injection-resistance pattern §5.6 reuses),
 [`49_prompt_cache_accounting_and_reuse/proposal.md`](../49_prompt_cache_accounting_and_reuse/proposal.md)
 (whose prefix stability compaction necessarily breaks — see §5.5), and
@@ -405,7 +405,7 @@ pattern, the same one MCP server settings use. It needs no new control style:
 ### 5.6 A summary is data
 
 Requirement 7, following
-[spec 30](../30_memory_retrieval_and_lifecycle.md) rather than inventing a second
+[spec 30](../30_memory_retrieval_and_lifecycle/proposal.md) rather than inventing a second
 approach.
 
 The conversation being summarised contains repository file content, command
