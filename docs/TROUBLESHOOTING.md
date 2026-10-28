@@ -1751,13 +1751,16 @@ common ones are about state, not about the request:
 - **A dirty switch.** A switch updates the index and working tree, so Damaian
   compares the files that differ between the two branches with your changed and
   untracked files first. If they overlap it refuses and names the paths; commit
-  or stash them, or switch when the tree matches. Git's own check remains the
-  backstop.
+  or stash them, or switch when the tree matches. An ignored local file is not
+  in that comparison, so the switch command also carries
+  `--no-overwrite-ignore`: Git refuses when it would replace an ignored file
+  that the target branch tracks, and your copy keeps its bytes.
 - **A name Git rejects or one that already exists.** The suggestion is validated
   with `git check-ref-format --branch`, and a collision is reported with a free
   suffixed alternative rather than silently changing the name. Edit the field
   and prepare again. A prefix containing `@{`, `..`, `//`, a control character,
-  a `.lock` component or a leading `-` is refused before Git runs.
+  a `.lock` component or a leading `-` is refused before Git runs, and a prefix
+  starting with `refs/` is refused because that is the full-ref namespace.
 - **Code mode or the profile.** `allow_git_branches=false` (the **Read-only**
   profile sets it) or a mode other than **Code** refuses every branch mutation.
   A repository may deny the capability and never grant it, so changing the
@@ -1768,8 +1771,13 @@ common ones are about state, not about the request:
   `branch_unmerged_confirmation_required` and the record stays prepared. When
   the default branch cannot be resolved (no `origin/HEAD`, local `main` or
   `master`, and no common history), the count is reported as unknown and the
-  same second confirmation is still required. The current branch and a branch
-  checked out in another worktree cannot be deleted at all.
+  same second confirmation is still required. Git also checks the branch's
+  upstream, or the checked-out branch when there is none, so a branch on `main`
+  can still need the second confirmation when `git branch -d` would refuse; the
+  card names that reference. If Git's answer changes between the review and the
+  approval, the approval is refused with the same code and nothing runs:
+  prepare the deletion again to see the second card. The current branch and a
+  branch checked out in another worktree cannot be deleted at all.
 
 **Conflict prediction is unavailable** when Git is too old for
 `merge-tree --write-tree` (the rewritten form arrived in Git 2.38) or when the
@@ -1781,15 +1789,18 @@ Git.
 
 A prepared operation is recorded in
 `branches/<prepare-id>.json` (see [Global data directory](#global-data-directory)).
-The engine's inspect compares the recorded ref with the repository now and
-reports `landed`, `not_landed` or `other_ref_state`; it never retries. If the app
-stops mid-operation, that record and the session log's `action_started` with
-`"action":"git_branch_create"`, `"git_branch_switch"` or `"git_branch_delete"`
-are the evidence; the recovery card does not currently offer a branch-specific
-**Inspect** row. The audit trail records `git_branch_read`, `git_branch_refused`,
-`git_branch_created`, `git_branch_switched`, `git_branch_deleted`,
-`git_merge_prepared` and `git_rebase_prepared` in `audit/events.jsonl`. None of
-them records commit bodies or the unredacted text a name was suggested from.
+The record is saved as `applying` before Git runs, so a second request or a
+restart cannot start the mutation twice; it becomes `applied` or `failed` when
+Git returns. The engine's inspect compares the recorded ref with the repository
+now and reports `landed`, `not_landed` or `other_ref_state`; it never retries.
+If the app stops mid-operation, that record and the session log's
+`action_started` with `"action":"git_branch_create"`, `"git_branch_switch"` or
+`"git_branch_delete"` are the evidence; the recovery card does not currently
+offer a branch-specific **Inspect** row. The audit trail records
+`git_branch_read`, `git_branch_refused`, `git_branch_created`,
+`git_branch_switched`, `git_branch_deleted`, `git_merge_prepared` and
+`git_rebase_prepared` in `audit/events.jsonl`. None of them records commit bodies
+or the unredacted text a name or commit subject was derived from.
 
 ### After a crash: what was still running
 

@@ -211,10 +211,13 @@ a later session should not re-litigate them without checking the code.
   refused until the repository has a commit.
 - **D6 — Switching uses `git switch`, not `symbolic-ref`.** Creation is
   `git branch <name> <resolved-start>`; creation-plus-switch and switching an
-  existing branch run `git switch --no-guess <name>`. The start point is
-  resolved with `git rev-parse --verify --end-of-options <start>^{commit}` before
-  any command, and reported as the resolved SHA. No `-f`/`--force` is ever
-  constructed.
+  existing branch run `git switch --no-guess --no-overwrite-ignore <name>`. The
+  start point is resolved with `git rev-parse --verify --end-of-options
+  <start>^{commit}` before any command, and reported as the resolved SHA. No
+  `-f`/`--force` is ever constructed. `--no-overwrite-ignore` is required: Git's
+  default updates ignored files, so a gitignored local file that the target
+  branch tracks would be silently replaced, and `git status` would never have
+  shown it to D15's dirty check.
 - **D7 — §5.7 is reporting-only.** Worktree creation stays with spec 57. This
   spec reads `BranchInfo` from the session's checkout (which may be a worktree),
   reports the mapping via the existing worktree listing, and adds an
@@ -236,7 +239,10 @@ a later session should not re-litigate them without checking the code.
   symbolic target, then local `main`, then local `master`, then the branch's
   merge base with the current `HEAD`; if none resolves, the unmerged count is
   reported as "could not determine a default branch" and deletion proceeds only
-  through the unmerged confirmation path with `-D`, never `-d`.
+  through the unmerged confirmation path with `-D`, never `-d`. A zero from that
+  count is not enough for `-d`: Git checks the branch's upstream, or `HEAD` when
+  it has none, so the deletion also asks that question and takes the
+  confirmation path when the two disagree (review fix 2b).
 - **D12 — Merge preparation parses `merge-tree --write-tree --name-only`.** The
   first line is the resulting tree id; lines after it up to the first blank line
   are conflicted paths; the remainder is informational text and is not shown as
@@ -256,7 +262,17 @@ a later session should not re-litigate them without checking the code.
   `HEAD..target`'s changed paths with the working tree's changed and untracked
   paths; any intersection is a refusal listing those paths. This is an earlier,
   clearer version of the refusal Git itself would produce, not a replacement for
-  Git's check.
+  Git's check. Ignored files are invisible to that comparison, so D6's
+  `--no-overwrite-ignore` is the guard for them.
+- **D16 — Review fixes harden the recorded guarantees.** A branch record is
+  saved as `applying` before `run_user_git`, so consumption does not depend on
+  the shell handling one request at a time. `/api/branch` requires the preparing
+  `session_id` and `/api/merge-preparation` requires a known session. Commit
+  subjects in merge, rebase and deletion reports pass through `SecretScanner`,
+  like suggested names. `git_branch_prefix` may not start with `refs/`, which is
+  the full-ref namespace rather than a naming convention. These were found in
+  review after the first Done and landed before merge; they change no approval,
+  capability or execution boundary.
 
 ## 5. What this means for the task order
 

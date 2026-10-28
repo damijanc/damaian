@@ -852,17 +852,22 @@ conflicted paths.
   as a second, separate approval. **Switch to branch…** is its own card and
   approval; it updates the index and working tree to the target, and when
   uncommitted changes would be overwritten it refuses before running and names
-  the paths.
+  the paths. Ignored files count here too: if a local file is gitignored but the
+  target branch tracks it, the switch refuses rather than replacing your copy.
 - **Every branch operation is Code mode only.** It also needs a permission
   profile whose `allow_git_branches` is on; **Read-only** turns it off, and a
   repository may turn it off but never on. There is no “always allow”.
 - **Deleting a merged branch asks once.** The dialog names the branch and says
-  every commit is on the default branch or a remote. **Deleting a branch with
-  unmerged commits asks twice**: the first card names the count and the commit
-  subjects that would be lost, and a differently worded second card requires the
-  separate confirmation before `git branch -D` runs. The current branch is not
-  offered; a branch checked out in another worktree is refused when the deletion
-  is prepared.
+  every commit is on the default branch or a remote, and Git would delete it
+  with a plain `git branch -d`. **Deleting a branch with unmerged commits checks
+  twice**: the first card names the count and the commit subjects that would be
+  lost, and a differently worded second card requires the separate confirmation
+  before `git branch -D` runs. The same second card appears when the branch is
+  on `main` but Git would not accept `-d` — for example when you are on another
+  branch that does not contain it, or its upstream is behind — because the card
+  names the reference Git actually checks. The current branch is not offered; a
+  branch checked out in another worktree is refused when the deletion is
+  prepared.
 - **Merge and rebase reports change nothing.** **Preview merge** reports the
   merge base, the commits that would come in, the files that would change, the
   paths that would conflict, and whether the merge would fast-forward. It is

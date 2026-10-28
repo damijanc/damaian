@@ -246,26 +246,32 @@ capabilities from committing (spec 36):
 - **One typed approval per operation.** `GitMutation` has one variant per
   operation — `CreateBranch`, `SwitchBranch`, `DeleteBranch` — and no catch-all,
   so an approval can never be reused across operations. The route requires
-  `approval=branch` and the exact prepared mutation; a commit approval, a command
-  approval or an answer to a question never satisfies it. The durable record is
-  consumed once and a second apply is refused. There is no “always allow”.
+  `approval=branch`, the preparing `session_id`, and the exact prepared mutation;
+  a commit approval, a command approval or an answer to a question never
+  satisfies it. The durable record is marked `applying` before Git runs and
+  consumed once, so a repeated or concurrent request is refused. There is no
+  “always allow”.
 - **Code mode and a profile that permits it.** Every prepare and every apply is
   refused in Ask, Plan and Review, and whenever the resolved
   `allow_git_branches` is false. The built-in **Read-only** profile turns it off.
   Repository config may turn it off and may never turn it on, like every other
   capability key.
 - **No force, merge, rebase or cherry-pick is executable here.** Creation runs
-  `git branch <name> <resolved-sha>`; switching runs `git switch --no-guess`;
-  deletion runs `git branch -d`, or `-D` only after the separate confirmation
-  that names the unmerged count and subjects. No command this feature constructs
-  contains `-f` or `--force`. Merge and rebase preparation run only
+  `git branch <name> <resolved-sha>`; switching runs
+  `git switch --no-guess --no-overwrite-ignore`, so an ignored local file that
+  the target branch tracks is never silently replaced; deletion runs
+  `git branch -d`, or `-D` only after the separate confirmation that names the
+  unmerged count and subjects. No command this feature constructs contains `-f`
+  or `--force`. Merge and rebase preparation run only
   `git merge-tree --write-tree --name-only` and reads, which touch neither the
   index, the working tree nor `HEAD`; there is no real-merge fallback and no
   route that executes a merge, rebase or cherry-pick.
-- **Names come from redacted text.** A suggested name is derived from the
-  session title or request only after `SecretScanner` redaction, and Git —
-  `git check-ref-format --branch` — is authoritative about the final name. A
-  collision is reported with a free alternative rather than silently changed.
+- **Names and commit subjects come from redacted text.** A suggested name is
+  derived from the session title or request only after `SecretScanner`
+  redaction, and Git — `git check-ref-format --branch` — is authoritative about
+  the final name. A collision is reported with a free alternative rather than
+  silently changed. Merge, rebase and deletion reports scan each commit subject
+  before it reaches the dialog.
 - **Restricted paths stay out of reports.** Conflicted, changed and
   dirty-switch path lists pass through `PathPolicy`, so a restricted file such
   as `.env` is never named in a merge report or a refusal.

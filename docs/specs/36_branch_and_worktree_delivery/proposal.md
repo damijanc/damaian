@@ -1,7 +1,8 @@
 # Feature Spec: Branch and Worktree Delivery
 
-Status: Done 2026-10-28. The full seven-check gate has **not** run for this
-branch yet; scoped checks passed locally (see `tasks.md` and §7).
+Status: Done 2026-10-28; review fixes landed after that close-out and before
+merge. The full seven-check gate has **not** run for this branch yet; scoped
+checks passed locally (see `tasks.md` and §7).
 Order: 36 of 37
 Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 2 (Must). That directory is local-only and not committed, so the
@@ -390,15 +391,16 @@ mutation and report paths) plus additions to `git_service.rs`: `BranchInfo`,
 The shell surface is five routes in `desktop-shell/src/lib.rs` — branch info
 (`repo`, `session`; returns `BranchInfo` plus the local branch names),
 suggestion (`repo`, `session_id`, optional `source`), prepare
-(`operation=create|switch|delete`), the typed apply (`approval=branch`, the
-prepared `GitMutation` as JSON, optional `confirm_unmerged=true`), and
-merge/rebase preparation (`mode=merge|rebase`, `base`) — plus a folder-menu
-*Branch…* dialog in `app.js` and `style.css`. No route accepts a raw command,
-and no route runs a merge, rebase or cherry-pick.
+(`operation=create|switch|delete`), the typed apply (`approval=branch`,
+`session_id` bound to the preparing record, the prepared `GitMutation` as JSON,
+optional `confirm_unmerged=true`), and merge/rebase preparation (`mode=merge|rebase`,
+`base`, a known `session`) — plus a folder-menu *Branch…* dialog in `app.js` and
+`style.css`. No route accepts a raw command, and no route runs a merge, rebase or
+cherry-pick.
 
-Tests: 37 integration tests in `workspace-engine/tests/branch_delivery.rs`,
+Tests: 41 integration tests in `workspace-engine/tests/branch_delivery.rs`,
 four `merge-tree` parser unit tests in `branch.rs`, the capability and config
-tests in `permission_profiles.rs`, and ten route tests in `desktop-shell`.
+tests in `permission_profiles.rs`, and eleven route tests in `desktop-shell`.
 
 ### Worktrees (§5.7)
 
@@ -441,6 +443,12 @@ worktree-deletion criteria were implemented here.
 - **Unmerged deletion without the second confirmation:**
   `branch_unmerged_confirmation_required`, carrying the count (or the unknown
   notice) and the subjects; the record stays `prepared`.
+- **A deletion Git would not accept with `-d` although the default-branch count
+  is zero:** the branch is merged into `main` but not into its upstream or the
+  checked-out branch, so the preparation takes the same
+  `branch_unmerged_confirmation_required` path and the dialog names the
+  reference Git checks. The record stays `prepared`; `-D` is offered only after
+  the second card.
 
 Submodules are not refused as a repository. Branch operations behave as Git's
 own commands do, and no submodule-specific behaviour was added, as §4 says.
@@ -449,14 +457,22 @@ own commands do, and no submodule-specific behaviour was added, as §4 says.
 
 - **`BranchInfo.head_oid` is `Option<String>`** rather than `String`, so an
   unborn branch is representable (D5).
-- **Switching runs `git switch --no-guess`, not `symbolic-ref`.** The proposal's
-  command moves only `HEAD`; it would leave the index and working tree behind
-  (D6, context §3.17).
+- **Switching runs `git switch --no-guess --no-overwrite-ignore`, not
+  `symbolic-ref`.** The proposal's command moves only `HEAD`; it would leave the
+  index and working tree behind (D6, context §3.17). `--no-overwrite-ignore` is
+  the review fix for a gitignored local file that the target branch tracks:
+  Git's default replaces it, and porcelain never reported it to the dirty check.
 - **The unmerged count uses one `--not`.** The proposal's literal
   `--not --remotes --not <default>` is wrong: a second `--not` toggles the
   revision walk back to positive and counts the default branch's own history.
   The implementation runs `git rev-list --count <branch> --not --remotes
-  <default>` and the matching `git log --format=%s`.
+  <default>` and the matching `git log --format=%s`. A zero there is checked
+  again against Git's own `-d` reference — the branch's upstream, or `HEAD` when
+  it has none — so a branch merged into `main` but not into the checked-out
+  branch takes the confirmation path instead of failing `git branch -d`.
+- **Commit subjects are redacted.** Merge, rebase and deletion reports pass each
+  subject through `SecretScanner`, just as a suggested name passes its source;
+  the audit still records counts, never subjects.
 - **`DeleteBranch.unmerged_commits` is `Option<u32>`** (D11), so "the default
   branch could not be resolved" is a state rather than a false zero.
 - **`apply` takes `confirm_unmerged`**; only that flag turns `git branch -d` into
@@ -484,6 +500,31 @@ own commands do, and no submodule-specific behaviour was added, as §4 says.
   `landed`, `not_landed` or `other_ref_state`, and no path retries. The desktop
   recovery card does not currently offer a branch-specific **Inspect** row, so
   the durable record and session marker are the evidence a user can read.
+
+### Review fixes after the first Done
+
+These landed after the initial close-out and before merge; they change no
+approval, capability or execution boundary. The branch has still had no CI run.
+
+- **Ignored-file switch (2a, confirmed).** The switch argv gained
+  `--no-overwrite-ignore`, and `switching_never_overwrites_an_ignored_local_file`
+  proves Git refuses and the local bytes survive. Before the flag, a target
+  branch could silently replace a gitignored file the user had edited.
+- **Merged-branch deletion (2b, confirmed).** `plain_delete_report` asks the
+  same reference `git branch -d` asks and is re-checked at apply;
+  `a_branch_merged_into_main_but_not_into_head_needs_the_confirmation` proves the
+  second card is offered rather than the record failing.
+- **One-shot state (2c, confirmed by reading).** The record is saved `applying`
+  before `run_user_git`; `a_record_that_is_applying_cannot_be_applied_again`
+  proves a non-`prepared` record runs nothing. The ordering has no injectable
+  pause, so it is verified by reading, not by timing.
+- **Route and naming hardening (2d).** `/api/branch` binds `session_id` to the
+  record, `/api/merge-preparation` refuses an unknown session, commit subjects
+  are scanned before display, and `git_branch_prefix` may not start with
+  `refs/`.
+- **Documentation reconciliation (2e).** The concurrent session's edits noted in
+  the Task 7 row are present once in `698d731`; no duplicate section or data row
+  remained uncommitted.
 
 ### Task 6: merge and rebase preparation
 
@@ -527,7 +568,7 @@ Every criterion in §6 is listed below. Test names without a path are in
 | The merge report names the merge base, incoming commits, changed files, conflicted paths and whether it would fast-forward. | Met | `a_clean_merge_is_planned_without_merging`; `a_fast_forward_merge_is_reported_as_fast_forward`; `merge_and_rebase_preparation_leave_the_index_head_and_status_identical`. |
 | On a Git without `merge-tree --write-tree`, prediction reports unavailable and no merge is attempted. | Met with a stated limitation | `interpret_merge_tree` unit tests use synthetic exit 129 / `unknown option 'write-tree'` output; `an_unrelated_or_unresolvable_base_reports_prediction_unavailable` proves the end-to-end unavailable report with no `merge-tree` process. No Git older than 2.38 was available, so the decision is proved at the parser and report boundaries, not on an old binary. |
 | No merge, rebase or cherry-pick is executable from this work package. | Met | `no_route_executes_a_merge_rebase_or_cherry_pick` (404 for `/api/merge`, `/api/rebase`, `/api/cherry-pick` and variants, with `HEAD`, status and `.git/MERGE_HEAD` unchanged); the engine has only the two report methods and no merge/rebase/cherry-pick command. |
-| Deleting a branch with unmerged commits requires a distinct confirmation naming the count and subjects; `git branch -d` is used in every other case. | Met | `an_unmerged_branch_needs_a_distinct_confirmation` (plain approval 409 with count and subjects, `-D` only after `confirm_unmerged`); `a_merged_branch_deletes_with_d_and_no_force`; `an_unknown_default_branch_still_requires_the_unmerged_confirmation`; `the_delete_route_keeps_the_two_step_confirmation`. |
+| Deleting a branch with unmerged commits requires a distinct confirmation naming the count and subjects; `git branch -d` is used in every other case. | Met | `an_unmerged_branch_needs_a_distinct_confirmation` (plain approval 409 with count and subjects, `-D` only after `confirm_unmerged`); `a_merged_branch_deletes_with_d_and_no_force`; `an_unknown_default_branch_still_requires_the_unmerged_confirmation`; `a_branch_merged_into_main_but_not_into_head_needs_the_confirmation` (Git's own `-d` reference takes the confirmation path); `the_delete_route_keeps_the_two_step_confirmation`. |
 | The current branch cannot be deleted. | Met | `the_current_branch_and_a_checked_out_branch_cannot_be_deleted` (also refuses a branch checked out in another worktree); `the_delete_route_keeps_the_two_step_confirmation` covers the route. |
 | An approval for one `GitMutation` cannot be reused for another. | Met | `an_approval_cannot_be_retargeted_and_is_consumed_once`; `a_branch_change_needs_its_own_branch_approval_not_a_commit_one`. |
 | Each mutation is bracketed by side-effecting action markers, and an interrupted creation is resolved by comparing the ref, never by retrying. | Met at the engine level | `a_branch_apply_is_bracketed_by_a_marker_pair_and_audited`; `inspect_reports_a_dangling_record_truthfully`; `a_delete_that_already_landed_is_inspected_not_retried`. The desktop recovery card has no branch-specific **Inspect** row; the record and marker are the evidence. |
