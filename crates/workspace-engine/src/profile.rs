@@ -356,6 +356,8 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         restricted_patterns,
         command_allowlist,
         command_allowlist_by_repository,
+        web_domain_allowlist,
+        web_domain_allowlist_by_repository,
         permission_profile_by_repository,
         command_blocklist,
         secret_patterns,
@@ -479,6 +481,21 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         refuse(
             "command_allowlist".to_string(),
             RepositoryKeyClass::UserOwned,
+        );
+    }
+    // A host grant is where the model may send a request, which a profile does
+    // not decide (spec 51 §5.3). Unlike the command allowlist it is refused as
+    // `Forbidden`, matching the scope merge and the report the user sees.
+    if web_domain_allowlist.is_some() {
+        refuse(
+            "web_domain_allowlist".to_string(),
+            RepositoryKeyClass::Forbidden,
+        );
+    }
+    for repository_id in web_domain_allowlist_by_repository.keys() {
+        refuse(
+            format!("web_domain_allowlist.{repository_id}"),
+            RepositoryKeyClass::Forbidden,
         );
     }
     for repository_id in command_allowlist_by_repository.keys() {

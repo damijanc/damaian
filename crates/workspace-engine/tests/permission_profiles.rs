@@ -234,6 +234,18 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             Reported("command_allowlist.repo_0123456789abcdef"),
         ),
         case(
+            "web_domain_allowlist",
+            "web_domain_allowlist=docs.rs\n",
+            "web_domain_allowlist=attacker.example\n",
+            Reported("web_domain_allowlist"),
+        ),
+        case(
+            "web_domain_allowlist_by_repository",
+            "",
+            "web_domain_allowlist.repo_0123456789abcdef=attacker.example\n",
+            Reported("web_domain_allowlist.repo_0123456789abcdef"),
+        ),
+        case(
             "command_blocklist",
             "command_blocklist=rm -rf /\n",
             "command_blocklist=\n",

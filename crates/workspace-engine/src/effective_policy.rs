@@ -157,6 +157,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "ignore_patterns" => "Files left out of the index",
         "restricted_patterns" => "Files Damaian may not read",
         "command_allowlist" => "Commands that run without asking",
+        "web_domain_allowlist" => "Hosts Damaian may read pages from",
         "command_blocklist" => "Commands that are always blocked",
         "secret_patterns" => "Extra patterns redacted as secrets",
         "require_approval_for_file_edits" => "Ask before changing files",
@@ -203,6 +204,7 @@ pub fn rule_label(key: &str) -> Option<String> {
     let (prefix, rest) = key.split_once('.')?;
     let owner = match prefix {
         "command_allowlist" => return rule_label(prefix),
+        "web_domain_allowlist" => return rule_label(prefix),
         "permission_profile" => return Some("Permission profile".to_string()),
         "hook_review" => return Some("Your review of a repository hook".to_string()),
         "language_server" => return Some(format!("Language server for {rest}")),
@@ -256,6 +258,7 @@ fn list_entries(config: &Config, key: &str) -> Option<Vec<String>> {
         "ignore_patterns" => strings(&config.ignore_patterns),
         "restricted_patterns" => strings(&config.restricted_patterns),
         "command_allowlist" => strings(&config.command_allowlist),
+        "web_domain_allowlist" => strings(&config.web_domain_allowlist),
         "command_blocklist" => strings(&config.command_blocklist),
         "secret_patterns" => strings(&config.secret_patterns),
         "mcp_server_allowlist" => strings(&config.mcp_server_allowlist),

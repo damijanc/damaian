@@ -13,7 +13,7 @@
 | Task | State | Notes |
 |---|---|---|
 | 1 · Folder, links, plan | Done 2026-10-28 | Moved the flat spec to `proposal.md`, added `context.md` (sixteen corrections, decisions D1–D12) and this plan, repointed every inbound link, and set `In progress` in the proposal, the README current-state bullets, the README implementation-order row and this header. Local checks: `npm run specs:check` passed (67 specs); `scripts/quality-gate.sh fmt node lint typos deny` — fmt, node, lint and typos passed, **`cargo deny check` failed on a pre-existing advisory** (`RUSTSEC-2026-0414`, `pulldown-cmark 0.13.4`; recorded in `context.md` §4, not touched here). |
-| 2 · Host approval storage | Not started |  |
+| 2 · Host approval storage | Done 2026-10-28 | Added `web_domain_allowlist` and `web_domain_allowlist.<repository id>` to `Config` and `ConfigOverlay` (values normalised to lower case, no trailing dot), folded per-repository grants into the effective list through `Config::apply_repository_web_domains` during `load_scoped`, and emitted both keys through `ConfigOverlay::to_policy_text` (the save path) and the effective `Config::to_policy_text`. Repository and profile scope reject both keys as `RepositoryKeyClass::Forbidden` and report them; `classify_overlay_fields!` marks both `Capability`; `split_profile_keys` refuses both; `effective_policy` has a label and list entry. Tests: two weakening cases, `repository_config_cannot_grant_a_web_host` (asserts the `Forbidden` class, not merely a refusal), the hostile-config equality check, `a_per_repository_web_grant_is_folded_only_for_its_repository`, and `web_domain_allowlist_survives_a_config_round_trip`. Scoped checks: `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest run -p workspace-engine --test permission_profiles --test repository_config_trust` 133 passed, 1 skipped, and because a config change is crate-wide the whole crate was run too — `cargo nextest run -p workspace-engine --locked` 1,902 passed, 27 skipped; `scripts/quality-gate.sh fmt node lint typos` clean. `cargo deny` still fails on the pre-existing `RUSTSEC-2026-0414` recorded in `context.md` §4. Falsification: `Capability`→`Preference` for the bare key fails the capability-cover test; forcing `trusted=true` for the repository merge fails both host tests; dropping the per-repository refusal from `split_profile_keys` fails the profile/merge agreement test; dropping the overlay policy line fails the round trip. **Deviation:** the tests were written after the implementation in this session, so Step 2's pre-implementation red run was not observed; the four mutations above are the evidence that each guard is load-bearing. |
 | 3 · URL inspection and the egress guard | Not started |  |
 | 4 · Fetch transport and session cache | Not started |  |
 | 5 · Text conversion, redaction and injection markers | Not started |  |
@@ -130,7 +130,7 @@ edits another worktree and none edits `build_model_prompt`.
 `crates/workspace-engine/tests/permission_profiles.rs`,
 `crates/workspace-engine/tests/repository_config_trust.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   1. `tests/permission_profiles.rs`: add `web_domain_allowlist` and
      `web_domain_allowlist_by_repository` to `weakening_cases()` with
      `Resists::Reported`, so the capability-cover test and the weakening test
@@ -148,9 +148,9 @@ edits another worktree and none edits `build_model_prompt`.
      `web_domain_allowlist_survives_a_config_round_trip` —
      `ConfigOverlay::parse` → `to_policy_text` → `parse` preserves both the bare
      and the per-repository key.
-- [ ] **Step 2: Confirm they fail** (the key does not parse, so nothing is
+- [x] **Step 2: Confirm they fail** (the key does not parse, so nothing is
   folded and the round trip is empty).
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - `Config`: `web_domain_allowlist: Vec<String>` (empty) and
     `web_domain_allowlist_by_repository: BTreeMap<String, Vec<String>>`
     (empty), documented as user-owned host approvals.
@@ -170,12 +170,12 @@ edits another worktree and none edits `build_model_prompt`.
     call it beside `apply_repository_allowlist` in `load_scoped`.
   - `effective_policy.rs`: `rule_label` for `web_domain_allowlist` and its
     per-repository prefix, and `list_entries` for the effective list.
-- [ ] **Step 4: Falsify.** Classify either field `Preference` → the capability
+- [x] **Step 4: Falsify.** Classify either field `Preference` → the capability
   cover test fails. Treat repository scope as trusted → the hostile repository
   grants `attacker.example`. Drop the keys from `split_profile_keys` → the
   profile-split agreement test fails. Omit either from
   `ConfigOverlay::to_policy_text` → the round-trip test fails.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -183,7 +183,7 @@ edits another worktree and none edits `build_model_prompt`.
   cargo nextest run -p workspace-engine --test permission_profiles --test repository_config_trust
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Store web host approvals where a repository cannot write them`.
 
 ## Task 3: URL inspection and the egress guard

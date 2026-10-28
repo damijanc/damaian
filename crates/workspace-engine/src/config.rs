@@ -289,6 +289,14 @@ pub struct Config {
     /// repository-scoped load folds the matching entries into
     /// [`Self::command_allowlist`].
     pub command_allowlist_by_repository: BTreeMap<String, Vec<String>>,
+    /// Hosts a page may be fetched from, machine-wide (spec 51 §5.3). The
+    /// user's own decision, so repository and profile config can never add one;
+    /// a repository copy is reported as a forbidden key.
+    pub web_domain_allowlist: Vec<String>,
+    /// `Allow Always` host grants, keyed by repository id. Folded into
+    /// [`Self::web_domain_allowlist`] by
+    /// [`Self::apply_repository_web_domains`] during a repository-scoped load.
+    pub web_domain_allowlist_by_repository: BTreeMap<String, Vec<String>>,
     /// The permission profile the user selected for each checkout, keyed by
     /// repository id the way `Allow Always` is. User-owned: a repository
     /// cannot choose its own profile in either direction (spec 31,
@@ -1087,6 +1095,7 @@ impl Config {
         }
         if let Some(root) = repository_root {
             report.allow_always_entries = config.apply_repository_allowlist(root);
+            config.apply_repository_web_domains(root);
         }
         // Spec 26 §5.2: an oversubscribed share set is a config error, and the
         // resolved config is where the sum is finally known.
@@ -1162,6 +1171,8 @@ impl Config {
             restricted_patterns,
             command_allowlist,
             command_allowlist_by_repository,
+            web_domain_allowlist,
+            web_domain_allowlist_by_repository,
             permission_profile_by_repository,
             command_blocklist,
             secret_patterns,
@@ -1381,6 +1392,30 @@ impl Config {
                     .insert(repository_id, entries);
             } else {
                 rejected.push(RejectedConfigKey::new(key, RepositoryKeyClass::UserOwned));
+            }
+        }
+        // Spec 51 §5.3: a host grant decides where the model may send a
+        // request, so it is the user's decision alone. Unlike the command
+        // allowlist it is `Forbidden` rather than `UserOwned`: the report must
+        // say a repository tried to grant itself a host, not merely that the
+        // key was somebody else's.
+        if let Some(value) = scoped(
+            web_domain_allowlist,
+            "web_domain_allowlist",
+            trusted,
+            forbidden,
+            rejected,
+        ) {
+            outcome.record(scope, "web_domain_allowlist", Some(value.clone()), false);
+            self.web_domain_allowlist = value;
+        }
+        for (repository_id, entries) in web_domain_allowlist_by_repository {
+            let key = format!("web_domain_allowlist.{repository_id}");
+            if trusted {
+                self.web_domain_allowlist_by_repository
+                    .insert(repository_id, entries);
+            } else {
+                rejected.push(RejectedConfigKey::new(key, forbidden));
             }
         }
         // User-owned for the same reason: choosing a checkout's profile is the
@@ -2533,6 +2568,32 @@ impl Config {
         added
     }
 
+    /// The `Allow Always` host grants the user made for `repository_root`,
+    /// folded into the effective [`Self::web_domain_allowlist`] (spec 51 §5.3).
+    /// Kept separate from the command allowlist because the same host in a
+    /// different checkout is a different decision.
+    ///
+    /// Returns the hosts it added, so the audit trail can name the basis of a
+    /// later fetch without re-reading user config.
+    pub fn apply_repository_web_domains(&mut self, repository_root: &Path) -> Vec<String> {
+        let repository_id = repository_id_for_root(repository_root);
+        let Some(entries) = self.web_domain_allowlist_by_repository.get(&repository_id) else {
+            return Vec::new();
+        };
+        let mut added = Vec::new();
+        for entry in entries.clone() {
+            if !self
+                .web_domain_allowlist
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&entry))
+            {
+                self.web_domain_allowlist.push(entry.clone());
+                added.push(entry);
+            }
+        }
+        added
+    }
+
     /// The resolved values spec 31's refusal points consult.
     pub fn profile_capabilities(&self) -> ProfileCapabilities {
         ProfileCapabilities {
@@ -2647,6 +2708,11 @@ impl Config {
             &mut output,
             "command_allowlist",
             &join_list(&self.command_allowlist),
+        );
+        push_line(
+            &mut output,
+            "web_domain_allowlist",
+            &join_list(&self.web_domain_allowlist),
         );
         // Deliberately not the per-repository maps: this text answers "what
         // applies in this repository", and another checkout's `Allow Always`
@@ -2861,6 +2927,8 @@ impl Default for Config {
                 .collect(),
             command_allowlist: Vec::new(),
             command_allowlist_by_repository: BTreeMap::new(),
+            web_domain_allowlist: Vec::new(),
+            web_domain_allowlist_by_repository: BTreeMap::new(),
             permission_profile_by_repository: BTreeMap::new(),
             command_blocklist: Vec::new(),
             secret_patterns: Vec::new(),
@@ -2959,6 +3027,13 @@ pub struct ConfigOverlay {
     pub command_allowlist: Option<Vec<String>>,
     /// `command_allowlist.<repository_id>` entries, from user or admin config.
     pub command_allowlist_by_repository: BTreeMap<String, Vec<String>>,
+    /// Spec 51 §5.3: hosts a page may be fetched from. Forbidden to repository
+    /// and profile config, because a clone that could add one would grant
+    /// itself a place to send the user's data.
+    pub web_domain_allowlist: Option<Vec<String>>,
+    /// `web_domain_allowlist.<repository_id>` entries, from user or admin
+    /// config.
+    pub web_domain_allowlist_by_repository: BTreeMap<String, Vec<String>>,
     /// `permission_profile.<repository_id>` entries, from user or admin config.
     pub permission_profile_by_repository: BTreeMap<String, ProfileId>,
     pub command_blocklist: Option<Vec<String>>,
@@ -3117,6 +3192,11 @@ classify_overlay_fields! {
     ignore_patterns => Capability,
     restricted_patterns => Capability,
     command_allowlist => Capability,
+    // Spec 51 §5.3: a host grant decides where the model may send a request.
+    // `Forbidden` in the merge, so neither a repository nor a profile may add
+    // one; classified here so every capability key still has a weakening case.
+    web_domain_allowlist => Capability,
+    web_domain_allowlist_by_repository => Capability,
     command_allowlist_by_repository => Capability,
     // User-owned at repository scope, like the allowlist map above.
     permission_profile_by_repository => Capability,
@@ -3287,6 +3367,9 @@ impl ConfigOverlay {
         if let Some(repository_id) = key.strip_prefix("command_allowlist.") {
             return self.set_repository_command_allowlist(repository_id, value);
         }
+        if let Some(repository_id) = key.strip_prefix("web_domain_allowlist.") {
+            return self.set_repository_web_domain_allowlist(repository_id, value);
+        }
         if let Some(repository_id) = key.strip_prefix("permission_profile.") {
             return self.set_repository_permission_profile(repository_id, value);
         }
@@ -3374,6 +3457,7 @@ impl ConfigOverlay {
             "ignore_patterns" => self.ignore_patterns = Some(split_list(value)),
             "restricted_patterns" => self.restricted_patterns = Some(split_list(value)),
             "command_allowlist" => self.command_allowlist = Some(split_list(value)),
+            "web_domain_allowlist" => self.web_domain_allowlist = Some(split_web_domains(value)),
             "command_blocklist" => self.command_blocklist = Some(split_list(value)),
             "secret_patterns" => self.secret_patterns = Some(split_list(value)),
             "require_approval_for_file_edits" => {
@@ -3482,6 +3566,25 @@ impl ConfigOverlay {
         }
         self.command_allowlist_by_repository
             .insert(repository_id.to_string(), split_list(value));
+        Ok(())
+    }
+
+    /// `web_domain_allowlist.<repository_id>=host|host` — the `Allow Always`
+    /// host grants for one repository. Valid in user and admin config; refused
+    /// as a forbidden key at repository and profile scope.
+    fn set_repository_web_domain_allowlist(
+        &mut self,
+        repository_id: &str,
+        value: &str,
+    ) -> Result<()> {
+        let repository_id = repository_id.trim();
+        if !repository_id.starts_with("repo_") {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid repository id in config key: web_domain_allowlist.{repository_id}"
+            )));
+        }
+        self.web_domain_allowlist_by_repository
+            .insert(repository_id.to_string(), split_web_domains(value));
         Ok(())
     }
 
@@ -3782,6 +3885,8 @@ impl ConfigOverlay {
             restricted_patterns,
             command_allowlist,
             command_allowlist_by_repository,
+            web_domain_allowlist,
+            web_domain_allowlist_by_repository,
             permission_profile_by_repository,
             command_blocklist,
             secret_patterns,
@@ -3921,6 +4026,16 @@ impl ConfigOverlay {
         }
         if let Some(value) = command_allowlist {
             push_line(&mut output, "command_allowlist", &join_list(value));
+        }
+        if let Some(value) = web_domain_allowlist {
+            push_line(&mut output, "web_domain_allowlist", &join_list(value));
+        }
+        for (repository_id, entries) in web_domain_allowlist_by_repository {
+            push_line(
+                &mut output,
+                &format!("web_domain_allowlist.{repository_id}"),
+                &join_list(entries),
+            );
         }
         for (repository_id, entries) in command_allowlist_by_repository {
             push_line(
@@ -4983,6 +5098,17 @@ fn split_list(value: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Host approvals are compared against a URL's host, which is lowercased and
+/// has no trailing dot. Normalising here means the same site written two ways
+/// is one approval rather than two.
+fn split_web_domains(value: &str) -> Vec<String> {
+    split_list(value)
+        .into_iter()
+        .map(|domain| domain.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty())
         .collect()
 }
 

@@ -3,7 +3,8 @@
 This file records why the work exists and what the code looked like when the
 spec became a folder (2026-10-28). [`proposal.md`](proposal.md) is the decision;
 this is the starting point and the corrections planning found. Every line
-reference was checked against the tree at commit `aaa3be8` on 2026-10-28.
+reference was checked against the tree at commit `aaa3be8` on 2026-10-28; the
+`config.rs` references were re-checked after Task 2, which shifts them.
 
 ## 1. Why now
 
@@ -47,11 +48,11 @@ exfiltration channel before it is a reading feature, and the constraints in
 | Model transport (the only credentialed HTTP) | `CurlModelTransport`, `model.rs:530`; curl spawn `:637` |
 | Cancellation-polled stream pump | `pump_stream`, `model.rs:814` |
 | Child sweep registry | `ProcessKind`, `process_registry.rs:107`; `register`, `:225` |
-| Config scopes | `ConfigScope`, `config.rs:75`; `RepositoryKeyClass`, `:80` |
-| Config overlay boundary | `apply_overlay_scoped`, `config.rs:1125`; report `:174` |
-| Config key partition | `ConfigKeyKind`, `config.rs:3052`; `classify_overlay_fields!`, `:3070` |
+| Config scopes | `ConfigScope`, `config.rs:67`; `RepositoryKeyClass`, `:80` |
+| Config overlay boundary | `apply_overlay_scoped`, `config.rs:1134`; report `:174` |
+| Config key partition | `ConfigKeyKind`, `config.rs:3127`; `classify_overlay_fields!`, `:3155` |
 | Profile key split | `split_profile_keys`, `profile.rs:327` |
-| `Allow Always` storage and writer | `command_allowlist_by_repository`, `config.rs:291`; fold `:2521`; writer `validation.rs:445` |
+| `Allow Always` storage and writer | `command_allowlist_by_repository`, `config.rs:291`; fold `:2556`; writer `validation.rs:445` |
 | Eval scenarios | TOML in `crates/eval-harness/scenarios`; loader `scenario.rs:475` |
 | Eval assertions | `Asserts`, `scenario.rs:50-260` |
 
@@ -83,10 +84,10 @@ exfiltration channel before it is a reading feature, and the constraints in
    turn, which this spec deliberately does not do (D5).
 5. **There is no per-host approval store.** The closest machinery is
    `command_allowlist_by_repository` plus `apply_repository_allowlist`
-   (`config.rs:2521`) and the user-config writer in
+   (`config.rs:2556`) and the user-config writer in
    `ValidationOrchestrator::allow_command_always` (`validation.rs:445`). A new
    list and writer are needed; the pattern is reusable.
-6. **`command_allowlist` is `UserOwned`, not `Forbidden`** (`config.rs:1362`).
+6. **`command_allowlist` is `UserOwned`, not `Forbidden`** (`config.rs:1377`).
    Spec 51's acceptance criterion says `web_domain_allowlist` must be rejected
    **as forbidden**, so the new key uses `RepositoryKeyClass::Forbidden` in both
    the overlay merge and `split_profile_keys`, not `UserOwned`.
