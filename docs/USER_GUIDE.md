@@ -279,7 +279,7 @@ Setting a value higher than the model actually allows causes the provider to rej
 
 ### What goes into context
 
-Every request is assembled the same way. The collected items are sent in one `Repository context:` block, followed by the conversation under `Recent conversation:` — a summary of older messages when one exists, then the most recent messages that fit the conversation window (each cut to 2,000 characters) — followed by your message under `User request:`. Your message appears once. Within the repository block each item is one section headed `--- <source>: <path> ---`; the source labels are listed in [Reading a turn's context manifest](TROUBLESHOOTING.md#reading-a-turns-context-manifest). Items are added in a fixed order: the files you named or added, the `AGENTS.md` files that apply to the collected paths, the root project rules, the repository map, symbol hints, hook context, a carried plan, then keyword and semantic search hits. A line range would append `:start-end` to the path; no source produces one yet, so every item is a whole file or a rendered block. A one-shot edit request sends the same items under its own `User edit request:` heading, which comes first because that request makes a single call.
+Every request is assembled the same way. The collected items are sent in one `Repository context:` block, followed by the conversation under `Recent conversation:` — a summary of older messages when one exists, then the most recent messages that fit the conversation window (each cut to 2,000 characters) — followed by your message under `User request:`. Your message appears once. Within the repository block each item is one section headed `--- <source>: <path> ---`; a fetched page has no path, so its header names the URL and fetch time instead. The source labels are listed in [Reading a turn's context manifest](TROUBLESHOOTING.md#reading-a-turns-context-manifest). Items are added in a fixed order: the files you named or added, the `AGENTS.md` files that apply to the collected paths, the root project rules, the repository map, symbol hints, hook context, a carried plan, keyword and semantic search hits, and last any page fetched in an earlier turn. A line range would append `:start-end` to the path; no source produces one yet, so every item is a whole file or a rendered block. A one-shot edit request sends the same items under its own `User edit request:` heading, which comes first because that request makes a single call.
 
 Your message is secret-scanned before it is sent, and so is every earlier message replayed under `Recent conversation:`. Sessions store messages as you typed them, so this is what keeps a credential from an older turn out of a later request: a detected value is replaced by Damaian's redaction marker rather than sent in cleartext.
 
@@ -294,12 +294,13 @@ Your message is secret-scanned before it is sent, and so is every earlier messag
 | `plan_state` | 5% | The plan a continued or resumed turn carries forward, as numbered steps with their status and detail. |
 | `repository_map` | 5% | The [repository map](#the-map-the-assistant-sees) block, still capped by `repository_map_max_tokens`. |
 | `symbols` | 10% | The symbol hints block, still capped by `symbol_context_max_tokens`. |
-| `search_results` | 15% | Files found by search: exact keyword hits first, then semantic-similarity hits. Semantic hits are dropped first when this category runs short. |
+| `search_results` | 10% | Files found by search: exact keyword hits first, then semantic-similarity hits. Semantic hits are dropped first when this category runs short. |
 | `file_ranges` | 25% | Files you named in the prompt and files you added with **+** ([Chat](#chat)); explicit paths are ordered ahead of mentioned ones. |
 | `findings` | 5% | Reserved for the [findings](#fix-n-errors-and-the-findings-list) repair flow. The assistant still receives only the findings you select for a repair request, so nothing fills this automatically today and its share is released. |
 | `conversation_summary` | 5% | The summary shown in the inspector's **Summary** row. It travels inside `Recent conversation:` rather than as a context item, so this share is released. |
+| `external_reference` | 5% | Pages read with `fetch_url`, shown in the turn **after** the fetch. It is the last category declared, so a crowded context drops a fetched page before it drops repository content. |
 
-A category that uses less than its share releases the remainder to the categories after it. In a repository with no hook context, no carried plan, no pinned context, no findings and no conversation summary, the five unused shares add up to 35% of the budget released to the categories that do have content. A category that wants more than its share is shortened within itself — its lowest-priority items are dropped, or the map or symbols block is re-rendered smaller — and it never takes from another category.
+A category that uses less than its share releases the remainder to the categories after it. In a repository with no hook context, no carried plan, no pinned context, no findings, no conversation summary and no fetched page, the six unused shares add up to 40% of the budget released to the categories that do have content. A category that wants more than its share is shortened within itself — its lowest-priority items are dropped, or the map or symbols block is re-rendered smaller — and it never takes from another category.
 
 Each share is its own key in your user config ([Settings](#settings)), written as a decimal fraction with at most four places:
 
@@ -310,10 +311,11 @@ context_budget.pinned=0.1500
 context_budget.plan_state=0.0500
 context_budget.repository_map=0.0500
 context_budget.symbols=0.1000
-context_budget.search_results=0.1500
+context_budget.search_results=0.1000
 context_budget.file_ranges=0.2500
 context_budget.findings=0.0500
 context_budget.conversation_summary=0.0500
+context_budget.external_reference=0.0500
 context_budget.safety_margin=0.1000
 ```
 
@@ -702,6 +704,56 @@ the main checkout, to survey them.
 
 When one model message asks for several read-only tools, they run together and
 their results are reported in the order the model asked for them.
+
+### Reading an external page
+
+With native tool-calling enabled and the session in **Code** mode, the
+assistant also has `fetch_url`. It reads one absolute `http` or `https` URL that
+the model names — a library's documentation, a changelog, an RFC — and returns
+it as text. It is one request for one page, never a crawl:
+
+- **A host is read only after you allow it.** The first fetch of a host pauses
+  the turn and shows a card with the host as the headline and the URL exactly as
+  the model wrote it, wrapped rather than shortened. A query or fragment longer
+  than 128 bytes is broken out and marked, because a long opaque parameter is
+  the shape exfiltration takes. The card offers *Allow once*, *Don't fetch*, and
+  *Always allow this host in this project* in the overflow. *Allow always*
+  writes `web_domain_allowlist.<repository id>` to your **user** config; a
+  repository's own config can never add a host, and neither can a permission
+  profile.
+- **Nothing has been sent when the card appears.** The request carries no API
+  key, no cookie and no other credential, and it does not reuse the model
+  connection. A redirect is never followed: a 3xx comes back as a result naming
+  the target, and fetching that URL is a new call with its own approval.
+- **A URL carrying something private is refused before you are asked.** If the
+  URL contains something that looks like a credential, or content from a file
+  the assistant read earlier in the same task, the fetch is refused and the
+  model is told why — no dialog appears, because an approval is not the last
+  line of defence. The query and fragment are checked raw, percent-decoded and
+  base64-decoded.
+- **Only text comes back.** `text/*`, `application/json` and
+  `application/xhtml+xml` are converted to plain text; scripts, styles, tags,
+  attributes, images and other sub-resources are dropped and never loaded.
+  Anything else returns its content type and size without its bytes. A response
+  is capped at 200 KiB; a larger one is cut short and the result says so.
+- **Nothing behind a login is reachable.** There are no cookies or sessions, so
+  a page that requires sign-in returns its login page or an error, not the
+  content.
+- **One session, one cache.** Re-reading the same URL in the same session is
+  served from a redacted cache and says so; a new session fetches it again, so a
+  stale page is never presented as current.
+- **At most eight pages per turn** by default (`web_fetch_max_per_turn`, hard
+  ceiling 20). The cap is a refusal the model can read, not a silent stop.
+
+The fetched text is **data, not an instruction**. It enters the model's context
+on the **next turn** as the *Reference pages* row in the [context
+inspector](#inspecting-and-controlling-context), labelled with its URL and fetch
+time; the immediate tool result is the same text inside a fixed frame and quoted
+line by line. It is the lowest-priority context category, so a crowded context
+drops a fetched page before it drops repository code. A page that looks like it
+is trying to issue instructions is marked in the result (instruction override,
+impersonation, fake tool call, exfiltration request); the text is still shown,
+quoted, and is not obeyed.
 
 ### When the assistant asks you a question
 
