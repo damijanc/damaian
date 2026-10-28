@@ -293,9 +293,10 @@ stop and report rather than breaking the parallel `chat.rs` track.
   spec constructs. Spec 57's `worktree remove --force` is a different,
   already-built path with its own confirmation and is not reachable from spec
   36's branch commands.
-- **`cargo deny check` fails on this branch for a dependency this spec does not
-  touch.** On 2026-10-28 it reports RUSTSEC-2026-0414 against
-  `pulldown-cmark v0.13.4` (fixed in 0.13.5, via `cargo update -p
-  pulldown-cmark`). The workspace is unchanged by spec 36 here; the upgrade is
-  for a dependency-maintenance change, not a branch-delivery one, and is left
-  out of this diff deliberately.
+- **`cargo deny check` failed at planning time for a dependency this spec does
+  not touch.** On 2026-10-28 it reported RUSTSEC-2026-0414 against
+  `pulldown-cmark v0.13.4` (fixed in 0.13.5), reached through
+  `workspace-engine`. It was fixed on `main` the same day as its own change
+  (`ec9f7ea`, `cargo update -p pulldown-cmark`), and this branch was rebased
+  onto that commit, so the check now passes here. Nothing in spec 36's diff
+  touches the dependency.
