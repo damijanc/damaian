@@ -69,7 +69,10 @@ and the three new settings behave as restrict-only or user-only.
 - [ ] Add `context_budget_memory: Option<u16>` and
       `memory_max_entries: Option<u32>` to `ConfigOverlay`, the built-in config
       field and parser, and `memory_retention_days: Option<u64>` as a user-only
-      key.
+      key. Fund the new share by lowering an existing one; never raise the
+      total. Spec 51 adds `external_reference` to the same array on a parallel
+      branch and pays for it out of `search_results`, so re-read the defaults
+      after that lands rather than assuming `main`'s table.
 - [ ] Classify all three: the two shares/caps are restrict-only `Preference`
       keys; `memory_retention_days` is forbidden to repository and profile, like
       `memory_user_scope_enabled` (`profile.rs:428`).

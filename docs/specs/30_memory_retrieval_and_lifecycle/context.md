@@ -230,6 +230,10 @@ metric.
 2. **`context_budget.memory` default share.** The plan assumes 300 basis points
    (3%), the smallest share in the default set, and restrict-only like every
    other share. It is enough for five short entries and cannot displace code.
+   The 300 must be taken out of an existing share, because the default total is
+   already at 10,000. Spec 51 adds `external_reference` to the same array on a
+   parallel branch and funds it by lowering `search_results`; re-read the
+   defaults when #51 has landed rather than trusting the numbers here.
 3. **`memory_retention_days` scope.** The plan makes it user-only, forbidden to
    repository and profile, for the same reason `memory_user_scope_enabled` is: a
    repository must not extend how long its own derived statements are kept.
