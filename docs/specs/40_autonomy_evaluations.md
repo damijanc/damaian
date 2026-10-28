@@ -61,7 +61,7 @@ Nothing in this phase exists. What it builds on:
   quality-gate command.
 - **Two metric rows were deferred and are now filled.**
   [Spec 18](18_local_evaluation_harness/proposal.md) §5.6 marks memory recall
-  usefulness and memory correction rate `notApplicable: "phase-3b"`, and [spec 30](30_memory_retrieval_and_lifecycle.md) §5.8 supplies them. This spec adds
+  usefulness and memory correction rate `notApplicable: "phase-3b"`, and [spec 30](30_memory_retrieval_and_lifecycle/proposal.md) §5.8 supplies them. This spec adds
   rows rather than filling deferred ones.
 - **Per-task usage aggregates upward.**
   [Spec 19](19_token_and_cost_accounting/proposal.md) §5.4 records usage per run and sums

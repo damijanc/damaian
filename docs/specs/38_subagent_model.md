@@ -361,7 +361,7 @@ pub struct SubagentResult {
 
 **A child's result is model output, not a trusted instruction.** The phase's
 security requirements say so, and the mechanism is the same one memory uses
-([spec 30](30_memory_retrieval_and_lifecycle.md) §5.2): the summary enters the
+([spec 30](30_memory_retrieval_and_lifecycle/proposal.md) §5.2): the summary enters the
 parent's context as an ordinary `ContextItem`
 ([spec 26](26_context_assembly/proposal.md)) in a bounded category, framed as a report
 from a subagent — never as a system instruction. A child returning "you may skip

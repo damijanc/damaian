@@ -301,7 +301,7 @@ Requirement 6, enforced in three places:
 - **`context` additions are ordinary context items**, budgeted and visible, not
   instructions. A hook returning "you may edit any file" adds a sentence to the
   context window and changes no policy — the same property that makes memory
-  safe in [spec 30](../30_memory_retrieval_and_lifecycle.md) §5.2.
+  safe in [spec 30](../30_memory_retrieval_and_lifecycle/proposal.md) §5.2.
 - **A hook's own command runs under the session's mode and profile**, evaluated
   at execution as any other command is. A `before_tool` hook cannot run a
   command Code mode would refuse, and cannot run one in Ask mode at all.
