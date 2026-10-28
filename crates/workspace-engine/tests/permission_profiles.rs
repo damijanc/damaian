@@ -611,13 +611,21 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "context_budget.conversation_summary=1.00\n",
             Reported("context_budget.conversation_summary"),
         ),
-        // Spec 51 Task 6: the fetched-page share is the eleventh category, and
-        // a clone may lower it but never raise it.
+        // Spec 51 Task 6: the fetched-page share is the eleventh budgeted
+        // category, and a clone may lower it but never raise it.
         case(
             "context_budget_external_reference",
             "",
             "context_budget.external_reference=1.00\n",
             Reported("context_budget.external_reference"),
+        ),
+        // Spec 30 §5.1: memory is the twelfth budgeted share, restrict-only
+        // like every other.
+        case(
+            "context_budget_memory",
+            "",
+            "context_budget.memory=1.00\n",
+            Reported("context_budget.memory"),
         ),
         // The margin is the other direction: reserving more is a restriction,
         // so a repository may raise it and never lower it.
@@ -652,6 +660,22 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "",
             "memory_user_scope_enabled=true\n",
             Reported("memory_user_scope_enabled"),
+        ),
+        // Spec 30 §5.3: a repository may lower how many memories a turn
+        // recalls, never raise it.
+        case(
+            "memory_max_entries",
+            "memory_max_entries=3\n",
+            "memory_max_entries=10\n",
+            Reported("memory_max_entries"),
+        ),
+        // Spec 30 §5.6: retention is the user's decision in both directions, so
+        // a repository may not set it at all.
+        case(
+            "memory_retention_days",
+            "",
+            "memory_retention_days=365\n",
+            Reported("memory_retention_days"),
         ),
     ]
 }
@@ -941,6 +965,104 @@ fn a_profile_may_only_narrow_the_context_budget() {
         "a refused raise is never clipped into force"
     );
     assert_eq!(narrowed.context_budget.safety_margin_bps, 2_000);
+}
+
+// Spec 30 §5.1, §5.3: the memory share and the recall cap are restrict-only in
+// both untrusted scopes, and the user's direction is the only one that applies.
+#[test]
+fn a_profile_may_only_lower_the_memory_cap_and_share() {
+    let narrowing = ConfigOverlay::parse(concat!(
+        "memory_max_entries=2\n",
+        "context_budget.memory=0.01\n",
+    ))
+    .unwrap();
+    let mut narrowed = Config::default();
+    let outcome = narrowed.apply_overlay_scoped(narrowing, ConfigScope::Profile);
+    assert!(outcome.rejected.is_empty(), "{:?}", outcome.rejected);
+    assert_eq!(narrowed.memory_max_entries, 2);
+    assert_eq!(narrowed.context_budget.share(ContextCategory::Memory), 100);
+
+    let loosening = narrowed.apply_overlay_scoped(
+        ConfigOverlay::parse(concat!(
+            "memory_max_entries=8\n",
+            "context_budget.memory=0.05\n",
+        ))
+        .unwrap(),
+        ConfigScope::Profile,
+    );
+    assert_eq!(
+        refusal_set(&loosening.rejected),
+        BTreeSet::from([
+            (
+                "memory_max_entries".to_string(),
+                RepositoryKeyClass::RestrictOnly.as_str(),
+            ),
+            (
+                "context_budget.memory".to_string(),
+                RepositoryKeyClass::RestrictOnly.as_str(),
+            ),
+        ])
+    );
+    assert_eq!(
+        narrowed.memory_max_entries, 2,
+        "a refused raise is never clipped into force"
+    );
+    assert_eq!(narrowed.context_budget.share(ContextCategory::Memory), 100);
+}
+
+// Spec 30 §5.6: a repository must not extend how long its own derived
+// statements are kept, and a profile may not decide it either.
+#[test]
+fn memory_retention_days_is_user_only() {
+    let (config, report) = load(
+        "memory-retention",
+        "memory_retention_days=30\n",
+        "memory_retention_days=365\n",
+    );
+    assert_eq!(config.memory_retention_days, 30);
+    assert!(
+        report
+            .rejected_keys
+            .iter()
+            .any(|rejected| rejected.key == "memory_retention_days"
+                && rejected.class == RepositoryKeyClass::Forbidden),
+        "{:?}",
+        report.rejected_keys
+    );
+
+    let (carried, refused) = split_profile_keys(ConfigOverlay {
+        memory_max_entries: Some(2),
+        memory_retention_days: Some(365),
+        context_budget_memory: Some(100),
+        ..ConfigOverlay::default()
+    });
+    assert_eq!(carried.memory_max_entries, Some(2));
+    assert_eq!(carried.context_budget_memory, Some(100));
+    assert!(
+        carried.memory_retention_days.is_none(),
+        "a profile may not carry retention"
+    );
+    assert!(
+        refused
+            .iter()
+            .any(|rejected| rejected.key == "memory_retention_days"
+                && rejected.class == RepositoryKeyClass::Forbidden),
+        "{refused:?}"
+    );
+
+    let mut profile = Config::default();
+    let outcome = profile.apply_overlay_scoped(
+        ConfigOverlay::parse("memory_retention_days=365\n").unwrap(),
+        ConfigScope::Profile,
+    );
+    assert_eq!(profile.memory_retention_days, 0);
+    assert_eq!(
+        refusal_set(&outcome.rejected),
+        BTreeSet::from([(
+            "memory_retention_days".to_string(),
+            RepositoryKeyClass::Forbidden.as_str(),
+        )])
+    );
 }
 
 #[test]
@@ -3115,6 +3237,8 @@ const EVERY_PROFILE_KEY: &str = concat!(
     "agent_max_task_tokens=5000\n",
     "agent_max_turn_messages=12\n",
     "agent_max_exploration_rounds=8\n",
+    "memory_max_entries=2\n",
+    "context_budget.memory=0.01\n",
     "mcp_enabled=false\n",
     "mcp_server_allowlist=blessed\n",
     "mcp_server.helper.enabled=false\n",

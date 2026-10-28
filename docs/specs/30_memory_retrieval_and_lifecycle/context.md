@@ -1,10 +1,12 @@
 # Spec 30 — Context and Corrections
 
-Pre-implementation state, verified against `main` at `d352004` on 2026-10-28.
-This file records what the code actually looks like, where the specification's
-assumptions no longer hold, and the decisions that follow. It is not a second
-proposal: where the two disagree, [`proposal.md`](proposal.md) states the intent
-and this file says how the current code forces that intent to be expressed.
+Pre-implementation state, verified against `main` at `d352004` on 2026-10-28,
+and re-checked against `main` at `426b00a` (2026-10-28) immediately before
+Task 1. This file records what the code actually looks like, where the
+specification's assumptions no longer hold, and the decisions that follow. It is
+not a second proposal: where the two disagree, [`proposal.md`](proposal.md)
+states the intent and this file says how the current code forces that intent to
+be expressed.
 
 Line numbers were read from the tree on the date above. Treat them as a starting
 point, not a contract; re-grep before editing.
@@ -36,13 +38,16 @@ everything retrieval needs except a file root and the task prompt.
 
 `crates/workspace-engine/src/context_manager.rs`:
 
-- `ContextCategory` is an ordered enum (`:37`) whose declaration order is the
-  truncation priority. It ends at `ConversationSummary` (`:54`).
-- `ContextCategory::BUDGETED` is a fixed `[ContextCategory; 10]` (`:76`) and
-  `ContextBudget::shares` is `[u16; 10]` (`:118`), defaulted at `:124` and
-  validated for oversubscription (`config.rs:2134`).
-- `ContextKind` (`:240`) is the prompt header spelling, and `ContextKind::category`
-  (`:285`) is the one kind-to-category decision.
+- `ContextCategory` is an ordered enum (`:38`) whose declaration order is the
+  truncation priority. Spec 51 added `ExternalReference` after
+  `ConversationSummary`, so it ends at `ExternalReference` (`:58`).
+- `ContextCategory::BUDGETED` is a fixed `[ContextCategory; 11]` (`:81`) and
+  `ContextBudget::shares` is `[u16; 11]` (`:125`), defaulted at `:134` and
+  validated for oversubscription (`config.rs:2229`). The default shares sum to
+  exactly 10,000, with `external_reference` at 500 funded from `search_results`
+  (1,500 → 1,000).
+- `ContextKind` (`:258`) is the prompt header spelling, and `ContextKind::category`
+  (`:296`) is the one kind-to-category decision.
 - `ContextRequest` carries `plan`, `pinned`, `restriction` and
   `conversation_summary` — all read by the caller from `SessionStore`. Assembly
   itself performs no I/O and has no store.
@@ -80,16 +85,21 @@ everything retrieval needs except a file root and the task prompt.
 ### 1.5 Configuration
 
 - `ContextBudget` lives in `config.rs` (`Context::context_budget`, `:273`) and is
-  filled from eleven individual overlay fields (`ConfigOverlay`,
-  `config.rs:2941–2951`), each classified by the overlay macro and validated by
-  name in `:1785`.
+  filled from twelve individual overlay fields (`ConfigOverlay`,
+  `config.rs:3139–3151`), each classified by the overlay macro and applied by
+  name in `:1866`.
 - Adding a key therefore touches `config.rs`, `profile.rs`
-  (`split_profile_keys`, `:325`), `effective_policy.rs` (`rule_label`, `:141`)
+  (`split_profile_keys`, `:333`), `effective_policy.rs` (`rule_label`, `:129`)
   and `tests/permission_profiles.rs` — the same four files specs 25, 32 and 50
   used, exactly as the README records.
-- `memory_user_scope_enabled` (`config.rs:2942`) is the precedent for a
-  memory switch that is user-only and forbidden to repository and profile
-  (`profile.rs:428`).
+- `memory_user_scope_enabled` (`config.rs:269`) is the precedent for a memory
+  switch that is user-only and forbidden to repository and profile
+  (`profile.rs:443`).
+- Restrict-only keys are `Capability`, not `Preference`: spec 31's rule is
+  "capability ⇔ repository scope does not apply the key freely", and the
+  preference test requires every `Preference` field to apply from repository
+  scope unchanged. All twelve `context_budget.*` shares are `Capability` today,
+  so the memory share and cap follow that pattern.
 
 ### 1.6 The watcher
 
@@ -127,14 +137,25 @@ directory, the audit log, or that a memory store exists.
 it `pub(crate)` is the smallest change; a new shared `text` module would be a
 refactor this spec does not need.
 
-**C2 — The budget arrays are fixed-size.** Adding `Memory` is not one enum
-variant: `BUDGETED` and `shares` are `[_; 10]` (`context_manager.rs:76`, `:118`),
-the default array and the oversubscription validator assume ten shares, and the
-overlay has one field per share. Every exhaustive match over `ContextCategory`
-(`as_str`, `budget_index`, the `CategoryUsage` order, the JS label map) must be
-updated in the same change, or the compiler will not let the array change land
-alone. `Memory` goes **after** `ConversationSummary` so it is last in `Ord`, per
-proposal §5.1.
+**C2 — The budget arrays are fixed-size, and `Memory` goes after `ExternalReference`.**
+Adding `Memory` is not one enum variant: `BUDGETED` and `shares` are `[_; 11]`
+(`context_manager.rs:81`, `:125`), the default array and the oversubscription
+validator assume eleven shares, the overlay has one field per share, and
+`apply_budget`'s per-category index array is `[_; 12]` (`:1694`), sized to the
+whole enum. Every exhaustive match over `ContextCategory` (`as_str`,
+`budget_index`, the `CategoryUsage` order) must be updated in the same change,
+or the compiler will not let the array change land alone. The JS label map is
+not exhaustive and is updated with the inspector work in Tasks 3 and 5.
+
+The plan said "after `ConversationSummary`", which was true when the plan was
+written. Spec 51 has since added `ExternalReference` in that position and
+declared it last so a fetched page drops before repository content. Spec 30's
+own acceptance criterion is stronger — "`Memory` is the lowest-priority category
+and is truncated before any other when the budget is contested" — so `Memory`
+goes **after `ExternalReference`**, making it the thirteenth variant and the
+twelfth budgeted category. ExternalReference keeps its guarantee (it still drops
+before every repository-content category) and loses only the claim to be the
+very last one. `indices`/`categories` become `[_; 13]` and capacity 13.
 
 **C3 — The inspector cannot show a memory statement from the manifest.** The
 manifest is content-free by design and is written to the audit log
@@ -220,6 +241,24 @@ Both are proxies and must say so in spec 18's §5.6 and the harness docs; the
 phase's real validation (proposal §7) is the elapsed-time observation, not the
 metric.
 
+**C12 — Task 1's draft mislabelled the classification and omitted two consequences.**
+The draft called the memory share and entry cap "restrict-only `Preference`
+keys". That combination does not exist: a `Preference` is applied freely from
+repository scope by the partition's own test, so a key with one-way direction is
+a `Capability` (spec 31's "capability ⇔ repository scope does not apply the key
+freely"). Both are therefore classified `Capability`, and each needs a weakening
+case in `tests/permission_profiles.rs`. Two edits outside the draft's file list
+also follow from the array growth: `apply_budget`'s `[Vec<usize>; 12]` and
+`Vec::with_capacity(12)` must become 13 (the compiler does not catch an
+out-of-range index here), and `tests/context_assembly.rs` pins the old category
+count, defaults and last category in four tests:
+`the_default_share_total_stays_ten_thousand`,
+`each_category_reports_whether_its_tokens_are_measured_or_estimated`,
+`an_external_reference_is_the_last_category_and_drops_first` (renamed to
+`an_external_reference_drops_before_repository_content`) and
+`a_category_orders_before_the_categories_after_it`, whose "exhaustive on
+purpose" array had already missed `ExternalReference`.
+
 ## 3. Open questions for the owner
 
 1. **`memory_max_entries` default.** Proposal §5.3 asks for "a small maximum".
@@ -228,12 +267,17 @@ metric.
    restrict-only key, so a user can lower it but not raise it above what the
    budget can hold.
 2. **`context_budget.memory` default share.** The plan assumes 300 basis points
-   (3%), the smallest share in the default set, and restrict-only like every
-   other share. It is enough for five short entries and cannot displace code.
-   The 300 must be taken out of an existing share, because the default total is
-   already at 10,000. Spec 51 adds `external_reference` to the same array on a
-   parallel branch and funds it by lowering `search_results`; re-read the
-   defaults when #51 has landed rather than trusting the numbers here.
+   (3%) and restrict-only like every other share. It is enough for five short
+   entries and cannot displace code. Spec 51 has landed: `external_reference`
+   is now the eleventh budgeted share (500, funded from `search_results`
+   1,500 → 1,000), and the defaults still total 10,000. Task 1 therefore takes
+   the 300 from a different share: `findings` 500 → 200. `findings` has no
+   producer in the current tree (the only references are the enum variant and
+   the config table), so its share is pure carry today; if spec 22's repair
+   subset is wired up, that split needs revisiting. This means memory is not
+   literally the smallest share (findings is 200) — the plan's "smallest" was
+   descriptive, and the acceptance criterion is the ordering, which puts memory
+   last and dropped first.
 3. **`memory_retention_days` scope.** The plan makes it user-only, forbidden to
    repository and profile, for the same reason `memory_user_scope_enabled` is: a
    repository must not extend how long its own derived statements are kept.
@@ -247,7 +291,7 @@ metric.
 
 ## 4. What the first task needs
 
-`tasks.md` Task 1 adds the category, the kind, the two config keys and the
+`tasks.md` Task 1 adds the category, the kind, the three config keys and the
 overlay classification. It is deliberately self-contained: no store, no turn
 path, no UI. Its acceptance is the compiler plus the config tests, because every
 exhaustive match over `ContextCategory` fails to compile until it is updated —

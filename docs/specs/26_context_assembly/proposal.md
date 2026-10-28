@@ -242,6 +242,8 @@ pub enum ContextCategory {
     FileRanges,
     Findings,       // spec 22 (reserved; see §5.11)
     ConversationSummary, // spec 55 (reserved)
+    ExternalReference,   // spec 51: a fetched page
+    Memory,              // spec 30: recalled facts, dropped first
 }
 
 /// The source label the prompt header shows. The spelling is today's, so a
@@ -332,17 +334,25 @@ context_budget.repository_map=0.05
 context_budget.symbols=0.10
 context_budget.search_results=0.10
 context_budget.file_ranges=0.25
-context_budget.findings=0.05
+context_budget.findings=0.02
 context_budget.conversation_summary=0.05
 context_budget.external_reference=0.05
+context_budget.memory=0.03
 context_budget.safety_margin=0.10
 ```
 
 The eleventh category, `external_reference`, is the text of a page fetched by
 [spec 51](../51_external_reference_retrieval/proposal.md)'s `fetch_url` tool. It
-is declared last, so a crowded context drops a fetched page before any
-repository content; its 0.05 share is funded from `search_results` (0.15 →
-0.10), so the defaults still total exactly 1.00.
+is declared after every repository-content category, so a crowded context drops
+a fetched page before any repository content; its 0.05 share is funded from
+`search_results` (0.15 → 0.10), so the defaults still total exactly 1.00.
+
+The twelfth category, `memory`, carries statements recalled by
+[spec 30](../30_memory_retrieval_and_lifecycle/proposal.md). It is declared last,
+after `external_reference`, because spec 29 requirement 5 and spec 30's
+acceptance criteria require memory to be dropped before any other category; its
+0.03 share is funded from `findings` (0.05 → 0.02), which has no producer yet,
+so the defaults still total exactly 1.00.
 
 Fractions of the effective limit (§5.7) rather than absolute counts, so one set
 of settings works across a 64k and a 200k budget. They are parsed as decimals and

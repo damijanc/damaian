@@ -344,6 +344,8 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         conversation_window_share,
         pause_for_context_review,
         memory_user_scope_enabled,
+        memory_max_entries,
+        memory_retention_days,
         context_budget_instructions,
         context_budget_hook_context,
         context_budget_pinned,
@@ -355,6 +357,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         context_budget_findings,
         context_budget_conversation_summary,
         context_budget_external_reference,
+        context_budget_memory,
         context_budget_safety_margin,
         max_command_output_bytes,
         command_timeout_secs,
@@ -443,6 +446,9 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
             "memory_user_scope_enabled",
             memory_user_scope_enabled.is_some(),
         ),
+        // Spec 30 §5.6: how long a repository's own derived statements are kept
+        // is the user's decision, like cross-project recall above.
+        ("memory_retention_days", memory_retention_days.is_some()),
         ("shell", shell.is_some()),
         ("model_provider", model_provider.is_some()),
         ("model_name", model_name.is_some()),
@@ -613,6 +619,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         repository_map_max_tokens,
         symbol_context_max_tokens,
         conversation_window_share: conversation_window_share.filter(|_| !window_below_floor),
+        memory_max_entries,
         context_budget_instructions,
         context_budget_hook_context,
         context_budget_pinned,
@@ -624,6 +631,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         context_budget_findings,
         context_budget_conversation_summary,
         context_budget_external_reference,
+        context_budget_memory,
         context_budget_safety_margin,
         command_timeout_secs,
         ignore_patterns,
@@ -776,6 +784,7 @@ fn equals_base_limit(key: &str, carried: &ConfigOverlay, base: &Config) -> bool 
         "conversation_window_share" => {
             carried.conversation_window_share == Some(base.conversation_window_share)
         }
+        "memory_max_entries" => carried.memory_max_entries == Some(base.memory_max_entries),
         "command_timeout_secs" => carried.command_timeout_secs == Some(base.command_timeout_secs),
         "agent_max_turn_messages" => {
             carried.agent_max_turn_messages == Some(base.agent_max_turn_messages)

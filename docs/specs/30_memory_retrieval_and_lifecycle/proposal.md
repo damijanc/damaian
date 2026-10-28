@@ -1,6 +1,6 @@
 # Feature Spec: Memory Retrieval, Lifecycle, and Injection Resistance
 
-Status: In progress (planned 2026-10-28; no task implemented yet).
+Status: In progress (started 2026-10-28; Task 1 of 8 done).
 Order: 30 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 4 (Must). That directory is local-only and not committed, so the
@@ -139,6 +139,7 @@ placed last:
 pub enum ContextCategory {
     Required,
     Instructions,
+    HookContext,
     Pinned,
     PlanState,
     RepositoryMap,
@@ -147,6 +148,7 @@ pub enum ContextCategory {
     FileRanges,
     Findings,
     ConversationSummary,
+    ExternalReference,
     /// Lowest priority. Dropped first, per spec 29 requirement 5.
     Memory,
 }
@@ -159,6 +161,12 @@ instructions, plan state, or file content. Requirement 5 of
 [spec 29](29_memory_creation_and_consent/proposal.md) ("memory is the lowest-priority
 context source") is therefore a property of the enum's ordering, not a rule
 someone must remember.
+
+`ExternalReference` is spec 51's fetched-page category. It was declared last
+when it landed, so a fetched page would drop before any repository content; this
+spec puts `Memory` after it, because spec 29 requirement 5 and this spec's
+acceptance criteria require memory to be the first thing dropped. The fetched
+page keeps its guarantee: it still precedes every repository-content category.
 
 `context_budget.memory` gets a deliberately small default share. A memory
 category that routinely consumes a tenth of the window has stopped being a

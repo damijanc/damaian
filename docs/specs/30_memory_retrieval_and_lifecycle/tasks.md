@@ -39,7 +39,7 @@ corrections planning found, before starting any task.
 
 | Task | Status | What landed |
 |---|---|---|
-| 1 · Types and configuration | Not started | — |
+| 1 · Types and configuration | Done 2026-10-28 | **Landed:** `ContextCategory::Memory` is the thirteenth variant and twelfth budgeted category, **after** spec 51's `ExternalReference` (plan correction: the draft said "after `ConversationSummary`", which would have left fetched pages lower than memory and violated this spec's own "memory drops first" acceptance criterion). `BUDGETED`/`shares` are `[_; 12]`; `apply_budget`'s `indices` is `[_; 13]` and its capacity is 13. The default table totals 10,000 with memory at 300, funded by lowering `findings` 500 → 200 — `findings` has no producer in the tree, and `search_results` had already paid for `external_reference`. `ContextKind::Memory` maps `"memory"` to the category. New keys: `memory_max_entries` (u32, default 5, restrict-only lower-wins through `restrict_only_u32`), `memory_retention_days` (u64, default 0 = no expiry, `Forbidden` to repository and profile) and `context_budget.memory` (restrict-only share). All three are `Capability`, not `Preference` as the draft said: spec 31 defines a capability as a key repository scope does not apply freely, and its preference test requires free application. Both overlay writers and the resolved policy text print them; `rule_label` names them; `split_profile_keys` carries the cap and share and refuses retention; `equals_base_limit` knows the cap. **Tests:** `permission_profiles` 87/87 (three new weakening cases and two new tests: profile direction, user-only retention); `context_assembly` 52/52; `config::tests` 3/3; full `workspace-engine` 2,039 passed, 28 skipped. **Discoveries:** two consequences lay outside the draft's file list — `apply_budget`'s index array had no compile-time link to the enum size (a 13th variant would have panicked at runtime, not failed the build), and `context_assembly.rs` pinned the old count/last category in three places, including `an_external_reference_is_the_last_category_and_drops_first`, renamed `an_external_reference_drops_before_repository_content`. **Intermediate state:** the inspector shows the new empty `memory` row with its raw key label until Task 3 adds the label map and Task 5 the row, as planned. **Docs:** proposal §5.1 and Status, context.md C2/C12 and §1.2/§1.5/§3 Q2, spec 26 §5.1–§5.2 defaults, and the README row/current-state paragraph were corrected. Scoped checks: fast gate (`fmt`, `node`, `lint`, `typos`, `deny`) passed; scoped clippy clean; `npm run specs:check` passed. Workspace clippy and the full suite are left to CI. |
 | 2 · Recall engine | Not started | — |
 | 3 · Context assembly | Not started | — |
 | 4 · Turn wiring and send-time re-check | Not started | — |
@@ -57,37 +57,50 @@ and the three new settings behave as restrict-only or user-only.
 `crates/workspace-engine/src/config.rs`,
 `crates/workspace-engine/src/profile.rs`,
 `crates/workspace-engine/src/effective_policy.rs`,
-`crates/workspace-engine/tests/permission_profiles.rs`.
+`crates/workspace-engine/tests/permission_profiles.rs`,
+`crates/workspace-engine/tests/context_assembly.rs`.
 
 **Steps**
 
-- [ ] Add `ContextCategory::Memory` after `ConversationSummary` in
-      `context_manager.rs:37`, with the doc comment that it is lowest priority
-      and dropped first.
-- [ ] Add `ContextKind::Memory` and its `as_str` (`"memory"`) and `category`
+- [x] Add `ContextCategory::Memory` **after `ExternalReference`** in
+      `context_manager.rs:58`, with the doc comment that it is lowest priority
+      and dropped first. The draft said "after `ConversationSummary`", which
+      spec 51's landed `ExternalReference` has since occupied; memory must be
+      last in `Ord` to satisfy this spec's own acceptance criterion (context.md
+      C2).
+- [x] Add `ContextKind::Memory` and its `as_str` (`"memory"`) and `category`
       arms; update `BUDGETED`, `budget_index`, the `shares` array type and the
-      default array to eleven entries, and the oversubscription test that
-      assumes ten.
-- [ ] Add `context_budget_memory: Option<u16>` and
+      default array to twelve entries, `apply_budget`'s `[Vec<usize>; 12]` and
+      `Vec::with_capacity(12)` to thirteen, and the tests in
+      `tests/context_assembly.rs` that assert the category count and that
+      `ExternalReference` is the last category.
+- [x] Add `context_budget_memory: Option<u16>` and
       `memory_max_entries: Option<u32>` to `ConfigOverlay`, the built-in config
-      field and parser, and `memory_retention_days: Option<u64>` as a user-only
+      fields and parser, and `memory_retention_days: Option<u64>` as a user-only
       key. Fund the new share by lowering an existing one; never raise the
-      total. Spec 51 adds `external_reference` to the same array on a parallel
-      branch and pays for it out of `search_results`, so re-read the defaults
-      after that lands rather than assuming `main`'s table.
-- [ ] Classify all three: the two shares/caps are restrict-only `Preference`
-      keys; `memory_retention_days` is forbidden to repository and profile, like
-      `memory_user_scope_enabled` (`profile.rs:428`).
-- [ ] Add `rule_label` text for each key and extend
+      total. Spec 51 has landed: `external_reference` (500) is funded from
+      `search_results` (1,500 → 1,000). Take memory's 300 from `findings`
+      (500 → 200), which has no producer in the current tree, rather than from
+      file content.
+- [x] Classify all three as `Capability`: the share and the cap are restrict-only
+      (lower-wins), and `memory_retention_days` is forbidden to repository and
+      profile, like `memory_user_scope_enabled` (`profile.rs:443`). The draft
+      said "`Preference`", which contradicts the partition's rule that a
+      capability is a key repository scope does not apply freely (context.md
+      C12).
+- [x] Add `rule_label` text for each key and extend
       `tests/permission_profiles.rs` with the three classifications: a
       repository raise is refused by name, a repository retention value is
       refused, and a profile may lower the cap and the share but not raise them.
-- [ ] Update `Config::validate_context_budget` and its test so eleven shares
-      still total at most 10,000.
+- [x] Update `Config::validate_context_budget` and its test so twelve shares
+      still total at most 10,000, and add `memory_max_entries` to
+      `profile.rs`'s `equals_base_limit` so an equal cap is not reported as a
+      loosening import.
 
 **Checks:** `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets
 --locked -- -D warnings`; `cargo nextest run -p workspace-engine --test
-permission_profiles`; the `config` inline tests.
+permission_profiles`; the `config` inline tests; `cargo nextest run -p
+workspace-engine --test context_assembly` (the two category-count tests).
 
 **Done when:** the workspace compiles with `Memory` in every match, and the
 config tests prove the three keys' direction and scope.

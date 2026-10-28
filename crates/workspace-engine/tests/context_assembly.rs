@@ -460,6 +460,8 @@ fn a_category_orders_before_the_categories_after_it() {
         ContextCategory::FileRanges,
         ContextCategory::Findings,
         ContextCategory::ConversationSummary,
+        ContextCategory::ExternalReference,
+        ContextCategory::Memory,
     ];
     for pair in pipeline.windows(2) {
         assert!(
@@ -2384,8 +2386,8 @@ fn each_category_reports_whether_its_tokens_are_measured_or_estimated() {
 
     assert_eq!(
         plan.manifest.categories.len(),
-        12,
-        "Required plus the eleven budgeted categories"
+        13,
+        "Required plus the twelve budgeted categories"
     );
     for usage in &plan.manifest.categories {
         assert!(
@@ -2764,7 +2766,7 @@ const CALIBRATION_JSON: &str = "\
   \"limit\": { \"tokens\": 64000, \"source\": \"declared\", \"safetyMarginBps\": 0 }
 }";
 
-// ---- Spec 51 Task 6: a fetched page enters as the last category ----
+// ---- Spec 51 Task 6: a fetched page drops before repository content ----
 
 /// A converted page, as spec 51's Task 5 hands one back: already text, already
 /// redacted, already bounded. The tests build it directly, so no fetch and no
@@ -2820,7 +2822,7 @@ fn assemble_with_references(
 }
 
 #[test]
-fn an_external_reference_is_the_last_category_and_drops_first() {
+fn an_external_reference_drops_before_repository_content() {
     let repo = fixture_repo("external-drop");
     let engine = WorkspaceEngine::new(config_with_shares(
         &repo,
@@ -2847,8 +2849,13 @@ fn an_external_reference_is_the_last_category_and_drops_first() {
 
     assert_eq!(
         ContextCategory::BUDGETED.last(),
-        Some(&ContextCategory::ExternalReference),
-        "the category is last, so it is the first to go under pressure"
+        Some(&ContextCategory::Memory),
+        "memory is the last category, so it drops first"
+    );
+    assert_eq!(
+        ContextCategory::BUDGETED[ContextCategory::BUDGETED.len() - 2],
+        ContextCategory::ExternalReference,
+        "the fetched page still drops before any repository content"
     );
 
     assert!(
@@ -3015,7 +3022,7 @@ fn the_default_share_total_stays_ten_thousand() {
     assert_eq!(
         budget.total_share_bps(),
         10_000,
-        "the new share is funded from search_results, never by inflating the total"
+        "new shares are funded from existing ones, never by inflating the total"
     );
     budget
         .validate()
@@ -3023,10 +3030,21 @@ fn the_default_share_total_stays_ten_thousand() {
     assert_eq!(
         budget.share(ContextCategory::SearchResults),
         1_000,
-        "search_results pays for the new category"
+        "search_results paid for the reference-page category"
     );
     assert_eq!(budget.share(ContextCategory::ExternalReference), 500);
-    assert_eq!(ContextCategory::BUDGETED.len(), 11);
+    assert_eq!(
+        budget.share(ContextCategory::Findings),
+        200,
+        "findings pays for memory"
+    );
+    assert_eq!(budget.share(ContextCategory::Memory), 300);
+    assert_eq!(ContextCategory::BUDGETED.len(), 12);
+    assert_eq!(
+        ContextCategory::BUDGETED[11],
+        ContextCategory::Memory,
+        "memory is the last category, so it drops first"
+    );
     assert_eq!(
         ContextCategory::BUDGETED[10],
         ContextCategory::ExternalReference
@@ -3035,4 +3053,7 @@ fn the_default_share_total_stays_ten_thousand() {
         ContextCategory::ExternalReference.as_str(),
         "external_reference"
     );
+    assert_eq!(ContextCategory::Memory.as_str(), "memory");
+    assert!(ContextCategory::Memory > ContextCategory::ExternalReference);
+    assert!(ContextCategory::Memory > ContextCategory::ConversationSummary);
 }

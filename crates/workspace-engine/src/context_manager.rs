@@ -53,9 +53,14 @@ pub enum ContextCategory {
     Findings,
     /// Reserved for spec 55.
     ConversationSummary,
-    /// A page fetched by spec 51's `fetch_url`. Last, so a crowded context
-    /// drops a fetched page before any repository content (spec 51 D6).
+    /// A page fetched by spec 51's `fetch_url`. It precedes every
+    /// repository-content category in drop order; spec 30's `Memory` is the one
+    /// category declared after it (spec 51 D6).
     ExternalReference,
+    /// Remembered statements the user confirmed (spec 30 §5.1). Last, so a
+    /// crowded context drops memory before anything else: losing a remembered
+    /// fact costs a little convenience, while losing code costs the answer.
+    Memory,
 }
 
 impl ContextCategory {
@@ -73,12 +78,13 @@ impl ContextCategory {
             Self::Findings => "findings",
             Self::ConversationSummary => "conversation_summary",
             Self::ExternalReference => "external_reference",
+            Self::Memory => "memory",
         }
     }
 
     /// The budgeted categories, in pipeline order after `Required`, which has no
     /// share (proposal §5.2). Declaration order of the enum is the same order.
-    pub const BUDGETED: [ContextCategory; 11] = [
+    pub const BUDGETED: [ContextCategory; 12] = [
         ContextCategory::Instructions,
         ContextCategory::HookContext,
         ContextCategory::Pinned,
@@ -90,6 +96,7 @@ impl ContextCategory {
         ContextCategory::Findings,
         ContextCategory::ConversationSummary,
         ContextCategory::ExternalReference,
+        ContextCategory::Memory,
     ];
 
     /// The index into [`ContextBudget::shares`]; `None` for `Required`.
@@ -107,6 +114,7 @@ impl ContextCategory {
             Self::Findings => Some(8),
             Self::ConversationSummary => Some(9),
             Self::ExternalReference => Some(10),
+            Self::Memory => Some(11),
         }
     }
 }
@@ -122,7 +130,7 @@ pub struct ContextBudget {
     /// One share per [`ContextCategory::BUDGETED`] category, in that order.
     /// The sum must be at most 10,000; a set that oversubscribes is a config
     /// error rather than a silent scale-down.
-    pub shares: [u16; 11],
+    pub shares: [u16; 12],
     /// The share of an observed window reserved for estimate error. It is not
     /// applied to the declared `context_token_budget` (proposal §5.7).
     pub safety_margin_bps: u16,
@@ -140,9 +148,10 @@ impl Default for ContextBudget {
                 1_000, // symbols
                 1_000, // search_results
                 2_500, // file_ranges
-                500,   // findings
+                200,   // findings — pays for memory; it has no producer yet
                 500,   // conversation_summary
                 500,   // external_reference
+                300,   // memory
             ],
             safety_margin_bps: 1_000,
         }
@@ -268,6 +277,8 @@ pub enum ContextKind {
     Pinned,
     /// Text of a page `fetch_url` retrieved (spec 51 §5.4).
     ExternalReference,
+    /// A remembered statement (spec 30 §5.2).
+    Memory,
 }
 
 impl ContextKind {
@@ -284,6 +295,7 @@ impl ContextKind {
             Self::PlanState => "plan_state",
             Self::Pinned => "pinned",
             Self::ExternalReference => "external_reference",
+            Self::Memory => "memory",
         }
     }
 
@@ -305,6 +317,7 @@ impl ContextKind {
             Self::RetrievedFile => ContextCategory::SearchResults,
             Self::ExplicitFile => ContextCategory::FileRanges,
             Self::ExternalReference => ContextCategory::ExternalReference,
+            Self::Memory => ContextCategory::Memory,
         }
     }
 }
@@ -1638,11 +1651,13 @@ impl ContextManager {
             &mut excluded,
         );
 
-        // A fetched page (spec 51 §5.4, D5). Collected after everything else so
-        // it is last in the prompt, and charged to the last category so a
-        // crowded context drops it before any repository content. The text is
-        // already converted, redacted and bounded by the fetch task: this is
-        // not a second conversion, and the provenance label travels with it.
+        // A fetched page (spec 51 §5.4, D5). Collected after every repository
+        // source so it follows repository content in the prompt, and charged to
+        // the fetched-page category, which drops before any repository content.
+        // Memory (spec 30) is the one category that drops earlier still. The
+        // text is already converted, redacted and bounded by the fetch task:
+        // this is not a second conversion, and the provenance label travels
+        // with it.
         for reference in external_references {
             push_text(
                 &mut pending,
@@ -1691,13 +1706,13 @@ impl ContextManager {
         }
         let available = limit.tokens - required_tokens;
 
-        let mut indices: [Vec<usize>; 12] = std::array::from_fn(|_| Vec::new());
+        let mut indices: [Vec<usize>; 13] = std::array::from_fn(|_| Vec::new());
         for (index, item) in pending.iter().enumerate() {
             indices[item.category() as usize].push(index);
         }
 
         let mut placed: Vec<Option<ContextItem>> = vec![None; pending.len()];
-        let mut categories = Vec::with_capacity(12);
+        let mut categories = Vec::with_capacity(13);
 
         // Required is never budgeted and never dropped (proposal §5.1).
         let required = &indices[ContextCategory::Required as usize];
@@ -2585,6 +2600,10 @@ mod tests {
             "\"conversation_summary\""
         );
         assert_eq!(ContextCategory::HookContext.as_str(), "hook_context");
+        assert_eq!(
+            serde_json::to_string(&ContextCategory::Memory).unwrap(),
+            "\"memory\""
+        );
     }
 
     #[test]
@@ -2600,6 +2619,8 @@ mod tests {
             (ContextKind::RetrievedFile, "retrieved_file"),
             (ContextKind::PlanState, "plan_state"),
             (ContextKind::Pinned, "pinned"),
+            (ContextKind::ExternalReference, "external_reference"),
+            (ContextKind::Memory, "memory"),
         ] {
             assert_eq!(kind.as_str(), spelling);
             assert_eq!(
