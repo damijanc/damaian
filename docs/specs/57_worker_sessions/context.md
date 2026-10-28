@@ -139,7 +139,7 @@ granted Keychain access to.
 
 ### 3.7 Worktrees
 
-Damaian creates no worktrees. [#36](../36_branch_and_worktree_delivery.md)
+Damaian creates no worktrees. [#36](../36_branch_and_worktree_delivery/proposal.md)
 leaves creation to "Phase 2 WP4", which is unspecified. #36 does record that a
 worktree at a different path is indexed as its own repository. `.damaian/` is
 already a repository-controlled directory — it holds the repository config

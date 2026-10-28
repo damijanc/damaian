@@ -29,7 +29,7 @@ warn-and-override mechanism §5.4 reuses),
 [`23_verification_loop/proposal.md`](../23_verification_loop/proposal.md) (check evidence),
 [`31_permission_profiles/proposal.md`](../31_permission_profiles/proposal.md) and
 [`34_repository_config_trust_boundary.md`](../34_repository_config_trust_boundary.md)
-(Git mutation is a capability), [`36_branch_and_worktree_delivery.md`](../36_branch_and_worktree_delivery.md).
+(Git mutation is a capability), [`36_branch_and_worktree_delivery/proposal.md`](../36_branch_and_worktree_delivery/proposal.md).
 
 ## 1. Motivation
 
@@ -116,7 +116,7 @@ this section is the history.
 ## 4. Non-goals
 
 - Pushing, or anything remote — [spec 37](../37_pull_request_creation.md).
-- Branch creation, merge, or rebase — [spec 36](../36_branch_and_worktree_delivery.md).
+- Branch creation, merge, or rebase — [spec 36](../36_branch_and_worktree_delivery/proposal.md).
 - Amend, reset, rebase, cherry-pick, or any history rewrite. Requirement 5
   forbids doing them without dedicated approval; this spec does not implement
   them at all, so the approval flow for them is future work.

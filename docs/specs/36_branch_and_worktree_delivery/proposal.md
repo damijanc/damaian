@@ -1,26 +1,29 @@
 # Feature Spec: Branch and Worktree Delivery
 
-Status: Not started
+Status: In progress (planned 2026-10-28; see `tasks.md`)
 Order: 36 of 37
 Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#35](35_commit_preparation/proposal.md) (commit preparation) — built
+Also in this spec: [`context.md`](context.md) (pre-implementation state, the
+corrections planning found, and the decisions the tasks implement) and
+[`tasks.md`](tasks.md) (execution order and progress).
+Depends on: [#35](../35_commit_preparation/proposal.md) (commit preparation) — built
 (Done 2026-10-26); Phase 2 WP4 (worktree isolation, optional) — **unspecified**,
 and §5.7 is written so branch delivery works without it.
 Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.8 (risk classification and approval). Related
 implementation specs:
-[`16_session_checkpoints_and_rewind.md`](16_session_checkpoints_and_rewind.md)
+[`16_session_checkpoints_and_rewind.md`](../16_session_checkpoints_and_rewind.md)
 (checkpoint scoping when a worktree is in play),
-[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md),
-[`20_working_modes/proposal.md`](20_working_modes/proposal.md),
-[`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) and
-[`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](../17_durable_task_state_and_crash_recovery/proposal.md),
+[`20_working_modes/proposal.md`](../20_working_modes/proposal.md),
+[`31_permission_profiles/proposal.md`](../31_permission_profiles/proposal.md) and
+[`34_repository_config_trust_boundary.md`](../34_repository_config_trust_boundary.md)
 (Git mutation is a capability repository config cannot grant),
-[`35_commit_preparation/proposal.md`](35_commit_preparation/proposal.md) (produces the commits this
-delivers), [`37_pull_request_creation.md`](37_pull_request_creation.md).
+[`35_commit_preparation/proposal.md`](../35_commit_preparation/proposal.md) (produces the commits this
+delivers), [`37_pull_request_creation.md`](../37_pull_request_creation.md).
 
 **Dependency correction.** The roadmap makes this work package depend on Phase 2
 WP4 (Worktree Isolation), which is **Should-tier and outside Phase 2's minimum
@@ -33,7 +36,7 @@ is the Must-tier half; worktrees are the Should-tier half it must not depend on.
 
 ## 1. Motivation
 
-[Spec 35](35_commit_preparation/proposal.md) can produce a commit. It commits to whatever
+[Spec 35](../35_commit_preparation/proposal.md) can produce a commit. It commits to whatever
 branch the repository is already on — which, for a user who opened Damaian on
 `main` and asked for a change, is `main`.
 
@@ -75,7 +78,7 @@ safe, and the two must not be reachable by the same code path.
 - **Phase 2 WP4 (Worktree Isolation) is unspecified**, Should-tier, and outside
   Phase 2's minimum slice.
 - **Checkpoints are repository-scoped.**
-  [Spec 16](16_session_checkpoints_and_rewind.md) §5.1 keys the shadow store on
+  [Spec 16](../16_session_checkpoints_and_rewind.md) §5.1 keys the shadow store on
   `repository_id`, which is `sha256(canonical path)`
   (`indexer.rs:382-385`) — so a worktree at a different path is already a
   different key. §5.7 depends on that.
@@ -93,8 +96,8 @@ safe, and the two must not be reachable by the same code path.
 
 ## 4. Non-goals
 
-- Pushing or any remote write — [spec 37](37_pull_request_creation.md).
-- Committing — [spec 35](35_commit_preparation/proposal.md).
+- Pushing or any remote write — [spec 37](../37_pull_request_creation.md).
+- Committing — [spec 35](../35_commit_preparation/proposal.md).
 - **Performing** merge, rebase, or cherry-pick. §5.5 is explicit: this work
   package implements *preparation and reporting* for those operations and does
   not execute any of them. Requirement 2's approval rule is stated so that a
@@ -106,7 +109,7 @@ safe, and the two must not be reachable by the same code path.
 - Submodules. A repository with submodules is handled to the extent Git's own
   commands handle it, and no submodule-specific behaviour is added.
 - Branch protection enforcement. Where a remote exposes protection information
-  [spec 37](37_pull_request_creation.md) uses it; locally there is nothing to
+  [spec 37](../37_pull_request_creation.md) uses it; locally there is nothing to
   enforce.
 - Stash management.
 
@@ -147,7 +150,7 @@ merge-base from `git merge-base <base> HEAD`. Both are pure reads.
 
 ### 5.2 Suggested branch name
 
-Derived from the task's plan title ([spec 21](21_task_plan_progress_and_budget/proposal.md))
+Derived from the task's plan title ([spec 21](../21_task_plan_progress_and_budget/proposal.md))
 or the user's original request: lowercased, non-alphanumerics collapsed to `-`,
 truncated, and prefixed per a configurable pattern (default
 `damaian/<slug>`).
@@ -286,7 +289,7 @@ If worktrees exist, requirement 1's worktree-to-branch identity is:
   which worktree, and the branch information in §5.1 is read from the worktree the
   session is using rather than the source repository.
 - **Checkpoint isolation follows for free.**
-  [Spec 16](16_session_checkpoints_and_rewind.md) §5.1 keys the shadow store on
+  [Spec 16](../16_session_checkpoints_and_rewind.md) §5.1 keys the shadow store on
   `repository_id`, which is `sha256(canonical path)` (`indexer.rs:382-385`), and
   a worktree has a different path. So a checkpoint created in a worktree restores
   into that worktree and cannot write into the source repository. The roadmap
@@ -307,14 +310,14 @@ acceptance criteria for this section are marked conditional.
 
 Every mutation here is a Git mutation and therefore a capability:
 
-- Code mode only ([spec 20](20_working_modes/proposal.md)); refused in Ask, Plan, and
+- Code mode only ([spec 20](../20_working_modes/proposal.md)); refused in Ask, Plan, and
   Review.
 - Permitted only under a profile allowing Git mutation
-  ([spec 31](31_permission_profiles/proposal.md)), which repository config cannot grant
-  ([spec 34](34_repository_config_trust_boundary.md)).
+  ([spec 31](../31_permission_profiles/proposal.md)), which repository config cannot grant
+  ([spec 34](../34_repository_config_trust_boundary.md)).
 - No `Allow Always` for any of them.
 - Each mutation is bracketed by
-  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.3 action markers with
+  [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.3 action markers with
   `sideEffecting: true`. Ref updates are individually atomic, so recovery is a
   read: compare the ref against the start marker's expectation. Branch creation
   interrupted mid-flight either created the ref or did not, and the check says
@@ -367,7 +370,7 @@ unavailable on an older Git, and where branch operations appear in the audit log
   distinct confirmation naming the dirty paths; an externally deleted worktree is
   reported rather than crashed on.
 - Every quality-gate command from `AGENTS.md` passes, and the
-  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  [spec 18](../18_local_evaluation_harness/proposal.md) baseline shows no
   regression.
 
 ## 7. Implementation Notes

@@ -17,7 +17,7 @@ cross-reference, not a prerequisite.
 Related implementation specs:
 [`08_stop_and_progress.md`](../08_stop_and_progress.md) (`CancelToken`, phases),
 [`21_task_plan_progress_and_budget/proposal.md`](../21_task_plan_progress_and_budget/proposal.md)
-(round budget), [`36_branch_and_worktree_delivery.md`](../36_branch_and_worktree_delivery.md)
+(round budget), [`36_branch_and_worktree_delivery/proposal.md`](../36_branch_and_worktree_delivery/proposal.md)
 (git-mutation approval and dirty-worktree removal, which this follows for the
 one mutation it performs), [`34_repository_config_trust_boundary.md`](../34_repository_config_trust_boundary.md)
 (`.damaian/` is repository-controlled), [`38_subagent_model.md`](../38_subagent_model.md)

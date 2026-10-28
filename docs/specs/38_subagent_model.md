@@ -334,7 +334,7 @@ primary mechanism and worktrees are the optional reinforcement:
   overlapping scope — is enforced when the second one is declared.
 - If worktrees exist, each Implementation subagent may additionally get its own,
   and checkpoint isolation follows from the path-keyed `repository_id`
-  ([spec 36](36_branch_and_worktree_delivery.md) §5.7).
+  ([spec 36](36_branch_and_worktree_delivery/proposal.md) §5.7).
 
 Refusing at spawn rather than at write is what makes this tractable: a conflict
 detected at write time has already produced two half-finished pieces of work.
