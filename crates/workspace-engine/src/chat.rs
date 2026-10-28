@@ -16,7 +16,7 @@ use crate::compaction::ConversationSummary;
 use crate::config::{Config, CostEstimate, McpTransport};
 use crate::context_manager::{
     ContextManager, ContextManifest, ContextPlan, ContextRequest, PreparedContext,
-    PromptSectionName,
+    PromptSectionName, TokenEstimate,
 };
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
 use crate::error::{ClientError, ProviderRefusal, Result};
@@ -1134,16 +1134,16 @@ impl ChatOrchestrator {
                 Ok(crate::compaction::CompactionOutcome::Compacted(_)) => {
                     conversation = self.session_store.read_conversation(&session.id)?;
                 }
-                Ok(crate::compaction::CompactionOutcome::NothingToCompact) => {}
-                // Stopping a turn is not a compaction failure: no durable
-                // notice, because the user already knows they stopped it.
-                Ok(crate::compaction::CompactionOutcome::Cancelled) => {}
-                Ok(crate::compaction::CompactionOutcome::Failed(reason)) => {
-                    self.note_compaction_failure(&session.id, &reason);
-                }
-                Err(error) => {
-                    self.note_compaction_failure(&session.id, &error.to_string());
-                }
+                // Nothing outside the window, the user stopped the turn, or the
+                // attempt failed. A failure was already audited and recorded by
+                // `compact_conversation`, which is why the manual route reports
+                // it too; the turn continues either way (proposal §5.7).
+                Ok(
+                    crate::compaction::CompactionOutcome::NothingToCompact
+                    | crate::compaction::CompactionOutcome::Cancelled
+                    | crate::compaction::CompactionOutcome::Failed(_),
+                )
+                | Err(_) => {}
             }
         }
         let user_message =
@@ -4583,10 +4583,41 @@ impl ChatOrchestrator {
     ///
     /// Never fails a turn: a model failure produces a facts-only summary, and
     /// only an unreadable log or a failed append returns `Err`, which the
-    /// turn-boundary caller treats as "compaction did not run". The
+    /// turn-boundary caller treats as "compaction did not run". A failure is
+    /// audited and recorded here, once, so the manual route reports it too. The
     /// summarisation call is recorded against a synthetic task id so it appears
     /// in the session's totals without reducing any turn's ceiling (§5.5).
     pub fn compact_conversation(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        cancel: &CancelToken,
+    ) -> Result<crate::compaction::CompactionOutcome> {
+        let outcome = self.compact_conversation_at_boundary(
+            repository_root,
+            session_id,
+            model_adapter,
+            cancel,
+        );
+        // Recorded here rather than by each caller, so a failure is audited and
+        // shown to the user whichever route asked: the automatic turn boundary
+        // and the manual `POST /api/compact` both go through this method.
+        match &outcome {
+            Ok(crate::compaction::CompactionOutcome::Failed(reason)) => {
+                self.note_compaction_failure(session_id, reason);
+            }
+            Err(error) => self.note_compaction_failure(session_id, &error.to_string()),
+            Ok(
+                crate::compaction::CompactionOutcome::Compacted(_)
+                | crate::compaction::CompactionOutcome::NothingToCompact
+                | crate::compaction::CompactionOutcome::Cancelled,
+            ) => {}
+        }
+        outcome
+    }
+
+    fn compact_conversation_at_boundary(
         &self,
         repository_root: &Path,
         session_id: &str,
@@ -4603,7 +4634,22 @@ impl ChatOrchestrator {
             .map(|summary| summary.through_seq)
             .unwrap_or(0);
         let messages = self.session_store.read_messages_with_seq(session_id)?;
-        let window = self.conversation_window_tokens();
+        // The summary is part of the conversation block and shares its budget
+        // (see `build_conversation`). So the span to compact is what does not
+        // fit *beside* the summary: with the full window here, a message could
+        // fit this check and still be omitted from the request, and the next
+        // compaction would never pick it up because it already looks like part
+        // of the window.
+        let summary_tokens = view
+            .summary
+            .as_ref()
+            .map(|summary| {
+                TokenEstimate::Prose.tokens(&self.scanner.redact(&summary.render_for_model()).text)
+            })
+            .unwrap_or(0);
+        let window = self
+            .conversation_window_tokens()
+            .saturating_sub(summary_tokens);
         let Some(outside) = crate::compaction::window_start(&messages, previous_through, window)
         else {
             return Ok(crate::compaction::CompactionOutcome::NothingToCompact);
@@ -4628,6 +4674,14 @@ impl ChatOrchestrator {
         let findings = self
             .session_store
             .read_findings(session_id, repository_root)?;
+        // A second summary describes the whole conversation. The fact reader
+        // below reads the active log up to the new boundary, which already
+        // includes the first summary's span — the original objective, files,
+        // steps, approvals and validation are re-derived there rather than
+        // accumulated from the previous summary. That is what requirement 6
+        // asks for; the previous summary still reaches the model, as the input
+        // to the narrative half (`narrative_prompt`), which owns the part the
+        // log cannot record.
         let Some(facts) = crate::compaction::facts_for_span(
             crate::compaction::FactInputs {
                 messages: &messages,
@@ -4640,13 +4694,6 @@ impl ChatOrchestrator {
             through_seq,
         ) else {
             return Ok(crate::compaction::CompactionOutcome::NothingToCompact);
-        };
-        // A second summary describes the whole conversation, not only the span
-        // since the first boundary: the original objective and every earlier
-        // fact are carried forward (§5.3).
-        let facts = match view.summary.as_ref() {
-            Some(previous) => crate::compaction::merge_summary_facts(previous, facts),
-            None => facts,
         };
 
         // Only the covered span is material. The previous summary travels
@@ -9373,10 +9420,6 @@ fn build_conversation(
     // said (spec 66 `context.md` D10).
     let conversation_messages =
         crate::compaction::sendable_messages(&prior_messages.iter().collect::<Vec<_>>());
-    // Spec 55 §5.1: the window is a token budget, not eight messages, so a
-    // conversation of short messages keeps more turns than one of long ones.
-    let recent_messages = crate::compaction::window_slice(&conversation_messages, window_tokens);
-    let omitted = conversation_messages.len() - recent_messages.len();
 
     // Spec 55 §5.6: the summary is delimited recorded data, inside the
     // conversation block. It is never merged into the system prompt and never
@@ -9385,6 +9428,23 @@ fn build_conversation(
     // Redact at the boundary so a secret in an earlier message cannot leave the
     // machine through the summary after being caught in the message itself.
     let summary = summary.map(|summary| scanner.redact(&summary.render_for_model()).text);
+
+    // Spec 55 §5.1: the window is a token budget, not eight messages, so a
+    // conversation of short messages keeps more turns than one of long ones.
+    // The summary is part of the block and is charged to the same budget: it is
+    // what the conversation may spend in total, not what the messages may spend
+    // with the summary free. Without this a compacted request would carry the
+    // summary *plus* a full window and exceed the threshold that triggered the
+    // compaction.
+    let summary_tokens = summary
+        .as_ref()
+        .map(|rendered| TokenEstimate::Prose.tokens(rendered))
+        .unwrap_or(0);
+    let recent_messages = crate::compaction::window_slice(
+        &conversation_messages,
+        window_tokens.saturating_sub(summary_tokens),
+    );
+    let omitted = conversation_messages.len() - recent_messages.len();
 
     let mut body = String::new();
     // §5.5: with no active summary covering the omitted messages, the loss is
@@ -14785,6 +14845,51 @@ mod approval_prompt_wording_tests {
         assert!(
             !prompt.contains("were not sent"),
             "nothing is omitted when the summary covers everything and no messages remain"
+        );
+    }
+
+    #[test]
+    fn the_summary_is_charged_to_the_same_window_as_the_messages() {
+        let messages = (0..6)
+            .map(|index| conversation_message("user", &format!("item {index}")))
+            .collect::<Vec<_>>();
+        let plan = prompt_plan();
+        let scanner = SecretScanner::default();
+        let without = build_model_prompt(&plan, &messages, None, 100, &scanner, None);
+        assert!(
+            without.contains("item 0") && without.contains("item 5"),
+            "the whole short conversation fits the window: {without}"
+        );
+
+        // A summary larger than the whole budget leaves no room for messages;
+        // the newest is still kept because it is the user's current position.
+        let summary = ConversationSummary {
+            id: "summary_1".to_string(),
+            through_seq: 8,
+            format_version: crate::compaction::SUMMARY_FORMAT_VERSION,
+            objective: "Do not touch the public API.".to_string(),
+            files_changed: Vec::new(),
+            plan_steps: Vec::new(),
+            approvals: Vec::new(),
+            validation: Vec::new(),
+            constraints: (0..crate::compaction::MAX_NARRATIVE_ITEMS)
+                .map(|index| format!("constraint {index} {}", "x".repeat(400)))
+                .collect(),
+            decisions: Vec::new(),
+            failed_approaches: Vec::new(),
+            uncertainty: Vec::new(),
+            model_run_id: None,
+            message_count: 8,
+        };
+        let with = build_model_prompt(&plan, &messages, Some(&summary), 100, &scanner, None);
+        assert!(with.contains("--- begin prior conversation summary"));
+        assert!(
+            !with.contains("item 0"),
+            "the summary is part of the block's budget, not free: {with}"
+        );
+        assert!(
+            with.contains("item 5"),
+            "the newest message is always kept: {with}"
         );
     }
 

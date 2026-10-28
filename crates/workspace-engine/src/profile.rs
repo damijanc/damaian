@@ -561,6 +561,20 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         }
     }
 
+    // A profile may lower the conversation window, but not below the floor a
+    // repository is held to: below it every turn exceeds the threshold, so the
+    // summarisation call bills the user's provider on every turn (spec 55
+    // §5.1). The merge refuses it for the same reason; this keeps the import
+    // preview (`not_carried`) truthful about it.
+    let window_below_floor = conversation_window_share
+        .is_some_and(|share| share < crate::compaction::MIN_UNTRUSTED_WINDOW_SHARE_BPS);
+    if window_below_floor {
+        refuse(
+            "conversation_window_share".to_string(),
+            RepositoryKeyClass::RestrictOnly,
+        );
+    }
+
     let carried = ConfigOverlay {
         max_read_lines,
         max_list_entries,
@@ -568,7 +582,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         max_match_line_chars,
         repository_map_max_tokens,
         symbol_context_max_tokens,
-        conversation_window_share,
+        conversation_window_share: conversation_window_share.filter(|_| !window_below_floor),
         context_budget_instructions,
         context_budget_hook_context,
         context_budget_pinned,

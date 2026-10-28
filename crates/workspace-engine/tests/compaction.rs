@@ -490,6 +490,15 @@ fn compaction_with_the_model_stubbed_out_still_has_every_fact() {
         validation.label == "cargo test (repository root)" && validation.outcome == "passed"
     }));
     assert!(summary.is_facts_only(), "the model wrote no narrative");
+    assert_eq!(
+        summary.message_count,
+        engine
+            .session_store
+            .read_conversation(&session.id)
+            .unwrap()
+            .summarised_messages,
+        "the summary covers exactly the messages it stands in for"
+    );
     assert!(
         summary.message_count > 0,
         "the summary covers messages, not a token count"
@@ -929,9 +938,30 @@ fn a_second_compaction_summarises_the_first_one_plus_what_followed() {
             .any(|validation| validation.label == "cargo test (repository root)"),
         "validation before the first boundary is still in the record"
     );
+    // The second fact read covers the whole active log up to the new boundary,
+    // so everything seeded before the first boundary is re-derived from it.
+    // The exact count is the number of messages at or below `through_seq`; it
+    // is not the first summary's count plus the new span, which would count the
+    // first span twice.
+    let view = engine.session_store.read_conversation(&session.id).unwrap();
+    assert_eq!(
+        second_summary.message_count, view.summarised_messages,
+        "the covered-message count is the number of messages the summary stands in for"
+    );
     assert!(
         second_summary.message_count > summaries[0].message_count,
-        "the covered-message count accumulates"
+        "the second summary covers more than the first"
+    );
+    assert_eq!(
+        summaries[0].message_count,
+        engine
+            .session_store
+            .read_messages_with_seq(&session.id)
+            .unwrap()
+            .iter()
+            .filter(|(seq, _)| *seq <= summaries[0].through_seq)
+            .count(),
+        "the first summary's count is exact too"
     );
 }
 
@@ -1044,4 +1074,44 @@ fn a_cancelled_compaction_leaves_no_failure_notice() {
         "stopping a turn must not leave a permanent failure notice"
     );
     assert!(adapter.requests.is_empty(), "no call is made after a stop");
+}
+
+#[test]
+fn a_compaction_failure_is_audited_where_it_happens() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = temp_repo("audit-failure");
+    let engine = engine(&repo, false);
+    let (session, task) = seed_session(&engine, &repo, "Audit failure");
+    seed_long_conversation(&engine, &session, &task, "Keep the public API stable.");
+
+    // A read-only log makes the summary append fail, which is the one failure
+    // shape that returns `Failed` rather than a facts-only summary.
+    let log = repo
+        .join(".damaian")
+        .join("sessions")
+        .join(format!("{}.jsonl", session.id));
+    let mut permissions = fs::metadata(&log).unwrap().permissions();
+    permissions.set_mode(0o444);
+    fs::set_permissions(&log, permissions).unwrap();
+
+    let mut adapter = MockModelAdapter::new("{}");
+    let outcome = engine
+        .chat_orchestrator
+        .compact_conversation(&repo, &session.id, &mut adapter, &cancel())
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        workspace_engine::compaction::CompactionOutcome::Failed(_)
+    ));
+
+    // The recording lives in `compact_conversation`, so the manual route
+    // (`POST /api/compact`, which calls the same method) reports the failure
+    // too, not only the automatic turn boundary.
+    let audit = fs::read_to_string(repo.join(".damaian").join("audit").join("events.jsonl"))
+        .expect("the audit log is written");
+    assert!(
+        audit.contains("conversation_compaction_failed"),
+        "a failed compaction is audited: {audit}"
+    );
 }

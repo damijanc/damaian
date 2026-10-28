@@ -3694,6 +3694,74 @@ fn a_repository_cannot_set_the_conversation_auto_compact_off_switch_either_way()
 }
 
 #[test]
+fn an_untrusted_scope_cannot_shrink_the_conversation_window_past_the_floor() {
+    let floor = workspace_engine::compaction::MIN_UNTRUSTED_WINDOW_SHARE_BPS;
+    assert_eq!(floor, 500, "the documented floor is 5%");
+
+    // A window of a few tokens makes every turn exceed the threshold, so the
+    // repository would be choosing a paid summary call on every turn.
+    let (config, report) = load(
+        "conversation-window-floor",
+        "",
+        "conversation_window_share=0.0001\n",
+    );
+    assert_eq!(
+        config.conversation_window_share,
+        Config::default().conversation_window_share,
+        "a repository cannot shrink the window past the floor"
+    );
+    assert!(
+        report.rejected_keys.iter().any(|rejected| {
+            rejected.key == "conversation_window_share"
+                && rejected.class == RepositoryKeyClass::RestrictOnly
+        }),
+        "{:?}",
+        report.rejected_keys
+    );
+
+    // At the floor is still a restriction, so the restrict-only direction holds.
+    let (at_floor, report) = load(
+        "conversation-window-at-floor",
+        "",
+        "conversation_window_share=0.05\n",
+    );
+    assert_eq!(at_floor.conversation_window_share, floor);
+    assert!(
+        !report
+            .rejected_keys
+            .iter()
+            .any(|rejected| rejected.key == "conversation_window_share"),
+        "{:?}",
+        report.rejected_keys
+    );
+
+    // The user's own config is not floored: the parser's minimum stays
+    // available to the person paying the bill.
+    let (user, _) = load(
+        "conversation-window-user",
+        "conversation_window_share=0.0001\n",
+        "",
+    );
+    assert_eq!(user.conversation_window_share, 1);
+}
+
+#[test]
+fn a_profile_cannot_shrink_the_conversation_window_past_the_floor() {
+    let overlay = ConfigOverlay {
+        conversation_window_share: Some(1),
+        ..ConfigOverlay::default()
+    };
+    let (carried, refused) = split_profile_keys(overlay);
+    assert!(carried.conversation_window_share.is_none());
+    assert!(
+        refused
+            .iter()
+            .any(|rejected| rejected.key == "conversation_window_share"),
+        "{refused:?}"
+    );
+}
+
+#[test]
 fn pause_for_context_review_is_off_by_default_and_user_only() {
     assert!(!Config::default().pause_for_context_review);
 
