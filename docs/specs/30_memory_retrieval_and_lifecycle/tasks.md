@@ -5,7 +5,7 @@ Implementation tasks for
 and [`context.md`](context.md) for the pre-implementation state and the
 corrections planning found, before starting any task.
 
-**Started:** 2026-10-28 (planned; no task implemented yet)
+**Started:** 2026-10-28
 
 ## Global Constraints
 
@@ -20,8 +20,10 @@ corrections planning found, before starting any task.
 - **The manifest stays content-free.** No task may put a memory statement into
   `ContextManifest` or into an audit event. Statements are resolved by id at
   display time (context.md C3).
-- **No new write path.** Retrieval may call `insert` never; it calls
-  `mark_state`, a new verification-transition method, and `record_recall` only.
+- **No new creation path.** Retrieval never calls `insert`. The only writes it
+  may perform are `mark_state` (expiry, deletion), the verification transition
+  (context.md C7) and `record_recall`; none of them creates or rewrites an
+  entry's statement.
 - **Secrets.** Every rendered statement passes the existing `SecretScanner` on
   the way into a `ContextItem`. The store refuses *detected* secrets; a memory
   file edited outside Damaian may still hold one, and requirement 6 of spec 29

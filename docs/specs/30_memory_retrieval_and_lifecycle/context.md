@@ -25,7 +25,7 @@ surface:
 | `MemoryStore::project_entries` / `user_entries` / `session_entries` | `memory.rs:1577`, `:1615`, `:2239` | The three scoped readers; each already refuses a wrongly scoped record. |
 | `MemoryStore::mark_state` | `memory.rs:1970` | Appends a state transition and audits it. Every `Expired`/`Deleted` change goes through it. |
 | `MemoryStore::record_recall` | `memory.rs:2039` | One `memory_recalled` audit event per entry. **Currently called from nowhere.** |
-| `MemoryStore::insert` / `supersede` / `edit_statement` | `memory.rs:1650`, `:1999`, `:1935` | The only writes. Retrieval must not add a fourth. |
+| `MemoryStore::insert` / `supersede` / `edit_statement` | `memory.rs:1650`, `:1999`, `:1935` | The only creation and edit paths. Retrieval may append state and verification transitions (`mark_state`, C7) but must never create or rewrite an entry. |
 
 `MemoryStore` is constructed once in `workspace_engine.rs:145` with the data
 directory, `memory_user_scope_enabled`, `ignore_patterns`, the audit log, the
