@@ -2565,7 +2565,8 @@ result in the conversation; the audit log records the outcome separately (see
 | A card headed with a host, then **Allow once** / **Don't fetch** | The host has no approval for this checkout. **Nothing has been sent.** | Read the URL. Approve once, choose *Always allow this host in this project* in the overflow, or decline. Declining makes no request and tells the model the host was refused. |
 | `Cannot fetch from <host>: the URL carries something that looks like a credential (<category>); it is refused before any approval is asked` | The URL contains a secret-shaped string. The category is named; the matched value is not repeated. | Remove the credential from the URL. This refusal happens **before** the dialog, so approving cannot override it. |
 | `Cannot fetch from <host>: the URL carries content from <path>, a file read earlier in this task; it is refused before any approval is asked` | The query or fragment contains a line of at least 16 bytes from a file `read_file` returned in this task, raw, percent-decoded or base64-decoded. | Do not put repository content in a URL. Files read through `search_content`, `read_git_diff` or a command are deliberately outside this check. |
-| `Cannot fetch that URL: <reason>. Nothing was requested` | The URL did not parse: not `http`/`https`, no host, userinfo, whitespace or a control character. | Supply a plain absolute `http(s)` URL. |
+| `Cannot fetch from <host>: the URL names <host>, which is not a public internet address; a fetch only reaches public addresses` | The host is a loopback, private, link-local or reserved address literal, including an IPv4-mapped IPv6 form. No dialog appears. | Use a public URL. A name that resolves privately is refused at request time with `… resolves to <ip>, which is not a public internet address`; the same rule applies. |
+| `Cannot fetch that URL: <reason>. Nothing was requested` | The URL did not parse: not `http`/`https`, no host, userinfo, whitespace or a control character, or an IPv4 address written as a bare number, hex or a short form (`2130706433`, `0x7f000001`, `127.1`). | Supply a plain absolute `http(s)` URL, with an IPv4 address written as four decimal octets. |
 | `The page answered with a redirect to <target>. This tool does not follow redirects. …` | A 3xx response, including a same-host one. The request count is one, and the target is named. | Fetch the named URL as a new call; its host needs its own approval. The audit event is `web_fetch_redirect`. |
 | `A fetch was not made: this turn has already fetched N of M pages` | The per-turn cap, `web_fetch_max_per_turn` (default 8, hard ceiling 20). | The turn must answer with what it has. The cap is not a bug. |
 | `Cannot fetch from <host>: <error>. Check the URL and try again` | The request or its timeout failed (connect 15 s, stall 30 s, total 60 s). | Check the URL; a stop during a fetch appears as `The fetch was stopped.` |
@@ -2589,11 +2590,13 @@ only the reported count is wrong. This is a known reporting defect, recorded in
 [spec 51](specs/51_external_reference_retrieval/proposal.md) §7.3; trust the
 placeholder, not the count.
 
-**Reloading while the dialog is open fails the task.** A crash or reload during
-a fetch approval is not reattachable: the next launch fails the task with
-`unknown pending approval kind fetch` instead of re-presenting the card. This is
-recorded as a follow-up in [spec 51](specs/51_external_reference_retrieval/proposal.md)
-§7.3; the paused turn is still on disk, but no recovery branch reads it.
+**Reloading while the dialog is open re-presents the card.** A crash or reload
+during a fetch approval no longer fails the task. The next launch reads the
+paused turn and shows the same host-and-URL card; *Allow once*, *Allow always*
+and *Don't fetch* go through the same route as the live dialog, and *Allow
+always* still writes only the user-scope per-checkout key. Nothing was requested
+before the crash, so the re-presented card is the same question rather than a
+resumed side effect.
 
 ### A file the model should see is missing from context
 

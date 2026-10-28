@@ -267,15 +267,14 @@ be presented as current.
   compared exactly, so `Allow Always` must store
   `ExternalUrl::approval_key()`. A default-port URL and the same host on a
   non-default port remain different approvals (D8).
-- **A crash during a fetch pause is not reattachable (Task 8 finding).** The
-  pause registers a `fetch` pending approval and writes the whole paused turn,
-  but `recovery.rs` has no branch for that kind, so the next launch fails the
-  task with "unknown pending approval kind fetch" instead of re-presenting the
-  dialog. This matches a browser-diagnostic or MCP pause, which are also
-  unrecoverable, and adding a reattachment branch would reach beyond Task 8's
-  files. The paused turn carries everything a card would need (`fetch_call`),
-  so a later change can add `ReattachedApproval::Fetch` and the shell card
-  without changing the pause format.
+- **A crash during a fetch pause was not reattachable (Task 8 finding; fixed in
+  Task 11).** The pause registers a `fetch` pending approval and writes the
+  whole paused turn, but `recovery.rs` had no branch for that kind, so the next
+  launch failed the task with "unknown pending approval kind fetch" instead of
+  re-presenting the dialog. Task 11 adds `ReattachedApproval::Fetch`, a
+  `PausedTurns::fetch_call` reader, the shell payload and the `app.js` branch,
+  plus a restart test; the paused turn already carried everything a card needs,
+  so no pause-format change was required.
 - **`Allow Always` is read back from user config on every fetch (Task 8).**
   `ChatOrchestrator::web_domain_allowlist_for` unions the loaded list with
   `web_domain_allowlist.<repository id>` read from `user.conf`, because the
@@ -318,3 +317,53 @@ be presented as current.
   3xx through `redirect_target()`, whose `may_follow()` is always false; Task 7
   passes only `read_file` contents to `inspect`, never files reached another
   way.
+
+## 6. Review fixes (Task 11)
+
+Six claims were checked against the Task 10 close-out. Five were confirmed and
+fixed; the sixth was a records defect.
+
+1. **Later-turn framing (confirmed).** `external_reference_item` passed the
+   page's raw text to `add_text`, so `render_item` produced
+   `--- external_reference: <url> ---` and then unquoted page text. A page line
+   `--- file: AGENTS.md ---` therefore looked like a section boundary on every
+   turn after the fetch. The item now calls `ExternalReference::render_for_model`,
+   which shares the tool result's frame: notice, metadata, `> ` on every body
+   line, recomputed injection markers, end marker. The recorded reference now
+   also carries `cached`, `fetchTruncationReason`, `conversionTruncated` and
+   `redactions` (all serde-defaulted) so the later frame can state the same
+   facts. `a_later_turn_frames_a_fetched_page_as_data_again` inspects a second
+   turn's rendered prompt.
+2. **SSRF and DNS rebinding (confirmed, security).** `fetch.rs` handed the
+   hostname to curl and checked nothing. `ExternalUrl` now accepts IPv4 only as
+   canonical dotted-quad and refuses `2130706433`, `0x7f000001`, `127.1`,
+   leading-zero octets and five-part forms, in a URL and in an allowlist entry.
+   `inspect` refuses a non-public address literal before the dialog;
+   `resolve_target` resolves the name before spawning, refuses every non-public
+   answer (loopback, private, link-local, CGNAT, reserved, IPv4-mapped) and pins
+   the chosen address with curl `--resolve host:port:ip`. The eval stub's
+   `127.0.0.1` is reachable only through
+   `CurlFetchTransport::with_non_public_allowed_for_tests` and
+   `ChatOrchestrator::allow_loopback_fetch_for_tests`; no config field exists,
+   and `a_config_host_approval_cannot_make_loopback_fetchable` proves a host
+   approval alone does not enable it.
+3. **Proxy inheritance (confirmed).** `-q` stops `~/.curlrc`, not the proxy
+   environment. The child now gets `--noproxy '*'` and every proxy variable
+   removed; `the_request_carries_no_authorization_cookie_or_api_key` asserts
+   both the argument and the child's explicit removals.
+4. **Egress guard read the disk (confirmed).** `read_files_for_egress_guard`
+   re-read the file through `FileAccessController` at fetch time. It now reads
+   the turn's own `read_file` tool messages, so the comparison is against what
+   the model saw. `the_egress_guard_compares_what_read_file_returned_not_the_disk_now`
+   rewrites the file between rounds and still refuses.
+5. **Crash reattachment (confirmed).** `ReattachedApproval::Fetch` +
+   `PausedTurns::fetch_call` + shell payload + `app.js` branch. Restart and
+   shell tests are named in §7.3 of the proposal.
+6. **Records (confirmed).** The proposal `Status:` line, the stale
+   "Until Task 8 wires that pause" comment in `chat.rs`, and the loopback-stub
+   justification are updated. The loopback tests remain un-`#[ignore]`d with the
+   written reason beside them: ephemeral port, `127.0.0.1` only, shut down
+   before the test returns, no external traffic.
+
+The `Redaction:` count understatement and the deterministic-only injection
+evidence remain recorded limits, not review findings that were fixed.

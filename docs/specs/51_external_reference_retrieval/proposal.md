@@ -1,9 +1,10 @@
 # Feature Spec: External Reference Retrieval
 
-Status: Done 2026-10-28 — **with CI outstanding**. All ten tasks landed on
-branch `spec-51-external-reference`; no Quality run has covered that branch yet,
-so the seven-check workspace gate is unproven. Scoped checks passed locally;
-the planner records the run id after the user pushes.
+Status: Done 2026-10-28 — **with CI outstanding**. Tasks 1–10 landed on branch
+`spec-51-external-reference`, and Task 11 fixed the review findings against that
+close-out. No Quality run has covered the branch yet, so the seven-check
+workspace gate remains unproven; the planner records the run id after the user
+pushes.
 Order: 51 of 53
 Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 8 (Should). That directory is local-only and not committed, so the
@@ -236,6 +237,26 @@ Five constraints, and none of them is optional:
    because it was returned. Every request is a tool call the model made and the
    user's allowlist permitted.
 
+**The destination is an address, not only a name.** Approval is per host, so a
+host that resolves to loopback, a private range, a link-local metadata endpoint
+(`169.254.169.254`) or an IPv4-mapped IPv6 address would let an approved name
+reach the machine's own services. Two rules close that: IPv4 is accepted only
+as canonical dotted-quad — `2130706433`, `0x7f000001` and `127.1` are refused
+rather than displayed as a name that means something else — and the host is
+resolved before the request, every answer must be a public internet address, and
+the connection is pinned to the checked address with curl
+`--resolve host:port:ip`, so a second DNS answer cannot rebind it. A name that
+resolves privately is refused at request time, after approval, because that is
+the only moment the answer exists. The `127.0.0.1` page server the deterministic
+harness uses is reachable only through a constructor the harness and the
+engine's tests call; no repository, profile or user setting reaches it, and a
+test asserts that a config host approval alone still refuses loopback.
+
+The proxy environment is not part of the request either. The child runs with
+`--noproxy '*'` and with `http_proxy`, `https_proxy`, `all_proxy`, `no_proxy`
+and their upper-case forms removed, so neither a user's environment nor a
+stub run is routed through an intermediary that could see or rewrite the page.
+
 The outbound request carries no `authorization` header, no cookies, and no
 Damaian identity beyond a plain user agent. `CurlModelTransport` is not reused —
 it exists to send an API key to a configured base URL, and the one thing this
@@ -340,14 +361,18 @@ content — with the refusal wording for each.
 ## 7. Implementation Notes
 
 **Status of this record (2026-10-28):** Tasks 1–10 landed on branch
-`spec-51-external-reference`. **CI has not run for that branch**, so the
-seven-check workspace gate is outstanding; scoped checks passed locally and the
-planner records the Quality run id after the user pushes. **No manual browser
-walk was performed.** The fetch dialog and the inspector row are exercised by
-engine, shell, `app.js` and harness tests, never by a click-through against a
-running app; the crash path is reasoned from `recovery.rs` and is recorded as a
-gap in §7.3. No live provider or live page was used. Everything below separates
-what a test proves from what remains a manual or conditional claim.
+`spec-51-external-reference`, and Task 11 fixed the review findings against that
+close-out: later-turn framing, the SSRF/rebinding check and connection pinning,
+proxy isolation, the egress guard reading the tool result rather than the file
+on disk, crash reattachment for a fetch pause, and the stale records. **CI has
+not run for that branch**, so the seven-check workspace gate is outstanding;
+scoped checks passed locally and the planner records the Quality run id after
+the user pushes. **No manual browser walk was performed.** The fetch dialog and
+the inspector row are exercised by engine, shell, `app.js` and harness tests,
+never by a click-through against a running app; the crash path now has a restart
+test and a shell payload test. No live provider or live page was used.
+Everything below separates what a test proves from what remains a manual or
+conditional claim.
 
 ### 7.1 Criterion-to-evidence
 
@@ -405,24 +430,41 @@ sub-resources. That is a stated limit, not a measured quality figure.
 
 ### 7.3 Conditional, unproven and imprecise
 
-**Crash reattachment for a fetch pause is missing (conditional criterion).**
-If the application is reloaded while a turn is paused on `PausedFor::Fetch`, the
-task is failed on restart with *"unknown pending approval kind fetch"* rather
-than re-presenting the dialog. `recovery.rs` has branches for command, patch,
-plan, provider fallback, round budget, context review, check batch and question,
-and none for `fetch`; this is the same gap a browser-diagnostic or MCP pause has.
-It was **not implemented in this close-out**: adding `ReattachedApproval::Fetch`
-also needs a `PausedTurns` reader, the shell's `describe_approval` payload and
-an `app.js` card branch, plus recovery tests in three crates — a pause-lifecycle
-change rather than the documentation task this close-out is. The paused turn
-already carries everything a card needs (`fetch_call`: verbatim URL, host,
-approval key, flags, query, fragment), so no pause-format change is required.
-**Named follow-up:** add `ReattachedApproval::Fetch` modelled on
-`RoundBudget`/`ProviderFallback`, with an integration test that reloads a
-session paused on a fetch and asserts the dialog is re-presented and the
-approval route still fetches. Until that lands, this criterion is **conditional**
-and the user-visible failure is recorded in
-[`TROUBLESHOOTING.md`](../../TROUBLESHOOTING.md#a-fetch-was-refused).
+**Crash reattachment for a fetch pause is implemented (Task 11).** A reload
+while a turn is paused on `PausedFor::Fetch` no longer fails the task with
+*"unknown pending approval kind fetch"*. `ReattachedApproval::Fetch` carries the
+paused `fetch_call` (verbatim URL, host, approval key, display flags, query and
+fragment), `PausedTurns::fetch_call` reads it, the shell rebuilds the same
+`fetchProposal` payload the live dialog uses, and `app.js` renders the
+`createFetchApproval` card. `a_fetch_pause_reattaches_on_restart_and_still_fetches`
+proves the pause is reattached after fresh stores are opened and that approving
+the reattached card makes exactly one request and returns the framed page;
+`a_reattached_fetch_pause_carries_the_dialog_payload` proves the shell payload
+and the `app.js` branch. Nothing was requested before the crash, so the
+re-presented card is the same question rather than a resumed side effect.
+
+**The egress guard compares the tool result, not the file on disk (Task 11).**
+`read_file` content for the pre-approval check now comes from the turn's own
+tool messages, exactly the text the model saw. Re-reading the file would compare
+against whatever is on disk at fetch time; a file rewritten after the read could
+hide the line the model is about to put in a URL.
+`the_egress_guard_compares_what_read_file_returned_not_the_disk_now` rewrites
+the fixture between the read round and the fetch round and still refuses the
+request. The check remains limited to `read_file`; `search_content`,
+`read_git_diff` and command output are outside it (D9).
+
+**The destination rule is tested at three layers (Task 11).**
+`an_ipv4_host_must_be_canonical_dotted_quad` refuses every alternate IPv4
+spelling in a URL and in an allowlist entry;
+`a_non_public_address_literal_is_refused_before_any_approval` covers loopback,
+private, link-local, CGNAT, reserved and IPv4-mapped literals;
+`the_transport_refuses_a_non_public_destination_without_a_request` proves the
+product transport makes no connection, and
+`a_config_host_approval_cannot_make_loopback_fetchable` proves a config grant
+does not enable the test allowance. A unit test asserts the `--resolve` line is
+emitted for a resolved name. **A live DNS rebinding was not run** — there is no
+DNS-server fixture here — so the pin is proven structurally, not by racing a
+resolver.
 
 **The `Redaction:` line reports only the post-conversion scan (known reporting
 imprecision).** `fetch.rs` redacts the raw body before returning it, so by the

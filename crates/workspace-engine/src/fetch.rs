@@ -32,7 +32,9 @@
 
 use crate::cancel::CancelToken;
 use crate::error::{ClientError, Result};
-use crate::external_reference::{ContentKind, ExternalUrl, RedirectTarget, redirect_target};
+use crate::external_reference::{
+    ContentKind, ExternalUrl, RedirectTarget, is_public_address, redirect_target,
+};
 use crate::hash::{create_id, now_millis, sha256, sha256_hex};
 use crate::model::escape_curl_config_value;
 use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
@@ -40,6 +42,7 @@ use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -106,6 +109,35 @@ impl FetchOutcome {
     }
 }
 
+/// A hostname resolved to an address that passed the public-address check, and
+/// the one address curl is pinned to. Pinning is what makes the check and the
+/// connection agree: without `--resolve`, curl would resolve the name a second
+/// time and a DNS answer could change in between.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedTarget {
+    host: String,
+    port: u16,
+    address: IpAddr,
+    /// An address literal in the URL needs no `--resolve`; curl connects to it
+    /// directly and the literal itself was already validated.
+    literal: bool,
+}
+
+impl PinnedTarget {
+    /// The `--resolve` value. An IPv6 address is bracketed, as curl requires.
+    fn resolve_value(&self) -> Option<String> {
+        if self.literal {
+            return None;
+        }
+        let address = match self.address {
+            IpAddr::V4(address) => address.to_string(),
+            IpAddr::V6(address) => format!("[{address}]"),
+        };
+        Some(format!("{}:{}:{address}", self.host, self.port))
+    }
+}
+
 /// The fetch transport: one credential-free `curl` invocation per request, and a
 /// session-scoped cache of what came back.
 pub struct CurlFetchTransport {
@@ -119,6 +151,11 @@ pub struct CurlFetchTransport {
     /// Applied before a body is cached or returned (§5.5).
     scanner: SecretScanner,
     max_bytes: usize,
+    /// Whether a non-public destination is permitted. False everywhere in the
+    /// product; the eval harness and the engine's own tests turn it on so a
+    /// `127.0.0.1` stub can be fetched. No config field can reach it, so a
+    /// repository or user approve-list entry cannot widen it.
+    allow_non_public: bool,
 }
 
 impl CurlFetchTransport {
@@ -139,6 +176,7 @@ impl CurlFetchTransport {
             session_id: session_id.into(),
             scanner,
             max_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            allow_non_public: false,
         }
     }
 
@@ -150,21 +188,81 @@ impl CurlFetchTransport {
         self
     }
 
+    /// Permit a non-public destination. Called only by the engine's tests and
+    /// the eval harness, whose stub binds `127.0.0.1`; deliberately a
+    /// constructor step rather than a `Config` field, so neither repository nor
+    /// user config can enable it.
+    #[doc(hidden)]
+    pub fn with_non_public_allowed_for_tests(mut self) -> Self {
+        self.allow_non_public = true;
+        self
+    }
+
     /// The curl arguments. `-q` keeps a user's `~/.curlrc` out of a request whose
     /// headers are a security promise, and `-g` turns off URL globbing: a path
-    /// containing `[1-3]` would otherwise become three requests. No
-    /// redirect-following argument appears here, and the test suite asserts that
-    /// absence against the source.
-    pub fn curl_args() -> [&'static str; 6] {
-        ["-q", "-g", "-sS", "--no-buffer", "--config", "-"]
+    /// containing `[1-3]` would otherwise become three requests. `--noproxy *`
+    /// keeps the user's proxy environment out of a fetch, so neither a stub nor
+    /// a real page is routed through an intermediary. No redirect-following
+    /// argument appears here, and the test suite asserts that absence against
+    /// the source.
+    pub fn curl_args() -> [&'static str; 8] {
+        [
+            "-q",
+            "-g",
+            "-sS",
+            "--no-buffer",
+            "--noproxy",
+            "*",
+            "--config",
+            "-",
+        ]
+    }
+
+    /// The proxy variables removed from the child. `--noproxy *` already stops
+    /// curl using a proxy; removing the variables as well means the rule holds
+    /// even if a future argument change removes that flag.
+    pub fn proxy_environment_variables() -> [&'static str; 8] {
+        [
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+        ]
+    }
+
+    /// The curl invocation. Public for the test that asserts no proxy
+    /// configuration reaches the child; production always goes through
+    /// [`Self::fetch`].
+    #[doc(hidden)]
+    pub fn curl_command() -> Command {
+        let mut command = Command::new("curl");
+        command.args(Self::curl_args());
+        for variable in Self::proxy_environment_variables() {
+            command.env_remove(variable);
+        }
+        command
     }
 
     /// The request as a curl config file, written to curl's stdin. The URL is
     /// [`ExternalUrl::request_url`], so the fragment is already gone; the only
-    /// headers are the fixed user agent and `Accept`.
-    pub fn curl_config(&self, url: &ExternalUrl, header_path: &Path) -> String {
+    /// headers are the fixed user agent and `Accept`. `pinned` adds the
+    /// `--resolve` line that keeps the connection to the validated address.
+    pub fn curl_config(
+        &self,
+        url: &ExternalUrl,
+        header_path: &Path,
+        pinned: Option<&PinnedTarget>,
+    ) -> String {
+        let resolve = pinned
+            .and_then(PinnedTarget::resolve_value)
+            .map(|value| format!("resolve = \"{}\"\n", escape_curl_config_value(&value)))
+            .unwrap_or_default();
         format!(
-            "request = \"GET\"\nurl = \"{}\"\nheader = \"user-agent: {USER_AGENT}\"\nheader = \"accept: {ACCEPT}\"\ndump-header = \"{}\"\nconnect-timeout = {CONNECT_TIMEOUT_SECS}\nspeed-limit = 1\nspeed-time = {STALL_TIMEOUT_SECS}\nmax-time = {MAX_TIME_SECS}\nmax-filesize = {}\n",
+            "request = \"GET\"\nurl = \"{}\"\nheader = \"user-agent: {USER_AGENT}\"\nheader = \"accept: {ACCEPT}\"\ndump-header = \"{}\"\n{resolve}connect-timeout = {CONNECT_TIMEOUT_SECS}\nspeed-limit = 1\nspeed-time = {STALL_TIMEOUT_SECS}\nmax-time = {MAX_TIME_SECS}\nmax-filesize = {}\n",
             escape_curl_config_value(&url.request_url()),
             escape_curl_config_value(&header_path.display().to_string()),
             self.max_bytes
@@ -189,6 +287,10 @@ impl CurlFetchTransport {
     }
 
     fn fetch_uncached(&self, url: &ExternalUrl, cancel: &CancelToken) -> Result<FetchOutcome> {
+        // Resolve before anything is spawned, so a private destination is
+        // refused without a request and the connection can be pinned to the
+        // address that was validated (§5.3).
+        let pinned = resolve_target(url, self.allow_non_public)?;
         let header_path = self
             .data_dir
             .join("tmp")
@@ -197,8 +299,7 @@ impl CurlFetchTransport {
             path: header_path.clone(),
         };
 
-        let spawned = Command::new("curl")
-            .args(Self::curl_args())
+        let spawned = Self::curl_command()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -217,7 +318,10 @@ impl CurlFetchTransport {
         };
 
         if let Some(mut stdin) = child.child().stdin.take() {
-            stdin.write_all(self.curl_config(url, &header_path).as_bytes())?;
+            stdin.write_all(
+                self.curl_config(url, &header_path, Some(&pinned))
+                    .as_bytes(),
+            )?;
         }
 
         // Taken out first so the borrow for the scrutinee ends before the
@@ -358,6 +462,53 @@ impl CurlFetchTransport {
             let _ = fs::write(path, json);
         }
     }
+}
+
+/// Resolve `url` to one address curl may connect to, refusing every non-public
+/// answer (§5.3).
+///
+/// Every resolved address is checked, not just the one that will be used: a
+/// name with both a public and a private answer is a rebinding attempt, and
+/// picking the public one would leave the window open on a later query. The
+/// first address is pinned with `--resolve`, so curl does not resolve again.
+fn resolve_target(url: &ExternalUrl, allow_non_public: bool) -> Result<PinnedTarget> {
+    let port = url.port.unwrap_or_else(|| url.scheme.default_port());
+    let literal = url.host.parse::<IpAddr>().ok();
+    let addresses: Vec<SocketAddr> = match literal {
+        Some(address) => vec![SocketAddr::new(address, port)],
+        None => (url.host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|error| {
+                ClientError::Io(format!(
+                    "fetch failed: could not resolve {}: {error}",
+                    url.host
+                ))
+            })?
+            .collect(),
+    };
+    if addresses.is_empty() {
+        return Err(ClientError::Io(format!(
+            "fetch failed: {} resolved to no address",
+            url.host
+        )));
+    }
+    if !allow_non_public
+        && let Some(refused) = addresses
+            .iter()
+            .find(|address| !is_public_address(address.ip()))
+    {
+        return Err(ClientError::PolicyBlocked(format!(
+            "fetch failed: {} resolves to {}, which is not a public internet address",
+            url.host,
+            refused.ip()
+        )));
+    }
+    Ok(PinnedTarget {
+        host: url.host.clone(),
+        port,
+        address: addresses[0].ip(),
+        literal: literal.is_some(),
+    })
 }
 
 /// curl's exit code for "maximum file size exceeded".
@@ -576,5 +727,57 @@ mod tests {
         let headers = parse_response_headers("HTTP/2 200\r\nContent-Type: application/json\r\n");
         assert_eq!(headers.status, Some(200));
         assert_eq!(headers.content_type.as_deref(), Some("application/json"));
+    }
+
+    #[test]
+    fn a_resolved_name_is_pinned_in_the_request() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "damaian-fetch-pin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let transport = CurlFetchTransport::new(
+            ProcessRegistry::open(&data_dir).expect("registry"),
+            &data_dir,
+            "session_pin",
+            SecretScanner::new(Vec::new()),
+        );
+        let url = ExternalUrl::parse("https://docs.example.com/guide").expect("a valid URL");
+        let pinned = PinnedTarget {
+            host: "docs.example.com".to_string(),
+            port: 443,
+            address: "93.184.216.34".parse().expect("an address"),
+            literal: false,
+        };
+        let config = transport.curl_config(&url, Path::new("/tmp/fetch.headers"), Some(&pinned));
+        assert!(
+            config.contains("resolve = \"docs.example.com:443:93.184.216.34\""),
+            "curl must connect to the address the guard checked: {config}"
+        );
+
+        let literal = PinnedTarget {
+            host: "93.184.216.34".to_string(),
+            port: 443,
+            address: "93.184.216.34".parse().expect("an address"),
+            literal: true,
+        };
+        let config = transport.curl_config(&url, Path::new("/tmp/fetch.headers"), Some(&literal));
+        assert!(!config.contains("resolve ="), "{config}");
+    }
+
+    #[test]
+    fn an_ipv6_pin_is_bracketed_for_curl() {
+        let pinned = PinnedTarget {
+            host: "docs.example.com".to_string(),
+            port: 443,
+            address: "2606:2800:220:1:248:1893:25c8:1946"
+                .parse()
+                .expect("an address"),
+            literal: false,
+        };
+        assert_eq!(
+            pinned.resolve_value().as_deref(),
+            Some("docs.example.com:443:[2606:2800:220:1:248:1893:25c8:1946]")
+        );
     }
 }

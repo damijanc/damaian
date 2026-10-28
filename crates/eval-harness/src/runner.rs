@@ -139,7 +139,12 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     config.model_name = "mock".to_string();
     config.model_providers.push(mock_provider());
     let scanner = SecretScanner::new(config.secret_patterns.clone());
-    let engine = WorkspaceEngine::new(config);
+    let mut engine = WorkspaceEngine::new(config);
+    // The stub page server binds 127.0.0.1. This is the harness's own
+    // allowance, not something a scenario can configure: the scenario only
+    // pre-approves the stub's `host:port`, which the SSRF check would still
+    // refuse without this.
+    engine.chat_orchestrator.allow_loopback_fetch_for_tests();
 
     let (responses, tool_calls, truncated) = script(&scenario);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(responses, tool_calls)
@@ -355,7 +360,10 @@ pub fn run_live(scenario: &Scenario) -> Result<Run> {
     );
     let scanner = SecretScanner::new(config.secret_patterns.clone());
     let mut adapter = OpenAICompatibleAdapter::with_provider(&provider, &model, transport);
-    let engine = WorkspaceEngine::new(config);
+    let mut engine = WorkspaceEngine::new(config);
+    // Same allowance as the deterministic tier: a scenario's `[[stub_page]]`
+    // is served on loopback, and no scenario config can grant it.
+    engine.chat_orchestrator.allow_loopback_fetch_for_tests();
 
     let mut run = drive(
         &scenario,

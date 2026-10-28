@@ -6476,6 +6476,7 @@ function createReattachedApprovalCard(approval) {
     provider_fallback: "An offer to switch providers was waiting when Damaian stopped",
     round_budget: "A turn was waiting for your decision when Damaian stopped",
     context_review: "A turn was waiting for you to review its context when Damaian stopped",
+    fetch: "A page read was waiting for your approval when Damaian stopped",
     checks: "Checks were waiting for your approval when Damaian stopped",
   };
   const notes = {
@@ -6502,6 +6503,11 @@ function createReattachedApprovalCard(approval) {
     context_review:
       "This turn was assembled but not sent, and it was saved while you reviewed it. " +
       "Sending continues that turn; declining sends nothing.",
+    // Saved like a plan review, so answering continues the same turn. Nothing
+    // was requested before the crash: the dialog is the same question.
+    fetch:
+      "This turn was paused before it requested a page, and it was saved while you decided. " +
+      "Allowing continues that turn and makes the request; Don't fetch sends nothing.",
     checks:
       "The verification of an applied patch stopped on this card. Deciding it continues the " +
       "same attempt; the report follows when every check is answered.",
@@ -6534,6 +6540,10 @@ function createReattachedApprovalCard(approval) {
     // Saved and re-presented like a plan review; either answer ends this card.
     currentContextReview = approval.payload;
     wrapper.append(createContextReview(approval.payload, repo()));
+  } else if (approval.kind === "fetch") {
+    // Spec 51: the paused turn carries the verbatim URL, so the live dialog is
+    // rebuilt and answers through the same fetch-decision route.
+    wrapper.append(createFetchApproval(approval.payload, repo()));
   } else if (approval.kind === "checks") {
     wrapper.append(
       createCheckBatchCard(approval.payload, repo(), {

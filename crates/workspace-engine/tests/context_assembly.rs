@@ -2919,7 +2919,23 @@ fn the_item_carries_its_url_and_fetch_time_and_no_path() {
         Some("https://docs.example.com/api?x=1 (fetched 2023-11-14T22:13:20Z)"),
         "the fragment is never sent, and the label names the fetch time"
     );
-    assert!(item.content.contains("Install the client."));
+    assert!(
+        item.content
+            .starts_with("--- begin retrieved external content ---\n"),
+        "the context item carries the same data frame as the tool result: {}",
+        item.content
+    );
+    assert!(
+        item.content.contains("> Install the client."),
+        "the page body is quoted, not bare prompt text: {}",
+        item.content
+    );
+    assert!(
+        item.content
+            .ends_with("--- end retrieved external content ---\n"),
+        "the frame has an end marker: {}",
+        item.content
+    );
 
     let included = plan
         .manifest

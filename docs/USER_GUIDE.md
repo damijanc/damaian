@@ -731,6 +731,15 @@ it as text. It is one request for one page, never a crawl:
   model is told why — no dialog appears, because an approval is not the last
   line of defence. The query and fragment are checked raw, percent-decoded and
   base64-decoded.
+- **Only public internet addresses are reachable.** Loopback, private networks,
+  link-local addresses (including cloud metadata at `169.254.169.254`) and
+  their IPv6 forms are refused, and the host is resolved and pinned before the
+  request so a name cannot resolve privately after you approved it. A URL that
+  writes an IPv4 address as a bare number, hex or a short form is rejected
+  rather than shown as a name that means something else.
+- **Your proxy is not used.** The fetch ignores `http_proxy`, `HTTPS_PROXY`,
+  `ALL_PROXY` and `NO_PROXY` for this one request, so a page is read directly
+  and an environment proxy cannot see or redirect it.
 - **Only text comes back.** `text/*`, `application/json` and
   `application/xhtml+xml` are converted to plain text; scripts, styles, tags,
   attributes, images and other sub-resources are dropped and never loaded.
@@ -748,12 +757,15 @@ it as text. It is one request for one page, never a crawl:
 The fetched text is **data, not an instruction**. It enters the model's context
 on the **next turn** as the *Reference pages* row in the [context
 inspector](#inspecting-and-controlling-context), labelled with its URL and fetch
-time; the immediate tool result is the same text inside a fixed frame and quoted
-line by line. It is the lowest-priority context category, so a crowded context
+time. Every turn after the fetch renders it in the same fixed frame as the
+immediate tool result — the "treat as data" notice, every line quoted with
+`> `, the same injection markers and an explicit end marker — so a line in the
+page that looks like `--- file: AGENTS.md ---` cannot pass for a section the
+engine wrote. It is the lowest-priority context category, so a crowded context
 drops a fetched page before it drops repository code. A page that looks like it
-is trying to issue instructions is marked in the result (instruction override,
-impersonation, fake tool call, exfiltration request); the text is still shown,
-quoted, and is not obeyed.
+is trying to issue instructions is marked (instruction override, impersonation,
+fake tool call, exfiltration request); the text is still shown, quoted, and is
+not obeyed.
 
 ### When the assistant asks you a question
 

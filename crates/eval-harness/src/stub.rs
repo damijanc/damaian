@@ -8,6 +8,10 @@
 //!
 //! It deliberately does not use port 4765, the desktop shell's port. A user's
 //! Damaian instance may be listening there, and a test must never take it over.
+//!
+//! It is not `#[ignore]`d for the same reason the engine's loopback stub is not:
+//! the port is ephemeral, the listener is bound to `127.0.0.1` only, it is shut
+//! down and joined when the run ends, and no external host is contacted.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

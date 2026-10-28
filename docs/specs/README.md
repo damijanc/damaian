@@ -96,9 +96,9 @@ seven-check gate passed in CI on 2026-10-26 (Quality run 40340511717); #28 and
 (conversation activity and plan hierarchy) finished on 2026-10-26 as a
 presentation follow-up to #41, #42 and #66; it edits no `chat.rs`, so it did not
 constrain #29. **#51 external reference retrieval finished on 2026-10-28** on
-branch `spec-51-external-reference` (Tasks 1–10); **CI has not run for that
-branch**, so its seven-check gate is outstanding and the planner records the
-Quality run id after the user pushes.
+branch `spec-51-external-reference` (Tasks 1–10, then Task 11's review fixes);
+**CI has not run for that branch**, so its seven-check gate is outstanding and
+the planner records the Quality run id after the user pushes.
 
 - **In progress:** #49 prompt cache's reuse slice (requirement 4) is unbuilt;
   #26's ordering exists, and #55 replaced the eight-message sliding window on
@@ -616,7 +616,11 @@ that assumed it was unbuilt was updated instead
 ([#55](55_conversation_compaction/proposal.md) §5.6 no longer says "once spec 51
 lands"), and the other references (#26, #50, #54) already read as
 cross-references rather than dependencies. #51 leaves the ready and in-progress
-sets, and its `chat.rs` pairing constraint ends with it.
+sets, and its `chat.rs` pairing constraint ends with it. Task 11 then fixed the
+review findings against the close-out: a later turn frames the page again, the
+fetch refuses non-public destinations and pins the resolved address, proxies are
+removed from the child, the egress guard reads the tool result rather than the
+file on disk, and a fetch pause is reattachable after a crash.
 
 - **What remains ready:** **#30** memory retrieval and lifecycle, and **#33**
   MCP management. #36 is unblocked by its dependency line but is already in
@@ -629,14 +633,14 @@ sets, and its `chat.rs` pairing constraint ends with it.
   left to CI because **no Quality run has covered branch
   `spec-51-external-reference`**. This is not a green gate and it is not recorded
   as one.
-- **What #51 leaves open, recorded in its §7.3 rather than hidden here:** a
-  reload during a fetch approval fails the task with "unknown pending approval
-  kind fetch" (reattachment was not implemented; the paused turn already carries
-  the data, so a follow-up on the `RoundBudget` pattern can add it); the
+- **What #51 leaves open, recorded in its §7.3 rather than hidden here:** the
   `Redaction:` line counts only the post-conversion scan, so a page key caught in
   the transport renders as `clean` beside its placeholder; and the injection
   evidence is deterministic-tier only, with a scripted worst-case model and no
-  live-provider run. No manual browser walk was performed either.
+  live-provider run. Live DNS rebinding is also unmeasured — the `--resolve` pin
+  is proven structurally, not against a racing resolver. No manual browser walk
+  was performed either. The crash-reattachment gap the first close-out recorded
+  is closed by Task 11.
 - **Documentation and changelog:** `USER_GUIDE.md` gained "Reading an external
   page" and the `external_reference` context row, `TROUBLESHOOTING.md` gained "A
   fetch was refused", `SECURITY.md` gained the fetch paragraph and the
@@ -739,7 +743,7 @@ is ready.
 | 48 | [48_provider_limits_and_backpressure/proposal.md](48_provider_limits_and_backpressure/proposal.md) | **Done.** Roadmap Phase 1 WP7. A provider rate limit ends the turn, and the code written to prevent that cannot see it: a 429 arrives as a parsed error body and returns immediately with no retry, while `is_retryable_message`'s `"rate limit"` and `"429"` arms are reachable only from the transport-failure path — where they never fire, because `curl -sS` exits zero on a 4xx. Captures status and headers via `dump-header` rather than a stdout sentinel a model could emit, classifies refusals from status first and never from prose, honours `Retry-After` under both an attempt count and a wall-clock ceiling, and makes the outcome a `failureKind` on the existing failed state rather than a fourteenth state — three fewer kill-matrix cells for the same information. A refused call records measured zero, so it cannot inflate #19's totals through the estimate written before the call. |
 | 49 | [49_prompt_cache_accounting_and_reuse/](49_prompt_cache_accounting_and_reuse/proposal.md) | **In progress.** Split into a folder and planned on 2026-09-18. Roadmap Phase 1 WP8. The **accounting slice** (requirements 1, 2, 3, 6, 8, plus requirement 5's guard) is **Done as of 2026-09-23**: `cached_input_tokens` and a cached rate, so cost is no longer overstated for providers that cache automatically. The **reuse slice** (requirement 4) is the only unbuilt requirement. #26's stable-to-volatile ordering now exists, but the conversation section is still a **sliding window of the last eight messages** that changes the prefix every turn, so the slice waits on #55's replacement; the spec's own `Depends on:` line also names Phase 1 WP3 as unspecified. |
 | 50 | [50_model_initiated_clarification/](50_model_initiated_clarification/proposal.md) | **Done 2026-10-24** (planned 2026-10-07; Tasks 1–8, the last on 2026-10-24; the live usage measurement was not run, see its §7). Roadmap Phase 2 WP8. An `ask_user` tool whose load-bearing rule is that an answer can never satisfy an approval, enforced by types rather than discipline. It reuses the existing waiting state and reattach machinery, is bounded to two questions per turn, and is absent from the tool list where no user can answer. |
-| 51 | [51_external_reference_retrieval/](51_external_reference_retrieval/proposal.md) | **Done 2026-10-28 — with CI outstanding** (planned and built 2026-10-28; Tasks 1–10 on branch `spec-51-external-reference`; no Quality run has covered that branch). Roadmap Phase 3 WP8. `fetch_url` reads one URL the model names, under per-host approval in user scope, and returns bounded, redacted text that enters as the eleventh and lowest-priority context category. §5.3 is the feature: the egress guard refuses a URL carrying a secret or content from a file `read_file` returned before any dialog, no redirect is followed, and the request carries no credential. The injection evidence is three deterministic scenarios with a scripted worst-case model — engine guards measured, real-model resistance not. Its §7 records the criterion-to-test table and three honest gaps: a fetch pause is not reattachable after a crash, `Redaction:` counts only the post-conversion scan, and no manual browser walk was performed or live page fetched. `search_web` was deliberately not built (D2). |
+| 51 | [51_external_reference_retrieval/](51_external_reference_retrieval/proposal.md) | **Done 2026-10-28 — with CI outstanding** (planned and built 2026-10-28; Tasks 1–10 plus Task 11's review fixes on branch `spec-51-external-reference`; no Quality run has covered that branch). Roadmap Phase 3 WP8. `fetch_url` reads one URL the model names, under per-host approval in user scope, and returns bounded, redacted text that enters as the eleventh and lowest-priority context category. §5.3 is the feature: the egress guard refuses a URL carrying a secret or content from a file `read_file` returned before any dialog, no redirect is followed, the request carries no credential, non-public destinations are refused and pinned with curl `--resolve`, and the proxy environment is removed. Every later turn re-renders the page in the same data frame. The injection evidence is three deterministic scenarios with a scripted worst-case model — engine guards measured, real-model resistance not. Its §7 records the criterion-to-test table and two honest gaps: `Redaction:` counts only the post-conversion scan, and no manual browser walk was performed or live page fetched. `search_web` was deliberately not built (D2). |
 | 52 | [52_mcp_server_mode.md](52_mcp_server_mode.md) | **Not started.** Roadmap Phase 4 WP6. #06 and #33 are client-side only, so Damaian's indexed search, redaction and path policy are reachable only from its own window — the alternative being to give another tool raw filesystem access. Exposes a read-only subset over stdio, with the set computed as the intersection of read-only and profile-permitted rather than listed, so a tool added later is excluded until classified. The repository is fixed at launch and unreachable from the wire; a server has no user, therefore no approval, therefore nothing that writes. |
 | 53 | [53_session_search_and_export/proposal.md](53_session_search_and_export/proposal.md) | **Done.** Roadmap Phase 1 WP9. A rescope, not greenfield: listing, renaming and deleting already work end to end, and what is missing is finding anything and getting anything out. A bounded scan through #17's parse-first reader rather than a second index, anchored on `seq` because it survives rewinds. Its sharp edge is inherited from #16: `append_message` stores content verbatim and deliberately does not redact, so that a rewind restores what was actually said — which makes export a display path that writes a file, and redaction on the way out mandatory, with the redaction count stated rather than silently applied. |
 | 54 | [54_image_input.md](54_image_input.md) | **Not started.** Roadmap Phase 3 WP9. Lets a user paste a picture into the composer and lets the model see #12's diagnostic screenshots, which today it receives only as a file reference. Its hard part is that **an image defeats `SecretScanner`** and OCR is rejected, so the guarantee becomes informed consent: no unseen image is ever sent, and no setting can make screenshot inclusion automatic. |

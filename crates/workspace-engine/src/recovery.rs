@@ -17,7 +17,7 @@
 //! a guarantee enforced only in a webview is not enforced.
 
 use crate::audit::AuditLog;
-use crate::chat::PausedTurns;
+use crate::chat::{PausedTurns, PendingFetchCall};
 use crate::clarification::PendingDecision;
 use crate::context_manager::ContextManifest;
 use crate::edit::PatchStore;
@@ -374,6 +374,16 @@ pub enum ReattachedApproval {
         proposal_id: String,
         manifest: ContextManifest,
     },
+    /// A host approval a fetch turn was waiting on (spec 51 §5.3). Its paused
+    /// turn is on disk and already carries the verbatim URL, host, approval key
+    /// and display flags, so the dialog is re-presented rather than lost; a
+    /// paused turn that is gone fails the task instead, because approving would
+    /// have nothing to fetch.
+    Fetch {
+        task_id: String,
+        proposal_id: String,
+        call: PendingFetchCall,
+    },
     /// A verification check batch waiting for one card's decisions (spec 23).
     /// Its paused turn is on disk, so the batch is re-presented rather than
     /// lost; a paused turn that is gone, or one with no proposals, fails the
@@ -508,6 +518,20 @@ pub fn reattach_pending_approvals(
                     })
                     .ok_or_else(|| {
                         format!("the paused turn behind context review {proposal_id} is gone")
+                    })
+            }
+            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+                if kind == "fetch" =>
+            {
+                paused
+                    .fetch_call(proposal_id)
+                    .map(|call| ReattachedApproval::Fetch {
+                        task_id: task_id.clone(),
+                        proposal_id: proposal_id.clone(),
+                        call,
+                    })
+                    .ok_or_else(|| {
+                        format!("the paused turn behind fetch approval {proposal_id} is gone")
                     })
             }
             Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
@@ -683,6 +707,9 @@ fn action_subject(action: &str) -> &str {
         "model_call" => "A model request",
         "mcp_call" => "An MCP tool call",
         "web_diagnostic" => "A browser diagnostic",
+        // Spec 51. A crash mid-fetch leaves this marker; the request may or may
+        // not have left the machine, so the sentence does not call it a read.
+        "fetch_url" => "A page fetch",
         "read_file" => "Reading a file",
         "search_codebase" => "A codebase search",
         "read_git_status" => "Reading git status",

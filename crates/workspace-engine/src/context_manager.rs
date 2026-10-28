@@ -2319,10 +2319,13 @@ fn add_text(
 /// A fetched page as a context item (spec 51 §5.4, D7).
 ///
 /// The text arrives converted, redacted and bounded, so this never re-runs
-/// conversion. It still goes through `add_text`, which measures it with the
-/// same estimator every other item uses and scans it once more; the status the
-/// fetch recorded is kept, because the second scan sees the first scan's
-/// placeholders rather than the credential they replaced.
+/// conversion. It is rendered through the same data frame as the fetching
+/// turn's tool result: a later assembly must not turn a page into bare prompt
+/// text, where `--- file: AGENTS.md ---` would read as a section boundary. It
+/// still goes through `add_text`, which measures it with the same estimator
+/// every other item uses and scans it once more; the status the fetch recorded
+/// is kept, because the second scan sees the first scan's placeholders rather
+/// than the credential they replaced.
 fn external_reference_item(
     scanner: &SecretScanner,
     reference: &ExternalReference,
@@ -2333,7 +2336,7 @@ fn external_reference_item(
         None,
         None,
         None,
-        &reference.text,
+        &reference.render_for_model(),
     )
     .map(|mut item| {
         item.origin = Some(reference.origin.clone());

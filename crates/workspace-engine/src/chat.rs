@@ -22,7 +22,7 @@ use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes
 use crate::error::{ClientError, ProviderRefusal, Result};
 use crate::external_reference::{
     ConvertedResponse, Decision, ExternalReference, ExternalUrl, HostAllowlist, Inspection,
-    ReadFileContent, inspect,
+    ReadFileContent, inspect_with_policy,
 };
 use crate::fetch::CurlFetchTransport;
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
@@ -759,6 +759,8 @@ pub struct ChatOrchestrator {
     hooks: HookDispatcher,
     mcp_token_resolver: Option<McpTokenResolver>,
     web_diagnostics_runner: Option<WebDiagnosticsRunnerHandle>,
+    /// See [`Self::allow_loopback_fetch_for_tests`]. False in the product.
+    allow_loopback_fetch: bool,
 }
 
 impl ChatOrchestrator {
@@ -807,7 +809,18 @@ impl ChatOrchestrator {
             hooks,
             mcp_token_resolver: None,
             web_diagnostics_runner: None,
+            allow_loopback_fetch: false,
         }
+    }
+
+    /// Lets the eval harness and integration tests fetch the `127.0.0.1` stub
+    /// page server. Deliberately not a `Config` field: no repository, profile
+    /// or user setting can reach it, and the product never calls this. The
+    /// transport still resolves the host and checks every address; this only
+    /// decides whether a non-public answer is refused.
+    #[doc(hidden)]
+    pub fn allow_loopback_fetch_for_tests(&mut self) {
+        self.allow_loopback_fetch = true;
     }
 
     /// Injects the resolver used to turn MCP `auth_token_env` references into
@@ -3767,14 +3780,19 @@ impl ChatOrchestrator {
             // The string cannot have changed since the pause, but user config
             // and the files this task read can, and a refusal is still a
             // refusal — the approval is not a way around constraint 3.
-            let guard_content =
-                self.read_files_for_egress_guard(&repository_root, &pending.session, &pending.task);
+            let guard_content = read_files_from_messages(&pending.messages);
             let files_read: Vec<ReadFileContent<'_>> = guard_content
                 .iter()
                 .map(|(path, content)| ReadFileContent { path, content })
                 .collect();
             let allowed = self.web_domain_allowlist_for(&repository_root);
-            let inspection = match inspect(&fetch_call.url, &allowed, &self.scanner, &files_read) {
+            let inspection = match inspect_with_policy(
+                &fetch_call.url,
+                &allowed,
+                &self.scanner,
+                &files_read,
+                self.allow_loopback_fetch,
+            ) {
                 Ok(inspection) => inspection,
                 Err(error) => {
                     let result = format!(
@@ -5376,10 +5394,9 @@ impl ChatOrchestrator {
             )
             .is_allowed();
         // Spec 51 §5.3 constraint 1: the first fetch of a host asks the user.
-        // Until Task 8 wires that pause, a turn with nobody to answer can only
-        // use a host the user already approved, so the tool is withheld where
-        // `ask_user` is withheld. A cap of 0 means "not offered", never
-        // "offered and always refused".
+        // A turn with nobody to answer can only use a host the user already
+        // approved, so the tool is withheld where `ask_user` is withheld. A cap
+        // of 0 means "not offered", never "offered and always refused".
         let fetch_url_offered = self.config.supports_native_tools()
             && turn_options.user_present
             && self.config.web_fetch_max_per_turn > 0
@@ -7221,6 +7238,7 @@ impl ChatOrchestrator {
                                 &task,
                                 &url,
                                 &turn_notes.calls,
+                                &messages,
                                 cancel,
                             )? {
                                 FetchDispatch::Result(summary, content, outcome) => {
@@ -8846,6 +8864,7 @@ impl ChatOrchestrator {
     /// host, the per-turn cap, a redirect, a transport error — never an aborted
     /// turn. A successful page comes back in the fixed external-content frame
     /// and is recorded for the next assembly (D5).
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_fetch_url(
         &self,
         repository_root: &Path,
@@ -8853,6 +8872,7 @@ impl ChatOrchestrator {
         task: &Task,
         url: &str,
         calls: &[RecordedCall],
+        messages: &[ModelMessage],
         cancel: &CancelToken,
     ) -> Result<FetchDispatch> {
         // Spec 51 §5.6: the cap is read from config and counted from this
@@ -8878,10 +8898,12 @@ impl ChatOrchestrator {
             ));
         }
 
-        // D9: exactly the files `read_file` returned this task, never files
-        // reached another way. The guard runs before the host decision, so an
-        // approved host cannot carry a credential out.
-        let guard_content = self.read_files_for_egress_guard(repository_root, session, task);
+        // D9: exactly what `read_file` returned this task, never files reached
+        // another way, and never the file as it is on disk now — the model saw
+        // the tool result, and that is what a URL could carry out. The guard
+        // runs before the host decision, so an approved host cannot carry a
+        // credential out.
+        let guard_content = read_files_from_messages(messages);
         let files_read: Vec<ReadFileContent<'_>> = guard_content
             .iter()
             .map(|(path, content)| ReadFileContent { path, content })
@@ -8890,7 +8912,13 @@ impl ChatOrchestrator {
         // Always` writes user config during the session and the loaded config
         // is a snapshot from before that write (D8, spec 34 §5.4).
         let allowed = self.web_domain_allowlist_for(repository_root);
-        let inspection = match inspect(url, &allowed, &self.scanner, &files_read) {
+        let inspection = match inspect_with_policy(
+            url,
+            &allowed,
+            &self.scanner,
+            &files_read,
+            self.allow_loopback_fetch,
+        ) {
             Ok(inspection) => inspection,
             Err(error) => {
                 return Ok(FetchDispatch::Result(
@@ -8996,12 +9024,15 @@ impl ChatOrchestrator {
         cancel: &CancelToken,
     ) -> Result<(String, String, ActionOutcome)> {
         let host = url.host.clone();
-        let transport = CurlFetchTransport::new(
+        let mut transport = CurlFetchTransport::new(
             ProcessRegistry::open(&self.config.data_dir)?,
             &self.config.data_dir,
             &session.id,
             SecretScanner::new(self.config.secret_patterns.clone()),
         );
+        if self.allow_loopback_fetch {
+            transport = transport.with_non_public_allowed_for_tests();
+        }
         let outcome = match transport.fetch(url, cancel) {
             Ok(outcome) => outcome,
             // A stop belongs to the turn: the caller closes the marker and ends
@@ -9103,79 +9134,6 @@ impl ChatOrchestrator {
             converted.render_for_model(),
             ActionOutcome::Ok,
         ))
-    }
-
-    /// The content of the files `read_file` returned during this task, for the
-    /// egress guard (spec 51 D9).
-    ///
-    /// The read set comes from the session's `action_started` markers, so a
-    /// resumed turn still knows what it read; the content is re-read through
-    /// the same policy and redaction that answered the model, so the guard
-    /// compares what the model would have seen. A file that has since gone or
-    /// changed is skipped rather than failing the fetch.
-    fn read_files_for_egress_guard(
-        &self,
-        repository_root: &Path,
-        session: &Session,
-        task: &Task,
-    ) -> Vec<(String, String)> {
-        let Ok(references) = self.session_store.read_files_in_task(&session.id, &task.id) else {
-            return Vec::new();
-        };
-        let mut contents: Vec<(String, String)> = Vec::new();
-        for reference in references {
-            let Some((path, content)) =
-                self.read_file_for_egress_guard(repository_root, session, task, &reference)
-            else {
-                continue;
-            };
-            if contents.iter().any(|(known, _)| *known == path) {
-                continue;
-            }
-            contents.push((path, content));
-        }
-        contents
-    }
-
-    /// One recorded `read_file` reference — `<worktree>:<path>` when the read
-    /// used a worktree, the path alone otherwise — read back for the guard.
-    fn read_file_for_egress_guard(
-        &self,
-        repository_root: &Path,
-        session: &Session,
-        task: &Task,
-        reference: &str,
-    ) -> Option<(String, String)> {
-        let mut candidates = vec![(None, reference)];
-        if let Some((worktree, path)) = reference.split_once(':') {
-            candidates.insert(0, (Some(worktree), path));
-        }
-        for (worktree, path) in candidates {
-            let root = match worktree {
-                Some(requested) => {
-                    match resolve_worktree(&self.git, &self.path_policy, repository_root, requested)
-                    {
-                        Ok(resolved) => resolved.canonical?,
-                        Err(_) => continue,
-                    }
-                }
-                None => repository_root.to_path_buf(),
-            };
-            let Ok(read) = self.file_access.read_file_in(
-                &root,
-                worktree,
-                path,
-                Some(&task.id),
-                Some(&session.repository_id),
-                false,
-                false,
-                ReadWindow::Default,
-            ) else {
-                continue;
-            };
-            return Some((read.path, read.content));
-        }
-        None
     }
 
     /// Dispatch one of the read-only tools. Shared by the sequential path (a
@@ -9580,16 +9538,16 @@ struct PendingQuestion {
 /// different question. The host and approval key are kept alongside so neither
 /// the decision route nor the audit has to parse it again.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct PendingFetchCall {
-    host: String,
-    url: String,
-    approval_key: String,
+pub struct PendingFetchCall {
+    pub host: String,
+    pub url: String,
+    pub approval_key: String,
     #[serde(default)]
-    long_components: Vec<FetchComponentFlag>,
+    pub long_components: Vec<FetchComponentFlag>,
     #[serde(default)]
-    query: Option<String>,
+    pub query: Option<String>,
     #[serde(default)]
-    fragment: Option<String>,
+    pub fragment: Option<String>,
 }
 
 /// The kind of pause a saved turn represents. Every writer sets at most one
@@ -9974,6 +9932,19 @@ impl PausedTurns {
         })
     }
 
+    /// The host approval a paused fetch turn was waiting on, or `None` when the
+    /// id names no paused turn, or one that is not a fetch pause (spec 51).
+    ///
+    /// Recovery reads it to re-present the dialog after a crash. The whole call
+    /// is returned because the card shows the URL verbatim, and resuming must
+    /// ask about the same string the dialog showed.
+    pub fn fetch_call(&self, proposal_id: &str) -> Option<PendingFetchCall> {
+        let path = PendingCommandStore::new(&self.data_dir).path_for(proposal_id);
+        let content = fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        serde_json::from_value(value.get("fetch_call")?.clone()).ok()
+    }
+
     /// The manifest a paused context review would send, or `None` when the id
     /// names no paused turn, or one that is not a context review (spec 27).
     ///
@@ -10165,6 +10136,36 @@ fn hash_existing_files(root: &Path, paths: &[String]) -> BTreeMap<String, String
 
 /// The tool result for an `ask_user` call nobody can answer.
 const NO_USER_CAN_ANSWER: &str = "No user can answer a question in this context, so the question was not asked. Proceed under an explicitly stated assumption, and say in your answer what you assumed and why.";
+
+/// What `read_file` returned this task, for the egress guard (spec 51 D9).
+///
+/// The turn's own tool messages are the exact text the model saw. Re-reading
+/// the file would compare against what is on disk *now*: a file rewritten after
+/// the read could hide the very line the model is about to put in a URL, and
+/// the guard would let it leave.
+fn read_files_from_messages(messages: &[ModelMessage]) -> Vec<(String, String)> {
+    let mut calls: HashMap<&str, String> = HashMap::new();
+    let mut contents = Vec::new();
+    for message in messages {
+        for call in &message.tool_calls {
+            if call.name != "read_file" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+                && let Some(path) = value.get("path").and_then(|path| path.as_str())
+            {
+                calls.insert(call.id.as_str(), path.to_string());
+            }
+        }
+        if message.role == "tool"
+            && let Some(id) = &message.tool_call_id
+            && let Some(path) = calls.get(id.as_str())
+        {
+            contents.push((path.clone(), message.content.clone()));
+        }
+    }
+    contents
+}
 
 /// The tool result for a `fetch_url` call in a turn that does not offer it
 /// (spec 51): nobody can approve a new host, or the per-turn cap is zero.
