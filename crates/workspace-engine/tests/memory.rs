@@ -371,7 +371,7 @@ use workspace_engine::{
     AuditLog, EvidenceRef, MAX_SUGGESTIONS_PER_TASK, MEMORY_SCHEMA_VERSION, MemoryCategory,
     MemoryEntry, MemoryError, MemoryExpiry, MemoryProposal, MemoryProposalGate, MemoryProvenance,
     MemorySchemaOutcome, MemoryScope, MemoryState, MemoryStore, MemoryStoreConfig, PathPolicy,
-    ProposalOrigin, Sensitivity, UserConfirmation, Verification,
+    ProposalOrigin, Sensitivity, UserConfirmation, Verification, evidence_ref_for,
 };
 
 fn memory_store(root: &Path, user_scope_enabled: bool) -> MemoryStore {
@@ -392,6 +392,7 @@ fn memory_store_with(
             data_dir: config.data_dir.clone(),
             user_scope_enabled,
             ignore_patterns: config.ignore_patterns.clone(),
+            retention_days: config.memory_retention_days,
         },
         audit,
         scanner,
@@ -768,6 +769,7 @@ fn the_store_follows_config_default_data_dir() {
             data_dir: data_dir.clone(),
             user_scope_enabled: false,
             ignore_patterns: Vec::new(),
+            retention_days: 0,
         },
         audit,
         scanner,
@@ -1459,6 +1461,7 @@ fn a_disabled_audit_log_writes_no_memory_events() {
             data_dir: config.data_dir.clone(),
             user_scope_enabled: false,
             ignore_patterns: config.ignore_patterns.clone(),
+            retention_days: config.memory_retention_days,
         },
         audit,
         scanner,
@@ -2754,4 +2757,771 @@ fn ignored_evidence_is_refused_after_the_file_was_indexed() {
     );
     assert!(audit_text(&root).contains("evidence_ignored"));
     assert!(store.pending_proposals(&session).unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Spec 30 Task 2: recall and retrieval-time lifecycle.
+// ---------------------------------------------------------------------------
+
+/// An evidence-derived entry whose verification is current when inserted.
+fn evidence_entry(
+    root: &Path,
+    identity: &ProjectIdentity,
+    statement: &str,
+    paths: &[&str],
+) -> MemoryEntry {
+    let mut entry = project_entry(&identity.key, statement);
+    entry.provenance = MemoryProvenance::RepositoryEvidence {
+        paths: paths
+            .iter()
+            .map(|path| evidence_ref_for(root, path).unwrap())
+            .collect(),
+    };
+    entry.verification = Verification::EvidenceCurrent;
+    entry
+}
+
+fn recall_for(
+    store: &MemoryStore,
+    root: &Path,
+    identity: &ProjectIdentity,
+    session_id: &str,
+    prompt: &str,
+    cap: usize,
+) -> Vec<workspace_engine::RecalledMemory> {
+    let no_paths: Vec<String> = Vec::new();
+    store
+        .recall(root, identity, session_id, prompt, &no_paths, cap)
+        .unwrap()
+}
+
+#[test]
+fn recall_selects_each_scope_and_never_another_session() {
+    let root = temp_dir("recall-scopes");
+    let store = memory_store(&root, true);
+    let identity = project_identity("root_recall_scopes");
+    let sessions = SessionStore::new(root.join(".damaian"));
+    let first = sessions.create_session("repo_fixture", "first").unwrap();
+    let second = sessions.create_session("repo_fixture", "second").unwrap();
+    let statement = "The review checkout uses the staging database.";
+
+    let session_memory = store
+        .insert(&root, None, session_entry(&first.id, statement))
+        .unwrap();
+    let project_memory = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, statement),
+        )
+        .unwrap();
+    let user_memory = store.insert(&root, None, user_entry(statement)).unwrap();
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        &first.id,
+        "review checkout staging database",
+        5,
+    );
+    assert_eq!(recalled.len(), 3);
+    let mut scopes: Vec<&str> = recalled
+        .iter()
+        .map(|recalled| recalled.entry.scope.as_str())
+        .collect();
+    scopes.sort();
+    assert_eq!(scopes, vec!["project", "session", "user"]);
+    for id in [&session_memory.id, &project_memory.id, &user_memory.id] {
+        assert!(
+            recalled.iter().any(|recalled| &recalled.entry.id == id),
+            "missing {id}"
+        );
+    }
+
+    let other_session = recall_for(
+        &store,
+        &root,
+        &identity,
+        &second.id,
+        "review checkout staging database",
+        5,
+    );
+    assert_eq!(
+        other_session.len(),
+        2,
+        "the first session's fact is private"
+    );
+    assert!(
+        !other_session
+            .iter()
+            .any(|recalled| recalled.entry.id == session_memory.id)
+    );
+}
+
+#[test]
+fn disabling_user_scope_stops_recall_without_deleting_the_entry() {
+    let root = temp_dir("recall-user-off");
+    let enabled = memory_store(&root, true);
+    let identity = project_identity("root_recall_user_off");
+    let stored = enabled
+        .insert(
+            &root,
+            None,
+            user_entry("Prefer short commit subjects for this person."),
+        )
+        .unwrap();
+
+    let recalled = recall_for(
+        &enabled,
+        &root,
+        &identity,
+        "session_missing",
+        "commit subjects",
+        5,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].entry.id, stored.id);
+
+    let disabled = memory_store(&root, false);
+    assert!(
+        recall_for(
+            &disabled,
+            &root,
+            &identity,
+            "session_missing",
+            "commit subjects",
+            5
+        )
+        .is_empty(),
+        "a disabled user scope must not influence recall"
+    );
+    assert!(disabled.user_entries().unwrap().is_empty());
+    assert_eq!(
+        enabled.user_entries().unwrap().len(),
+        1,
+        "turning the scope off does not delete the entry"
+    );
+}
+
+#[test]
+fn expired_superseded_and_deleted_entries_are_never_recalled() {
+    let root = temp_dir("recall-state-filter");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_state");
+    let target = MemoryTarget::Project(&identity);
+    let statement = "Docker compose defines the Postgres service.";
+
+    let active = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, statement),
+        )
+        .unwrap();
+    let expired = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, statement),
+        )
+        .unwrap();
+    store
+        .mark_state(target, &expired.id, MemoryState::Expired)
+        .unwrap();
+    let superseded = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, statement),
+        )
+        .unwrap();
+    store
+        .mark_state(target, &superseded.id, MemoryState::Superseded)
+        .unwrap();
+    let deleted = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, statement),
+        )
+        .unwrap();
+    store
+        .mark_state(target, &deleted.id, MemoryState::Deleted)
+        .unwrap();
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "docker compose postgres",
+        10,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].entry.id, active.id);
+    assert_eq!(recalled[0].entry.state, MemoryState::Active);
+}
+
+#[test]
+fn the_cap_selects_the_strongest_overlap_and_reports_why() {
+    let root = temp_dir("recall-cap");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_cap");
+
+    let weak = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(
+                &identity.key,
+                "The parser uses a rope buffer for large files.",
+            ),
+        )
+        .unwrap();
+    let strong = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "The parser rejects trailing commas."),
+        )
+        .unwrap();
+    store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "The linter enforces two-space indentation."),
+        )
+        .unwrap();
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "fix the parser trailing commas",
+        1,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].entry.id, strong.id);
+    assert_eq!(
+        recalled[0].match_reason.matched_terms,
+        vec!["commas", "parser", "trailing"]
+    );
+    assert!(recalled[0].match_reason.category_boost);
+    assert!(recalled[0].match_reason.describe().contains("commas"));
+
+    let all = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "fix the parser trailing commas",
+        5,
+    );
+    assert_eq!(all.len(), 2, "the unrelated entry has no overlap");
+    assert!(all.iter().any(|recalled| recalled.entry.id == weak.id));
+
+    assert!(
+        recall_for(
+            &store,
+            &root,
+            &identity,
+            "session_missing",
+            "fix the parser trailing commas",
+            0
+        )
+        .is_empty(),
+        "a zero cap recalls nothing"
+    );
+}
+
+#[test]
+fn a_running_task_boosts_environment_entries_over_equally_matched_facts() {
+    let root = temp_dir("recall-boost");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_boost");
+
+    let mut environment = project_entry(&identity.key, "Docker service is required.");
+    environment.category = MemoryCategory::Environment;
+    let environment = store.insert(&root, Some(&identity), environment).unwrap();
+    let mut fact = project_entry(&identity.key, "Docker service is pinned.");
+    fact.category = MemoryCategory::Fact;
+    store.insert(&root, Some(&identity), fact).unwrap();
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "run the service",
+        5,
+    );
+    assert_eq!(recalled.len(), 2);
+    assert_eq!(
+        recalled[0].entry.id, environment.id,
+        "the running-task boost ranks the environment entry first"
+    );
+    assert!(recalled[0].match_reason.category_boost);
+    assert!(!recalled[1].match_reason.category_boost);
+
+    let without_intent = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "the service",
+        5,
+    );
+    assert_eq!(without_intent.len(), 2);
+    assert!(
+        without_intent
+            .iter()
+            .all(|recalled| !recalled.match_reason.category_boost),
+        "no running term means no boost"
+    );
+}
+
+#[test]
+fn explicit_paths_contribute_relevance_terms() {
+    let root = temp_dir("recall-explicit-paths");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_paths");
+    let stored = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(
+                &identity.key,
+                "The docker-compose file defines the Postgres service.",
+            ),
+        )
+        .unwrap();
+
+    let paths = vec!["docker-compose.yml".to_string()];
+    let recalled = store
+        .recall(
+            &root,
+            &identity,
+            "session_missing",
+            "review this change",
+            &paths,
+            5,
+        )
+        .unwrap();
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].entry.id, stored.id);
+    assert!(
+        recalled[0]
+            .match_reason
+            .matched_terms
+            .iter()
+            .any(|term| term == "docker-compose")
+    );
+}
+
+#[test]
+fn grammatical_overlap_alone_is_not_relevance() {
+    let root = temp_dir("recall-stopwords");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_stopwords");
+    store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "The project uses the standard layout."),
+        )
+        .unwrap();
+
+    assert!(
+        recall_for(
+            &store,
+            &root,
+            &identity,
+            "session_missing",
+            "Add a button to the project.",
+            5
+        )
+        .is_empty(),
+        "sharing only grammatical words must not recall an unrelated entry"
+    );
+}
+
+#[test]
+fn evidence_staleness_is_detected_at_recall_and_reverts() {
+    let root = temp_dir("recall-stale");
+    let original = "services:\n  postgres:\n    ports: ['5433:5432']\n";
+    fs::write(root.join("docker-compose.yml"), original).unwrap();
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_stale");
+    let stored = store
+        .insert(
+            &root,
+            Some(&identity),
+            evidence_entry(
+                &root,
+                &identity,
+                "The Postgres service listens on port 5433.",
+                &["docker-compose.yml"],
+            ),
+        )
+        .unwrap();
+
+    let current = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "postgres port 5433",
+        5,
+    );
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].verification, Verification::EvidenceCurrent);
+    assert!(!current[0].redacted);
+
+    fs::write(root.join("docker-compose.yml"), "changed externally\n").unwrap();
+    let stale = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "postgres port 5433",
+        5,
+    );
+    assert_eq!(stale[0].verification, Verification::EvidenceStale);
+    assert_eq!(stale[0].entry.verification, Verification::EvidenceStale);
+    let loaded = store.project_entries(&identity).unwrap();
+    assert_eq!(loaded[0].id, stored.id);
+    assert_eq!(loaded[0].state, MemoryState::Active);
+    assert_eq!(loaded[0].verification, Verification::EvidenceStale);
+    let audit = audit_text(&root);
+    assert!(audit.contains("memory_verification_changed"));
+    assert!(audit.contains("evidence_stale"));
+
+    // The revert is the same equality check in the other direction: a file
+    // that matches its recorded hash is current again, with no penalty.
+    fs::write(root.join("docker-compose.yml"), original).unwrap();
+    let reverted = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "postgres port 5433",
+        5,
+    );
+    assert_eq!(reverted[0].verification, Verification::EvidenceCurrent);
+    assert_eq!(
+        audit_text(&root)
+            .lines()
+            .filter(|line| line.contains("memory_verification_changed"))
+            .count(),
+        2,
+        "one transition to stale and one back to current"
+    );
+}
+
+#[test]
+fn a_deleted_evidence_path_is_stale_not_deleted() {
+    let root = temp_dir("recall-evidence-gone");
+    fs::write(root.join("settings.yml"), "port: 5433\n").unwrap();
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_evidence_gone");
+    let stored = store
+        .insert(
+            &root,
+            Some(&identity),
+            evidence_entry(
+                &root,
+                &identity,
+                "The settings file defines the Postgres port.",
+                &["settings.yml"],
+            ),
+        )
+        .unwrap();
+
+    fs::remove_file(root.join("settings.yml")).unwrap();
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "settings postgres port",
+        5,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].verification, Verification::EvidenceStale);
+    let loaded = store.project_entries(&identity).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].id, stored.id);
+    assert_eq!(loaded[0].state, MemoryState::Active);
+}
+
+#[test]
+fn restricted_and_ignored_evidence_is_withdrawn_and_restored() {
+    let root = temp_dir("recall-withdraw");
+    fs::create_dir_all(root.join("deploy")).unwrap();
+    fs::write(root.join("deploy/settings.yml"), "port: 5433\n").unwrap();
+    let identity = project_identity("root_recall_withdraw");
+    let open = memory_store(&root, false);
+    let stored = open
+        .insert(
+            &root,
+            Some(&identity),
+            evidence_entry(
+                &root,
+                &identity,
+                "The deploy settings define the Postgres port.",
+                &["deploy/settings.yml"],
+            ),
+        )
+        .unwrap();
+    let prompt = "deploy postgres port";
+
+    assert_eq!(
+        recall_for(&open, &root, &identity, "session_missing", prompt, 5).len(),
+        1
+    );
+
+    // A restriction added after creation fires no file event; retrieval is the
+    // only place that can notice it.
+    let restricted = memory_store_with(&root, false, |config| {
+        config
+            .restricted_patterns
+            .push("deploy/settings.yml".to_string());
+    });
+    assert!(recall_for(&restricted, &root, &identity, "session_missing", prompt, 5).is_empty());
+    let audit = audit_text(&root);
+    assert!(audit.contains("memory_recall_withdrawn"));
+    assert!(audit.contains("evidence_restricted"));
+    let loaded = restricted.project_entries(&identity).unwrap();
+    assert_eq!(loaded.len(), 1, "withdrawal is not deletion");
+    assert_eq!(loaded[0].id, stored.id);
+    assert_eq!(loaded[0].state, MemoryState::Active);
+
+    // Narrowing the restriction restores the entry, from the same store.
+    assert_eq!(
+        recall_for(&open, &root, &identity, "session_missing", prompt, 5).len(),
+        1
+    );
+
+    // The `.gitignore` route is the same event with a different rule source.
+    fs::write(root.join(".gitignore"), "deploy/\n").unwrap();
+    assert!(recall_for(&open, &root, &identity, "session_missing", prompt, 5).is_empty());
+    assert!(audit_text(&root).contains("evidence_ignored"));
+
+    fs::write(root.join(".gitignore"), "").unwrap();
+    assert_eq!(
+        recall_for(&open, &root, &identity, "session_missing", prompt, 5).len(),
+        1
+    );
+}
+
+#[test]
+fn recall_refuses_a_project_record_that_names_another_project() {
+    let root = temp_dir("recall-cross-project");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_mismatch");
+    store.ensure_schema().unwrap();
+    let foreign = full_entry("root_someone_else");
+    write_lines(
+        &store.project_path(&identity.key),
+        &[serde_json::to_string(&foreign).unwrap()],
+    );
+
+    let error = store
+        .recall(
+            &root,
+            &identity,
+            "session_missing",
+            "docker postgres",
+            &[],
+            5,
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Invalid(_)));
+    assert!(error.to_string().contains("cross a project boundary"));
+}
+
+#[test]
+fn recall_is_isolated_at_each_project_key_tier() {
+    let data_root = temp_dir("recall-isolation-tiers");
+    let store = memory_store(&data_root, false);
+    let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+    pairs.push((
+        repo_with_a_commit("recall-tier-root-first"),
+        repo_with_a_commit("recall-tier-root-second"),
+    ));
+
+    let remote_first = temp_dir("recall-tier-remote-first");
+    let remote_second = temp_dir("recall-tier-remote-second");
+    for (root, remote) in [
+        (&remote_first, "git@github.com:owner/recall-first.git"),
+        (&remote_second, "git@github.com:owner/recall-second.git"),
+    ] {
+        init_repo(root);
+        git(root, &["remote", "add", "origin", remote]);
+    }
+    pairs.push((remote_first, remote_second));
+
+    let path_first = temp_dir("recall-tier-path-first");
+    let path_second = temp_dir("recall-tier-path-second");
+    init_repo(&path_first);
+    init_repo(&path_second);
+    pairs.push((path_first, path_second));
+
+    for (tier, (owner_root, other_root)) in pairs.iter().enumerate() {
+        let owner = shared_identity(owner_root, &data_root);
+        let other = shared_identity(other_root, &data_root);
+        assert_ne!(owner.key, other.key, "tier {tier} needs distinct keys");
+        let stored = store
+            .insert(
+                owner_root,
+                Some(&owner),
+                project_entry(&owner.key, "Integration tests need Docker."),
+            )
+            .unwrap();
+
+        let recalled = recall_for(
+            &store,
+            owner_root,
+            &owner,
+            "session_missing",
+            "integration tests docker",
+            5,
+        );
+        assert_eq!(recalled.len(), 1, "owner recalls at tier {tier}");
+        assert_eq!(recalled[0].entry.id, stored.id);
+
+        assert!(
+            recall_for(
+                &store,
+                other_root,
+                &other,
+                "session_missing",
+                "integration tests docker",
+                5
+            )
+            .is_empty(),
+            "tier {tier} must not cross repositories"
+        );
+    }
+}
+
+#[test]
+fn retention_and_entry_expiry_transition_to_expired_before_ranking() {
+    let root = temp_dir("recall-retention");
+    let store = memory_store_with(&root, false, |config| config.memory_retention_days = 30);
+    let identity = project_identity("root_recall_retention");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let old_created = now.saturating_sub(31 * 24 * 60 * 60 * 1000);
+
+    let old = tampered(
+        project_entry(
+            &identity.key,
+            "Docker data is kept for thirty days of build output.",
+        ),
+        serde_json::json!({ "createdAtMs": old_created as u64 }),
+    );
+    let old = store.insert(&root, Some(&identity), old).unwrap();
+
+    let expiring = project_entry(
+        &identity.key,
+        "The staging URL is temporary during the migration.",
+    )
+    .with_expiry(MemoryExpiry {
+        expires_at_ms: Some(now.saturating_sub(1)),
+        revalidate_on_evidence_change: false,
+    });
+    let expiring = store.insert(&root, Some(&identity), expiring).unwrap();
+
+    let fresh = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Docker data is current."),
+        )
+        .unwrap();
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "docker data staging url build output",
+        10,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].entry.id, fresh.id);
+
+    let loaded = store.project_entries(&identity).unwrap();
+    for id in [&old.id, &expiring.id] {
+        let entry = loaded
+            .iter()
+            .find(|entry| &entry.id == id)
+            .expect("the expired entry remains in the store");
+        assert_eq!(entry.state, MemoryState::Expired);
+    }
+    assert_eq!(
+        audit_text(&root)
+            .lines()
+            .filter(|line| line.contains("memory_expired"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn a_credential_added_directly_to_the_memory_file_is_redacted_on_recall() {
+    let root = temp_dir("recall-secret");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_secret");
+    let stored = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Deploy uses a harmless token."),
+        )
+        .unwrap();
+    let poisoned = tampered(
+        stored,
+        serde_json::json!({
+            "statement": format!("Deploy with {SEEDED_SECRET} token."),
+            "sensitivity": "ordinary",
+        }),
+    );
+    write_lines(
+        &store.project_path(&identity.key),
+        &[serde_json::to_string(&poisoned).unwrap()],
+    );
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "deploy token",
+        5,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert!(recalled[0].redacted);
+    assert!(!recalled[0].entry.statement.contains(SEEDED_SECRET));
+    assert!(recalled[0].entry.statement.contains("[REDACTED_"));
+    assert!(
+        fs::read_to_string(store.project_path(&identity.key))
+            .unwrap()
+            .contains(SEEDED_SECRET),
+        "recall redacts the read, it does not rewrite the user's file"
+    );
+
+    store
+        .record_recall(std::slice::from_ref(&recalled[0].entry))
+        .unwrap();
+    assert!(
+        !audit_text(&root).contains(SEEDED_SECRET),
+        "the audit log redacts a recalled statement too"
+    );
 }

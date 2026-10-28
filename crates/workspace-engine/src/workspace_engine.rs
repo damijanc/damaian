@@ -148,6 +148,7 @@ impl WorkspaceEngine {
                 data_dir: config.data_dir.clone(),
                 user_scope_enabled: config.memory_user_scope_enabled,
                 ignore_patterns: config.ignore_patterns.clone(),
+                retention_days: config.memory_retention_days,
             },
             audit_log.clone(),
             scanner.clone(),

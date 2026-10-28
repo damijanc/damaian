@@ -355,7 +355,8 @@ impl ProjectIndexer {
     }
 }
 
-fn tokenize(text: &str) -> Vec<String> {
+/// The index's term splitter, shared with memory recall (spec 30 C1).
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
     let mut terms = HashSet::new();
     let mut current = String::new();
     for character in text.chars().flat_map(|character| character.to_lowercase()) {

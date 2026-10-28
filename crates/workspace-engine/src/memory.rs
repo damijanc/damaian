@@ -21,6 +21,7 @@ use crate::error::{ClientError, Result};
 use crate::git_service::GitService;
 use crate::hash::{create_id, file_hash, now_millis, repository_id_for_root, sha256_hex};
 use crate::ignore::{is_ignored_by_rules, parse_ignore_patterns};
+use crate::indexer::tokenize;
 use crate::path_policy::PathPolicy;
 use crate::secret_scanner::SecretScanner;
 use crate::session::SessionStore;
@@ -309,6 +310,54 @@ impl MemoryEntry {
         self.sensitivity = self.effective_sensitivity();
         self
     }
+}
+
+/// Why a stored entry was one of the few recalled for a task (spec 30 §5.3).
+///
+/// This is derived from the task text at retrieval time and is never stored:
+/// the same entry can be recalled for one task and not another. The inspector
+/// shows it so "why is this here?" has an answer that a cosine distance could
+/// not give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryMatchReason {
+    /// Statement terms that also appeared in the prompt or the named paths,
+    /// sorted so the reason is stable across runs.
+    pub matched_terms: Vec<String>,
+    /// Whether the entry's category fitted the task's running or editing
+    /// intent. A boost changes rank, not eligibility: a category alone never
+    /// makes an entry relevant.
+    pub category_boost: bool,
+}
+
+impl MemoryMatchReason {
+    /// One line for the inspector and for a troubleshooting reader.
+    pub fn describe(&self) -> String {
+        let terms = self.matched_terms.join(", ");
+        if self.category_boost {
+            format!("matched {terms}; category fitted the task")
+        } else {
+            format!("matched {terms}")
+        }
+    }
+}
+
+/// One entry recall selected, with the explanation the inspector needs.
+///
+/// `verification` repeats `entry.verification` deliberately: it is the state
+/// after this recall's evidence check, and the manifest records it beside the
+/// entry id without carrying the statement (spec 30 C3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecalledMemory {
+    pub entry: MemoryEntry,
+    pub match_reason: MemoryMatchReason,
+    pub verification: Verification,
+    /// Whether [`MemoryStore::recall`] removed a detected secret from
+    /// `entry.statement`. A memory file edited outside Damaian can hold one
+    /// even though the store refused it at write time. The rendering path uses
+    /// this to report the item as `redacted` rather than `clean`; the stored
+    /// record is not rewritten.
+    pub redacted: bool,
 }
 
 /// Where a proposal came from. The user's own request is the only trusted
@@ -1485,6 +1534,12 @@ pub struct MemoryStoreConfig {
     /// `ignore_patterns`, so the store's evidence check sees the same file set
     /// the index does.
     pub ignore_patterns: Vec<String>,
+    /// `memory_retention_days` (spec 30 §5.6). Zero means no time-based expiry;
+    /// a set value expires an entry once its `created_at_ms` is older than the
+    /// window. Kept here rather than passed to [`MemoryStore::recall`] because
+    /// it is a property of the store, like the user-scope switch, not of one
+    /// retrieval.
+    pub retention_days: u64,
 }
 
 /// Which stored scope a transition operates on.
@@ -2157,6 +2212,265 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// The entries that apply to a task, and why (spec 30 §5.3).
+    ///
+    /// The order is the specification's, not an implementation convenience:
+    ///
+    /// 1. scope, so another session or repository can never contribute;
+    /// 2. state, with due expiries transitioned to `Expired` first, so an
+    ///    expired entry is excluded before it can be ranked;
+    /// 3. evidence withdrawal, so a memory derived from a path the user has
+    ///    since restricted or ignored never enters the window;
+    /// 4. lexical relevance, then the category boost;
+    /// 5. the cap;
+    /// 6. evidence verification and redaction for the entries actually
+    ///    recalled.
+    ///
+    /// Nothing here creates or rewrites a stored statement; the redaction at
+    /// the end changes only the returned copy. The only writes are the expiry
+    /// transition and the verification transition, both append-only and
+    /// audited. Recall is *not* the place that records a recall: a paused review
+    /// may be declined, so [`Self::record_recall`] runs at send (C9).
+    pub fn recall(
+        &self,
+        root: &Path,
+        identity: &ProjectIdentity,
+        session_id: &str,
+        prompt: &str,
+        explicit_paths: &[String],
+        cap: usize,
+    ) -> MemoryResult<Vec<RecalledMemory>> {
+        let now = now_millis();
+        let mut scoped: Vec<(MemoryTarget<'_>, MemoryEntry)> = Vec::new();
+        for entry in self.session_entries(session_id)? {
+            scoped.push((MemoryTarget::Session(session_id), entry));
+        }
+        for entry in self.project_entries(identity)? {
+            scoped.push((MemoryTarget::Project(identity), entry));
+        }
+        // `user_entries` already refuses the disabled scope without opening the
+        // file; the explicit branch keeps that decision visible here.
+        if self.config.user_scope_enabled {
+            for entry in self.user_entries()? {
+                scoped.push((MemoryTarget::User, entry));
+            }
+        }
+
+        let query = query_terms(prompt, explicit_paths);
+        let intent = TaskIntent::from_terms(&query);
+        let mut candidates: Vec<Candidate<'_>> = Vec::new();
+
+        for (target, entry) in scoped {
+            if entry.state != MemoryState::Active {
+                continue;
+            }
+            if self.expiry_due(&entry, now) {
+                self.mark_state(target, &entry.id, MemoryState::Expired)?;
+                continue;
+            }
+            if let Some((path, reason)) = self.withdrawal_reason(root, &entry) {
+                self.audit_withdrawal(&entry, &path, reason)?;
+                continue;
+            }
+            let statement_terms: HashSet<String> =
+                scoring_terms(&entry.statement).into_iter().collect();
+            let matched_terms: Vec<String> = query
+                .iter()
+                .filter(|term| statement_terms.contains(*term))
+                .cloned()
+                .collect();
+            if matched_terms.is_empty() {
+                continue;
+            }
+            let mut matched_terms = matched_terms;
+            matched_terms.sort();
+            let category_boost = intent.boosts(entry.category);
+            let score = matched_terms.len() + usize::from(category_boost);
+            candidates.push(Candidate {
+                target,
+                entry,
+                matched_terms,
+                category_boost,
+                score,
+            });
+        }
+
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| right.entry.updated_at_ms.cmp(&left.entry.updated_at_ms))
+                .then_with(|| left.entry.id.cmp(&right.entry.id))
+        });
+
+        let mut recalled = Vec::with_capacity(candidates.len().min(cap));
+        for candidate in candidates.into_iter().take(cap) {
+            let mut entry = candidate.entry;
+            // Verification runs only for the entries about to be recalled: it
+            // hashes files, and an entry beyond the cap is not being relied on
+            // this turn.
+            if matches!(
+                entry.provenance,
+                MemoryProvenance::RepositoryEvidence { .. }
+            ) {
+                let verification = self.evidence_verification(root, &entry);
+                if entry.verification != verification {
+                    entry = self.set_verification(candidate.target, &entry.id, verification)?;
+                }
+            }
+            let redaction = self.scanner.redact(&entry.statement);
+            let redacted = !redaction.findings.is_empty();
+            entry.statement = redaction.text;
+            recalled.push(RecalledMemory {
+                verification: entry.verification,
+                entry,
+                match_reason: MemoryMatchReason {
+                    matched_terms: candidate.matched_terms,
+                    category_boost: candidate.category_boost,
+                },
+                redacted,
+            });
+        }
+        Ok(recalled)
+    }
+
+    /// Whether an entry's own expiry or the store-wide retention window has
+    /// passed (spec 30 C8). Both are enforced here, before ranking.
+    fn expiry_due(&self, entry: &MemoryEntry, now: u128) -> bool {
+        if let Some(expires_at_ms) = entry.expiry.and_then(|expiry| expiry.expires_at_ms)
+            && now >= expires_at_ms
+        {
+            return true;
+        }
+        if self.config.retention_days == 0 {
+            return false;
+        }
+        let retention_ms = u128::from(self.config.retention_days) * 86_400_000;
+        now.saturating_sub(entry.created_at_ms) >= retention_ms
+    }
+
+    /// Why an evidence path must be withdrawn rather than recalled (spec 30
+    /// §5.5). A policy or `.gitignore` change fires no watcher event, so this
+    /// check has to run at retrieval.
+    ///
+    /// Path shape is checked before anything reads the file: a memory file
+    /// edited outside Damaian could otherwise name `../../etc/passwd` and turn
+    /// a recall into a read outside the repository.
+    fn withdrawal_reason(
+        &self,
+        root: &Path,
+        entry: &MemoryEntry,
+    ) -> Option<(String, &'static str)> {
+        let MemoryProvenance::RepositoryEvidence { paths } = &entry.provenance else {
+            return None;
+        };
+        for evidence in paths {
+            let path = evidence.path.as_str();
+            let relative = Path::new(path);
+            if path.trim().is_empty()
+                || relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Some((path.to_string(), "evidence_not_relative"));
+            }
+            if self.path_policy.is_restricted(path, false) {
+                return Some((path.to_string(), "evidence_restricted"));
+            }
+            if is_ignored_in_repository(root, &self.config.ignore_patterns, path) {
+                return Some((path.to_string(), "evidence_ignored"));
+            }
+        }
+        None
+    }
+
+    /// The verification an evidence-derived entry should carry right now.
+    ///
+    /// Any unreadable path is stale: a file that cannot be verified must not be
+    /// presented as current. Equality is symmetric, so a reverted file returns
+    /// the entry to `EvidenceCurrent` (spec 30 §5.5).
+    fn evidence_verification(&self, root: &Path, entry: &MemoryEntry) -> Verification {
+        let MemoryProvenance::RepositoryEvidence { paths } = &entry.provenance else {
+            return entry.verification;
+        };
+        for evidence in paths {
+            match file_hash(root.join(&evidence.path)) {
+                Ok(hash) if hash == evidence.content_hash => {}
+                _ => return Verification::EvidenceStale,
+            }
+        }
+        Verification::EvidenceCurrent
+    }
+
+    /// Appends a changed verification state. Deliberately separate from
+    /// [`Self::mark_state`]: staleness is not a `MemoryState`, and routing it
+    /// through the state machine would claim a transition that did not happen
+    /// (spec 30 C7).
+    fn set_verification(
+        &self,
+        target: MemoryTarget<'_>,
+        id: &str,
+        verification: Verification,
+    ) -> MemoryResult<MemoryEntry> {
+        let mut entry = self.find_entry(target, id)?;
+        if entry.verification == verification {
+            return Ok(entry);
+        }
+        let previous = entry.verification;
+        entry.verification = verification;
+        entry.updated_at_ms = now_millis();
+        self.append_to_target(target, &entry)?;
+        self.audit_verification_changed(&entry, previous, verification)?;
+        Ok(entry)
+    }
+
+    fn audit_verification_changed(
+        &self,
+        entry: &MemoryEntry,
+        from: Verification,
+        to: Verification,
+    ) -> MemoryResult<()> {
+        let mut fields = vec![
+            ("entryId", entry.id.clone()),
+            ("scope", entry.scope.as_str().to_string()),
+            ("category", entry.category.as_str().to_string()),
+            ("provenance", entry.provenance.kind().to_string()),
+            ("sensitivity", entry.sensitivity.as_str().to_string()),
+            ("fromVerification", from.as_str().to_string()),
+            ("toVerification", to.as_str().to_string()),
+        ];
+        if entry.sensitivity == Sensitivity::Ordinary {
+            fields.push(("statement", entry.statement.clone()));
+        }
+        self.audit_log
+            .record("memory_verification_changed", &fields)?;
+        Ok(())
+    }
+
+    /// Reports a withdrawn entry once per entry and reason per process run.
+    ///
+    /// A withdrawn entry stays withdrawn every turn until the rule narrows, so
+    /// appending the same line on every recall would bury the audit log. The
+    /// first line is enough to answer "why did this memory stop appearing?";
+    /// the store itself remains the evidence that the entry still exists.
+    fn audit_withdrawal(&self, entry: &MemoryEntry, path: &str, reason: &str) -> MemoryResult<()> {
+        if !audit_withdrawal_once(&entry.id, reason) {
+            return Ok(());
+        }
+        self.audit_log.record(
+            "memory_recall_withdrawn",
+            &[
+                ("entryId", entry.id.clone()),
+                ("scope", entry.scope.as_str().to_string()),
+                ("category", entry.category.as_str().to_string()),
+                ("path", path.to_string()),
+                ("reason", reason.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn find_entry(&self, target: MemoryTarget<'_>, id: &str) -> MemoryResult<MemoryEntry> {
         self.target_entries(target)?
             .into_iter()
@@ -2635,6 +2949,145 @@ fn replay_entries<'a>(lines: impl Iterator<Item = &'a str>) -> (Vec<MemoryEntry>
         }
     }
     (entries, skipped)
+}
+
+/// One scored candidate inside [`MemoryStore::recall`]. Kept private: only the
+/// selected entries become a [`RecalledMemory`], and the score is a ranking
+/// detail rather than something the inspector shows.
+struct Candidate<'a> {
+    target: MemoryTarget<'a>,
+    entry: MemoryEntry,
+    matched_terms: Vec<String>,
+    category_boost: bool,
+    score: usize,
+}
+
+/// Which kind of task the prompt looks like, for the category boost only
+/// (spec 30 §5.3). This is intentionally a coarse keyword test: it changes
+/// ranking between already-relevant entries, never eligibility, so a wrong
+/// guess cannot pull an unrelated memory in.
+#[derive(Debug, Clone, Copy, Default)]
+struct TaskIntent {
+    running: bool,
+    editing: bool,
+}
+
+const RUNNING_TERMS: &[&str] = &[
+    "run", "runs", "running", "test", "tests", "testing", "build", "builds", "building", "execute",
+    "exec", "command", "commands", "shell", "terminal", "start", "starts", "launch", "install",
+    "cargo", "npm", "docker", "make", "script", "scripts", "deploy", "migrate", "compile", "lint",
+    "serve", "server",
+];
+
+const EDITING_TERMS: &[&str] = &[
+    "edit",
+    "edits",
+    "editing",
+    "change",
+    "changes",
+    "refactor",
+    "refactors",
+    "fix",
+    "fixes",
+    "bug",
+    "bugs",
+    "implement",
+    "implements",
+    "feature",
+    "features",
+    "add",
+    "adds",
+    "update",
+    "updates",
+    "rename",
+    "write",
+    "writes",
+    "rewrite",
+    "modify",
+    "patch",
+    "file",
+    "files",
+    "code",
+    "function",
+    "class",
+    "module",
+    "test",
+    "tests",
+];
+
+impl TaskIntent {
+    fn from_terms(terms: &HashSet<String>) -> Self {
+        Self {
+            running: RUNNING_TERMS.iter().any(|term| terms.contains(*term)),
+            editing: EDITING_TERMS.iter().any(|term| terms.contains(*term)),
+        }
+    }
+
+    fn boosts(self, category: MemoryCategory) -> bool {
+        match category {
+            MemoryCategory::Environment | MemoryCategory::Command => self.running,
+            MemoryCategory::Convention | MemoryCategory::Decision => self.editing,
+            MemoryCategory::Preference | MemoryCategory::Fact => false,
+        }
+    }
+}
+
+/// Grammatical words that would otherwise make every entry "relevant" to every
+/// prompt. The list is deliberately small and English-only: `tokenize` is the
+/// index's splitter, and recall's relevance signal is term overlap rather than
+/// stemming or a language model.
+const STOP_WORDS: &[&str] = &[
+    "a", "about", "after", "again", "all", "also", "an", "and", "any", "are", "as", "at", "be",
+    "because", "been", "before", "being", "between", "both", "but", "by", "can", "could", "did",
+    "do", "does", "done", "down", "during", "each", "every", "for", "from", "further", "had",
+    "has", "have", "here", "how", "i", "if", "in", "into", "is", "it", "its", "just", "may", "me",
+    "might", "more", "most", "must", "my", "no", "nor", "not", "of", "off", "on", "once", "only",
+    "or", "other", "our", "out", "over", "own", "project", "projects", "same", "shall", "should",
+    "so", "some", "such", "than", "that", "the", "their", "them", "then", "there", "these", "they",
+    "this", "those", "through", "to", "too", "under", "up", "us", "use", "used", "uses", "using",
+    "very", "was", "we", "were", "what", "when", "where", "which", "who", "why", "will", "with",
+    "within", "without", "would", "you", "your",
+];
+
+fn is_scoring_term(term: &str) -> bool {
+    term.len() > 1 && !STOP_WORDS.contains(&term)
+}
+
+fn scoring_terms(text: &str) -> Vec<String> {
+    // `tokenize` keeps `.` and `/` *inside* a term, which is what makes
+    // `src/memory.rs` one token. A sentence-final period therefore arrives as
+    // `commas.`, and without trimming the statement's last word could never
+    // match a prompt that names it. Only the edges are normalized; the paths
+    // stay intact.
+    tokenize(text)
+        .into_iter()
+        .map(|term| term.trim_end_matches(['.', '/']).to_string())
+        .filter(|term| is_scoring_term(term))
+        .collect()
+}
+
+fn query_terms(prompt: &str, explicit_paths: &[String]) -> HashSet<String> {
+    let mut terms: HashSet<String> = scoring_terms(prompt).into_iter().collect();
+    for path in explicit_paths {
+        terms.extend(scoring_terms(path));
+        // `tokenize` keeps `src/memory.rs` as one term. A statement is far more
+        // likely to say "memory" or "rs" than to repeat the whole path, so the
+        // segments and extension contribute too.
+        terms.extend(scoring_terms(&path.replace(['/', '.'], " ")));
+    }
+    terms
+}
+
+/// Whether this process should report a withdrawn entry for `entry:reason`.
+/// `true` at most once per process run, because a withdrawn entry stays
+/// withdrawn every turn until the rule narrows.
+fn audit_withdrawal_once(entry_id: &str, reason: &str) -> bool {
+    static AUDITED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let audited = AUDITED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut audited = audited
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    audited.insert(format!("{entry_id}:{reason}"))
 }
 
 fn append_entry_line(path: &Path, entry: &MemoryEntry) -> MemoryResult<()> {

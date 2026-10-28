@@ -133,7 +133,7 @@ directory, the audit log, or that a memory store exists.
 ## 2. Corrections
 
 **C1 — `tokenize` is private, and its line moved.** The proposal cites
-`indexer.rs:387`; today the function is `indexer.rs:331` and is not `pub`. Making
+`indexer.rs:387`; today the function is `indexer.rs:358` and is not `pub`. Making
 it `pub(crate)` is the smallest change; a new shared `text` module would be a
 refactor this spec does not need.
 
@@ -258,6 +258,57 @@ count, defaults and last category in four tests:
 `an_external_reference_drops_before_repository_content`) and
 `a_category_orders_before_the_categories_after_it`, whose "exhaustive on
 purpose" array had already missed `ExternalReference`.
+
+**C13 — Task 2's plan left six details unnamed, and they are recorded here
+because Task 3 and Task 4 depend on them.**
+
+1. **Retention had no home in the store.** `MemoryStore` carries
+   `user_scope_enabled` and `ignore_patterns`, but nothing from
+   `memory_retention_days`. The setting is a property of the store rather than
+   of one retrieval, so `MemoryStoreConfig` gains `retention_days` and
+   `workspace_engine.rs:146` fills it from `config.memory_retention_days`,
+   exactly as it already fills the user-scope switch. Task 2's file list
+   therefore gains `crates/workspace-engine/src/workspace_engine.rs`.
+2. **Recall redacts, and says so.** Task 2's test list requires a credential
+   added directly to the memory file to be redacted "on the way out", while
+   Task 3 is where a `ContextItem` is rendered. Both are true, and they are
+   different boundaries: `recall` removes a detected secret from the returned
+   `entry.statement` (the stored line is not rewritten) and reports
+   `RecalledMemory.redacted`. Task 3 still scans the rendered frame on the way
+   into the item, per the global constraint; it can use the flag so the item
+   reports `redaction_status: "redacted"` rather than `"clean"` after the
+   statement was already cleaned. Without the flag the second scan would see
+   only the replacement marker and call it clean.
+3. **Withdrawal needs a report with no excluded list in the return type.**
+   `recall` returns `Vec<RecalledMemory>`; a withdrawn entry is not in it.
+   The report is the `memory_recall_withdrawn` audit event, carrying entry id,
+   scope, category, path and reason (`evidence_not_relative`,
+   `evidence_restricted`, `evidence_ignored`). It is written once per entry and
+   reason per process run, so an entry that stays withdrawn does not append a
+   line every turn. The entry remains `Active` in the store and recall returns
+   it again once the rule narrows.
+4. **Lexical scoring needs edge handling that `tokenize` alone does not give.**
+   `tokenize` keeps `.` and `/` inside a term, which is right for paths and
+   wrong for sentence-final punctuation: `commas.` would never match a prompt
+   saying `commas`. Recall therefore trims a trailing `.` or `/` from each
+   scoring term and filters a small English stopword list. Without the stopword
+   filter, grammatical overlap (`the`, `project`) would make unrelated entries
+   "relevant", contradicting requirement 1. Explicit paths contribute the whole
+   path and its `/`- and `.`-separated parts, so a statement naming
+   `docker-compose` matches an explicit `docker-compose.yml`. Ranking quality is
+   still out of scope; this only makes relevance mean what §5.3 says.
+5. **The ignore check reuses the store's helper, not `ignore.rs` directly.**
+   The task's reference to `is_ignored_by_rules` resolves to the store's
+   existing `is_ignored_in_repository` helper, which applies the configured
+   patterns plus every per-directory `.gitignore`; calling `ignore.rs` directly
+   would have lost the per-directory rules. Evidence path shape is checked
+   before anything is hashed: a memory file edited outside Damaian could
+   otherwise name `../../…` and turn recall into a read outside the repository,
+   so a non-relative path is withdrawn rather than read.
+6. **The category boost is a coarse intent test, not a second ranking model.**
+   A small keyword list decides "running" versus "editing"; the boost adds one
+   point and only orders entries that already have a term match, never makes an
+   entry eligible, so a wrong guess cannot pull in an unrelated memory.
 
 ## 3. Open questions for the owner
 

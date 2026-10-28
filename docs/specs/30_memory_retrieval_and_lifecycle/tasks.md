@@ -40,7 +40,7 @@ corrections planning found, before starting any task.
 | Task | Status | What landed |
 |---|---|---|
 | 1 · Types and configuration | Done 2026-10-28 | **Landed:** `ContextCategory::Memory` is the thirteenth variant and twelfth budgeted category, **after** spec 51's `ExternalReference` (plan correction: the draft said "after `ConversationSummary`", which would have left fetched pages lower than memory and violated this spec's own "memory drops first" acceptance criterion). `BUDGETED`/`shares` are `[_; 12]`; `apply_budget`'s `indices` is `[_; 13]` and its capacity is 13. The default table totals 10,000 with memory at 300, funded by lowering `findings` 500 → 200 — `findings` has no producer in the tree, and `search_results` had already paid for `external_reference`. `ContextKind::Memory` maps `"memory"` to the category. New keys: `memory_max_entries` (u32, default 5, restrict-only lower-wins through `restrict_only_u32`), `memory_retention_days` (u64, default 0 = no expiry, `Forbidden` to repository and profile) and `context_budget.memory` (restrict-only share). All three are `Capability`, not `Preference` as the draft said: spec 31 defines a capability as a key repository scope does not apply freely, and its preference test requires free application. Both overlay writers and the resolved policy text print them; `rule_label` names them; `split_profile_keys` carries the cap and share and refuses retention; `equals_base_limit` knows the cap. **Tests:** `permission_profiles` 87/87 (three new weakening cases and two new tests: profile direction, user-only retention); `context_assembly` 52/52; `config::tests` 3/3; full `workspace-engine` 2,039 passed, 28 skipped. **Discoveries:** two consequences lay outside the draft's file list — `apply_budget`'s index array had no compile-time link to the enum size (a 13th variant would have panicked at runtime, not failed the build), and `context_assembly.rs` pinned the old count/last category in three places, including `an_external_reference_is_the_last_category_and_drops_first`, renamed `an_external_reference_drops_before_repository_content`. **Intermediate state:** the inspector shows the new empty `memory` row with its raw key label until Task 3 adds the label map and Task 5 the row, as planned. **Docs:** proposal §5.1 and Status, context.md C2/C12 and §1.2/§1.5/§3 Q2, spec 26 §5.1–§5.2 defaults, and the README row/current-state paragraph were corrected. Scoped checks: fast gate (`fmt`, `node`, `lint`, `typos`, `deny`) passed; scoped clippy clean; `npm run specs:check` passed. Workspace clippy and the full suite are left to CI. |
-| 2 · Recall engine | Not started | — |
+| 2 · Recall engine | Done 2026-10-28 | **Landed:** `MemoryStore::recall(root, identity, session_id, prompt, explicit_paths, cap)` in `memory.rs`, returning `RecalledMemory { entry, match_reason, verification, redacted }`. Order: scope (session / project / user only when enabled), `Active` only, expiry through `mark_state(.., Expired)` (own `MemoryExpiry` or `memory_retention_days`), evidence withdrawal, lexical scoring, cap, then hash revalidation and redaction for the selected entries only. `MemoryMatchReason { matched_terms, category_boost }` with `describe()`, serde-ready for Task 3's manifest. Scoring is `tokenize` plus a stopword filter and a trailing `.`/`/` trim; explicit paths contribute the whole path and its split parts; the +1 category boost from a small running/editing keyword test never makes an entry eligible. Verification: `set_verification` appends and audits `memory_verification_changed` without `mark_state`; any hash difference or unreadable/missing path is `EvidenceStale`, equality is `EvidenceCurrent`, so a revert works. Restricted, ignored or non-relative evidence is withdrawn with `memory_recall_withdrawn` (once per entry+reason per process); the entry stays `Active` and returns when the rule narrows. `MemoryStoreConfig` gains `retention_days`, filled from `config.memory_retention_days` in `workspace_engine.rs` — the task's file list omitted that file. Recall redacts a credential edited into the memory file and reports `redacted`, leaving the stored line unchanged (C13.2). `tokenize` is `pub(crate)`. **Tests:** `tests/memory.rs` 95/95 including 14 new: scope and session isolation, user scope off, state filter, cap and match reason, category boost, explicit paths, stopword-only overlap, stale/revert, deleted evidence, restricted+ignored withdrawal/restore, project-key mismatch at recall, all three project-key tiers, retention and entry expiry, and a file-injected credential redacted on read and in audit. Full `workspace-engine` 2,053 passed, 28 skipped. **Discoveries:** `tokenize` keeps `.` inside a term, so a statement-final `commas.` could never match a prompt saying `commas`; scoring trims edge punctuation. `Config`'s retention key had no store field. Withdrawal needed an audit report because recall's return type has no excluded list. **Checks:** `fmt`, `node`, `lint`, `typos`, `deny`; scoped clippy; `nextest -p workspace-engine`. |
 | 3 · Context assembly | Not started | — |
 | 4 · Turn wiring and send-time re-check | Not started | — |
 | 5 · Inspector and shell | Not started | — |
@@ -111,12 +111,13 @@ config tests prove the three keys' direction and scope.
 hold?" without any UI or prompt code.
 
 **Files:** `crates/workspace-engine/src/memory.rs`,
-`crates/workspace-engine/src/indexer.rs` (`tokenize` visibility), tests in
-`crates/workspace-engine/tests/memory.rs`.
+`crates/workspace-engine/src/indexer.rs` (`tokenize` visibility),
+`crates/workspace-engine/src/workspace_engine.rs` (retention reaches the store),
+tests in `crates/workspace-engine/tests/memory.rs`.
 
 **Steps**
 
-- [ ] Add `RecalledMemory { entry, match_reason, verification }` and a
+- [x] Add `RecalledMemory { entry, match_reason, verification, redacted }` and a
       `MemoryStore::recall(root, identity, session_id, prompt, explicit_paths,
       cap)` that:
       - filters by scope (session for this session, project for this
@@ -125,22 +126,32 @@ hold?" without any UI or prompt code.
       - expires entries whose own `MemoryExpiry` or `memory_retention_days` has
         passed, through `mark_state(.., Expired)` (context.md C8);
       - scores term overlap with `tokenize` over the statement against the
-        prompt plus `explicit_paths`;
+        prompt plus `explicit_paths`, filtering stopwords and a sentence-final
+        `.`/`/` so `commas.` matches `commas` (context.md C13);
       - applies the `Environment`/`Command`-vs-`Convention`/`Decision` boost;
       - caps the result and returns each entry's match reason.
-- [ ] Add the verification transition (context.md C7): recompute the hash of
+      The extra `redacted` field exists because recall removes a detected
+      secret from the returned statement and Task 3 must still report the item
+      as redacted (context.md C13.2).
+- [x] Add `retention_days` to `MemoryStoreConfig`, filled from
+      `config.memory_retention_days` in `workspace_engine.rs`, so the store has
+      the setting C8 needs without recall depending on a caller's config.
+- [x] Add the verification transition (context.md C7): recompute the hash of
       every `RepositoryEvidence` path about to be recalled; a difference
       transitions to `EvidenceStale`, equality transitions back to
       `EvidenceCurrent`, a missing path is `EvidenceStale`, and each transition
-      is audited. Do not route this through `mark_state`.
-- [ ] Withdraw, do not mark, an entry whose evidence path now fails
-      `PathPolicy::is_restricted` (`path_policy.rs:149`) or
-      `is_ignored_by_rules` (`ignore.rs:44`): excluded from recall, retained in
-      the store, reported with the reason.
-- [ ] Treat a `project_key` mismatch as a hard error, not a filtered row
+      is audited as `memory_verification_changed`. Do not route this through
+      `mark_state`.
+- [x] Withdraw, do not mark, an entry whose evidence path now fails
+      `PathPolicy::is_restricted` (`path_policy.rs:149`) or the store's
+      `is_ignored_in_repository` helper (which applies `ignore.rs:44` plus the
+      per-directory `.gitignore`): excluded from recall, retained in the store,
+      reported with the reason as a `memory_recall_withdrawn` audit event
+      (context.md C13.3, C13.5).
+- [x] Treat a `project_key` mismatch as a hard error, not a filtered row
       (already the store's read behaviour — assert it at the recall boundary).
-- [ ] Make `tokenize` `pub(crate)` (context.md C1).
-- [ ] Tests: scope isolation at each `project_key` tier; user scope off; stale
+- [x] Make `tokenize` `pub(crate)` (context.md C1).
+- [x] Tests: scope isolation at each `project_key` tier; user scope off; stale
       on change and back to current on revert; deleted path is stale, not
       deleted; restricted and ignored paths withdrawn and restored when the rule
       narrows; `Expired`/`Deleted`/`Superseded` never recalled; cap and match
