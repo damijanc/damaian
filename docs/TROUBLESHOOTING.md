@@ -909,8 +909,13 @@ same manifest, without a shell.
   in Excluded was included — expand **Pinned** to confirm.
 - **Only a few files are being considered.** Check the line under the pin list
   that says the session is restricted to N paths, and clear it with **Clear
-  paths** if that was not what you meant. The restriction never overrides
-  `restricted_patterns`, so selecting a restricted path does not include it.
+  paths** if that was not what you meant. An entry selects a file, or a
+  directory with a trailing slash and everything under it. The restriction never
+  overrides `restricted_patterns`, so selecting a restricted path does not
+  include it. It filters what is assembled and sent, not what a turn may read:
+  the assistant's own file-reading, directory and search tools are not limited
+  by it. The symbols row and the repository map are still built from the whole
+  repository.
 - **An item you removed is still listed.** On a paused turn, an item removed in
   the panel appears under Excluded as `user_removed` and the token total falls.
   Removal is per turn; a pin or restriction is what changes later turns.

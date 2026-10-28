@@ -361,28 +361,40 @@ the **+** composer chips: a chip is an attachment for the request you are typing
 and is not carried into later turns.
 
 **Path restriction.** Enter one path per line and choose **Apply paths** to make
-only those files eligible for context in this session. The field shows the
-session's current restriction when the panel opens. The restriction narrows; it
-never widens. `restricted_patterns` and the path policy still apply on top, so
-selecting a restricted path does not include it. The `AGENTS.md` hierarchy and
-your own message are still included: repository instructions are policy rather
-than one of the content files you are choosing between, and your message is
-required. The **symbols** row is not filtered either: it is a lookup from the
-identifiers in your message, not file content, so it can still name a symbol in
-a file outside your selection. An empty list is a restriction that admits no
-file content, not "no restriction": applying an empty field is refused, and
-**Clear paths** removes the restriction.
+only those files' content part of the assembled context in this session. An
+entry names a file, or a directory with a trailing slash (`src/`), which selects
+everything under it. The field shows the session's current restriction when the
+panel opens. The restriction narrows; it never widens. `restricted_patterns` and
+the path policy still apply on top, so selecting a restricted path does not
+include it.
+
+The restriction filters what is **assembled and sent**, not what a turn may do.
+The assistant's own `read_file`, `list_directory` and search tools are not
+restricted by it, so a turn can still read a file outside your selection when
+the model asks for one; that behaviour is unchanged and would need a separate
+enforcement change. The `AGENTS.md` hierarchy and your own message are still
+included: repository instructions are policy rather than one of the content
+files you are choosing between, and your message is required. The **symbols**
+row and the **repository map** are not filtered either: the symbols row is a
+lookup from the identifiers in your message, and the map is a rendering of the
+repository index that lists paths across the whole repository, not file
+content. An empty list is a restriction that admits no file content, not "no
+restriction": applying an empty field is refused, and **Clear paths** removes
+the restriction.
 
 **Reviewing before sending.** By default a turn sends as soon as its context is
 assembled; the panel shows the manifest while the turn runs. Turn on **Pause
-before sending to review context** in **Settings › Conversation** to hold every
-turn at that point instead. The turn card then offers **Review context**,
-**Send** and **Decline**. While it is paused, expanding a category gives each
-optional item a **×** to remove it from this turn only; the removal appears under
-**Excluded** as **removed by you**, and the token total falls. **Send** sends the
-amended context, and **Decline** sends nothing at all. `Required` items have no
-**×** and the API refuses their removal even if a client asks. The setting is
-yours alone: a repository or a permission profile cannot turn it on or off.
+before sending to review context** in **Settings › Conversation** to hold each
+chat turn at that point instead. Two paths are not held: a verification repair
+turn, which Damaian starts after a failed check, and a one-shot edit request.
+Both assemble and send in one step even with the setting on. The turn card then
+offers **Review context**, **Send** and **Decline**. While it is paused,
+expanding a category gives each optional item a **×** to remove it from this
+turn only; the removal appears under **Excluded** as **removed by you**, and the
+token total falls. **Send** sends the amended context, and **Decline** sends
+nothing at all. `Required` items have no **×** and the API refuses their removal
+even if a client asks. The setting is yours alone: a repository or a permission
+profile cannot turn it on or off.
 
 **Past turns.** Each assistant message whose turn recorded a manifest has a
 **Context · N tokens** link. It opens the same panel for that turn, read-only.

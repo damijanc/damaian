@@ -155,6 +155,13 @@ available — a control showing the token total, openable during or after the tu
 — and the turn proceeds. A user who wants to inspect before every send can
 enable a `pause_for_context_review` setting, off by default.
 
+**The pause covers chat turns.** A verification repair turn
+(`run_repair_turn` in `chat.rs`) and a one-shot edit request (`edit.rs`) assemble
+and send in one path and are not held for review, even with the setting on.
+They still read the session's pins and restriction; giving them the pause too is
+a follow-up, recorded in `tasks.md`'s Review fixes and stated in the user guide
+rather than left for the user to discover.
+
 This is the design decision most likely to be got wrong in the other direction.
 A pre-send view that blocks is technically closer to the requirement's wording
 and worse as a product; the requirement is that the user *can* see before
@@ -305,19 +312,30 @@ what policy already permits — stated explicitly because "restrict the session 
 selected paths" could be read as an override, and it is not.
 
 A path restriction filters the **file-bearing collection sources** — explicit
-paths, prompt mentions, keyword and semantic hits, project rules, and pins. It
-does not filter `Instructions`: the `AGENTS.md` hierarchy is the repository's
-policy and `Required` content is the user's own message, and silently ignoring a
-repository's rules because the user narrowed *content* would be a surprising and
-unsafe reading of "restrict to these paths". Both are still listed in the panel,
-and an instruction may still be removed for a turn. Nor does it filter the
-**symbols block**: that is one path-less item built from the identifiers in the
-prompt, not file content, so a match may still name a symbol and location in a
-file outside the selection. The panel says so beside the restriction, and
-`a_restriction_narrows_file_content_but_not_the_symbols_block` pins the
+paths, prompt mentions, keyword and semantic hits, project rules, and pins. An
+entry names a file, or a directory with a trailing `/` (`src/`), which selects
+everything under it. It does not filter `Instructions`: the `AGENTS.md`
+hierarchy is the repository's policy and `Required` content is the user's own
+message, and silently ignoring a repository's rules because the user narrowed
+*content* would be a surprising and unsafe reading of "restrict to these paths".
+Both are still listed in the panel, and an instruction may still be removed for
+a turn. Nor does it filter the **symbols block**: that is one path-less item
+built from the identifiers in the prompt, not file content, so a match may still
+name a symbol and location in a file outside the selection. Nor the
+**repository map**, which is a rendered overview of the index rather than file
+content, and lists paths across the whole repository. The panel says so beside
+the restriction, and
+`a_restriction_narrows_file_content_but_not_the_symbols_block` pins the symbols
 exemption, so changing it is a deliberate decision rather than a silent
-regression. This is recorded again in `context.md` §5 because the sentence "only
-these paths are eligible for context" could be read more broadly.
+regression.
+
+**It filters assembly, not capability.** `read_file`, `list_directory` and the
+search tools still run anywhere the path policy allows, so a turn can read a
+file outside the selection when the model asks for it. The restriction decides
+what a turn is *handed*, not what it may *do*; enforcing it in tool dispatch
+would change the second, and is a follow-up in `chat.rs` rather than part of
+this control. This is recorded again in `context.md` §5 because the sentence
+"only these paths are eligible for context" could be read more broadly.
 
 A pinned file that later becomes restricted, or is deleted, is reported in the
 excluded list with the reason rather than silently dropped from the pin list:
@@ -513,9 +531,37 @@ What was walked, and what was seen:
   note and test name were corrected on the same day. Automatic collection is
   still whole-file.
 - The session restriction filters file-bearing collection only; `AGENTS.md`,
-  `Required` and the path-less symbols lookup are exempt (`context.md` C10). That
-  was a planning decision, not an oversight, and the user guide and the panel
-  both state it.
+  `Required`, the path-less symbols lookup and the repository map are exempt
+  (`context.md` C10). That was a planning decision, not an oversight, and the
+  user guide and the panel both state it. Review fixes on 2026-10-28 added the
+  map to that list, made a directory entry (`src/`) prefix-match instead of
+  selecting nothing, and stated in the panel, the guide and §5.4 that the
+  restriction filters assembly rather than the tools a turn may use.
+
+### Review fixes (2026-10-28)
+
+A post-merge review found four issues; [`tasks.md`](tasks.md)'s **Review fixes**
+section has the evidence and falsifications.
+
+- **The review card reopened a stale manifest (5a).** *Review context* restored
+  the review object the card was created with while removal is by index in the
+  panel's manifest, so a second removal after a reopen addressed the wrong item.
+  The card now owns one live review refreshed from every removal route's
+  returned manifest, and a test removes two items across a reopen.
+- **The restriction does not reach tool dispatch (5b).** `read_file`,
+  `list_directory` and the search tools ignore it. Enforcing it belongs in
+  `chat.rs`, which spec 51 owns until it merges, so the behaviour is unchanged
+  and the panel hint, the user guide and §5.4 now describe exactly what the
+  restriction does and does not cover.
+- **Two send paths skip the pause (5c).** `run_repair_turn` and the one-shot
+  edit flow send without `pause_for_context_review`; the user guide said "every
+  turn". The guide and the settings hint now name both exemptions, and pause
+  parity for those paths is a follow-up.
+- **Four smaller corrections (5d).** A directory entry such as `src/`
+  prefix-matches (it previously selected nothing); the repository map is named
+  as exempt beside the symbols row; the finding-repair dialog counts the
+  findings actually sent; and the file-bearing-source restriction test no longer
+  pins the path its search hit reaches, so it exercises the filter again.
 
 ### Known gaps
 
