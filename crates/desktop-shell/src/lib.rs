@@ -12,24 +12,24 @@ use workspace_engine::hooks::{
     HookReviewDecision, list_hooks, review_hook, set_hook_enabled, test_run,
 };
 use workspace_engine::{
-    AgentCheckBatch, AgentContextReview, AgentFallbackProposal, AgentPlanProposal,
-    AgentQuestionProposal, AgentRoundBudgetProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken,
-    ChatMessage, ChatTurnOptions, ChatTurnResult, CommitError, Config, ContextDecision,
-    ContextManifest, CostEstimate, CurlModelTransport, DataSchemaOutcome, EffectivePolicy,
-    ExportFormat, GeneratedSecretWarning, HookActivation, HookEvent, LanguageServerStatus,
-    LineRange, McpClient, McpServerConfig, McpTokenResolver, McpTransport, MemoryScope,
-    ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns,
-    PlanRevisionStep, ProcessRegistry, ProfileId, ProjectIdentity, ProposedFilePatch,
-    QuestionState, RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision,
-    SearchOptions, Session, SessionMode, StepStatus, SymbolRef, TaskPlan, TaskUsage, TokenUsage,
-    TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationReport,
-    WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
-    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
-    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
-    import_profile, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
-    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
-    select_profile,
+    AgentCheckBatch, AgentContextReview, AgentFallbackProposal, AgentFetchProposal,
+    AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal,
+    CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult,
+    CommitError, Config, ContextDecision, ContextManifest, CostEstimate, CurlModelTransport,
+    DataSchemaOutcome, EffectivePolicy, ExportFormat, FetchDecision, GeneratedSecretWarning,
+    HookActivation, HookEvent, LanguageServerStatus, LineRange, McpClient, McpServerConfig,
+    McpTokenResolver, McpTransport, MemoryScope, ModelAdapter, ModelMessage, ModelRequest,
+    ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId,
+    ProjectIdentity, ProposedFilePatch, QuestionState, RepositoryConfigReport,
+    ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus,
+    SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink,
+    UserConfirmation, VerificationReport, WebDiagnosticCall, WebDiagnosticKind,
+    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
+    WorkspaceEngine, allow_always_eligible, command_approval_prompt, custom_profile_ids,
+    ensure_data_dir_schema, export_profile, import_profile, normalize_mcp_server_id,
+    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
+    review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -365,6 +365,8 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/render-markdown") => handle_render_markdown(stream, &request),
         ("POST", "/api/ask-stream") => handle_ask_stream(stream, &request),
         ("POST", "/api/resume-command-stream") => handle_resume_command_stream(stream, &request),
+        ("POST", "/api/resume-fetch-stream") => handle_resume_fetch_stream(stream, &request),
+        ("POST", "/api/fetch-decision") => handle_fetch_decision(stream, &request),
         ("POST", "/api/verify-stream") => handle_verify_stream(stream, &request),
         ("POST", "/api/resume-checks-stream") => handle_resume_checks_stream(stream, &request),
         ("POST", "/api/resume-plan-stream") => handle_resume_plan_stream(stream, &request),
@@ -2633,6 +2635,65 @@ fn handle_resume_command_stream(stream: &mut TcpStream, request: &Request) -> Re
     })
 }
 
+fn handle_resume_fetch_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    write_event_stream_headers(stream, request)?;
+    stream_turn(stream, move |cancel, events| {
+        run_fetch_decision_request(&form, cancel, events)
+    })
+}
+
+/// The non-streaming fetch decision, as `/api/fetch-decision`.
+///
+/// Answering a fetch approval resumes a turn, so the streaming route above is
+/// what the app uses; this is the fallback for a client that cannot consume
+/// SSE, and the place a wrong-kind pause or an unknown decision becomes a
+/// stated `{error, code, message}` instead of an SSE failure event.
+fn handle_fetch_decision(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let (events, _discard) = std::sync::mpsc::channel();
+    match run_fetch_decision_request(&form, &CancelToken::new(), &events) {
+        Ok(result) => write_response(
+            stream,
+            request,
+            200,
+            "application/json",
+            &chat_result_json(&result),
+        ),
+        Err(error) => {
+            let code = fetch_decision_error_code(&error);
+            write_response(
+                stream,
+                request,
+                400,
+                "application/json",
+                &fetch_decision_error_json(code, &error),
+            )
+        }
+    }
+}
+
+/// A stable code for a refused fetch decision, so the client can branch without
+/// reading prose.
+fn fetch_decision_error_code(error: &str) -> &'static str {
+    if error.contains("No pending chat command") || error.contains("No pending fetch") {
+        "no_pending_fetch"
+    } else if error.starts_with("Unknown fetch decision") {
+        "invalid_decision"
+    } else if error.contains("is a fetch approval") {
+        "fetch_pause_expected"
+    } else if error.contains("resume it with") || error.contains("more than one kind of pause") {
+        "not_fetch_pause"
+    } else {
+        "fetch_decision_failed"
+    }
+}
+
+fn fetch_decision_error_json(code: &str, message: &str) -> String {
+    let message = escape_json(message);
+    format!("{{\"error\":\"{message}\",\"code\":\"{code}\",\"message\":\"{message}\"}}")
+}
+
 fn handle_verify_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     write_event_stream_headers(stream, request)?;
@@ -2773,6 +2834,70 @@ fn run_resume_command_request(
             adapter.as_mut(),
             &mut sink,
             resume_decision_options(form),
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// Answers a fetch approval (spec 51 §5.3).
+///
+/// `decision` is `once`, `always` or `deny`. `always` writes the host to user
+/// config in the engine, before the request, so a write failure leaves the pause
+/// unanswered rather than granting half a decision. `session_id` is required so
+/// a client cannot post a decision without naming the conversation it belongs
+/// to; the paused turn's own session is what the engine records.
+fn run_fetch_decision_request(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+) -> Result<ChatTurnResult, String> {
+    run_fetch_decision_request_with(form, cancel, events, &mut |config| {
+        chat_model_adapter(config, || resolve_shell_model_api_key(config))
+    })
+}
+
+fn run_fetch_decision_request_with(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+    adapter_for: &mut AdapterFor<'_>,
+) -> Result<ChatTurnResult, String> {
+    let repo = required_form(form, "repo")?;
+    let proposal_id = required_form(form, "proposal_id")?;
+    let _session_id = required_form(form, "session_id")?;
+    let decision = match required_form(form, "decision")?.as_str() {
+        "once" => FetchDecision::Once,
+        "always" => FetchDecision::Always,
+        "deny" => FetchDecision::Deny,
+        other => {
+            return Err(format!(
+                "Unknown fetch decision: {other}. Expected once, always or deny."
+            ));
+        }
+    };
+    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+    let mut adapter = adapter_for(&engine.config)?;
+    let mut on_token = |token: &str| {
+        let _ = events.send(TurnEvent::Token(token.to_string()));
+    };
+    let mut on_progress = |progress: TurnProgress| {
+        if let Some(event) = turn_progress_event(progress) {
+            let _ = events.send(event);
+        }
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_fetch_decision(
+            &proposal_id,
+            decision,
+            "desktop_user",
+            adapter.as_mut(),
+            &mut sink,
         )
         .map_err(|error| error.to_string())
 }
@@ -5158,6 +5283,44 @@ fn question_proposal_json(proposal: Option<&AgentQuestionProposal>) -> String {
     )
 }
 
+/// Spec 51 §5.3's host approval, shaped for the dialog.
+///
+/// The URL is the string the model wrote, unshortened. `longComponents` says
+/// which part is over the display threshold; `query` and `fragment` carry its
+/// exact text so the dialog can break it out rather than parse the URL again in
+/// JavaScript and risk showing a different string than the request carries.
+fn fetch_proposal_json(proposal: Option<&AgentFetchProposal>) -> String {
+    let Some(proposal) = proposal else {
+        return "null".to_string();
+    };
+    let flags = proposal
+        .long_components
+        .iter()
+        .map(|flag| {
+            format!(
+                "{{\"component\":\"{}\",\"bytes\":{}}}",
+                escape_json(&flag.component),
+                flag.bytes
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let optional = |value: &Option<String>| match value {
+        Some(value) => format!("\"{}\"", escape_json(value)),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"proposalId\":\"{}\",\"host\":\"{}\",\"url\":\"{}\",\"approvalKey\":\"{}\",\"longComponents\":[{}],\"query\":{},\"fragment\":{}}}",
+        escape_json(&proposal.id),
+        escape_json(&proposal.host),
+        escape_json(&proposal.url),
+        escape_json(&proposal.approval_key),
+        flags,
+        optional(&proposal.query),
+        optional(&proposal.fragment)
+    )
+}
+
 /// Spec 61's round-budget pause: the rounds used and granted, and whether the
 /// turn is at the hard cap (so the shell can offer only *Answer now*).
 fn round_budget_proposal_json(proposal: Option<&AgentRoundBudgetProposal>) -> String {
@@ -5293,7 +5456,7 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         None => "null".to_string(),
     };
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"checkBatch\":{},\"verificationReport\":{},\"turnNotes\":{},\"usage\":{},\"contextReview\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"fetchProposal\":{},\"checkBatch\":{},\"verificationReport\":{},\"turnNotes\":{},\"usage\":{},\"contextReview\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -5308,6 +5471,7 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         fallback_proposal_json(result.fallback_proposal.as_ref()),
         round_budget_proposal_json(result.round_budget_proposal.as_ref()),
         question_proposal_json(result.question_proposal.as_ref()),
+        fetch_proposal_json(result.fetch_proposal.as_ref()),
         check_batch_json(result.check_batch.as_ref()),
         verification_report_json(result.verification_report.as_ref()),
         turn_notes,
@@ -6218,17 +6382,19 @@ mod tests {
         browser_report_from_tool_result, cached_model_api_key, chat_engine, checkpoint_list_json,
         checkpoint_restore_json, config_and_report_for_repo, default_engine,
         desktop_settings_config_path, effective_policy_for_repo, engine_for_repo,
+        fetch_decision_error_code, fetch_decision_error_json, fetch_proposal_json,
         forget_model_api_key, generated_secret_warnings_json, handle_connection, index_html,
         json_error, json_optional_string, keychain, language_servers_json, mcp_browser_arguments,
         message_json, parse_form, parse_path_list, percent_decode, phase_json, plan_json,
         plan_proposal_json, question_proposal_json, relay_turn_events, remember_model_api_key,
         render_markdown_with_optional_file_links, repository_config_review_json,
         repository_config_write_target, require_api_token, resolve_shell_model_api_key,
-        run_answer_question_request, run_server, run_terminal_command, save_config_file,
-        spawn_with_shell_stack, sweep_orphaned_processes, symbol_repository, task_states_json,
-        task_usage_json, terminal_cwd_for_repo, turn_progress_event, validate_context_files,
-        validate_working_folder, validate_workspace_path, verify_data_dir_schema_at,
-        web_diagnostic_json, web_diagnostic_reveal_target, write_basic_response, write_sse_event,
+        run_answer_question_request, run_fetch_decision_request_with, run_server,
+        run_terminal_command, save_config_file, spawn_with_shell_stack, sweep_orphaned_processes,
+        symbol_repository, task_states_json, task_usage_json, terminal_cwd_for_repo,
+        turn_progress_event, validate_context_files, validate_working_folder,
+        validate_workspace_path, verify_data_dir_schema_at, web_diagnostic_json,
+        web_diagnostic_reveal_target, write_basic_response, write_sse_event,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
@@ -6239,12 +6405,13 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use workspace_engine::CheckpointRestoreResult;
     use workspace_engine::{
-        AgentPlanProposal, AgentQuestionProposal, AskUserInput, CancelToken, ChatMessage,
-        ChatTurnOptions, ChatTurnResult, Config, Evidence, GeneratedSecretWarning,
-        LanguageServerHub, LanguageServerLaunch, LanguageServerState, LanguageServerStatus,
-        MockModelAdapter, PendingQuestionRef, PhaseKind, PlanStep, SecretScanner, SessionMode,
-        StepStatus, TaskPlan, TaskStatus, TaskUsage, ToolCall, TurnNotes, TurnPhase, TurnProgress,
-        TurnSink, UsageSource, WebDiagnosticRecord, WebDiagnosticReport, WorkspaceEngine,
+        AgentFetchProposal, AgentPlanProposal, AgentQuestionProposal, AskUserInput, CancelToken,
+        ChatMessage, ChatTurnOptions, ChatTurnResult, Config, Evidence, FetchComponentFlag,
+        GeneratedSecretWarning, LanguageServerHub, LanguageServerLaunch, LanguageServerState,
+        LanguageServerStatus, MockModelAdapter, PendingQuestionRef, PhaseKind, PlanStep,
+        SecretScanner, SessionMode, StepStatus, TaskPlan, TaskStatus, TaskUsage, ToolCall,
+        TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource, WebDiagnosticRecord,
+        WebDiagnosticReport, WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
     };
 
@@ -6529,6 +6696,71 @@ mod tests {
             "a question is not an approval: {value}"
         );
         assert_eq!(question_proposal_json(None), "null");
+    }
+
+    #[test]
+    fn the_fetch_proposal_carries_the_verbatim_url_and_the_long_flag() {
+        let long = format!("q={}", "a".repeat(198));
+        let url = format!("http://127.0.0.1:9/docs?{long}");
+        let json = fetch_proposal_json(Some(&AgentFetchProposal {
+            id: "fetch_7f".to_string(),
+            host: "127.0.0.1".to_string(),
+            url: url.clone(),
+            approval_key: "127.0.0.1:9".to_string(),
+            long_components: vec![FetchComponentFlag {
+                component: "query".to_string(),
+                bytes: 200,
+            }],
+            query: Some(long.clone()),
+            fragment: None,
+        }));
+        let value: serde_json::Value = serde_json::from_str(&json).expect("fetch JSON");
+        assert_eq!(value["proposalId"], "fetch_7f");
+        assert_eq!(value["host"], "127.0.0.1");
+        assert_eq!(value["url"], url, "the dialog gets the URL unshortened");
+        assert_eq!(value["approvalKey"], "127.0.0.1:9");
+        assert_eq!(value["longComponents"][0]["component"], "query");
+        assert_eq!(value["longComponents"][0]["bytes"], 200);
+        assert_eq!(value["query"], long);
+        assert_eq!(value["fragment"], serde_json::Value::Null);
+        assert_eq!(fetch_proposal_json(None), "null");
+    }
+
+    #[test]
+    fn a_fetch_decision_refuses_another_pause_kind_with_a_stated_code() {
+        isolated_data_dir();
+        let repo = question_repo("fetch-decision-question");
+        let paused = paused_on_question(&repo);
+        let question_id = paused
+            .question_proposal
+            .as_ref()
+            .expect("the question pauses")
+            .question_id
+            .clone();
+        let form = form_fields(&[
+            ("repo", repo.to_str().unwrap()),
+            ("proposal_id", question_id.as_str()),
+            ("decision", "once"),
+            ("session_id", paused.session.id.as_str()),
+        ]);
+        let cancel = CancelToken::new();
+        let (events, _discard) = std::sync::mpsc::channel();
+        let mut adapter_for = |_config: &Config| {
+            Ok(Box::new(MockModelAdapter::new("Done.")) as Box<dyn workspace_engine::ModelAdapter>)
+        };
+        let error = run_fetch_decision_request_with(&form, &cancel, &events, &mut adapter_for)
+            .expect_err("a question is not a fetch approval");
+        assert!(error.contains("is a question"), "{error}");
+        assert!(error.contains("resume_after_answer"), "{error}");
+
+        // The shell maps an engine refusal to a body the client can branch on.
+        let code = fetch_decision_error_code(&error);
+        assert_eq!(code, "not_fetch_pause");
+        let body: serde_json::Value =
+            serde_json::from_str(&fetch_decision_error_json(code, &error)).expect("error JSON");
+        assert_eq!(body["code"], "not_fetch_pause");
+        assert_eq!(body["error"], error);
+        assert_eq!(body["message"], error);
     }
 
     fn form_fields(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -11340,6 +11572,7 @@ mod tests {
                     tokens: 12,
                     root_path: None,
                     provenance: None,
+                    origin: None,
                 }],
                 excluded: Vec::new(),
                 conversation_summary: None,

@@ -241,7 +241,7 @@ context that narrows the offered set, never a mode that widens one.
 ### 5.5 Untrusted text
 
 The question is written by a model, and in a session carrying repository content
-or fetched pages ([spec 51](../51_external_reference_retrieval.md)) it may be
+or fetched pages ([spec 51](../51_external_reference_retrieval/proposal.md)) it may be
 repeating text from either. It is therefore rendered as untrusted content on the
 same terms as any other model output: no markup interpretation that could
 produce a control, no link that navigates anywhere on its own, and the

@@ -289,6 +289,14 @@ pub struct Config {
     /// repository-scoped load folds the matching entries into
     /// [`Self::command_allowlist`].
     pub command_allowlist_by_repository: BTreeMap<String, Vec<String>>,
+    /// Hosts a page may be fetched from, machine-wide (spec 51 §5.3). The
+    /// user's own decision, so repository and profile config can never add one;
+    /// a repository copy is reported as a forbidden key.
+    pub web_domain_allowlist: Vec<String>,
+    /// `Allow Always` host grants, keyed by repository id. Folded into
+    /// [`Self::web_domain_allowlist`] by
+    /// [`Self::apply_repository_web_domains`] during a repository-scoped load.
+    pub web_domain_allowlist_by_repository: BTreeMap<String, Vec<String>>,
     /// The permission profile the user selected for each checkout, keyed by
     /// repository id the way `Allow Always` is. User-owned: a repository
     /// cannot choose its own profile in either direction (spec 31,
@@ -367,6 +375,12 @@ pub struct Config {
     /// How many `ask_user` questions one turn may ask (spec 50). `0` means the
     /// tool is not offered at all, rather than offered and always refused.
     pub agent_max_questions_per_turn: u32,
+    /// How many `fetch_url` requests one turn may make (spec 51 §5.6, D12).
+    /// `0` means the tool is not offered at all, rather than offered and
+    /// always refused. Restrict-only, lower wins: a repository may lower it,
+    /// never raise it, because each fetch leaves the machine on the
+    /// repository's behalf.
+    pub web_fetch_max_per_turn: u32,
     /// Total tokens one task may spend before it is stopped at a step boundary.
     ///
     /// `None` means no ceiling, which is the default so that upgrading cannot
@@ -1087,6 +1101,7 @@ impl Config {
         }
         if let Some(root) = repository_root {
             report.allow_always_entries = config.apply_repository_allowlist(root);
+            config.apply_repository_web_domains(root);
         }
         // Spec 26 §5.2: an oversubscribed share set is a config error, and the
         // resolved config is where the sum is finally known.
@@ -1154,6 +1169,7 @@ impl Config {
             context_budget_file_ranges,
             context_budget_findings,
             context_budget_conversation_summary,
+            context_budget_external_reference,
             context_budget_safety_margin,
             max_command_output_bytes,
             command_timeout_secs,
@@ -1162,6 +1178,8 @@ impl Config {
             restricted_patterns,
             command_allowlist,
             command_allowlist_by_repository,
+            web_domain_allowlist,
+            web_domain_allowlist_by_repository,
             permission_profile_by_repository,
             command_blocklist,
             secret_patterns,
@@ -1185,6 +1203,7 @@ impl Config {
             agent_web_debug_max_tool_rounds,
             agent_tool_retry_limit,
             agent_max_questions_per_turn,
+            web_fetch_max_per_turn,
             agent_max_task_tokens,
             agent_max_turn_messages,
             agent_max_turn_notes_chars,
@@ -1381,6 +1400,30 @@ impl Config {
                     .insert(repository_id, entries);
             } else {
                 rejected.push(RejectedConfigKey::new(key, RepositoryKeyClass::UserOwned));
+            }
+        }
+        // Spec 51 §5.3: a host grant decides where the model may send a
+        // request, so it is the user's decision alone. Unlike the command
+        // allowlist it is `Forbidden` rather than `UserOwned`: the report must
+        // say a repository tried to grant itself a host, not merely that the
+        // key was somebody else's.
+        if let Some(value) = scoped(
+            web_domain_allowlist,
+            "web_domain_allowlist",
+            trusted,
+            forbidden,
+            rejected,
+        ) {
+            outcome.record(scope, "web_domain_allowlist", Some(value.clone()), false);
+            self.web_domain_allowlist = value;
+        }
+        for (repository_id, entries) in web_domain_allowlist_by_repository {
+            let key = format!("web_domain_allowlist.{repository_id}");
+            if trusted {
+                self.web_domain_allowlist_by_repository
+                    .insert(repository_id, entries);
+            } else {
+                rejected.push(RejectedConfigKey::new(key, forbidden));
             }
         }
         // User-owned for the same reason: choosing a checkout's profile is the
@@ -1667,6 +1710,20 @@ impl Config {
             outcome.record(scope, "agent_max_exploration_rounds", None, loosened);
         }
 
+        // Spec 51 D12: a repository may lower how many pages leave the machine
+        // in one turn, never raise it.
+        if let Some(value) = web_fetch_max_per_turn
+            && let Some(loosened) = restrict_only_u32(
+                &mut self.web_fetch_max_per_turn,
+                value,
+                "web_fetch_max_per_turn",
+                trusted,
+                rejected,
+            )
+        {
+            outcome.record(scope, "web_fetch_max_per_turn", None, loosened);
+        }
+
         // Restrict-only like the token ceiling: a repository may shrink the
         // window, never widen what one request carries.
         //
@@ -1830,6 +1887,11 @@ impl Config {
                 "context_budget.conversation_summary",
                 ContextCategory::ConversationSummary,
                 context_budget_conversation_summary,
+            ),
+            (
+                "context_budget.external_reference",
+                ContextCategory::ExternalReference,
+                context_budget_external_reference,
             ),
         ] {
             if let Some(value) = incoming
@@ -2533,6 +2595,86 @@ impl Config {
         added
     }
 
+    /// The `Allow Always` host grants the user made for `repository_root`,
+    /// folded into the effective [`Self::web_domain_allowlist`] (spec 51 §5.3).
+    /// Kept separate from the command allowlist because the same host in a
+    /// different checkout is a different decision.
+    ///
+    /// Returns nothing: the audit basis for a later fetch is read from
+    /// [`Self::web_domain_allowlist_by_repository`] when the fetch happens, which
+    /// is the same list this folds and stays correct if user config changes
+    /// after the load. A load-time snapshot would only duplicate it.
+    pub fn apply_repository_web_domains(&mut self, repository_root: &Path) {
+        let repository_id = repository_id_for_root(repository_root);
+        let Some(entries) = self.web_domain_allowlist_by_repository.get(&repository_id) else {
+            return;
+        };
+        let entries = entries.clone();
+        for entry in entries {
+            if !self
+                .web_domain_allowlist
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&entry))
+            {
+                self.web_domain_allowlist.push(entry);
+            }
+        }
+    }
+
+    /// Records one host as this checkout's `Allow Always` grant (spec 51 §5.3
+    /// constraint 1, D8).
+    ///
+    /// The entry is `web_domain_allowlist.<repository id>` in the **user's**
+    /// config, never the machine-wide `web_domain_allowlist` and never
+    /// `<repo>/.damaian/config.conf`: the grant is the user's decision about one
+    /// checkout, and a repository config entry would be indistinguishable from
+    /// one that arrived with a clone (spec 34 §5.4). The id is per checkout, so
+    /// the same host in another clone still asks.
+    ///
+    /// `approval_key` is [`crate::external_reference::ExternalUrl::approval_key`],
+    /// the host plus a non-default port. It is shape-validated as one host
+    /// before it is stored, so a wildcard or a path cannot become an approval.
+    pub fn grant_web_domain_always(
+        config: &Config,
+        repository_root: &Path,
+        approval_key: &str,
+    ) -> Result<PathBuf> {
+        let approval_key = approval_key.trim();
+        if approval_key.is_empty() {
+            return Err(ClientError::InvalidInput(
+                "A host approval needs a host".to_string(),
+            ));
+        }
+        // `HostAllowlist` is the one parser that decides what an entry means.
+        // An entry it would ignore must never be written, because it would look
+        // like an approval in the file and approve nothing.
+        let parsed =
+            crate::external_reference::HostAllowlist::from_config(&[approval_key.to_string()]);
+        if !parsed.ignored_entries().is_empty() {
+            return Err(ClientError::InvalidInput(format!(
+                "Not a single host approval: {approval_key}"
+            )));
+        }
+        let repository_id = repository_id_for_root(repository_root);
+        let path = config.user_config_path();
+        let mut overlay = ConfigOverlay::load_or_default(&path)?;
+        let mut entries = overlay
+            .web_domain_allowlist_by_repository
+            .remove(&repository_id)
+            .unwrap_or_default();
+        if !entries
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(approval_key))
+        {
+            entries.push(approval_key.to_string());
+        }
+        overlay
+            .web_domain_allowlist_by_repository
+            .insert(repository_id, entries);
+        overlay.save(&path)?;
+        Ok(path)
+    }
+
     /// The resolved values spec 31's refusal points consult.
     pub fn profile_capabilities(&self) -> ProfileCapabilities {
         ProfileCapabilities {
@@ -2647,6 +2789,11 @@ impl Config {
             &mut output,
             "command_allowlist",
             &join_list(&self.command_allowlist),
+        );
+        push_line(
+            &mut output,
+            "web_domain_allowlist",
+            &join_list(&self.web_domain_allowlist),
         );
         // Deliberately not the per-repository maps: this text answers "what
         // applies in this repository", and another checkout's `Allow Always`
@@ -2763,6 +2910,11 @@ impl Config {
             "agent_max_questions_per_turn",
             &self.agent_max_questions_per_turn.to_string(),
         );
+        push_line(
+            &mut output,
+            "web_fetch_max_per_turn",
+            &self.web_fetch_max_per_turn.to_string(),
+        );
         // Only when set. Printing `0` for "no ceiling" would read as a ceiling
         // of zero, which is a different and much worse configuration than the
         // default — and `config-show` is one of the two touch points the
@@ -2861,6 +3013,8 @@ impl Default for Config {
                 .collect(),
             command_allowlist: Vec::new(),
             command_allowlist_by_repository: BTreeMap::new(),
+            web_domain_allowlist: Vec::new(),
+            web_domain_allowlist_by_repository: BTreeMap::new(),
             permission_profile_by_repository: BTreeMap::new(),
             command_blocklist: Vec::new(),
             secret_patterns: Vec::new(),
@@ -2885,6 +3039,9 @@ impl Default for Config {
             agent_web_debug_max_tool_rounds: 12,
             agent_tool_retry_limit: 2,
             agent_max_questions_per_turn: 2,
+            // Spec 51 D12: a model that fetches twelve pages has lost the
+            // thread, and the cap turns that into a refusal it can read.
+            web_fetch_max_per_turn: 8,
             // Three times the action budget, so a discovery turn can read
             // roughly what the motivating session needed several times over
             // (spec 59 §5.4). The number is a starting point; the long-task
@@ -2950,6 +3107,8 @@ pub struct ConfigOverlay {
     pub context_budget_file_ranges: Option<u16>,
     pub context_budget_findings: Option<u16>,
     pub context_budget_conversation_summary: Option<u16>,
+    /// Spec 51 §5.4: the fetched-page share, restrict-only like every other.
+    pub context_budget_external_reference: Option<u16>,
     pub context_budget_safety_margin: Option<u16>,
     pub max_command_output_bytes: Option<usize>,
     pub command_timeout_secs: Option<usize>,
@@ -2959,6 +3118,13 @@ pub struct ConfigOverlay {
     pub command_allowlist: Option<Vec<String>>,
     /// `command_allowlist.<repository_id>` entries, from user or admin config.
     pub command_allowlist_by_repository: BTreeMap<String, Vec<String>>,
+    /// Spec 51 §5.3: hosts a page may be fetched from. Forbidden to repository
+    /// and profile config, because a clone that could add one would grant
+    /// itself a place to send the user's data.
+    pub web_domain_allowlist: Option<Vec<String>>,
+    /// `web_domain_allowlist.<repository_id>` entries, from user or admin
+    /// config.
+    pub web_domain_allowlist_by_repository: BTreeMap<String, Vec<String>>,
     /// `permission_profile.<repository_id>` entries, from user or admin config.
     pub permission_profile_by_repository: BTreeMap<String, ProfileId>,
     pub command_blocklist: Option<Vec<String>>,
@@ -2983,6 +3149,9 @@ pub struct ConfigOverlay {
     pub agent_web_debug_max_tool_rounds: Option<u32>,
     pub agent_tool_retry_limit: Option<u32>,
     pub agent_max_questions_per_turn: Option<u32>,
+    /// Spec 51 §5.6, D12: page fetches one turn may make. Restrict-only, and
+    /// `0` withholds the tool.
+    pub web_fetch_max_per_turn: Option<u32>,
     pub agent_max_task_tokens: Option<u64>,
     pub agent_max_turn_messages: Option<usize>,
     pub agent_max_turn_notes_chars: Option<usize>,
@@ -3110,6 +3279,9 @@ classify_overlay_fields! {
     context_budget_file_ranges => Capability,
     context_budget_findings => Capability,
     context_budget_conversation_summary => Capability,
+    // Spec 51 §5.4: a fetched page competes with repository content, so a
+    // clone may lower its share and never raise it.
+    context_budget_external_reference => Capability,
     context_budget_safety_margin => Capability,
     max_command_output_bytes => Preference,
     command_timeout_secs => Capability,
@@ -3117,6 +3289,11 @@ classify_overlay_fields! {
     ignore_patterns => Capability,
     restricted_patterns => Capability,
     command_allowlist => Capability,
+    // Spec 51 §5.3: a host grant decides where the model may send a request.
+    // `Forbidden` in the merge, so neither a repository nor a profile may add
+    // one; classified here so every capability key still has a weakening case.
+    web_domain_allowlist => Capability,
+    web_domain_allowlist_by_repository => Capability,
     command_allowlist_by_repository => Capability,
     // User-owned at repository scope, like the allowlist map above.
     permission_profile_by_repository => Capability,
@@ -3150,6 +3327,9 @@ classify_overlay_fields! {
     // Asking widens no capability; validation holds it under a hard ceiling
     // (spec 50 `context.md` §8).
     agent_max_questions_per_turn => Preference,
+    // Spec 51 D12: each fetch leaves the machine, so the per-turn cap is a
+    // capability a repository may lower but never raise.
+    web_fetch_max_per_turn => Capability,
     agent_max_task_tokens => Capability,
     agent_max_turn_messages => Capability,
     // Spec 65: restrict-only like the request window, and sent on every later
@@ -3287,6 +3467,9 @@ impl ConfigOverlay {
         if let Some(repository_id) = key.strip_prefix("command_allowlist.") {
             return self.set_repository_command_allowlist(repository_id, value);
         }
+        if let Some(repository_id) = key.strip_prefix("web_domain_allowlist.") {
+            return self.set_repository_web_domain_allowlist(repository_id, value);
+        }
         if let Some(repository_id) = key.strip_prefix("permission_profile.") {
             return self.set_repository_permission_profile(repository_id, value);
         }
@@ -3361,6 +3544,9 @@ impl ConfigOverlay {
             "context_budget.conversation_summary" => {
                 self.context_budget_conversation_summary = Some(parse_basis_points(key, value)?)
             }
+            "context_budget.external_reference" => {
+                self.context_budget_external_reference = Some(parse_basis_points(key, value)?)
+            }
             "context_budget.safety_margin" => {
                 self.context_budget_safety_margin = Some(parse_basis_points(key, value)?)
             }
@@ -3374,6 +3560,7 @@ impl ConfigOverlay {
             "ignore_patterns" => self.ignore_patterns = Some(split_list(value)),
             "restricted_patterns" => self.restricted_patterns = Some(split_list(value)),
             "command_allowlist" => self.command_allowlist = Some(split_list(value)),
+            "web_domain_allowlist" => self.web_domain_allowlist = Some(split_web_domains(value)),
             "command_blocklist" => self.command_blocklist = Some(split_list(value)),
             "secret_patterns" => self.secret_patterns = Some(split_list(value)),
             "require_approval_for_file_edits" => {
@@ -3427,6 +3614,9 @@ impl ConfigOverlay {
             }
             "agent_max_questions_per_turn" => {
                 self.agent_max_questions_per_turn = Some(parse_question_cap(key, value)?)
+            }
+            "web_fetch_max_per_turn" => {
+                self.web_fetch_max_per_turn = Some(parse_web_fetch_cap(key, value)?)
             }
             "agent_max_task_tokens" => {
                 self.agent_max_task_tokens = Some(parse_task_token_ceiling(key, value)?)
@@ -3482,6 +3672,25 @@ impl ConfigOverlay {
         }
         self.command_allowlist_by_repository
             .insert(repository_id.to_string(), split_list(value));
+        Ok(())
+    }
+
+    /// `web_domain_allowlist.<repository_id>=host|host` — the `Allow Always`
+    /// host grants for one repository. Valid in user and admin config; refused
+    /// as a forbidden key at repository and profile scope.
+    fn set_repository_web_domain_allowlist(
+        &mut self,
+        repository_id: &str,
+        value: &str,
+    ) -> Result<()> {
+        let repository_id = repository_id.trim();
+        if !repository_id.starts_with("repo_") {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid repository id in config key: web_domain_allowlist.{repository_id}"
+            )));
+        }
+        self.web_domain_allowlist_by_repository
+            .insert(repository_id.to_string(), split_web_domains(value));
         Ok(())
     }
 
@@ -3774,6 +3983,7 @@ impl ConfigOverlay {
             context_budget_file_ranges,
             context_budget_findings,
             context_budget_conversation_summary,
+            context_budget_external_reference,
             context_budget_safety_margin,
             max_command_output_bytes,
             command_timeout_secs,
@@ -3782,6 +3992,8 @@ impl ConfigOverlay {
             restricted_patterns,
             command_allowlist,
             command_allowlist_by_repository,
+            web_domain_allowlist,
+            web_domain_allowlist_by_repository,
             permission_profile_by_repository,
             command_blocklist,
             secret_patterns,
@@ -3805,6 +4017,7 @@ impl ConfigOverlay {
             agent_web_debug_max_tool_rounds,
             agent_tool_retry_limit,
             agent_max_questions_per_turn,
+            web_fetch_max_per_turn,
             agent_max_task_tokens,
             agent_max_turn_messages,
             agent_max_turn_notes_chars,
@@ -3895,6 +4108,10 @@ impl ConfigOverlay {
                 "context_budget.conversation_summary",
                 context_budget_conversation_summary,
             ),
+            (
+                "context_budget.external_reference",
+                context_budget_external_reference,
+            ),
             ("context_budget.safety_margin", context_budget_safety_margin),
         ] {
             if let Some(value) = value {
@@ -3921,6 +4138,16 @@ impl ConfigOverlay {
         }
         if let Some(value) = command_allowlist {
             push_line(&mut output, "command_allowlist", &join_list(value));
+        }
+        if let Some(value) = web_domain_allowlist {
+            push_line(&mut output, "web_domain_allowlist", &join_list(value));
+        }
+        for (repository_id, entries) in web_domain_allowlist_by_repository {
+            push_line(
+                &mut output,
+                &format!("web_domain_allowlist.{repository_id}"),
+                &join_list(entries),
+            );
         }
         for (repository_id, entries) in command_allowlist_by_repository {
             push_line(
@@ -4039,6 +4266,9 @@ impl ConfigOverlay {
                 "agent_max_questions_per_turn",
                 &value.to_string(),
             );
+        }
+        if let Some(value) = web_fetch_max_per_turn {
+            push_line(&mut output, "web_fetch_max_per_turn", &value.to_string());
         }
         if let Some(value) = agent_max_turn_messages {
             push_line(&mut output, "agent_max_turn_messages", &value.to_string());
@@ -4924,6 +5154,10 @@ fn context_budget_policy_lines(budget: &ContextBudget) -> Vec<(&'static str, u16
             "context_budget.conversation_summary",
             budget.share(ContextCategory::ConversationSummary),
         ),
+        (
+            "context_budget.external_reference",
+            budget.share(ContextCategory::ExternalReference),
+        ),
     ];
     lines.push(("context_budget.safety_margin", budget.safety_margin_bps));
     lines
@@ -4983,6 +5217,17 @@ fn split_list(value: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Host approvals are compared against a URL's host, which is lowercased and
+/// has no trailing dot. Normalising here means the same site written two ways
+/// is one approval rather than two.
+fn split_web_domains(value: &str) -> Vec<String> {
+    split_list(value)
+        .into_iter()
+        .map(|domain| domain.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty())
         .collect()
 }
 
@@ -5269,6 +5514,22 @@ fn parse_question_cap(key: &str, value: &str) -> Result<u32> {
     } else {
         Err(ClientError::InvalidInput(format!(
             "{key} must be between 0 and {MAX_QUESTIONS_PER_TURN_CEILING}"
+        )))
+    }
+}
+
+/// Absolute upper bound for `web_fetch_max_per_turn` (spec 51 D12). The default
+/// is 8; the ceiling exists so a hand-edited config cannot turn one turn into
+/// an unbounded number of outbound requests.
+pub const WEB_FETCH_MAX_PER_TURN_CEILING: u32 = 20;
+
+fn parse_web_fetch_cap(key: &str, value: &str) -> Result<u32> {
+    let parsed = parse_u64(key, value)?;
+    if parsed <= u64::from(WEB_FETCH_MAX_PER_TURN_CEILING) {
+        Ok(parsed as u32)
+    } else {
+        Err(ClientError::InvalidInput(format!(
+            "{key} must be between 0 and {WEB_FETCH_MAX_PER_TURN_CEILING}"
         )))
     }
 }

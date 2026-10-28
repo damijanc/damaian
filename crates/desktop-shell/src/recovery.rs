@@ -10,13 +10,13 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use workspace_engine::{
-    CommandProposal, PausedTurns, PendingVerification, ProposedPatch, QUESTION_WAITING_HEADLINE,
-    ReattachedApproval, RecoveredTask, TaskStatus, WorkspaceEngine, allow_always_eligible,
-    classify_all, classify_session, command_approval_prompt, headline, pending_verifications,
-    reattach_pending_approvals, resume_allowed, resume_blocked_reason,
+    AgentFetchProposal, CommandProposal, PausedTurns, PendingVerification, ProposedPatch,
+    QUESTION_WAITING_HEADLINE, ReattachedApproval, RecoveredTask, TaskStatus, WorkspaceEngine,
+    allow_always_eligible, classify_all, classify_session, command_approval_prompt, headline,
+    pending_verifications, reattach_pending_approvals, resume_allowed, resume_blocked_reason,
 };
 
-use crate::{escape_json, patch_files_json, plan_json};
+use crate::{escape_json, fetch_proposal_json, patch_files_json, plan_json};
 
 /// What an interrupted commit can be inspected against: the expected old
 /// `HEAD`, the commit object that may have been created, and where `HEAD` is
@@ -682,6 +682,29 @@ fn describe_approval(
         // question route. The text was redacted before it was stored in the
         // session log; `answered` and `answer` are what a reattached card shows
         // instead of asking again.
+        // Spec 51. Like a plan review, the paused turn is on disk, so the same
+        // `fetchProposal` payload the live dialog uses is rebuilt and answering
+        // it goes through `/api/fetch-decision`, which performs the request the
+        // dialog showed.
+        ReattachedApproval::Fetch {
+            task_id,
+            proposal_id,
+            call,
+        } => Approval {
+            session_id: session_id.to_string(),
+            task_id,
+            kind: "fetch",
+            payload: fetch_proposal_json(Some(&AgentFetchProposal {
+                id: proposal_id,
+                host: call.host,
+                url: call.url,
+                approval_key: call.approval_key,
+                long_components: call.long_components,
+                query: call.query,
+                fragment: call.fragment,
+            })),
+            unavailable_reason: None,
+        },
         ReattachedApproval::CheckBatch {
             task_id,
             proposal_id,
@@ -1241,6 +1264,67 @@ mod tests {
                 .get(&task.id)
                 .map(String::as_str),
             Some("waiting_for_approval")
+        );
+    }
+
+    /// Spec 51 §5.3: a fetch pause is saved with the verbatim URL, so a crash
+    /// re-presents the same dialog. Before this, the sweep failed the task with
+    /// "unknown pending approval kind fetch" while the paused turn sat on disk.
+    #[test]
+    fn a_reattached_fetch_pause_carries_the_dialog_payload() {
+        let (engine, dir) = engine("fetch-pause");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Recovery")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "read the guide", "mock", "m")
+            .unwrap();
+        let pending = dir.join("chat").join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(
+            pending.join("fetchprop_1.json"),
+            concat!(
+                r#"{"proposal_id":"fetchprop_1","fetch_call":{"#,
+                r#""host":"docs.example.com","url":"https://docs.example.com/a?b=1","#,
+                r#""approval_key":"docs.example.com","long_components":[],"#,
+                r#""query":"b=1","fragment":null}}"#,
+            ),
+        )
+        .unwrap();
+        engine
+            .session_store
+            .await_approval(
+                &task,
+                &PendingApprovalRef {
+                    kind: "fetch".to_string(),
+                    proposal_id: "fetchprop_1".to_string(),
+                },
+            )
+            .unwrap();
+
+        let (_, payload) = sweep(&engine);
+
+        assert!(payload.contains("\"kind\":\"fetch\""), "got {payload}");
+        assert!(
+            payload.contains("\"proposalId\":\"fetchprop_1\""),
+            "got {payload}"
+        );
+        assert!(
+            payload.contains("\"host\":\"docs.example.com\""),
+            "got {payload}"
+        );
+        assert!(
+            payload.contains("\"url\":\"https://docs.example.com/a?b=1\""),
+            "the verbatim URL is what the dialog shows and the request uses: got {payload}"
+        );
+        assert!(payload.contains("\"query\":\"b=1\""), "got {payload}");
+        // The card renders the headline in the webview; the payload is the same
+        // `fetchProposal` shape the live dialog uses.
+        assert!(
+            include_str!("../static/app.js").contains("approval.kind === \"fetch\""),
+            "the reattached card must have a fetch branch"
         );
     }
 

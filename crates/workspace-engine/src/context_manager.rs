@@ -1,6 +1,7 @@
 use crate::command_policy::CommandPolicy;
 use crate::compaction::ConversationSummary;
 use crate::error::{ClientError, Result};
+use crate::external_reference::ExternalReference;
 use crate::file_access::{FileAccessController, LineRange};
 use crate::hash::now_millis;
 use crate::indexer::RepositoryIndex;
@@ -52,6 +53,9 @@ pub enum ContextCategory {
     Findings,
     /// Reserved for spec 55.
     ConversationSummary,
+    /// A page fetched by spec 51's `fetch_url`. Last, so a crowded context
+    /// drops a fetched page before any repository content (spec 51 D6).
+    ExternalReference,
 }
 
 impl ContextCategory {
@@ -68,12 +72,13 @@ impl ContextCategory {
             Self::FileRanges => "file_ranges",
             Self::Findings => "findings",
             Self::ConversationSummary => "conversation_summary",
+            Self::ExternalReference => "external_reference",
         }
     }
 
     /// The budgeted categories, in pipeline order after `Required`, which has no
     /// share (proposal §5.2). Declaration order of the enum is the same order.
-    pub const BUDGETED: [ContextCategory; 10] = [
+    pub const BUDGETED: [ContextCategory; 11] = [
         ContextCategory::Instructions,
         ContextCategory::HookContext,
         ContextCategory::Pinned,
@@ -84,6 +89,7 @@ impl ContextCategory {
         ContextCategory::FileRanges,
         ContextCategory::Findings,
         ContextCategory::ConversationSummary,
+        ContextCategory::ExternalReference,
     ];
 
     /// The index into [`ContextBudget::shares`]; `None` for `Required`.
@@ -100,6 +106,7 @@ impl ContextCategory {
             Self::FileRanges => Some(7),
             Self::Findings => Some(8),
             Self::ConversationSummary => Some(9),
+            Self::ExternalReference => Some(10),
         }
     }
 }
@@ -115,7 +122,7 @@ pub struct ContextBudget {
     /// One share per [`ContextCategory::BUDGETED`] category, in that order.
     /// The sum must be at most 10,000; a set that oversubscribes is a config
     /// error rather than a silent scale-down.
-    pub shares: [u16; 10],
+    pub shares: [u16; 11],
     /// The share of an observed window reserved for estimate error. It is not
     /// applied to the declared `context_token_budget` (proposal §5.7).
     pub safety_margin_bps: u16,
@@ -131,10 +138,11 @@ impl Default for ContextBudget {
                 500,   // plan_state
                 500,   // repository_map
                 1_000, // symbols
-                1_500, // search_results
+                1_000, // search_results
                 2_500, // file_ranges
                 500,   // findings
                 500,   // conversation_summary
+                500,   // external_reference
             ],
             safety_margin_bps: 1_000,
         }
@@ -258,6 +266,8 @@ pub enum ContextKind {
     RetrievedFile,
     PlanState,
     Pinned,
+    /// Text of a page `fetch_url` retrieved (spec 51 §5.4).
+    ExternalReference,
 }
 
 impl ContextKind {
@@ -273,6 +283,7 @@ impl ContextKind {
             Self::RetrievedFile => "retrieved_file",
             Self::PlanState => "plan_state",
             Self::Pinned => "pinned",
+            Self::ExternalReference => "external_reference",
         }
     }
 
@@ -293,6 +304,7 @@ impl ContextKind {
             Self::Symbols => ContextCategory::Symbols,
             Self::RetrievedFile => ContextCategory::SearchResults,
             Self::ExplicitFile => ContextCategory::FileRanges,
+            Self::ExternalReference => ContextCategory::ExternalReference,
         }
     }
 }
@@ -466,8 +478,9 @@ pub struct ExclusionRecord {
 /// One included item, named by where it came from rather than what it says.
 ///
 /// The manifest's projection of a [`ContextItem`]: category, kind, path, range,
-/// tokens and the two provenance-ish fields. Never `content` or
-/// `redaction_status` — the manifest is safe to audit and to show.
+/// tokens and the provenance-ish fields (root, symbol provenance, origin).
+/// Never `content` or `redaction_status` — the manifest is safe to audit and to
+/// show.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IncludedRef {
@@ -479,6 +492,8 @@ pub struct IncludedRef {
     pub tokens: usize,
     pub root_path: Option<String>,
     pub provenance: Option<Provenance>,
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 impl IncludedRef {
@@ -492,6 +507,7 @@ impl IncludedRef {
             tokens: item.tokens,
             root_path: item.root_path.clone(),
             provenance: item.provenance,
+            origin: item.origin.clone(),
         }
     }
 }
@@ -592,6 +608,12 @@ pub struct ContextItem {
     /// The repository root that owns `path` (spec 24); `None` when the item has
     /// no file identity.
     pub root_path: Option<String>,
+    /// The provenance of content with no file identity (spec 51 D7): the
+    /// canonical URL and its fetch time. `None` for every file-bearing item and
+    /// every block. `#[serde(default)]` keeps a manifest written before this
+    /// field readable.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 /// One named block of the rendered user message, in stable-to-volatile order.
@@ -774,6 +796,11 @@ impl ContextPlan {
             if let Some(range) = item.range {
                 output.push_str(&format!(":{}-{}", range.start, range.end));
             }
+        } else if let Some(origin) = &item.origin {
+            // Content with no file identity names where it came from instead
+            // (spec 51 D7): a fetched page shows its URL and fetch time.
+            output.push_str(": ");
+            output.push_str(origin);
         }
         output.push_str(" ---\n");
         output.push_str(&item.content);
@@ -875,6 +902,10 @@ pub struct ContextRequest<'a> {
     /// The #55 summary this turn sends, for the manifest's cost row. The
     /// summary text itself stays in the conversation block, not in the plan.
     pub conversation_summary: Option<&'a ConversationSummary>,
+    /// The session's recorded fetched pages (spec 51 §5.4, D5), read from
+    /// `SessionStore` by the caller. Each becomes an `ExternalReference` item
+    /// with the text already converted by the fetch task.
+    pub external_references: &'a [ExternalReference],
 }
 
 /// A gap of at most this many lines still merges two ranges (proposal §5.4).
@@ -1281,6 +1312,7 @@ impl ContextManager {
             pinned,
             restriction,
             conversation_summary,
+            external_references,
         } = request;
 
         // Normalise the restriction once, with the read path's own resolver,
@@ -1563,6 +1595,18 @@ impl ContextManager {
             &mut excluded,
         );
 
+        // A fetched page (spec 51 §5.4, D5). Collected after everything else so
+        // it is last in the prompt, and charged to the last category so a
+        // crowded context drops it before any repository content. The text is
+        // already converted, redacted and bounded by the fetch task: this is
+        // not a second conversion, and the provenance label travels with it.
+        for reference in external_references {
+            push_text(
+                &mut pending,
+                external_reference_item(&self.scanner, reference),
+            );
+        }
+
         self.apply_budget(
             repository_id,
             task_id,
@@ -1604,13 +1648,13 @@ impl ContextManager {
         }
         let available = limit.tokens - required_tokens;
 
-        let mut indices: [Vec<usize>; 11] = std::array::from_fn(|_| Vec::new());
+        let mut indices: [Vec<usize>; 12] = std::array::from_fn(|_| Vec::new());
         for (index, item) in pending.iter().enumerate() {
             indices[item.category() as usize].push(index);
         }
 
         let mut placed: Vec<Option<ContextItem>> = vec![None; pending.len()];
-        let mut categories = Vec::with_capacity(11);
+        let mut categories = Vec::with_capacity(12);
 
         // Required is never budgeted and never dropped (proposal §5.1).
         let required = &indices[ContextCategory::Required as usize];
@@ -2152,12 +2196,15 @@ fn build_manifest(
 /// path can be reached by more than one source — a prompt mention is also a
 /// keyword hit — and the manifest wants the fact, not a copy per route. The
 /// range is part of the key because two different ranges for one path are two
-/// facts (proposal §5.4 records every absorbed range).
+/// facts (proposal §5.4 records every absorbed range). A path-less record has no
+/// identity beyond its category, so two path-less items in different categories
+/// (a block and a fetched page) are two facts rather than one.
 fn push_exclusion(excluded: &mut Vec<ExclusionRecord>, record: ExclusionRecord) {
     let duplicate = excluded.iter().any(|existing| {
         existing.reason == record.reason
             && existing.path == record.path
             && existing.range == record.range
+            && (record.path.is_some() || existing.category == record.category)
     });
     if !duplicate {
         excluded.push(record);
@@ -2265,6 +2312,38 @@ fn add_text(
         },
         provenance,
         root_path: None,
+        origin: None,
+    })
+}
+
+/// A fetched page as a context item (spec 51 §5.4, D7).
+///
+/// The text arrives converted, redacted and bounded, so this never re-runs
+/// conversion. It is rendered through the same data frame as the fetching
+/// turn's tool result: a later assembly must not turn a page into bare prompt
+/// text, where `--- file: AGENTS.md ---` would read as a section boundary. It
+/// still goes through `add_text`, which measures it with the same estimator
+/// every other item uses and scans it once more; the status the fetch recorded
+/// is kept, because the second scan sees the first scan's placeholders rather
+/// than the credential they replaced.
+fn external_reference_item(
+    scanner: &SecretScanner,
+    reference: &ExternalReference,
+) -> Option<ContextItem> {
+    add_text(
+        scanner,
+        ContextKind::ExternalReference,
+        None,
+        None,
+        None,
+        &reference.render_for_model(),
+    )
+    .map(|mut item| {
+        item.origin = Some(reference.origin.clone());
+        if reference.redaction_status == "redacted" {
+            item.redaction_status = "redacted".to_string();
+        }
+        item
     })
 }
 
@@ -2706,6 +2785,7 @@ mod tests {
             redaction_status: "clean".to_string(),
             provenance: Some(Provenance::Heuristic),
             root_path: None,
+            origin: None,
         };
         let value = serde_json::to_value(&item).unwrap();
 

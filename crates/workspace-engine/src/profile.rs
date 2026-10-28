@@ -348,6 +348,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         context_budget_file_ranges,
         context_budget_findings,
         context_budget_conversation_summary,
+        context_budget_external_reference,
         context_budget_safety_margin,
         max_command_output_bytes,
         command_timeout_secs,
@@ -356,6 +357,8 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         restricted_patterns,
         command_allowlist,
         command_allowlist_by_repository,
+        web_domain_allowlist,
+        web_domain_allowlist_by_repository,
         permission_profile_by_repository,
         command_blocklist,
         secret_patterns,
@@ -379,6 +382,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         agent_web_debug_max_tool_rounds,
         agent_tool_retry_limit,
         agent_max_questions_per_turn,
+        web_fetch_max_per_turn,
         agent_max_task_tokens,
         agent_max_turn_messages,
         agent_max_turn_notes_chars,
@@ -481,6 +485,21 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
             RepositoryKeyClass::UserOwned,
         );
     }
+    // A host grant is where the model may send a request, which a profile does
+    // not decide (spec 51 §5.3). Unlike the command allowlist it is refused as
+    // `Forbidden`, matching the scope merge and the report the user sees.
+    if web_domain_allowlist.is_some() {
+        refuse(
+            "web_domain_allowlist".to_string(),
+            RepositoryKeyClass::Forbidden,
+        );
+    }
+    for repository_id in web_domain_allowlist_by_repository.keys() {
+        refuse(
+            format!("web_domain_allowlist.{repository_id}"),
+            RepositoryKeyClass::Forbidden,
+        );
+    }
     for repository_id in command_allowlist_by_repository.keys() {
         refuse(
             format!("command_allowlist.{repository_id}"),
@@ -579,6 +598,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         context_budget_file_ranges,
         context_budget_findings,
         context_budget_conversation_summary,
+        context_budget_external_reference,
         context_budget_safety_margin,
         command_timeout_secs,
         ignore_patterns,
@@ -598,6 +618,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         agent_max_turn_messages,
         agent_max_turn_notes_chars,
         agent_max_exploration_rounds,
+        web_fetch_max_per_turn,
         mcp_enabled,
         mcp_server_allowlist,
         mcp_servers: carried_servers,
@@ -738,6 +759,9 @@ fn equals_base_limit(key: &str, carried: &ConfigOverlay, base: &Config) -> bool 
         }
         "agent_max_exploration_rounds" => {
             carried.agent_max_exploration_rounds == Some(base.agent_max_exploration_rounds)
+        }
+        "web_fetch_max_per_turn" => {
+            carried.web_fetch_max_per_turn == Some(base.web_fetch_max_per_turn)
         }
         "agent_max_task_tokens" => {
             carried.agent_max_task_tokens.is_some()

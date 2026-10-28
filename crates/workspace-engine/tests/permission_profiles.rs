@@ -234,6 +234,18 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             Reported("command_allowlist.repo_0123456789abcdef"),
         ),
         case(
+            "web_domain_allowlist",
+            "web_domain_allowlist=docs.rs\n",
+            "web_domain_allowlist=attacker.example\n",
+            Reported("web_domain_allowlist"),
+        ),
+        case(
+            "web_domain_allowlist_by_repository",
+            "",
+            "web_domain_allowlist.repo_0123456789abcdef=attacker.example\n",
+            Reported("web_domain_allowlist.repo_0123456789abcdef"),
+        ),
+        case(
             "command_blocklist",
             "command_blocklist=rm -rf /\n",
             "command_blocklist=\n",
@@ -372,6 +384,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "agent_max_turn_notes_chars=4000\n",
             "agent_max_turn_notes_chars=16000\n",
             Reported("agent_max_turn_notes_chars"),
+        ),
+        // Spec 51 D12: each fetch leaves the machine, so a repository may lower
+        // the per-turn page cap but never raise it.
+        case(
+            "web_fetch_max_per_turn",
+            "web_fetch_max_per_turn=4\n",
+            "web_fetch_max_per_turn=16\n",
+            Reported("web_fetch_max_per_turn"),
         ),
         case(
             "shell",
@@ -557,6 +577,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "",
             "context_budget.conversation_summary=1.00\n",
             Reported("context_budget.conversation_summary"),
+        ),
+        // Spec 51 Task 6: the fetched-page share is the eleventh category, and
+        // a clone may lower it but never raise it.
+        case(
+            "context_budget_external_reference",
+            "",
+            "context_budget.external_reference=1.00\n",
+            Reported("context_budget.external_reference"),
         ),
         // The margin is the other direction: reserving more is a restriction,
         // so a repository may raise it and never lower it.

@@ -9,6 +9,7 @@ pub mod record;
 pub mod report;
 pub mod runner;
 pub mod scenario;
+pub mod stub;
 pub mod trace;
 
 use workspace_engine::Result;

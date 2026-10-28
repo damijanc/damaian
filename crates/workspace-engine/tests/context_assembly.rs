@@ -14,8 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::context_manager::ExclusionReason;
 use workspace_engine::{
     CancelToken, CategoryUsage, ChatTurnResult, ClientError, CollectionSource, Config,
-    ConfigOverlay, ContextCategory, ContextItem, ContextKind, ContextManifest, ContextPlan,
-    ContextRequest, CurlModelTransport, ExclusionRecord, LimitSource, LineRange, MockModelAdapter,
+    ConfigOverlay, ContentKind, ContextBudget, ContextCategory, ContextItem, ContextKind,
+    ContextManifest, ContextPlan, ContextRequest, ConvertedResponse, CurlModelTransport,
+    ExclusionRecord, ExternalReference, ExternalUrl, LimitSource, LineRange, MockModelAdapter,
     ModelAdapter, ModelMessage, ModelRequest, OpenAICompatibleAdapter, PlanStep, ProcessRegistry,
     Provenance, RepositoryIndex, StepStatus, Symbol, SymbolIndexStore, TaskPlan, TokenEstimate,
     TurnProgress, TurnSink, UsageSource, WorkspaceEngine,
@@ -64,6 +65,7 @@ fn item(kind: ContextKind, path: Option<&str>, content: &str) -> ContextItem {
         redaction_status: "clean".to_string(),
         provenance: None,
         root_path: None,
+        origin: None,
     }
 }
 
@@ -305,6 +307,7 @@ fn a_required_item_that_does_not_fit_is_an_error() {
         pinned: &[],
         restriction: None,
         conversation_summary: None,
+        external_references: &[],
     });
     assert!(
         matches!(&direct, Err(ClientError::InvalidInput(message)) if message.contains(&limit.to_string())),
@@ -483,6 +486,7 @@ const ZERO_CONTEXT_SHARES: &str = concat!(
     "context_budget.file_ranges=0\n",
     "context_budget.findings=0\n",
     "context_budget.conversation_summary=0\n",
+    "context_budget.external_reference=0\n",
 );
 
 fn config_with_shares(repo: &Path, extra: &str) -> Config {
@@ -542,6 +546,7 @@ fn assemble_with_limit(
             pinned: &[],
             restriction: None,
             conversation_summary: None,
+            external_references: &[],
         })
         .expect("the assembly should succeed")
 }
@@ -2377,7 +2382,11 @@ fn each_category_reports_whether_its_tokens_are_measured_or_estimated() {
         None,
     );
 
-    assert_eq!(plan.manifest.categories.len(), 11);
+    assert_eq!(
+        plan.manifest.categories.len(),
+        12,
+        "Required plus the eleven budgeted categories"
+    );
     for usage in &plan.manifest.categories {
         assert!(
             usage.estimated,
@@ -2754,3 +2763,276 @@ const CALIBRATION_JSON: &str = "\
   ],
   \"limit\": { \"tokens\": 64000, \"source\": \"declared\", \"safetyMarginBps\": 0 }
 }";
+
+// ---- Spec 51 Task 6: a fetched page enters as the last category ----
+
+/// A converted page, as spec 51's Task 5 hands one back: already text, already
+/// redacted, already bounded. The tests build it directly, so no fetch and no
+/// conversion runs.
+fn reference(url: &str, text: &str, fetched_at_ms: u64) -> ExternalReference {
+    let response = ConvertedResponse {
+        url: ExternalUrl::parse(url).expect("the fixture URL should parse"),
+        fetched_at_ms,
+        status: 200,
+        content_type: Some("text/plain".to_string()),
+        bytes: text.len(),
+        cached: false,
+        fetch_truncated: false,
+        fetch_truncation_reason: None,
+        kind: ContentKind::PlainText,
+        text: text.to_string(),
+        conversion_truncated: false,
+        redactions: 0,
+        markers: Vec::new(),
+    };
+    ExternalReference::from_converted(&response)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_with_references(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    repository_id: &str,
+    prompt: &str,
+    explicit_paths: &[String],
+    index: Option<&RepositoryIndex>,
+    limit: usize,
+    external_references: &[ExternalReference],
+) -> ContextPlan {
+    engine
+        .context_manager
+        .build_context(ContextRequest {
+            repository_root: repo,
+            repository_id,
+            task_id: "task-6",
+            prompt,
+            index,
+            explicit_paths,
+            limit,
+            hook_context: &[],
+            plan: None,
+            pinned: &[],
+            restriction: None,
+            conversation_summary: None,
+            external_references,
+        })
+        .expect("the assembly should succeed")
+}
+
+#[test]
+fn an_external_reference_is_the_last_category_and_drops_first() {
+    let repo = fixture_repo("external-drop");
+    let engine = WorkspaceEngine::new(config_with_shares(
+        &repo,
+        "context_budget.file_ranges=0.25\ncontext_budget.external_reference=0.05\n",
+    ));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["src/lib.rs".to_string()];
+    let page = reference(
+        "https://docs.example.com/api",
+        &"The endpoint takes a token and returns a page. ".repeat(600),
+        1_700_000_000_000,
+    );
+
+    let plan = assemble_with_references(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Explain src/lib.rs",
+        &explicit,
+        Some(&index),
+        1_000,
+        &[page],
+    );
+
+    assert_eq!(
+        ContextCategory::BUDGETED.last(),
+        Some(&ContextCategory::ExternalReference),
+        "the category is last, so it is the first to go under pressure"
+    );
+
+    assert!(
+        plan.items
+            .iter()
+            .any(|item| item.path.as_deref() == Some("src/lib.rs")),
+        "the file item must survive: {:?}",
+        plan.manifest.excluded
+    );
+    assert!(
+        plan.items
+            .iter()
+            .all(|item| item.category != ContextCategory::ExternalReference),
+        "the page does not fit its share: {:?}",
+        plan.items
+            .iter()
+            .map(|item| (item.category, item.tokens))
+            .collect::<Vec<_>>()
+    );
+    let records = plan
+        .manifest
+        .excluded
+        .iter()
+        .filter(|record| record.category == ContextCategory::ExternalReference)
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "{:?}", plan.manifest.excluded);
+    assert_eq!(records[0].reason, ExclusionReason::CategoryBudgetExhausted);
+    assert!(usage(&plan, ContextCategory::ExternalReference).truncated);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn the_item_carries_its_url_and_fetch_time_and_no_path() {
+    let repo = fixture_repo("external-origin");
+    let engine = WorkspaceEngine::new(config_with_shares(
+        &repo,
+        "context_budget.external_reference=0.50\n",
+    ));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["src/lib.rs".to_string()];
+    let page = reference(
+        "https://docs.example.com/api?x=1#install",
+        "Install the client.\n",
+        1_700_000_000_000,
+    );
+
+    let plan = assemble_with_references(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Explain src/lib.rs",
+        &explicit,
+        Some(&index),
+        4_000,
+        &[page],
+    );
+
+    let item = plan
+        .items
+        .last()
+        .expect("the page is collected after everything else");
+    assert_eq!(item.category, ContextCategory::ExternalReference);
+    assert_eq!(item.kind, ContextKind::ExternalReference);
+    assert_eq!(item.path, None, "a page has no file identity");
+    assert_eq!(
+        item.origin.as_deref(),
+        Some("https://docs.example.com/api?x=1 (fetched 2023-11-14T22:13:20Z)"),
+        "the fragment is never sent, and the label names the fetch time"
+    );
+    assert!(
+        item.content
+            .starts_with("--- begin retrieved external content ---\n"),
+        "the context item carries the same data frame as the tool result: {}",
+        item.content
+    );
+    assert!(
+        item.content.contains("> Install the client."),
+        "the page body is quoted, not bare prompt text: {}",
+        item.content
+    );
+    assert!(
+        item.content
+            .ends_with("--- end retrieved external content ---\n"),
+        "the frame has an end marker: {}",
+        item.content
+    );
+
+    let included = plan
+        .manifest
+        .included
+        .last()
+        .expect("the manifest lists the page");
+    assert_eq!(included.origin, item.origin);
+    assert_eq!(included.path, None);
+
+    let rendered = ContextPlan::render_item(item);
+    assert!(
+        rendered.starts_with(
+            "\n--- external_reference: https://docs.example.com/api?x=1 \
+             (fetched 2023-11-14T22:13:20Z) ---\n"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("--- external_reference ---"),
+        "the origin replaces the absent path in the header: {rendered}"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn an_old_manifest_without_origin_still_loads() {
+    let repo = fixture_repo("external-old-manifest");
+    let engine = WorkspaceEngine::new(config_with_shares(
+        &repo,
+        "context_budget.external_reference=0.50\n",
+    ));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let explicit = vec!["src/lib.rs".to_string()];
+    let page = reference(
+        "https://docs.example.com/api",
+        "Install the client.\n",
+        1_700_000_000_000,
+    );
+
+    let plan = assemble_with_references(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "Explain src/lib.rs",
+        &explicit,
+        Some(&index),
+        4_000,
+        &[page],
+    );
+
+    let mut value = serde_json::to_value(&plan.manifest).unwrap();
+    for included in value["included"]
+        .as_array_mut()
+        .expect("the manifest lists included items")
+    {
+        included
+            .as_object_mut()
+            .expect("an included item is an object")
+            .remove("origin");
+    }
+    let parsed: ContextManifest = serde_json::from_value(value).unwrap();
+    assert!(
+        parsed
+            .included
+            .iter()
+            .all(|included| included.origin.is_none()),
+        "a manifest written before origin existed must still load"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn the_default_share_total_stays_ten_thousand() {
+    let budget = ContextBudget::default();
+    assert_eq!(
+        budget.total_share_bps(),
+        10_000,
+        "the new share is funded from search_results, never by inflating the total"
+    );
+    budget
+        .validate()
+        .expect("the default allocation must be valid");
+    assert_eq!(
+        budget.share(ContextCategory::SearchResults),
+        1_000,
+        "search_results pays for the new category"
+    );
+    assert_eq!(budget.share(ContextCategory::ExternalReference), 500);
+    assert_eq!(ContextCategory::BUDGETED.len(), 11);
+    assert_eq!(
+        ContextCategory::BUDGETED[10],
+        ContextCategory::ExternalReference
+    );
+    assert_eq!(
+        ContextCategory::ExternalReference.as_str(),
+        "external_reference"
+    );
+}

@@ -53,6 +53,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | Memory will not save, a project's memory is missing (including a shallow clone), or the store was refused | [Memory](#memory) |
 | A permission profile key has no effect | [A permission profile key had no effect](#a-permission-profile-key-had-no-effect) |
 | A file read or search result was cut short | [A file read or search result was truncated](#a-file-read-or-search-result-was-truncated) |
+| A page the agent tried to read was not fetched, or a fetch approval did not appear after a reload | [A fetch was refused](#a-fetch-was-refused) |
 | A file is missing from the model's context | [A file the model should see is missing from context](#a-file-the-model-should-see-is-missing-from-context) |
 | Why a file was not consulted, or a pin or restriction is not taking effect | [The context inspector: why a file was not consulted](#the-context-inspector-why-a-file-was-not-consulted) |
 | Why a file or search hit was excluded, or what a turn's context actually held | [Reading a turn's context manifest](#reading-a-turns-context-manifest) |
@@ -2551,6 +2552,51 @@ reads as complete is the failure the caps exist to prevent. The caps are
 `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and
 `max_match_line_chars` (500); a repository config may lower one but never raise
 it.
+
+### A fetch was refused
+
+`fetch_url` is the agent's page reader. Several different things can stop a
+fetch, and only one of them is the approval dialog. Find the wording in the tool
+result in the conversation; the audit log records the outcome separately (see
+[Audit log](#audit-log)).
+
+| What the model sees | Cause | What to do |
+|---|---|---|
+| A card headed with a host, then **Allow once** / **Don't fetch** | The host has no approval for this checkout. **Nothing has been sent.** | Read the URL. Approve once, choose *Always allow this host in this project* in the overflow, or decline. Declining makes no request and tells the model the host was refused. |
+| `Cannot fetch from <host>: the URL carries something that looks like a credential (<category>); it is refused before any approval is asked` | The URL contains a secret-shaped string. The category is named; the matched value is not repeated. | Remove the credential from the URL. This refusal happens **before** the dialog, so approving cannot override it. |
+| `Cannot fetch from <host>: the URL carries content from <path>, a file read earlier in this task; it is refused before any approval is asked` | The query or fragment contains a line of at least 16 bytes from a file `read_file` returned in this task, raw, percent-decoded or base64-decoded. | Do not put repository content in a URL. Files read through `search_content`, `read_git_diff` or a command are deliberately outside this check. |
+| `Cannot fetch from <host>: the URL names <host>, which is not a public internet address; a fetch only reaches public addresses` | The host is a loopback, private, link-local or reserved address literal, including an IPv4-mapped IPv6 form. No dialog appears. | Use a public URL. A name that resolves privately is refused at request time with `… resolves to <ip>, which is not a public internet address`; the same rule applies. |
+| `Cannot fetch that URL: <reason>. Nothing was requested` | The URL did not parse: not `http`/`https`, no host, userinfo, whitespace or a control character, or an IPv4 address written as a bare number, hex or a short form (`2130706433`, `0x7f000001`, `127.1`). | Supply a plain absolute `http(s)` URL, with an IPv4 address written as four decimal octets. |
+| `The page answered with a redirect to <target>. This tool does not follow redirects. …` | A 3xx response, including a same-host one. The request count is one, and the target is named. | Fetch the named URL as a new call; its host needs its own approval. The audit event is `web_fetch_redirect`. |
+| `A fetch was not made: this turn has already fetched N of M pages` | The per-turn cap, `web_fetch_max_per_turn` (default 8, hard ceiling 20). | The turn must answer with what it has. The cap is not a bug. |
+| `Cannot fetch from <host>: <error>. Check the URL and try again` | The request or its timeout failed (connect 15 s, stall 30 s, total 60 s). | Check the URL; a stop during a fetch appears as `The fetch was stopped.` |
+| `No text is shown: this content type is not one the fetch tool converts (text/*, application/json, application/xhtml+xml)` | The response is not convertible text. Its type and size are still reported. | Nothing to fix; the body is not returned and was not cached. |
+| `The page contained no text` | A convertible type with an empty body, or a page whose text was all inside scripts, styles or tags. | A JavaScript-rendered page is expected to land here: nothing is rendered and no sub-resource is loaded. |
+
+**Where an approval lives.** *Allow always* writes
+`web_domain_allowlist.<repository id>` to **user** config. The machine-wide
+`web_domain_allowlist` is also user-scoped. A repository file that sets either
+key is rejected as a forbidden key, recorded as `repository_config_key_rejected`
+with the key and class only, and reported once; a permission profile cannot
+carry it either. A host and the same host on a non-default port are different
+approvals.
+
+**`Redaction: clean` beside a `[REDACTED_…]` placeholder.** The raw page is
+scanned and redacted in the fetch transport before conversion, and the converted
+text is scanned again. By then the credential is already a placeholder, so the
+second scan finds nothing and the result prints `Redaction: clean` and
+`redaction_status()` / the session event say `clean`. **The secret is gone**;
+only the reported count is wrong. This is a known reporting defect, recorded in
+[spec 51](specs/51_external_reference_retrieval/proposal.md) §7.3; trust the
+placeholder, not the count.
+
+**Reloading while the dialog is open re-presents the card.** A crash or reload
+during a fetch approval no longer fails the task. The next launch reads the
+paused turn and shows the same host-and-URL card; *Allow once*, *Allow always*
+and *Don't fetch* go through the same route as the live dialog, and *Allow
+always* still writes only the user-scope per-checkout key. Nothing was requested
+before the crash, so the re-presented card is the same question rather than a
+resumed side effect.
 
 ### A file the model should see is missing from context
 

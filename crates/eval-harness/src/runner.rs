@@ -14,8 +14,10 @@ use crate::record::{
     CacheUsage, RecordedApproval, RecordedCheck, RecordedPlan, RecordedRecovery, RunRecord, Tokens,
 };
 use crate::scenario::{
-    CrashMidAction, RoundBudgetDecision as ScenarioRoundBudgetDecision, Scenario, Tier,
+    CrashMidAction, RoundBudgetDecision as ScenarioRoundBudgetDecision, STUB_BASE_PLACEHOLDER,
+    Scenario, Tier,
 };
+use crate::stub::StubServer;
 use crate::trace::{self, Trace};
 
 #[derive(Debug)]
@@ -62,6 +64,10 @@ pub struct Run {
     pub conversation_compactions: u64,
     /// Whether the newest summary is facts-only.
     pub compaction_facts_only: bool,
+    /// How many HTTP requests the scenario's loopback page server accepted
+    /// (spec 51 Task 9). Captured before the server is dropped, because the
+    /// count is a measurement of the run rather than of a live listener.
+    pub stub_requests: u64,
     pub trace: Trace,
 }
 
@@ -105,6 +111,12 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
         return Ok(skipped);
     }
 
+    // Spec 51 Task 9: one page server per scenario, started before the fixture
+    // so the substituted URL is already in the prompt and tool arguments. It is
+    // dropped when this function returns.
+    let stub = StubServer::start(&scenario.stub_pages)?;
+    let scenario = with_stub_base(scenario, stub.as_ref());
+
     let materialized = fixture::materialize(&scenario.fixture)?;
     for file in &scenario.seed_files {
         let path = materialized.root.join(&file.path);
@@ -121,19 +133,25 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
         })?;
     }
     let mut config = base_config(&materialized);
-    apply_scenario_config(&mut config, scenario);
+    apply_scenario_config(&mut config, &scenario);
+    pre_approve_stub(&mut config, stub.as_ref());
     config.model_provider = "mock".to_string();
     config.model_name = "mock".to_string();
     config.model_providers.push(mock_provider());
     let scanner = SecretScanner::new(config.secret_patterns.clone());
-    let engine = WorkspaceEngine::new(config);
+    let mut engine = WorkspaceEngine::new(config);
+    // The stub page server binds 127.0.0.1. This is the harness's own
+    // allowance, not something a scenario can configure: the scenario only
+    // pre-approves the stub's `host:port`, which the SSRF check would still
+    // refuse without this.
+    engine.chat_orchestrator.allow_loopback_fetch_for_tests();
 
-    let (responses, tool_calls, truncated) = script(scenario);
+    let (responses, tool_calls, truncated) = script(&scenario);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(responses, tool_calls)
         .with_truncated(truncated);
 
     let mut run = drive(
-        scenario,
+        &scenario,
         &materialized,
         &engine,
         &scanner,
@@ -142,6 +160,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
         "mock",
         "mock",
     )?;
+    run.stub_requests = stub.as_ref().map(StubServer::requests).unwrap_or(0);
     // The adapter is the only place the tier can see what a request actually
     // contained, and the resume happens inside `drive`. Read it here, after the
     // run, and locate the first post-continuation request from the trace: the
@@ -151,6 +170,70 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     run.answer_request = answer_request(&run.trace, &adapter.requests);
     (run.compacted_request, run.compacted_system_prompt) = compacted_requests(&adapter.requests);
     Ok(run)
+}
+
+/// Replaces `{stub_base}` with the running page server's base URL.
+///
+/// The port is ephemeral, so a scenario file cannot name it. The prompt, the
+/// follow-up prompt, seeded conversation and every string in a scripted
+/// tool-call argument are substituted, because those are the places a scripted
+/// URL can appear.
+pub fn substitute_stub_base(scenario: &Scenario, base: &str) -> Scenario {
+    let mut scenario = scenario.clone();
+    scenario.prompt = scenario.prompt.replace(STUB_BASE_PLACEHOLDER, base);
+    if let Some(prompt) = &mut scenario.follow_up_prompt {
+        *prompt = prompt.replace(STUB_BASE_PLACEHOLDER, base);
+    }
+    for message in &mut scenario.seed_conversation {
+        message.content = message.content.replace(STUB_BASE_PLACEHOLDER, base);
+    }
+    for turn in &mut scenario.turns {
+        for call in &mut turn.tool_calls {
+            replace_in_value(&mut call.arguments, base);
+        }
+    }
+    scenario
+}
+
+fn with_stub_base(scenario: &Scenario, stub: Option<&StubServer>) -> Scenario {
+    match stub {
+        Some(stub) => substitute_stub_base(scenario, stub.base()),
+        None => scenario.clone(),
+    }
+}
+
+fn replace_in_value(value: &mut serde_json::Value, base: &str) {
+    match value {
+        serde_json::Value::String(text) => *text = text.replace(STUB_BASE_PLACEHOLDER, base),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                replace_in_value(item, base);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                replace_in_value(item, base);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The harness is the user here, and the user has approved the page server.
+///
+/// A `fetch_url` to a host with no approval pauses for a dialog, and the
+/// harness has no action that answers one, so each fetch scenario must arrive
+/// with its stub already allowed. The port is ephemeral, so this cannot be a
+/// line in the scenario file; the runner appends the exact `host:port` the
+/// server bound to the user-scope list. This does not weaken the pause — a
+/// scenario that names any other host still pauses — it only says the user
+/// approved the loopback page the scenario itself serves.
+fn pre_approve_stub(config: &mut Config, stub: Option<&StubServer>) {
+    if let Some(stub) = stub {
+        config
+            .web_domain_allowlist
+            .push(stub.approval_key().to_string());
+    }
 }
 
 /// The request that followed the first `turn_budget_extended`, flattened to the
@@ -252,9 +335,16 @@ pub fn run_live(scenario: &Scenario) -> Result<Run> {
         ClientError::InvalidInput("the live tier needs DAMAIAN_EVAL_MODEL".to_string())
     })?;
 
+    // The page server is tier-independent: the live tier asks a real model the
+    // same question the deterministic one scripts, so it fetches the same
+    // loopback pages rather than reaching a real host (spec 51 Task 9).
+    let stub = StubServer::start(&scenario.stub_pages)?;
+    let scenario = with_stub_base(scenario, stub.as_ref());
+
     let materialized = fixture::materialize(&scenario.fixture)?;
     let mut config = live_config(&materialized.data_dir, &provider, &model);
-    apply_scenario_config(&mut config, scenario);
+    apply_scenario_config(&mut config, &scenario);
+    pre_approve_stub(&mut config, stub.as_ref());
 
     let api_key = std::env::var(&config.model_api_key_env).map_err(|_| {
         ClientError::InvalidInput(format!(
@@ -270,10 +360,13 @@ pub fn run_live(scenario: &Scenario) -> Result<Run> {
     );
     let scanner = SecretScanner::new(config.secret_patterns.clone());
     let mut adapter = OpenAICompatibleAdapter::with_provider(&provider, &model, transport);
-    let engine = WorkspaceEngine::new(config);
+    let mut engine = WorkspaceEngine::new(config);
+    // Same allowance as the deterministic tier: a scenario's `[[stub_page]]`
+    // is served on loopback, and no scenario config can grant it.
+    engine.chat_orchestrator.allow_loopback_fetch_for_tests();
 
-    drive(
-        scenario,
+    let mut run = drive(
+        &scenario,
         &materialized,
         &engine,
         &scanner,
@@ -281,7 +374,9 @@ pub fn run_live(scenario: &Scenario) -> Result<Run> {
         "live",
         &provider,
         &model,
-    )
+    )?;
+    run.stub_requests = stub.as_ref().map(StubServer::requests).unwrap_or(0);
+    Ok(run)
 }
 
 /// The live tier's configuration for a provider and model.
@@ -368,6 +463,7 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
         compacted_system_prompt: None,
         conversation_compactions: 0,
         compaction_facts_only: false,
+        stub_requests: 0,
         trace: Trace::default(),
     })
 }
@@ -387,12 +483,16 @@ fn base_config(materialized: &Materialized) -> Config {
 /// The turn options a run drives with.
 ///
 /// A scenario that scripts answers is interactive, so `ask_user` is offered and
-/// the system prompt carries no headless paragraph. Everything else keeps the
-/// defaults, which is headless: the tool is absent and the prompt tells the
-/// model to proceed under a stated assumption (spec 50 `context.md` §4, §9).
+/// the system prompt carries no headless paragraph. A scenario can also say a
+/// user is present without scripting an answer: `fetch_url` is offered on the
+/// same condition as `ask_user` [spec 51 §5.3], and a fetch scenario
+/// pre-approves its stub host so nothing actually pauses for an answer the
+/// script does not have. Everything else keeps the defaults, which is headless:
+/// the tool is absent and the prompt tells the model to proceed under a stated
+/// assumption (spec 50 `context.md` §4, §9).
 fn turn_options(scenario: &Scenario) -> ChatTurnOptions {
     ChatTurnOptions {
-        user_present: !scenario.answers.is_empty(),
+        user_present: !scenario.answers.is_empty() || scenario.user_present,
         ..ChatTurnOptions::default()
     }
 }
@@ -1070,6 +1170,7 @@ fn drive(
         compacted_system_prompt: None,
         conversation_compactions,
         compaction_facts_only,
+        stub_requests: 0,
         trace,
     })
 }

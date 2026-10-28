@@ -12,9 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::compaction::ConversationSummary;
 use workspace_engine::context_manager::ExclusionReason;
 use workspace_engine::{
-    CancelToken, ChatTurnResult, Config, ContextCategory, ContextDecision, ContextKind, ContextPin,
-    ContextRequest, LineRange, MockModelAdapter, ModelAdapter, Provenance, Symbol,
-    SymbolIndexStore, TaskStatus, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
+    CancelToken, ChatTurnResult, Config, ContentKind, ContextCategory, ContextDecision,
+    ContextKind, ContextPin, ContextRequest, ConvertedResponse, ExternalReference, ExternalUrl,
+    LineRange, MockModelAdapter, ModelAdapter, Provenance, Symbol, SymbolIndexStore, TaskStatus,
+    ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -113,6 +114,7 @@ fn assemble(
             pinned,
             restriction,
             conversation_summary: None,
+            external_references: &[],
         })
         .expect("the assembly should run")
 }
@@ -155,6 +157,7 @@ fn the_manifest_has_a_summary_row_with_its_message_count() {
             pinned: &[],
             restriction: None,
             conversation_summary: Some(&summary),
+            external_references: &[],
         })
         .expect("the assembly should run");
 
@@ -589,6 +592,7 @@ fn removing_the_summary_records_its_category_and_hides_the_row() {
             pinned: &[],
             restriction: None,
             conversation_summary: Some(&summary()),
+            external_references: &[],
         })
         .unwrap();
     let mut prepared = workspace_engine::PreparedContext::from_plan(&plan);
@@ -1238,4 +1242,87 @@ fn a_turn_records_its_context_only_when_it_is_sent() {
         1,
         "the amended send records one assembly: the one it sent"
     );
+}
+
+// ---- Spec 51 Task 6: a fetched page is a listed inspector category ----
+
+fn external_reference() -> ExternalReference {
+    let url = ExternalUrl::parse("https://docs.example.com/api").expect("the fixture URL parses");
+    let text = "Install the client and pass the token as a header.\n";
+    ExternalReference::from_converted(&ConvertedResponse {
+        url,
+        fetched_at_ms: 1_700_000_000_000,
+        status: 200,
+        content_type: Some("text/plain".to_string()),
+        bytes: text.len(),
+        cached: false,
+        fetch_truncated: false,
+        fetch_truncation_reason: None,
+        kind: ContentKind::PlainText,
+        text: text.to_string(),
+        conversion_truncated: false,
+        redactions: 0,
+        markers: Vec::new(),
+    })
+}
+
+#[test]
+fn the_inspector_lists_the_category() {
+    let repo = fixture_repo("external-inspector");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let reference = external_reference();
+    let plan = engine
+        .context_manager
+        .build_context(ContextRequest {
+            repository_root: &repo,
+            repository_id: &index.repository_id,
+            task_id: "task_external",
+            prompt: "What does the API expect?",
+            index: Some(&index),
+            explicit_paths: &[],
+            limit: 16_000,
+            hook_context: &[],
+            plan: None,
+            pinned: &[],
+            restriction: None,
+            conversation_summary: None,
+            external_references: &[reference],
+        })
+        .expect("the assembly should run");
+
+    // The shell serialises the manifest exactly as this, so this is the JSON a
+    // `context` event carries to the inspector.
+    let json = serde_json::to_value(plan.manifest).unwrap();
+    let row = json["categories"]
+        .as_array()
+        .expect("the manifest has category rows")
+        .iter()
+        .find(|usage| usage["category"] == "external_reference")
+        .expect("the manifest must carry the new category");
+    assert_eq!(row["items"], 1, "{row}");
+    let included = json["included"]
+        .as_array()
+        .expect("the manifest lists included items")
+        .iter()
+        .find(|included| included["category"] == "external_reference")
+        .expect("the page must be listed");
+    assert_eq!(included["path"], serde_json::Value::Null);
+    assert!(
+        included["origin"]
+            .as_str()
+            .is_some_and(|origin| origin.starts_with("https://docs.example.com/api (fetched ")),
+        "{included}"
+    );
+
+    let app_js = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../desktop-shell/static/app.js"),
+    )
+    .expect("the shell's app.js should be readable");
+    assert!(
+        app_js.contains(r#"external_reference: "Reference pages""#),
+        "the inspector has no label for the new category"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
 }

@@ -3020,6 +3020,7 @@ fn a_before_context_hook_adds_a_redacted_hook_context_item_to_an_edit_plan() {
             pinned: &[],
             restriction: None,
             conversation_summary: None,
+            external_references: &[],
         })
         .expect("the hook assembly should run");
     assert!(

@@ -16,6 +16,8 @@ pub mod edit;
 pub mod effective_policy;
 pub mod embeddings;
 pub mod error;
+pub mod external_reference;
+pub mod fetch;
 pub mod file_access;
 pub mod finding;
 pub mod git_service;
@@ -58,10 +60,11 @@ pub use audit::AuditLog;
 pub use cancel::CancelToken;
 pub use chat::{
     AgentCheckBatch, AgentCommandProposal, AgentContextReview, AgentFallbackProposal,
-    AgentPatchProposal, AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal,
-    ChatOrchestrator, ChatTurnOptions, ChatTurnResult, ContextDecision, McpTokenResolver,
-    PausedTurns, PhaseKind, PlanRevisionStep, ResumeDecisionOptions, RoundBudgetDecision,
-    RoundBudgetPause, TurnPhase, TurnProgress, TurnSink,
+    AgentFetchProposal, AgentPatchProposal, AgentPlanProposal, AgentQuestionProposal,
+    AgentRoundBudgetProposal, ChatOrchestrator, ChatTurnOptions, ChatTurnResult, ContextDecision,
+    FetchComponentFlag, FetchDecision, McpTokenResolver, PausedTurns, PendingFetchCall, PhaseKind,
+    PlanRevisionStep, ResumeDecisionOptions, RoundBudgetDecision, RoundBudgetPause, TurnPhase,
+    TurnProgress, TurnSink,
 };
 pub use checkpoint::{
     CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,
@@ -116,6 +119,14 @@ pub use effective_policy::{
     rule_label,
 };
 pub use error::{ClientError, ProviderRefusal, Result};
+pub use external_reference::{
+    ContentKind, ConvertedResponse, ConvertedText, Decision, EXTERNAL_CONTENT_NOTICE,
+    ExternalReference, ExternalUrl, HostAllowlist, InjectionCategory, InjectionMarker, Inspection,
+    InspectionFlags, LongComponent, MAX_REFERENCE_TEXT_BYTES, ReadFileContent, RedirectTarget,
+    RefusalReason, UrlComponent, UrlParseError, UrlScheme, detect_injection_markers, html_to_text,
+    inspect, redirect_target,
+};
+pub use fetch::{CurlFetchTransport, DEFAULT_MAX_RESPONSE_BYTES, FetchOutcome};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};
 pub use git_service::{
     DiffOptions, GitFileStatus, GitHubRepo, GitReadCaps, GitService, GitStatus, GitSummary,

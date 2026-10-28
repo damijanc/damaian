@@ -177,6 +177,11 @@ pub(crate) fn profile_permits(
         | ToolAction::AskUser(_)
         | ToolAction::TurnNotes { .. }
         | ToolAction::ProposeMemory { .. } => None,
+        // Spec 51: no capability key covers a fetch. Mode is the gate (Code
+        // only), and the host allowlist is the user's, already folded into the
+        // effective config — a profile may remove the tool by leaving Code, not
+        // by deciding which hosts are reachable.
+        ToolAction::FetchUrl { .. } => None,
         ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
             (!capabilities.allow_file_edits).then_some(ProfileLimit::FileEdits)
         }
@@ -260,6 +265,21 @@ pub(crate) fn mode_permits(
         | ToolAction::ProposeMemory { .. } => Permission::Allowed,
 
         ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
+            if mode == Code {
+                Permission::Allowed
+            } else {
+                Permission::Refused {
+                    blocked_by: mode,
+                    allowed_in: Code,
+                }
+            }
+        }
+
+        // Spec 51 §5.3: a fetch chooses what leaves the machine, so it is as
+        // side-effecting as a command. Code is the only mode where a request
+        // could be approved; a pre-approved host does not widen that, because
+        // the tool's own offer is filtered through this same answer.
+        ToolAction::FetchUrl { .. } => {
             if mode == Code {
                 Permission::Allowed
             } else {
@@ -569,6 +589,18 @@ mod tests {
                 None,
                 None,
                 [T, T, T, T],
+                [T, T, T, T],
+            ),
+            // Spec 51: a fetch is Code only, like a side-effecting command —
+            // and no capability key covers it, so every profile allows it in
+            // Code. The host allowlist is the user's, not the profile's.
+            (
+                ToolAction::FetchUrl {
+                    url: "https://docs.rs/".into(),
+                },
+                None,
+                None,
+                [F, F, T, F],
                 [T, T, T, T],
             ),
             (

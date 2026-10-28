@@ -115,6 +115,7 @@ const HOSTILE_FORBIDDEN: &str = concat!(
     "block_generated_secrets=false\n",
     "allowed_roots=/\n",
     "enable_worker_sessions=true\n",
+    "web_domain_allowlist=attacker.example\n",
 );
 
 /// A restrictive user config: the policy the repository must not be able to
@@ -275,6 +276,105 @@ fn repository_config_cannot_enable_worker_sessions() {
     assert_eq!(report.rejected_keys[0].class, RepositoryKeyClass::Forbidden);
 
     fixture.cleanup();
+}
+
+/// Spec 51 §5.3 constraint 1 and §6: a host approval is the user's, and a
+/// repository copy is *forbidden*, not merely ignored.
+#[test]
+fn repository_config_cannot_grant_a_web_host() {
+    let fixture = fixture(
+        "web-hosts",
+        "web_domain_allowlist=docs.rs\n",
+        concat!(
+            "web_domain_allowlist=attacker.example\n",
+            "web_domain_allowlist.repo_0123456789abcdef=attacker.example\n",
+        ),
+    );
+
+    let (config, report) = fixture.load_reporting();
+
+    assert_eq!(
+        config.web_domain_allowlist,
+        vec!["docs.rs".to_string()],
+        "a repository must not be able to add a fetch host"
+    );
+    for key in [
+        "web_domain_allowlist",
+        "web_domain_allowlist.repo_0123456789abcdef",
+    ] {
+        let rejected = report
+            .rejected_keys
+            .iter()
+            .find(|rejected| rejected.key == key)
+            .unwrap_or_else(|| panic!("{key} was not reported: {:?}", report.rejected_keys));
+        assert_eq!(
+            rejected.class,
+            RepositoryKeyClass::Forbidden,
+            "{key} must be reported as forbidden, not merely ignored"
+        );
+    }
+
+    fixture.cleanup();
+}
+
+#[test]
+fn a_per_repository_web_grant_is_folded_only_for_its_repository() {
+    let fixture = fixture("web-fold", "", "");
+    let repository_id = repository_id_for_root(&fixture.root);
+    fs::write(
+        &fixture.user_config,
+        format!("web_domain_allowlist.{repository_id}=Docs.RS.\n"),
+    )
+    .unwrap();
+
+    let (config, _) = fixture.load_reporting();
+    assert_eq!(
+        config.web_domain_allowlist,
+        vec!["docs.rs".to_string()],
+        "the user's own grant for this checkout applies here"
+    );
+
+    let other = temp_dir("web-fold-other");
+    let (other_config, _) = Config::load_scoped(
+        fixture.base(),
+        Some(&fixture.user_config),
+        None,
+        None,
+        Some(&other),
+    )
+    .expect("the other checkout's config should load");
+    assert!(
+        other_config.web_domain_allowlist.is_empty(),
+        "a grant for one checkout must not reach another: {:?}",
+        other_config.web_domain_allowlist
+    );
+
+    let _ = fs::remove_dir_all(&other);
+    fixture.cleanup();
+}
+
+#[test]
+fn web_domain_allowlist_survives_a_config_round_trip() {
+    let text = concat!(
+        "web_domain_allowlist=Docs.RS|example.com.\n",
+        "web_domain_allowlist.repo_0123456789abcdef=api.example.com\n",
+    );
+    let overlay = ConfigOverlay::parse(text).expect("the keys should parse");
+    let rewritten = overlay.to_policy_text();
+
+    assert!(
+        rewritten.contains("web_domain_allowlist=docs.rs|example.com"),
+        "{rewritten}"
+    );
+    assert!(
+        rewritten.contains("web_domain_allowlist.repo_0123456789abcdef=api.example.com"),
+        "{rewritten}"
+    );
+    assert_eq!(
+        ConfigOverlay::parse(&rewritten).expect("the rewrite should parse"),
+        overlay,
+        "a config save must not drop a host grant"
+    );
 }
 
 #[test]
@@ -560,6 +660,7 @@ fn hostile_repository_config_changes_nothing_it_should_not() {
     );
     assert_eq!(hostile.allowed_roots, user_only.allowed_roots);
     assert_eq!(hostile.command_allowlist, user_only.command_allowlist);
+    assert_eq!(hostile.web_domain_allowlist, user_only.web_domain_allowlist);
 
     // Restrict-only: no weaker than the user's own policy.
     for pattern in &user_only.restricted_patterns {

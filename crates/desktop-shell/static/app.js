@@ -2218,6 +2218,7 @@ const CONTEXT_CATEGORY_LABELS = {
   file_ranges: "File ranges",
   findings: "Findings",
   conversation_summary: "Summary",
+  external_reference: "Reference pages",
 };
 
 const CONTEXT_REASON_LABELS = {
@@ -2344,6 +2345,12 @@ function contextCategoryRow(manifest, category) {
     row.className = "context-item";
     if (item.path) {
       row.append(contextPathButton(item.path, item.lineRange));
+    } else if (item.origin) {
+      // A fetched page has no path; its URL and fetch time are its identity
+      // (spec 51 §5.4), so the row names where it came from.
+      const name = document.createElement("span");
+      name.textContent = item.origin;
+      row.append(name);
     } else {
       const name = document.createElement("span");
       name.textContent = item.kind === "user_prompt" ? "Your message" : item.kind || category;
@@ -6469,6 +6476,7 @@ function createReattachedApprovalCard(approval) {
     provider_fallback: "An offer to switch providers was waiting when Damaian stopped",
     round_budget: "A turn was waiting for your decision when Damaian stopped",
     context_review: "A turn was waiting for you to review its context when Damaian stopped",
+    fetch: "A page read was waiting for your approval when Damaian stopped",
     checks: "Checks were waiting for your approval when Damaian stopped",
   };
   const notes = {
@@ -6495,6 +6503,11 @@ function createReattachedApprovalCard(approval) {
     context_review:
       "This turn was assembled but not sent, and it was saved while you reviewed it. " +
       "Sending continues that turn; declining sends nothing.",
+    // Saved like a plan review, so answering continues the same turn. Nothing
+    // was requested before the crash: the dialog is the same question.
+    fetch:
+      "This turn was paused before it requested a page, and it was saved while you decided. " +
+      "Allowing continues that turn and makes the request; Don't fetch sends nothing.",
     checks:
       "The verification of an applied patch stopped on this card. Deciding it continues the " +
       "same attempt; the report follows when every check is answered.",
@@ -6527,6 +6540,10 @@ function createReattachedApprovalCard(approval) {
     // Saved and re-presented like a plan review; either answer ends this card.
     currentContextReview = approval.payload;
     wrapper.append(createContextReview(approval.payload, repo()));
+  } else if (approval.kind === "fetch") {
+    // Spec 51: the paused turn carries the verbatim URL, so the live dialog is
+    // rebuilt and answers through the same fetch-decision route.
+    wrapper.append(createFetchApproval(approval.payload, repo()));
   } else if (approval.kind === "checks") {
     wrapper.append(
       createCheckBatchCard(approval.payload, repo(), {
@@ -10669,6 +10686,196 @@ function createQuestionCard(question, questionRepo, { answered = null } = {}) {
   return wrapper;
 }
 
+// Spec 51 §5.3: the first fetch of a host asks before anything leaves the
+// machine. The host is the headline and the URL is shown exactly as the model
+// wrote it — wrapped, never shortened — because a user approving a request has
+// to be able to read all of it. An over-long query or fragment is broken out
+// and marked, since a long opaque parameter is the shape exfiltration takes and
+// nobody spots it inside a long line.
+//
+// "Always allow" persists beyond this turn, so it goes in the overflow rather
+// than beside the one-shot action (UI_STYLE_GUIDE §4).
+function createFetchApproval(proposal, proposalRepo) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "fetch-approval";
+  wrapper.dataset.fetchProposalId = proposal.proposalId || "";
+
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "fetch-approval-eyebrow";
+  eyebrow.textContent = "Read an external page";
+
+  const host = document.createElement("p");
+  host.className = "fetch-approval-host";
+  host.textContent = proposal.host || "";
+
+  const lead = document.createElement("p");
+  lead.className = "fetch-approval-lead";
+  lead.textContent =
+    "The agent wants to request this address. Nothing has been sent, and the request " +
+    "carries no credentials or cookies.";
+
+  const url = document.createElement("code");
+  url.className = "fetch-approval-url";
+  url.textContent = proposal.url || "";
+
+  wrapper.append(eyebrow, host, lead, url);
+
+  const flags = Array.isArray(proposal.longComponents) ? proposal.longComponents : [];
+  for (const flag of flags) {
+    const component = flag.component === "fragment" ? "fragment" : "query";
+    const value = component === "fragment" ? proposal.fragment : proposal.query;
+    const box = document.createElement("div");
+    box.className = "fetch-approval-flag";
+    const label = document.createElement("p");
+    label.className = "fetch-approval-flag-label";
+    label.textContent = `Long ${component} — ${flag.bytes} bytes. Read it before allowing this.`;
+    const code = document.createElement("code");
+    code.className = "fetch-approval-flag-value";
+    code.textContent = value || "";
+    box.append(label, code);
+    wrapper.append(box);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "command-approval-actions";
+  const once = document.createElement("button");
+  once.type = "button";
+  once.className = "btn-sm btn-primary";
+  once.textContent = "Allow once";
+  const deny = document.createElement("button");
+  deny.type = "button";
+  deny.className = "btn-sm btn-quiet";
+  deny.textContent = "Don't fetch";
+  actions.append(once, deny);
+
+  let overflowButton = null;
+  if (proposal.approvalKey) {
+    overflowButton = document.createElement("button");
+    overflowButton.type = "button";
+    overflowButton.className = "btn-icon";
+    overflowButton.dataset.menuId = `fetch-approval-${proposal.proposalId}`;
+    overflowButton.setAttribute("aria-haspopup", "menu");
+    overflowButton.setAttribute("aria-expanded", "false");
+    overflowButton.setAttribute("aria-label", "More fetch options");
+    overflowButton.title = "More fetch options";
+    overflowButton.innerHTML = '<span class="dots-icon" aria-hidden="true"></span>';
+    overflowButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleApprovalMenu(
+        [
+          {
+            label: "Always allow this host in this project",
+            hint: "Writes web_domain_allowlist to user config — persists after this turn",
+            onSelect: () => void decide("always", "Allowed for this project"),
+          },
+        ],
+        overflowButton,
+      );
+    });
+    actions.append(overflowButton);
+  }
+
+  const status = document.createElement("p");
+  status.className = "fetch-approval-status";
+  status.hidden = true;
+
+  wrapper.append(actions, status);
+
+  const controls = [once, deny, ...(overflowButton ? [overflowButton] : [])];
+  const setDisabled = (disabled) => {
+    controls.forEach((control) => {
+      control.disabled = disabled;
+    });
+  };
+
+  once.addEventListener("click", () => void decide("once", "Allowed once"));
+  deny.addEventListener("click", () => void decide("deny", "Not fetched"));
+
+  async function decide(decision, settledText) {
+    if (chatSubmitting) {
+      toast("A turn is already running");
+      return;
+    }
+    setDisabled(true);
+    closeApprovalMenu();
+    status.hidden = false;
+    status.textContent = decision === "deny" ? "Refusing…" : "Reading…";
+
+    const assistantMessage = appendChatMessage("assistant", "");
+    const indicator = startTurnIndicator(assistantMessage);
+    let assistantText = "";
+    let streamError = null;
+    chatSubmitting = true;
+    setComposerBusy(true);
+    try {
+      await streamResumeFetchRequest(
+        {
+          repo: proposalRepo,
+          proposal_id: proposal.proposalId,
+          decision,
+          session_id: currentSessionId || "",
+        },
+        {
+          phase(payload) {
+            indicator.phase(payload);
+          },
+          plan(planPayload) {
+            renderPlanPanel(assistantMessage, planPayload);
+          },
+          webDiagnostic(record) {
+            sessionHasRecordedDiagnostics = true;
+            renderWebDiagnosticCard(assistantMessage, record);
+          },
+          token(token) {
+            assistantText += token;
+            updateChatMessage(assistantMessage, assistantText);
+            indicator.streaming();
+          },
+          done(payload) {
+            if (payload.response && payload.response !== assistantText) {
+              assistantText = payload.response;
+              updateChatMessage(assistantMessage, assistantText);
+            }
+            appendProposals(assistantMessage, payload, proposalRepo);
+            if (payload.sessionId) {
+              currentSessionId = payload.sessionId;
+              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+            }
+            appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            appendTurnNotes(assistantMessage.body, payload.turnNotes);
+            markMessageUsage(assistantMessage, payload.usage);
+            indicator.finish(chatCompletionState(payload));
+            markMessageTurnStop(assistantMessage, payload);
+          },
+          error(payload) {
+            streamError = new Error(payload.error || "The fetch decision failed");
+          },
+        },
+      );
+    } catch (error) {
+      streamError = error;
+    } finally {
+      indicator.finish("failed");
+      chatSubmitting = false;
+      setComposerBusy(false);
+    }
+    if (streamError) {
+      // The engine puts the pause back on a refusal, so a second attempt is
+      // still the same decision rather than a new one.
+      renderChatMessageError(assistantMessage, streamError);
+      status.textContent = streamError.message;
+      setDisabled(false);
+      return;
+    }
+    status.textContent = settledText;
+    await loadSessions(currentSessionId, false);
+    await refreshFindings();
+    void refreshRepoBar();
+  }
+
+  return wrapper;
+}
+
 // One verification continuation, streamed into a fresh assistant bubble. Used
 // by the patch card's settle trigger, the recovery offer, and the check card,
 // so all three render the report and any repair patch the same way.
@@ -11025,6 +11232,9 @@ function appendProposals(message, payload, repo) {
   }
   if (payload.questionProposal) {
     message.body.append(createQuestionCard(payload.questionProposal, repo));
+  }
+  if (payload.fetchProposal) {
+    message.body.append(createFetchApproval(payload.fetchProposal, repo));
   }
   if (payload.contextReview) {
     message.body.append(createContextReview(payload.contextReview, repo));
@@ -12517,6 +12727,12 @@ async function streamChatRequest(data, handlers, signal) {
 async function streamResumeCommandRequest(data, handlers) {
   const fallbackPath = data.approved === "true" ? "/api/run-command" : "/api/reject-command";
   return streamRequest("/api/resume-command-stream", fallbackPath, data, handlers);
+}
+
+// A fetch decision resumes the turn, so the non-streaming fallback carries the
+// same decision and answers with the whole turn result.
+async function streamResumeFetchRequest(data, handlers) {
+  return streamRequest("/api/resume-fetch-stream", "/api/fetch-decision", data, handlers);
 }
 
 // No non-streaming fallback: resuming a plan decision *is* a turn, and there is

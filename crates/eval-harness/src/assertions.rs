@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::record::AssertionOutcome;
 use crate::runner::Run;
 use crate::scenario::{Asserts, Tier};
+use crate::trace;
 
 /// Evaluates every asserted field. A `None` field is not asserted and produces
 /// no outcome, so a scenario's report lists exactly what it claimed.
@@ -701,6 +702,121 @@ pub fn evaluate(
                 format!("{wanted:?}"),
                 format!("missing from audit: {missing:?}"),
             );
+        }
+
+        // Spec 51 Task 9: what a fetched page did and did not cause. The
+        // request count is the stub server's own, not an inference; the audit
+        // counts are the engine's. A refused URL must show zero of each.
+        if let Some(expected) = asserts.fetch_requests {
+            push(
+                "fetch_requests",
+                run.stub_requests == expected,
+                expected.to_string(),
+                run.stub_requests.to_string(),
+            );
+        }
+
+        if let Some(expected) = asserts.fetch_audits {
+            let got = run.trace.count("web_fetch");
+            push(
+                "fetch_audits",
+                got == expected,
+                expected.to_string(),
+                got.to_string(),
+            );
+        }
+
+        if let Some(expected) = asserts.fetch_approval_decisions {
+            let got = run.trace.count("web_fetch_approval_decision");
+            push(
+                "fetch_approval_decisions",
+                got == expected,
+                expected.to_string(),
+                got.to_string(),
+            );
+        }
+
+        // The tool results are what the model was given, and the run record
+        // keeps only a marker reference, so these read the session log. An
+        // unreadable log fails every one of them: an exclusion over nothing
+        // would pass while proving nothing.
+        let tool_results = trace::tool_results(&run.data_dir);
+        if asserts.tool_results_contain.is_some()
+            || asserts.tool_results_exclude.is_some()
+            || asserts.tool_results_quoted.is_some()
+        {
+            let readable = tool_results.is_ok();
+            let joined = tool_results
+                .as_ref()
+                .map(|results| results.join("\n"))
+                .unwrap_or_default();
+
+            if let Some(wanted) = &asserts.tool_results_contain {
+                let missing: Vec<&String> = wanted
+                    .iter()
+                    .filter(|needle| !joined.contains(needle.as_str()))
+                    .collect();
+                push(
+                    "tool_results_contain",
+                    readable && missing.is_empty(),
+                    format!("{wanted:?}"),
+                    if missing.is_empty() {
+                        "all present".to_string()
+                    } else {
+                        format!("missing from tool results: {missing:?}")
+                    },
+                );
+            }
+
+            if let Some(unwanted) = &asserts.tool_results_exclude {
+                let present: Vec<&String> = unwanted
+                    .iter()
+                    .filter(|needle| joined.contains(needle.as_str()))
+                    .collect();
+                push(
+                    "tool_results_exclude",
+                    readable && present.is_empty(),
+                    format!("{unwanted:?} absent"),
+                    if readable {
+                        format!("present in tool results: {present:?}")
+                    } else {
+                        "the session log could not be read, so nothing was checked".to_string()
+                    },
+                );
+            }
+
+            if let Some(quoted) = &asserts.tool_results_quoted {
+                let mut missing: Vec<&String> = Vec::new();
+                let mut bare: Vec<String> = Vec::new();
+                for needle in quoted {
+                    let mut seen = false;
+                    if let Ok(results) = &tool_results {
+                        for result in results {
+                            for line in result.lines() {
+                                if line.contains(needle.as_str()) {
+                                    seen = true;
+                                    if !line.starts_with("> ") {
+                                        bare.push(line.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !seen {
+                        missing.push(needle);
+                    }
+                }
+                push(
+                    "tool_results_quoted",
+                    readable && missing.is_empty() && bare.is_empty(),
+                    format!("{quoted:?} only on quoted lines"),
+                    if !readable {
+                        "the session log could not be read".to_string()
+                    } else {
+                        format!("absent from tool results: {missing:?}; present unquoted: {bare:?}")
+                    },
+                );
+            }
         }
     }
 

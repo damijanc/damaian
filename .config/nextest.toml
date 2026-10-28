@@ -5,3 +5,10 @@
 [[profile.default.overrides]]
 filter = 'test(=a_before_task_complete_hook_that_always_denies_stops_at_the_round_budget)'
 slow-timeout = { period = "30s", terminate-after = 1 }
+
+# Spec 51 Task 4: a stop must kill the fetch. If the kill path regresses, the
+# test would wait out the stub's held connection instead of failing promptly;
+# terminate it after 20 s instead of hanging the job.
+[[profile.default.overrides]]
+filter = 'test(=a_stop_during_a_fetch_kills_curl)'
+slow-timeout = { period = "20s", terminate-after = 1 }
