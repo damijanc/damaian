@@ -14,7 +14,7 @@
 |---|---|---|
 | 1 · Folder, links, plan | Done 2026-10-28 | Moved the flat spec to `proposal.md`, added `context.md` (sixteen corrections, decisions D1–D12) and this plan, repointed every inbound link, and set `In progress` in the proposal, the README current-state bullets, the README implementation-order row and this header. Local checks: `npm run specs:check` passed (67 specs); `scripts/quality-gate.sh fmt node lint typos deny` — fmt, node, lint and typos passed, **`cargo deny check` failed on a pre-existing advisory** (`RUSTSEC-2026-0414`, `pulldown-cmark 0.13.4`; recorded in `context.md` §4, not touched here). |
 | 2 · Host approval storage | Done 2026-10-28 | Added `web_domain_allowlist` and `web_domain_allowlist.<repository id>` to `Config` and `ConfigOverlay` (values normalised to lower case, no trailing dot), folded per-repository grants into the effective list through `Config::apply_repository_web_domains` during `load_scoped`, and emitted both keys through `ConfigOverlay::to_policy_text` (the save path) and the effective `Config::to_policy_text`. Repository and profile scope reject both keys as `RepositoryKeyClass::Forbidden` and report them; `classify_overlay_fields!` marks both `Capability`; `split_profile_keys` refuses both; `effective_policy` has a label and list entry. Tests: two weakening cases, `repository_config_cannot_grant_a_web_host` (asserts the `Forbidden` class, not merely a refusal), the hostile-config equality check, `a_per_repository_web_grant_is_folded_only_for_its_repository`, and `web_domain_allowlist_survives_a_config_round_trip`. Scoped checks: `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest run -p workspace-engine --test permission_profiles --test repository_config_trust` 133 passed, 1 skipped, and because a config change is crate-wide the whole crate was run too — `cargo nextest run -p workspace-engine --locked` 1,902 passed, 27 skipped; `scripts/quality-gate.sh fmt node lint typos` clean. `cargo deny` still fails on the pre-existing `RUSTSEC-2026-0414` recorded in `context.md` §4. Falsification: `Capability`→`Preference` for the bare key fails the capability-cover test; forcing `trusted=true` for the repository merge fails both host tests; dropping the per-repository refusal from `split_profile_keys` fails the profile/merge agreement test; dropping the overlay policy line fails the round trip. **Deviation:** the tests were written after the implementation in this session, so Step 2's pre-implementation red run was not observed; the four mutations above are the evidence that each guard is load-bearing. |
-| 3 · URL inspection and the egress guard | Not started |  |
+| 3 · URL inspection and the egress guard | Done 2026-10-28 | New `crates/workspace-engine/src/external_reference.rs`: strict `ExternalUrl::parse` (http/https only, DNS or IPv4/IPv6 host, optional port, no userinfo, no whitespace/control, host lowercased and trailing dot dropped, default port normalised away, `approval_key()` for `Allow Always`, `request_url()` without the fragment); `HostAllowlist` parses each user-scope entry as `host` or `host:port` and reports wildcards, paths, userinfo and malformed ports through `Inspection.ignored_allowlist_entries` instead of comparing them as strings; `inspect` refuses a whole-URL secret (raw, percent-decoded and base64-decoded parameter values) and repository content (raw, percent-decoded, `+`-as-space and base64 forms of the query/fragment against trimmed 16-byte `read_file` lines) **before** the allowlist, so an approved host cannot carry a credential out; query/fragment over 128 bytes is flagged (`LongComponent`) and not blocked; `redirect_target` names a 3xx target and `may_follow()` is always false (D10). Tests: 9 in `tests/external_reference.rs`, 3 inline for percent/base64/host-entry parsing; `cargo nextest run -p workspace-engine --test external_reference` 9 passed; `--test repository_config_trust` 53 passed and `--test permission_profiles` 80 passed, 1 skipped (config touched); `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean. Falsification: scanning only the query (path secret accepted) fails `a_secret_in_the_query…`; raw-only comparison (percent/base64 fixtures accepted) fails `repository_content…`; `url.host.contains(entry)` (substring approval) fails `the_approval_decision…`; accepting `*.example.com` as a host fails `wildcard_path…`. **Boundary review resolved:** `Config::apply_repository_web_domains` now returns nothing — Task 7 reads the audit basis from `web_domain_allowlist_by_repository` at fetch time instead of a load-time snapshot that Task 8's `Allow Always` can invalidate; recorded in `context.md` §4. **Deviation:** the module was written before the tests in this session, so Step 2's red run was not observed; the four mutations above are the evidence each guard is load-bearing. **Naming:** `Decision` is the plan's `Approval` enum and `HostAllowlist` is its `HostApproval` matcher; `Inspection` also carries the parsed `url` and the ignored entries. **Files touched beyond the task list:** `config.rs` (return removed) and `lib.rs` (module plus re-exports); no `chat.rs`, no docs yet (Task 10 owns `SECURITY.md`/`TROUBLESHOOTING.md`/`USER_GUIDE.md`). **Task 4/7 note:** Task 4 should build the request from `request_url()` and classify a 3xx with `redirect_target()`; Task 7 must pass exactly the `read_file` contents of the task, not files reached another way (D9). |
 | 4 · Fetch transport and session cache | Not started |  |
 | 5 · Text conversion, redaction and injection markers | Not started |  |
 | 6 · Context category, assembly and inspector | Not started |  |
@@ -195,7 +195,7 @@ edits another worktree and none edits `build_model_prompt`.
 `crates/workspace-engine/src/lib.rs`, `crates/workspace-engine/tests/external_reference.rs`
 (new).
 
-- [ ] **Step 1: Write the failing unit tests.**
+- [x] **Step 1: Write the failing unit tests.**
   1. `only_http_and_https_urls_with_a_real_host_parse` — `http`, `https`, DNS
      host, IPv4, bracketed IPv6, explicit port; reject `file:`, `ftp:`,
      `javascript:`, empty host, `user:pass@host`, whitespace and control
@@ -210,8 +210,8 @@ edits another worktree and none edits `build_model_prompt`.
      display flag and still returns `NeedsApproval`/`Allowed`.
   6. `the_approval_decision_names_the_host_and_never_a_substring` — an approved
      `example.com` does not approve `example.com.evil` or `notexample.com`.
-- [ ] **Step 2: Confirm they fail** (the module does not exist).
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Confirm they fail** (the module does not exist).
+- [x] **Step 3: Implement.**
   - `ExternalUrl { raw, scheme, host, port, path, query, fragment }` and
     `ExternalUrl::parse`.
   - `HostApproval` from the config list: `Approval::AlreadyAllowed`,
@@ -225,11 +225,11 @@ edits another worktree and none edits `build_model_prompt`.
     base64-decoded value.
   - Percent-decoding and base64 decoding are small local functions with their
     own tests; no new dependency.
-- [ ] **Step 4: Falsify.** Scan only the query instead of the whole URL → a
+- [x] **Step 4: Falsify.** Scan only the query instead of the whole URL → a
   secret in the path is accepted. Compare against raw text only → the base64
   fixture is not refused. Match any substring of the host → the
   `example.com.evil` test approves.
-- [ ] **Step 5: Scoped checks.**
+- [x] **Step 5: Scoped checks.**
 
   ```bash
   scripts/quality-gate.sh fmt node lint typos deny
@@ -237,7 +237,7 @@ edits another worktree and none edits `build_model_prompt`.
   cargo nextest run -p workspace-engine --test external_reference
   ```
 
-- [ ] **Step 6: Update the Progress row** and commit:
+- [x] **Step 6: Update the Progress row** and commit:
   `Refuse a URL that carries a secret or repository content before asking`.
 
 ## Task 4: Fetch transport and session cache

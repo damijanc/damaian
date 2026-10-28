@@ -16,6 +16,7 @@ pub mod edit;
 pub mod effective_policy;
 pub mod embeddings;
 pub mod error;
+pub mod external_reference;
 pub mod file_access;
 pub mod finding;
 pub mod git_service;
@@ -116,6 +117,11 @@ pub use effective_policy::{
     rule_label,
 };
 pub use error::{ClientError, ProviderRefusal, Result};
+pub use external_reference::{
+    Decision, ExternalUrl, HostAllowlist, Inspection, InspectionFlags, LongComponent,
+    ReadFileContent, RedirectTarget, RefusalReason, UrlComponent, UrlParseError, UrlScheme,
+    inspect, redirect_target,
+};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};
 pub use git_service::{
     DiffOptions, GitFileStatus, GitHubRepo, GitReadCaps, GitService, GitStatus, GitSummary,

@@ -249,6 +249,24 @@ be presented as current.
   that dependency, so planning left it alone. It was fixed on `main` the same
   day as its own change (`ec9f7ea`), and this branch was rebased onto that
   commit, so the check now passes here.
+- **Review point from Task 2 resolved in Task 3: the fold returns nothing.**
+  `Config::apply_repository_web_domains` returned the hosts it added "so the
+  audit trail can name the basis of a later fetch", but the load path discarded
+  the value and no `RepositoryConfigReport` field held it. Task 3 removes the
+  return rather than adding one: the audit basis is the per-repository entry in
+  `web_domain_allowlist_by_repository`, which Task 7 can read at fetch time and
+  which Task 8's `Allow Always` writer changes in the same session. A load-time
+  snapshot would duplicate that list and go stale after an approval.
+- **Review point from Task 2 resolved in Task 3: allowlist entries are shape
+  validated, not just normalised.** `external_reference::HostAllowlist` parses
+  each entry as one host with an optional non-default port. Wildcards, paths,
+  userinfo, whitespace and malformed or empty ports are rejected and reported
+  through `Inspection.ignored_allowlist_entries`, never compared as strings; a
+  `*` entry therefore approves nothing and cannot become a pattern. The URL's
+  port is normalised away when it is the scheme default, and an entry's port is
+  compared exactly, so `Allow Always` must store
+  `ExternalUrl::approval_key()`. A default-port URL and the same host on a
+  non-default port remain different approvals (D8).
 
 ## 5. What later tasks inherit
 
@@ -262,3 +280,11 @@ be presented as current.
   the same change as the behaviour.
 - Task 10's injection scenarios are the evidence for requirement 4. A design
   argument is not evidence; record which fixtures ever succeeded.
+- Task 3's `external_reference::inspect` reports an unparsable URL as
+  `Err(UrlParseError)` and a secret or repository-content match as
+  `Ok(Inspection { decision: Decision::Refused(..) })`. Task 7 maps both to a
+  failed tool result. Task 4 should build the request from
+  `ExternalUrl::request_url()` (the fragment is already stripped) and classify a
+  3xx through `redirect_target()`, whose `may_follow()` is always false; Task 7
+  passes only `read_file` contents to `inspect`, never files reached another
+  way.

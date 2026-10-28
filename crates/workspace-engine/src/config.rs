@@ -2573,25 +2573,25 @@ impl Config {
     /// Kept separate from the command allowlist because the same host in a
     /// different checkout is a different decision.
     ///
-    /// Returns the hosts it added, so the audit trail can name the basis of a
-    /// later fetch without re-reading user config.
-    pub fn apply_repository_web_domains(&mut self, repository_root: &Path) -> Vec<String> {
+    /// Returns nothing: the audit basis for a later fetch is read from
+    /// [`Self::web_domain_allowlist_by_repository`] when the fetch happens, which
+    /// is the same list this folds and stays correct if user config changes
+    /// after the load. A load-time snapshot would only duplicate it.
+    pub fn apply_repository_web_domains(&mut self, repository_root: &Path) {
         let repository_id = repository_id_for_root(repository_root);
         let Some(entries) = self.web_domain_allowlist_by_repository.get(&repository_id) else {
-            return Vec::new();
+            return;
         };
-        let mut added = Vec::new();
-        for entry in entries.clone() {
+        let entries = entries.clone();
+        for entry in entries {
             if !self
                 .web_domain_allowlist
                 .iter()
                 .any(|existing| existing.eq_ignore_ascii_case(&entry))
             {
-                self.web_domain_allowlist.push(entry.clone());
-                added.push(entry);
+                self.web_domain_allowlist.push(entry);
             }
         }
-        added
     }
 
     /// The resolved values spec 31's refusal points consult.
