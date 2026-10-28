@@ -51,6 +51,7 @@ pub struct WorkspaceEngine {
     pub git: GitService,
     pub patch_engine: PatchEngine,
     pub commit: crate::commit::CommitEngine,
+    pub branch: crate::branch::BranchEngine,
     pub checkpoint_store: CheckpointStore,
     pub session_store: SessionStore,
     pub memory_store: MemoryStore,
@@ -197,6 +198,14 @@ impl WorkspaceEngine {
             git.clone(),
             command_runner.clone(),
         );
+        let branch = crate::branch::BranchEngine::new(
+            config.clone(),
+            audit_log.clone(),
+            scanner.clone(),
+            path_policy.clone(),
+            session_store.clone(),
+            git.clone(),
+        );
         let edit_orchestrator = EditOrchestrator::new(
             config.clone(),
             scanner.clone(),
@@ -223,6 +232,7 @@ impl WorkspaceEngine {
             git,
             patch_engine,
             commit,
+            branch,
             checkpoint_store,
             session_store,
             memory_store,

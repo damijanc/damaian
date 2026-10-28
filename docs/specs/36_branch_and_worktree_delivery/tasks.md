@@ -17,7 +17,7 @@ wins.
 | 1 · Read-only branch information | Done 2026-10-28 | Added `BranchInfo` (camelCase serde) and `GitService::branch_info` in `git_service.rs`: current branch, full `HEAD`, detached, upstream via `rev-parse @{upstream}`, ahead/behind through the existing helper, in-progress operation from Git-resolved marker paths including `BISECT_LOG`, and unmerged paths via `git diff --diff-filter=U -z` filtered by the restricted-path rule. `merge_base` is now public and validates `base` before git runs. `head_oid` is `Option<String>` because an unborn branch has no commit (context §3.13/D5). Audit is `git_branch_read` with counts and no restricted path names. New `tests/branch_delivery.rs` has 10 tests: upstream 0/0 → 1/0 → 0/1 → 1/1, detached, unborn, real conflicted merge, clean state, merge-base and option-shaped base refusal, byte-identical index/HEAD/status across reads, restricted conflicting `.env` omitted, non-repository refusal, and camelCase JSON. Falsified by swapping ahead/behind (test failed) and by skipping the `MERGE_HEAD` scan (test failed), then restoring. Scoped checks: `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest -p workspace-engine --test branch_delivery --test worktree_reads` 58 passed. No `chat.rs` change. |
 | 2 · Suggested branch name | Done 2026-10-28 | Added `git_branch_prefix` (`Config` default `damaian/`, `ConfigOverlay` field, parse/serialise, `ConfigKeyKind::Preference`, repository-scope `preference()` merge, policy text, profile split refuses it) and the config-key record updates. New `branch.rs` has `slugify_branch_title` (lowercase ASCII, separator runs, 50-char cap, `change` fallback), `validate_branch_prefix` (empty allowed; rejects `@{`, `..`, `//`, leading `-`/`/`, control/special characters, `.lock` components, trailing `.`), `BranchSuggestion`, and `suggest_branch_name`, which redirects the source through `SecretScanner::redact` before slugging (D10). `GitService` gained `check_branch_name` (authoritative `git check-ref-format --branch`) and `local_branches` (one `for-each-ref`); a collision keeps the name unchanged and offers the first free `-2`/`-3` alternative. Six new branch tests: slug bounds/unicode, default prefix, collision and alternative, empty/invalid prefixes including `feature@{1}/`, Git-authoritative valid/invalid names, and a seeded AWS key absent from the name. One new permission test proves a repository may choose the prefix and a profile may not. Falsified by removing the redaction call: the secret test failed with `damaian/rotate-akiaiosfodnn7example-before-release`, then restored. Scoped checks: `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest -p workspace-engine --test branch_delivery --test permission_profiles --test foundation` 268 passed (1 skipped); fast gate `fmt node typos` clean. `cargo deny check` fails on RUSTSEC-2026-0414 in `pulldown-cmark` 0.13.4, a dependency this task does not touch (context §6). Discovery recorded in context §3.14: Git 2.56's `check-ref-format` rejects `--end-of-options`, so leading-`-` refusal stays in Rust. No `chat.rs` change. |
 | 3 · The `allow_git_branches` capability | Done 2026-10-28 | Added `allow_git_branches` through the same four-file pattern as `allow_git_commits`: `Config` default `true`, `ConfigOverlay` field with parse/serialise, `ConfigKeyKind::Capability`, restrict-only in `apply_overlay_scoped`, `Config::to_policy_text`, `ProfileCapabilities.allow_git_branches` and `Config::profile_capabilities`, the Read-only overlay turns it off, `split_profile_keys` carries it, and `rule_label` gives it "Git branches allowed". Tests in `tests/permission_profiles.rs`: the weakening case (repository `true` over user `false` refused as restrict-only), a new two-load `a_repository_may_deny_git_branches_and_may_not_grant_them`, `allow_git_branches_is_a_capability_key_with_a_human_name`, default `true`, the Read-only row in `each_built_in_profile_resolves_to_its_table_row` now expects false (all other built-ins true), and `EVERY_PROFILE_KEY` carries the new key. Falsified by passing `restrictive = true` for the new key in `apply_overlay_scoped`: `every_capability_key_resists_weakening_from_repository_scope` failed with "repository value was not refused as allow_git_branches; got []" and the denial test failed at `!denied.allow_git_branches`; restored and both pass. Scoped checks: `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest -p workspace-engine --test permission_profiles --test branch_delivery --test foundation` 270 passed (1 skipped); `cargo nextest -p workspace-engine --lib` 579 passed (5 skipped). No behaviour is wired, per the task and D1: no branch mutation entry point exists yet (Task 4 adds `prepare_*`/`apply`), and the only existing branch-creating path, spec 57's `worktree.rs` `git worktree add -b`, is its own `enable_worker_sessions` facility, not this capability. Task 4 must gate every `prepare_*` on `config.profile_capabilities().allow_git_branches` and Code mode. Observation, not changed: `EVERY_PROFILE_KEY` never gained `allow_git_commits` in spec 35; only the new key was added here. The repeated `rev-parse --git-path` calls noted in review were left alone as instructed. No `chat.rs` change. |
-| 4 · Branch creation and switching | Not started | — |
+| 4 · Branch creation and switching | Done 2026-10-28 | Added `GitMutation` (`CreateBranch`/`SwitchBranch`, internally tagged camelCase, no catch-all), `BranchPreparation`, `BranchRecord`, `BranchOutcome`, `BranchInspection`, `BranchError` (`code()`/`message()`), and `BranchEngine` in `branch.rs`; `WorkspaceEngine` gains `branch` built with config, audit log, scanner, path policy, session store and `GitService`. `prepare_create(name, start_point, session_id)` and `prepare_switch(name, session_id)` refuse a non-repository, unknown session, non-Code mode, `allow_git_branches == false`, any in-progress operation, detached `HEAD` without an explicit start, unborn `HEAD`, invalid/option-shaped names and start points, a collision, and a missing switch target; every refusal is a reason in the preparation plus `git_branch_refused`. Creation resolves the start with `rev-parse --verify -q --end-of-options <start>^{commit}` (default `HEAD`) and records the resolved SHA in the mutation; `git branch <name> <sha>` leaves `HEAD`/index/tree untouched. Switching resolves `refs/heads/<name>`, intersects `HEAD..target` changed paths with `git.changes`' changed/untracked paths (restricted paths filtered by `PathPolicy`), names the paths in the refusal and re-checks at apply; the command is `git switch --no-guess <name>`. `apply(prepare_id, approved_mutation, approved_by)` requires the exact mutation, a `prepared` record, and re-checks Code mode, `allow_git_branches`, in-progress state, `HEAD`/ref expectations; it creates a synthetic `RunningTool` task, starts `start_action(..., true)` with `git_branch_create`/`git_branch_switch`, runs through `checkpoint::run_user_git`, records the exact `user_git_command_line`, finishes the marker, marks the record `applied` (or `failed`) and audits `git_branch_created`/`git_branch_switched` with refs, start point, `approvedBy`, head before/after and outcome. `inspect` compares `show-ref --verify` with the record and reports `landed`/`not_landed`/`other_ref_state` without retrying; a creation left `prepared` but already at its resolved start reports `landed` (crash-after-command is a read, not a guess). Ten new tests in `tests/branch_delivery.rs`: creation byte-identical index/HEAD/status with the ref at the start point; create-then-switch and switching an existing branch move HEAD and files; Ask/Plan/Review and `allow_git_branches=false` refused at prepare and again at apply (record survives a policy refusal); mid-merge and detached (refused without a start point, allowed with one); collision/invalid/option-shaped/unresolved; dirty switch names paths at prepare and at apply; retargeted approval and second apply refused; dangling record inspect; marker pair + audit; no `-f`/`--force`. Falsified by adding `-f` to creation (no-force test failed), disabling the existing-ref refusal (collision test failed) and skipping the `prepared` check (consumption test failed), then restoring. Scoped checks: `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest run -p workspace-engine --test branch_delivery --test permission_profiles` 109 passed, 1 skipped. Deviations: the mutation carries the resolved SHA while the preparation/record report the original start point and SHA; apply re-checks dirty-switch paths (stricter than the task's "before switching"); `BranchEngine::suggest` is a read-only convenience so the configured prefix and redaction have one entry point for Task 7; `finish_preparation` has a targeted `#[allow(clippy::too_many_arguments)]` as `commit.rs` does; `show-ref` failure is treated as "ref absent" and Git's own `git branch` refusal remains the backstop. No `chat.rs`, `git_service.rs` or spec 57 `worktree.rs` change; Task 5 starts from `BranchRecord`/`apply`/`inspect` and must add `DeleteBranch` to every exhaustive match (`name`, `action`, `audited_verb`, `reference`, `finish_preparation`'s `expected_ref_oid`, `inspect`'s `expected_oid`, apply's expected-state/dirty branches). |
 | 5 · Branch deletion with the unmerged confirmation | Not started | — |
 | 6 · Merge and rebase preparation without executing either | Not started | — |
 | 7 · Shell routes and the branch dialog | Not started | — |
@@ -278,16 +278,16 @@ repository config cannot grant it. No behaviour is wired until Task 4.
 `SwitchBranch`; creation leaves `HEAD` unchanged; switching updates the index
 and working tree; every refusal names why.
 
-- [ ] Define `GitMutation` with one variant per operation:
+- [x] Define `GitMutation` with one variant per operation:
       `CreateBranch { name, start_point }` and `SwitchBranch { name }` (add
       `DeleteBranch` in Task 5). There is no catch-all variant.
-- [ ] Define the durable `BranchRecord` and its `<data_dir>/branches/` store:
+- [x] Define the durable `BranchRecord` and its `<data_dir>/branches/` store:
       `prepare_id`, repository root, session id, mutation, resolved start SHA,
       expected state, `BranchInfo` snapshot, state
       (`prepared`/`applied`/`failed`), `created_ref`, `applied_at_ms`, and the
       command lines actually run. A `prepare_id` is loaded and compared at apply
       time; a record not in `prepared` state is refused.
-- [ ] `BranchEngine` in `branch.rs`, built in `workspace_engine.rs` with the
+- [x] `BranchEngine` in `branch.rs`, built in `workspace_engine.rs` with the
       config, audit log, scanner, session store, path policy and `GitService`.
       `prepare_create(name, start_point, session_id)` and
       `prepare_switch(name, session_id)` return a `BranchPreparation` with
@@ -296,30 +296,30 @@ and working tree; every refusal names why.
       than Code, `allow_git_branches == false`, any `in_progress_operation`,
       detached `HEAD` for creation without an explicit start point, unborn
       `HEAD` for creation, an invalid name, and an existing target ref.
-- [ ] Resolve the start point with
+- [x] Resolve the start point with
       `git rev-parse --verify -q --end-of-options <start>^{commit}`, defaulting
       to `HEAD`; reject an option-shaped or unresolvable value before any
       branch command. Report the original and resolved SHA.
-- [ ] Creation runs `git branch <name> <resolved-sha>` through
+- [x] Creation runs `git branch <name> <resolved-sha>` through
       `checkpoint::run_user_git`; it never switches. Switching runs
       `git switch --no-guess <name>` (D6), never `symbolic-ref`, so the index and
       working tree move with `HEAD`.
-- [ ] Dirty-switch refusal (D15): before switching, intersect the paths that
+- [x] Dirty-switch refusal (D15): before switching, intersect the paths that
       differ between `HEAD` and the target with the working tree's changed and
       untracked paths, and refuse naming those paths. Let Git's own check remain
       the backstop.
-- [ ] `apply(prepare_id, approved_mutation, approved_by)` requires the exact
+- [x] `apply(prepare_id, approved_mutation, approved_by)` requires the exact
       mutation value from the record and consumes the record. A second apply, a
       different mutation, or a stale record is refused without running git.
       There is no persistent approval.
-- [ ] Bracket the mutation with the synthetic task + `start_action(..., true)` /
+- [x] Bracket the mutation with the synthetic task + `start_action(..., true)` /
       `finish_action` pattern from `commit.rs:781`–`:843`, and audit
       `git_branch_created` / `git_branch_switched` with refs, start point,
       approvedBy, and outcome. Record `git_branch_refused` for a policy refusal.
-- [ ] `inspect(prepare_id)` compares `show-ref --verify refs/heads/<name>` with
+- [x] `inspect(prepare_id)` compares `show-ref --verify refs/heads/<name>` with
       the record's expected state and reports `landed`/`not landed`/`other ref
       state`; it never retries.
-- [ ] Tests: creation leaves `HEAD` and the index unchanged and the ref exists at
+- [x] Tests: creation leaves `HEAD` and the index unchanged and the ref exists at
       the start point; create-then-switch moves `HEAD` and the working tree to
       the new branch; switching an existing branch updates files; Ask/Plan/Review
       and `allow_git_branches=false` are refused; mid-merge and detached states
@@ -328,14 +328,14 @@ and working tree; every refusal names why.
       a second apply is refused; a dangling record's `inspect` reports the ref
       truthfully; the constructed command lines contain neither `-f` nor
       `--force`; the marker pair and audit exist.
-- [ ] Run `cargo fmt --all`; scoped checks:
+- [x] Run `cargo fmt --all`; scoped checks:
       `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`,
       `cargo nextest run -p workspace-engine --test branch_delivery`, and
       `cargo nextest run -p workspace-engine --test permission_profiles`.
-- [ ] Falsify: make creation use `git branch -f`, confirm the force-flag and
+- [x] Falsify: make creation use `git branch -f`, confirm the force-flag and
       existing-ref tests fail; restore. Make `apply` reuse a record twice and
       confirm the consumption test fails; restore.
-- [ ] Update the progress row and commit. If this task grows past the creation
+- [x] Update the progress row and commit. If this task grows past the creation
       and switching boundary, stop at the last coherent point and record the
       deviation rather than folding deletion in.
 

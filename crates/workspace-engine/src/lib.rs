@@ -57,8 +57,9 @@ pub mod worktree_access;
 
 pub use audit::AuditLog;
 pub use branch::{
-    BRANCH_SLUG_MAX_CHARS, BranchSuggestion, slugify_branch_title, suggest_branch_name,
-    validate_branch_prefix,
+    BRANCH_SLUG_MAX_CHARS, BranchEngine, BranchError, BranchInspection, BranchOutcome,
+    BranchPreparation, BranchRecord, BranchSuggestion, GitMutation, slugify_branch_title,
+    suggest_branch_name, validate_branch_prefix,
 };
 pub use cancel::CancelToken;
 pub use chat::{
