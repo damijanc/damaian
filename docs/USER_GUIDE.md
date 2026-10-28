@@ -444,6 +444,12 @@ grows past the window, and you can always compact by hand.
 - **Repository config cannot set this key.** A clone cannot choose to spend your
   money on a summary call, or choose to lower what the model sees in your
   sessions.
+- **Repository config may shrink the window only so far.** A repository or an
+  imported profile may lower `conversation_window_share` (the share of the
+  context budget kept verbatim) to no less than 5%. A smaller window would be
+  exceeded on every turn, which turns the "restriction" into a paid summary call
+  every time. Your own config has no such floor — the choice and the bill are
+  yours.
 
 **What you see.** The transcript is complete. Nothing is deleted or rewritten:
 compaction adds one record to the session log, and every original message stays

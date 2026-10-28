@@ -192,6 +192,16 @@ the threshold from the window would let the threshold trigger a compaction that
 cannot change what is sent. [`context.md`](context.md) §3 records why #26's
 category is not used.
 
+An untrusted scope — repository config or an imported profile — may lower the
+window, but not below **5%** of the context budget (`0.05`, held as
+`MIN_UNTRUSTED_WINDOW_SHARE_BPS`). Below that the "restriction" stops being a
+restriction and becomes a bill: a window of a few tokens is exceeded by every
+turn, so automatic compaction makes a model call on every turn at the repository
+author's direction and the user's expense. The floor keeps the restrict-only
+model coherent — a repository still narrows what the model sees, it just cannot
+narrow it into a per-turn spend. The user's own config is not floored; there the
+choice and the bill are theirs, and §7's live scenario relies on that.
+
 Everything older than the window is represented by one summary. Everything
 inside it goes as it does today. The 2,000-character cut inside a kept message
 stays for now — it is a different lossiness, it announces itself, and widening it
@@ -554,7 +564,9 @@ both are stated as such rather than inferred.
   deterministic scenarios set `0.01` so a seeded conversation crosses it; in
   real use the default is the number to read. It is also the automatic
   threshold, because a threshold that does not equal the window could trigger a
-  compaction that changes nothing (context.md D2).
+  compaction that changes nothing (context.md D2). A repository or imported
+  profile may lower it no further than `0.05`; the floor is the review fix
+  recorded at the end of this section.
 - **Trigger rate:** the deterministic tier now runs 30 scenarios; **two** of
   them exercised compaction (the two named above). That is a fixture count, not
   a measurement of real sessions, and it is recorded as such.
@@ -563,10 +575,13 @@ both are stated as such rather than inferred.
   fourth summary drifts is still open. What is proved structurally is that each
   summary is an input to the next, that the fact half accumulates rather than
   shrinking — objective, files changed, plan steps, approvals and validation
-  carry forward, and the later record wins on a conflict
-  (`a_second_compaction_summarises_the_first_one_plus_what_followed`,
-  `a_merge_carries_earlier_facts_and_lets_the_new_span_win`) — and that the
-  covered-message count accumulates. The
+  carry forward, and the later record wins on a conflict — and that the
+  covered-message count is the exact number of messages the summary stands in
+  for (`a_second_compaction_summarises_the_first_one_plus_what_followed`). The
+  carry-forward is not implemented by merging the previous summary's facts: the
+  fact reader reads the whole active log up to the new boundary, so the previous
+  span is re-derived from the transcript rather than copied from a derived
+  record (review fix 4c). The
   question §7 asks — how far a third or fourth summary drifts — remains open and
   is the first thing a live tier should measure. Nothing is lost to make that
   possible: the original messages stay in the log, so a future change can
@@ -616,10 +631,12 @@ because the mock provider's budget is 16,000 (a 160-token window). The coupling
 was accidental and undocumented.
 
 Both injection scenarios now set `conversation_window_share=0.0001`, the
-smallest the config accepts (one basis point), and say why in the file: a
+smallest the config parser accepts (one basis point), and say why in the file: a
 few-token window under any provider budget, so the scenario does not depend on
-which provider runs it. The deterministic tier still passes with 11 of the 12
-seeded messages summarised instead of a handful.
+which provider runs it. The harness applies a scenario's overlay at user scope,
+so the repository floor added in review (`0.05`) does not apply here. The
+deterministic tier still passes with 11 of the 12 seeded messages summarised
+instead of a handful.
 
 **The post-fix live run passed.** Provider `deepseek`, model
 `deepseek-v4-flash`; 3 model calls (the summarisation plus the turn), 14,945
@@ -671,3 +688,77 @@ Three defects found in review, fixed before hand-off:
   `the_boundary_counts_match_the_prompt_when_a_plan_reminder_is_present`, which
   compares the payload's `omittedMessages` with the count in the request's
   elision notice.
+
+### Review fixes (2026-10-28)
+
+A second review, after the spec was on `main`, found the defects below. Each was
+checked against the code before it was changed; two findings needed a different
+remedy from the one proposed, and the reasons are recorded with them.
+
+- **4a — the covered-message count was doubled.** `facts_for_span` counts every
+  active message at or before `through_seq`, starting from the first message in
+  the log; the second summary therefore already counted the first summary's
+  span. `merge_summary_facts` added `previous.message_count` on top, so a third
+  compaction would have reported the span three times. The counters agree exactly
+  with `read_conversation().summarised_messages` now, and the tests assert
+  equality rather than `> 0`
+  (`a_second_compaction_summarises_the_first_one_plus_what_followed`,
+  `compaction_with_the_model_stubbed_out_still_has_every_fact`).
+- **4c — the second-compaction test did not need the merge.** Confirmed, but the
+  proposed remedy (seed a fact that exists only in the first span) cannot work:
+  the fact reader reads the whole active log up to the new boundary, so every
+  fact from the first span is re-derived from the transcript, and only facts
+  that are in the log can be in a summary at all. `merge_summary_facts` had no
+  remaining effect except the double count, so it was **removed** instead of
+  given a stronger test. The test now proves the real mechanism — the second
+  summary's facts, including the original objective and the first span's file,
+  approval and validation, come from the log — and asserts the exact count.
+- **4d — a repository could force a paid summary call on every turn.**
+  `conversation_window_share` accepted one basis point from an untrusted scope,
+  making every turn exceed the threshold. Untrusted scopes are now floored at
+  `0.05` (`MIN_UNTRUSTED_WINDOW_SHARE_BPS`), refused and reported as
+  `restrict_only`, in both `Config::apply_overlay_scoped` and
+  `split_profile_keys`. The user's own config is not floored. Covered by
+  `an_untrusted_scope_cannot_shrink_the_conversation_window_past_the_floor` and
+  `a_profile_cannot_shrink_the_conversation_window_past_the_floor`.
+- **4e — injected line breaks in engine facts.** Plan titles, approval subjects,
+  check labels, finding summaries and file paths reach the rendering without
+  being model-written, but a newline in one could still emit a line of its own —
+  including a fake `--- end prior conversation summary ---`, which would place
+  the rest of the request outside the block that says it is quoted data. Every
+  continuation line is now prefixed; covered by
+  `a_newline_in_a_fact_cannot_end_the_block_early`.
+- **4e — the summary was not charged to the window.** `build_conversation` sized
+  the message window from the full budget and then prepended the summary, so a
+  compacted request could carry the summary *plus* a whole window. The rendered
+  summary's tokens are subtracted from the window budget now, both when the
+  request is assembled and when a compaction decides how much of the span to
+  leave outside the summary; covered by
+  `the_summary_is_charged_to_the_same_window_as_the_messages`.
+- **4e — the approvals digest grew without bound.** It is capped at the newest
+  20 (`MAX_APPROVAL_ITEMS`), like the plan-step and validation lists; covered by
+  `the_approvals_digest_is_bounded_at_the_newest_entries`.
+- **4e — the `failedApproaches` alias applied to every key.** A reply naming only
+  `failedApproaches` copied that list into `constraints`, `decisions` and
+  `uncertainty` as well. The alias now applies only to its own field; covered by
+  `only_failed_approaches_answers_to_the_camel_case_alias`.
+- **4e — a failed manual compaction was not audited.** Recording lived in the
+  turn-boundary caller, so `POST /api/compact` returned `failed` with nothing in
+  the audit log. The recording moved into `ChatOrchestrator::compact_conversation`,
+  which both routes call; covered by `a_compaction_failure_is_audited_where_it_happens`.
+
+Known limits recorded rather than fixed in this pass:
+
+- **Material dropped past 24,000 characters is still marked as summarised.**
+  `transcript_for_summary` drops the oldest material from the summarisation
+  call's input, but the summary's boundary still covers every message up to
+  `through_seq`. The facts (objective, files, steps, approvals, validation) are
+  engine-read and unaffected; the narrative may miss an old constraint. Fixing
+  it means either bounding the boundary to the material actually sent or
+  recording the gap in the summary format, and neither is contained enough for a
+  review fix.
+- **4b, carrying previous summary facts forward on a failed call, is deferred.**
+  It touches `chat.rs`, which spec 51 owns until it merges. The failure path
+  currently produces a facts-only summary whose facts are re-read from the log up
+  to the boundary, so the loss is the narrative half of the previous summary, not
+  its facts.

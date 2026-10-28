@@ -1836,16 +1836,25 @@ impl Config {
             self.memory_user_scope_enabled = value;
             outcome.record(scope, "memory_user_scope_enabled", None, false);
         }
-        if let Some(value) = conversation_window_share
-            && let Some(loosened) = restrict_only_share(
+        if let Some(value) = conversation_window_share {
+            // Spec 55 §5.1: a repository may lower the window, but not below
+            // the floor. Below it every turn exceeds the threshold, so the
+            // "restriction" becomes a paid summary call on every turn — spend
+            // decided by the repository's author and billed to the user.
+            if !trusted && value < crate::compaction::MIN_UNTRUSTED_WINDOW_SHARE_BPS {
+                rejected.push(RejectedConfigKey::new(
+                    "conversation_window_share",
+                    RepositoryKeyClass::RestrictOnly,
+                ));
+            } else if let Some(loosened) = restrict_only_share(
                 &mut self.conversation_window_share,
                 value,
                 "conversation_window_share",
                 trusted,
                 rejected,
-            )
-        {
-            outcome.record(scope, "conversation_window_share", None, loosened);
+            ) {
+                outcome.record(scope, "conversation_window_share", None, loosened);
+            }
         }
 
         // Spec 26 §5.2: each category share is restrict-only and lower-wins —
@@ -3547,7 +3556,11 @@ impl ConfigOverlay {
                 self.memory_user_scope_enabled = Some(parse_bool(key, value)?)
             }
             // A zero window would compact on every turn; a window above the
-            // whole budget would leave nothing to compact against.
+            // whole budget would leave nothing to compact against. The parser
+            // accepts the smallest value for the user's own config; an
+            // untrusted scope is floored in `apply_overlay_scoped` instead,
+            // because there the same setting spends the user's money (spec 55
+            // §5.1).
             "conversation_window_share" => {
                 let share = parse_basis_points(key, value)?;
                 if !(1..=10_000).contains(&share) {
