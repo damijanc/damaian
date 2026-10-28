@@ -109,6 +109,9 @@ pub enum ProcessKind {
     ModelCall,
     Terminal,
     Command,
+    /// A spec 51 `fetch_url` request. Its own kind so a sweep's audit names the
+    /// request that left the machine rather than an ordinary command.
+    Fetch,
     /// A spec 32 hook executable.
     Hook,
     /// A spec 57 worker process. The **shell** registers it (owner = shell),
@@ -128,6 +131,7 @@ impl ProcessKind {
             Self::ModelCall => "model_call",
             Self::Terminal => "terminal",
             Self::Command => "command",
+            Self::Fetch => "fetch",
             Self::Hook => "hook",
             Self::Worker => "worker",
             Self::LanguageServer => "language_server",

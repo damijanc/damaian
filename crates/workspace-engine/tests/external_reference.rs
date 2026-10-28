@@ -1,12 +1,24 @@
-//! The egress guard for external reference retrieval (spec 51 §5.3, D4, D9).
+//! The egress guard and fetch transport for external reference retrieval
+//! (spec 51 §5.3, §5.5, D3, D4, D9, D10, D12).
 //!
-//! These tests pin the five refusals that must happen before an approval
-//! dialog exists: a non-http(s) URL, a secret anywhere in the URL, repository
-//! content in the query or fragment, an allowlist entry that is not a host, and
-//! an approval that would match a substring. None of them makes a request.
+//! The first half of this file pins the five refusals that must happen before an
+//! approval dialog exists: a non-http(s) URL, a secret anywhere in the URL,
+//! repository content in the query or fragment, an allowlist entry that is not a
+//! host, and an approval that would match a substring. The second half pins the
+//! request itself against a loopback stub: no credential leaves, no redirect is
+//! followed, the body is bounded and redacted, and the cache is per session.
+//! Nothing here reaches the internet.
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use workspace_engine::{
-    Config, ConfigOverlay, Decision, ExternalUrl, InspectionFlags, ReadFileContent, RefusalReason,
+    CancelToken, ClientError, Config, ConfigOverlay, CurlFetchTransport, Decision, ExternalUrl,
+    InspectionFlags, ProcessIdentity, ProcessKind, ProcessRegistry, ReadFileContent, RefusalReason,
     SecretScanner, UrlScheme, inspect, redirect_target,
 };
 
@@ -404,4 +416,528 @@ fn a_redirect_target_is_named_and_never_followed() {
     assert!(unsupported.url.is_none());
     assert!(!unsupported.may_follow());
     assert!(ExternalUrl::parse("file:///etc/passwd").is_err());
+}
+
+// A loopback stub exactly as the desktop-shell tests use: bound to
+// `127.0.0.1:0`, released when the value is dropped. This is not real network
+// access, but it is still never `127.0.0.1:4765`.
+mod stub {
+    use super::*;
+
+    pub struct Response {
+        pub status: &'static str,
+        pub content_type: Option<&'static str>,
+        pub location: Option<&'static str>,
+        pub body: Vec<u8>,
+        /// Whether to send a `content-length`. Off for a response that must be
+        /// cut short mid-stream, so curl cannot know the size up front.
+        pub declare_length: bool,
+        /// Keep the connection open this long after the body, so a fetch can be
+        /// interrupted while it is still waiting for the end of the response.
+        pub hold: Option<Duration>,
+    }
+
+    impl Response {
+        pub fn ok(content_type: &'static str, body: impl Into<Vec<u8>>) -> Self {
+            Self {
+                status: "200 OK",
+                content_type: Some(content_type),
+                location: None,
+                body: body.into(),
+                declare_length: true,
+                hold: None,
+            }
+        }
+
+        pub fn redirect(location: &'static str) -> Self {
+            Self {
+                status: "302 Found",
+                content_type: None,
+                location: Some(location),
+                body: Vec::new(),
+                declare_length: true,
+                hold: None,
+            }
+        }
+    }
+
+    pub struct Stub {
+        port: u16,
+        requests: Arc<AtomicUsize>,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Stub {
+        pub fn start(responder: impl Fn(usize) -> Response + Send + 'static) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback stub");
+            let port = listener.local_addr().expect("local addr").port();
+            listener
+                .set_nonblocking(true)
+                .expect("a polling accept loop");
+            let requests = Arc::new(AtomicUsize::new(0));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let handle = {
+                let requests = requests.clone();
+                let shutdown = shutdown.clone();
+                std::thread::spawn(move || {
+                    let mut served = 0;
+                    loop {
+                        if shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                stream.set_nonblocking(false).expect("blocking stream");
+                                let index = served;
+                                served += 1;
+                                requests.fetch_add(1, Ordering::SeqCst);
+                                read_request(&mut stream);
+                                write_response(&mut stream, responder(index));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+            };
+            Self {
+                port,
+                requests,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        pub fn base_url(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+
+        pub fn url(&self, path: &str) -> ExternalUrl {
+            ExternalUrl::parse(&format!("{}{path}", self.base_url()))
+                .expect("the stub URL should parse")
+        }
+
+        pub fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Stub {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            // Wakes the polling accept loop so it can observe the flag; a
+            // refused connection means it already stopped.
+            let _ = TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_response(stream: &mut TcpStream, response: Response) {
+        let mut head = format!("HTTP/1.1 {}\r\n", response.status);
+        if let Some(content_type) = response.content_type {
+            head.push_str(&format!("content-type: {content_type}\r\n"));
+        }
+        if let Some(location) = response.location {
+            head.push_str(&format!("location: {location}\r\n"));
+        }
+        if response.declare_length {
+            head.push_str(&format!("content-length: {}\r\n", response.body.len()));
+        }
+        head.push_str("connection: close\r\n\r\n");
+        // A client that stops at the cap closes the connection under the
+        // writer, so a failed write is the expected outcome of truncation.
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&response.body);
+        let _ = stream.flush();
+        if let Some(hold) = response.hold {
+            std::thread::sleep(hold);
+        }
+    }
+}
+
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "damaian-fetch-{name}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch data dir");
+    dir
+}
+
+fn transport_for(data_dir: &Path, session_id: &str, max_bytes: usize) -> CurlFetchTransport {
+    let registry = ProcessRegistry::open(data_dir).expect("the process registry should open");
+    CurlFetchTransport::new(
+        registry,
+        data_dir,
+        session_id,
+        SecretScanner::new(Vec::new()),
+    )
+    .with_max_bytes(max_bytes)
+}
+
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+#[test]
+fn the_request_carries_no_authorization_cookie_or_api_key() {
+    let config = Config {
+        // Stands in for whatever the model transport would send to a provider.
+        // No part of this transport may be able to read it.
+        model_api_key_env: "sk_live_fetch_must_never_send_this".to_string(),
+        ..Config::default()
+    };
+    let data_dir = scratch_dir("credentials");
+    let transport = transport_for(&data_dir, "session_credentials", 1024);
+    let url = ExternalUrl::parse("https://docs.rs/serde/latest/serde/").expect("a valid URL");
+    let config_text = transport.curl_config(&url, Path::new("/tmp/fetch.headers"));
+    let args = CurlFetchTransport::curl_args();
+
+    assert!(
+        !args
+            .iter()
+            .any(|arg| *arg == "-L" || arg.starts_with("--location")),
+        "a redirect-following argument would turn an approved host into any host"
+    );
+    assert!(config_text.lines().all(|line| {
+        !line.contains("--location") && !line.trim_start().starts_with("location =")
+    }));
+    for forbidden in [
+        "authorization",
+        "cookie",
+        "bearer",
+        "api_key",
+        &config.model_api_key_env,
+    ] {
+        let forbidden = forbidden.to_lowercase();
+        assert!(
+            !config_text.to_lowercase().contains(&forbidden),
+            "the request config must not carry {forbidden:?}: {config_text}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.to_lowercase().contains(&forbidden)),
+            "the curl arguments must not carry {forbidden:?}"
+        );
+    }
+
+    let headers: Vec<&str> = config_text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("header ="))
+        .collect();
+    assert_eq!(
+        headers.len(),
+        2,
+        "the only headers are the fixed user agent and Accept: {headers:?}"
+    );
+    assert!(headers[0].contains("user-agent: Damaian"), "{headers:?}");
+    assert!(headers[1].contains("accept: "), "{headers:?}");
+
+    // `-q` first, so a user's `~/.curlrc` cannot add a header or a redirect to
+    // a request whose headers are a security promise.
+    assert_eq!(args[0], "-q");
+
+    // The source-level guard: a future edit cannot reintroduce the flag or a
+    // credential field without this test noticing.
+    let source = include_str!("../src/fetch.rs");
+    assert!(!source.contains("--location"));
+    assert!(!source.contains("location = true"));
+    assert!(!source.contains("api_key"));
+}
+
+#[test]
+fn a_get_is_fetched_through_a_loopback_stub_and_bounded() {
+    let stub = stub::Stub::start(|index| match index {
+        0 => stub::Response::ok("text/plain; charset=utf-8", b"hello from the stub".to_vec()),
+        _ => stub::Response {
+            declare_length: false,
+            ..stub::Response::ok("text/plain", vec![b'a'; 4096])
+        },
+    });
+    let data_dir = scratch_dir("bounded");
+    let transport = transport_for(&data_dir, "session_bounded", 64);
+    let cancel = CancelToken::new();
+
+    let small = transport
+        .fetch(&stub.url("/small"), &cancel)
+        .expect("the small page should be fetched");
+    assert_eq!(small.status, 200);
+    assert_eq!(
+        small.content_type.as_deref(),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(small.body, "hello from the stub");
+    assert_eq!(small.bytes, small.body.len());
+    assert!(!small.truncated);
+    assert_eq!(small.truncation_reason, None);
+    assert!(!small.cached);
+    assert!(small.redirect_to.is_none());
+
+    let big = transport
+        .fetch(&stub.url("/big"), &cancel)
+        .expect("an over-cap page is truncated, not a failure");
+    assert!(big.truncated, "a body over the cap must be truncated");
+    assert!(big.body.len() <= 64, "retained {} bytes", big.body.len());
+    assert_eq!(big.bytes, big.body.len());
+    let reason = big
+        .truncation_reason
+        .as_deref()
+        .expect("truncation must be stated");
+    assert!(reason.contains("cap"), "{reason}");
+    assert_eq!(big.status, 200);
+    assert_eq!(stub.requests(), 2);
+
+    // The header file is removed on every exit path, so response headers are
+    // never left in the data directory.
+    let leftovers = std::fs::read_dir(data_dir.join("tmp"))
+        .expect("the tmp directory exists")
+        .count();
+    assert_eq!(leftovers, 0, "a fetch must leave no header file behind");
+}
+
+#[test]
+fn a_redirect_is_not_followed_and_names_the_target() {
+    let stub = stub::Stub::start(|_| stub::Response::redirect("https://evil.example/collect"));
+    let data_dir = scratch_dir("redirect");
+    let transport = transport_for(&data_dir, "session_redirect", 1024);
+    let cancel = CancelToken::new();
+
+    let outcome = transport
+        .fetch(&stub.url("/moved"), &cancel)
+        .expect("a 3xx is a result, not a transport failure");
+    assert_eq!(outcome.status, 302);
+    let redirect = outcome.redirect_to.as_ref().expect("the target is named");
+    assert_eq!(redirect.location, "https://evil.example/collect");
+    assert!(redirect.cross_host);
+    assert!(!redirect.may_follow());
+    assert_eq!(stub.requests(), 1, "no second request may be made");
+
+    // A redirect carries no content, so it is never cached: asking again is a
+    // fresh decision.
+    let again = transport
+        .fetch(&stub.url("/moved"), &cancel)
+        .expect("the redirect is reported again");
+    assert!(!again.cached);
+    assert_eq!(stub.requests(), 2);
+}
+
+#[test]
+fn a_stop_during_a_fetch_kills_curl() {
+    let stub = stub::Stub::start(|_| stub::Response {
+        // No length and a held connection: the fetch is waiting for the rest of
+        // the response when the stop arrives.
+        declare_length: false,
+        hold: Some(Duration::from_secs(3)),
+        ..stub::Response::ok("text/plain", b"partial".to_vec())
+    });
+    let data_dir = scratch_dir("cancel");
+    let registry = ProcessRegistry::open(&data_dir).expect("the process registry should open");
+    let transport = CurlFetchTransport::new(
+        registry.clone(),
+        &data_dir,
+        "session_cancel",
+        SecretScanner::new(Vec::new()),
+    );
+    let url = stub.url("/slow");
+    let cancel = CancelToken::new();
+    let cancelling = {
+        let cancel = cancel.clone();
+        let registry = registry.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let entry = registry
+                .entries()
+                .expect("the registry should be readable")
+                .into_iter()
+                .filter_map(|(_, entry)| entry)
+                .find(|entry| entry.kind == ProcessKind::Fetch.as_str())
+                .expect("the running fetch should be registered");
+            assert_eq!(
+                ProcessIdentity::of(entry.pid),
+                Some(entry.identity()),
+                "the registered child should still be running"
+            );
+            cancel.cancel();
+            entry.pid
+        })
+    };
+
+    let started = Instant::now();
+    let outcome = transport.fetch(&url, &cancel);
+    let pid = cancelling.join().expect("the cancelling thread");
+
+    assert_eq!(outcome.unwrap_err(), ClientError::Cancelled);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "a stop must interrupt the fetch, took {:?}",
+        started.elapsed()
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while ProcessIdentity::of(pid).is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        ProcessIdentity::of(pid),
+        None,
+        "curl was still running after the stop"
+    );
+    assert!(
+        registry
+            .entries()
+            .expect("the registry should be readable")
+            .is_empty(),
+        "the registration must be gone when the fetch returns"
+    );
+}
+
+#[test]
+fn a_repeat_fetch_in_one_session_is_served_from_cache_and_says_so() {
+    let stub = stub::Stub::start(|_| stub::Response::ok("text/plain", b"cached page".to_vec()));
+    let data_dir = scratch_dir("cache");
+    let transport = transport_for(&data_dir, "session_cache", 1024);
+    let cancel = CancelToken::new();
+    let url = stub.url("/page");
+
+    let first = transport
+        .fetch(&url, &cancel)
+        .expect("the page should be fetched");
+    assert!(!first.cached);
+    assert_eq!(stub.requests(), 1);
+
+    let second = transport
+        .fetch(&url, &cancel)
+        .expect("the page should be cached");
+    assert!(second.cached, "a repeat fetch must say it came from cache");
+    assert_eq!(second.body, first.body);
+    assert_eq!(second.status, 200);
+    assert_eq!(second.content_type, first.content_type);
+    assert_eq!(second.fetched_at_ms, first.fetched_at_ms);
+    assert_eq!(stub.requests(), 1, "the cache must make no request");
+
+    // The cache is on disk, so a new transport for the same session reads it
+    // too; the session id, not the object, is the scope.
+    let reopened = transport_for(&data_dir, "session_cache", 1024);
+    let third = reopened
+        .fetch(&url, &cancel)
+        .expect("the same session's cache should be readable");
+    assert!(third.cached);
+    assert_eq!(stub.requests(), 1);
+}
+
+#[test]
+fn another_session_does_not_read_the_cache() {
+    let stub = stub::Stub::start(|_| stub::Response::ok("text/plain", b"session scoped".to_vec()));
+    let data_dir = scratch_dir("cache-scope");
+    let cancel = CancelToken::new();
+    let url = stub.url("/page");
+
+    let first = transport_for(&data_dir, "session_one", 1024)
+        .fetch(&url, &cancel)
+        .expect("the first session should fetch");
+    assert!(!first.cached);
+
+    let second = transport_for(&data_dir, "session_two", 1024)
+        .fetch(&url, &cancel)
+        .expect("the second session should fetch");
+    assert!(
+        !second.cached,
+        "a stale page must never be presented to another session as current"
+    );
+    assert_eq!(stub.requests(), 2, "the second session must make a request");
+}
+
+#[test]
+fn the_cache_holds_only_redacted_text() {
+    // Structural detector: 20 upper-case/digit characters after `AKIA`.
+    const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+    let stub = stub::Stub::start(move |_| {
+        stub::Response::ok("text/plain", format!("aws key: {KEY}\n").into_bytes())
+    });
+    let data_dir = scratch_dir("cache-redaction");
+    let transport = transport_for(&data_dir, "session_redaction", 1024);
+
+    let outcome = transport
+        .fetch(&stub.url("/key"), &CancelToken::new())
+        .expect("the page should be fetched");
+    assert!(!outcome.body.contains(KEY), "the result must be redacted");
+    assert!(outcome.body.contains("[REDACTED_"), "{}", outcome.body);
+
+    let files = files_under(&data_dir.join("external"));
+    assert_eq!(files.len(), 1, "one cache record: {files:?}");
+    for file in files {
+        let stored = std::fs::read_to_string(&file).expect("the record should be readable");
+        assert!(
+            !stored.contains(KEY),
+            "the cache must hold only redacted text: {}",
+            file.display()
+        );
+        assert!(stored.contains("contentHash"), "{stored}");
+    }
+}
+
+/// Reaches the real network, so it is excluded from normal runs. Run it by hand
+/// with:
+///
+/// ```sh
+/// cargo test -p workspace-engine --test external_reference -- --ignored --exact \
+///   live_fetch_reads_a_documentation_page
+/// ```
+#[test]
+#[ignore]
+fn live_fetch_reads_a_documentation_page() {
+    let data_dir = scratch_dir("live");
+    let transport = transport_for(&data_dir, "session_live", 200 * 1024);
+    let url = ExternalUrl::parse("https://docs.rs/serde/latest/serde/").expect("a valid URL");
+
+    let outcome = transport
+        .fetch(&url, &CancelToken::new())
+        .expect("docs.rs should answer");
+    assert_eq!(outcome.status, 200);
+    assert!(!outcome.body.is_empty());
+    assert!(
+        outcome
+            .content_type
+            .as_deref()
+            .is_some_and(|content_type| content_type.starts_with("text/html")),
+        "{:?}",
+        outcome.content_type
+    );
+    assert!(outcome.body.to_lowercase().contains("serde"));
 }
