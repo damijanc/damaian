@@ -1,7 +1,8 @@
 # Feature Spec: Commit Preparation
 
-Status: Done (2026-10-26). The full seven-check gate passed in CI on 2026-10-26
-(Quality run 40323902715); scoped checks passed locally: see `tasks.md`.
+Status: Done (2026-10-26; review fixes 2026-10-28). The full seven-check gate
+passed in CI on 2026-10-26 (Quality run 40323902715); scoped checks for the
+review fixes passed locally: see `tasks.md`.
 Order: 35 of 37
 Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -170,26 +171,41 @@ index is theirs. If they have staged work in progress, staging Damaian's
 selection on top and committing would commit their staged work as well, and
 resetting afterwards would lose their staging.
 
-So the commit does not use the repository index at all. Damaian builds the tree
+So no tree is built from the repository index at all. Damaian builds the tree
 explicitly:
 
 ```sh
-# A private index file; the user's .git/index is never read or written.
+# A private index file; no tree is built from the user's .git/index.
 GIT_INDEX_FILE=<tmp> git -C <root> read-tree HEAD
 GIT_INDEX_FILE=<tmp> git -C <root> update-index --add --cacheinfo <mode>,<oid>,<path>
 GIT_INDEX_FILE=<tmp> git -C <root> write-tree
 git -C <root> commit-tree <tree> -p HEAD -m <message>
 git -C <root> update-ref refs/heads/<branch> <commit> <expected-old>
+# Then the committed paths' entries in the real index are rewritten to the
+# new HEAD, only where they still equal the old HEAD's entry.
 ```
 
 Blobs for hunk-level selections are written with `git hash-object -w` from the
 content Damaian composed, which is the same content-composition path
 `prepare_files` (`patch_engine.rs:242`) already uses for partial applies.
 
-Three properties this buys, each mapping to requirement 4:
+Four properties this buys, each mapping to requirement 4:
 
-- **The user's index and working tree are untouched.** Nothing to restore if the
-  commit fails, because nothing was changed.
+- **A failure leaves the index and working tree untouched.** Everything up to
+  `update-ref` reads the repository and writes only Damaian's private state, so
+  nothing needs restoring if the commit does not happen.
+- **A success leaves the user's staging consistent with the new `HEAD`.** A
+  commit that moved the branch while leaving `.git/index` describing the old
+  `HEAD` is not harmless: `git status` then shows the commit as a staged
+  reversal, and the user's next plain `git commit` stages that reversal —
+  reverting Damaian's change and deleting the files it added. So after
+  `update-ref` succeeds, each committed path's index entry is rewritten to what
+  the commit recorded, exactly as `git commit --only` leaves it. The rewrite is
+  conditional: an entry is changed only when it still equals the old `HEAD`'s
+  entry for that path. Work the user staged at a different path is untouched,
+  and a path the user staged differently is left alone, because that staging is
+  theirs. (This was a real data-loss defect found in review; see §7.9, finding
+  3a.)
 - **`update-ref` with an expected old value is a compare-and-swap.** If `HEAD`
   moved between preparation and commit — a concurrent terminal, a rebase — the
   update fails and nothing happens, rather than committing onto a base that no
@@ -291,6 +307,10 @@ existing command path with its timeout, output truncation, and `SecretScanner`
 redaction, and their PIDs are registered per
 [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.7 — a hanging
 `pre-commit` must not hang the session, and a crash must not leave it running.
+They run as part of the commit the user approved (`approved: true`), gated by
+`allow_git_commits` rather than by a second command approval; whether a profile
+that denies commands should refuse to run them is an open decision recorded in
+§7.8.
 
 ### 5.6 Message suggestion
 
@@ -333,6 +353,10 @@ automatically, per requirement 5 of that spec.
 Requirement 3's SHA is recorded in the finish marker and in the audit log, and
 surfaced in the completion report.
 
+`update-ref` is also the one step whose hook is not part of §5.5's flow: Git runs
+the repository's `reference-transaction` hook from inside `update-ref`, so it is
+not reported, hashed or given a timeout by Damaian. §7.8 records the options.
+
 ### 5.8 Approval and policy
 
 A commit is a Git mutation and therefore a capability, not a convenience:
@@ -368,9 +392,11 @@ crash actually landed, and where the commit appears in the audit log.
   selected by default.
 - A file changed by an approved command is shown, labelled, and not selected by
   default.
-- The user's staged work is not committed and their index is unchanged, even
-  when they had staged content before the commit — asserted with a fixture that
-  stages an unrelated file first.
+- The user's staged work is not committed and stays staged, while the committed
+  paths' index entries agree with the new `HEAD`, even when they had staged
+  content before the commit — asserted with a fixture that stages an unrelated
+  file first, and by a plain `git commit` afterwards that does not revert
+  Damaian's commit or delete the files it added.
 - A failing `pre-commit` hook aborts the commit and reports the hook's output.
 - A `commit-msg` hook that rewrites the message has its result shown before the
   commit is created.
@@ -427,8 +453,11 @@ A new `workspace-engine/src/commit.rs` module, exposed as
   `write-tree`, then `ls-tree -r -z` compared against the full expected map
   (HEAD's tree with the selected additions, modifications and deletions). Only
   then `commit-tree`, a final HEAD check, and
-  `update-ref refs/heads/<branch> <commit> <expected-old>`. The user's
-  `.git/index` is never read or written. The tree check compares the whole tree,
+  `update-ref refs/heads/<branch> <commit> <expected-old>`. No tree is built
+  from `.git/index`; after the ref moves, the committed paths' entries in the
+  real index are rewritten to the new `HEAD` where they still equal the old
+  `HEAD`'s entry, as `git commit --only` leaves them. The tree check compares
+  the whole tree,
   not only the selected paths, so a composition bug cannot commit an extra
   entry. The mode comes from the working tree (`120000`, `100755`, `100644`),
   so a chmod-only change and a file-to-symlink change are commit as what is
@@ -439,9 +468,12 @@ A new `workspace-engine/src/commit.rs` module, exposed as
   mismatch. The record also stores the expected old `HEAD` and the branch, and
   refuses when either moved. The approval therefore covers the bytes, not the
   redacted preview.
-- **Secrets.** The scanner runs on the bytes that would become blobs, not the
-  redacted diff. Findings become `GeneratedSecretWarning` (path, categories,
-  count), a file over `max_file_bytes` is `unscanned` and needs the override
+- **Secrets.** The scanner runs on the committed blob, not the working-tree
+  file and not the redacted diff: the blob is hashed into a throwaway object
+  directory and read back, so a clean or EOL filter cannot make the scanned
+  bytes differ from the committed bytes, and an unapproved secret never reaches
+  `.git/objects`. Findings become `GeneratedSecretWarning` (path, categories,
+  count), a blob over `max_file_bytes` is `unscanned` and needs the override
   too, and `allow_generated_secrets` is a separate request field. The override
   writes `commit_secret_override` with categories and counts; the prepared
   record keeps only the redacted diff.
@@ -472,7 +504,11 @@ A new `workspace-engine/src/commit.rs` module, exposed as
   answer, used by `prepare`. `POST /api/commit-message` may draft with a model
   from the redacted diff and the latest plan's step titles; no adapter, a
   refusal, an empty answer or an unparsable one falls back to the template. The
-  textarea is the user's, and the edited text is committed.
+  textarea is the user's, and the edited text is committed. Before comparing a
+  hook's rewrite with the approved text, both are cleaned the way `git commit`
+  cleans a message (`git stripspace --strip-comments`), because `commit-tree -F`
+  applies no cleanup: a hook that appends a `#` comment must not look like a
+  rewrite on every attempt.
 - **Desktop.** *Commit…* is one entry in #58's contextual-action provider list,
   visible while the session has a candidate. Its dialog shows the per-file
   labels and redacted diffs, the standing redaction statement, the hook report,
@@ -600,7 +636,8 @@ named without a path are in
 | Hunk-level acceptance contains exactly the accepted hunks | `a_hunk_level_acceptance_commits_only_the_accepted_hunks` |
 | A hand-edited accepted file is shown, labelled, unselected | `a_hand_edited_accepted_file_is_shown_labelled_and_unselected` |
 | A command-changed file is shown, labelled, unselected | `a_command_changed_file_is_shown_labelled_and_unselected` |
-| Staged work is not committed and the index is unchanged | `the_users_index_and_working_tree_are_unchanged_by_a_commit` |
+| Staged work is not committed, stays staged, and the committed entries match the new HEAD | `a_commit_updates_the_committed_paths_in_the_users_index` |
+| A plain `git commit` after Damaian's does not revert it or delete its files | `a_plain_commit_after_a_damaian_commit_does_not_revert_it` |
 | A failing pre-commit aborts and reports its output | `a_failing_pre_commit_aborts_and_reports_its_output` |
 | A commit-msg rewrite is shown before the commit exists | `a_commit_msg_hook_that_rewrites_the_message_is_shown_before_the_commit`, `a_prepare_commit_msg_hook_is_run_and_its_rewrite_is_shown` |
 | A failing post-commit is a warning and does not un-commit | `a_failing_post_commit_hook_is_a_warning_and_the_commit_stays` |
@@ -616,7 +653,11 @@ named without a path are in
 | A chmod-only change is a candidate and commits `100755` | `a_chmod_only_change_is_a_candidate_and_commits_the_mode` |
 | A file replaced by a symlink commits `120000` | `replacing_a_file_with_a_symlink_commits_mode_120000` |
 | A chmod after preparation is refused | `a_chmod_after_preparation_is_refused_as_content_changed` |
-| Index and working tree identical after a failed attempt | same test, plus `the_users_index_and_working_tree_are_unchanged_by_a_commit` |
+| Index and working tree identical after a failed attempt | `head_moving_between_prepare_and_commit_fails_with_nothing_changed` |
+| A post-ref failure is a warning and the commit is still recorded | `a_staged_copy_that_cannot_be_updated_is_a_warning_after_the_commit` |
+| A preparation id cannot traverse out of `commits/` | `a_prepare_id_cannot_escape_the_commit_state_directory` |
+| A message hook's comment line is cleanup, not a rewrite | `a_commit_msg_hook_that_only_adds_comments_does_not_block_the_commit` |
+| The secret scan reads the committed blob, not the working-tree file | `the_secret_scan_reads_the_blob_that_will_be_committed` |
 | Secret warnings have categories/counts and no text; override audited | `a_seeded_secret_warns_with_categories_and_counts_and_no_text`, `a_secret_needs_a_separate_per_commit_override`, `the_recorded_diff_is_redacted_and_the_record_holds_no_secret` |
 | The approval UI says the diff is redacted and the commit is not | the dialog's `.commit-redaction` line; **manual, not walked** |
 | Action markers and a crash classify as unknown with no re-commit | `a_commit_is_bracketed_by_a_side_effecting_marker`, `a_crash_between_the_markers_is_an_unknown_outcome`, `an_interrupted_commit_reports_the_prepared_commit_and_the_current_head` |
@@ -632,3 +673,141 @@ The one manual gap is the dialog walk: the web UI bootstraps through Tauri
 (`damaian_desktop_bootstrap`), and no browser harness was available in this
 session. The JS is `node --check`ed and Biome-linted, and every route it calls
 is covered by a test; the interaction itself was read, not clicked.
+
+### 7.8 Open decisions
+
+Two review findings are choices for the owner, not defects this change silently
+decided. Both concern how repository hooks interact with the capability model.
+They are recorded here rather than resolved in code.
+
+1. **`update-ref` runs the repository's `reference-transaction` hook.**
+   `update-ref` is the only step that mutates the user's repository, and Git runs
+   `reference-transaction` (and its `prepared`/`committed` phases) for it. That
+   hook is not part of `GIT_COMMIT_HOOKS`: it is not reported in the hook report,
+   its content hash is not stored or compared, and it has no timeout of our own —
+   only whatever `git update-ref` itself gives it, which is none. A repository
+   therefore has an unreviewed code path that runs at the moment the ref moves.
+   The options:
+   - **Keep as is and document it.** `update-ref` is the operation Git provides;
+     any local `git commit` runs the same hook. The risk is the same one the user
+     already accepts in their terminal, and adding a hook report for
+     `reference-transaction` would not make it reviewable in time to matter
+     (it fires while the ref moves).
+   - **Report it like the commit hooks.** Add `reference-transaction` to the
+     report with its path and hash, refuse when it changes between preparation
+     and commit, and document that it is not run by us but by Git. This closes
+     the "unhashed" gap but cannot add a timeout, because the process is Git's
+     own child.
+   - **Refuse when one exists.** Treat a present `reference-transaction` hook as
+     `commit_not_supported` so the user commits from a terminal. Safe, and
+     hostile to the repositories that use it legitimately (they are used for
+     audit and for locking refs).
+   The current implementation is the first option and does not mention the hook
+   anywhere the user sees. Whichever option is chosen, the user guide must say
+   what actually runs.
+
+2. **Hooks run with `approved: true` even when the profile denies commands.**
+   `run_one_hook` passes `CommandRunOptions { approved: true, approved_by:
+   Some("git_hook"), … }` so a `pre-commit` hook never raises a command-approval
+   card during a commit the user already approved. That is deliberate — a hook
+   is part of the operation being approved, and asking again mid-commit for a
+   command the user did not write is noise — but it means a profile that denies
+   shell commands still executes arbitrary repository code when the user commits.
+   The profile gate is `allow_git_commits`; command approval is not consulted.
+   The options:
+   - **Keep as is with the rationale stated.** Approving a commit is approving
+     what a commit does, hooks included; the hook report is shown before the
+     approval, and the profile's commit capability is the gate. Document it in
+     `SECURITY.md` and the user guide.
+   - **Refuse to run hooks when command execution is denied.** If the resolved
+     profile turns commands off (`allow_commands=false`, or every command would
+     need an approval that a hook cannot obtain), refuse the commit with a
+     typed refusal naming the hook and the profile. Safer, and it makes a
+     commit impossible in such profiles even when `allow_git_commits` is on;
+     repositories with hooks then need a profile that allows them.
+   The current implementation is the first option, and it is not stated at the
+   point of approval.
+
+### 7.9 Review fixes
+
+A review of the shipped spec found the following. Each entry says what was
+confirmed or disproved, and what changed. Finding numbers are the review's.
+
+1. **3a — the user's real index was never updated (confirmed, data loss).**
+   Only `update-ref` moved the branch, so `.git/index` still held the old `HEAD`
+   at every committed path. After the commit, `git status` showed the commit as
+   a staged reversal, and the user's next plain `git commit` committed that
+   reversal: Damaian's change reverted and its new files deleted. Confirmed by
+   writing the follow-up-commit test first and watching it fail against the old
+   code. §5.3's "nothing to restore" sentence was wrong in the same way — it was
+   true only for the failure path, not for the committed paths after success.
+   The fix rewrites each committed path's real-index entry to the new `HEAD`,
+   only where that entry still equals the old `HEAD`'s entry, as `git commit
+   --only` leaves the index; a path the user staged differently is untouched.
+   Tests: `a_commit_updates_the_committed_paths_in_the_users_index`,
+   `a_plain_commit_after_a_damaian_commit_does_not_revert_it`. The old
+   `the_users_index_and_working_tree_are_unchanged_by_a_commit` asserted the
+   broken state (identical index bytes), so it was replaced rather than kept.
+   `USER_GUIDE.md`, `SECURITY.md`, the module doc and §5.3/§6/§7.1 now describe
+   the real behaviour.
+2. **3b — `prepare_id` was not validated (confirmed).** It flowed into
+   `data_dir/commits/<id>.json` and into `private_dir`, which does
+   `remove_dir_all`; `../` could therefore read a planted record and delete a
+   directory outside `commits/`. Confirmed by planting a valid record at
+   `data_dir/victim.json`, creating `data_dir/victim/keep.txt`, and calling
+   `commit` with `../victim`: the old code deleted `victim/` and committed.
+   `validate_prepare_id` now accepts only `commit_` followed by
+   ASCII-alphanumeric/underscore, is enforced in `commit`, `load_record`,
+   `save_record` and `private_dir`, and a bad id is `commit_not_prepared`.
+   Test: `a_prepare_id_cannot_escape_the_commit_state_directory`.
+3. **3c — a post-`update-ref` error marked a real commit as failed
+   (confirmed).** `rev-parse HEAD` and `run_post_commit(...)?` propagated a
+   `CommitError` after the ref had moved. The caller then set the record to
+   `failed`, finished the marker as failed, and skipped `commit_created` and the
+   Committed session event. Confirmed with a test that holds `.git/index.lock`:
+   with the post-ref steps fatal, `commit` returned `Engine` while HEAD had
+   already moved. From `update-ref` onward every step is now a warning on the
+   outcome; success is recorded first. Test:
+   `a_staged_copy_that_cannot_be_updated_is_a_warning_after_the_commit`
+   (asserts the new HEAD, the warning, `state: created` and the audit entry).
+   Forcing `rev-parse HEAD` itself to fail deterministically would need a race,
+   so its warning path is covered by reading it and by the shared post-ref
+   structure, not by its own test.
+4. **3d — `reference-transaction` is unreviewed and unbounded** — recorded as an
+   open decision in §7.8; no code change.
+5. **3e — hooks run with `approved: true` under a command-denying profile** —
+   recorded as an open decision in §7.8; no code change.
+6. **3f — message cleanup made a hook-added `#` line a permanent rewrite
+   (confirmed).** `commit-tree -F` writes the file verbatim, so a `commit-msg`
+   hook appending a comment always differed from the approved text: every
+   attempt returned `MessageRewritten` and the commit could never be made.
+   Confirmed by the comment-hook test failing with exactly that error. Both texts
+   are now cleaned with `git stripspace --strip-comments` before comparison, the
+   cleaned text is written back to the message file, and an all-comment message
+   is refused as empty. A hook that appends real text still requires a second
+   approval, as before. Test:
+   `a_commit_msg_hook_that_only_adds_comments_does_not_block_the_commit`.
+7. **3g — the scan read the file, the commit wrote the filtered blob
+   (confirmed).** `hash-object -- <path>` applies clean and EOL filters, so a
+   repository with a clean filter could commit bytes the scanner never saw.
+   Confirmed with a filter that turns `PLACEHOLDER` into a seeded AWS key: the
+   old code committed it with no warning. The blob is now hashed into a
+   throwaway object directory and read back (`hash-object -w`,
+   `cat-file -s`/`blob`), so the scanned bytes are the committed bytes and an
+   unapproved secret never reaches `.git/objects`; a filter-expanded blob over
+   `max_file_bytes` is `unscanned`. Test:
+   `the_secret_scan_reads_the_blob_that_will_be_committed`.
+8. **3h — message spacing and a `GET` with side effects.** The doubled spaces
+   from dropped line continuations in five messages (branch changed, hooks
+   changed, HEAD read-back, both rename refusals) are fixed. `GET
+   /api/commit-preparation` wrote a record and an audit entry; the route is now
+   `POST /api/commit-preparation`, with the dialog, the handler doc and the shell
+   route tests updated. No known nit was left from this finding.
+
+Checks for this batch: `scripts/quality-gate.sh fmt node lint typos deny`;
+`cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`;
+`cargo clippy -p desktop-shell --all-targets --locked -- -D warnings`;
+`cargo nextest run -p workspace-engine --test commit_preparation` (42);
+`cargo nextest run -p desktop-shell --lib` (the commit and recovery tests);
+`node --check crates/desktop-shell/static/app.js`; `npm run lint:web`. The
+workspace-wide clippy and tests were left to CI.
