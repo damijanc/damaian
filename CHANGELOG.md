@@ -29,7 +29,7 @@ harness, and **Release** covers packaging, signing and distribution.
 
 | | |
 |---|---|
-| **Next** | - Let the agent keep short notes while it investigates that stay in view after earlier rounds are dropped and carry into your next request, so it can answer — and then act — from everything it found.<br>- Stop showing a finished turn's plan as still running: remind the agent once to mark its steps done, keep what each step ran, and say plainly which steps were left open. |
+| **Next** | - Bring back what you confirmed about this project when it bears on the request at hand, say plainly when the file it came from has changed since, and never let it act as an instruction. |
 | **After that** | - Order each request so the provider's prompt cache can serve more of it, cutting cost and waiting time.<br>- Fetch a page the model names, under per-host approval, treated as reference material and never as instructions.<br>- Accept a pasted screenshot, and let the agent look at the screenshots its own browser diagnostics already capture. |
 | **Later** | - Per-tool MCP management, where nothing installed can widen what you allowed.<br>- Create a branch and open a pull request from the commits Damaian prepares, each its own explicit approval.<br>- Let another tool read your repository through Damaian, read-only, with the same redaction and path rules.<br>- Run several agents in parallel, only if measurement shows it beats a single agent. Abandoning it is a legitimate outcome. |
 
