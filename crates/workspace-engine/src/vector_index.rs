@@ -84,10 +84,12 @@ impl VectorIndex {
         query_vector: &[f32],
         index: &RepositoryIndex,
         limit: usize,
+        allowed: &dyn Fn(&str) -> bool,
     ) -> Vec<SearchResult> {
         let mut scored: Vec<(f32, &StoredChunkVector)> = self
             .entries
             .iter()
+            .filter(|entry| allowed(&entry.path))
             .map(|entry| (cosine_similarity(query_vector, &entry.vector), entry))
             .collect();
         scored.sort_by(|left, right| {
@@ -167,11 +169,26 @@ impl VectorIndexCache {
         query: &str,
         limit: usize,
     ) -> Vec<SearchResult> {
+        Self::semantic_search_allowed(data_dir, index, query, limit, &|_| true)
+    }
+
+    /// [`Self::semantic_search`] over files `allowed` admits.
+    ///
+    /// The filter is applied before the cap in both the embedding path and its
+    /// term-overlap fallback, so outside hits cannot consume the caller's
+    /// result slots.
+    pub fn semantic_search_allowed(
+        data_dir: &Path,
+        index: &RepositoryIndex,
+        query: &str,
+        limit: usize,
+        allowed: &dyn Fn(&str) -> bool,
+    ) -> Vec<SearchResult> {
         let Some(model) = shared_model(data_dir) else {
-            return index.semantic_search(query, limit);
+            return index.semantic_search_allowed(query, limit, allowed);
         };
         let Ok(query_vector) = model.embed(query) else {
-            return index.semantic_search(query, limit);
+            return index.semantic_search_allowed(query, limit, allowed);
         };
 
         let path = vector_index_path(data_dir, &index.repository_id);
@@ -193,7 +210,7 @@ impl VectorIndexCache {
         if cached.index.sync(index, model) {
             cached.index.save(&cached.path);
         }
-        cached.index.search(&query_vector, index, limit)
+        cached.index.search(&query_vector, index, limit, allowed)
     }
 
     /// Test-only: drop every cached vector index so tests don't observe

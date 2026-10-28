@@ -212,12 +212,17 @@ impl NavigationController {
             max_matches,
             task_id,
             repository_id,
+            None,
         )
     }
 
     /// [`Self::search_content`] under a worktree's root, recording `worktree`
     /// (its display path) in the audit record; `None` is the session's own
     /// checkout.
+    ///
+    /// `allowed` is the session's path restriction. It is applied while walking,
+    /// before a file is read and before a match is counted, so the match cap is
+    /// spent on admitted files rather than on hits the caller would discard.
     #[allow(clippy::too_many_arguments)]
     pub fn search_content_in(
         &self,
@@ -228,6 +233,7 @@ impl NavigationController {
         max_matches: Option<usize>,
         task_id: Option<&str>,
         repository_id: Option<&str>,
+        allowed: Option<&dyn Fn(&str) -> bool>,
     ) -> Result<ContentSearch> {
         // Compiled before the walk, so a bad pattern costs no I/O and the
         // compile error reaches the model in the same round.
@@ -264,6 +270,11 @@ impl NavigationController {
                 }
                 if let Some(glob) = path_glob
                     && !glob_match(glob, &file.relative_path)
+                {
+                    return Ok(());
+                }
+                if let Some(allowed) = allowed
+                    && !allowed(&file.relative_path)
                 {
                     return Ok(());
                 }

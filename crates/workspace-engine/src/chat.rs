@@ -5243,12 +5243,28 @@ impl ChatOrchestrator {
         // constraints, decisions, failed approaches and uncertainty. When this
         // call cannot produce a new narrative, those are still true unless the
         // conversation says otherwise, so they travel into the facts-only
-        // summary rather than disappearing.
+        // summary rather than disappearing. `narrative_carried_forward` keeps
+        // the failure visible even though the four lists are no longer empty.
         let previous_narrative = view.summary.as_ref().map(ConversationSummary::narrative);
+        let carried_forward = previous_narrative
+            .as_ref()
+            .is_some_and(|narrative| !narrative.is_empty());
         let narrative = match &run {
-            Ok(run) => crate::compaction::parse_narrative(&run.content, &self.scanner)
-                .or_else(|| previous_narrative.clone())
-                .unwrap_or_default(),
+            Ok(run) => match crate::compaction::parse_narrative(&run.content, &self.scanner) {
+                Some(narrative) => narrative,
+                None => {
+                    let _ = self.audit_log.record(
+                        "conversation_compaction_narrative_failed",
+                        &[
+                            ("actor", "system".to_string()),
+                            ("sessionId", session_id.to_string()),
+                            ("reason", "the reply was not a usable narrative".to_string()),
+                            ("throughSeq", through_seq.to_string()),
+                        ],
+                    );
+                    previous_narrative.unwrap_or_default()
+                }
+            },
             Err(error) => {
                 let _ = self.audit_log.record(
                     "conversation_compaction_narrative_failed",
@@ -5276,6 +5292,7 @@ impl ChatOrchestrator {
             decisions: narrative.decisions,
             failed_approaches: narrative.failed_approaches,
             uncertainty: narrative.uncertainty,
+            narrative_carried_forward: carried_forward,
             model_run_id: model_run_id.clone(),
             message_count: facts.message_count,
         };
@@ -5318,6 +5335,10 @@ impl ChatOrchestrator {
                     model_run_id.clone().unwrap_or_else(|| "none".to_string()),
                 ),
                 ("factsOnly", summary.is_facts_only().to_string()),
+                (
+                    "narrativeCarriedForward",
+                    summary.narrative_carried_forward.to_string(),
+                ),
                 (
                     "inputTokens",
                     usage
@@ -9443,7 +9464,7 @@ impl ChatOrchestrator {
                 ..
             } => {
                 // A literal glob is a path request, so it can be refused
-                // outright. A pattern with wildcards is filtered by result
+                // outright. A pattern with wildcards is filtered while walking,
                 // below, because no single path can answer it.
                 if let Some(glob) = path_glob
                     && !glob.contains(['*', '?', '[', '{'])
@@ -9457,6 +9478,7 @@ impl ChatOrchestrator {
                         ActionOutcome::Failed,
                     );
                 }
+                let allowed = |path: &str| !outside_restriction(Some(path));
                 match self.navigation.search_content_in(
                     repository_root,
                     worktree,
@@ -9465,23 +9487,11 @@ impl ChatOrchestrator {
                     *max_matches,
                     Some(&task.id),
                     Some(&session.repository_id),
+                    Some(&allowed),
                 ) {
                     Ok(found) => {
-                        let before = found.matches.len();
-                        let matches: Vec<_> = found
+                        let mut lines = found
                             .matches
-                            .into_iter()
-                            .filter(|m| !outside_restriction(Some(&m.path)))
-                            .collect();
-                        let filtered = matches.len() != before;
-                        // Counts are the restricted view: a total that included
-                        // paths the user cannot see would be a misleading answer.
-                        let total_found = if filtered {
-                            matches.len()
-                        } else {
-                            found.total_found
-                        };
-                        let mut lines = matches
                             .iter()
                             .map(|m| format!("{}:{}: {}", m.path, m.line, m.text))
                             .collect::<Vec<_>>()
@@ -9496,10 +9506,10 @@ impl ChatOrchestrator {
                         };
                         let content = format!(
                             "{} matches for \"{}\" across {} files{scope}{note} (showing {}):\n{}",
-                            total_found,
+                            found.total_found,
                             pattern,
                             found.files_searched,
-                            matches.len(),
+                            found.matches.len(),
                             lines,
                         );
                         (
@@ -9533,22 +9543,23 @@ impl ChatOrchestrator {
                         );
                     }
                 };
-                let mut results = if *semantic {
+                let allowed = |path: &str| !outside_restriction(Some(path));
+                let results = if *semantic {
                     if self.config.enable_semantic_search {
-                        VectorIndexCache::semantic_search(
+                        VectorIndexCache::semantic_search_allowed(
                             &self.config.data_dir,
                             &index,
                             query,
                             *limit,
+                            &allowed,
                         )
                     } else {
-                        index.semantic_search(query, *limit)
+                        index.semantic_search_allowed(query, *limit, &allowed)
                     }
                 } else {
-                    index.keyword_search(query, *limit)
+                    index.keyword_search_allowed(query, *limit, &allowed)
                 };
                 let note = if context_restriction.is_some() {
-                    results.retain(|result| !outside_restriction(Some(&result.path)));
                     "\n\n(Results are limited to this session's path restriction.)"
                 } else {
                     ""
@@ -9582,6 +9593,39 @@ impl ChatOrchestrator {
                 base,
                 ..
             } => {
+                // Spec 27 §5.4: a diff is file content, so it is bounded by the
+                // session restriction like `read_file`. Refusing is clearer
+                // than silently dropping hunks: the model can name an admitted
+                // path instead of believing it saw every change.
+                if context_restriction.is_some() {
+                    if paths.is_empty() {
+                        return (
+                            format!(
+                                "Read git diff{}{scope}",
+                                if *staged { " (staged)" } else { "" }
+                            ),
+                            "Cannot read the whole repository's diff: this session is restricted \
+                             to selected paths. Name paths inside the restriction."
+                                .to_string(),
+                            ActionOutcome::Failed,
+                        );
+                    }
+                    if let Some(path) = paths
+                        .iter()
+                        .find(|path| outside_restriction(Some(path.as_str())))
+                    {
+                        return (
+                            format!(
+                                "Read git diff{}{scope}",
+                                if *staged { " (staged)" } else { "" }
+                            ),
+                            format!(
+                                "Cannot read git diff for {path}{scope}: the path is outside this session's path restriction."
+                            ),
+                            ActionOutcome::Failed,
+                        );
+                    }
+                }
                 let options = DiffOptions {
                     staged: *staged,
                     paths: paths.clone(),
@@ -15990,6 +16034,7 @@ mod approval_prompt_wording_tests {
             decisions: Vec::new(),
             failed_approaches: Vec::new(),
             uncertainty: Vec::new(),
+            narrative_carried_forward: false,
             model_run_id: None,
             message_count: 8,
         };
@@ -16057,6 +16102,7 @@ mod approval_prompt_wording_tests {
             decisions: Vec::new(),
             failed_approaches: Vec::new(),
             uncertainty: Vec::new(),
+            narrative_carried_forward: false,
             model_run_id: None,
             message_count: 8,
         };

@@ -929,9 +929,11 @@ same manifest, without a shell.
   paths** if that was not what you meant. An entry selects a file, or a
   directory with a trailing slash and everything under it. The restriction never
   overrides `restricted_patterns`, so selecting a restricted path does not
-  include it. It filters what is assembled and sent, and the assistant's file
-  tools enforce it too: a read or directory listing outside the selection is
-  refused as a tool result, and a search returns only matches inside it. The
+  include it. It filters what is assembled and sent, and the file-content tools
+  enforce it too: a read, directory listing or diff outside the selection is
+  refused as a tool result, and searches count only admitted matches. An
+  auto-approved shell command such as `ls -R`, and the path lists from
+  `read_git_status`, `read_git_log` and `list_worktrees`, are not filtered. The
   symbols row and the repository map are still built from the whole repository.
 - **An item you removed is still listed.** On a paused turn, an item removed in
   the panel appears under Excluded as `user_removed` and the token total falls.

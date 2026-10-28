@@ -284,7 +284,7 @@ Post-send is a record and is read-only.
 | Pin file or range | Enters the `Pinned` category on every subsequent turn | Session |
 | Unpin / clear pins | Removes them | Session |
 | Remove optional item | Excluded from this turn, reason `UserRemoved` | This turn |
-| Restrict session to paths | Only these paths' file content is eligible for context, and the file tools may read or list only these paths; the symbols row is still looked up across the repository | Session |
+| Restrict session to paths | Only these paths' file content is eligible for context, and the file-content tools (`read_file`, `list_directory`, the search tools, `read_git_diff`) may read or list only these paths; the symbols row is still looked up across the repository | Session |
 | Open referenced content | Opens in app or configured editor | — |
 
 Pins and restrictions persist as appended session events, following the
@@ -332,15 +332,25 @@ the restriction, and
 exemption, so changing it is a deliberate decision rather than a silent
 regression.
 
-**It filters assembly and tool dispatch.** `read_file`, `list_directory` and the
-search tools run only on paths the restriction admits. A read or listing outside
-it is refused with a plain tool result naming the session's path restriction
-rather than reading the file; a search is refused when its literal path is
-outside, and otherwise returns only matches inside the selection. The refusal is
-a tool result, so the turn continues and the model can ask for an admitted path
-instead. This is still an intersection with `path_policy.rs` and
-`restricted_patterns`, never an override: a restriction cannot make a protected
-path readable.
+**It filters assembly and tool dispatch.** `read_file`, `list_directory`, the
+search tools and `read_git_diff` run only on paths the restriction admits. A
+read or listing outside it is refused with a plain tool result naming the
+session's path restriction rather than reading the file; a search is refused
+when its literal path is outside, and otherwise searches only admitted files, so
+the match cap is spent on admitted hits rather than on hits that would be
+discarded; `read_git_diff` refuses a whole-repository request and any request
+naming a path outside the selection. The refusal is a tool result, so the turn
+continues and the model can ask for an admitted path instead. This is still an
+intersection with `path_policy.rs` and `restricted_patterns`, never an override:
+a restriction cannot make a protected path readable.
+
+**What remains exempt.** An auto-approved read-only shell command (`ls`, including
+`ls -R <dir>`) is bounded by `restricted_patterns` and the path policy but not by
+the session restriction, so it can list names outside the selection. The path
+lists returned by `read_git_status`, `read_git_log` and `list_worktrees` are not
+filtered either; they name paths but return no file content. The file-content
+tools and `read_git_diff` are the enforced set, and the panel and user guide name
+this boundary rather than saying "every read".
 
 A pinned file that later becomes restricted, or is deleted, is reported in the
 excluded list with the reason rather than silently dropped from the pin list:
@@ -554,13 +564,15 @@ section has the evidence and falsifications.
   The card now owns one live review refreshed from every removal route's
   returned manifest, and a test removes two items across a reopen.
 - **The restriction now reaches tool dispatch (5b).** `read_file`,
-  `list_directory` and the search tools enforce the session's path restriction:
-  an outside read or listing is refused with a plain tool result naming the
-  restriction, a literal search path outside it is refused, and wildcard or
-  whole-repository searches return only matches inside the selection. The same
-  normalization is used as assembly, so a spelling cannot be admitted by a tool
-  after the panel refused it. The panel hint, `index.html`, the user guide and
-  §5.4 describe the enforced behaviour.
+  `list_directory`, the search tools and `read_git_diff` enforce the session's
+  path restriction: an outside read or listing is refused with a plain tool
+  result naming the restriction, a literal search path outside it is refused,
+  `read_git_diff` refuses a whole-repository request or an outside path, and
+  searches check admission before their match cap. The same normalization is
+  used as assembly, so a spelling cannot be admitted by a tool after the panel
+  refused it. An auto-approved `ls` and the path lists of the git read tools stay
+  unfiltered and are named as exemptions. The panel hint, `index.html`, the user
+  guide and §5.4 describe the enforced behaviour.
 - **The pause covers verification repair turns (5c).** `run_repair_turn` now
   goes through `pause_for_context_review`, carries `verification_turn` on the
   pending turn, and `resume_after_context_decision` closes a resumed repair

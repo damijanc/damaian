@@ -1794,9 +1794,14 @@ impl MemoryStore {
     ) -> MemoryResult<ProposalOutcome> {
         let gate = self.proposal_gate(root, None);
         if let Err(error) = proposal.screen(&gate) {
-            self.audit_proposal_refused(&proposal, &error)?;
+            // A refusal is audited by the store. Any other screening error is
+            // not a refusal; it reaches the caller, which records it once as
+            // `memory_proposal_failed`, so it is never audited twice.
             return match error {
-                MemoryError::Refused(refusal) => Ok(ProposalOutcome::Refused(refusal)),
+                MemoryError::Refused(refusal) => {
+                    self.audit_proposal_refused(&proposal, &MemoryError::Refused(refusal.clone()))?;
+                    Ok(ProposalOutcome::Refused(refusal))
+                }
                 other => Err(other),
             };
         }

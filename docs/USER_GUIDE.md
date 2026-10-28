@@ -371,19 +371,28 @@ panel opens. The restriction narrows; it never widens. `restricted_patterns` and
 the path policy still apply on top, so selecting a restricted path does not
 include it.
 
-The restriction filters what is **assembled and sent**, and the assistant's file
-tools. `read_file` and `list_directory` refuse a path outside your selection with
-a plain tool result rather than reading it; a search with a literal path outside
-it is refused, and a wildcard or whole-repository search returns only matches
-inside it. The `AGENTS.md` hierarchy and your own message are still included:
+The restriction filters what is **assembled and sent**, and the assistant's
+file-content tools. `read_file` and `list_directory` refuse a path outside your
+selection with a plain tool result rather than reading it; `read_git_diff`
+refuses a whole-repository request and any request naming an outside path; a
+search with a literal path outside it is refused, and other searches apply the
+restriction before their match cap, so outside hits cannot crowd out admitted
+ones. The `AGENTS.md` hierarchy and your own message are still included:
 repository instructions are policy rather than one of the content files you are
 choosing between, and your message is required. The **symbols** row and the
 **repository map** are not filtered either: the symbols row is a lookup from the
 identifiers in your message, and the map is a rendering of the repository index
 that lists paths across the whole repository, not file content. An empty list is
 a restriction that admits no file content, not "no restriction": applying an
-empty field is refused, and **Clear paths** removes the restriction. While an
-empty restriction is active, every file read is refused.
+empty field is refused, and **Clear paths** removes the restriction. With an
+empty restriction, `read_file`, `list_directory` and `read_git_diff` refuse every
+path, and searches return no admitted match.
+
+Some read paths are not filtered by the session restriction. An auto-approved
+read-only shell command such as `ls -R <dir>` can still list paths outside the
+selection (it remains bounded by `restricted_patterns` and the path policy), and
+`read_git_status`, `read_git_log` and `list_worktrees` still return path names
+across the repository. None of them returns file content outside the selection.
 
 **Reviewing before sending.** By default a turn sends as soon as its context is
 assembled; the panel shows the manifest while the turn runs. Turn on **Pause

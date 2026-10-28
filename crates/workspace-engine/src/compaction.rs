@@ -153,6 +153,13 @@ pub struct ConversationSummary {
     pub decisions: Vec<String>,
     pub failed_approaches: Vec<String>,
     pub uncertainty: Vec<String>,
+    /// True when the newest summarisation call failed or returned no usable
+    /// narrative, and the four model-written lists above were carried forward
+    /// from the previous summary. `is_facts_only()` is then false even though
+    /// this call failed; this flag is what lets the panel say so. Old summaries
+    /// load with `false`.
+    #[serde(default)]
+    pub narrative_carried_forward: bool,
     /// The run that produced the narrative half, for spec 19 accounting.
     pub model_run_id: Option<String>,
     /// How many messages the summary represents, for the boundary marker.
@@ -808,6 +815,7 @@ mod tests {
             decisions: vec!["Used the existing parser entry point.".to_string()],
             failed_approaches: vec!["Rewriting the lexer broke the tests.".to_string()],
             uncertainty: vec!["The 32-bit path is untested.".to_string()],
+            narrative_carried_forward: false,
             model_run_id: Some("modelrun_1".to_string()),
             message_count: 8,
         }
@@ -819,6 +827,7 @@ mod tests {
             decisions: Vec::new(),
             failed_approaches: Vec::new(),
             uncertainty: Vec::new(),
+            narrative_carried_forward: false,
             model_run_id: None,
             ..summary()
         }

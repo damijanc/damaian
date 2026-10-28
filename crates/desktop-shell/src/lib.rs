@@ -967,6 +967,7 @@ fn compact_session(
                 "throughSeq": summary.through_seq,
                 "messageCount": summary.message_count,
                 "factsOnly": summary.is_facts_only(),
+                "narrativeCarriedForward": summary.narrative_carried_forward,
             })
         }
         Ok(workspace_engine::compaction::CompactionOutcome::NothingToCompact) => {
@@ -15287,6 +15288,7 @@ mod conversation_compaction_tests {
             decisions: Vec::new(),
             failed_approaches: Vec::new(),
             uncertainty: Vec::new(),
+            narrative_carried_forward: false,
             model_run_id: Some("modelrun_1".to_string()),
             message_count: 8,
         }

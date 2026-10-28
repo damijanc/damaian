@@ -526,6 +526,11 @@ pub struct ConversationSummaryUsage {
     pub through_seq: u64,
     /// True when the model call failed and only the facts half was kept.
     pub facts_only: bool,
+    /// True when the newest summarisation call failed and the narrative lists
+    /// were carried from the previous summary. `facts_only` is then false, so
+    /// this is how the panel can still say the call failed.
+    #[serde(default)]
+    pub narrative_carried_forward: bool,
 }
 
 /// How many of the symbols actually shown came from each provenance
@@ -1370,6 +1375,7 @@ impl ContextManager {
                 messages: summary.message_count,
                 through_seq: summary.through_seq,
                 facts_only: summary.is_facts_only(),
+                narrative_carried_forward: summary.narrative_carried_forward,
             }
         });
 

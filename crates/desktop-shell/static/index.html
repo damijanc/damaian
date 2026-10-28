@@ -211,10 +211,12 @@
             </p>
             <label class="context-restriction-label" for="context-restriction-paths">
               Restrict this session to these paths (one per line). Only those paths' file
-              content is assembled for a turn, and the assistant's file tools can read or list
-              only those paths. A directory with a trailing slash selects everything under it.
-              An empty list admits no file content and refuses every file read; use
-              <strong>Clear paths</strong> to remove the restriction.
+              content is assembled for a turn, and the file-content tools can read or list only
+              those paths. A directory with a trailing slash selects everything under it. An
+              empty list admits no file content: `read_file`, `list_directory` and `read_git_diff`
+              refuse every path and searches return no admitted match; use
+              <strong>Clear paths</strong> to remove the restriction. A one-off shell command such
+              as <code>ls -R</code> can still list names outside the selection.
             </label>
             <textarea
               id="context-restriction-paths"

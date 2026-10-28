@@ -2977,7 +2977,11 @@ function renderContextPanel() {
     const count = document.createElement("span");
     count.className = "context-category-count";
     count.textContent = `${manifest.conversationSummary.messages} messages${
-      manifest.conversationSummary.factsOnly ? " · facts only" : ""
+      manifest.conversationSummary.factsOnly
+        ? " · facts only"
+        : manifest.conversationSummary.narrativeCarriedForward
+          ? " · narrative carried forward"
+          : ""
     }`;
     row.append(label, tokens, count);
     if (contextCanRemove()) {
@@ -3039,8 +3043,8 @@ function renderContextPanel() {
     const restriction = document.createElement("p");
     restriction.className = "context-panel-hint";
     restriction.textContent = contextRestriction.length
-      ? `This session is restricted to ${contextRestriction.length} path(s). Only those paths' file content is assembled for a turn, and the assistant's file tools can read or list only those paths. The symbols row and repository map are still built from the whole repository.`
-      : "This session is restricted to no paths, so no file content is assembled for a turn and the assistant's file tools cannot read or list any path. The symbols row and repository map are still built from the whole repository.";
+      ? `This session is restricted to ${contextRestriction.length} path(s). Only those paths' file content is assembled for a turn, and the file-content tools (read_file, list_directory, searches and read_git_diff) can use only those paths. A one-off shell command such as ls -R can still list names outside it, and the symbols row and repository map are still built from the whole repository.`
+      : "This session is restricted to no paths, so no file content is assembled for a turn and the file-content tools cannot read or list any path. A one-off shell command such as ls -R can still list names outside it, and the symbols row and repository map are still built from the whole repository.";
     body.append(restriction);
   }
 
@@ -6414,6 +6418,13 @@ function summaryBody(summary) {
   section("Decisions", summary.decisions);
   section("Failed approaches", summary.failedApproaches);
   section("Remaining uncertainty", summary.uncertainty);
+  if (summary.narrativeCarriedForward) {
+    const note = document.createElement("p");
+    note.className = "compaction-summary-note";
+    note.textContent =
+      "The last summarisation call failed, so these model-written fields are carried forward from the previous summary.";
+    container.append(note);
+  }
   section("Files changed", summary.filesChanged);
   section(
     "Plan steps",
