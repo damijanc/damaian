@@ -118,8 +118,8 @@ pub use effective_policy::{
 pub use error::{ClientError, ProviderRefusal, Result};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};
 pub use git_service::{
-    DiffOptions, GitFileStatus, GitHubRepo, GitReadCaps, GitService, GitStatus, GitSummary,
-    WorktreeListing, WorktreeListingEntry, parse_github_remote,
+    BranchInfo, DiffOptions, GitFileStatus, GitHubRepo, GitReadCaps, GitService, GitStatus,
+    GitSummary, WorktreeListing, WorktreeListingEntry, parse_github_remote,
 };
 pub use hash::repository_id_for_root;
 pub use hooks::{

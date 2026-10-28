@@ -14,7 +14,7 @@ wins.
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Read-only branch information | Not started | — |
+| 1 · Read-only branch information | Done 2026-10-28 | Added `BranchInfo` (camelCase serde) and `GitService::branch_info` in `git_service.rs`: current branch, full `HEAD`, detached, upstream via `rev-parse @{upstream}`, ahead/behind through the existing helper, in-progress operation from Git-resolved marker paths including `BISECT_LOG`, and unmerged paths via `git diff --diff-filter=U -z` filtered by the restricted-path rule. `merge_base` is now public and validates `base` before git runs. `head_oid` is `Option<String>` because an unborn branch has no commit (context §3.13/D5). Audit is `git_branch_read` with counts and no restricted path names. New `tests/branch_delivery.rs` has 10 tests: upstream 0/0 → 1/0 → 0/1 → 1/1, detached, unborn, real conflicted merge, clean state, merge-base and option-shaped base refusal, byte-identical index/HEAD/status across reads, restricted conflicting `.env` omitted, non-repository refusal, and camelCase JSON. Falsified by swapping ahead/behind (test failed) and by skipping the `MERGE_HEAD` scan (test failed), then restoring. Scoped checks: `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest -p workspace-engine --test branch_delivery --test worktree_reads` 58 passed. No `chat.rs` change. |
 | 2 · Suggested branch name | Not started | — |
 | 3 · The `allow_git_branches` capability | Not started | — |
 | 4 · Branch creation and switching | Not started | — |
@@ -137,18 +137,18 @@ upstream, ahead/behind, in-progress operation, and conflicted paths, plus a
 public validated merge-base. It must not change a ref, the index, or the working
 tree.
 
-- [ ] Add `BranchInfo` with camelCase serde:
+- [x] Add `BranchInfo` with camelCase serde:
       `current: Option<String>`, `head_oid: Option<String>` (D5),
       `detached: bool`, `upstream: Option<String>`, `ahead: u32`, `behind: u32`,
       `in_progress_operation: Option<String>`, `conflicted_paths: Vec<String>`.
-- [ ] Add `GitService::branch_info`; return a clear `InvalidInput` error for a
+- [x] Add `GitService::branch_info`; return a clear `InvalidInput` error for a
       folder that is not a Git work tree. Read the branch with
       `symbolic-ref --short -q HEAD`, the full SHA with
       `rev-parse --verify -q HEAD`, the upstream with
       `rev-parse --abbrev-ref --symbolic-full-name @{upstream}`, and ahead/behind
       with the existing `ahead_behind` helper (`git_service.rs:785`). No upstream
       means `0/0`, not an error.
-- [ ] Detect an in-progress operation by checking
+- [x] Detect an in-progress operation by checking
       `git rev-parse --git-path <marker>` for `MERGE_HEAD`, `CHERRY_PICK_HEAD`,
       `REVERT_HEAD`, `rebase-merge`, `rebase-apply`, `sequencer`, and
       `BISECT_LOG`. Return a short stable label (`merge`, `cherry-pick`,
@@ -156,17 +156,17 @@ tree.
       Do not reuse `commit.rs`'s private list by editing `commit.rs` in this
       task; context §3.12/§4 D4 records the duplication and a later task may
       unify it.
-- [ ] Read conflicted paths with `git diff --name-only --diff-filter=U -z
+- [x] Read conflicted paths with `git diff --name-only --diff-filter=U -z
       --no-ext-diff --no-textconv`, then drop restricted paths with the existing
       `path_is_restricted` rule. This is cheaper and more complete than
       `changes`.
-- [ ] Audit one `git_branch_read` event with the root, whether it succeeded, and
+- [x] Audit one `git_branch_read` event with the root, whether it succeeded, and
       counts only; no path names of restricted files and no branch content.
-- [ ] Make `merge_base(root, base)` public, validate `base` with the existing
+- [x] Make `merge_base(root, base)` public, validate `base` with the existing
       `validate_base` first, and document that it is a pure read. `diff_in`
       continues to use it.
-- [ ] Re-export `BranchInfo` from `lib.rs`.
-- [ ] Tests in `tests/branch_delivery.rs`: a repository with a local bare
+- [x] Re-export `BranchInfo` from `lib.rs`.
+- [x] Tests in `tests/branch_delivery.rs`: a repository with a local bare
       `origin` reports upstream and ahead/behind (0/0, then 1/0, then 1/1 using
       refs moved only in the fixture); a detached `HEAD` reports
       `current: None`, `detached: true`; an unborn repository reports the branch
@@ -174,16 +174,16 @@ tree.
       `in_progress_operation: Some("merge")` and the conflicted path; a clean
       repository reports `None` and an empty list; `merge_base` resolves the fork
       point and rejects an option-shaped base.
-- [ ] Assert the read changes nothing: hash `.git/index`, `HEAD`'s full SHA, and
+- [x] Assert the read changes nothing: hash `.git/index`, `HEAD`'s full SHA, and
       `git status --porcelain=v2` before and after `branch_info` and
       `merge_base`, and compare them byte for byte.
-- [ ] Run `cargo fmt --all`; scoped checks:
+- [x] Run `cargo fmt --all`; scoped checks:
       `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`
       and `cargo nextest run -p workspace-engine --test branch_delivery`.
-- [ ] Falsify: temporarily make `branch_info` report the upstream ahead count as
+- [x] Falsify: temporarily make `branch_info` report the upstream ahead count as
       behind (or skip the merge-marker scan) and confirm the named test fails;
       restore.
-- [ ] Update this task's progress row and commit.
+- [x] Update this task's progress row and commit.
 
 ### Task 2 · Suggested branch name
 
