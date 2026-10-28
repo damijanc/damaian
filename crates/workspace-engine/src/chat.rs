@@ -1260,6 +1260,9 @@ impl ChatOrchestrator {
             pinned: &context_pins,
             restriction: context_restriction.as_deref(),
             conversation_summary: conversation.summary.as_ref(),
+            // Task 7 reads the session's recorded pages here; this task only
+            // defines the category and its assembly.
+            external_references: &[],
         })?;
         // What this turn is about to send (spec 27 §5.1, C9). Sent before the
         // first call, so the default (no pause) still gives the user a
@@ -2637,6 +2640,9 @@ impl ChatOrchestrator {
             pinned: &context_pins,
             restriction: context_restriction.as_deref(),
             conversation_summary: conversation.summary.as_ref(),
+            // A repair continuation carries no fetched pages of its own; Task 7
+            // wires the session's references into the ordinary turn.
+            external_references: &[],
         })?;
         let mut fields = vec![
             ("actor", "system".to_string()),
@@ -14538,6 +14544,7 @@ mod approval_prompt_wording_tests {
                 redaction_status: "clean".to_string(),
                 provenance: None,
                 root_path: None,
+                origin: None,
             }],
             files: Vec::new(),
             manifest: crate::context_manager::ContextManifest {
@@ -14609,6 +14616,7 @@ mod approval_prompt_wording_tests {
                 redaction_status: "clean".to_string(),
                 provenance: None,
                 root_path: None,
+                origin: None,
             }],
             files: Vec::new(),
             manifest: crate::context_manager::ContextManifest {
@@ -14657,6 +14665,7 @@ mod approval_prompt_wording_tests {
                 redaction_status: "clean".to_string(),
                 provenance: None,
                 root_path: None,
+                origin: None,
             }],
             files: Vec::new(),
             manifest: crate::context_manager::ContextManifest {

@@ -537,6 +537,7 @@ impl EditOrchestrator {
             pinned: &context_pins,
             restriction: context_restriction.as_deref(),
             conversation_summary: None,
+            external_references: &[],
         }) {
             Ok(context) => context,
             // A required prompt that cannot fit is the user's to see, and the

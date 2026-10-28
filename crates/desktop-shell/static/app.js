@@ -2218,6 +2218,7 @@ const CONTEXT_CATEGORY_LABELS = {
   file_ranges: "File ranges",
   findings: "Findings",
   conversation_summary: "Summary",
+  external_reference: "Reference pages",
 };
 
 const CONTEXT_REASON_LABELS = {
@@ -2344,6 +2345,12 @@ function contextCategoryRow(manifest, category) {
     row.className = "context-item";
     if (item.path) {
       row.append(contextPathButton(item.path, item.lineRange));
+    } else if (item.origin) {
+      // A fetched page has no path; its URL and fetch time are its identity
+      // (spec 51 §5.4), so the row names where it came from.
+      const name = document.createElement("span");
+      name.textContent = item.origin;
+      row.append(name);
     } else {
       const name = document.createElement("span");
       name.textContent = item.kind === "user_prompt" ? "Your message" : item.kind || category;

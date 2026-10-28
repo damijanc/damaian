@@ -11340,6 +11340,7 @@ mod tests {
                     tokens: 12,
                     root_path: None,
                     provenance: None,
+                    origin: None,
                 }],
                 excluded: Vec::new(),
                 conversation_summary: None,

@@ -27,6 +27,7 @@
 
 use crate::fetch::FetchOutcome;
 use crate::secret_scanner::SecretScanner;
+use serde::{Deserialize, Serialize};
 
 /// A query or fragment longer than this is broken out for display. A long
 /// opaque parameter is the shape of exfiltration and a user scanning a dialog
@@ -1465,6 +1466,47 @@ impl ConvertedResponse {
         }
         out.push_str("--- end retrieved external content ---\n");
         out
+    }
+}
+
+/// One fetched page, recorded for its session and carried into the next
+/// assembly (spec 51 §5.4, D5, D7).
+///
+/// This is what a `external_reference_fetched` session event holds and what
+/// [`crate::session::SessionStore::read_external_references`] reads back. The
+/// text is the converted, redacted, bounded text a tool result already showed;
+/// it is never re-converted, and the event never carries the raw body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalReference {
+    /// The canonical request URL, without the fragment.
+    pub url: String,
+    pub fetched_at_ms: u64,
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub bytes: usize,
+    /// Converted, redacted, bounded text.
+    pub text: String,
+    /// `"clean"` or `"redacted"`, as the conversion recorded it.
+    pub redaction_status: String,
+    /// The label a context item shows: the URL and the fetch time.
+    pub origin: String,
+}
+
+impl ExternalReference {
+    /// The recorded form of one converted response. `provenance()` is the
+    /// origin label D7 puts on the context item.
+    pub fn from_converted(response: &ConvertedResponse) -> Self {
+        Self {
+            url: response.url.request_url(),
+            fetched_at_ms: response.fetched_at_ms,
+            status: response.status,
+            content_type: response.content_type.clone(),
+            bytes: response.bytes,
+            text: response.text.clone(),
+            redaction_status: response.redaction_status().to_string(),
+            origin: response.provenance(),
+        }
     }
 }
 

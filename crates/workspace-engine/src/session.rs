@@ -3,6 +3,7 @@ use crate::clarification::{
     AskUserInput, PendingDecision, PendingQuestionRef, QuestionState, validate_answer,
 };
 use crate::error::Result;
+use crate::external_reference::ExternalReference;
 use crate::file_access::LineRange;
 use crate::hash::{create_id, now_millis};
 use crate::mode::SessionMode;
@@ -1291,6 +1292,26 @@ impl SessionStore {
             }
         }
         Ok(restriction)
+    }
+
+    /// The pages this session has fetched, in fetch order (spec 51 §5.4, D5).
+    ///
+    /// The `fetch_url` tool appends an `external_reference_fetched` event whose
+    /// payload is one [`ExternalReference`] — its converted, redacted, bounded
+    /// text and its provenance, never the raw body. The next assembly reads
+    /// them here and carries them as the last context category. The read is
+    /// `active_events`, so a rewind drops the pages of the turns it discards.
+    /// A malformed payload is skipped rather than failing the turn.
+    pub fn read_external_references(&self, session_id: &str) -> Result<Vec<ExternalReference>> {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(Vec::new());
+        };
+        Ok(active_events(&content)
+            .into_iter()
+            .filter(|event| event.event_type == "external_reference_fetched")
+            .filter_map(|event| serde_json::from_value(event.payload).ok())
+            .collect())
     }
 
     /// The newest `context_assembled` manifest per task (spec 27 §5.3).

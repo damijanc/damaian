@@ -119,10 +119,11 @@ pub use effective_policy::{
 };
 pub use error::{ClientError, ProviderRefusal, Result};
 pub use external_reference::{
-    ContentKind, ConvertedResponse, ConvertedText, Decision, EXTERNAL_CONTENT_NOTICE, ExternalUrl,
-    HostAllowlist, InjectionCategory, InjectionMarker, Inspection, InspectionFlags, LongComponent,
-    MAX_REFERENCE_TEXT_BYTES, ReadFileContent, RedirectTarget, RefusalReason, UrlComponent,
-    UrlParseError, UrlScheme, detect_injection_markers, html_to_text, inspect, redirect_target,
+    ContentKind, ConvertedResponse, ConvertedText, Decision, EXTERNAL_CONTENT_NOTICE,
+    ExternalReference, ExternalUrl, HostAllowlist, InjectionCategory, InjectionMarker, Inspection,
+    InspectionFlags, LongComponent, MAX_REFERENCE_TEXT_BYTES, ReadFileContent, RedirectTarget,
+    RefusalReason, UrlComponent, UrlParseError, UrlScheme, detect_injection_markers, html_to_text,
+    inspect, redirect_target,
 };
 pub use fetch::{CurlFetchTransport, DEFAULT_MAX_RESPONSE_BYTES, FetchOutcome};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};

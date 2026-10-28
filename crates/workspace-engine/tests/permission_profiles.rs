@@ -570,6 +570,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "context_budget.conversation_summary=1.00\n",
             Reported("context_budget.conversation_summary"),
         ),
+        // Spec 51 Task 6: the fetched-page share is the eleventh category, and
+        // a clone may lower it but never raise it.
+        case(
+            "context_budget_external_reference",
+            "",
+            "context_budget.external_reference=1.00\n",
+            Reported("context_budget.external_reference"),
+        ),
         // The margin is the other direction: reserving more is a restriction,
         // so a repository may raise it and never lower it.
         case(

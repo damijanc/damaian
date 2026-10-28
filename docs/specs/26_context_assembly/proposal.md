@@ -330,12 +330,19 @@ context_budget.pinned=0.15
 context_budget.plan_state=0.05
 context_budget.repository_map=0.05
 context_budget.symbols=0.10
-context_budget.search_results=0.15
+context_budget.search_results=0.10
 context_budget.file_ranges=0.25
 context_budget.findings=0.05
 context_budget.conversation_summary=0.05
+context_budget.external_reference=0.05
 context_budget.safety_margin=0.10
 ```
+
+The eleventh category, `external_reference`, is the text of a page fetched by
+[spec 51](../51_external_reference_retrieval/proposal.md)'s `fetch_url` tool. It
+is declared last, so a crowded context drops a fetched page before any
+repository content; its 0.05 share is funded from `search_results` (0.15 →
+0.10), so the defaults still total exactly 1.00.
 
 Fractions of the effective limit (§5.7) rather than absolute counts, so one set
 of settings works across a 64k and a 200k budget. They are parsed as decimals and

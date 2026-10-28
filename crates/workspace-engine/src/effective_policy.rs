@@ -150,6 +150,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "context_budget.file_ranges" => "Context share for file content",
         "context_budget.findings" => "Context share for findings",
         "context_budget.conversation_summary" => "Context share for the conversation summary",
+        "context_budget.external_reference" => "Context share for fetched reference pages",
         "context_budget.safety_margin" => "Context safety margin",
         "max_command_output_bytes" => "Command output kept (bytes)",
         "command_timeout_secs" => "Time limit per command (seconds)",

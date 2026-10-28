@@ -1163,6 +1163,7 @@ impl Config {
             context_budget_file_ranges,
             context_budget_findings,
             context_budget_conversation_summary,
+            context_budget_external_reference,
             context_budget_safety_margin,
             max_command_output_bytes,
             command_timeout_secs,
@@ -1865,6 +1866,11 @@ impl Config {
                 "context_budget.conversation_summary",
                 ContextCategory::ConversationSummary,
                 context_budget_conversation_summary,
+            ),
+            (
+                "context_budget.external_reference",
+                ContextCategory::ExternalReference,
+                context_budget_external_reference,
             ),
         ] {
             if let Some(value) = incoming
@@ -3018,6 +3024,8 @@ pub struct ConfigOverlay {
     pub context_budget_file_ranges: Option<u16>,
     pub context_budget_findings: Option<u16>,
     pub context_budget_conversation_summary: Option<u16>,
+    /// Spec 51 §5.4: the fetched-page share, restrict-only like every other.
+    pub context_budget_external_reference: Option<u16>,
     pub context_budget_safety_margin: Option<u16>,
     pub max_command_output_bytes: Option<usize>,
     pub command_timeout_secs: Option<usize>,
@@ -3185,6 +3193,9 @@ classify_overlay_fields! {
     context_budget_file_ranges => Capability,
     context_budget_findings => Capability,
     context_budget_conversation_summary => Capability,
+    // Spec 51 §5.4: a fetched page competes with repository content, so a
+    // clone may lower its share and never raise it.
+    context_budget_external_reference => Capability,
     context_budget_safety_margin => Capability,
     max_command_output_bytes => Preference,
     command_timeout_secs => Capability,
@@ -3443,6 +3454,9 @@ impl ConfigOverlay {
             }
             "context_budget.conversation_summary" => {
                 self.context_budget_conversation_summary = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.external_reference" => {
+                self.context_budget_external_reference = Some(parse_basis_points(key, value)?)
             }
             "context_budget.safety_margin" => {
                 self.context_budget_safety_margin = Some(parse_basis_points(key, value)?)
@@ -3877,6 +3891,7 @@ impl ConfigOverlay {
             context_budget_file_ranges,
             context_budget_findings,
             context_budget_conversation_summary,
+            context_budget_external_reference,
             context_budget_safety_margin,
             max_command_output_bytes,
             command_timeout_secs,
@@ -3999,6 +4014,10 @@ impl ConfigOverlay {
             (
                 "context_budget.conversation_summary",
                 context_budget_conversation_summary,
+            ),
+            (
+                "context_budget.external_reference",
+                context_budget_external_reference,
             ),
             ("context_budget.safety_margin", context_budget_safety_margin),
         ] {
@@ -5038,6 +5057,10 @@ fn context_budget_policy_lines(budget: &ContextBudget) -> Vec<(&'static str, u16
         (
             "context_budget.conversation_summary",
             budget.share(ContextCategory::ConversationSummary),
+        ),
+        (
+            "context_budget.external_reference",
+            budget.share(ContextCategory::ExternalReference),
         ),
     ];
     lines.push(("context_budget.safety_margin", budget.safety_margin_bps));
