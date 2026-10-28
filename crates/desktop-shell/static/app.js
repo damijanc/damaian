@@ -1367,6 +1367,14 @@ function toggleRepoFolderMenu(anchorEl) {
       ],
       [
         {
+          label: "Branch…",
+          action: "branch",
+          // Spec 36 D8: branch entry points live in the folder menu so the
+          // repo bar's single action slot stays Commit…-first.
+          hidden: Boolean(payload && payload.exitCode !== 0),
+          onSelect: () => void openBranchDialog(),
+        },
+        {
           label: "Copy path",
           action: "copy-path",
           onSelect: () => void copyRepoPath(repoPath),
@@ -1858,6 +1866,502 @@ function showCommitDialog(preparation, repoPath, sessionId) {
   document.addEventListener("keydown", onKeydown, true);
   refresh();
   dialog.querySelector(".commit-message").focus();
+}
+
+// ---------------------------------------------------------------------------
+// Branch delivery (spec 36). The dialog reads the state once, then prepares
+// one operation at a time. Creating, switching, and deleting are separate
+// decisions: each sends back the exact prepared mutation with its own
+// `approval=branch`. The merge and rebase panels are reports only — they have
+// no control that could run either.
+
+function branchOutcomeLabel(outcome) {
+  switch (outcome?.mutation?.kind) {
+    case "createBranch":
+      return `Created ${outcome.branch}`;
+    case "switchBranch":
+      return `Switched to ${outcome.branch}`;
+    case "deleteBranch":
+      return `Deleted ${outcome.branch}`;
+    default:
+      return `Branch ready: ${outcome?.branch || "unknown"}`;
+  }
+}
+
+function shortOid(oid) {
+  return String(oid || "").slice(0, 8) || "the current commit";
+}
+
+function mergeReportText(report) {
+  const lines = [
+    `Merge ${report.base} into ${shortOid(report.headOid)}.`,
+    `Merge base: ${report.mergeBase || "not found"}`,
+    `Incoming commits (${report.incomingCommits.length}):`,
+    ...report.incomingCommits.map((commit) => `  ${commit}`),
+    `Changed files (${report.changedFiles.length}):`,
+    ...report.changedFiles.map((path) => `  ${path}`),
+    `Conflicted paths (${report.conflictedPaths.length}):`,
+  ];
+  if (report.conflictedPaths.length) {
+    lines.push(...report.conflictedPaths.map((path) => `  ${path}`));
+  } else {
+    lines.push("  none");
+  }
+  lines.push(`Fast-forward: ${report.fastForward ? "yes" : "no"}`);
+  if (report.problem) lines.push("", report.problem);
+  if (!report.conflictPredictionAvailable && report.conflictPredictionUnavailableReason) {
+    lines.push(
+      "",
+      `Conflict prediction is unavailable: ${report.conflictPredictionUnavailableReason}`,
+    );
+  }
+  lines.push("", "Nothing was merged or changed. Damaian ran no merge and made no commit.");
+  return lines.join("\n");
+}
+
+function rebaseReportText(report) {
+  const onto = report.ontoOid ? `${report.onto} (${shortOid(report.ontoOid)})` : report.onto;
+  const lines = [
+    `Rebase ${shortOid(report.headOid)} onto ${onto}.`,
+    `Merge base: ${report.mergeBase || "not found"}`,
+    `Commits that would be replayed (${report.commitsToReplay.length}):`,
+    ...report.commitsToReplay.map((commit) => `  ${commit}`),
+  ];
+  if (report.problem) lines.push("", report.problem);
+  lines.push(
+    "",
+    "Conflict prediction for a rebase is unavailable because it would require replaying " +
+      "the commits one by one. Nothing was replayed.",
+  );
+  return lines.join("\n");
+}
+
+async function openBranchDialog() {
+  const repoPath = repo();
+  const sessionId = currentSessionId;
+  if (!repoPath || !sessionId) return;
+  let info;
+  try {
+    info = await api(
+      `/api/branch-info?repo=${encodeURIComponent(repoPath)}&session=${encodeURIComponent(sessionId)}`,
+    );
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
+  let suggestion = null;
+  try {
+    suggestion = await api(
+      "/api/branch-suggestion",
+      form({ repo: repoPath, session_id: sessionId }),
+    );
+  } catch {
+    // The name field stays editable when a suggestion cannot be produced.
+  }
+  showBranchDialog(info, suggestion, repoPath, sessionId);
+}
+
+// One card, one decision. Cancel takes focus: an approval surface never
+// pre-selects its own confirmation (§5 of the UI style guide).
+function renderBranchCard(card, { title, message, lines = [], confirmLabel, danger, onConfirm }) {
+  card.replaceChildren();
+  card.hidden = false;
+  const titleEl = document.createElement("p");
+  titleEl.className = "branch-card-title";
+  titleEl.textContent = title;
+  const messageEl = document.createElement("p");
+  messageEl.className = "branch-card-message";
+  messageEl.textContent = message;
+  card.append(titleEl, messageEl);
+  if (lines.length) {
+    const list = document.createElement("ul");
+    list.className = "branch-card-list";
+    lines.forEach((line) => {
+      const item = document.createElement("li");
+      item.textContent = line;
+      list.append(item);
+    });
+    card.append(list);
+  }
+  const actions = document.createElement("div");
+  actions.className = "branch-actions";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "app-dialog-btn";
+  cancel.textContent = "Cancel";
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.className = `app-dialog-btn app-dialog-confirm${danger ? " app-dialog-btn-danger" : ""}`;
+  confirm.textContent = confirmLabel;
+  cancel.addEventListener("click", () => {
+    card.hidden = true;
+    card.replaceChildren();
+  });
+  confirm.addEventListener("click", async () => {
+    confirm.disabled = true;
+    try {
+      await onConfirm();
+    } finally {
+      confirm.disabled = false;
+    }
+  });
+  actions.append(cancel, confirm);
+  card.append(actions);
+  cancel.focus();
+}
+
+function showBranchDialog(info, suggestion, repoPath, sessionId) {
+  const backdrop = document.createElement("div");
+  backdrop.className = "app-dialog-backdrop";
+  backdrop.innerHTML = `
+    <div class="app-dialog app-dialog-branch" role="dialog" aria-modal="true" aria-label="Branches">
+      <p class="app-dialog-title">Branches</p>
+      <div class="branch-state"></div>
+      <label class="branch-label" for="branch-name">Branch name</label>
+      <input id="branch-name" class="app-dialog-input branch-name" type="text" spellcheck="false" />
+      <p class="branch-note"></p>
+      <button type="button" class="btn-sm branch-use-alternative" hidden></button>
+      <label class="app-dialog-checkitem">
+        <input type="checkbox" class="branch-switch-after" />
+        <span>Switch to it after creating (a separate approval)</span>
+      </label>
+      <p class="branch-refusal" hidden></p>
+      <div class="branch-actions">
+        <button type="button" class="app-dialog-btn branch-create">Create branch…</button>
+        <button type="button" class="app-dialog-btn branch-switch">Switch to branch…</button>
+      </div>
+      <div class="branch-card branch-approval" hidden></div>
+      <p class="branch-section-title">Delete a branch</p>
+      <p class="branch-note">The current branch is never offered for deletion.</p>
+      <div class="branch-branch-list"></div>
+      <div class="branch-card branch-delete" hidden></div>
+      <div class="branch-card branch-confirm" hidden></div>
+      <p class="branch-section-title">Merge or rebase report</p>
+      <label class="branch-label" for="branch-base">Merge or onto branch</label>
+      <input id="branch-base" class="app-dialog-input" type="text" spellcheck="false" />
+      <div class="branch-actions">
+        <button type="button" class="app-dialog-btn branch-merge">Preview merge</button>
+        <button type="button" class="app-dialog-btn branch-rebase">Preview rebase</button>
+      </div>
+      <pre class="app-dialog-detail branch-report" tabindex="0" hidden></pre>
+      <div class="app-dialog-actions">
+        <button type="button" class="app-dialog-btn app-dialog-cancel">Close</button>
+      </div>
+    </div>
+  `;
+  document.body.append(backdrop);
+
+  const dialog = backdrop.querySelector(".app-dialog");
+  const state = dialog.querySelector(".branch-state");
+  const nameInput = dialog.querySelector(".branch-name");
+  const note = dialog.querySelector(".branch-note");
+  const switchAfter = dialog.querySelector(".branch-switch-after");
+  const alternativeButton = dialog.querySelector(".branch-use-alternative");
+  const refusal = dialog.querySelector(".branch-refusal");
+  const approvalCard = dialog.querySelector(".branch-approval");
+  const deleteCard = dialog.querySelector(".branch-delete");
+  const confirmCard = dialog.querySelector(".branch-confirm");
+  const branchList = dialog.querySelector(".branch-branch-list");
+  const baseInput = dialog.querySelector(".branch-base");
+  const reportEl = dialog.querySelector(".branch-report");
+
+  const cleanup = () => {
+    document.removeEventListener("keydown", onKeydown, true);
+    backdrop.remove();
+  };
+  const onKeydown = (event) => {
+    if (event.key === "Escape") cleanup();
+  };
+  backdrop.querySelector(".app-dialog-cancel").addEventListener("click", cleanup);
+  document.addEventListener("keydown", onKeydown, true);
+
+  const showRefusal = (message) => {
+    refusal.textContent = message || "";
+    refusal.hidden = !message;
+  };
+  const hideDeleteCards = () => {
+    deleteCard.hidden = true;
+    deleteCard.replaceChildren();
+    confirmCard.hidden = true;
+    confirmCard.replaceChildren();
+  };
+
+  const addStateLine = (label, value) => {
+    const line = document.createElement("p");
+    line.className = "branch-state-line";
+    const name = document.createElement("span");
+    name.className = "branch-state-label";
+    name.textContent = `${label}: `;
+    const text = document.createElement("span");
+    text.textContent = value;
+    line.append(name, text);
+    state.append(line);
+  };
+  addStateLine("Current branch", info.current || `detached HEAD at ${shortOid(info.headOid)}`);
+  addStateLine("Upstream", info.upstream || "none configured");
+  addStateLine("Ahead / behind", `${info.ahead ?? 0} / ${info.behind ?? 0}`);
+  if (info.inProgressOperation) {
+    addStateLine("Operation in progress", info.inProgressOperation);
+  }
+  const conflicted = info.conflictedPaths || [];
+  addStateLine("Conflicted paths", conflicted.length ? conflicted.join(", ") : "none");
+
+  let currentSuggestion = suggestion;
+  nameInput.value = currentSuggestion?.name || "";
+  const refreshNote = () => {
+    const name = nameInput.value.trim();
+    alternativeButton.hidden = true;
+    note.classList.remove("branch-note-warn");
+    if (!name) {
+      note.textContent = "Enter the branch name to create or switch to.";
+      return;
+    }
+    if (currentSuggestion && currentSuggestion.name === name) {
+      if (!currentSuggestion.valid) {
+        note.classList.add("branch-note-warn");
+        note.textContent = `Git will not accept this name: ${
+          currentSuggestion.refusal || "the name is invalid"
+        }.`;
+        return;
+      }
+      if (currentSuggestion.exists && currentSuggestion.alternative) {
+        note.classList.add("branch-note-warn");
+        note.textContent =
+          `\`${name}\` already exists. A free alternative is ` +
+          `\`${currentSuggestion.alternative}\`; the field was not changed.`;
+        alternativeButton.textContent = `Use ${currentSuggestion.alternative}`;
+        alternativeButton.hidden = false;
+        return;
+      }
+    }
+    note.textContent = "Create and switch are separate approvals; each asks before it runs.";
+  };
+  refreshNote();
+  nameInput.addEventListener("input", refreshNote);
+  alternativeButton.addEventListener("click", () => {
+    nameInput.value = currentSuggestion?.alternative || nameInput.value;
+    refreshNote();
+    nameInput.focus();
+  });
+
+  const applyBranch = (preparation, confirmUnmerged) =>
+    api(
+      "/api/branch",
+      form({
+        repo: repoPath,
+        prepare_id: preparation.prepareId,
+        mutation: JSON.stringify(preparation.mutation),
+        approval: "branch",
+        confirm_unmerged: confirmUnmerged ? "true" : "false",
+      }),
+    );
+
+  const finishMutation = async (outcome) => {
+    cleanup();
+    toast(branchOutcomeLabel(outcome), { duration: 7000 });
+    await refreshRepoBar();
+    await openBranchDialog();
+  };
+
+  const applyPrepared = async (preparation, confirmUnmerged) => {
+    try {
+      await finishMutation(await applyBranch(preparation, confirmUnmerged));
+    } catch (error) {
+      showRefusal(error.message);
+    }
+  };
+
+  const prepareBranch = async (operation) => {
+    const name = nameInput.value.trim();
+    if (!name) {
+      showRefusal("Enter a branch name first.");
+      nameInput.focus();
+      return null;
+    }
+    showRefusal("");
+    approvalCard.hidden = true;
+    approvalCard.replaceChildren();
+    hideDeleteCards();
+    try {
+      return await api(
+        "/api/branch-prepare",
+        form({ repo: repoPath, session_id: sessionId, operation, name }),
+      );
+    } catch (error) {
+      const preparation = error.payload?.preparation || null;
+      if (preparation?.suggestion) {
+        currentSuggestion = preparation.suggestion;
+        refreshNote();
+      }
+      showRefusal(error.message);
+      return null;
+    }
+  };
+
+  dialog.querySelector(".branch-create").addEventListener("click", async () => {
+    const preparation = await prepareBranch("create");
+    if (!preparation) return;
+    renderBranchCard(approvalCard, {
+      title: `Create ${preparation.mutation.name}?`,
+      message:
+        `This creates ${preparation.mutation.name} at ${shortOid(
+          preparation.mutation.startPoint,
+        )} and leaves ${info.current || "HEAD"} checked out. Nothing else changes; ` +
+        "switching to it is a separate approval.",
+      confirmLabel: "Create branch",
+      onConfirm: async () => {
+        try {
+          const outcome = await applyBranch(preparation, false);
+          toast(`Created ${outcome.branch}`, { duration: 7000 });
+          if (!switchAfter.checked) {
+            await finishMutation(outcome);
+            return;
+          }
+          const switching = await prepareBranch("switch");
+          if (!switching) return;
+          renderBranchCard(approvalCard, {
+            title: `Switch to ${switching.mutation.name}?`,
+            message:
+              "The branch was created and the current branch is still checked out. This is " +
+              `the separate switch approval; it updates the index and working tree to ${shortOid(
+                switching.startPointSha,
+              )}.`,
+            confirmLabel: "Switch branch",
+            onConfirm: async () => {
+              try {
+                await finishMutation(await applyBranch(switching, false));
+              } catch (error) {
+                showRefusal(error.message);
+              }
+            },
+          });
+        } catch (error) {
+          showRefusal(error.message);
+        }
+      },
+    });
+  });
+
+  dialog.querySelector(".branch-switch").addEventListener("click", async () => {
+    const preparation = await prepareBranch("switch");
+    if (!preparation) return;
+    renderBranchCard(approvalCard, {
+      title: `Switch to ${preparation.mutation.name}?`,
+      message: `This updates the index and working tree to ${shortOid(
+        preparation.startPointSha,
+      )}. Uncommitted changes that would be overwritten are refused before anything runs.`,
+      confirmLabel: "Switch branch",
+      onConfirm: () => applyPrepared(preparation, false),
+    });
+  });
+
+  const showDeleteCard = (preparation) => {
+    const name = preparation.mutation.name;
+    const subjects = preparation.unmergedSubjects || [];
+    const count = preparation.unmergedCommits;
+    if (count === 0) {
+      renderBranchCard(deleteCard, {
+        title: `Delete ${name}`,
+        message:
+          `${name} is fully merged: every commit is on the default branch or a remote, ` +
+          "so deleting it loses no commits.",
+        confirmLabel: `Delete ${name}`,
+        danger: true,
+        onConfirm: () => applyPrepared(preparation, false),
+      });
+      return;
+    }
+    const counted = count === null || count === undefined;
+    const lost = counted
+      ? "an unknown number of commits"
+      : `${count} commit${count === 1 ? "" : "s"}`;
+    renderBranchCard(deleteCard, {
+      title: `${name} has unmerged commits`,
+      message: counted
+        ? `Damaian could not determine the default branch, so it cannot count what deleting ` +
+          `${name} would lose. The commit subjects are below. Nothing has been deleted; ` +
+          "Continue leads to a second confirmation."
+        : `Deleting ${name} would lose ${lost} that are not on the default branch or any ` +
+          "remote. Nothing has been deleted; Continue leads to a second confirmation.",
+      lines: subjects,
+      confirmLabel: "Continue…",
+      onConfirm: () => {
+        deleteCard.hidden = true;
+        renderBranchCard(confirmCard, {
+          title: counted ? `Delete ${name} anyway?` : `Delete ${name} and lose ${lost}?`,
+          message:
+            "This is the second confirmation. Damaian will run git branch -D; the commits " +
+            "below will no longer be reachable from any branch.",
+          lines: subjects,
+          confirmLabel: counted ? "Delete anyway" : `Delete and lose ${lost}`,
+          danger: true,
+          onConfirm: () => applyPrepared(preparation, true),
+        });
+      },
+    });
+  };
+
+  const deletable = (info.branches || []).filter((name) => name !== info.current);
+  if (!deletable.length) {
+    const empty = document.createElement("p");
+    empty.className = "branch-note";
+    empty.textContent = "No other local branches are available to delete.";
+    branchList.append(empty);
+  }
+  deletable.forEach((name) => {
+    const row = document.createElement("div");
+    row.className = "branch-branch-row";
+    const label = document.createElement("code");
+    label.className = "branch-branch-name";
+    label.textContent = name;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn-sm btn-danger";
+    button.textContent = "Delete…";
+    button.addEventListener("click", async () => {
+      showRefusal("");
+      approvalCard.hidden = true;
+      approvalCard.replaceChildren();
+      hideDeleteCards();
+      try {
+        const preparation = await api(
+          "/api/branch-prepare",
+          form({ repo: repoPath, session_id: sessionId, operation: "delete", name }),
+        );
+        showDeleteCard(preparation);
+      } catch (error) {
+        showRefusal(error.message);
+      }
+    });
+    row.append(label, button);
+    branchList.append(row);
+  });
+
+  baseInput.value = info.upstream || "main";
+  const runReport = async (mode) => {
+    const base = baseInput.value.trim();
+    if (!base) {
+      showRefusal("Enter the branch to merge or rebase onto.");
+      baseInput.focus();
+      return;
+    }
+    showRefusal("");
+    try {
+      const report = await api(
+        `/api/merge-preparation?repo=${encodeURIComponent(repoPath)}` +
+          `&session=${encodeURIComponent(sessionId)}&mode=${mode}&base=${encodeURIComponent(base)}`,
+      );
+      reportEl.textContent = mode === "merge" ? mergeReportText(report) : rebaseReportText(report);
+      reportEl.hidden = false;
+    } catch (error) {
+      reportEl.hidden = true;
+      showRefusal(error.message);
+    }
+  };
+  dialog.querySelector(".branch-merge").addEventListener("click", () => void runReport("merge"));
+  dialog.querySelector(".branch-rebase").addEventListener("click", () => void runReport("rebase"));
+
+  nameInput.focus();
 }
 
 function closeApprovalMenu() {
