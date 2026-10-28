@@ -281,6 +281,17 @@ be presented as current.
   `web_domain_allowlist.<repository id>` read from `user.conf`, because the
   engine's `Config` predates the write. Only user config is read; repository
   config still cannot write that map.
+- **The `Redaction:` line reports only the post-conversion scan (Task 9).**
+  `fetch.rs` redacts the raw body before it is returned, so by the time
+  `ConvertedResponse::from_outcome` scans the converted text the credential is
+  already a placeholder; `redactions` is 0 and `render_for_model` says
+  `Redaction: clean`, while `redaction_status()` and the session event say
+  `clean` too. The secret is gone — the placeholder is in the text and the raw
+  value is not — but the label understates what happened, and a user debugging a
+  strange turn would see "clean" for a page that carried a key. The injection
+  scenarios therefore assert the `[REDACTED_AWS_ACCESS_KEY_` placeholder and the
+  absence of the raw value, not the count. Counting both scans (transport and
+  conversion) would need a `FetchOutcome` field and is Task 10's call.
 
 ## 5. What later tasks inherit
 

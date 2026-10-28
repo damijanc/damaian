@@ -41,6 +41,46 @@ pub struct Turn {
     pub truncated: bool,
 }
 
+/// The placeholder a scenario writes where the stub's base URL belongs.
+///
+/// The server binds `127.0.0.1:0`, so the port does not exist until the run
+/// starts and cannot be written into a scenario file. The runner substitutes
+/// this in the prompt and in string tool-call arguments.
+pub const STUB_BASE_PLACEHOLDER: &str = "{stub_base}";
+
+/// One page the harness serves from a loopback stub (spec 51 Task 9).
+///
+/// A page is matched by exact path — the query string is ignored — so a
+/// scenario can count requests to a collection endpoint that must never be
+/// reached. A path no page names answers `404`, which makes a mistyped
+/// scenario fail as a page that was fetched rather than silently as a
+/// non-fetch.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct StubPage {
+    /// Request path including the leading slash, e.g. `/docs/install`.
+    pub path: String,
+    /// HTTP status; 200 unless the scenario needs a redirect or an error.
+    #[serde(default = "default_stub_status")]
+    pub status: u16,
+    #[serde(default = "default_stub_content_type")]
+    pub content_type: String,
+    #[serde(default)]
+    pub body: String,
+    /// A `location` header for a 3xx page. The tool never follows it; the page
+    /// exists so a redirect can be measured without the internet.
+    #[serde(default)]
+    pub location: Option<String>,
+}
+
+fn default_stub_status() -> u16 {
+    200
+}
+
+fn default_stub_content_type() -> String {
+    "text/plain; charset=utf-8".to_string()
+}
+
 /// One message written into the session before a scenario's first ask.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
@@ -198,6 +238,30 @@ pub struct Asserts {
     pub memory_absent: Option<Vec<String>>,
     /// Strings the audit log must contain, such as a refusal reason.
     pub memory_audit_contains: Option<Vec<String>>,
+    /// How many HTTP requests the scenario's loopback page server received
+    /// (spec 51 Task 9). An exact count, not an upper bound: the claim a fetch
+    /// scenario makes is "nothing left the machine", and zero is the answer
+    /// that matters for a refused URL.
+    pub fetch_requests: Option<u64>,
+    /// How many `web_fetch` audit events the run recorded. One per successful
+    /// fetch, never for a refused URL.
+    pub fetch_audits: Option<u64>,
+    /// How many `web_fetch_approval_decision` audit events the run recorded.
+    /// The committed fetch scenarios pre-approve their stub host, so this is
+    /// zero; a non-zero value means the run paused on an approval the harness
+    /// cannot answer.
+    pub fetch_approval_decisions: Option<u64>,
+    /// Strings the run's tool results must contain. Read from the session log,
+    /// because that is what the model was actually given; the run record keeps
+    /// only a marker reference.
+    pub tool_results_contain: Option<Vec<String>>,
+    /// Strings no tool result may contain — a seeded credential that would
+    /// otherwise reach the model unredacted.
+    pub tool_results_exclude: Option<Vec<String>>,
+    /// Strings that must appear in a tool result **only** on a line beginning
+    /// with `> `. This is the "fetched content is data" claim: the page's own
+    /// words reach the model inside the reference frame, never as bare text.
+    pub tool_results_quoted: Option<Vec<String>>,
     #[serde(default)]
     pub deterministic_only: Vec<String>,
 }
@@ -241,6 +305,14 @@ pub struct Scenario {
     /// resumes each question through `resume_after_answer`. Empty is the
     /// headless default every other scenario keeps.
     pub answers: Vec<String>,
+    /// That someone can answer a mid-turn question even though the scenario
+    /// scripts no answer. `fetch_url` is offered on the same condition as
+    /// `ask_user` [spec 51 §5.3], and a fetch scenario pre-approves its stub
+    /// host so it never actually pauses; this is how it says a user is there
+    /// without inventing an answer nothing will consume.
+    pub user_present: bool,
+    /// Pages served from a loopback stub for this run (spec 51 Task 9).
+    pub stub_pages: Vec<StubPage>,
     /// A second user turn in the same session, run after the first finishes
     /// (spec 65 §5.9). Its scripted responses are the rest of `turns`, so one
     /// scenario can measure what a later turn inherits. `None` is one turn, as
@@ -297,6 +369,12 @@ struct RawScenario {
     /// leaves the run headless.
     #[serde(default)]
     answers: Vec<String>,
+    /// That a user is present without scripting an answer (spec 51 Task 9).
+    #[serde(default)]
+    user_present: bool,
+    /// Pages served from a loopback stub (spec 51 Task 9).
+    #[serde(default, rename = "stub_page")]
+    stub_page: Vec<StubPage>,
     /// A second user turn in the same session (spec 65 §5.9). The scripted
     /// responses continue from where the first turn stopped.
     #[serde(default)]
@@ -440,6 +518,42 @@ pub fn load(path: &Path) -> Result<Scenario> {
         });
     }
 
+    let stub_pages = raw.stub_page;
+    for page in &stub_pages {
+        if !page.path.starts_with('/') {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: stub page path {:?} must start with `/`",
+                path.display(),
+                page.path
+            )));
+        }
+    }
+    // A placeholder with nothing to substitute would reach the model as a
+    // literal URL and fail as a parse error, which reads like an engine defect
+    // rather than a scenario mistake. Refuse it at the boundary instead.
+    if stub_pages.is_empty() {
+        let uses_placeholder = raw.prompt.contains(STUB_BASE_PLACEHOLDER)
+            || raw
+                .follow_up_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.contains(STUB_BASE_PLACEHOLDER))
+            || raw
+                .seed_conversation
+                .iter()
+                .any(|message| message.content.contains(STUB_BASE_PLACEHOLDER))
+            || turns.iter().any(|turn| {
+                turn.tool_calls
+                    .iter()
+                    .any(|call| value_contains_placeholder(&call.arguments))
+            });
+        if uses_placeholder {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: {STUB_BASE_PLACEHOLDER} is used but the scenario declares no [[stub_page]]",
+                path.display()
+            )));
+        }
+    }
+
     Ok(Scenario {
         name: raw.name,
         fixture: raw.fixture,
@@ -453,6 +567,8 @@ pub fn load(path: &Path) -> Result<Scenario> {
         approval_decision: raw.approval_decision,
         round_budget_decision: raw.round_budget_decision,
         answers: raw.answers,
+        user_present: raw.user_present,
+        stub_pages,
         follow_up_prompt: raw.follow_up_prompt,
         seed_conversation: raw.seed_conversation,
         seed_files: raw.seed_files,
@@ -469,6 +585,15 @@ pub fn load(path: &Path) -> Result<Scenario> {
         turns,
         asserts: raw.asserts,
     })
+}
+
+fn value_contains_placeholder(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.contains(STUB_BASE_PLACEHOLDER),
+        serde_json::Value::Array(items) => items.iter().any(value_contains_placeholder),
+        serde_json::Value::Object(map) => map.values().any(value_contains_placeholder),
+        _ => false,
+    }
 }
 
 pub fn load_all() -> Result<Vec<Scenario>> {
