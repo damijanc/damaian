@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::error::{ClientError, Result};
 use crate::path_policy::PathPolicy;
 use crate::secret_scanner::SecretScanner;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -181,6 +182,67 @@ pub struct GitSummary {
     pub insertions: u64,
     pub deletions: u64,
     pub github: Option<GitHubRepo>,
+}
+
+/// The branch state a delivery action reads before offering to change anything
+/// (spec 36 §5.1). Every field is a read; `detached` and
+/// `in_progress_operation` are surfaced because they are states in which
+/// branch creation and switching must refuse rather than guess.
+///
+/// `head_oid` is optional because an unborn branch has a name and no commit.
+/// The proposal's `String` could not represent a freshly initialised
+/// repository (spec 36 `context.md` §3.13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchInfo {
+    /// `None` when `HEAD` is detached.
+    pub current: Option<String>,
+    /// The full `HEAD` SHA, or `None` on an unborn branch.
+    pub head_oid: Option<String>,
+    pub detached: bool,
+    /// `None` when the branch has no upstream configured.
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    /// `merge`, `rebase`, `cherry-pick`, `revert`, `sequencer`, or `bisect`.
+    pub in_progress_operation: Option<String>,
+    /// Unmerged paths, restricted paths omitted.
+    pub conflicted_paths: Vec<String>,
+}
+
+/// The Git operations whose marker files mean a repository is mid-operation.
+/// Order matters: a rebase also has a `sequencer`, so `rebase-merge` and
+/// `rebase-apply` are checked first.
+const IN_PROGRESS_MARKERS: [(&str, &str); 7] = [
+    ("MERGE_HEAD", "merge"),
+    ("CHERRY_PICK_HEAD", "cherry-pick"),
+    ("REVERT_HEAD", "revert"),
+    ("rebase-merge", "rebase"),
+    ("rebase-apply", "rebase"),
+    ("sequencer", "sequencer"),
+    ("BISECT_LOG", "bisect"),
+];
+
+/// Whether Git accepts a branch name, and why not when it does not
+/// (spec 36 §5.2). The check is `git check-ref-format --branch`, never a
+/// hand-written pattern, so a name this says is valid is one Git will accept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchNameCheck {
+    pub valid: bool,
+    /// Git's own refusal text, when invalid.
+    pub reason: Option<String>,
+}
+
+/// The outcome of the read-only `git merge-tree --write-tree` probe
+/// (spec 36 §5.4). Exit status 1 is a normal answer — the merge conflicts — so
+/// the status travels beside the output instead of using [`git_output`]'s
+/// success-only contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergeTreeRun {
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 /// Parses an `origin` URL into a GitHub owner and repository name.
@@ -502,6 +564,175 @@ impl GitService {
         })
     }
 
+    /// The branch information branch delivery reads before it offers to change
+    /// anything (spec 36 §5.1). Every command is a read: no ref moves, and
+    /// `read_git` keeps the index from being refreshed.
+    ///
+    /// A folder that is not a Git work tree is an error rather than an empty
+    /// answer, because unlike the repo-bar summary there is no branch action to
+    /// offer for it.
+    pub fn branch_info(&self, root_path: impl AsRef<Path>) -> Result<BranchInfo> {
+        let root = root_path.as_ref();
+        let inside = git_line(root, &["rev-parse", "--is-inside-work-tree"])?;
+        if inside.as_deref() != Some("true") {
+            return Err(ClientError::InvalidInput(format!(
+                "{} is not a Git work tree",
+                root.display()
+            )));
+        }
+        let current = git_line(root, &["symbolic-ref", "--short", "-q", "HEAD"])?;
+        let head_oid = git_line(root, &["rev-parse", "--verify", "-q", "HEAD"])?;
+        // An unborn branch has a current branch and no HEAD, so it is not
+        // detached. Detachment means HEAD points at a commit, not a ref.
+        let detached = current.is_none() && head_oid.is_some();
+        let upstream = git_line(
+            root,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        )?;
+        let (ahead, behind) = match &upstream {
+            Some(upstream) => {
+                let (ahead, behind) = self.ahead_behind(root, upstream)?;
+                (
+                    u32::try_from(ahead).unwrap_or(u32::MAX),
+                    u32::try_from(behind).unwrap_or(u32::MAX),
+                )
+            }
+            None => (0, 0),
+        };
+        let in_progress_operation = self.read_in_progress_operation(root)?;
+        let conflicted_paths = self.conflicted_paths(root)?;
+        self.audit_log.record(
+            "git_branch_read",
+            &[
+                ("actor", "system".to_string()),
+                ("resourcePath", root.to_string_lossy().to_string()),
+                ("status", "complete".to_string()),
+                ("detached", detached.to_string()),
+                ("upstream", upstream.clone().unwrap_or_default()),
+                ("ahead", ahead.to_string()),
+                ("behind", behind.to_string()),
+                (
+                    "operation",
+                    in_progress_operation.clone().unwrap_or_default(),
+                ),
+                ("conflictedCount", conflicted_paths.len().to_string()),
+            ],
+        )?;
+        Ok(BranchInfo {
+            current,
+            head_oid,
+            detached,
+            upstream,
+            ahead,
+            behind,
+            in_progress_operation,
+            conflicted_paths,
+        })
+    }
+
+    /// The operation whose marker file is present, if any. The marker paths
+    /// come from Git rather than from a joined `.git` path, because a linked
+    /// worktree's markers live under the repository's `worktrees/<name>`
+    /// directory, not in the worktree.
+    fn read_in_progress_operation(&self, root: &Path) -> Result<Option<String>> {
+        for (marker, operation) in IN_PROGRESS_MARKERS {
+            let Some(path) = git_line(root, &["rev-parse", "--git-path", marker])? else {
+                continue;
+            };
+            let path = Path::new(&path);
+            let exists = if path.is_absolute() {
+                path.exists()
+            } else {
+                root.join(path).exists()
+            };
+            if exists {
+                return Ok(Some(operation.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The unmerged paths, as `git diff --diff-filter=U` reports them. This is
+    /// cheaper than `changes` (which lists every untracked file) and it names
+    /// only paths Git currently considers unmerged. Restricted paths are
+    /// dropped like every other read (spec 60 §5.4).
+    fn conflicted_paths(&self, root: &Path) -> Result<Vec<String>> {
+        let output = git_output(
+            root,
+            &[
+                "diff",
+                "--name-only",
+                "--diff-filter=U",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(ClientError::Git(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        let paths: std::collections::BTreeSet<String> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .filter(|path| !self.path_is_restricted(path))
+            .collect();
+        Ok(paths.into_iter().collect())
+    }
+
+    /// `git check-ref-format --branch <name>`, the authoritative answer about
+    /// whether a branch name is acceptable (spec 36 §5.2). The name is passed
+    /// as one argument; a name starting with `-` is refused by the caller
+    /// before this runs, and Git would reject it as an option otherwise.
+    pub fn check_branch_name(
+        &self,
+        root_path: impl AsRef<Path>,
+        name: &str,
+    ) -> Result<BranchNameCheck> {
+        let output = git_output(root_path.as_ref(), &["check-ref-format", "--branch", name])?;
+        if output.status.success() {
+            return Ok(BranchNameCheck {
+                valid: true,
+                reason: None,
+            });
+        }
+        Ok(BranchNameCheck {
+            valid: false,
+            reason: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        })
+    }
+
+    /// Every local branch, short names, in Git's order (spec 36 §5.2). One
+    /// process, so a collision search does not start one per candidate.
+    pub fn local_branches(
+        &self,
+        root_path: impl AsRef<Path>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let output = git_output(
+            root_path.as_ref(),
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        )?;
+        if !output.status.success() {
+            return Err(ClientError::Git(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     /// The working tree's (or with `staged`, the index's) diff, with
     /// restricted paths left out and the output capped (spec 60 §5.4).
     pub fn diff(&self, root_path: impl AsRef<Path>, staged: bool) -> Result<String> {
@@ -546,7 +777,7 @@ impl GitService {
         }
         let scope = self.diff_scope(root, &options.paths)?;
         let merge_base = match &options.base {
-            Some(base) => Some(self.merge_base(root, base)?),
+            Some(base) => Some(self.merge_base_in(root, base)?),
             None => None,
         };
         let mut args = vec!["diff"];
@@ -658,7 +889,16 @@ impl GitService {
 
     /// `merge-base(base, HEAD)` as a full SHA, so the diff compares against
     /// the point the branch left `base` rather than `base`'s current tip.
-    fn merge_base(&self, root: &Path, base: &str) -> Result<String> {
+    ///
+    /// `base` is model input wherever it reaches a tool, so it is checked
+    /// against git's ref-name rules before any process starts. The read is
+    /// also used for the merge-base display (spec 36 §5.1).
+    pub fn merge_base(&self, root_path: impl AsRef<Path>, base: &str) -> Result<String> {
+        validate_base(base)?;
+        self.merge_base_in(root_path.as_ref(), base)
+    }
+
+    fn merge_base_in(&self, root: &Path, base: &str) -> Result<String> {
         let output = git_output(root, &["merge-base", "--end-of-options", base, "HEAD"])?;
         let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !output.status.success() || sha.is_empty() {
@@ -668,6 +908,55 @@ impl GitService {
             )));
         }
         Ok(sha)
+    }
+
+    /// `git merge-tree --write-tree --name-only <base> HEAD`. The merge is
+    /// computed in Git's object store: the index, the working tree and `HEAD`
+    /// are not touched, and no merge state file is created (spec 36 decision
+    /// D12). Exit 1 means conflicts and is an answer, not an error.
+    pub(crate) fn merge_tree(&self, root: &Path, base: &str) -> Result<MergeTreeRun> {
+        validate_base(base)?;
+        let output = git_output(
+            root,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--end-of-options",
+                base,
+                "HEAD",
+            ],
+        )?;
+        Ok(MergeTreeRun {
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    /// Root-relative paths that differ between two commits or trees. This
+    /// belongs beside [`read_git`] rather than a shell runner because
+    /// `diff.autoRefreshIndex=false` is what keeps `git diff` from rewriting
+    /// the user's index as a side effect of reading it.
+    pub(crate) fn diff_names(&self, root: &Path, from: &str, to: &str) -> Result<Vec<String>> {
+        let output = git_output(
+            root,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                from,
+                to,
+            ],
+        )?;
+        Ok(output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).to_string())
+            .collect())
     }
 
     /// How many of `lines` fit under both caps, counting each with its newline.

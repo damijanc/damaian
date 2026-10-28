@@ -185,6 +185,7 @@ isolated tree — that is the intended way to test without touching real data.
 | `rollback/<patch-id>/` | Pre-edit file copies backing patch rollback, **unredacted** | `PatchEngine::apply_patch` ([patch_engine.rs](../crates/workspace-engine/src/patch_engine.rs)) |
 | `commits/<prepare-id>.json` | A prepared commit’s record: candidates, exact blob ids, expected old `HEAD`, prepared commit, hooks and state. Redacted diffs only, no file content | `CommitEngine::save_record` ([commit.rs](../crates/workspace-engine/src/commit.rs)) |
 | `commits/<prepare-id>/` | The private index and message file used for one attempt; removed after a known outcome | `CommitEngine` ([commit.rs](../crates/workspace-engine/src/commit.rs)) |
+| `branches/<prepare-id>.json` | A prepared branch create, switch or delete: the exact `GitMutation`, expected refs, the reviewed state and outcome. No commit bodies | `BranchEngine` ([branch.rs](../crates/workspace-engine/src/branch.rs)) |
 | `checkpoints/<repo-id>/objects/` | Session checkpoint content, a Damaian-owned Git object store, **unredacted** | [checkpoint.rs](../crates/workspace-engine/src/checkpoint.rs) |
 | `checkpoints/<repo-id>/manifests/<checkpoint-id>.json` | What one checkpoint covers: paths, hashes, origins. No file content | [checkpoint.rs](../crates/workspace-engine/src/checkpoint.rs) |
 | `commands/pending/<id>.dcmd` | Command proposals awaiting approval | `CommandStore::save_proposal` ([validation.rs](../crates/workspace-engine/src/validation.rs)) |
@@ -1735,6 +1736,72 @@ The audit trail records `commit_prepared`, `commit_refused`, `commit_secret_over
 A **successful** commit can still carry a warning. The most common one is a `pre-commit` hook that reformatted files and staged them (lint-staged). Damaian commits the bytes you reviewed and leaves the hook's edit in your working tree; the warning names the hook. This is deliberate: including the hook's staging would commit bytes you did not review, and dropping it silently would lose the hook's work. If a hook leaves the private index unreadable, the warning says the staged changes could not be checked and the commit still contains the reviewed bytes.
 
 If the app stops while a commit was in progress, the task classifies as an unknown external outcome and recovery **does not re-commit**. Open the recovery card's **Inspect**: the “Commit in flight” row shows the prepared commit, the expected old `HEAD`, the current `HEAD`, and whether the prepared commit is where `HEAD` is. If it is, the commit landed; if `HEAD` is still the old value, it did not. The durable record is `commits/<prepare-id>.json`; the marker is an `action_started` with `"action":"commit"` and `"sideEffecting":true` in the session log.
+
+### A branch operation was refused, or its outcome is unknown
+
+Branch refusals are values with a reason, and the dialog shows the sentence. The
+common ones are about state, not about the request:
+
+- **A detached `HEAD` or an operation in progress.** Creating and switching are
+  refused while a merge, rebase, cherry-pick, revert, sequencer or bisect is in
+  progress, and creation is refused from a detached `HEAD` (the dialog always
+  creates from the current `HEAD`, so it offers no start point). A branch created
+  mid-rebase is hard to explain afterwards, so Damaian stops before the ref
+  moves. Finish or abort the operation first. A freshly initialised repository
+  with no commit is refused too: there is nothing to branch from.
+- **A dirty switch.** A switch updates the index and working tree, so Damaian
+  compares the files that differ between the two branches with your changed and
+  untracked files first. If they overlap it refuses and names the paths; commit
+  or stash them, or switch when the tree matches. An ignored local file is not
+  in that comparison, so the switch command also carries
+  `--no-overwrite-ignore`: Git refuses when it would replace an ignored file
+  that the target branch tracks, and your copy keeps its bytes.
+- **A name Git rejects or one that already exists.** The suggestion is validated
+  with `git check-ref-format --branch`, and a collision is reported with a free
+  suffixed alternative rather than silently changing the name. Edit the field
+  and prepare again. A prefix containing `@{`, `..`, `//`, a control character,
+  a `.lock` component or a leading `-` is refused before Git runs, and a prefix
+  starting with `refs/` is refused because that is the full-ref namespace.
+- **Code mode or the profile.** `allow_git_branches=false` (the **Read-only**
+  profile sets it) or a mode other than **Code** refuses every branch mutation.
+  A repository may deny the capability and never grant it, so changing the
+  repository's config cannot make a refusal go away.
+- **Unmerged commits.** Deleting a branch with commits that are not on the
+  default branch or a remote needs the second, differently worded confirmation
+  that names the count and the subjects. A plain approval is refused with
+  `branch_unmerged_confirmation_required` and the record stays prepared. When
+  the default branch cannot be resolved (no `origin/HEAD`, local `main` or
+  `master`, and no common history), the count is reported as unknown and the
+  same second confirmation is still required. Git also checks the branch's
+  upstream, or the checked-out branch when there is none, so a branch on `main`
+  can still need the second confirmation when `git branch -d` would refuse; the
+  card names that reference. If Git's answer changes between the review and the
+  approval, the approval is refused with the same code and nothing runs:
+  prepare the deletion again to see the second card. The current branch and a
+  branch checked out in another worktree cannot be deleted at all.
+
+**Conflict prediction is unavailable** when Git is too old for
+`merge-tree --write-tree` (the rewritten form arrived in Git 2.38) or when the
+output cannot be parsed. The report still names the merge base, ahead/behind and
+the incoming commits, and states the reason. Damaian does **not** fall back to a
+real merge with `--no-commit`; nothing is merged, rebased or cherry-picked. Use
+the report's commit and file lists and resolve the merge yourself, or update
+Git.
+
+A prepared operation is recorded in
+`branches/<prepare-id>.json` (see [Global data directory](#global-data-directory)).
+The record is saved as `applying` before Git runs, so a second request or a
+restart cannot start the mutation twice; it becomes `applied` or `failed` when
+Git returns. The engine's inspect compares the recorded ref with the repository
+now and reports `landed`, `not_landed` or `other_ref_state`; it never retries.
+If the app stops mid-operation, that record and the session log's
+`action_started` with `"action":"git_branch_create"`, `"git_branch_switch"` or
+`"git_branch_delete"` are the evidence; the recovery card does not currently
+offer a branch-specific **Inspect** row. The audit trail records
+`git_branch_read`, `git_branch_refused`, `git_branch_created`,
+`git_branch_switched`, `git_branch_deleted`, `git_merge_prepared` and
+`git_rebase_prepared` in `audit/events.jsonl`. None of them records commit bodies
+or the unredacted text a name or commit subject was derived from.
 
 ### After a crash: what was still running
 

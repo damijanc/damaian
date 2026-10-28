@@ -116,10 +116,35 @@ fn the_preference_keys_are_exactly_spec_34s_free_keys() {
         // whether it needs approval (24 context.md §6).
         "project_roots_added",
         "project_roots_removed",
+        // Spec 36: a branch-name prefix is naming, and git validates the
+        // composed name, so a repository choosing its own convention widens
+        // nothing.
+        "git_branch_prefix",
     ]
     .into_iter()
     .collect();
     assert_eq!(fields_of(ConfigKeyKind::Preference), free);
+}
+
+#[test]
+fn a_repository_may_choose_its_branch_prefix_but_a_profile_may_not() {
+    let (config, report) = load("branch-prefix", "", "git_branch_prefix=team/\n");
+    assert_eq!(config.git_branch_prefix, "team/");
+    assert!(report.rejected_keys.is_empty(), "{report:?}");
+
+    let overlay = ConfigOverlay {
+        git_branch_prefix: Some("feature/".to_string()),
+        ..ConfigOverlay::default()
+    };
+    let (carried, refused) = split_profile_keys(overlay);
+    assert!(carried.git_branch_prefix.is_none());
+    assert!(
+        refused
+            .iter()
+            .any(|rejected| rejected.key == "git_branch_prefix"
+                && rejected.class == RepositoryKeyClass::Forbidden),
+        "{refused:?}"
+    );
 }
 
 #[test]
@@ -486,6 +511,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "allow_git_commits=true\n",
             Reported("allow_git_commits"),
         ),
+        // Spec 36 D1: branch mutation is its own capability, denied the same
+        // way and for the same reason.
+        case(
+            "allow_git_branches",
+            "allow_git_branches=false\n",
+            "allow_git_branches=true\n",
+            Reported("allow_git_branches"),
+        ),
         // Task 3: the selection is the user's, like `Allow Always` (context.md §4).
         case(
             "permission_profile_by_repository",
@@ -727,6 +760,11 @@ fn every_preference_key_applies_from_repository_scope() {
             repository: "project_roots_removed=examples/legacy\n",
             applied: |c| c.project_roots_removed == ["examples/legacy"],
         },
+        PreferenceCase {
+            field: "git_branch_prefix",
+            repository: "git_branch_prefix=team/\n",
+            applied: |c| c.git_branch_prefix == "team/",
+        },
     ];
     let covered: BTreeSet<&str> = cases.iter().map(|c| c.field).collect();
     assert_eq!(covered, fields_of(ConfigKeyKind::Preference));
@@ -752,6 +790,57 @@ fn the_profile_keys_default_to_todays_behaviour() {
     assert_eq!(config.command_access, CommandAccess::All);
     assert!(config.allow_browser_diagnostics);
     assert!(config.allow_mutating_mcp_tools);
+    assert!(config.allow_git_branches);
+}
+
+/// Spec 36 D1: a repository may deny branch mutation and may never grant it,
+/// in either direction of the merge.
+#[test]
+fn a_repository_may_deny_git_branches_and_may_not_grant_them() {
+    let (denied, report) = load("branch-capability-deny", "", "allow_git_branches=false\n");
+    assert!(!denied.allow_git_branches);
+    assert!(
+        report.rejected_keys.is_empty(),
+        "narrowing is not a refusal: {:?}",
+        report.rejected_keys
+    );
+
+    let (granted, report) = load(
+        "branch-capability-grant",
+        "allow_git_branches=false\n",
+        "allow_git_branches=true\n",
+    );
+    assert!(
+        !granted.allow_git_branches,
+        "a repository granted a capability"
+    );
+    assert!(
+        report
+            .rejected_keys
+            .iter()
+            .any(|rejected| rejected.key == "allow_git_branches"
+                && rejected.class == RepositoryKeyClass::RestrictOnly),
+        "{:?}",
+        report.rejected_keys
+    );
+}
+
+#[test]
+fn allow_git_branches_is_a_capability_key_with_a_human_name() {
+    let kind_of = |name: &str| {
+        overlay_field_kinds()
+            .into_iter()
+            .find(|(field, _)| *field == name)
+            .map(|(_, kind)| kind)
+    };
+    assert_eq!(
+        kind_of("allow_git_branches"),
+        Some(ConfigKeyKind::Capability)
+    );
+    assert_eq!(
+        workspace_engine::rule_label("allow_git_branches").as_deref(),
+        Some("Git branches allowed")
+    );
 }
 
 #[test]
@@ -1140,41 +1229,51 @@ struct ProfileRow {
 
 #[test]
 fn each_built_in_profile_resolves_to_its_table_row() {
-    let capabilities =
-        |edits, access, browser, mutating_mcp, git_commits, mcp| ProfileCapabilities {
+    let capabilities = |edits, access, browser, mutating_mcp, git_commits, git_branches, mcp| {
+        ProfileCapabilities {
             allow_file_edits: edits,
             command_access: access,
             allow_browser_diagnostics: browser,
             allow_mutating_mcp_tools: mutating_mcp,
             allow_git_commits: git_commits,
+            allow_git_branches: git_branches,
             mcp_enabled: mcp,
-        };
+        }
+    };
     // context.md §3, over a permissive user config that turned edit approval off.
     let rows = [
         ProfileRow {
             id: ProfileId::ReadOnly,
-            capabilities: capabilities(false, CommandAccess::None, false, false, false, true),
+            capabilities: capabilities(
+                false,
+                CommandAccess::None,
+                false,
+                false,
+                false,
+                false,
+                true,
+            ),
             require_approval_for_file_edits: false,
             audit_retention_days: 90,
             checkpoint_retention_days: 90,
         },
         ProfileRow {
             id: ProfileId::SafeLocal,
-            capabilities: capabilities(true, CommandAccess::Local, true, true, true, true),
+            capabilities: capabilities(true, CommandAccess::Local, true, true, true, true, true),
             require_approval_for_file_edits: true,
             audit_retention_days: 90,
             checkpoint_retention_days: 90,
         },
         ProfileRow {
             id: ProfileId::Full,
-            capabilities: capabilities(true, CommandAccess::All, true, true, true, true),
+            capabilities: capabilities(true, CommandAccess::All, true, true, true, true, true),
             require_approval_for_file_edits: false,
             audit_retention_days: 90,
             checkpoint_retention_days: 90,
         },
         ProfileRow {
             id: ProfileId::OfflinePrivate,
-            capabilities: capabilities(true, CommandAccess::Local, false, true, true, false),
+            capabilities: capabilities(true, CommandAccess::Local, false, true, true, true, false),
             require_approval_for_file_edits: false,
             audit_retention_days: 7,
             checkpoint_retention_days: 7,
@@ -1183,7 +1282,7 @@ fn each_built_in_profile_resolves_to_its_table_row() {
     let fixture = profile_fixture("built-ins");
     assert_eq!(
         Config::default().profile_capabilities(),
-        capabilities(true, CommandAccess::All, true, true, true, true)
+        capabilities(true, CommandAccess::All, true, true, true, true, true)
     );
 
     for row in rows {
@@ -3010,6 +3109,7 @@ const EVERY_PROFILE_KEY: &str = concat!(
     "command_access=read_only\n",
     "allow_browser_diagnostics=false\n",
     "allow_mutating_mcp_tools=false\n",
+    "allow_git_branches=false\n",
     "audit_retention_days=7\n",
     "checkpoint_retention_days=7\n",
     "agent_max_task_tokens=5000\n",

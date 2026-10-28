@@ -85,8 +85,8 @@ A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
 reports the disagreement.
 
-#23, #25, #26, #27, #28, #29, #32, #35, #50, #55, #59, #62, #65 and #66 are all
-Done and merged into `main` or finished on their branch. #23 and #26 both
+#23, #25, #26, #27, #28, #29, #32, #35, #36, #50, #55, #59, #62, #65 and #66 are
+all Done and merged into `main` or finished on their branch. #23 and #26 both
 finished on 2026-10-25, so the two keystones are no longer in flight; #35 and
 #55 finished on 2026-10-26, and the full seven-check gate passed in CI on
 2026-10-26 (Quality run 40323902715). #27 finished on 2026-10-26, and the full
@@ -100,17 +100,20 @@ branch `spec-51-external-reference` (Tasks 1–10, then Task 11's review fixes);
 **CI has not run for that branch**, so its seven-check gate is outstanding and
 the planner records the Quality run id after the user pushes.
 
-- **In progress:** #49 prompt cache's reuse slice (requirement 4) is unbuilt;
-  #26's ordering exists, and #55 replaced the eight-message sliding window on
+- **In progress:** none. #36 branch and worktree delivery finished on 2026-10-28
+  (see its [`tasks.md`](36_branch_and_worktree_delivery/tasks.md)); review fixes
+  landed after that first Done and before merge, and its scoped checks passed
+  locally, but **no CI run exists for it yet**, so the full seven-check gate is
+  outstanding. #51 and #36 were merged into `main` on 2026-10-28. #49 prompt
+  cache's accounting slice is done and the reuse slice (requirement 4) is still
+  unbuilt; #26's ordering exists, and #55 replaced the eight-message sliding window on
   2026-10-26, so the reuse slice is no longer blocked by either. #49's own
   `Depends on:` line still names Phase 1 WP3 (provider capability validation) as
   unspecified, so it is not in the ready set.
 - **Ready, not started:** #30 memory retrieval and lifecycle (promoted by #29 on
-  2026-10-26); #33 MCP management. #36 branch and worktree delivery is also
-  unblocked (its only named dependency, #35, finished on 2026-10-26, and Phase 2
-  WP4 is optional), but it is already in flight on its own branch, so it is not
-  counted as unstarted here.
-- **Blocked:** #37 on #33 and #36; #52 on #33;
+  2026-10-26); #33 MCP management.
+- **Blocked:** #37 on #33 (its #36 dependency is now built; #36 finished on
+  2026-10-28); #52 on #33;
   #39 on #38; #40 on #38 and #39; #54 on Phase 1 WP3 (provider capability
   validation), which is unspecified.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
@@ -120,8 +123,8 @@ the planner records the Quality run id after the user pushes.
   it no longer constrains anything. **#30 and #33 both edit `chat.rs`** — #30
   through the turn path and the `Memory` category, #33 through the MCP tool list
   and per-tool dispatch — so they are not safe together; one must own that file
-  and the other wait or rebase. #26, #27, #28, #29, #35, #55, #65, #66 and #51
-  are Done and no longer constrain anything. See
+  and the other wait or rebase. #26, #27, #28, #29, #35, #36, #51, #55, #65 and
+  #66 are Done and no longer constrain anything. See
   [Parallel work](#parallel-work).
 - **Open decision:** the priority table below predates #59–#64 and does not
   rank them; the text after it now calls #23 the priority with #65 done.
@@ -401,7 +404,7 @@ set was then #30, #33 and #36; #51's completion is recorded below.
 | 2 | #55 compaction | **Done 2026-10-26.** Replaced the eight-message window with a token budget plus an append-only summary, so #49's reuse slice now has a stable conversation block to measure |
 | 3 | #28, #33, #51 | The fan-out #26 unblocked. **#27 is Done (2026-10-26)** and promoted #28; **#51 is Done (2026-10-28, CI outstanding)**. #28 and #29 are Done; #33 remains, and it shares `chat.rs` with #30 |
 | 4 | #29 → #30 | Memory, strictly serial behind #27. **#29 is Done (2026-10-26)** and promoted #30, now the next memory step |
-| 5 | #36/#37; #33 → #52 | Delivery and extensibility clusters. #35 is Done (2026-10-26) and promoted #36; **#36 is in flight on its own branch**, #37 waits on #33 and #36, and #52 waits on #33 |
+| 5 | #36 (**Done 2026-10-28**, CI outstanding)/#37; #33 → #52 | Delivery and extensibility clusters. #35 is Done (2026-10-26) and promoted #36, which finished on 2026-10-28. #37 is still blocked on #33, not on #36 |
 | 6 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not". #38 is deferred; #57 is done, so its stage 1 is due for re-evaluation |
 
 #54 stays off this table until Phase 1 WP3's provider capability validation is
@@ -526,7 +529,7 @@ message drafting belongs in the desktop shell because the engine holds no model
 adapter. #35 never edits `chat.rs`, so it pairs with #55.
 
 Re-derived on 2026-10-26, when [#35](35_commit_preparation/proposal.md) finished.
-Two `Depends on:` lines named #35 not built: [#36](36_branch_and_worktree_delivery.md)
+Two `Depends on:` lines named #35 not built: [#36](36_branch_and_worktree_delivery/proposal.md)
 and [#37](37_pull_request_creation.md). **One is promoted:** #36, whose other
 named dependency (Phase 2 WP4, worktree isolation) is optional and which is
 written to work without it. #35 leaves the
@@ -609,6 +612,42 @@ undetectable credential stored directly in a memory file is still redacted
 before it is sent. The scoped local checks passed, and the full seven-check gate
 passed in CI on 2026-10-26 for the `main` push at `4abbf1f`.
 
+Re-checked on 2026-10-28, when [#36](36_branch_and_worktree_delivery/proposal.md)
+was planned. It moved from the ready set into **In progress** without being
+built: the flat spec became a folder,
+[`context.md`](36_branch_and_worktree_delivery/context.md) records nineteen
+corrections and decisions D1–D15, and
+[`tasks.md`](36_branch_and_worktree_delivery/tasks.md) holds eight tasks. No
+dependency line changes, because #37 still waits on #36 itself. What planning
+found that matters to the order: read-only branch state is not wholly absent
+(`summary`, the private `ahead_behind` and `merge_base` already exist), but there
+is no typed `BranchInfo`, upstream tracking, or conflict prediction; the crate
+already creates `damaian/<slug>` branches for spec 57's worker worktrees, and
+spec 60 already lists worktree-to-branch identity, so §5.7 is reporting-only
+rather than a new worktree feature; Git mutation has only `allow_git_commits`,
+so branch mutation adds `allow_git_branches` as a seventh, restrict-only
+capability; the proposal's `symbolic-ref` switch would move `HEAD` without the
+index or working tree, so switching uses `git switch --no-guess`; and the repo
+bar's single action slot is Commit…-first, so branch entry points belong in the
+folder menu. A suggested name is built from text passed through the secret
+scanner, because a task title can carry a credential. #36 never edits `chat.rs`,
+so it pairs with a `chat.rs` spec.
+
+Re-derived on 2026-10-28, when [#36](36_branch_and_worktree_delivery/proposal.md)
+finished. One `Depends on:` line named #36 not built:
+[#37](37_pull_request_creation.md). It now records #36 as built, but **nothing
+is promoted**: #37 also needs #33, which is not built, so it stays blocked. #36
+leaves the ready and in-progress sets, leaving #30, #33 and #51 as the ready
+set. What #36 leaves for the next spec: branch mutation is a Code-mode
+capability (`allow_git_branches`, restrict-only from repository config);
+creation, switching and deletion are separate typed approvals consumed once;
+deletion has a distinct unmerged confirmation; and merge/rebase preparation is
+`merge-tree`-only with no execution path. Its
+[`proposal.md`](36_branch_and_worktree_delivery/proposal.md) §7 records what
+shipped, the acceptance table and the one manual gap (no browser walk). **CI has
+not run for the branch yet**; scoped checks passed locally, and the full
+seven-check gate is not claimed until CI is green.
+
 Re-derived on 2026-10-28, when
 [#51](51_external_reference_retrieval/proposal.md) finished. **No `Depends on:`
 line names #51**, so nothing is promoted by its completion; the prose reference
@@ -623,8 +662,7 @@ removed from the child, the egress guard reads the tool result rather than the
 file on disk, and a fetch pause is reattachable after a crash.
 
 - **What remains ready:** **#30** memory retrieval and lifecycle, and **#33**
-  MCP management. #36 is unblocked by its dependency line but is already in
-  flight on its own branch, so it is not counted as unstarted here.
+  MCP management. #36 finished earlier the same day (above).
 - **#30 and #33 are not safe together:** both edit `chat.rs`. #30 changes the
   turn path and adds the `Memory` category; #33 changes the MCP tool list and
   per-tool dispatch. One must own the file and the other wait or rebase.
@@ -728,7 +766,7 @@ is ready.
 | 33 | [33_mcp_management_and_deferred_discovery.md](33_mcp_management_and_deferred_discovery.md) | **Not started.** Roadmap Phase 4 WP4. Every enabled server's full schema currently reaches every request, outside #26's accounting. Adds a search tool with on-demand schemas, per-tool enable, lazy startup, and treats a remote read-only claim as an assertion that cannot lower an approval requirement. |
 | 34 | [34_repository_config_trust_boundary.md](34_repository_config_trust_boundary.md) | **Done — implemented ahead of #14 onward.** Bug-driven, not a roadmap graduation. `apply_overlay` is scope-blind, so repository config overrides user config: a repo-set `shell` runs its own script for every approved command (verified), a repo-set `model_base_url` exfiltrates the API key and code with no approval, and a repo `command_allowlist` executes commands unprompted. Adds a scope-aware overlay, a forbidden-key list, restrict-only merges, and moves `Allow Always` to user scope keyed by repository. Security subset of #31, extracted so it need not wait for Phase 4. |
 | 35 | [35_commit_preparation/](35_commit_preparation/proposal.md) | **Done 2026-10-26** (planned 2026-10-26; Tasks 1–9; seven-check gate green in CI, Quality run 40323902715). Roadmap Phase 5 WP1. Damaian's first write to a user's Git repository. Builds the commit through a private index so the user's staging is never touched, runs the repository's real `pre-commit`/`prepare-commit-msg`/`commit-msg`/`post-commit` hooks with the private index in their environment and no `--no-verify`, and closes the trap: `GitService::diff` redacts, so the commit scans the composed bytes, reports categories and counts only, requires a separate per-commit override, and proves each selected path's blob id against the prepared record. The candidate set is the session's uncommitted accepted changes, with hand-edited and command-changed files shown and unselected. Committing is a Code-mode capability (`allow_git_commits`) a profile or a repository may deny, takes its own typed approval, and is bracketed by #17's side-effecting markers with an Inspect view that compares HEAD with the prepared commit. `suggest_commit_message` remains the fallback; the shell may draft with the redacted diff. |
-| 36 | [36_branch_and_worktree_delivery.md](36_branch_and_worktree_delivery.md) | **Not started.** Roadmap Phase 5 WP2. Branch suggestion, creation, ahead/behind, merge-base, and conflict prediction via `merge-tree --write-tree` so preparation provably cannot execute. Written to work with no worktree support, since its stated dependency (Phase 2 WP4) is Should-tier and unspecified. |
+| 36 | [36_branch_and_worktree_delivery/proposal.md](36_branch_and_worktree_delivery/proposal.md) | **Done 2026-10-28** (planned 2026-10-28; Tasks 1–8 plus the review-fix row after the first Done, before merge, in its [`tasks.md`](36_branch_and_worktree_delivery/tasks.md)). **CI has not run for this branch yet**; scoped checks passed locally. Roadmap Phase 5 WP2. Branch suggestion, creation, ahead/behind, merge-base, and conflict prediction via `merge-tree --write-tree` so preparation provably cannot execute. Create, switch and delete are separate typed one-shot approvals behind `allow_git_branches` in Code mode; switching carries `--no-overwrite-ignore`; an unmerged delete needs a distinct confirmation naming the count and subjects, including when Git's own `-d` reference disagrees with the default-branch count; merge and rebase are reports only, with no execution route. Written to work with no worktree support, since its stated dependency (Phase 2 WP4) is Should-tier and unspecified; spec 57's worker worktrees and spec 60's listing mean §5.7 stays reporting-only rather than building worktree support. |
 | 37 | [37_pull_request_creation.md](37_pull_request_creation.md) | **Not started.** Roadmap Phase 5 WP4. Push and publication as two typed approvals that cannot substitute for each other, base branch asked for rather than inferred, force push refused rather than gated, and interrupted PR creation resolved by a duplicate search before any retry. Uses MCP rather than a bespoke client. |
 | 38 | [38_subagent_model.md](38_subagent_model.md) | **Not started; deferred 2026-10-09.** Stage 2 (editing subagents) is superseded by #57's worktree workers; stage 1 is re-evaluated once #57 and its result-summary follow-up have shipped, and may then be recorded as abandoned. Its §Deferral says why. Roadmap Phase 6 WP1, and gated on that phase's eight readiness gates being measured first. Subagents as in-process tasks whose capability can only be derived by narrowing a parent's, staged read-only-first. Corrects the roadmap's process-based framing and the flat `CancelToken`. |
 | 39 | [39_coordination_and_conflict_handling.md](39_coordination_and_conflict_handling.md) | **Not started.** Roadmap Phase 6 WP2. Exclusive file-ownership claims checked at spawn *and* before every write, serialized patch integration with `base_hash` revalidation between applies, and a combined-check rerun that catches two individually-passing patches failing together. |

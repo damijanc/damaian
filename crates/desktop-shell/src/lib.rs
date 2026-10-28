@@ -13,23 +13,24 @@ use workspace_engine::hooks::{
 };
 use workspace_engine::{
     AgentCheckBatch, AgentContextReview, AgentFallbackProposal, AgentFetchProposal,
-    AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal,
+    AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal, BranchError,
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult,
-    CommitError, Config, ContextDecision, ContextManifest, CostEstimate, CurlModelTransport,
-    DataSchemaOutcome, EffectivePolicy, ExportFormat, FetchDecision, GeneratedSecretWarning,
-    HookActivation, HookEvent, LanguageServerStatus, LineRange, McpClient, McpServerConfig,
-    McpTokenResolver, McpTransport, MemoryScope, ModelAdapter, ModelMessage, ModelRequest,
-    ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId,
-    ProjectIdentity, ProposedFilePatch, QuestionState, RepositoryConfigReport,
-    ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus,
-    SymbolRef, TaskPlan, TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink,
-    UserConfirmation, VerificationReport, WebDiagnosticCall, WebDiagnosticKind,
-    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
-    WorkspaceEngine, allow_always_eligible, command_approval_prompt, custom_profile_ids,
-    ensure_data_dir_schema, export_profile, import_profile, normalize_mcp_server_id,
-    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
-    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
-    review_profile_import, review_profile_rejections, select_profile,
+    ClientError, CommitError, Config, ContextDecision, ContextManifest, CostEstimate,
+    CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExportFormat, FetchDecision,
+    GeneratedSecretWarning, GitMutation, HookActivation, HookEvent, LanguageServerStatus,
+    LineRange, McpClient, McpServerConfig, McpTokenResolver, McpTransport, MemoryScope,
+    ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns,
+    PlanRevisionStep, ProcessRegistry, ProfileId, ProjectIdentity, ProposedFilePatch,
+    QuestionState, RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision,
+    SearchOptions, Session, SessionMode, StepStatus, SymbolRef, TaskPlan, TaskUsage, TokenUsage,
+    TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationReport,
+    WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
+    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
+    import_profile, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
+    select_profile,
 };
 
 mod keychain;
@@ -307,6 +308,14 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("GET", "/api/commit-status") => handle_commit_status(stream, &request),
         ("GET", "/api/commit-preparation") => handle_commit_preparation(stream, &request),
         ("POST", "/api/commit") => handle_commit(stream, &request),
+        // Spec 36: branch state, the prepared operation, its typed approval,
+        // and two read-only reports. There is deliberately no route that runs
+        // a merge, rebase, or cherry-pick, and no route takes a raw command.
+        ("GET", "/api/branch-info") => handle_branch_info(stream, &request),
+        ("POST", "/api/branch-suggestion") => handle_branch_suggestion(stream, &request),
+        ("POST", "/api/branch-prepare") => handle_branch_prepare(stream, &request),
+        ("POST", "/api/branch") => handle_branch_change(stream, &request),
+        ("GET", "/api/merge-preparation") => handle_merge_preparation(stream, &request),
         ("GET", "/api/terminal-cwd") => handle_terminal_cwd(stream, &request),
         ("POST", "/api/terminal-run") => handle_terminal_run(stream, &request),
         ("GET", "/api/sessions") => handle_sessions(stream, &request),
@@ -2091,6 +2100,357 @@ fn after_first_line(message: &str) -> String {
         .split_once('\n')
         .map(|(_, rest)| rest.trim().to_string())
         .unwrap_or_default()
+}
+
+fn branch_error_body(code: &str, message: &str) -> String {
+    format!(
+        "{{\"error\":\"{}\",\"code\":\"{}\",\"message\":\"{}\"}}",
+        escape_json(message),
+        escape_json(code),
+        escape_json(message),
+    )
+}
+
+/// A read the branch dialog makes can fail on a folder that is not a
+/// repository (`InvalidInput`) or in Git itself. Both keep the same shape the
+/// commit routes use, so the dialog never parses prose to find a code.
+fn branch_read_error_response(error: &ClientError) -> (u16, String) {
+    let message = error.to_string();
+    match error {
+        ClientError::InvalidInput(_) => (400, branch_error_body("branch_invalid_input", &message)),
+        _ => (500, branch_error_body("branch_engine_error", &message)),
+    }
+}
+
+fn branch_apply_error_response(error: &BranchError) -> (u16, String) {
+    let message = error.message();
+    let status = match error {
+        BranchError::Refused { .. } => 409,
+        BranchError::Engine(_) => 500,
+    };
+    (status, branch_error_body(error.code(), &message))
+}
+
+/// `GET /api/branch-info`: the read-only state the dialog opens with, plus the
+/// local branch names it may offer for switching or deletion. The current
+/// branch is filtered out by the dialog, and nothing here changes a ref.
+fn handle_branch_info(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let session_id = required_param(request, "session")?;
+    let engine = engine_for_repo(&repo)?;
+    if engine
+        .session_store
+        .read_session(&session_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return write_response(
+            stream,
+            request,
+            400,
+            "application/json",
+            &branch_error_body(
+                "branch_unknown_session",
+                "Unknown session. Open a session before reading branch state.",
+            ),
+        );
+    }
+    let info = match engine.git.branch_info(&repo) {
+        Ok(info) => info,
+        Err(error) => {
+            let (status, body) = branch_read_error_response(&error);
+            return write_response(stream, request, status, "application/json", &body);
+        }
+    };
+    let branches = match engine.git.local_branches(&repo) {
+        Ok(branches) => branches,
+        Err(error) => {
+            let (status, body) = branch_read_error_response(&error);
+            return write_response(stream, request, status, "application/json", &body);
+        }
+    };
+    let mut body = serde_json::to_value(&info).map_err(|error| error.to_string())?;
+    body["branches"] = serde_json::Value::Array(
+        branches
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>(),
+    );
+    write_response(stream, request, 200, "application/json", &body.to_string())
+}
+
+/// The suggestion's source is the session title, then the last thing the user
+/// asked in that session. Both are user-authored; neither comes from a file in
+/// the repository, and the engine redacts the text before slugging it (spec 36
+/// decision D10).
+fn branch_suggestion_source(engine: &WorkspaceEngine, session: &Session) -> String {
+    let title = session.title.trim();
+    if !title.is_empty() && title != "New session" {
+        return title.to_string();
+    }
+    let content = engine
+        .session_store
+        .read_messages(&session.id)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .find(|message| message.role == "user" && message.kind.is_none())
+        .map(|message| message.content)
+        .unwrap_or_default();
+    content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .take(500)
+        .collect()
+}
+
+/// `POST /api/branch-suggestion`: one suggested name. A `source` field from
+/// the dialog wins; otherwise the session supplies it. The name is never
+/// derived from repository content.
+fn handle_branch_suggestion(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let engine = engine_for_repo(&repo)?;
+    let Some(session) = engine
+        .session_store
+        .read_session(&session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return write_response(
+            stream,
+            request,
+            400,
+            "application/json",
+            &branch_error_body(
+                "branch_unknown_session",
+                "Unknown session. Open a session before naming a branch.",
+            ),
+        );
+    };
+    let source = form
+        .get("source")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| branch_suggestion_source(&engine, &session));
+    let suggestion = match engine.branch.suggest(&repo, &source) {
+        Ok(suggestion) => suggestion,
+        Err(error) => {
+            let (status, body) = branch_read_error_response(&error);
+            return write_response(stream, request, status, "application/json", &body);
+        }
+    };
+    let body = serde_json::to_string(&suggestion).map_err(|error| error.to_string())?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `POST /api/branch-prepare`: a prepared `create`, `switch`, or `delete`.
+/// A refusal means no record was written, so it is a 409 with the preparation
+/// that explains it rather than a 200 the dialog would have to inspect.
+fn handle_branch_prepare(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let operation = required_form(&form, "operation")?;
+    let name = required_form(&form, "name")?;
+    let start_point = form
+        .get("start_point")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    let engine = engine_for_repo(&repo)?;
+    let prepared = match operation.as_str() {
+        "create" => engine
+            .branch
+            .prepare_create(&repo, &name, start_point, &session_id),
+        "switch" => engine.branch.prepare_switch(&repo, &name, &session_id),
+        "delete" => engine.branch.prepare_delete(&repo, &name, &session_id),
+        other => {
+            return write_response(
+                stream,
+                request,
+                400,
+                "application/json",
+                &branch_error_body(
+                    "branch_invalid_operation",
+                    &format!(
+                        "Unknown branch operation `{other}`. Expected create, switch, or delete."
+                    ),
+                ),
+            );
+        }
+    };
+    let preparation = match prepared {
+        Ok(preparation) => preparation,
+        Err(error) => {
+            let (status, body) = branch_read_error_response(&error);
+            return write_response(stream, request, status, "application/json", &body);
+        }
+    };
+    if preparation.can_apply {
+        let body = serde_json::to_string(&preparation).map_err(|error| error.to_string())?;
+        return write_response(stream, request, 200, "application/json", &body);
+    }
+    let message = preparation
+        .refusal
+        .clone()
+        .unwrap_or_else(|| "The branch operation was refused.".to_string());
+    let preparation = serde_json::to_string(&preparation).map_err(|error| error.to_string())?;
+    let body = format!(
+        "{{\"error\":\"{}\",\"code\":\"branch_refused\",\"message\":\"{}\",\"preparation\":{preparation}}}",
+        escape_json(&message),
+        escape_json(&message),
+    );
+    write_response(stream, request, 409, "application/json", &body)
+}
+
+/// `POST /api/branch`: the typed approval. `approval=branch` is its own field;
+/// a commit approval, a question answer, or a command approval never satisfies
+/// it. The exact prepared `GitMutation` is sent back as JSON and compared with
+/// the durable record, so this route cannot run a command the record did not
+/// name.
+fn handle_branch_change(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    if form.get("approval").map(String::as_str) != Some("branch") {
+        return write_response(
+            stream,
+            request,
+            400,
+            "application/json",
+            &branch_error_body(
+                "approval_required",
+                "A branch change needs its own approval (approval=branch). Nothing ran.",
+            ),
+        );
+    }
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let prepare_id = required_form(&form, "prepare_id")?;
+    let mutation = required_form(&form, "mutation")?;
+    let mutation = match serde_json::from_str::<GitMutation>(&mutation) {
+        Ok(mutation) => mutation,
+        Err(_) => {
+            return write_response(
+                stream,
+                request,
+                400,
+                "application/json",
+                &branch_error_body(
+                    "branch_mutation_invalid",
+                    "The approved branch operation is not readable. Nothing ran.",
+                ),
+            );
+        }
+    };
+    let engine = engine_for_repo(&repo)?;
+    match engine.branch.load_record(&prepare_id) {
+        Ok(record) if record.repository_root == repo && record.session_id == session_id => {}
+        Ok(record) if record.repository_root != repo => {
+            return write_response(
+                stream,
+                request,
+                400,
+                "application/json",
+                &branch_error_body(
+                    "branch_repository_mismatch",
+                    "That branch preparation belongs to a different folder. Nothing ran.",
+                ),
+            );
+        }
+        Ok(_) => {
+            return write_response(
+                stream,
+                request,
+                400,
+                "application/json",
+                &branch_error_body(
+                    "branch_session_mismatch",
+                    "That branch preparation belongs to a different session. Nothing ran.",
+                ),
+            );
+        }
+        Err(error) => {
+            let (status, body) = branch_read_error_response(&error);
+            return write_response(stream, request, status, "application/json", &body);
+        }
+    }
+    let confirm_unmerged = form.get("confirm_unmerged").map(String::as_str) == Some("true");
+    match engine
+        .branch
+        .apply(&prepare_id, &mutation, "desktop_user", confirm_unmerged)
+    {
+        Ok(outcome) => {
+            let body = serde_json::to_string(&outcome).map_err(|error| error.to_string())?;
+            write_response(stream, request, 200, "application/json", &body)
+        }
+        Err(error) => {
+            let (status, body) = branch_apply_error_response(&error);
+            write_response(stream, request, status, "application/json", &body)
+        }
+    }
+}
+
+/// `GET /api/merge-preparation?mode=merge|rebase`: what a merge would do, or
+/// which commits a rebase would replay. Both are reports; neither runs the
+/// operation, and this handler has no branch that could.
+fn handle_merge_preparation(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let session = required_param(request, "session")?;
+    let mode = required_param(request, "mode")?;
+    let base = required_param(request, "base")?;
+    let engine = engine_for_repo(&repo)?;
+    if engine
+        .session_store
+        .read_session(&session)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return write_response(
+            stream,
+            request,
+            400,
+            "application/json",
+            &branch_error_body(
+                "branch_unknown_session",
+                "Unknown session. Open a session before preparing a merge or rebase.",
+            ),
+        );
+    }
+    match mode.as_str() {
+        "merge" => match engine.branch.prepare_merge(&repo, &base, &session) {
+            Ok(plan) => {
+                let body = serde_json::to_string(&plan).map_err(|error| error.to_string())?;
+                write_response(stream, request, 200, "application/json", &body)
+            }
+            Err(error) => {
+                let (status, body) = branch_read_error_response(&error);
+                write_response(stream, request, status, "application/json", &body)
+            }
+        },
+        "rebase" => match engine.branch.prepare_rebase(&repo, &base, &session) {
+            Ok(plan) => {
+                let body = serde_json::to_string(&plan).map_err(|error| error.to_string())?;
+                write_response(stream, request, 200, "application/json", &body)
+            }
+            Err(error) => {
+                let (status, body) = branch_read_error_response(&error);
+                write_response(stream, request, status, "application/json", &body)
+            }
+        },
+        other => write_response(
+            stream,
+            request,
+            400,
+            "application/json",
+            &branch_error_body(
+                "branch_invalid_mode",
+                &format!("Unknown preparation mode `{other}`. Expected merge or rebase."),
+            ),
+        ),
+    }
 }
 
 fn json_nullable_str(value: Option<&str>) -> String {
@@ -15487,5 +15847,713 @@ mod memory_route_tests {
         let app = include_str!("../static/app.js").to_lowercase();
         assert!(!app.contains("accept all"));
         assert!(!app.contains("accept-all"));
+    }
+}
+
+/// Spec 36 Task 7: the branch routes through the same token-gated HTTP surface
+/// the dialog uses. Each test drives the real routes, so a create proves the
+/// ref appears and `HEAD` does not move, and a merge report proves the index,
+/// `HEAD`, and status are unchanged byte for byte.
+#[cfg(test)]
+mod branch_route_tests {
+    use super::*;
+    use std::process::Command;
+    use std::sync::OnceLock;
+    use workspace_engine::SessionStore;
+
+    fn isolated_data_dir() -> &'static Path {
+        static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+        DATA_DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "damaian-branch-route-data-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            unsafe { std::env::set_var("DAMAIAN_DATA_DIR", &dir) };
+            dir
+        })
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn ref_exists(repo: &Path, reference: &str) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["show-ref", "--verify", "--quiet", reference])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn repo_fixture(name: &str) -> PathBuf {
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-branch-route-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("README.md"), "# Branch route fixture\n").unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&repo, &["config", "user.email", "route@example.invalid"]);
+        git(&repo, &["config", "user.name", "Route"]);
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "fixture"]);
+        repo
+    }
+
+    fn session(repo: &Path, title: &str) -> String {
+        SessionStore::new(isolated_data_dir())
+            .create_session(&repository_id_for_root(repo), title)
+            .unwrap()
+            .id
+    }
+
+    fn serve() -> (u16, String) {
+        let options = ShellOptions::new(0, None);
+        let token = options.api_token.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        spawn_with_shell_stack("branch-route-shell", move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                if let Err(error) = handle_connection(&mut stream, &options) {
+                    let _ = write_basic_response(
+                        &mut stream,
+                        500,
+                        "application/json",
+                        &json_error(&error),
+                    );
+                }
+            }
+        })
+        .expect("spawn shell");
+        (port, token)
+    }
+
+    fn encode(value: &str) -> String {
+        value
+            .bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (byte as char).to_string()
+                }
+                b' ' => "+".to_string(),
+                other => format!("%{other:02X}"),
+            })
+            .collect()
+    }
+
+    fn post(port: u16, token: &str, path: &str, fields: &[(&str, &str)]) -> String {
+        let body = fields
+            .iter()
+            .map(|(key, value)| format!("{key}={}", encode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/x-www-form-urlencoded\r\nx-damaian-api-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn get(port: u16, token: &str, path: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn body_json(response: &str) -> serde_json::Value {
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or(response);
+        serde_json::from_str(body).unwrap_or_else(|error| panic!("{error}: {body}"))
+    }
+
+    fn index_bytes(repo: &Path) -> Vec<u8> {
+        fs::read(repo.join(".git/index")).unwrap()
+    }
+
+    fn status_text(repo: &Path) -> String {
+        git(repo, &["status", "--porcelain=v2"])
+    }
+
+    fn prepare(
+        port: u16,
+        token: &str,
+        repo: &Path,
+        session_id: &str,
+        operation: &str,
+        name: &str,
+    ) -> String {
+        post(
+            port,
+            token,
+            "/api/branch-prepare",
+            &[
+                ("repo", &repo.to_string_lossy()),
+                ("session_id", session_id),
+                ("operation", operation),
+                ("name", name),
+            ],
+        )
+    }
+
+    fn approve(
+        port: u16,
+        token: &str,
+        repo: &Path,
+        session_id: &str,
+        prepared: &serde_json::Value,
+        confirm_unmerged: bool,
+    ) -> String {
+        post(
+            port,
+            token,
+            "/api/branch",
+            &[
+                ("repo", &repo.to_string_lossy()),
+                ("session_id", session_id),
+                ("prepare_id", prepared["prepareId"].as_str().unwrap()),
+                ("mutation", &prepared["mutation"].to_string()),
+                ("approval", "branch"),
+                (
+                    "confirm_unmerged",
+                    if confirm_unmerged { "true" } else { "false" },
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn the_info_route_reports_state_and_local_branches() {
+        let repo = repo_fixture("info");
+        git(&repo, &["branch", "side"]);
+        let session_id = session(&repo, "Branch info");
+        let (port, token) = serve();
+        let response = get(
+            port,
+            &token,
+            &format!(
+                "/api/branch-info?repo={}&session={}",
+                encode(&repo.to_string_lossy()),
+                encode(&session_id)
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = body_json(&response);
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        let current = git(&repo, &["symbolic-ref", "--short", "HEAD"]);
+        assert_eq!(body["current"].as_str(), Some(current.as_str()));
+        assert_eq!(body["headOid"].as_str(), Some(head.as_str()));
+        assert!(!body["detached"].as_bool().unwrap());
+        assert_eq!(body["upstream"], serde_json::Value::Null);
+        assert_eq!(body["ahead"], 0);
+        assert_eq!(body["behind"], 0);
+        assert!(body["inProgressOperation"].is_null());
+        assert_eq!(body["conflictedPaths"].as_array().unwrap().len(), 0);
+        let branches = body["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|branch| branch.as_str())
+            .collect::<Vec<_>>();
+        assert!(branches.contains(&current.as_str()), "{branches:?}");
+        assert!(branches.contains(&"side"), "{branches:?}");
+    }
+
+    #[test]
+    fn the_info_route_refuses_a_folder_that_is_not_a_repository() {
+        let folder = std::env::temp_dir().join(format!(
+            "damaian-branch-route-plain-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&folder).unwrap();
+        let session_id = SessionStore::new(isolated_data_dir())
+            .create_session(&repository_id_for_root(&folder), "plain folder")
+            .unwrap()
+            .id;
+        let (port, token) = serve();
+        let response = get(
+            port,
+            &token,
+            &format!(
+                "/api/branch-info?repo={}&session={}",
+                encode(&folder.to_string_lossy()),
+                encode(&session_id)
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        let body = body_json(&response);
+        assert_eq!(body["code"], "branch_invalid_input");
+        assert!(body["message"].as_str().unwrap().contains("Git work tree"));
+    }
+
+    #[test]
+    fn the_suggestion_route_uses_the_session_or_the_dialog_and_redacts_the_source() {
+        let repo = repo_fixture("suggestion");
+        let session_id = session(&repo, "Add branch delivery");
+        let (port, token) = serve();
+        let response = post(
+            port,
+            &token,
+            "/api/branch-suggestion",
+            &[
+                ("repo", &repo.to_string_lossy()),
+                ("session_id", &session_id),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = body_json(&response);
+        assert_eq!(body["name"], "damaian/add-branch-delivery");
+        assert!(body["valid"].as_bool().unwrap());
+        assert!(!body["exists"].as_bool().unwrap());
+        assert!(body["alternative"].is_null());
+
+        let from_dialog = post(
+            port,
+            &token,
+            "/api/branch-suggestion",
+            &[
+                ("repo", &repo.to_string_lossy()),
+                ("session_id", &session_id),
+                ("source", "Fix login bug"),
+            ],
+        );
+        assert_eq!(
+            body_json(&from_dialog)["name"],
+            "damaian/fix-login-bug",
+            "{from_dialog}"
+        );
+
+        let secret = post(
+            port,
+            &token,
+            "/api/branch-suggestion",
+            &[
+                ("repo", &repo.to_string_lossy()),
+                ("session_id", &session_id),
+                ("source", "rotate AKIAIOSFODNN7EXAMPLE before release"),
+            ],
+        );
+        let name = body_json(&secret)["name"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(!name.contains("akiaiosfodnn7example"), "{name}");
+    }
+
+    #[test]
+    fn a_branch_change_needs_its_own_branch_approval_not_a_commit_one() {
+        let repo = repo_fixture("approval");
+        let session_id = session(&repo, "Branch approval");
+        let (port, token) = serve();
+        let prepared = prepare(
+            port,
+            &token,
+            &repo,
+            &session_id,
+            "create",
+            "damaian/approval",
+        );
+        assert!(prepared.starts_with("HTTP/1.1 200"), "{prepared}");
+        let prepared = body_json(&prepared);
+        let refused = post(
+            port,
+            &token,
+            "/api/branch",
+            &[
+                ("repo", &repo.to_string_lossy()),
+                ("prepare_id", prepared["prepareId"].as_str().unwrap()),
+                ("mutation", &prepared["mutation"].to_string()),
+                ("approval", "commit"),
+            ],
+        );
+        assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+        let refused = body_json(&refused);
+        assert_eq!(refused["code"], "approval_required");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("approval=branch")
+        );
+        assert!(!ref_exists(&repo, "refs/heads/damaian/approval"));
+        // A refused approval does not consume the preparation.
+        let applied = approve(port, &token, &repo, &session_id, &prepared, false);
+        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
+        assert!(ref_exists(&repo, "refs/heads/damaian/approval"));
+    }
+
+    #[test]
+    fn a_branch_approval_is_bound_to_the_preparing_session() {
+        let repo = repo_fixture("session-binding");
+        let preparing = session(&repo, "Branch binding");
+        let other = session(&repo, "Another session");
+        let (port, token) = serve();
+        let prepared = prepare(port, &token, &repo, &preparing, "create", "damaian/bound");
+        assert!(prepared.starts_with("HTTP/1.1 200"), "{prepared}");
+        let prepared = body_json(&prepared);
+
+        let refused = approve(port, &token, &repo, &other, &prepared, false);
+        assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+        let body = body_json(&refused);
+        assert_eq!(body["code"], "branch_session_mismatch");
+        assert!(!ref_exists(&repo, "refs/heads/damaian/bound"));
+
+        let applied = approve(port, &token, &repo, &preparing, &prepared, false);
+        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
+        assert!(ref_exists(&repo, "refs/heads/damaian/bound"));
+    }
+
+    #[test]
+    fn a_code_mode_create_through_the_route_leaves_head_and_the_index_unchanged() {
+        let repo = repo_fixture("create");
+        let session_id = session(&repo, "Branch create");
+        let (port, token) = serve();
+        let before_head = git(&repo, &["rev-parse", "HEAD"]);
+        let before_branch = git(&repo, &["symbolic-ref", "--short", "HEAD"]);
+        let before_index = index_bytes(&repo);
+        let before_status = status_text(&repo);
+
+        let prepared = prepare(
+            port,
+            &token,
+            &repo,
+            &session_id,
+            "create",
+            "damaian/route-create",
+        );
+        assert!(prepared.starts_with("HTTP/1.1 200"), "{prepared}");
+        let prepared = body_json(&prepared);
+        assert!(prepared["canApply"].as_bool().unwrap());
+        assert_eq!(prepared["mutation"]["kind"], "createBranch");
+        assert_eq!(
+            prepared["mutation"]["startPoint"].as_str(),
+            Some(before_head.as_str())
+        );
+        assert_eq!(prepared["suggestion"]["name"], "damaian/route-create");
+
+        let applied = approve(port, &token, &repo, &session_id, &prepared, false);
+        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
+        let outcome = body_json(&applied);
+        assert_eq!(outcome["branch"], "damaian/route-create");
+        assert_eq!(outcome["headBefore"].as_str(), Some(before_head.as_str()));
+        assert_eq!(outcome["headAfter"].as_str(), Some(before_head.as_str()));
+        assert_eq!(outcome["createdRef"], "refs/heads/damaian/route-create");
+        assert_eq!(
+            git(&repo, &["rev-parse", "refs/heads/damaian/route-create"]),
+            before_head
+        );
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(
+            git(&repo, &["symbolic-ref", "--short", "HEAD"]),
+            before_branch
+        );
+        assert_eq!(index_bytes(&repo), before_index);
+        assert_eq!(status_text(&repo), before_status);
+    }
+
+    #[test]
+    fn a_switch_through_the_route_moves_head_and_the_working_tree() {
+        let repo = repo_fixture("switch");
+        let base = git(&repo, &["symbolic-ref", "--short", "HEAD"]);
+        git(&repo, &["branch", "side"]);
+        let side_oid = git(&repo, &["rev-parse", "refs/heads/side"]);
+        fs::write(repo.join("README.md"), "# Changed on the base branch\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "base change"]);
+        let session_id = session(&repo, "Branch switch");
+        let (port, token) = serve();
+
+        let prepared = prepare(port, &token, &repo, &session_id, "switch", "side");
+        assert!(prepared.starts_with("HTTP/1.1 200"), "{prepared}");
+        let prepared = body_json(&prepared);
+        assert_eq!(prepared["mutation"]["kind"], "switchBranch");
+        let applied = approve(port, &token, &repo, &session_id, &prepared, false);
+        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
+        let outcome = body_json(&applied);
+        assert_eq!(outcome["branch"], "side");
+        assert_eq!(outcome["headAfter"].as_str(), Some(side_oid.as_str()));
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), side_oid);
+        assert_eq!(git(&repo, &["symbolic-ref", "--short", "HEAD"]), "side");
+        assert_eq!(
+            fs::read_to_string(repo.join("README.md")).unwrap(),
+            "# Branch route fixture\n"
+        );
+        assert_eq!(status_text(&repo), "");
+        assert_ne!(base, "side");
+    }
+
+    #[test]
+    fn the_delete_route_keeps_the_two_step_confirmation() {
+        let repo = repo_fixture("delete");
+        let base = git(&repo, &["symbolic-ref", "--short", "HEAD"]);
+        git(&repo, &["branch", "merged"]);
+        let session_id = session(&repo, "Branch delete");
+        let (port, token) = serve();
+
+        let merged = prepare(port, &token, &repo, &session_id, "delete", "merged");
+        assert!(merged.starts_with("HTTP/1.1 200"), "{merged}");
+        let merged = body_json(&merged);
+        assert_eq!(merged["unmergedCommits"], 0);
+        assert_eq!(merged["mutation"]["kind"], "deleteBranch");
+        let deleted = approve(port, &token, &repo, &session_id, &merged, false);
+        assert!(deleted.starts_with("HTTP/1.1 200"), "{deleted}");
+        let deleted = body_json(&deleted);
+        let commands = deleted["gitCommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|command| command.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            commands.iter().any(|command| command.contains("branch -d")),
+            "{commands:?}"
+        );
+        assert!(!ref_exists(&repo, "refs/heads/merged"));
+
+        // A branch with a commit that is not on the base or a remote.
+        git(&repo, &["switch", "-q", "-c", "unmerged"]);
+        fs::write(repo.join("unmerged.txt"), "unmerged work\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "unmerged work"]);
+        git(&repo, &["switch", "-q", &base]);
+        let unmerged = prepare(port, &token, &repo, &session_id, "delete", "unmerged");
+        assert!(unmerged.starts_with("HTTP/1.1 200"), "{unmerged}");
+        let unmerged = body_json(&unmerged);
+        assert_eq!(unmerged["unmergedCommits"], 1);
+        assert_eq!(unmerged["unmergedSubjects"][0], "unmerged work");
+
+        let refused = approve(port, &token, &repo, &session_id, &unmerged, false);
+        assert!(refused.starts_with("HTTP/1.1 409"), "{refused}");
+        let refused = body_json(&refused);
+        assert_eq!(refused["code"], "branch_unmerged_confirmation_required");
+        assert!(refused["error"].as_str().is_some());
+        assert!(refused["message"].as_str().unwrap().contains("1 commit"));
+        assert!(ref_exists(&repo, "refs/heads/unmerged"));
+        // The record survives the refusal, so the second decision can still be
+        // made without preparing again.
+        let still_refused = approve(port, &token, &repo, &session_id, &unmerged, false);
+        assert!(still_refused.starts_with("HTTP/1.1 409"), "{still_refused}");
+        let confirmed = approve(port, &token, &repo, &session_id, &unmerged, true);
+        assert!(confirmed.starts_with("HTTP/1.1 200"), "{confirmed}");
+        let confirmed = body_json(&confirmed);
+        let commands = confirmed["gitCommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|command| command.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            commands.iter().any(|command| command.contains("branch -D")),
+            "{commands:?}"
+        );
+        assert!(!ref_exists(&repo, "refs/heads/unmerged"));
+
+        let current = prepare(
+            port,
+            &token,
+            &repo,
+            &session_id,
+            "delete",
+            &git(&repo, &["symbolic-ref", "--short", "HEAD"]),
+        );
+        assert!(current.starts_with("HTTP/1.1 409"), "{current}");
+        let current = body_json(&current);
+        assert_eq!(current["code"], "branch_refused");
+        assert!(
+            current["message"]
+                .as_str()
+                .unwrap()
+                .contains("current branch")
+        );
+    }
+
+    #[test]
+    fn ask_mode_is_refused_before_a_record_or_a_ref_exists() {
+        let repo = repo_fixture("ask");
+        let session_id = session(&repo, "Branch ask");
+        SessionStore::new(isolated_data_dir())
+            .set_session_mode(&session_id, SessionMode::Ask, "test")
+            .unwrap();
+        let (port, token) = serve();
+        let refused = prepare(port, &token, &repo, &session_id, "create", "damaian/ask");
+        assert!(refused.starts_with("HTTP/1.1 409"), "{refused}");
+        let refused = body_json(&refused);
+        assert_eq!(refused["code"], "branch_refused");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("Code mode only")
+        );
+        assert!(!refused["preparation"]["canApply"].as_bool().unwrap());
+        assert!(!ref_exists(&repo, "refs/heads/damaian/ask"));
+    }
+
+    #[test]
+    fn merge_and_rebase_preparation_leave_the_index_head_and_status_identical() {
+        let repo = repo_fixture("merge");
+        let base = git(&repo, &["symbolic-ref", "--short", "HEAD"]);
+        let base_oid = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["switch", "-q", "-c", "feature"]);
+        fs::write(repo.join("feature.txt"), "feature work\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "feature work"]);
+        git(&repo, &["switch", "-q", &base]);
+        let session_id = session(&repo, "Branch merge");
+        let (port, token) = serve();
+
+        let before_head = git(&repo, &["rev-parse", "HEAD"]);
+        let before_index = index_bytes(&repo);
+        let before_status = status_text(&repo);
+        let response = get(
+            port,
+            &token,
+            &format!(
+                "/api/merge-preparation?repo={}&session={}&mode=merge&base=feature",
+                encode(&repo.to_string_lossy()),
+                encode(&session_id)
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let report = body_json(&response);
+        assert!(report["conflictPredictionAvailable"].as_bool().unwrap());
+        assert_eq!(report["mergeTreeExitStatus"], 0);
+        assert!(report["fastForward"].as_bool().unwrap());
+        assert_eq!(report["incomingCommits"].as_array().unwrap().len(), 1);
+        assert_eq!(report["conflictedPaths"].as_array().unwrap().len(), 0);
+        assert!(
+            report["changedFiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == "feature.txt")
+        );
+        assert!(report["problem"].is_null());
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(index_bytes(&repo), before_index);
+        assert_eq!(status_text(&repo), before_status);
+        assert!(!repo.join(".git/MERGE_HEAD").exists());
+
+        git(&repo, &["switch", "-q", "feature"]);
+        let before_head = git(&repo, &["rev-parse", "HEAD"]);
+        let rebase = get(
+            port,
+            &token,
+            &format!(
+                "/api/merge-preparation?repo={}&session={}&mode=rebase&base={base}",
+                encode(&repo.to_string_lossy()),
+                encode(&session_id)
+            ),
+        );
+        assert!(rebase.starts_with("HTTP/1.1 200"), "{rebase}");
+        let rebase = body_json(&rebase);
+        assert_eq!(rebase["onto"].as_str(), Some(base.as_str()));
+        assert_eq!(rebase["ontoOid"].as_str(), Some(base_oid.as_str()));
+        assert_eq!(rebase["commitsToReplay"].as_array().unwrap().len(), 1);
+        assert!(!rebase["conflictPredictionAvailable"].as_bool().unwrap());
+        assert!(
+            rebase["conflictPredictionUnavailableReason"]
+                .as_str()
+                .unwrap()
+                .contains("would require replaying")
+        );
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), before_head);
+        assert!(!repo.join(".git/REBASE_HEAD").exists());
+
+        let unknown = get(
+            port,
+            &token,
+            &format!(
+                "/api/merge-preparation?repo={}&session=missing-session&mode=merge&base={base}",
+                encode(&repo.to_string_lossy()),
+            ),
+        );
+        assert!(unknown.starts_with("HTTP/1.1 400"), "{unknown}");
+        assert_eq!(body_json(&unknown)["code"], "branch_unknown_session");
+
+        let refused_mode = get(
+            port,
+            &token,
+            &format!(
+                "/api/merge-preparation?repo={}&session={}&mode=cherry-pick&base={base}",
+                encode(&repo.to_string_lossy()),
+                encode(&session_id)
+            ),
+        );
+        assert!(refused_mode.starts_with("HTTP/1.1 400"), "{refused_mode}");
+        assert_eq!(body_json(&refused_mode)["code"], "branch_invalid_mode");
+    }
+
+    #[test]
+    fn no_route_executes_a_merge_rebase_or_cherry_pick() {
+        let repo = repo_fixture("no-execute");
+        let session_id = session(&repo, "No execute");
+        let (port, token) = serve();
+        for path in [
+            "/api/merge",
+            "/api/rebase",
+            "/api/branch-merge",
+            "/api/branch-rebase",
+            "/api/cherry-pick",
+        ] {
+            let response = post(
+                port,
+                &token,
+                path,
+                &[
+                    ("repo", &repo.to_string_lossy()),
+                    ("session_id", &session_id),
+                    ("base", "main"),
+                ],
+            );
+            assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+        }
+        let before_head = git(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(status_text(&repo), "");
+        assert!(!repo.join(".git/MERGE_HEAD").exists());
     }
 }

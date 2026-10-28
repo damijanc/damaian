@@ -33,6 +33,7 @@ This build is a developer preview. Release builds are Developer ID signed and no
 - [File Changes](#file-changes)
 - [Verification](#verification)
 - [Commits](#commits)
+- [Branches](#branches)
 - [Rewind](#rewind)
 - [The Plan Panel](#the-plan-panel)
 - [Memory](#memory)
@@ -893,6 +894,58 @@ change is correct, and the report is written to avoid implying that.
 The commit message starts as a template from your request. **Draft with model** asks the configured model for a subject and body using the redacted diff and the plan; if there is no model, the call fails or the answer is unusable, the template stays. You can always edit the message, and your text is what is committed.
 
 If Damaian is interrupted while committing, the recovery card offers **Inspect**: it shows the prepared commit, the `HEAD` it was prepared on, and where `HEAD` is now. It does not resolve the commit for you.
+
+## Branches
+
+**Branch…** in the folder menu opens the branch dialog. It needs a Git repository
+and an open session. The dialog shows the current branch or a detached `HEAD`,
+the upstream and how far ahead and behind it is, whether a merge, rebase,
+cherry-pick, revert, sequencer or bisect is in progress, and any currently
+conflicted paths.
+
+- **The suggested name is a suggestion.** It is built from the session title or
+  your last request, lowercased, with punctuation collapsed to hyphens, and
+  prefixed with `git_branch_prefix` (`damaian/` by default). The text passes
+  through the secret scanner before it becomes a name, so a credential in a title
+  cannot end up in a ref. Edit the field freely: Git itself validates the result.
+  If the name exists, the dialog says so and offers a free `-2` alternative; it
+  does not change the name for you.
+- **Creating and switching are separate approvals.** **Create branch…** makes the
+  branch at the commit shown and leaves `HEAD`, the index and your working tree
+  where they are. Tick *Switch to it after creating* to be asked for the switch
+  as a second, separate approval. **Switch to branch…** is its own card and
+  approval; it updates the index and working tree to the target, and when
+  uncommitted changes would be overwritten it refuses before running and names
+  the paths. Ignored files count here too: if a local file is gitignored but the
+  target branch tracks it, the switch refuses rather than replacing your copy.
+- **Every branch operation is Code mode only.** It also needs a permission
+  profile whose `allow_git_branches` is on; **Read-only** turns it off, and a
+  repository may turn it off but never on. There is no “always allow”.
+- **Deleting a merged branch asks once.** The dialog names the branch and says
+  every commit is on the default branch or a remote, and Git would delete it
+  with a plain `git branch -d`. **Deleting a branch with unmerged commits checks
+  twice**: the first card names the count and the commit subjects that would be
+  lost, and a differently worded second card requires the separate confirmation
+  before `git branch -D` runs. The same second card appears when the branch is
+  on `main` but Git would not accept `-d` — for example when you are on another
+  branch that does not contain it, or its upstream is behind — because the card
+  names the reference Git actually checks. The current branch is not offered; a
+  branch checked out in another worktree is refused when the deletion is
+  prepared.
+- **Merge and rebase reports change nothing.** **Preview merge** reports the
+  merge base, the commits that would come in, the files that would change, the
+  paths that would conflict, and whether the merge would fast-forward. It is
+  computed with `git merge-tree`, which does not touch the index, the working
+  tree or `HEAD`. **Preview rebase** lists the commits that would be replayed and
+  onto what, and says conflict prediction is unavailable because predicting it
+  would require replaying them. The dialog has no merge, rebase or cherry-pick
+  button, and Damaian does not run any of them.
+- **The result is reported and audited.** A success names the created ref and
+  its start point, or the branch switched to or deleted. The audit log records
+  `git_branch_created`, `git_branch_switched` and `git_branch_deleted` with the
+  refs and outcome, `git_branch_refused` for a policy or state refusal, and
+  `git_merge_prepared` or `git_rebase_prepared` for a report. It never records
+  commit bodies or the unredacted source of a suggested name.
 
 ## Rewind
 

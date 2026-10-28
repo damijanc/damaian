@@ -129,7 +129,7 @@ No task edits `chat.rs`.
 truthful". **Context:** §1, §2.
 
 **Files:** `docs/specs/35_commit_preparation/`, `docs/specs/README.md`,
-`docs/specs/36_branch_and_worktree_delivery.md`,
+`docs/specs/36_branch_and_worktree_delivery/proposal.md`,
 `docs/specs/37_pull_request_creation.md`, `docs/specs/38_subagent_model.md`,
 `docs/specs/52_mcp_server_mode.md`,
 `docs/specs/57_worker_sessions/proposal.md`,
@@ -583,7 +583,7 @@ exists).
 
 **Requirements:** §5.9, §6, §7. **Files:** `docs/USER_GUIDE.md`,
 `docs/TROUBLESHOOTING.md`, `SECURITY.md`, `proposal.md` §7,
-`docs/specs/README.md`, `CHANGELOG.md`, `docs/specs/36_branch_and_worktree_delivery.md`,
+`docs/specs/README.md`, `CHANGELOG.md`, `docs/specs/36_branch_and_worktree_delivery/proposal.md`,
 `docs/specs/37_pull_request_creation.md`, this file.
 
 - [x] **Step 1: Walk every acceptance criterion in §6** against the finished

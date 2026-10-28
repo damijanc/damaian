@@ -7,9 +7,9 @@ Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#33](33_mcp_management_and_deferred_discovery.md) (the MCP client
 it publishes through) — **not built**; [#35](35_commit_preparation/proposal.md) (commit
-preparation) — built (Done 2026-10-26); [#36](36_branch_and_worktree_delivery.md) (branch
-delivery) — **not built**. Everything else named below is a cross-reference,
-not a prerequisite.
+preparation) — built (Done 2026-10-26); [#36](36_branch_and_worktree_delivery/proposal.md) (branch
+delivery) — built (Done 2026-10-28; CI run outstanding). Everything else named
+below is a cross-reference, not a prerequisite. #37 stays blocked on #33.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.8 (risk classification and approval), section 7.10
 (secret detection). Related implementation specs:
@@ -25,7 +25,7 @@ body quotes), [`31_permission_profiles/proposal.md`](31_permission_profiles/prop
 (per-tool approval, and the rule that a remote read-only claim is an assertion),
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md),
 [`35_commit_preparation/proposal.md`](35_commit_preparation/proposal.md),
-[`36_branch_and_worktree_delivery.md`](36_branch_and_worktree_delivery.md).
+[`36_branch_and_worktree_delivery/proposal.md`](36_branch_and_worktree_delivery/proposal.md).
 See also [`SECURITY.md`](../../SECURITY.md).
 
 ## 1. Motivation
@@ -208,7 +208,7 @@ The base is resolved only from unambiguous evidence:
 | Evidence | Use |
 |---|---|
 | The user stated it | Use it |
-| The branch was created from a local branch in this session ([spec 36](36_branch_and_worktree_delivery.md) records the start point) | Offer it, pre-selected, still confirmable |
+| The branch was created from a local branch in this session ([spec 36](36_branch_and_worktree_delivery/proposal.md) records the start point) | Offer it, pre-selected, still confirmable |
 | The remote reports a default branch **and** it is the only plausible candidate | Offer it, pre-selected |
 | Anything else | **Ask.** No default |
 

@@ -4502,6 +4502,147 @@ body.worker-view #chat-model-menu {
   white-space: pre-wrap;
 }
 
+/* Spec 36: the branch dialog. State is read-only text; every change is its own
+   card with its own decision, and the merge/rebase panel is a report. */
+.app-dialog-branch {
+  width: min(640px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+}
+
+.branch-state {
+  display: grid;
+  gap: 3px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 8px 10px;
+}
+
+.branch-state-line {
+  margin: 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.branch-state-label {
+  color: var(--muted);
+}
+
+.branch-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.branch-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.branch-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.branch-note-warn {
+  color: var(--warn);
+}
+
+.branch-use-alternative {
+  justify-self: start;
+}
+
+.branch-refusal {
+  margin: 0;
+  border-left: 3px solid var(--danger);
+  border-radius: 0 6px 6px 0;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-size: 12px;
+  padding: 6px 10px;
+  white-space: pre-wrap;
+}
+
+.branch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.branch-section-title {
+  margin: 6px 0 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.branch-branch-list {
+  display: grid;
+  gap: 4px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.branch-branch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.branch-branch-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.branch-branch-row button {
+  flex: 0 0 auto;
+}
+
+.branch-card {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 10px;
+}
+
+.branch-card[hidden] {
+  display: none;
+}
+
+.branch-card-title {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.branch-card-message {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.branch-card-list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--ink);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.branch-report {
+  font-size: 11px;
+}
+
 .app-dialog-checklist {
   display: grid;
   gap: 6px;
