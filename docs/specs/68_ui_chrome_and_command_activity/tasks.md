@@ -140,7 +140,7 @@ test in the task that owns the code.
   that is followed in the same task by an assistant starting ``Ran ` ``. Task 3
   replaces this with its absorption predicate.
 
-- [ ] **Step 1: Console asserts (expected to fail before the change)**
+- [x] **Step 1: Console asserts (expected to fail before the change)**
 
 ```js
 const m = (taskId, createdAtMs, role = "assistant") => ({ taskId, createdAtMs, role });
@@ -150,16 +150,16 @@ console.assert(turnDurationMs("t", [m("t", 1000, "user"), m("t", 9000)], new Set
 console.assert(turnDurationMs("t", [m("t", undefined, "user"), m("t", 9000)], new Set()) === null);
 ```
 
-- [ ] **Step 2: Implement `turnDurationMs`.** Move the `renderMessages` call to
+- [x] **Step 2: Implement `turnDurationMs`.** Move the `renderMessages` call to
   `markMessageUsage` inside the `endsTheTurn` block, and pass the duration.
-- [ ] **Step 3: Live paths.** Pass the indicator's elapsed time only when the
+- [x] **Step 3: Live paths.** Pass the indicator's elapsed time only when the
   turn was not resumed from a pause; resume paths pass `null`. Expose the
   started-at time from the indicator (`startedAt`, ~5909) rather than
   re-timing.
-- [ ] **Step 4:** Reload the Task 1 session. Exactly one usage row shows, under
+- [x] **Step 4:** Reload the Task 1 session. Exactly one usage row shows, under
   message 18, and it has no duration because the task paused. "Add retry to the
   upload client" also shows one row.
-- [ ] **Step 5:** Run the scoped checks, then fill in the Progress row.
+- [x] **Step 5:** Run the scoped checks, then fill in the Progress row.
 
 ### Task 3: Command steps, hook notes and absorbed approvals
 
@@ -418,7 +418,7 @@ month: "short", day: "numeric" })`.
 | Task | State | Notes |
 |---|---|---|
 | 1 · Inspection fixture | Done 2026-10-29 | `command_activity_session` helper in the `serves_the_ui_for_manual_inspection` fixture seeds one finished task titled "Command activity" with the 18 messages in order plus one recorded usage row (~5,840 tokens, 1 model call); printed as `command activity session = session_<hex>_<hex>_<hex>`. The cause line uses `workspace_engine::ApprovalCause::plain_words()` (exported). Clippy `-p desktop-shell` clean, fmt and typos clean. Before figure observed in the running app: 3 usage rows (under the first activity group, under the "cargo check" group, and under the "rm -rf" group ahead of the answer), where one is wanted. Note: the fixture's "Add retry" task records no usage; the row here comes from `record_task_usage_for_task_id`. |
-| 2 · Usage once, duration | Not started | |
+| 2 · Usage once, duration | Done 2026-10-29 | `turnDurationMs` and `pausedTasksOf` (interim predicate, a named helper for Task 3 to replace) added; `renderMessages` draws usage only under `endsTheTurn`. `markMessageUsage` takes `durationMs`; the indicator exposes `startedAt`. Live rule: the four non-resume paths (verification stream, patch proposal, `sendChatPrompt`, ask-again) pass `Date.now() - indicator.startedAt`; the seven approval/question/offer resume paths pass `null`. Console asserts: 0 `turnDurationMs` at HEAD (ReferenceError), 4/4 pass after. Command activity session: 3 usage rows before, 1 after (under "The crate builds; the clean was declined.", no duration, task paused). The fixture's "Add retry" task records no usage, so it shows none; the refused-in-Ask session shows one row per turn with a duration. biome, `node --check`, typos clean. |
 | 3 · Command steps and approvals | Not started | |
 | 4 · Sidebar visibility | Not started | |
 | 5 · Icons, header, composer | Not started | |

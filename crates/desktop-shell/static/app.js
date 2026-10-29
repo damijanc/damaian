@@ -5917,6 +5917,9 @@ function startTurnIndicator(target, onStop = null) {
   let streaming = false;
 
   return {
+    // Read by the usage row, so the turn's duration is the clock the user
+    // watched rather than a second timing that could disagree with it.
+    startedAt,
     phase(payload) {
       if (done) return;
       if (payload.phase === "output") {
@@ -6170,6 +6173,43 @@ function renderActivityGroup(pairs) {
   return { message: article, body };
 }
 
+// Tasks that stopped for the user: they hold a question, or an approval
+// request. Until the engine marks approvals, a request is an assistant message
+// that is not the turn's last and is followed in its task by a "Ran `" result.
+function pausedTasksOf(messages, endsTheTurn) {
+  const paused = new Set();
+  messages.forEach((message, index) => {
+    if (!message.taskId) return;
+    if (message.role === "question") {
+      paused.add(message.taskId);
+      return;
+    }
+    if (message.role !== "assistant" || endsTheTurn(message)) return;
+    const later = messages
+      .slice(index + 1)
+      .some(
+        (next) =>
+          next.taskId === message.taskId &&
+          next.role === "assistant" &&
+          next.content.startsWith("Ran `"),
+      );
+    if (later) paused.add(message.taskId);
+  });
+  return paused;
+}
+
+// How long a turn took, from the user's message to its last assistant message.
+// A paused turn includes the time spent waiting on the user, which is not work,
+// so it gets no duration rather than a misleading one.
+function turnDurationMs(taskId, messages, pausedTaskIds) {
+  if (pausedTaskIds.has(taskId)) return null;
+  const inTask = messages.filter((message) => message.taskId === taskId);
+  const start = inTask.find((message) => message.role === "user")?.createdAtMs;
+  const end = inTask.findLast((message) => message.role === "assistant")?.createdAtMs;
+  if (typeof start !== "number" || typeof end !== "number" || end < start) return null;
+  return end - start;
+}
+
 // `tasks` carries each task's final status so a stopped turn stays marked as
 // one on reload. Without it a truncated answer renders as a complete short one.
 // Returns each message with its bubble, in order, for entries placed between
@@ -6229,6 +6269,7 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
     }
   });
   const endsTheTurn = (message) => lastAssistantByTask.get(message.taskId) === message.id;
+  const pausedTaskIds = pausedTasksOf(messages, endsTheTurn);
   // A task with no usage events carries no token fields at all, which is how
   // a session written before token accounting stays silent instead of
   // claiming a free turn.
@@ -6340,7 +6381,15 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
             appendContextLink(bubble.body, contextByTask.get(message.taskId)),
           );
         }
-        if (message.taskId) markMessageUsage(bubble, usageByTask.get(message.taskId));
+        // Drawn once, under the turn's last assistant message, rather than under
+        // each of the turn's messages (spec 68 §3 req. 1).
+        if (message.taskId && endsTheTurn(message)) {
+          markMessageUsage(
+            bubble,
+            usageByTask.get(message.taskId),
+            turnDurationMs(message.taskId, messages, pausedTaskIds),
+          );
+        }
       }
       return { message, bubble };
     })
@@ -9268,7 +9317,7 @@ function cacheUsageTitle(usage) {
 // `reportedCost` is what the provider charged. It is absent for almost every
 // provider, and absent is rendered as nothing rather than as a zero, which
 // would read as "this turn was free".
-function markMessageUsage(target, usage) {
+function markMessageUsage(target, usage, durationMs = null) {
   if (!usage || typeof usage.inputTokens !== "number") return;
   if (target.body.nextElementSibling?.dataset?.state === "usage") return;
   const row = document.createElement("p");
@@ -9283,6 +9332,7 @@ function markMessageUsage(target, usage) {
     `${estimated ? "~" : ""}${total.toLocaleString()} tokens${estimated ? " (estimated)" : ""}`,
     calls,
   ];
+  if (typeof durationMs === "number") parts.push(formatElapsed(durationMs));
   // What the provider charged wins over what the user's own rates compute:
   // one is a fact about the bill, the other is arithmetic, and the label says
   // which is which rather than letting them look alike.
@@ -11218,7 +11268,7 @@ function createQuestionCard(question, questionRepo, { answered = null } = {}) {
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -11408,7 +11458,7 @@ function createFetchApproval(proposal, proposalRepo) {
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -11470,7 +11520,7 @@ async function runVerificationStream(streamCall, targetRepo) {
         }
         appendProposals(target, payload, targetRepo);
         appendContextDisclosure(target.body, payload.contextFiles || []);
-        markMessageUsage(target, payload.usage);
+        markMessageUsage(target, payload.usage, Date.now() - indicator.startedAt);
         markMessageTurnStop(target, payload);
         indicator.finish(chatCompletionState(payload));
       },
@@ -11926,7 +11976,7 @@ function createFallbackOffer(proposal, proposalRepo) {
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             if (indicator) indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -12094,7 +12144,7 @@ function createContextReview(review, reviewRepo) {
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -12217,7 +12267,7 @@ function createRoundBudgetOffer(proposal, proposalRepo) {
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -12461,7 +12511,7 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -13120,7 +13170,7 @@ function createCommandApprovalPreview(
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -13807,7 +13857,7 @@ async function proposePatchFromChat(prompt, assistantMessage) {
   assistantMessage.body.append(createPatchPreview(payload, patchRepo));
   appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
   appendTurnNotes(assistantMessage.body, payload.turnNotes);
-  markMessageUsage(assistantMessage, payload.usage);
+  markMessageUsage(assistantMessage, payload.usage, Date.now() - indicator.startedAt);
 }
 
 // The turn currently in flight, so Stop (button or Escape) can reach its
@@ -13941,7 +13991,7 @@ async function sendChatPrompt(options = {}) {
           appendProposals(assistantMessage, payload, chatRepo);
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           appendTurnNotes(assistantMessage.body, payload.turnNotes);
-          markMessageUsage(assistantMessage, payload.usage);
+          markMessageUsage(assistantMessage, payload.usage, Date.now() - indicator.startedAt);
           void refreshMemoryProposals(currentSessionId);
           if (payload.cancelled) {
             if (indicator) indicator.finish("stopped");
@@ -14046,7 +14096,7 @@ async function askAgainFromExhausted(sessionId, taskId) {
           appendProposals(assistantMessage, payload, chatRepo);
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           appendTurnNotes(assistantMessage.body, payload.turnNotes);
-          markMessageUsage(assistantMessage, payload.usage);
+          markMessageUsage(assistantMessage, payload.usage, Date.now() - indicator.startedAt);
           void refreshMemoryProposals(currentSessionId);
           if (payload.cancelled) {
             indicator.finish("stopped");
