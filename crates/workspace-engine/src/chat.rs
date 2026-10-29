@@ -11897,7 +11897,7 @@ fn read_git_diff_tool_definition() -> ToolDefinition {
 fn list_worktrees_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "list_worktrees".to_string(),
-        description: "List this repository's git worktrees: each one's path, branch (or `detached`), short HEAD, count of changed files, and how far it is ahead of and behind a base branch. Use this to discover the worktrees, then pass one's path as `worktree` to the read tools. Restricted files are not counted. Prefer this over running git in a shell: it needs no approval.".to_string(),
+        description: "List this repository's git worktrees: each one's path, branch (or `detached`), short HEAD, count of changed files, and how far it is ahead of and behind a base branch. Use this to discover the worktrees, then pass one's path as `worktree` to the read tools. Worktrees this session cannot read (for example outside the repository root and `allowed_roots`) are listed after them with branch, HEAD, ahead/behind and why, so the list is every registered worktree but this session's own checkout. Restricted files are not counted. Prefer this over running git in a shell: it needs no approval.".to_string(),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"base\":{\"type\":\"string\",\"description\":\"A branch name to measure ahead/behind against; defaults to the main worktree's branch, and is omitted when it is detached\"}},\"required\":[]}".to_string(),
     }
 }
@@ -12847,6 +12847,35 @@ fn format_worktree_listing(listing: &WorktreeListing) -> String {
             listing.entries.len(),
             listing.entries.len() + listing.omitted
         ));
+    }
+    // Spec 60 §5.1: without this section a survey that cannot read a worktree
+    // reads as complete, and a model concludes the worktree does not exist.
+    if !listing.unreachable.is_empty() {
+        text.push_str(&format!(
+            "Not readable from this session ({}); the read tools refuse these. Branch, HEAD and ahead/behind come from git's worktree list and this repository's commits, not from the worktree:\n",
+            listing.unreachable.len() + listing.unreachable_omitted
+        ));
+        for worktree in &listing.unreachable {
+            let mut line = format!(
+                "{}: {} @ {}",
+                worktree.path,
+                worktree.branch.as_deref().unwrap_or("detached"),
+                worktree.head.as_deref().unwrap_or("unknown"),
+            );
+            if let (Some(ahead), Some(behind)) = (worktree.ahead, worktree.behind) {
+                line.push_str(&format!(", {ahead} ahead, {behind} behind"));
+            }
+            line.push_str(&format!("; it {}", worktree.reason));
+            text.push_str(&line);
+            text.push('\n');
+        }
+        if listing.unreachable_omitted > 0 {
+            text.push_str(&format!(
+                "[Unreadable worktrees truncated: {} of {} listed.]\n",
+                listing.unreachable.len(),
+                listing.unreachable.len() + listing.unreachable_omitted
+            ));
+        }
     }
     text
 }

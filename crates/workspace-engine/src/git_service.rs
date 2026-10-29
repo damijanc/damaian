@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::error::{ClientError, Result};
 use crate::path_policy::PathPolicy;
 use crate::secret_scanner::SecretScanner;
+use crate::worktree_access::WorktreeRefusal;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -88,8 +89,29 @@ pub struct WorktreeListingEntry {
     pub behind: Option<usize>,
 }
 
+/// A registered worktree this session cannot read, named so a survey that
+/// misses it does not read as complete (spec 60 §5.1). Everything here comes
+/// from git's worktree list and the repository's shared object store; nothing
+/// opens the worktree's own files, so no changed-file count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreachableWorktree {
+    /// Repository-relative path, absolute when outside the repository root.
+    pub path: String,
+    /// The branch checked out; `None` when detached or bare.
+    pub branch: Option<String>,
+    /// Short `HEAD`; `None` when git lists none.
+    pub head: Option<String>,
+    /// Commits its `HEAD` is ahead of `base`; `None` without a base or when
+    /// the count cannot be taken.
+    pub ahead: Option<usize>,
+    /// Commits its `HEAD` is behind `base`.
+    pub behind: Option<usize>,
+    pub reason: WorktreeRefusal,
+}
+
 /// `list_worktrees`: every reachable worktree, capped at 20 with the rest
-/// counted but not listed (spec 60 §5.2).
+/// counted but not listed, then the unreachable ones under the same cap
+/// (spec 60 §5.2). The session's own checkout is in neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeListing {
     /// The effective `base` the ahead/behind counts are against, or `None`
@@ -98,6 +120,9 @@ pub struct WorktreeListing {
     pub entries: Vec<WorktreeListingEntry>,
     /// Reachable worktrees past the cap, counted but not listed.
     pub omitted: usize,
+    pub unreachable: Vec<UnreachableWorktree>,
+    /// Unreachable worktrees past the cap, counted but not listed.
+    pub unreachable_omitted: usize,
 }
 
 /// The most `list_worktrees` lists; the rest are counted, not enumerated, so a
@@ -596,7 +621,7 @@ impl GitService {
         )?;
         let (ahead, behind) = match &upstream {
             Some(upstream) => {
-                let (ahead, behind) = self.ahead_behind(root, upstream)?;
+                let (ahead, behind) = self.ahead_behind(root, upstream, "HEAD")?;
                 (
                     u32::try_from(ahead).unwrap_or(u32::MAX),
                     u32::try_from(behind).unwrap_or(u32::MAX),
@@ -1067,11 +1092,11 @@ impl GitService {
             .and_then(|entry| entry.branch))
     }
 
-    /// `(ahead, behind)` of `root`'s HEAD against `base`, the two counts of
-    /// `rev-list --left-right --count base...HEAD`: the left count is the
-    /// commits `base` has that HEAD does not (behind), the right the reverse
-    /// (ahead).
-    fn ahead_behind(&self, root: &Path, base: &str) -> Result<(usize, usize)> {
+    /// `(ahead, behind)` of `rev` against `base`, read in `root`, the two
+    /// counts of `rev-list --left-right --count base...rev`: the left count is
+    /// the commits `base` has that `rev` does not (behind), the right the
+    /// reverse (ahead).
+    fn ahead_behind(&self, root: &Path, base: &str, rev: &str) -> Result<(usize, usize)> {
         let output = git_output(
             root,
             &[
@@ -1079,7 +1104,7 @@ impl GitService {
                 "--left-right",
                 "--count",
                 "--end-of-options",
-                &format!("{base}...HEAD"),
+                &format!("{base}...{rev}"),
             ],
         )?;
         if !output.status.success() {
@@ -1120,8 +1145,9 @@ impl GitService {
     /// runs; the default is the main worktree's branch, and when there is no
     /// base the ahead/behind fields are `None`. One git process for the list,
     /// then `status`, `rev-parse` and `rev-list` per listed worktree, capped at
-    /// 20 with the rest counted. Not audited per worktree: the tool records one
-    /// `git_worktrees_listed`.
+    /// 20 with the rest counted, then `rev-parse` and `rev-list` per
+    /// unreachable one under the same cap. Not audited per worktree: the tool
+    /// records one `git_worktrees_listed`.
     pub fn list_worktrees(
         &self,
         repository_root: &Path,
@@ -1153,7 +1179,7 @@ impl GitService {
             let changed_files = self.changed_file_count(root)?;
             let (ahead, behind) = match &base {
                 Some(base) => {
-                    let (ahead, behind) = self.ahead_behind(root, base)?;
+                    let (ahead, behind) = self.ahead_behind(root, base, "HEAD")?;
                     (Some(ahead), Some(behind))
                 }
                 None => (None, None),
@@ -1167,6 +1193,52 @@ impl GitService {
                 behind,
             });
         }
+        // The rest are named, not read: their commits are in this repository's
+        // object store, so `HEAD` and ahead/behind are taken here at
+        // `repository_root` and the worktree's own directory is never touched.
+        let unreachable_all: Vec<_> = classified
+            .iter()
+            .filter(|worktree| {
+                !matches!(worktree.refusal, None | Some(WorktreeRefusal::OwnCheckout))
+            })
+            .collect();
+        let unreachable_omitted = unreachable_all.len().saturating_sub(WORKTREES_LISTED_CAP);
+        let mut unreachable = Vec::new();
+        for worktree in unreachable_all.into_iter().take(WORKTREES_LISTED_CAP) {
+            // Git listed it, but it is passed to git again, so only a hex id,
+            // which cannot be read as an option.
+            let sha = worktree
+                .entry
+                .head
+                .as_deref()
+                .filter(|sha| !sha.is_empty() && sha.bytes().all(|b| b.is_ascii_hexdigit()));
+            let head = match sha {
+                Some(sha) => git_line(
+                    repository_root,
+                    &["rev-parse", "--short", "--verify", "-q", sha],
+                )?,
+                None => None,
+            };
+            // A prunable entry's commits may be gone; a missing count is shown
+            // as missing rather than failing the whole listing.
+            let (ahead, behind) = match (&base, sha) {
+                (Some(base), Some(sha)) => match self.ahead_behind(repository_root, base, sha) {
+                    Ok((ahead, behind)) => (Some(ahead), Some(behind)),
+                    Err(_) => (None, None),
+                },
+                _ => (None, None),
+            };
+            unreachable.push(UnreachableWorktree {
+                path: worktree.display.clone(),
+                branch: worktree.entry.branch.clone(),
+                head,
+                ahead,
+                behind,
+                reason: worktree
+                    .refusal
+                    .expect("an unreachable worktree has a refusal"),
+            });
+        }
         self.audit_log.record(
             "git_worktrees_listed",
             &[
@@ -1177,12 +1249,18 @@ impl GitService {
                 ),
                 ("count", listed.len().to_string()),
                 ("omitted", omitted.to_string()),
+                (
+                    "unreachable",
+                    (unreachable.len() + unreachable_omitted).to_string(),
+                ),
             ],
         )?;
         Ok(WorktreeListing {
             base,
             entries: listed,
             omitted,
+            unreachable,
+            unreachable_omitted,
         })
     }
 

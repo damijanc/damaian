@@ -1219,17 +1219,37 @@ fn list_worktrees_reports_path_branch_head_changed_count_and_ahead_behind() {
 }
 
 #[test]
-fn from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots() {
-    // Spec 60 §5.1 / C1, pinned as a limitation: the containment root is the
-    // session's own checkout, not the repository's main worktree. A session in
-    // a linked worktree therefore lists nothing, and the result does not name
-    // the refusals; `git worktree list` still shows every registration.
+fn from_a_linked_worktree_list_worktrees_reads_none_but_names_them_without_allowed_roots() {
+    // Spec 60 §5.1 / C1: the containment root is the session's own checkout,
+    // not the repository's main worktree. A session in a linked worktree
+    // therefore reads none of the others, but names each one and why, so the
+    // listing does not read as "no worktrees". Its own checkout is in neither.
     let fixture = fixture("list-from-linked");
     let session_root = fixture.worktree("a");
     let listing = fixture.git.list_worktrees(&session_root, None).unwrap();
     assert_eq!(listing.base.as_deref(), Some("main"));
     assert_eq!(listing.entries.len(), 0, "{listing:?}");
     assert_eq!(listing.omitted, 0, "{listing:?}");
+    let main = fs::canonicalize(&fixture.repo).unwrap();
+    let named: Vec<(String, WorktreeRefusal)> = listing
+        .unreachable
+        .iter()
+        .map(|worktree| (worktree.path.clone(), worktree.reason))
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            (
+                main.to_string_lossy().to_string(),
+                WorktreeRefusal::OutsideAllowedRoots
+            ),
+            (
+                fixture.worktree("b").to_string_lossy().to_string(),
+                WorktreeRefusal::OutsideAllowedRoots
+            ),
+        ],
+        "{listing:?}"
+    );
 
     // The documented remedy: allow the main repository, and the main checkout
     // and the sibling become reachable from the linked session. The session's
@@ -1243,6 +1263,7 @@ fn from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots() {
     );
     let listing = allowed_git.list_worktrees(&session_root, None).unwrap();
     assert_eq!(listing.entries.len(), 2, "{listing:?}");
+    assert!(listing.unreachable.is_empty(), "{listing:?}");
     let main = fs::canonicalize(&fixture.repo).unwrap();
     let paths: Vec<String> = listing
         .entries
@@ -1256,6 +1277,91 @@ fn from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots() {
     assert!(
         paths.contains(&fixture.worktree("b").to_string_lossy().to_string()),
         "{listing:?}"
+    );
+}
+
+#[test]
+fn an_outside_worktree_is_named_with_branch_head_and_ahead_behind_but_not_read() {
+    // The motivating case (spec 60 §7, 2026-10-29): a tool's worktrees live
+    // outside the repository root, and a listing that left them out made a
+    // model report "nothing in progress" with a branch six commits ahead.
+    let fixture = fixture("list-outside-named");
+    let outside = fixture.outside().join("wt");
+    fixture.run(&[
+        "worktree",
+        "add",
+        "-q",
+        outside.to_str().unwrap(),
+        "-b",
+        "wt-out",
+    ]);
+    fs::write(outside.join("committed.txt"), "out\n").unwrap();
+    fixture.run_in(&outside, &["add", "-A"]);
+    fixture.run_in(&outside, &["commit", "-q", "-m", "ahead outside"]);
+
+    let listing = fixture.git.list_worktrees(&fixture.repo, None).unwrap();
+    // The reachable ones are unchanged.
+    assert_eq!(listing.entries.len(), 2, "{listing:?}");
+    assert_eq!(listing.unreachable.len(), 1, "{listing:?}");
+    let named = &listing.unreachable[0];
+    assert_eq!(
+        named.path,
+        fs::canonicalize(&outside).unwrap().to_string_lossy()
+    );
+    assert_eq!(named.branch.as_deref(), Some("wt-out"));
+    assert_eq!(
+        named.head.as_deref(),
+        Some(fixture.short_head(&outside).as_str())
+    );
+    assert_eq!((named.ahead, named.behind), (Some(1), Some(0)));
+    assert_eq!(named.reason, WorktreeRefusal::OutsideAllowedRoots);
+}
+
+#[test]
+fn a_removed_worktree_directory_is_named_as_prunable() {
+    let fixture = fixture("list-prunable");
+    fs::remove_dir_all(fixture.worktree("b")).unwrap();
+    let listing = fixture.git.list_worktrees(&fixture.repo, None).unwrap();
+    assert_eq!(listing.entries.len(), 1, "{listing:?}");
+    assert_eq!(listing.unreachable.len(), 1, "{listing:?}");
+    assert_eq!(listing.unreachable[0].branch.as_deref(), Some("wt-b"));
+    assert_eq!(listing.unreachable[0].reason, WorktreeRefusal::Prunable);
+}
+
+#[test]
+fn the_list_worktrees_tool_names_unreadable_worktrees_and_why() {
+    let fixture = fixture("tools-listing-unreadable");
+    let outside = fixture.outside().join("wt");
+    fixture.run(&[
+        "worktree",
+        "add",
+        "-q",
+        outside.to_str().unwrap(),
+        "-b",
+        "wt-out",
+    ]);
+    let turn = fixture.tools(&[("list_worktrees", "{}")]);
+    assert!(!turn.approval_requested);
+    let text = &turn.results[0];
+    assert!(
+        text.contains("Not readable from this session (1)"),
+        "{text}"
+    );
+    let line = text
+        .lines()
+        .find(|line| line.contains("wt-out"))
+        .unwrap_or_else(|| panic!("no line for wt-out in {text}"));
+    assert!(
+        line.contains("0 ahead, 0 behind") && line.contains("allowed_roots"),
+        "{line}"
+    );
+    assert!(
+        turn.records
+            .lines()
+            .any(|line| line.contains("git_worktrees_listed")
+                && line.contains("\"unreachable\":\"1\"")),
+        "{}",
+        turn.records
     );
 }
 

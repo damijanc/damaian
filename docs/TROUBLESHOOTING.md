@@ -2737,31 +2737,40 @@ omitted exactly as in the main checkout.
 
 ### `list_worktrees` shows no worktrees from a worktree session
 
-`list_worktrees` lists only the worktrees that are **reachable from the session's
-own checkout**, not every registration git knows about. The containment root is
-the checkout the session opened. A session running in a linked worktree — a
-worker's `.damaian/worktrees/<slug>`, or a development worktree under
-`.claude/worktrees/` — therefore treats its own entry as the session checkout
-and the main checkout and every sibling as outside it. With the default empty
-`allowed_roots`, the reachable set is empty and the tool result is:
+`list_worktrees` reads only the worktrees that are **reachable from the session's
+own checkout**. The containment root is the checkout the session opened, so a
+registered worktree outside the repository root and `allowed_roots` cannot be
+read. That includes worktrees another tool keeps outside the repository, and,
+from a session running in a linked worktree — a worker's
+`.damaian/worktrees/<slug>`, or a development worktree under
+`.claude/worktrees/` — the main checkout and every sibling. With the default
+empty `allowed_roots`, such a session reads none of them, and the tool result
+looks like:
 
 ```
 Worktrees (0 listed, ahead/behind vs `main`):
+Not readable from this session (2); the read tools refuse these. Branch, HEAD and ahead/behind come from git's worktree list and this repository's commits, not from the worktree:
+/path/to/repo: main @ 23ee8bc, 0 ahead, 0 behind; it is outside the repository root and no `allowed_roots` entry contains it
+/path/to/repo/.claude/worktrees/b: wt-b @ 6b362a9, 1 ahead, 0 behind; it is outside the repository root and no `allowed_roots` entry contains it
 ```
 
-It does not enumerate the entries it withheld, so the assistant can read that as
-“no worktrees are registered”. They are registered; the tool cannot reach them.
+The second section names every registered worktree it cannot read and why
+(outside the allowed roots, prunable, missing, or bare), with what git and the
+repository's own commits say about it. It never shows a changed-file count for
+those, because that would mean reading the worktree. The session's own checkout
+is in neither section. Before 2026-10-29 the second section did not exist, and
+an assistant could read an empty listing as "no worktrees are registered".
 
-Check the truth with `git -C <repo> worktree list` or the audit event
-`git_worktrees_listed`: its `count` is the number listed and its `resourcePath`
-is the session root that decided reachability. A `count: 0` with a `resourcePath`
-inside a worktree is this case, not an empty repository.
+The audit event `git_worktrees_listed` records `count` (readable worktrees
+listed), `unreachable` (worktrees named as not readable) and `resourcePath`,
+the session root that decided reachability.
 
-To survey the repository from a worktree session, either add the main checkout
-to `allowed_roots` (then the main and its siblings are reachable, while the
-session's own checkout is still addressed by omitting `worktree`), or run the
-tool from the main checkout. This is deliberate (spec 60 §5.1, correction C1),
-pinned by `from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots`;
+To read those worktrees from the session, either add the main checkout (or the
+directory holding them) to `allowed_roots`, or run the tool from the main
+checkout. In a worktree session the session's own checkout is still addressed
+by omitting `worktree`. The containment rule is deliberate (spec 60 §5.1,
+correction C1), pinned by
+`from_a_linked_worktree_list_worktrees_reads_none_but_names_them_without_allowed_roots`;
 changing it would be a spec change, not a configuration fix.
 
 ### MCP server not working

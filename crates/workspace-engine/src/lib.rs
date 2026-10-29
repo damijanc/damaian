@@ -136,7 +136,8 @@ pub use fetch::{CurlFetchTransport, DEFAULT_MAX_RESPONSE_BYTES, FetchOutcome};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};
 pub use git_service::{
     BranchInfo, BranchNameCheck, DiffOptions, GitFileStatus, GitHubRepo, GitReadCaps, GitService,
-    GitStatus, GitSummary, WorktreeListing, WorktreeListingEntry, parse_github_remote,
+    GitStatus, GitSummary, UnreachableWorktree, WorktreeListing, WorktreeListingEntry,
+    parse_github_remote,
 };
 pub use hash::repository_id_for_root;
 pub use hooks::{
