@@ -104,7 +104,7 @@ scale.
 | `.btn-quiet` | Transparent border and background, `--muted` text | Dismiss, cancel, reject |
 | `.btn-danger` | Transparent, `--danger` text | Delete, remove, revoke |
 | `.btn-icon` | Transparent, `5px 8px`, glyph only | Overflow (vertical `.dots-icon`), close, small toggles |
-| `.icon-btn` | 28×28, transparent, `--muted`; hover `rgba(0,0,0,.05)`; `[aria-pressed="true"]` takes the accent tint | A single glyph that is not an overflow ⋮: header symbol search and terminal. Holds one `icon()` SVG (24×24 viewBox, 1.7 stroke, 16px). Keep its `aria-label` and `title` |
+| `.icon-btn` | 28×28, transparent, `--muted`; hover `rgba(0,0,0,.05)`; `[aria-pressed="true"]` takes the accent tint | Every header control: symbol search, terminal and the session ⋮ (which holds `.dots-icon` instead of an SVG). Other glyphs hold one `icon()` SVG (24×24 viewBox, 1.7 stroke, 16px). Keep its `aria-label` and `title` |
 | `.btn-trigger` | 12px / 600 / `5px 6px`, transparent, `--muted` label, caret | Opens a popover from an action row; the label is the current value |
 
 **Rules**
@@ -121,7 +121,7 @@ scale.
   the action, and a setting must not outweigh it. Its label never wraps, and a
   trigger whose value can be arbitrarily long caps its width and truncates
   rather than pushing the row around.
-- **The overflow trigger is a vertical ⋮, always.** It is a `.btn-icon` containing
+- **The overflow trigger is a vertical ⋮, always.** It is a `.btn-icon` (the header's, a `.icon-btn`, so it matches its neighbours) containing
   `<span class="dots-icon" aria-hidden="true"></span>`, with an `aria-label` that
   names what the menu is for ("More approval options", not "More"). Never a
   text glyph: not `⋯`, not `…`, not `⋮` typed as a character, because a glyph's
@@ -494,6 +494,7 @@ Each of these existed in the shell and was removed. Do not reintroduce them.
 | Controls positioned over the field they displace | The field then pays for them in padding it cannot use. The composer's textarea reserved 70px of height and 58px of *every line* to keep text clear of three floating controls — 41px of text inside a 111px field, and text stopping 59px short of the edge on every row. The `@media` block holding that layout together at narrow widths was three rules whose only job was to stop it colliding. Controls belong in a row of their own |
 | Turn state in a header badge | Nobody looks at the header during a turn; they look at the reply. `#chat-status` was the only progress signal for four turn paths. Running state is the in-bubble turn indicator; an end state is a mark on that turn's message (spec 58 §3.2) |
 | Horizontal `⋯` or a text-glyph overflow trigger | Vertical ⋮ was asked for and applied to one control while this guide still said `⋯`; the approval and recovery overflows were then built from the guide and came out horizontal. The trigger is `.dots-icon` (§3), and the guide is what gets fixed first |
+| Chrome with nothing to say | An empty *Workers* entry and a permanent *Check Updates* button cost space on every screen to report nothing. Draw an entry only when it has state to show, and keep the way back to it in a menu or in Settings |
 | Two values sharing one truncating label | Whichever is last is the one that disappears. `model + effort` in one 220px pill rendered `claude-3-5-sonnet-202…` — the effort still in force and readable nowhere but the popover. One trigger per value |
 
 ---

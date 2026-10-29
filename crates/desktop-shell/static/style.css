@@ -545,6 +545,11 @@ button:disabled {
   color: #3b3f44;
 }
 
+/* A worker row has no time column: just the open button and its ⋮. */
+.project-worker-item {
+  grid-template-columns: minmax(0, 1fr) 26px;
+}
+
 .project-session-open {
   min-width: 0;
   min-height: 32px;
@@ -778,15 +783,6 @@ button:disabled {
   height: 16px;
   flex: none;
   display: block;
-}
-
-/* The header's overflow trigger, at the header's 30px control height. */
-.thread-menu-btn {
-  width: 30px;
-  height: 30px;
-  display: inline-grid;
-  place-items: center;
-  padding: 0;
 }
 
 /* The app failing rather than a turn (spec 58 §3.2). Unlike the toast that
@@ -5921,6 +5917,10 @@ body.worker-view #chat-model-menu {
    it never reflows the log or the composer. */
 /* A borderless chip, so the one header item that is information rather than a
    control does not look like a button. */
+.context-inspector-button[hidden] {
+  display: none;
+}
+
 .context-inspector-button {
   display: inline-flex;
   align-items: center;

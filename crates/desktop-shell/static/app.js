@@ -3453,6 +3453,8 @@ function showRestartNotice() {
 }
 
 async function checkForAppUpdate(showCurrent = true) {
+  // A check mid-install would reset the footer the install is driving.
+  if (appUpdateInstalling) return null;
   const updater = tauriUpdater();
   if (!updater?.check) {
     if (showCurrent) toast("Updater is not available in this build");
@@ -6448,6 +6450,17 @@ function pausedTasksOf(messages, endsTheTurn, tasks = []) {
     if (
       approvalRequestFor(message, next, nextResult, endsTheTurn) ||
       unparsedRequestFor(message, next, nextResult, endsTheTurn)
+    ) {
+      paused.add(message.taskId);
+      return;
+    }
+    // Fetch, MCP, plan and browser-diagnostic requests are not command steps,
+    // but their resume paths also leave a non-final assistant message directly
+    // followed by another of the same task, with no tool result between.
+    if (
+      isGroupableAction(message, endsTheTurn) &&
+      next?.role === "assistant" &&
+      next.taskId === message.taskId
     ) {
       paused.add(message.taskId);
     }
