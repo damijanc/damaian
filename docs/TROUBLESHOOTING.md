@@ -1223,6 +1223,13 @@ A step showing `"status":"completed"` with `"evidence":[]` is **completed
 unverified** — it finished with nothing observable behind it. That is a
 reported outcome, not a missing record. A step showing `"status":"blocked"` had
 a command that did not succeed; the steps after it stay `pending` on purpose.
+A `CommandExit` carries `commandHash`, the SHA-256 of the exact command line,
+and only the latest run of each command decides: an exit followed by another
+run with the same `commandHash` no longer blocks. So a blocked step that later
+shows `"status":"completed"` with a failing exit in its evidence is a check
+that was rerun and passed, not a block that was overridden. Evidence written
+before 2026-10-29 has no `commandHash`, and each of its exits still counts on
+its own.
 
 Rewinding takes plans and approvals with it: `read_task_plan` and
 `read_plan_approved` both read only events after the last

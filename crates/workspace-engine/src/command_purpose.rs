@@ -70,9 +70,11 @@ pub fn command_purpose(command: &str, detected: bool) -> CommandPurpose {
 /// Programs that only look, matched on the first word of a simple command.
 /// `read` is here for `… | while read f; do …; done`: it only fills a shell
 /// variable.
+/// `which`, `type` and `whence` only say where a program is; finding none is
+/// an answer, as for `ls`.
 const EXPLORATION_PROGRAMS: &[&str] = &[
     "ls", "pwd", "cat", "head", "tail", "wc", "grep", "rg", "find", "awk", "sort", "uniq", "cut",
-    "du", "stat", "file", "echo", "true", "read",
+    "du", "stat", "file", "echo", "true", "read", "which", "type", "whence",
 ];
 
 /// `git` subcommands that only look. `branch` and `worktree` count only in
@@ -192,6 +194,8 @@ fn is_exploration_command(words: &[&str]) -> bool {
                 _ => false,
             }
         }
+        // Only the lookup forms: plain `command npm install` runs `npm`.
+        "command" => matches!(words.get(1), Some(&"-v" | &"-V")),
         program => EXPLORATION_PROGRAMS.contains(&program),
     }
 }
@@ -277,6 +281,25 @@ mod tests {
             "echo done || true",
         ] {
             assert_eq!(purpose(command), CommandPurpose::Exploration, "{command}");
+        }
+    }
+
+    #[test]
+    fn looking_up_where_a_program_is_is_exploration() {
+        // From a session on 2026-10-29: `npm` was not on the shell's PATH, and
+        // the probe that looked for it exited 1 and blocked the step.
+        for command in [
+            "command -v node; command -v npm; ls /opt/homebrew/bin/node 2>/dev/null",
+            "command -V npm",
+            "which node",
+            "type -a npm",
+            "whence -p node",
+        ] {
+            assert_eq!(purpose(command), CommandPurpose::Exploration, "{command}");
+        }
+        // `command` without a lookup flag runs its argument.
+        for command in ["command npm install", "command -p rm -rf build", "command"] {
+            assert_eq!(purpose(command), CommandPurpose::Other, "{command}");
         }
     }
 

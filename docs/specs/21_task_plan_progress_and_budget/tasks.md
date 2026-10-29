@@ -80,6 +80,7 @@ Every task's requirements implicitly include this section.
 | 11. Plan review gate | **done** | "Mutating" is not decidable from the action alone — see the note below |
 | 12. Plan panel and completion report | **done** | Closed Task 7's and Task 11's debts; found a pre-existing duplicate-stop-row bug — see the note below |
 | 13. Harness coverage and documentation | **done** | §7's own question found a missing evidence source — see the note below |
+| Follow-up · Blocked steps recover on the same command | **done** 2026-10-29 | `Evidence::CommandExit` gains `command_hash` (SHA-256 of the command line, omitted when absent); `status_from_evidence` lets only the latest run of each hashed command decide; `complete_step` re-judges a blocked step on what was observed since and hands off if it now completes, else stays refused with what clears it. Exploration gains `which`, `type`, `whence`, `command -v/-V`. Tests in `tests/plan.rs`, `tests/plan_turn.rs` and `command_purpose.rs`; disabling supersession fails the three rerun tests. See proposal §7, "A blocked step is judged again". |
 
 ## File Structure
 

@@ -85,6 +85,13 @@ pub enum Evidence {
         exit_code: Option<i32>,
         #[serde(default)]
         purpose: CommandPurpose,
+        /// SHA-256 of the exact command text, so a later run of the same
+        /// command can be recognised (spec 21 §5.3) without the text itself,
+        /// which may hold a secret, reaching the plan. `None` for events
+        /// written before it existed and for checks that are not a command
+        /// line; those are judged one exit at a time, as they always were.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_hash: Option<String>,
     },
     /// A patch was applied, with the hash actually written per file.
     #[serde(rename_all = "camelCase")]
@@ -164,8 +171,28 @@ pub enum TaskPhase {
 /// retry logic" genuinely has nothing observable behind it, and forcing a fake
 /// observation would be worse than admitting the gap —
 /// [`PlanStep::is_unverified`] is how the completion report admits it.
+///
+/// Only the latest run of a command decides. Evidence is in the order it was
+/// observed, so an exit followed by another run of the same command is
+/// superseded: a check that failed, was fixed and then passed is a step that
+/// succeeded, and one that passed and then failed is not. "The same command"
+/// is the exact text, by hash; a different command passing says nothing about
+/// the one that failed, so it clears nothing.
 pub fn status_from_evidence(evidence: &[Evidence]) -> StepStatus {
-    let blocked = evidence.iter().any(|item| match item {
+    let superseded = |index: usize| match &evidence[index] {
+        Evidence::CommandExit {
+            command_hash: Some(hash),
+            ..
+        } => evidence[index + 1..].iter().any(|later| {
+            matches!(
+                later,
+                Evidence::CommandExit { command_hash: Some(later_hash), .. } if later_hash == hash
+            )
+        }),
+        _ => false,
+    };
+    let blocked = evidence.iter().enumerate().any(|(index, item)| match item {
+        _ if superseded(index) => false,
         // `Some(0)` and nothing else. `None` means the command was killed or
         // signalled, so nothing is known — and "nothing is known" is not "it
         // passed". Writing this as `matches!(code, Some(c) if *c != 0)` would

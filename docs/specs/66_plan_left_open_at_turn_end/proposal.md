@@ -198,7 +198,9 @@ the model says so, and ending the turn is the model saying so.
 A plan is **open** when any step's status is `pending` or `in_progress`.
 `blocked` is not open for this purpose: it is terminal for the step until the
 model acts on it, and #21 already makes a blocked step stop the handoff and
-report itself. (A turn can end with a blocked step; the reminder in §5.2 is
+report itself. Acting on it means running the failed command again
+successfully, after which `complete_step` re-judges the step (#21 §7, "A
+blocked step is judged again", 2026-10-29). (A turn can end with a blocked step; the reminder in §5.2 is
 not for it, because the model was already told "Step … is blocked" in the
 `complete_step` result.)
 

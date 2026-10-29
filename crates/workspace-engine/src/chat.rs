@@ -127,13 +127,22 @@ enum ActionOutcome {
 /// [`ActionOutcome::Failed`] likewise: it carries no code, so there is nothing
 /// to record that would not be invented, and the step's status follows from
 /// the *absence* of confirming evidence.
-fn evidence_for(outcome: &ActionOutcome, marker_id: &str) -> Option<crate::plan::Evidence> {
+///
+/// `command` is the command line that ran, when the action was one. Only its
+/// hash is kept, so a later run of the same command can supersede this exit
+/// (spec 21 §5.3).
+fn evidence_for(
+    outcome: &ActionOutcome,
+    marker_id: &str,
+    command: Option<&str>,
+) -> Option<crate::plan::Evidence> {
     match outcome {
         ActionOutcome::CommandExit(exit_code, purpose) => {
             Some(crate::plan::Evidence::CommandExit {
                 marker_id: marker_id.to_string(),
                 exit_code: *exit_code,
                 purpose: *purpose,
+                command_hash: command.map(command_hash),
             })
         }
         // No marker id: unlike a command, the fact worth keeping is *which
@@ -145,6 +154,20 @@ fn evidence_for(outcome: &ActionOutcome, marker_id: &str) -> Option<crate::plan:
             hash: hash.clone(),
         }),
         ActionOutcome::Ok | ActionOutcome::Failed | ActionOutcome::Cancelled => None,
+    }
+}
+
+/// The hash `Evidence::CommandExit::command_hash` holds: of the exact text, so
+/// only an identical command line counts as the same command.
+fn command_hash(command: &str) -> String {
+    crate::hash::sha256(command)
+}
+
+/// The command line a tool action runs, if it runs one.
+fn action_command(action: &ToolAction) -> Option<&str> {
+    match action {
+        ToolAction::Command(request) => Some(request.command.as_str()),
+        _ => None,
     }
 }
 
@@ -2406,6 +2429,7 @@ impl ChatOrchestrator {
             marker_id: marker_id.clone(),
             exit_code,
             purpose: record.execution.purpose,
+            command_hash: Some(command_hash(&record.execution.command)),
         }];
         if let Some(findings) = findings {
             evidence.push(findings);
@@ -2496,6 +2520,8 @@ impl ChatOrchestrator {
             marker_id: record.id.clone(),
             exit_code: Some(exit_code),
             purpose: CommandPurpose::Check,
+            // A browser check is not a command line; each run stands alone.
+            command_hash: None,
         };
         if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
             step.evidence = vec![evidence];
@@ -3355,6 +3381,7 @@ impl ChatOrchestrator {
                         record.execution.purpose,
                     ),
                     &record.execution.id,
+                    Some(&command_request.command),
                 ) {
                     step_evidence.push(evidence);
                 }
@@ -7220,41 +7247,40 @@ impl ChatOrchestrator {
                             ),
                             Some(current) => {
                                 // A step can only be closed while it is the one
-                                // running. A second `complete_step` after a block
+                                // running, or re-judged while it is the one
+                                // blocked. A second `complete_step` after a block
                                 // used to find no open step, leave `status` at its
                                 // default `Completed`, and start the next pending
                                 // step — laundering the block into a handoff
-                                // (found in a session on 2026-10-26).
-                                match current.steps.iter().position(|step| {
+                                // (found in a session on 2026-10-26). It then
+                                // became a refusal with no way out, so a block
+                                // stood for the rest of the turn even after the
+                                // model fixed it (2026-10-29). A blocked step is
+                                // now judged again on everything observed since,
+                                // by the same rule: it clears only when the
+                                // command that failed has since passed.
+                                let running = current.steps.iter().position(|step| {
                                     step.status == crate::plan::StepStatus::InProgress
-                                }) {
-                                    None => {
-                                        let blocked = current
-                                            .steps
-                                            .iter()
-                                            .find(|step| {
-                                                step.status == crate::plan::StepStatus::Blocked
-                                            })
-                                            .map(|step| step.title.clone());
-                                        let result = match blocked {
-                                            Some(title) => format!(
-                                                "No step is in progress. Step \"{title}\" is blocked: resolve what blocked it before moving on; the remaining steps are still pending."
-                                            ),
-                                            None => "No step is in progress, so there is nothing to complete. Do not call complete_step again.".to_string(),
-                                        };
-                                        (
-                                            "Attempted to complete a step.".to_string(),
-                                            result,
-                                            ActionOutcome::Failed,
-                                        )
-                                    }
+                                });
+                                let blocked = current.steps.iter().position(|step| {
+                                    step.status == crate::plan::StepStatus::Blocked
+                                });
+                                match running.or(blocked) {
+                                    None => (
+                                        "Attempted to complete a step.".to_string(),
+                                        "No step is in progress, so there is nothing to complete. Do not call complete_step again.".to_string(),
+                                        ActionOutcome::Failed,
+                                    ),
                                     Some(open_index) => {
+                                        let was_blocked = current.steps[open_index].status
+                                            == crate::plan::StepStatus::Blocked;
                                         // The model asked to move on; it does not get
                                         // to say how the step ended. §5.3: the status
                                         // is a function of the evidence, and this is
                                         // the only place a step reaches a terminal
                                         // status.
                                         let accrued = std::mem::take(&mut step_evidence);
+                                        let observed_more = !accrued.is_empty();
                                         let now = now_millis();
                                         let open = &mut current.steps[open_index];
                                         // Extends rather than replaces. A step can
@@ -7269,54 +7295,80 @@ impl ChatOrchestrator {
                                         open.evidence.extend(accrued);
                                         let status =
                                             crate::plan::status_from_evidence(&open.evidence);
-                                        open.status = status;
-                                        open.completed_at_ms = Some(now);
                                         let finished_title = open.title.clone();
-                                        let closed = open.clone();
-                                        self.session_store.update_plan_step(&task, &closed)?;
+                                        if was_blocked && status == crate::plan::StepStatus::Blocked {
+                                            // Still blocked: nothing hands off, and the
+                                            // block keeps its time. What was observed
+                                            // since is kept, so the next re-check
+                                            // weighs it too.
+                                            if observed_more {
+                                                let kept = open.clone();
+                                                self.session_store.update_plan_step(&task, &kept)?;
+                                                sink.plan(current);
+                                            }
+                                            (
+                                                "Attempted to complete a step.".to_string(),
+                                                format!(
+                                                    "No step is in progress. Step \"{finished_title}\" is still blocked: a command it ran failed, and that same command has not succeeded since. Fix the cause, run exactly the same command again (a different command does not clear it), then call complete_step. The remaining steps are still pending."
+                                                ),
+                                                ActionOutcome::Failed,
+                                            )
+                                        } else {
+                                            open.status = status;
+                                            open.completed_at_ms = Some(now);
+                                            let closed = open.clone();
+                                            self.session_store.update_plan_step(&task, &closed)?;
 
-                                        // A blocked step does not hand off: the next
-                                        // step's prerequisite failed, and starting it
-                                        // anyway would build on work that did not
-                                        // happen.
-                                        let mut next_title = None;
-                                        if status == crate::plan::StepStatus::Completed
-                                            && let Some(next) =
-                                                current.steps.iter_mut().find(|step| {
-                                                    step.status == crate::plan::StepStatus::Pending
-                                                })
-                                        {
-                                            next.status = crate::plan::StepStatus::InProgress;
-                                            next.started_at_ms = Some(now);
-                                            next_title = Some(next.title.clone());
-                                            let started = next.clone();
-                                            self.session_store.update_plan_step(&task, &started)?;
+                                            // A blocked step does not hand off: the next
+                                            // step's prerequisite failed, and starting it
+                                            // anyway would build on work that did not
+                                            // happen.
+                                            let mut next_title = None;
+                                            if status == crate::plan::StepStatus::Completed
+                                                && let Some(next) =
+                                                    current.steps.iter_mut().find(|step| {
+                                                        step.status
+                                                            == crate::plan::StepStatus::Pending
+                                                    })
+                                            {
+                                                next.status = crate::plan::StepStatus::InProgress;
+                                                next.started_at_ms = Some(now);
+                                                next_title = Some(next.title.clone());
+                                                let started = next.clone();
+                                                self.session_store
+                                                    .update_plan_step(&task, &started)?;
+                                            }
+                                            // Once, after the handoff rather than after
+                                            // each of its two writes: between them the
+                                            // closing step is already terminal and the
+                                            // next has not opened, so a panel updated
+                                            // mid-handoff would blink through a state
+                                            // with no current step. The log keeps both
+                                            // writes; the panel does not need them.
+                                            sink.plan(current);
+
+                                            let done = if was_blocked {
+                                                format!(
+                                                    "Step \"{finished_title}\" is no longer blocked: the command that failed has since succeeded."
+                                                )
+                                            } else {
+                                                format!("Step \"{finished_title}\" is complete.")
+                                            };
+                                            let result = match (status, &next_title) {
+                                                (crate::plan::StepStatus::Blocked, _) => format!(
+                                                    "Step \"{finished_title}\" is blocked: a command it ran did not succeed. Fix the cause and run that same command again; complete_step then checks the step again. The remaining steps are still pending."
+                                                ),
+                                                (_, Some(next)) => {
+                                                    format!("{done} The current step is now: {next}.")
+                                                }
+                                                (_, None) => format!("{done} That was the last step."),
+                                            };
+                                            (
+                                                format!("Finished: {finished_title}"),
+                                                result,
+                                                ActionOutcome::Ok,
+                                            )
                                         }
-                                        // Once, after the handoff rather than after
-                                        // each of its two writes: between them the
-                                        // closing step is already terminal and the
-                                        // next has not opened, so a panel updated
-                                        // mid-handoff would blink through a state with
-                                        // no current step. The log keeps both writes;
-                                        // the panel does not need them.
-                                        sink.plan(current);
-
-                                        let result = match (status, &next_title) {
-                                            (crate::plan::StepStatus::Blocked, _) => format!(
-                                                "Step \"{finished_title}\" is blocked: a command it ran did not succeed. Fix that before moving on; the remaining steps are still pending."
-                                            ),
-                                            (_, Some(next)) => format!(
-                                                "Step \"{finished_title}\" is complete. The current step is now: {next}."
-                                            ),
-                                            (_, None) => format!(
-                                                "Step \"{finished_title}\" is complete. That was the last step."
-                                            ),
-                                        };
-                                        (
-                                            format!("Finished: {finished_title}"),
-                                            result,
-                                            ActionOutcome::Ok,
-                                        )
                                     }
                                 }
                             }
@@ -8006,7 +8058,11 @@ impl ChatOrchestrator {
                 // belongs to whichever step is open; with no plan there is nothing
                 // to attach it to and this is a no-op.
                 if plan.is_some()
-                    && let Some(evidence) = evidence_for(&action_outcome, action_marker.id())
+                    && let Some(evidence) = evidence_for(
+                        &action_outcome,
+                        action_marker.id(),
+                        action_command(&after_tool_action),
+                    )
                 {
                     step_evidence.push(evidence);
                 }
@@ -13009,12 +13065,14 @@ mod evidence_tests {
         assert_eq!(
             evidence_for(
                 &ActionOutcome::CommandExit(Some(1), CommandPurpose::Check),
-                "action_1"
+                "action_1",
+                Some("cargo test")
             ),
             Some(Evidence::CommandExit {
                 marker_id: "action_1".to_string(),
                 exit_code: Some(1),
                 purpose: CommandPurpose::Check,
+                command_hash: Some(crate::hash::sha256("cargo test")),
             })
         );
     }
@@ -13027,12 +13085,14 @@ mod evidence_tests {
         assert_eq!(
             evidence_for(
                 &ActionOutcome::CommandExit(None, CommandPurpose::Other),
-                "action_1"
+                "action_1",
+                None
             ),
             Some(Evidence::CommandExit {
                 marker_id: "action_1".to_string(),
                 exit_code: None,
                 purpose: CommandPurpose::Other,
+                command_hash: None,
             })
         );
     }
@@ -13044,12 +13104,14 @@ mod evidence_tests {
         assert_eq!(
             evidence_for(
                 &ActionOutcome::CommandExit(Some(1), CommandPurpose::Exploration),
-                "action_1"
+                "action_1",
+                None
             ),
             Some(Evidence::CommandExit {
                 marker_id: "action_1".to_string(),
                 exit_code: Some(1),
                 purpose: CommandPurpose::Exploration,
+                command_hash: None,
             })
         );
     }
@@ -13060,7 +13122,7 @@ mod evidence_tests {
         // served is done. Manufacturing a success record from it is exactly
         // the letter-not-spirit failure requirement 6 guards against — it
         // would make every step look verified.
-        assert_eq!(evidence_for(&ActionOutcome::Ok, "action_1"), None);
+        assert_eq!(evidence_for(&ActionOutcome::Ok, "action_1", None), None);
     }
 
     #[test]
@@ -13068,7 +13130,7 @@ mod evidence_tests {
         // `Failed` carries no exit code, so there is nothing to record that
         // would not be invented. The step's own status comes from the absence
         // of confirming evidence, not from a fabricated failure record.
-        assert_eq!(evidence_for(&ActionOutcome::Failed, "action_1"), None);
+        assert_eq!(evidence_for(&ActionOutcome::Failed, "action_1", None), None);
     }
 
     /// Requirement 5: a command that was killed reports why it stopped. `-1` is

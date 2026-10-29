@@ -1055,7 +1055,11 @@ Every finished step carries one of four outcomes:
 - **Blocked** — a check or other command the step ran did not succeed. The
   steps after it stay pending: continuing would build on work that did not
   happen. A look-around command that fails, such as a `grep` with no match or an
-  `ls` of a missing path, is kept as evidence but does not block the step.
+  `ls` of a missing path, is kept as evidence but does not block the step. A
+  block clears when the assistant fixes the cause and runs **the same command**
+  again and it succeeds: only the latest run of a command counts, so a check
+  that failed, was fixed and then passed confirms the step, with both runs
+  still listed. A different command succeeding does not clear it.
 - **Skipped** — the step was not needed.
 
 The one-line summary at the top of the panel **never says "complete" while any
@@ -1957,7 +1961,7 @@ whether a failure becomes a finding.
   (`cargo build`, `cargo check`, `cargo clippy`, Biome).
 - **Exploration** commands do not. These are the assistant looking around:
   searches (`grep`, `rg`, `find`), listings (`ls`, `pwd`, `du`, `stat`,
-  `file`), text reads (`cat`, `head`, `tail`, `wc`, `sed` without `-i`, `awk`,
+  `file`), program lookups (`which`, `type`, `whence`, `command -v`), text reads (`cat`, `head`, `tail`, `wc`, `sed` without `-i`, `awk`,
   `sort`, `uniq`, `cut`, `echo`, `true`, `read`), and git reads (`status`,
   `diff`, `log`, `show`, `rev-list`, `rev-parse`, `branch --list`,
   `worktree list`, `ls-files`, `grep`), including pipelines and `&&`/`||`/`;`
