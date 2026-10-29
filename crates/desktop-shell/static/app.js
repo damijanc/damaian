@@ -190,6 +190,37 @@ function updaterErrorMessage(error) {
   return message;
 }
 
+// The one icon set (style guide §3): 24x24 stroke glyphs that take the
+// surrounding text colour. Path data is the agreed mockup's.
+const ICON_PATHS = {
+  code: ["M8 6 3 12l5 6", "m16 6 5 6-5 6"],
+  terminal: ["m5 8 4 4-4 4", "M12 17h7"],
+  paperclip: [
+    "m20 11-8.5 8.5a5 5 0 0 1-7-7L13 4a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4L15 7",
+  ],
+  folderPlus: ["M3 7h6l2 2h10v10H3z", "M12 12v5M9.5 14.5h5"],
+  compose: ["M12 20h8", "M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"],
+};
+
+function icon(name) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.7");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("class", "icon");
+  (ICON_PATHS[name] || []).forEach((d) => {
+    const path = document.createElementNS(ns, "path");
+    path.setAttribute("d", d);
+    svg.append(path);
+  });
+  return svg;
+}
+
 function toast(message, { duration } = {}) {
   const el = $("toast");
   const text = String(message || "Unexpected error");
@@ -1138,7 +1169,10 @@ function toggleProjectMenu(projectPath, anchorEl) {
         { label: "Delete", action: "delete", danger: true },
       ],
       // §5.1 Entry points: from the sidebar, empty and without a parent.
-      [{ label: "New worker", action: "new-worker", hidden: !workersEnabled }],
+      [
+        { label: "New worker", action: "new-worker", hidden: !workersEnabled },
+        { label: "Workers board", action: "workers-board", hidden: !workersEnabled },
+      ],
     ],
   });
 }
@@ -1166,6 +1200,10 @@ async function handleProjectMenuAction(action, projectPath) {
     } catch (error) {
       toast(error.message);
     }
+    return;
+  }
+  if (action === "workers-board") {
+    void openWorkersBoard(projectPath).catch((error) => toast(error.message));
     return;
   }
   if (action === "open-vscode") {
@@ -2783,19 +2821,39 @@ function contextPathButton(path, range) {
   return button;
 }
 
+// The header chip shows how full this turn's context budget is.
+function contextMeterText(totalTokens, limitTokens) {
+  const total = Number(totalTokens) || 0;
+  const limit = Number(limitTokens) || 0;
+  if (limit <= 0) return { percent: null, label: `${formatContextTokens(total)} tokens` };
+  const percent = Math.round((total / limit) * 100);
+  return { percent, label: `${percent}% of budget` };
+}
+
 function renderContextButton() {
   const button = $("context-inspector-btn");
   if (!button) return;
+  const divider = $("context-divider");
   if (!lastContextManifest) {
     button.hidden = true;
+    if (divider) divider.hidden = true;
     button.setAttribute("aria-expanded", "false");
     return;
   }
   button.hidden = false;
-  const total = formatContextTokens(lastContextManifest.totalTokens);
-  const limit = formatContextTokens(lastContextManifest.limit?.tokens ?? 0);
-  $("context-inspector-label").textContent = `${total} / ${limit}`;
-  button.title = `Context for this turn: ${total} of ${limit} tokens`;
+  if (divider) divider.hidden = false;
+  const totalTokens = lastContextManifest.totalTokens;
+  const limitTokens = lastContextManifest.limit?.tokens ?? 0;
+  const total = formatContextTokens(totalTokens);
+  const limit = formatContextTokens(limitTokens);
+  const { percent, label } = contextMeterText(totalTokens, limitTokens);
+  $("context-inspector-label").textContent = label;
+  $("context-meter-fill").style.width = `${Math.min(100, percent ?? 0)}%`;
+  $("context-meter").hidden = percent === null;
+  const window = lastContextManifest.limit?.window;
+  button.title = `Context for this turn: ${total} of ${limit} tokens${
+    window ? `; model window ${formatContextTokens(window)}` : ""
+  }`;
 }
 
 function setContextManifest(manifest, target = "") {
@@ -3370,26 +3428,45 @@ function scheduleUpdateCheck() {
   }, 1200);
 }
 
+// The footer exists only while there is an update to offer or a restart to ask
+// for; the Settings button covers checking.
+let appUpdateRestartPending = false;
+
 function resetUpdateButton(title = "Check Updates") {
-  $("update-app-footer").hidden = false;
+  if (appUpdateRestartPending) return;
+  $("update-app-footer").hidden = true;
   const button = $("update-app-btn");
-  button.hidden = false;
+  button.hidden = true;
   button.disabled = false;
   button.textContent = "Check Updates";
   button.title = title;
+  $("update-restart-notice").hidden = true;
+}
+
+function showRestartNotice() {
+  appUpdateRestartPending = true;
+  $("update-app-footer").hidden = false;
+  $("update-app-btn").hidden = true;
+  const notice = $("update-restart-notice");
+  notice.hidden = false;
+  notice.textContent = "Restart Damaian to finish the update";
 }
 
 async function checkForAppUpdate(showCurrent = true) {
+  // A check mid-install would reset the footer the install is driving.
+  if (appUpdateInstalling) return null;
   const updater = tauriUpdater();
   if (!updater?.check) {
     if (showCurrent) toast("Updater is not available in this build");
     return null;
   }
   const button = $("update-app-btn");
+  const checkButton = $("check-updates-btn");
   try {
-    button.hidden = false;
-    button.disabled = true;
-    button.textContent = "Checking...";
+    if (checkButton) {
+      checkButton.disabled = true;
+      checkButton.textContent = "Checking...";
+    }
     const update = await updater.check();
     if (update !== null && typeof update !== "object") {
       throw new Error("Updater returned an invalid response");
@@ -3408,7 +3485,10 @@ async function checkForAppUpdate(showCurrent = true) {
       update,
     };
     const versionLabel = version || "latest version";
-    button.hidden = false;
+    if (!appUpdateRestartPending) {
+      $("update-app-footer").hidden = false;
+      button.hidden = false;
+    }
     button.disabled = false;
     button.textContent = version ? `Update ${version}` : "Update";
     button.title = `Install Damaian ${versionLabel}`;
@@ -3420,6 +3500,11 @@ async function checkForAppUpdate(showCurrent = true) {
     resetUpdateButton(`Update check failed: ${message}`);
     if (showCurrent) toast(`Update check failed: ${message}`, { duration: 7000 });
     return null;
+  } finally {
+    if (checkButton) {
+      checkButton.disabled = false;
+      checkButton.textContent = "Check for updates";
+    }
   }
 }
 
@@ -3452,7 +3537,7 @@ async function installAppUpdate() {
     await update.downloadAndInstall();
     appUpdateInstalling = false;
     appUpdateInfo = null;
-    resetUpdateButton("Restart Damaian to finish the update");
+    showRestartNotice();
     toast("Update installed. Restart Damaian to finish.", { duration: 7000 });
   } catch (error) {
     appUpdateInstalling = false;
@@ -3462,6 +3547,7 @@ async function installAppUpdate() {
         ? `Update ${appUpdateInfo.version}`
         : "Update"
       : "Check Updates";
+    button.hidden = false;
     toast(`Update failed: ${updaterErrorMessage(error)}`, { duration: 7000 });
   }
 }
@@ -5917,6 +6003,9 @@ function startTurnIndicator(target, onStop = null) {
   let streaming = false;
 
   return {
+    // Read by the usage row, so the turn's duration is the clock the user
+    // watched rather than a second timing that could disagree with it.
+    startedAt,
     phase(payload) {
       if (done) return;
       if (payload.phase === "output") {
@@ -6132,8 +6221,174 @@ function isGroupableAction(message, endsTheTurn) {
   );
 }
 
+// A command's `tool` result as `sandbox_command_context` writes it (spec 68
+// §5.1), or null for anything else. STDOUT is greedy, so the split is at the
+// last STDERR marker and stdout that quotes one keeps it. A trailing
+// `\n\nHook `…` line is the after_tool hook's note, not the command's stderr.
+const commandResultPattern =
+  /^Command: (.*)\nWorking directory: (.*)\nExit code: (-?\d+|none \(timed out\)|none \(cancelled by user\))\n\nSTDOUT:\n([\s\S]*)\n\nSTDERR:\n([\s\S]*)$/;
+
+function parseCommandResult(text) {
+  const match = commandResultPattern.exec(text);
+  if (!match) return null;
+  const [, command, workingDirectory, exitText, stdout, capturedStderr] = match;
+  let exit;
+  if (exitText === "none (timed out)") exit = { state: "timed_out", code: null };
+  else if (exitText === "none (cancelled by user)") exit = { state: "cancelled", code: null };
+  else {
+    const code = Number(exitText);
+    exit = { state: code === 0 ? "ok" : "failed", code };
+  }
+  let stderr = capturedStderr;
+  let hookNote = null;
+  const hook = /\n\n(Hook `[^\n]*)$/.exec(capturedStderr);
+  if (hook) {
+    hookNote = hook[1];
+    stderr = capturedStderr.slice(0, hook.index);
+  }
+  return { command, workingDirectory, exit, stdout, stderr, hookNote };
+}
+
+// The model's reason from `Ran \`<command>\` — <reason>`. The prefix is built
+// from the known command rather than split on the first "` — ", because a
+// command may itself contain one.
+function commandReason(actionContent, command) {
+  const prefix = `Ran \`${command}\` — `;
+  return actionContent.startsWith(prefix) ? actionContent.slice(prefix.length).trim() : "";
+}
+
+// Spec 68 §5.2: `message` is an approval request whose command then ran.
+// Both it and the "Ran" action are groupable, all three share a task, the
+// result parses as a command result (a declined one never does), the action
+// names that command, and the request contains it verbatim.
+function approvalRequestFor(message, next, nextResult, endsTheTurn = () => false) {
+  if (!requestShaped(message, next, nextResult, endsTheTurn)) return false;
+  const parsed = parseCommandResult(nextResult.content);
+  if (!parsed) return false;
+  return (
+    next.content.startsWith(`Ran \`${parsed.command}\``) && message.content.includes(parsed.command)
+  );
+}
+
+// Every condition of `approvalRequestFor` but the parse: a request whose
+// command was declined (or did not run). It stays a bubble, but its task still
+// waited on the user.
+function unparsedRequestFor(message, next, nextResult, endsTheTurn = () => false) {
+  if (!requestShaped(message, next, nextResult, endsTheTurn)) return false;
+  if (parseCommandResult(nextResult.content)) return false;
+  // Without a parse the command is not known, so try each closing backtick:
+  // the action is `Ran \`X\` — …`, and X may itself hold backticks.
+  const action = next.content;
+  for (let end = action.indexOf("`", 5); end !== -1; end = action.indexOf("`", end + 1)) {
+    const command = action.slice(5, end);
+    if (command && message.content.includes(command)) return true;
+  }
+  return false;
+}
+
+function requestShaped(message, next, nextResult, endsTheTurn) {
+  return Boolean(
+    message &&
+      next &&
+      nextResult &&
+      isGroupableAction(message, endsTheTurn) &&
+      isGroupableAction(next, endsTheTurn) &&
+      next.taskId === message.taskId &&
+      nextResult.role === "tool" &&
+      nextResult.taskId === message.taskId &&
+      next.content.startsWith("Ran `"),
+  );
+}
+
+const exitMarkText = {
+  ok: () => "✓ 0",
+  failed: (code) => `exit ${code}`,
+  timed_out: () => "timed out",
+  cancelled: () => "cancelled",
+};
+
+// A parsed command pair as one row: `$ command`, exit mark, reason. The row is
+// the trigger for its own collapsed output (spec 68 §3 req. 2–3). Every stored
+// string goes in through `textContent`.
+function renderCommandStep(step, action, parsed, request) {
+  const panel = document.createElement("div");
+  panel.className = "activity-command-panel";
+  if (request) {
+    const approval = document.createElement("div");
+    approval.className = "activity-request";
+    const label = document.createElement("div");
+    label.className = "activity-stream-label";
+    label.textContent = "Approval request";
+    const text = document.createElement("div");
+    text.className = "activity-request-text";
+    text.textContent = request.content;
+    approval.append(label, text);
+    panel.append(approval);
+  }
+  if (parsed.workingDirectory !== repo()) {
+    const cwd = document.createElement("div");
+    cwd.className = "activity-command-cwd";
+    cwd.textContent = parsed.workingDirectory;
+    panel.append(cwd);
+  }
+  const streams = [
+    ["stdout", parsed.stdout],
+    ["stderr", parsed.stderr],
+  ].filter(([, text]) => text !== "");
+  streams.forEach(([name, text]) => {
+    const label = document.createElement("div");
+    label.className = "activity-stream-label";
+    label.textContent = name;
+    const output = document.createElement("pre");
+    output.className = "activity-step-result";
+    output.dataset.stream = name;
+    output.textContent = text;
+    panel.append(label, output);
+  });
+  if (!streams.length) {
+    const empty = document.createElement("div");
+    empty.className = "activity-no-output";
+    empty.textContent = "No output";
+    panel.append(empty);
+  }
+  if (parsed.hookNote) {
+    const note = document.createElement("div");
+    note.className = "activity-hook-note";
+    note.textContent = parsed.hookNote;
+    panel.append(note);
+  }
+
+  const trigger = createDisclosure("", panel);
+  trigger.classList.add("activity-command");
+  const text = document.createElement("span");
+  text.className = "activity-command-text";
+  text.textContent = `$ ${parsed.command}`;
+  text.title = parsed.command;
+  const mark = document.createElement("span");
+  mark.className = "exit-mark";
+  mark.dataset.state = parsed.exit.state;
+  mark.textContent = exitMarkText[parsed.exit.state](parsed.exit.code);
+  trigger.append(text, mark);
+  if (request) {
+    const approved = document.createElement("span");
+    approved.className = "activity-approved";
+    approved.textContent = "approved";
+    trigger.append(approved);
+  }
+  const reason = commandReason(action.content, parsed.command);
+  if (reason) {
+    const why = document.createElement("span");
+    why.className = "activity-command-reason";
+    why.textContent = reason;
+    trigger.append(why);
+  }
+  step.append(trigger, panel);
+}
+
 // One collapsed run of action/result pairs. The result is kept as preformatted
 // text: tool output is not Markdown, and the exact bytes matter to a diff.
+// A pair whose result parses as a command result is drawn as a command row
+// instead; anything else keeps #67's title and `<pre>`.
 function renderActivityGroup(pairs) {
   const article = document.createElement("article");
   article.className = "message activity";
@@ -6146,9 +6401,15 @@ function renderActivityGroup(pairs) {
   detail.className = "activity-detail";
   detail.tabIndex = 0;
   detail.setAttribute("aria-label", "Activity detail");
-  pairs.forEach(({ action, result }) => {
+  pairs.forEach(({ action, result, request }) => {
     const step = document.createElement("section");
     step.className = "activity-step";
+    const parsed = parseCommandResult(result.content);
+    if (parsed) {
+      renderCommandStep(step, action, parsed, request);
+      detail.append(step);
+      return;
+    }
     const title = document.createElement("div");
     title.className = "activity-step-title";
     title.innerHTML = renderMarkdown(action.content);
@@ -6168,6 +6429,67 @@ function renderActivityGroup(pairs) {
   $("chat-log").append(article);
   $("chat-log").scrollTop = $("chat-log").scrollHeight;
   return { message: article, body };
+}
+
+// Tasks that stopped for the user (spec 68 §5.3): they hold a question, an
+// approval request absorbed into its step, or a request that matched every
+// absorption condition but the parse (declined). A request still pending at
+// reload has no "Ran" step yet; its task's status says it is waiting instead.
+function pausedTasksOf(messages, endsTheTurn, tasks = []) {
+  const paused = new Set(
+    tasks.filter((task) => task.status === "waiting_for_approval").map((task) => task.id),
+  );
+  messages.forEach((message, index) => {
+    if (!message.taskId) return;
+    if (message.role === "question") {
+      paused.add(message.taskId);
+      return;
+    }
+    const next = messages[index + 1];
+    const nextResult = messages[index + 2];
+    if (
+      approvalRequestFor(message, next, nextResult, endsTheTurn) ||
+      unparsedRequestFor(message, next, nextResult, endsTheTurn)
+    ) {
+      paused.add(message.taskId);
+      return;
+    }
+    // Fetch, MCP, plan and browser-diagnostic requests are not command steps,
+    // but their resume paths also leave a non-final assistant message directly
+    // followed by another of the same task, with no tool result between.
+    if (
+      isGroupableAction(message, endsTheTurn) &&
+      next?.role === "assistant" &&
+      next.taskId === message.taskId
+    ) {
+      paused.add(message.taskId);
+    }
+  });
+  return paused;
+}
+
+// How long a turn took, from the user's message to its last assistant message.
+// A paused turn includes the time spent waiting on the user, which is not work,
+// so it gets no duration rather than a misleading one.
+function turnDurationMs(taskId, messages, pausedTaskIds) {
+  if (pausedTaskIds.has(taskId)) return null;
+  const inTask = messages.filter((message) => message.taskId === taskId);
+  const start = inTask.find((message) => message.role === "user")?.createdAtMs;
+  const end = inTask.findLast((message) => message.role === "assistant")?.createdAtMs;
+  if (typeof start !== "number" || typeof end !== "number" || end < start) return null;
+  return end - start;
+}
+
+// The live counterpart of `turnDurationMs`: a turn that ended by asking the
+// user (a pending command, fetch, plan or question) is paused, so it gets no
+// duration live either, and live agrees with reload.
+function liveTurnDurationMs(payload, indicator) {
+  const paused =
+    payload.commandProposal ||
+    payload.fetchProposal ||
+    payload.planProposal ||
+    payload.questionProposal;
+  return paused ? null : Date.now() - indicator.startedAt;
 }
 
 // `tasks` carries each task's final status so a stopped turn stays marked as
@@ -6229,6 +6551,7 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
     }
   });
   const endsTheTurn = (message) => lastAssistantByTask.get(message.taskId) === message.id;
+  const pausedTaskIds = pausedTasksOf(messages, endsTheTurn, tasks);
   // A task with no usage events carries no token fields at all, which is how
   // a session written before token accounting stays silent instead of
   // claiming a free turn.
@@ -6248,6 +6571,17 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
     const pairs = [];
     let cursor = index;
     while (cursor + 1 < messages.length) {
+      // An approval request whose command then ran joins the run inside that
+      // step, rather than as its own bubble (spec 68 §5.2).
+      const request = messages[cursor];
+      if (approvalRequestFor(request, messages[cursor + 1], messages[cursor + 2], endsTheTurn)) {
+        pairs.push({ action: messages[cursor + 1], result: messages[cursor + 2], request });
+        groupedMessageIds.add(request.id);
+        groupedMessageIds.add(messages[cursor + 1].id);
+        groupedMessageIds.add(messages[cursor + 2].id);
+        cursor += 3;
+        continue;
+      }
       const action = messages[cursor];
       const result = messages[cursor + 1];
       if (!isGroupableAction(action, endsTheTurn)) break;
@@ -6340,7 +6674,15 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
             appendContextLink(bubble.body, contextByTask.get(message.taskId)),
           );
         }
-        if (message.taskId) markMessageUsage(bubble, usageByTask.get(message.taskId));
+        // Drawn once, under the turn's last assistant message, rather than under
+        // each of the turn's messages (spec 68 §3 req. 1).
+        if (message.taskId && endsTheTurn(message)) {
+          markMessageUsage(
+            bubble,
+            usageByTask.get(message.taskId),
+            turnDurationMs(message.taskId, messages, pausedTaskIds),
+          );
+        }
       }
       return { message, bubble };
     })
@@ -8000,22 +8342,39 @@ function sidebarEntries(sessions, rows) {
   return entries;
 }
 
+// Most urgent first: a project's entry wears the dot of the worker that most
+// needs a look.
+const WORKER_DOT_URGENCY = ["needs-you", "running", "paused", "failed", "finished"];
+
+// Null when there is nothing to say: no workers, or only dismissed finished
+// ones. The board stays reachable from the project menu.
 function renderWorkersEntry(projectPath, rows) {
+  const shown = (rows || []).filter(
+    (row) => !(row.group === "finished" && dismissedWorkers.has(row.sessionId)),
+  );
+  if (!shown.length) return null;
   const entry = document.createElement("button");
   entry.type = "button";
   entry.className = "project-workers-entry";
   entry.classList.toggle("active", workersBoardProject === projectPath);
+  const states = shown.map(workerDotState);
+  const state = WORKER_DOT_URGENCY.find((candidate) => states.includes(candidate));
+  const dot = createWorkerDot({ ...shown[states.indexOf(state)] });
   const label = document.createElement("span");
-  label.textContent = "Workers";
-  entry.append(label);
-  const needYou = rows.filter((row) => row.group === "needs_you").length;
+  const running = shown.filter((row) => row.group === "running").length;
+  label.textContent = running ? `Workers \u00b7 ${running} running` : "Workers";
+  entry.append(dot, label);
+  const needYou = shown.filter((row) => row.group === "needs_you").length;
   if (needYou) {
     const badge = document.createElement("span");
     badge.className = "workers-badge";
     badge.textContent = String(needYou);
     entry.append(badge);
   }
-  entry.setAttribute("aria-label", needYou ? `Workers, ${needYou} need you` : "Workers");
+  const parts = [];
+  if (needYou) parts.push(`${needYou} need you`);
+  if (running) parts.push(`${running} running`);
+  entry.setAttribute("aria-label", parts.length ? `Workers, ${parts.join(", ")}` : "Workers");
   entry.addEventListener("click", () => {
     void openWorkersBoard(projectPath).catch((error) => toast(error.message));
   });
@@ -8203,6 +8562,7 @@ function dismissWorker(row) {
   dismissedWorkers.add(row.sessionId);
   saveDismissedWorkers();
   renderWorkersBoard();
+  renderProjectList();
 }
 
 // A dismissed worker that runs again (Restart worker) is back on the board.
@@ -9268,7 +9628,7 @@ function cacheUsageTitle(usage) {
 // `reportedCost` is what the provider charged. It is absent for almost every
 // provider, and absent is rendered as nothing rather than as a zero, which
 // would read as "this turn was free".
-function markMessageUsage(target, usage) {
+function markMessageUsage(target, usage, durationMs = null) {
   if (!usage || typeof usage.inputTokens !== "number") return;
   if (target.body.nextElementSibling?.dataset?.state === "usage") return;
   const row = document.createElement("p");
@@ -9283,6 +9643,7 @@ function markMessageUsage(target, usage) {
     `${estimated ? "~" : ""}${total.toLocaleString()} tokens${estimated ? " (estimated)" : ""}`,
     calls,
   ];
+  if (typeof durationMs === "number") parts.push(formatElapsed(durationMs));
   // What the provider charged wins over what the user's own rates compute:
   // one is a fact about the bill, the other is arithmetic, and the label says
   // which is which rather than letting them look alike.
@@ -10232,7 +10593,7 @@ function renderProjectList() {
   if (!projectPaths.length) {
     const empty = document.createElement("p");
     empty.className = "sidebar-empty";
-    empty.textContent = "Use + to add a working folder";
+    empty.textContent = "Add a working folder to begin";
     list.append(empty);
     return;
   }
@@ -10253,9 +10614,8 @@ function renderProjectList() {
     projectButton.type = "button";
     projectButton.className = "project-select-btn";
     projectButton.innerHTML = `
-      <span class="folder-icon" aria-hidden="true"></span>
-      <span class="project-name"></span>
       <span class="project-chevron" aria-hidden="true"></span>
+      <span class="project-name"></span>
     `;
     projectButton.querySelector(".project-name").textContent = projectName(projectPath);
     projectButton.addEventListener("click", async () => {
@@ -10289,7 +10649,7 @@ function renderProjectList() {
     const addSessionButton = document.createElement("button");
     addSessionButton.type = "button";
     addSessionButton.className = "project-session-add-btn";
-    addSessionButton.textContent = "+";
+    addSessionButton.append(icon("compose"));
     addSessionButton.title = `New session in ${projectName(projectPath)}`;
     addSessionButton.setAttribute("aria-label", `New session in ${projectName(projectPath)}`);
     addSessionButton.addEventListener("click", async () => {
@@ -10311,7 +10671,8 @@ function renderProjectList() {
       const workers = workersEnabled ? workerRowsByProject.get(projectPath) : null;
       if (workersEnabled) {
         if (!workers) void loadProjectWorkers(projectPath);
-        sessionsList.append(renderWorkersEntry(projectPath, workers || []));
+        const workersEntry = renderWorkersEntry(projectPath, workers || []);
+        if (workersEntry) sessionsList.append(workersEntry);
       }
       if (!sessions && projectSessionsLoading.has(projectPath)) {
         const loading = document.createElement("p");
@@ -10366,6 +10727,9 @@ function renderProjectSession(projectPath, session) {
   button.className = "project-session-open";
   button.textContent = session.title;
   button.title = `${session.title} - double-click to rename`;
+  const when = document.createElement("span");
+  when.className = "session-when";
+  when.textContent = formatRelativeTime(session.updatedAtMs);
   button.addEventListener("click", async () => {
     try {
       expandedProjectPaths.add(projectPath);
@@ -10400,8 +10764,22 @@ function renderProjectSession(projectPath, session) {
     toggleSessionMenu(projectPath, session, menuButton);
   });
 
-  row.append(button, menuButton);
+  row.append(button, when, menuButton);
   return row;
+}
+
+// "now", minutes, hours, a weekday within the last 6 days, else a short date.
+function formatRelativeTime(ms, now = Date.now()) {
+  const age = now - ms;
+  if (!Number.isFinite(age)) return "";
+  if (age < 60_000) return "now";
+  if (age < 3_600_000) return `${Math.floor(age / 60_000)}m`;
+  const startOfToday = new Date(now).setHours(0, 0, 0, 0);
+  if (ms >= startOfToday) return `${Math.floor(age / 3_600_000)}h`;
+  if (ms >= startOfToday - 6 * 86_400_000) {
+    return new Date(ms).toLocaleDateString("en-US", { weekday: "short" });
+  }
+  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 // The session row menu. Rows are re-rendered by `renderProjectList()`, so the
@@ -11218,7 +11596,7 @@ function createQuestionCard(question, questionRepo, { answered = null } = {}) {
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -11408,7 +11786,7 @@ function createFetchApproval(proposal, proposalRepo) {
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -11470,7 +11848,7 @@ async function runVerificationStream(streamCall, targetRepo) {
         }
         appendProposals(target, payload, targetRepo);
         appendContextDisclosure(target.body, payload.contextFiles || []);
-        markMessageUsage(target, payload.usage);
+        markMessageUsage(target, payload.usage, liveTurnDurationMs(payload, indicator));
         markMessageTurnStop(target, payload);
         indicator.finish(chatCompletionState(payload));
       },
@@ -11926,7 +12304,7 @@ function createFallbackOffer(proposal, proposalRepo) {
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             if (indicator) indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -12094,7 +12472,7 @@ function createContextReview(review, reviewRepo) {
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -12217,7 +12595,7 @@ function createRoundBudgetOffer(proposal, proposalRepo) {
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -12461,7 +12839,7 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -13120,7 +13498,7 @@ function createCommandApprovalPreview(
             }
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
-            markMessageUsage(assistantMessage, payload.usage);
+            markMessageUsage(assistantMessage, payload.usage, null);
             indicator.finish(chatCompletionState(payload));
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -13807,7 +14185,7 @@ async function proposePatchFromChat(prompt, assistantMessage) {
   assistantMessage.body.append(createPatchPreview(payload, patchRepo));
   appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
   appendTurnNotes(assistantMessage.body, payload.turnNotes);
-  markMessageUsage(assistantMessage, payload.usage);
+  markMessageUsage(assistantMessage, payload.usage, liveTurnDurationMs(payload, indicator));
 }
 
 // The turn currently in flight, so Stop (button or Escape) can reach its
@@ -13941,7 +14319,7 @@ async function sendChatPrompt(options = {}) {
           appendProposals(assistantMessage, payload, chatRepo);
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           appendTurnNotes(assistantMessage.body, payload.turnNotes);
-          markMessageUsage(assistantMessage, payload.usage);
+          markMessageUsage(assistantMessage, payload.usage, liveTurnDurationMs(payload, indicator));
           void refreshMemoryProposals(currentSessionId);
           if (payload.cancelled) {
             if (indicator) indicator.finish("stopped");
@@ -14046,7 +14424,7 @@ async function askAgainFromExhausted(sessionId, taskId) {
           appendProposals(assistantMessage, payload, chatRepo);
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           appendTurnNotes(assistantMessage.body, payload.turnNotes);
-          markMessageUsage(assistantMessage, payload.usage);
+          markMessageUsage(assistantMessage, payload.usage, liveTurnDurationMs(payload, indicator));
           void refreshMemoryProposals(currentSessionId);
           if (payload.cancelled) {
             indicator.finish("stopped");
@@ -14310,9 +14688,18 @@ $("model-key-delete-btn").addEventListener("click", async () => {
   }
 });
 
+$("check-updates-btn").addEventListener("click", () => {
+  void checkForAppUpdate(true);
+});
+
 $("update-app-btn").addEventListener("click", () => {
   void installAppUpdate();
 });
+
+$("symbol-search-btn").replaceChildren(icon("code"));
+$("terminal-toggle-btn").replaceChildren(icon("terminal"));
+$("composer-attach-btn").replaceChildren(icon("paperclip"));
+$("pick-folder-btn").replaceChildren(icon("folderPlus"));
 
 $("ask-btn").disabled = true;
 syncProviderCatalogFromPolicy("");

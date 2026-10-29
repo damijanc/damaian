@@ -68,7 +68,7 @@ This build is a developer preview. Release builds are Developer ID signed and no
 
 ## Updates
 
-Damaian checks for updates when the desktop app starts, and on demand from **Damaian › Check for Updates...**. If a newer GitHub Release is available, the button at the bottom of the sidebar changes to **Update &lt;version&gt;**. Select it and confirm **Install** to download and install the signed update, then quit and reopen Damaian to finish.
+Damaian checks for updates when the desktop app starts, and on demand from **Damaian › Check for Updates...** or **Settings › General › Check for updates**. If a newer GitHub Release is available, a button appears at the bottom of the sidebar, **Update &lt;version&gt;**. The footer is hidden when Damaian is up to date, and a check that finds nothing says so in a message instead. Select it and confirm **Install** to download and install the signed update, then quit and reopen Damaian to finish. Until you do, the footer reads *Restart Damaian to finish the update*.
 
 The first installed version must already include the updater. If you installed an older developer-preview DMG before automatic updates were added, download and install one newer DMG manually once.
 
@@ -327,7 +327,9 @@ A repository's `.damaian/config.conf` may lower a share and raise the margin, an
 ### Inspecting and controlling context
 
 The **Context** control in the conversation header shows this turn's assembled
-context as `tokens / limit`. Open it to see what Damaian is about to send, or
+context as a small meter and `N% of budget`, the share of Damaian's packing
+budget in use (hover it for the token counts and the model's window). The control
+is hidden until a turn has context to show. Open it to see what Damaian is about to send, or
 what an earlier turn sent:
 
 - **Every category**, with the tokens it used and how many items it holds.
@@ -360,7 +362,7 @@ Pins are stored in the session, so they survive a restart. **Clear pins** remove
 them. A pin that later becomes restricted, or whose file is deleted, stays in the
 pin list and appears in **Excluded** with the reason, so restoring the file
 restores the pin without you re-pinning it. Pins made in the panel differ from
-the **+** composer chips: a chip is an attachment for the request you are typing
+the paperclip composer chips: a chip is an attachment for the request you are typing
 and is not carried into later turns.
 
 **Path restriction.** Enter one path per line and choose **Apply paths** to make
@@ -699,7 +701,7 @@ A turn that ends any other way leaves a mark on its message: **Stopped by you**,
 
 ### Intermediate steps and the answer
 
-A turn records each action it takes — a file read, a search, a command, a note — as an assistant summary followed by its result. Those consecutive steps are folded into one collapsed **Activity (N steps)** row rather than left as a full bubble per action. Open it to see each action and its exact tool result; the content scrolls at a cap, and the answer stays its own message at the end of the turn. This is the same on reload: the activities are rebuilt from the session log, not stored as a second record.
+A turn records each action it takes — a file read, a search, a command, a note — as an assistant summary followed by its result. Those consecutive steps are folded into one collapsed **Activity (N steps)** row rather than left as a full bubble per action. Open it to see each action and its exact tool result; the content scrolls at a cap, and the answer stays its own message at the end of the turn. A command step reads `$ <command>`, an exit mark (`✓ 0`, `exit N`, *timed out* or *cancelled*) and the model's reason. Open the step for its output: the working directory appears only when it is not the repository root, an empty stream is left out, and a command that printed nothing reads *No output*. **approved** after the mark means you approved the command; the request you answered is inside the step under *Approval request*. A declined request keeps its own message, and a note from an `after_tool` hook appears last in the step. The turn's token and time row is drawn once, under the answer; a turn that stopped to ask you something shows no duration, since it would include your wait. This is the same on reload: the activities are rebuilt from the session log, not stored as a second record.
 
 The plan panel keeps its summary visible and puts its steps behind a collapsed **Steps (N)** row. Open it when you want the full plan, each step's outcome, and the evidence behind it; leave it closed when you only need the answer. See [The Plan Panel](#the-plan-panel).
 
@@ -1116,7 +1118,7 @@ An export is a one-way record. It cannot be imported back, and it never leaves y
 
 ## Symbol Search and Language Servers
 
-The `{ }` button in the thread header, beside the terminal control, opens symbol search for the current folder. It searches declarations rather than text. Each result gives the symbol's name, its kind (function, method, struct, class, and so on) and an exact `path:line`. The `path:line` is clickable and opens the file in Visual Studio Code at that line and column, the same way a file reference in a reply does. A result in a project root other than the repository root shows that root after its path.
+The `</>` button in the thread header, beside the terminal control, opens symbol search for the current folder. It searches declarations rather than text. Each result gives the symbol's name, its kind (function, method, struct, class, and so on) and an exact `path:line`. The `path:line` is clickable and opens the file in Visual Studio Code at that line and column, the same way a file reference in a reply does. A result in a project root other than the repository root shows that root after its path.
 
 Results put a language-server answer before a guess, then order exact names before prefix matches and prefix matches before fuzzy ones, and show at most 50. The index is local and built from source text, so search needs no setup, no network and no language server.
 
@@ -1581,7 +1583,7 @@ A **worker** is a session that runs on its own: it gets a prompt, works in a new
 
 **What a worker creates.** A branch `damaian/<name>` and a worktree at `<repository>/.damaian/worktrees/<name>`, the name taken from the prompt's first line. Damaian adds `.damaian/worktrees/` to `.git/info/exclude` once, so worktrees never show as untracked files. `.gitignore` is never edited. Clicking **Start worker** is your approval of those Git commands. They are recorded in the audit log and in the worker's session.
 
-**The Workers board.** **Workers** at the top of each project in the sidebar opens the board, and its badge counts the workers that need you. Workers are also listed in the sidebar under their parent, with a status dot. The board groups workers under *Needs you* (waiting for approval, or paused), *Running* and *Finished*, newest first. Each row shows the planner it came from, its rounds, what it is doing and how long it has run. Finished rows show files changed and commits ahead of where the worker started. Each row has one action — **Review** for an approval, **Pause** while running, **Open** otherwise — and a ⋯ menu with **Stop**, **Reveal worktree in Finder**, **Remove worktree** and **Dismiss from board**. Dismissing only hides the row. The session stays in the sidebar.
+**The Workers board.** **Workers** under a project in the sidebar opens the board. The entry appears only while the project has workers that you have not dismissed; it shows a dot for the most urgent state, *N running* when any are running, and a badge counting the workers that need you. With no workers the entry is absent, and **Workers board** on the project's ⋮ menu still opens the board. Workers are also listed in the sidebar under their parent, with a status dot. The board groups workers under *Needs you* (waiting for approval, or paused), *Running* and *Finished*, newest first. Each row shows the planner it came from, its rounds, what it is doing and how long it has run. Finished rows show files changed and commits ahead of where the worker started. Each row has one action — **Review** for an approval, **Pause** while running, **Open** otherwise — and a ⋯ menu with **Stop**, **Reveal worktree in Finder**, **Remove worktree** and **Dismiss from board**. Dismissing only hides the row. The session stays in the sidebar.
 
 **In a worker's session** a control strip under the header shows its state and round, with **Pause** and **Stop** while it runs, **Resume** and **Stop** while it is paused, and **Stop** while it waits or sits idle. The header says which session it came from and which branch it is on.
 

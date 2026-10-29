@@ -22,7 +22,7 @@
           </div>
           <div>
             <h1>Damaian</h1>
-            <p id="repo-state">No repository selected</p>
+            <p id="repo-state" hidden>No repository selected</p>
           </div>
         </div>
 
@@ -57,7 +57,6 @@
               aria-label="Add working folder"
               title="Add working folder"
             >
-              +
             </button>
           </div>
           <select
@@ -77,6 +76,7 @@
           >
             Update
           </button>
+          <p id="update-restart-notice" class="update-restart-notice" hidden></p>
         </div>
 
       </aside>
@@ -93,7 +93,7 @@
             <div class="thread-actions">
               <button
                 id="context-inspector-btn"
-                class="topbar-button context-inspector-button"
+                class="context-inspector-button"
                 type="button"
                 aria-label="Show context for this turn"
                 aria-haspopup="dialog"
@@ -101,32 +101,34 @@
                 title="Show context for this turn"
                 hidden
               >
+                <span id="context-meter" class="context-meter" aria-hidden="true"
+                  ><span id="context-meter-fill"></span
+                ></span>
                 <span id="context-inspector-label">Context</span>
               </button>
+              <span id="context-divider" class="thread-actions-divider" aria-hidden="true" hidden></span>
               <button
                 id="symbol-search-btn"
-                class="topbar-button symbol-search-button"
+                class="icon-btn"
                 type="button"
                 aria-label="Search symbols"
                 aria-haspopup="dialog"
                 aria-expanded="false"
                 title="Search symbols"
               >
-                <span class="symbol-icon" aria-hidden="true"></span>
               </button>
               <button
                 id="terminal-toggle-btn"
-                class="topbar-button terminal-button"
+                class="icon-btn"
                 type="button"
                 aria-label="Show terminal"
                 aria-pressed="false"
                 title="Show terminal"
               >
-                <span class="terminal-icon" aria-hidden="true"></span>
               </button>
               <button
                 id="thread-menu-btn"
-                class="btn-icon thread-menu-btn"
+                class="icon-btn"
                 type="button"
                 aria-label="More session options"
                 aria-haspopup="menu"
@@ -336,7 +338,6 @@
                 aria-controls="composer-attach-popover"
                 title="Add to context"
               >
-                <span class="attach-icon" aria-hidden="true"></span>
               </button>
               <div id="composer-attach-popover" class="model-popover attach-popover" role="menu" hidden>
                 <button id="attach-add-file-btn" class="attach-menu-row" type="button" role="menuitem">
@@ -364,6 +365,7 @@
               title="Working mode: what the assistant may do in this session"
               disabled
             >
+              <span class="trigger-key">Mode</span>
               <span id="session-mode-label">Code</span>
               <span class="menu-caret" aria-hidden="true"></span>
             </button>
@@ -391,6 +393,7 @@
                 data-entry-panel="reasoning"
                 title="Reasoning effort"
               >
+                <span class="trigger-key">Effort</span>
                 <span id="effort-menu-summary"></span>
                 <span class="menu-caret" aria-hidden="true"></span>
               </button>
@@ -517,6 +520,11 @@
 
         <section id="settings-page-general" class="settings-page" data-page="general">
           <h2 class="settings-page-title">General</h2>
+          <section class="settings-section">
+            <button id="check-updates-btn" class="btn-quiet" type="button">
+              Check for updates
+            </button>
+          </section>
           <section class="settings-section">
             <label class="field-checkbox">
               <input id="worker-sessions-input" type="checkbox" disabled />
