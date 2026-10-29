@@ -2,7 +2,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) · agreed look in [`mockup.html`](mockup.html)
 **Style reference:** [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) · rendered at `docs/ui-style-guide.html`
-**Started:** not started
+**Started:** 2026-10-29
 
 > **For agentic workers:** use superpowers:subagent-driven-development or
 > superpowers:executing-plans to work through this list task by task. Steps use
@@ -89,7 +89,7 @@ test in the task that owns the code.
 - Produces a session titled **"Command activity"** in the fixture repository,
   printed as `command activity session = <id>`. Task 3 and Task 7 walk it.
 
-- [ ] **Step 1: Seed one task with these messages, in order**, using the
+- [x] **Step 1: Seed one task with these messages, in order**, using the
   fixture's existing `append_message(&session.id, Some(&task.id), role,
   content)` pattern. `<root>` is the fixture repo path; `<cause>` is
   `ApprovalCause::ShellControl { constructs: "`|`".into() }.plain_words()`.
@@ -112,11 +112,11 @@ test in the task that owns the code.
   16. `assistant`: `` Read `src/lib.rs`. ``
   17. `tool`: `fn main() {}`. This does not parse, so it falls back.
   18. `assistant`: `The crate builds; the clean was declined.` This is the answer.
-- [ ] **Step 2: Record usage on the task** the way the fixture already does
+- [x] **Step 2: Record usage on the task** the way the fixture already does
   for "Add retry to the upload client", so the usage row exists.
-- [ ] **Step 3:** `cargo clippy -p desktop-shell --all-targets --locked -- -D
+- [x] **Step 3:** `cargo clippy -p desktop-shell --all-targets --locked -- -D
   warnings` passes, and the test starts and prints the new session id.
-- [ ] **Step 4:** In the running app, as it is today: the session shows
+- [x] **Step 4:** In the running app, as it is today: the session shows
   requests 4 and 9 as bubbles, and the usage row repeats under each of them.
   Note the count in the Progress row as the "before" figure.
 
@@ -417,7 +417,7 @@ month: "short", day: "numeric" })`.
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Inspection fixture | Not started | |
+| 1 · Inspection fixture | Done 2026-10-29 | `command_activity_session` helper in the `serves_the_ui_for_manual_inspection` fixture seeds one finished task titled "Command activity" with the 18 messages in order plus one recorded usage row (~5,840 tokens, 1 model call); printed as `command activity session = session_<hex>_<hex>_<hex>`. The cause line uses `workspace_engine::ApprovalCause::plain_words()` (exported). Clippy `-p desktop-shell` clean, fmt and typos clean. Before figure observed in the running app: 3 usage rows (under the first activity group, under the "cargo check" group, and under the "rm -rf" group ahead of the answer), where one is wanted. Note: the fixture's "Add retry" task records no usage; the row here comes from `record_task_usage_for_task_id`. |
 | 2 · Usage once, duration | Not started | |
 | 3 · Command steps and approvals | Not started | |
 | 4 · Sidebar visibility | Not started | |

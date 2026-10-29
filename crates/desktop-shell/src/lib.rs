@@ -8510,6 +8510,7 @@ mod tests {
         let legacy_session = legacy_web_diagnostic_session(&engine, &repository_id, &data_dir);
         let findings_session = findings_to_review_session(&engine, &repository_id, &repo);
         let activity_session = activity_and_plan_session(&engine, &repository_id);
+        let command_activity_session = command_activity_session(&engine, &repository_id, &repo_arg);
 
         let options = ShellOptions {
             port: 4899,
@@ -8530,8 +8531,100 @@ mod tests {
         println!(
             "  activity + plan session (collapsed Activity and Steps disclosures) = {activity_session}"
         );
+        println!(
+            "  command activity session (spec 68: command steps, approval requests, one usage row) = {command_activity_session}"
+        );
         println!("  data_dir = {}", data_dir.display());
         run_server(options).expect("serve the UI");
+    }
+
+    /// A finished turn made of command steps in every stored shape spec 68
+    /// renders: ran, repeated, approval request, declined, timed out with a
+    /// hook note, a command containing a backtick and an em dash, a mixed
+    /// STDERR body, and a tool result that does not parse. Returns the
+    /// session id.
+    fn command_activity_session(
+        engine: &WorkspaceEngine,
+        repository_id: &str,
+        root: &str,
+    ) -> String {
+        let store = &engine.session_store;
+        let session = store
+            .create_session(repository_id, "Command activity")
+            .unwrap();
+        let task = store
+            .create_task(
+                &session.id,
+                "list the build output and check the crate",
+                "mock",
+                "mock",
+            )
+            .unwrap();
+        let cause = workspace_engine::ApprovalCause::ShellControl {
+            constructs: "`|`".into(),
+        }
+        .plain_words();
+        let check = format!(
+            "Command: cargo check 2>&1 | tail -5\nWorking directory: {root}\nExit code: 0\n\nSTDOUT:\nFinished dev\n\nSTDERR:\n"
+        );
+        let messages: Vec<(&str, String)> = vec![
+            ("user", "List the build output and check the crate.".into()),
+            ("assistant", "Ran `ls target` — See what the last build left.".into()),
+            (
+                "tool",
+                format!(
+                    "Command: ls target\nWorking directory: {root}\nExit code: 0\n\nSTDOUT:\ndebug\n\nSTDERR:\n"
+                ),
+            ),
+            ("assistant", format!("{cause}\n\n`cargo check 2>&1 | tail -5`")),
+            ("assistant", "Ran `cargo check 2>&1 | tail -5` — Compile the crate.".into()),
+            ("tool", check.clone()),
+            ("assistant", "Ran `cargo check 2>&1 | tail -5` — Check again.".into()),
+            ("tool", check),
+            ("assistant", format!("{cause}\n\n`rm -rf target | cat`")),
+            ("assistant", "Ran `rm -rf target | cat` — Clean the build.".into()),
+            (
+                "tool",
+                "The user declined to run `rm -rf target | cat`. Do not request it again; answer using what you already know, noting the limitation if it matters.".into(),
+            ),
+            ("assistant", "Ran `sleep 999` — Wait for the server.".into()),
+            (
+                "tool",
+                format!(
+                    "Command: sleep 999\nWorking directory: {root}/sub\nExit code: none (timed out)\n\nSTDOUT:\n\n\nSTDERR:\nslow\n\nHook `fmt-guard`: refused after the action."
+                ),
+            ),
+            ("assistant", "Ran `echo \"a ` — b\"` — Quote test.".into()),
+            (
+                "tool",
+                format!(
+                    "Command: echo \"a ` — b\"\nWorking directory: {root}\nExit code: 1\n\nSTDOUT:\nx\n\nSTDERR:\nHalf\n\nSTDERR:\nreal"
+                ),
+            ),
+            ("assistant", "Read `src/lib.rs`.".into()),
+            ("tool", "fn main() {}".into()),
+            ("assistant", "The crate builds; the clean was declined.".into()),
+        ];
+        for (role, content) in &messages {
+            store
+                .append_message(&session.id, Some(&task.id), role, content)
+                .unwrap();
+        }
+        store
+            .record_task_usage_for_task_id(
+                &session.id,
+                &task.id,
+                "run_command_activity",
+                None,
+                workspace_engine::TokenUsage::estimated(5200, 640),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .update_task_status(&task, workspace_engine::TaskStatus::Complete, None)
+            .unwrap();
+        session.id
     }
 
     /// A finished turn with a plan and a run of intermediate action/result
