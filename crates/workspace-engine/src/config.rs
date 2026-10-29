@@ -428,6 +428,16 @@ pub struct Config {
     /// removed, so the decision can be seen and undone.
     pub project_roots_removed: Vec<String>,
     pub shell: String,
+    /// Commands get the `PATH` the user's interactive login shell ends up
+    /// with, which `<shell> -lc` alone does not read (spec 69). User and admin
+    /// configuration only, like `shell`.
+    ///
+    /// On for the product, off in [`Config::default`]: the product default is
+    /// [`Config::product_default`], which the loader starts from, so a test or an
+    /// embedder that builds its config from `default()` never starts the
+    /// user's interactive shell, which runs their rc files and takes about a
+    /// second (spec 69 §7).
+    pub command_path_from_interactive_shell: bool,
     pub model_provider: String,
     pub model_name: String,
     pub model_base_url: String,
@@ -967,6 +977,17 @@ impl Config {
             .join("DamaianClient")
     }
 
+    /// What the product starts from before any configuration file:
+    /// [`Config::default`] with the defaults that must not apply to a config
+    /// built from `default()` in a test (`command_path_from_interactive_shell`,
+    /// spec 69).
+    pub fn product_default() -> Self {
+        Self {
+            command_path_from_interactive_shell: true,
+            ..Self::default()
+        }
+    }
+
     pub fn load_for_repository(repository_root: Option<&Path>) -> Result<Self> {
         Self::load_for_repository_reporting(repository_root).map(|(config, _)| config)
     }
@@ -977,7 +998,7 @@ impl Config {
     pub fn load_for_repository_reporting(
         repository_root: Option<&Path>,
     ) -> Result<(Self, RepositoryConfigReport)> {
-        let config = Self::default();
+        let config = Self::product_default();
         let default_data_dir = config.data_dir.clone();
         let user_path = default_data_dir.join("config").join("user.conf");
         let repo_path = repository_root.map(Self::repository_config_path);
@@ -1222,6 +1243,7 @@ impl Config {
             project_roots_added,
             project_roots_removed,
             shell,
+            command_path_from_interactive_shell,
             model_provider,
             model_name,
             model_base_url,
@@ -1305,6 +1327,18 @@ impl Config {
         if let Some(value) = scoped(shell, "shell", trusted, forbidden, rejected) {
             self.shell = value;
             outcome.record(scope, "shell", None, false);
+        }
+        // Decides which programs a command's names resolve to, so it has the
+        // power of `shell` (spec 69 requirement 7).
+        if let Some(value) = scoped(
+            command_path_from_interactive_shell,
+            "command_path_from_interactive_shell",
+            trusted,
+            forbidden,
+            rejected,
+        ) {
+            self.command_path_from_interactive_shell = value;
+            outcome.record(scope, "command_path_from_interactive_shell", None, false);
         }
         // A program Damaian starts unprompted, with the repository as its
         // working directory: the same power as `shell`, so a clone may not name
@@ -2980,6 +3014,11 @@ impl Config {
             &join_list(&self.project_roots_removed),
         );
         push_line(&mut output, "shell", &self.shell);
+        push_line(
+            &mut output,
+            "command_path_from_interactive_shell",
+            &self.command_path_from_interactive_shell.to_string(),
+        );
         push_line(&mut output, "model_provider", &self.model_provider);
         push_line(&mut output, "model_name", &self.model_name);
         push_line(&mut output, "model_base_url", &self.model_base_url);
@@ -3096,6 +3135,7 @@ impl Default for Config {
             project_roots_added: Vec::new(),
             project_roots_removed: Vec::new(),
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
+            command_path_from_interactive_shell: false,
             model_provider: "openai".to_string(),
             model_name: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".to_string()),
             model_base_url: std::env::var("OPENAI_BASE_URL")
@@ -3205,6 +3245,7 @@ pub struct ConfigOverlay {
     pub project_roots_added: Option<Vec<String>>,
     pub project_roots_removed: Option<Vec<String>>,
     pub shell: Option<String>,
+    pub command_path_from_interactive_shell: Option<bool>,
     pub model_provider: Option<String>,
     pub model_name: Option<String>,
     pub model_base_url: Option<String>,
@@ -3397,6 +3438,8 @@ classify_overlay_fields! {
     project_roots_added => Preference,
     project_roots_removed => Preference,
     shell => Capability,
+    // Which program a command name runs; the power of `shell` (spec 69).
+    command_path_from_interactive_shell => Capability,
     model_provider => Capability,
     model_name => Capability,
     model_base_url => Capability,
@@ -3700,6 +3743,9 @@ impl ConfigOverlay {
                 self.agent_max_exploration_rounds = Some(parse_exploration_round_count(key, value)?)
             }
             "shell" => self.shell = Some(value.to_string()),
+            "command_path_from_interactive_shell" => {
+                self.command_path_from_interactive_shell = Some(parse_bool(key, value)?)
+            }
             "model_provider" => self.model_provider = Some(normalize_model_provider(value)?),
             "model_name" => self.model_name = Some(value.to_string()),
             "model_base_url" => self.model_base_url = Some(value.to_string()),
@@ -4094,6 +4140,7 @@ impl ConfigOverlay {
             project_roots_added,
             project_roots_removed,
             shell,
+            command_path_from_interactive_shell,
             model_provider,
             model_name,
             model_base_url,
@@ -4363,6 +4410,13 @@ impl ConfigOverlay {
         }
         if let Some(value) = shell {
             push_line(&mut output, "shell", value);
+        }
+        if let Some(value) = command_path_from_interactive_shell {
+            push_line(
+                &mut output,
+                "command_path_from_interactive_shell",
+                &value.to_string(),
+            );
         }
         if let Some(value) = model_provider {
             push_line(&mut output, "model_provider", value);
@@ -5664,6 +5718,57 @@ mod tests {
                 .to_policy_text()
                 .contains("enable_worker_sessions=true")
         );
+    }
+
+    /// Spec 69: on for the product, off for a config built from `default()`,
+    /// so tests never start the user's interactive shell.
+    #[test]
+    fn the_interactive_shell_path_is_on_for_the_product_and_off_by_default() {
+        assert!(!Config::default().command_path_from_interactive_shell);
+        assert!(Config::product_default().command_path_from_interactive_shell);
+        let mut config = Config::product_default();
+        config.apply_overlay(
+            ConfigOverlay::parse("command_path_from_interactive_shell=false\n").unwrap(),
+        );
+        assert!(!config.command_path_from_interactive_shell);
+        assert!(
+            config
+                .to_policy_text()
+                .contains("command_path_from_interactive_shell=false")
+        );
+    }
+
+    /// Spec 69 requirement 7: it decides which program a command name runs,
+    /// so a clone or a profile may not set it in either direction.
+    #[test]
+    fn the_interactive_shell_path_is_refused_from_a_repository_and_a_profile() {
+        for scope in [ConfigScope::Repository, ConfigScope::Profile] {
+            for value in ["true", "false"] {
+                let mut config = Config::default();
+                let before = config.command_path_from_interactive_shell;
+                let outcome = config.apply_overlay_scoped(
+                    ConfigOverlay::parse(&format!("command_path_from_interactive_shell={value}\n"))
+                        .unwrap(),
+                    scope,
+                );
+                assert_eq!(config.command_path_from_interactive_shell, before);
+                assert!(
+                    outcome
+                        .rejected
+                        .iter()
+                        .any(|rejected| rejected.key == "command_path_from_interactive_shell"),
+                    "{scope:?} {value}: {outcome:?}"
+                );
+            }
+        }
+        for scope in [ConfigScope::User, ConfigScope::Admin] {
+            let mut config = Config::product_default();
+            config.apply_overlay_scoped(
+                ConfigOverlay::parse("command_path_from_interactive_shell=false\n").unwrap(),
+                scope,
+            );
+            assert!(!config.command_path_from_interactive_shell, "{scope:?}");
+        }
     }
 
     /// Spec 26 §5.2: decimals are stored and allocated as integer basis points,

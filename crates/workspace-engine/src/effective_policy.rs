@@ -191,6 +191,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "project_roots_added" => "Folders you made project roots",
         "project_roots_removed" => "Folders you said are not project roots",
         "shell" => "Shell that runs commands",
+        "command_path_from_interactive_shell" => "Commands use your Terminal's PATH",
         "model_provider" => "Model provider",
         "model_name" => "Model",
         "model_base_url" => "Where model requests are sent",

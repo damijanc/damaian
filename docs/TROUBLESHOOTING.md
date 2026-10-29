@@ -257,7 +257,7 @@ remove one
 
 | Key | In repository config |
 |-----|----------------------|
-| `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `language_server.<lang>`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, any `model_*` (including `model_provider.<id>.*`) | Ignored, audited, reported to the user once per repository |
+| `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `language_server.<lang>`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, any `model_*` (including `model_provider.<id>.*`) | Ignored, audited, reported to the user once per repository |
 | `command_allowlist`, `command_allowlist.<repo_id>`, `permission_profile.<repo_id>`, `hook_review.<repo_id>.<hook_id>` | Never honoured: they are the user's decisions, and `Allow Always` writes user scope instead |
 | `hook.<id>.*` | A new hook is kept, and runs only after you review it; one that names a hook you or an admin defined is ignored |
 | `restricted_patterns`, `ignore_patterns`, `command_blocklist` | Added to the user's list, never replacing it |
@@ -314,7 +314,8 @@ A profile only narrows. A profile key has no effect when:
 - **It would loosen what is already in force.** For example `command_access=all`
   in a custom profile over a user config that set `local`. Nothing is reported
   for this at load; import lists such keys under "Written but no effect here".
-- **A profile may not carry it.** `shell`, `data_dir`, `allowed_roots`,
+- **A profile may not carry it.** `shell`, `command_path_from_interactive_shell`,
+  `data_dir`, `allowed_roots`,
   `secret_patterns`, `audit_enabled`, `block_generated_secrets`, every `model_*`
   key, the preference keys (`max_file_bytes`, `enable_semantic_search`, the
   `agent_*` round limits, …), `command_allowlist`, a
@@ -2262,11 +2263,31 @@ one fact is behind several symptoms:
   that is set in your shell and missing in the app, so
   [model calls fail](#model-calls-fail). A `keychain:` reference avoids this.
   A loopback endpoint such as Ollama (local) does not need a key at all.
-- An MCP stdio server's `command`, or `docker`, resolves in Terminal and not in
-  the app. Use an absolute path to the executable.
+- An MCP stdio server's `command`, a hook, or a language server resolves in
+  Terminal and not in the app. These are started directly, not through your
+  shell, so use an absolute path to the executable.
 - A variable such as `DAMAIAN_MOCK_MODEL_RESPONSE` or `DAMAIAN_DATA_DIR`
   changes the behaviour of a shell started from a terminal and not of the app
   started from Finder.
+
+Commands the assistant runs are the exception for `PATH` (spec 69): once per
+run Damaian asks your interactive login shell for its `PATH`, so `npm`,
+`python` or `docker` installed through nvm, pyenv or Homebrew are found as in
+your Terminal. If one is still `command not found` (exit 127):
+
+- Read the audit event `shell_path_resolved`. `status` is `resolved`
+  (`entries` says how many directories were kept), `timed_out` (your rc files
+  took more than five seconds; skip slow setup when
+  `DAMAIAN_RESOLVING_SHELL_PATH` is set, see the user guide), `failed` (the
+  shell exited without printing a `PATH`), or `unsupported` (your `shell` is
+  not `sh`, `bash`, `zsh`, `ksh`, `dash` or `mksh`). There is no event when
+  `command_path_from_interactive_shell=false`. The `PATH` itself is not
+  recorded.
+- Check where the program comes from in a new Terminal window: `zsh -ilc
+  'command -v npm'`. If that fails too, the setup is not in your shell's
+  interactive files.
+- You edited `~/.zshrc` after Damaian started: the `PATH` is read once per run,
+  so restart Damaian.
 
 To see what the app does with your shell's environment, launch it from a
 terminal instead, as described in

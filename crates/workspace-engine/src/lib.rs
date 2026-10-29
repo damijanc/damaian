@@ -45,6 +45,7 @@ pub mod repository_map;
 pub mod repository_trust;
 pub mod secret_scanner;
 pub mod session;
+pub mod shell_path;
 pub mod steering;
 pub mod symbol_index;
 pub mod tree_walk;

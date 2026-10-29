@@ -424,6 +424,13 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "shell=./tools/sh\n",
             Reported("shell"),
         ),
+        // Spec 69: which program a command name runs, like `shell`.
+        case(
+            "command_path_from_interactive_shell",
+            "command_path_from_interactive_shell=false\n",
+            "command_path_from_interactive_shell=true\n",
+            Reported("command_path_from_interactive_shell"),
+        ),
         case(
             "model_provider",
             "",

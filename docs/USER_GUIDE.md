@@ -105,6 +105,7 @@ Common keys:
 | `model_provider.<id>.context_token_budget` | Per model | How much repository content is sent with each request, in tokens | No |
 | `enable_semantic_search` | `false` | Embedding-based retrieval ([Semantic search](#semantic-search)) | Yes |
 | `enable_worker_sessions` | `false` | [Worker Sessions](#worker-sessions) | No |
+| `command_path_from_interactive_shell` | `true` | Commands find programs on the `PATH` your Terminal has, including what `~/.zshrc` adds ([Which programs a command finds](#which-programs-a-command-finds)) | No |
 | `agent_max_tool_rounds` | `8` | Action rounds before a turn pauses ([While a turn runs](#while-a-turn-runs-and-how-it-ended)) | Yes |
 | `agent_max_exploration_rounds` | `24` | Read-only rounds before reads start counting as action rounds ([While a turn runs](#while-a-turn-runs-and-how-it-ended)) | Lower only |
 | `agent_max_turn_notes_chars` | `8000` | Characters of notes the assistant may keep per turn ([Notes](#notes-kept-during-and-between-turns)) | Lower only |
@@ -124,7 +125,7 @@ Repository-scoped settings are not edited from Settings. Put repository defaults
 
 Because that file arrives with a clone, a repository can only make Damaian *more* careful, never less:
 
-- `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
+- `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
 - `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are added to yours rather than replacing them.
 - The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
 - `command_allowlist` is never taken from repository config; *Allow Always* writes to your own config instead. See [Allow Always](#allow-always).
@@ -1560,6 +1561,32 @@ A command the assistant asks for runs in the working folder unless it asks for a
 Error locations a command prints (`src/x.ts:3:5`) are matched to files relative to the directory it ran in first, then its parent directories up to the working folder. So findings from a command in `packages/api` point at `packages/api/src/x.ts`, and `cargo` output from a member crate, which prints workspace-relative paths, still resolves.
 
 Elsewhere the UI names the root when a file is not in the working folder's own root: a pinned file chip reads `index.ts · packages/api`, and each file in a patch preview is tagged with its root. A turn that touches two packages shows both.
+
+### Which programs a command finds
+
+Commands run in your login shell (`zsh -lc` by default), which reads
+`~/.zprofile` but not `~/.zshrc`, and an app opened from Finder does not get
+your Terminal's `PATH`. Version managers such as nvm, pyenv and rbenv set
+`PATH` in `~/.zshrc`, so without help `npm` or `python` could be missing for
+the assistant while they work in your Terminal.
+
+So once per app run, before the first command, Damaian starts your shell as an
+interactive login shell in your home folder and reads its final `PATH`.
+Commands then find the same programs, in the same order, as in your Terminal.
+Only `PATH` is taken: your aliases, functions and other variables are not, so
+`ls` or `git` mean what they mean everywhere else. While Damaian asks,
+`DAMAIAN_RESOLVING_SHELL_PATH=1` is set, so your rc file can skip slow setup:
+
+```sh
+[ -n "$DAMAIAN_RESOLVING_SHELL_PATH" ] && return
+```
+
+placed after the lines that set `PATH`. If your shell takes more than five
+seconds, or does not answer, commands run as they did before. Edits to
+`~/.zshrc` take effect the next time Damaian starts. Set
+`command_path_from_interactive_shell=false` in your user config to turn it off.
+Only `sh`, `bash`, `zsh`, `ksh`, `dash` and `mksh` are asked; with another
+`shell`, such as fish, commands run with the login shell's `PATH`.
 
 ### `Allow Always` in a root
 
