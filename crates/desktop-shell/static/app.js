@@ -190,6 +190,37 @@ function updaterErrorMessage(error) {
   return message;
 }
 
+// The one icon set (style guide §3): 24x24 stroke glyphs that take the
+// surrounding text colour. Path data is the agreed mockup's.
+const ICON_PATHS = {
+  code: ["M8 6 3 12l5 6", "m16 6 5 6-5 6"],
+  terminal: ["m5 8 4 4-4 4", "M12 17h7"],
+  paperclip: [
+    "m20 11-8.5 8.5a5 5 0 0 1-7-7L13 4a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4L15 7",
+  ],
+  folderPlus: ["M3 7h6l2 2h10v10H3z", "M12 12v5M9.5 14.5h5"],
+  compose: ["M12 20h8", "M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"],
+};
+
+function icon(name) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.7");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("class", "icon");
+  (ICON_PATHS[name] || []).forEach((d) => {
+    const path = document.createElementNS(ns, "path");
+    path.setAttribute("d", d);
+    svg.append(path);
+  });
+  return svg;
+}
+
 function toast(message, { duration } = {}) {
   const el = $("toast");
   const text = String(message || "Unexpected error");
@@ -1138,7 +1169,10 @@ function toggleProjectMenu(projectPath, anchorEl) {
         { label: "Delete", action: "delete", danger: true },
       ],
       // §5.1 Entry points: from the sidebar, empty and without a parent.
-      [{ label: "New worker", action: "new-worker", hidden: !workersEnabled }],
+      [
+        { label: "New worker", action: "new-worker", hidden: !workersEnabled },
+        { label: "Workers board", action: "workers-board", hidden: !workersEnabled },
+      ],
     ],
   });
 }
@@ -1166,6 +1200,10 @@ async function handleProjectMenuAction(action, projectPath) {
     } catch (error) {
       toast(error.message);
     }
+    return;
+  }
+  if (action === "workers-board") {
+    void openWorkersBoard(projectPath).catch((error) => toast(error.message));
     return;
   }
   if (action === "open-vscode") {
@@ -2783,19 +2821,39 @@ function contextPathButton(path, range) {
   return button;
 }
 
+// The header chip shows how full this turn's context budget is.
+function contextMeterText(totalTokens, limitTokens) {
+  const total = Number(totalTokens) || 0;
+  const limit = Number(limitTokens) || 0;
+  if (limit <= 0) return { percent: null, label: `${formatContextTokens(total)} tokens` };
+  const percent = Math.round((total / limit) * 100);
+  return { percent, label: `${percent}% of budget` };
+}
+
 function renderContextButton() {
   const button = $("context-inspector-btn");
   if (!button) return;
+  const divider = $("context-divider");
   if (!lastContextManifest) {
     button.hidden = true;
+    if (divider) divider.hidden = true;
     button.setAttribute("aria-expanded", "false");
     return;
   }
   button.hidden = false;
-  const total = formatContextTokens(lastContextManifest.totalTokens);
-  const limit = formatContextTokens(lastContextManifest.limit?.tokens ?? 0);
-  $("context-inspector-label").textContent = `${total} / ${limit}`;
-  button.title = `Context for this turn: ${total} of ${limit} tokens`;
+  if (divider) divider.hidden = false;
+  const totalTokens = lastContextManifest.totalTokens;
+  const limitTokens = lastContextManifest.limit?.tokens ?? 0;
+  const total = formatContextTokens(totalTokens);
+  const limit = formatContextTokens(limitTokens);
+  const { percent, label } = contextMeterText(totalTokens, limitTokens);
+  $("context-inspector-label").textContent = label;
+  $("context-meter-fill").style.width = `${Math.min(100, percent ?? 0)}%`;
+  $("context-meter").hidden = percent === null;
+  const window = lastContextManifest.limit?.window;
+  button.title = `Context for this turn: ${total} of ${limit} tokens${
+    window ? `; model window ${formatContextTokens(window)}` : ""
+  }`;
 }
 
 function setContextManifest(manifest, target = "") {
@@ -3370,13 +3428,28 @@ function scheduleUpdateCheck() {
   }, 1200);
 }
 
+// The footer exists only while there is an update to offer or a restart to ask
+// for; the Settings button covers checking.
+let appUpdateRestartPending = false;
+
 function resetUpdateButton(title = "Check Updates") {
-  $("update-app-footer").hidden = false;
+  if (appUpdateRestartPending) return;
+  $("update-app-footer").hidden = true;
   const button = $("update-app-btn");
-  button.hidden = false;
+  button.hidden = true;
   button.disabled = false;
   button.textContent = "Check Updates";
   button.title = title;
+  $("update-restart-notice").hidden = true;
+}
+
+function showRestartNotice() {
+  appUpdateRestartPending = true;
+  $("update-app-footer").hidden = false;
+  $("update-app-btn").hidden = true;
+  const notice = $("update-restart-notice");
+  notice.hidden = false;
+  notice.textContent = "Restart Damaian to finish the update";
 }
 
 async function checkForAppUpdate(showCurrent = true) {
@@ -3386,10 +3459,12 @@ async function checkForAppUpdate(showCurrent = true) {
     return null;
   }
   const button = $("update-app-btn");
+  const checkButton = $("check-updates-btn");
   try {
-    button.hidden = false;
-    button.disabled = true;
-    button.textContent = "Checking...";
+    if (checkButton) {
+      checkButton.disabled = true;
+      checkButton.textContent = "Checking...";
+    }
     const update = await updater.check();
     if (update !== null && typeof update !== "object") {
       throw new Error("Updater returned an invalid response");
@@ -3408,7 +3483,10 @@ async function checkForAppUpdate(showCurrent = true) {
       update,
     };
     const versionLabel = version || "latest version";
-    button.hidden = false;
+    if (!appUpdateRestartPending) {
+      $("update-app-footer").hidden = false;
+      button.hidden = false;
+    }
     button.disabled = false;
     button.textContent = version ? `Update ${version}` : "Update";
     button.title = `Install Damaian ${versionLabel}`;
@@ -3420,6 +3498,11 @@ async function checkForAppUpdate(showCurrent = true) {
     resetUpdateButton(`Update check failed: ${message}`);
     if (showCurrent) toast(`Update check failed: ${message}`, { duration: 7000 });
     return null;
+  } finally {
+    if (checkButton) {
+      checkButton.disabled = false;
+      checkButton.textContent = "Check for updates";
+    }
   }
 }
 
@@ -3452,7 +3535,7 @@ async function installAppUpdate() {
     await update.downloadAndInstall();
     appUpdateInstalling = false;
     appUpdateInfo = null;
-    resetUpdateButton("Restart Damaian to finish the update");
+    showRestartNotice();
     toast("Update installed. Restart Damaian to finish.", { duration: 7000 });
   } catch (error) {
     appUpdateInstalling = false;
@@ -3462,6 +3545,7 @@ async function installAppUpdate() {
         ? `Update ${appUpdateInfo.version}`
         : "Update"
       : "Check Updates";
+    button.hidden = false;
     toast(`Update failed: ${updaterErrorMessage(error)}`, { duration: 7000 });
   }
 }
@@ -8245,22 +8329,39 @@ function sidebarEntries(sessions, rows) {
   return entries;
 }
 
+// Most urgent first: a project's entry wears the dot of the worker that most
+// needs a look.
+const WORKER_DOT_URGENCY = ["needs-you", "running", "paused", "failed", "finished"];
+
+// Null when there is nothing to say: no workers, or only dismissed finished
+// ones. The board stays reachable from the project menu.
 function renderWorkersEntry(projectPath, rows) {
+  const shown = (rows || []).filter(
+    (row) => !(row.group === "finished" && dismissedWorkers.has(row.sessionId)),
+  );
+  if (!shown.length) return null;
   const entry = document.createElement("button");
   entry.type = "button";
   entry.className = "project-workers-entry";
   entry.classList.toggle("active", workersBoardProject === projectPath);
+  const states = shown.map(workerDotState);
+  const state = WORKER_DOT_URGENCY.find((candidate) => states.includes(candidate));
+  const dot = createWorkerDot({ ...shown[states.indexOf(state)] });
   const label = document.createElement("span");
-  label.textContent = "Workers";
-  entry.append(label);
-  const needYou = rows.filter((row) => row.group === "needs_you").length;
+  const running = shown.filter((row) => row.group === "running").length;
+  label.textContent = running ? `Workers \u00b7 ${running} running` : "Workers";
+  entry.append(dot, label);
+  const needYou = shown.filter((row) => row.group === "needs_you").length;
   if (needYou) {
     const badge = document.createElement("span");
     badge.className = "workers-badge";
     badge.textContent = String(needYou);
     entry.append(badge);
   }
-  entry.setAttribute("aria-label", needYou ? `Workers, ${needYou} need you` : "Workers");
+  const parts = [];
+  if (needYou) parts.push(`${needYou} need you`);
+  if (running) parts.push(`${running} running`);
+  entry.setAttribute("aria-label", parts.length ? `Workers, ${parts.join(", ")}` : "Workers");
   entry.addEventListener("click", () => {
     void openWorkersBoard(projectPath).catch((error) => toast(error.message));
   });
@@ -8448,6 +8549,7 @@ function dismissWorker(row) {
   dismissedWorkers.add(row.sessionId);
   saveDismissedWorkers();
   renderWorkersBoard();
+  renderProjectList();
 }
 
 // A dismissed worker that runs again (Restart worker) is back on the board.
@@ -10478,7 +10580,7 @@ function renderProjectList() {
   if (!projectPaths.length) {
     const empty = document.createElement("p");
     empty.className = "sidebar-empty";
-    empty.textContent = "Use + to add a working folder";
+    empty.textContent = "Add a working folder to begin";
     list.append(empty);
     return;
   }
@@ -10499,9 +10601,8 @@ function renderProjectList() {
     projectButton.type = "button";
     projectButton.className = "project-select-btn";
     projectButton.innerHTML = `
-      <span class="folder-icon" aria-hidden="true"></span>
-      <span class="project-name"></span>
       <span class="project-chevron" aria-hidden="true"></span>
+      <span class="project-name"></span>
     `;
     projectButton.querySelector(".project-name").textContent = projectName(projectPath);
     projectButton.addEventListener("click", async () => {
@@ -10535,7 +10636,7 @@ function renderProjectList() {
     const addSessionButton = document.createElement("button");
     addSessionButton.type = "button";
     addSessionButton.className = "project-session-add-btn";
-    addSessionButton.textContent = "+";
+    addSessionButton.append(icon("compose"));
     addSessionButton.title = `New session in ${projectName(projectPath)}`;
     addSessionButton.setAttribute("aria-label", `New session in ${projectName(projectPath)}`);
     addSessionButton.addEventListener("click", async () => {
@@ -10557,7 +10658,8 @@ function renderProjectList() {
       const workers = workersEnabled ? workerRowsByProject.get(projectPath) : null;
       if (workersEnabled) {
         if (!workers) void loadProjectWorkers(projectPath);
-        sessionsList.append(renderWorkersEntry(projectPath, workers || []));
+        const workersEntry = renderWorkersEntry(projectPath, workers || []);
+        if (workersEntry) sessionsList.append(workersEntry);
       }
       if (!sessions && projectSessionsLoading.has(projectPath)) {
         const loading = document.createElement("p");
@@ -10612,6 +10714,9 @@ function renderProjectSession(projectPath, session) {
   button.className = "project-session-open";
   button.textContent = session.title;
   button.title = `${session.title} - double-click to rename`;
+  const when = document.createElement("span");
+  when.className = "session-when";
+  when.textContent = formatRelativeTime(session.updatedAtMs);
   button.addEventListener("click", async () => {
     try {
       expandedProjectPaths.add(projectPath);
@@ -10646,8 +10751,22 @@ function renderProjectSession(projectPath, session) {
     toggleSessionMenu(projectPath, session, menuButton);
   });
 
-  row.append(button, menuButton);
+  row.append(button, when, menuButton);
   return row;
+}
+
+// "now", minutes, hours, a weekday within the last 6 days, else a short date.
+function formatRelativeTime(ms, now = Date.now()) {
+  const age = now - ms;
+  if (!Number.isFinite(age)) return "";
+  if (age < 60_000) return "now";
+  if (age < 3_600_000) return `${Math.floor(age / 60_000)}m`;
+  const startOfToday = new Date(now).setHours(0, 0, 0, 0);
+  if (ms >= startOfToday) return `${Math.floor(age / 3_600_000)}h`;
+  if (ms >= startOfToday - 6 * 86_400_000) {
+    return new Date(ms).toLocaleDateString("en-US", { weekday: "short" });
+  }
+  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 // The session row menu. Rows are re-rendered by `renderProjectList()`, so the
@@ -14556,9 +14675,18 @@ $("model-key-delete-btn").addEventListener("click", async () => {
   }
 });
 
+$("check-updates-btn").addEventListener("click", () => {
+  void checkForAppUpdate(true);
+});
+
 $("update-app-btn").addEventListener("click", () => {
   void installAppUpdate();
 });
+
+$("symbol-search-btn").replaceChildren(icon("code"));
+$("terminal-toggle-btn").replaceChildren(icon("terminal"));
+$("composer-attach-btn").replaceChildren(icon("paperclip"));
+$("pick-folder-btn").replaceChildren(icon("folderPlus"));
 
 $("ask-btn").disabled = true;
 syncProviderCatalogFromPolicy("");

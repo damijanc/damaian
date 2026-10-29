@@ -104,6 +104,7 @@ scale.
 | `.btn-quiet` | Transparent border and background, `--muted` text | Dismiss, cancel, reject |
 | `.btn-danger` | Transparent, `--danger` text | Delete, remove, revoke |
 | `.btn-icon` | Transparent, `5px 8px`, glyph only | Overflow (vertical `.dots-icon`), close, small toggles |
+| `.icon-btn` | 28×28, transparent, `--muted`; hover `rgba(0,0,0,.05)`; `[aria-pressed="true"]` takes the accent tint | A single glyph that is not an overflow ⋮: header symbol search and terminal. Holds one `icon()` SVG (24×24 viewBox, 1.7 stroke, 16px). Keep its `aria-label` and `title` |
 | `.btn-trigger` | 12px / 600 / `5px 6px`, transparent, `--muted` label, caret | Opens a popover from an action row; the label is the current value |
 
 **Rules**
@@ -223,7 +224,8 @@ context })` from the trigger's click handler, stopping propagation.
   anything in the composer needs because it sits at the bottom of the window.
   `align: "start"` lines up the left edges; the default lines up the right.
 
-A row whose ⋮ only shows on hover hides it with `opacity`, never `display` or
+A row whose ⋮ only shows on hover (a session row, or a project row, whose *New
+session* and ⋮ both hide this way) hides it with `opacity`, never `display` or
 `visibility`, and shows it on `.active`, `:hover`, `:focus-within` and
 `[aria-expanded="true"]`, so every row stays reachable by Tab.
 
@@ -268,6 +270,9 @@ group. Two rules matter:
 
 - **The controls sit below the field, never over it.** See the §8
   anti-pattern.
+- **A `.btn-trigger` names its setting.** A `.trigger-key` (muted, weight 500)
+  precedes the value — *Mode Code*, *Effort Default* — so a bare value is never
+  ambiguous. The model trigger is exempt: its id is self-evident.
 - **The action anchors the right edge and does not move.** Settings grow
   leftward as their values lengthen, so the button the user aims at is always
   in the same place — including when it changes into Stop mid-turn.
@@ -297,9 +302,12 @@ look. State colours only (§2):
   `aria-hidden`. Keep it that way: the finished dot is about 1.5:1 against
   `--sidebar`, too faint to be the only signal.
 
-**Sidebar.** A project with workers gets a `.project-workers-entry` ("Workers")
-at the top of its sessions, with a `.workers-badge` counting the workers that
-need you — white on `--warn`, 5.2:1. A worker's session is listed under the
+**Sidebar.** The `.project-workers-entry` ("Workers") is conditional: a project
+with no workers, or only dismissed finished ones, has none, and the project
+menu's *Workers board* row still opens the board. When shown it carries the
+`.worker-dot` of its most urgent worker (needs-you, running, paused, failed,
+finished), a `· N running` label, and a `.workers-badge` counting the workers
+that need you — white on `--warn`, 5.2:1. A worker's session is listed under the
 session that started it as `.project-worker-item.nested`, indented one 14px
 step, with its dot where a child's bullet would be.
 

@@ -339,14 +339,13 @@ button:disabled {
 .project-add-btn {
   width: 30px;
   height: 30px;
+  display: inline-grid;
+  place-items: center;
   border: 0;
   border-radius: 50%;
   background: transparent;
   color: var(--muted);
-  font-size: 24px;
-  font-weight: 350;
-  line-height: 1;
-  padding: 0 0 3px;
+  padding: 0;
 }
 
 .project-list {
@@ -384,7 +383,7 @@ button:disabled {
   min-width: 0;
   min-height: 34px;
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) 14px;
+  grid-template-columns: 12px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
   border: 0;
@@ -425,6 +424,12 @@ button:disabled {
   padding: 0 0 2px;
 }
 
+.project-session-add-btn {
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+
 .project-session-add-btn:hover,
 .project-menu-btn:hover {
   background: rgba(255, 255, 255, 0.85);
@@ -435,6 +440,24 @@ button:disabled {
   display: grid;
   place-items: center;
   padding: 0;
+}
+
+/* The project row's New session and ⋮ follow the same rule as the session
+   rows' ⋮ below. */
+.project-row .project-session-add-btn,
+.project-row .project-menu-btn {
+  opacity: 0;
+}
+
+.project-row:hover .project-session-add-btn,
+.project-row:hover .project-menu-btn,
+.project-row:focus-within .project-session-add-btn,
+.project-row:focus-within .project-menu-btn,
+.project-group.active > .project-row .project-session-add-btn,
+.project-group.active > .project-row .project-menu-btn,
+.project-row .project-session-add-btn[aria-expanded="true"],
+.project-row .project-menu-btn[aria-expanded="true"] {
+  opacity: 1;
 }
 
 /* Hidden by opacity only, never `display`/`visibility`, so the ⋮ of a row
@@ -514,7 +537,7 @@ button:disabled {
   width: 100%;
   min-height: 32px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 26px;
+  grid-template-columns: minmax(0, 1fr) auto 26px;
   align-items: center;
   gap: 2px;
   border-radius: 9px;
@@ -540,6 +563,15 @@ button:disabled {
 
 .project-session-open:hover {
   color: inherit;
+}
+
+/* Never truncated: the title ellipsizes before the time does. */
+.session-when {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .project-session-item.active {
@@ -665,14 +697,6 @@ button:disabled {
   padding: 4px 8px;
 }
 
-.topbar-button {
-  height: 30px;
-  display: inline-grid;
-  place-items: center;
-  padding: 5px 10px;
-  white-space: nowrap;
-}
-
 .update-button {
   width: 100%;
   min-height: 34px;
@@ -682,6 +706,13 @@ button:disabled {
   font-size: 12px;
   font-weight: 800;
   padding: 7px 10px;
+  text-align: center;
+}
+
+.update-restart-notice {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
   text-align: center;
 }
 
@@ -717,6 +748,38 @@ button:disabled {
   left: 4px;
 }
 
+/* One icon set (style guide §3): a 28px glyph button whose 16px stroke icon
+   takes the text colour. Rest is quiet; hover and pressed shade it. */
+.icon-btn {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  padding: 0;
+}
+
+.icon-btn:hover {
+  border-color: transparent;
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--ink);
+}
+
+.icon-btn[aria-pressed="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  display: block;
+}
+
 /* The header's overflow trigger, at the header's 30px control height. */
 .thread-menu-btn {
   width: 30px;
@@ -740,18 +803,6 @@ button:disabled {
 
 .app-error-banner[hidden] {
   display: none;
-}
-
-.terminal-button {
-  width: 30px;
-  height: 30px;
-  padding: 0;
-}
-
-.terminal-button[aria-pressed="true"] {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--accent);
 }
 
 .terminal-icon {
@@ -801,25 +852,6 @@ button:disabled {
   background: currentColor;
   transform: rotate(45deg);
   content: "";
-}
-
-.symbol-search-button {
-  width: 30px;
-  padding: 0;
-}
-
-/* The symbol lookup is repo-wide, so its trigger is the drawn pair of braces
-   rather than a second magnifier beside "Search sessions". */
-.symbol-icon {
-  display: block;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: -1px;
-  line-height: 1;
-}
-
-.symbol-icon::before {
-  content: "{}";
 }
 
 /* Its trigger sits in the sidebar header, so the panel opens at the
@@ -1945,36 +1977,6 @@ button:disabled {
   background: #eeeeea;
 }
 
-.attach-icon {
-  position: relative;
-  width: 12px;
-  height: 12px;
-  display: block;
-}
-
-.attach-icon::before,
-.attach-icon::after {
-  position: absolute;
-  background: currentColor;
-  content: "";
-}
-
-.attach-icon::before {
-  left: 5px;
-  top: 0;
-  width: 2px;
-  height: 12px;
-  border-radius: 2px;
-}
-
-.attach-icon::after {
-  left: 0;
-  top: 5px;
-  width: 12px;
-  height: 2px;
-  border-radius: 2px;
-}
-
 .attach-popover {
   left: -1px;
   right: auto;
@@ -2049,6 +2051,13 @@ button:disabled {
   padding: 5px 6px;
   box-shadow: none;
   white-space: nowrap;
+}
+
+/* The setting's name, before its value, so a bare "Code" or "Default" is never
+   ambiguous. Quieter than the value. */
+.trigger-key {
+  color: var(--muted);
+  font-weight: 500;
 }
 
 .btn-trigger:hover,
@@ -5910,10 +5919,53 @@ body.worker-view #chat-model-menu {
 
 /* Spec 27: the context inspector. An overlay drawer over the conversation, so
    it never reflows the log or the composer. */
+/* A borderless chip, so the one header item that is information rather than a
+   control does not look like a button. */
 .context-inspector-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
   font-variant-numeric: tabular-nums;
   font-size: 11px;
+  font-weight: 600;
+  padding: 4px 6px;
   white-space: nowrap;
+}
+
+.context-inspector-button:hover,
+.context-inspector-button[aria-expanded="true"] {
+  border-color: transparent;
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--ink);
+}
+
+.context-meter {
+  width: 36px;
+  height: 4px;
+  flex: none;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--line);
+}
+
+.context-meter > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.thread-actions-divider {
+  width: 1px;
+  height: 16px;
+  background: var(--line);
+}
+
+.thread-actions-divider[hidden],
+.context-meter[hidden] {
+  display: none;
 }
 
 .context-panel {

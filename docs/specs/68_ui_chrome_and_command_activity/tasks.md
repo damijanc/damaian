@@ -263,7 +263,7 @@ assert pins it.
   the text reads *Restart Damaian to finish the update*.
 - Produces the Settings button `#check-updates-btn` (`.btn-quiet`).
 
-- [ ] **Step 1: Console asserts**
+- [x] **Step 1: Console asserts**
 
 ```js
 console.assert(renderWorkersEntry("/p", []) === null);
@@ -275,25 +275,25 @@ console.assert(e.textContent.includes("1 running") && e.querySelector(".workers-
 dismissedWorkers.delete("w1");
 ```
 
-- [ ] **Step 2: Implement.** Make the entry conditional, give it the dot (most
+- [x] **Step 2: Implement.** Make the entry conditional, give it the dot (most
   urgent: `needs-you` › `running` › `paused` › `failed` › `finished`) and the
   `· N running` label. Make `dismissWorker` also redraw the project list.
-- [ ] **Step 3: Project menu.** Add *Workers board* after *New worker*, both
+- [x] **Step 3: Project menu.** Add *Workers board* after *New worker*, both
   `hidden: !workersEnabled`, calling `openWorkersBoard(projectPath)`.
-- [ ] **Step 4: Update footer.** `resetUpdateButton` hides `#update-app-footer`.
+- [x] **Step 4: Update footer.** `resetUpdateButton` hides `#update-app-footer`.
   The available and installing branches show it, as now. A successful install
   calls `showRestartNotice()`. Add a *Check for updates* row to General that
   calls `checkForAppUpdate(true)`.
-- [ ] **Step 5: Brand.** Add `hidden` to `#repo-state`; `setRepoState` is
+- [x] **Step 5: Brand.** Add `hidden` to `#repo-state`; `setRepoState` is
   unchanged.
-- [ ] **Step 6: Walk.** Turn worker sessions on in Settings: a project with no
+- [x] **Step 6: Walk.** Turn worker sessions on in Settings: a project with no
   workers shows no entry, and its ⋮ opens *Workers board*. Outside the desktop
   app, stub `tauriUpdater` from the console to return `null`: no footer shows,
   and Settings → *Check for updates* toasts "up to date".
-- [ ] **Step 7: Style guide.** Update §4 Worker sessions' *Sidebar* paragraph:
+- [x] **Step 7: Style guide.** Update §4 Worker sessions' *Sidebar* paragraph:
   the entry is conditional, and its dot and running count. Update the
   `.workers-badge` specimen if it shows the old entry.
-- [ ] **Step 8:** Run the scoped checks, then fill in the Progress row.
+- [x] **Step 8:** Run the scoped checks, then fill in the Progress row.
 
 ### Task 5: One icon set; header and composer
 
@@ -316,7 +316,7 @@ dismissedWorkers.delete("w1");
 - Produces `contextMeterText(totalTokens, limitTokens) -> { percent: number |
   null, label: string }`.
 
-- [ ] **Step 1: Console asserts**
+- [x] **Step 1: Console asserts**
 
 ```js
 console.assert(icon("code").getAttribute("aria-hidden") === "true");
@@ -325,27 +325,27 @@ console.assert(contextMeterText(12000, 32000).label === "38% of budget");
 console.assert(contextMeterText(12000, 0).percent === null);
 ```
 
-- [ ] **Step 2: Header.** Symbol search and terminal become `.icon-btn` with
+- [x] **Step 2: Header.** Symbol search and terminal become `.icon-btn` with
   `icon("code")` and `icon("terminal")`. Their existing ids, `aria-label`s and
   `title`s stay, so every listener still binds. *Context* is a borderless chip
   left of a `.thread-actions-divider`, holding a `.context-meter`
   (36×4px, `--accent` on `--line`) and the label. Its title adds `; model
   window <n>` when `lastContextManifest.limit.window` is known.
-- [ ] **Step 3: Composer.** Add `<span class="trigger-key">Mode</span>` and
+- [x] **Step 3: Composer.** Add `<span class="trigger-key">Mode</span>` and
   `<span class="trigger-key">Effort</span>` before the values (muted, weight
   500), and make attach use `icon("paperclip")`. `#session-mode-label` and
   `#effort-menu-summary` keep their ids.
-- [ ] **Step 4: Remove** the CSS for the replaced glyphs, only where no other
+- [x] **Step 4: Remove** the CSS for the replaced glyphs, only where no other
   element uses them (`grep` each class first; the terminal tab bar uses
   `.terminal-icon`, so keep it there).
-- [ ] **Step 5: Walk.** Tab reaches each header control in order. Every
+- [x] **Step 5: Walk.** Tab reaches each header control in order. Every
   control shows its tooltip on hover. Pressing the terminal tints it. The
   composer reads *Mode Code* and *Effort Default*. Measure the header height
   before and after and record both.
-- [ ] **Step 6: Style guide.** In §3 add `.icon-btn` to the button table. In §4
+- [x] **Step 6: Style guide.** In §3 add `.icon-btn` to the button table. In §4
   *Footer control rows*, add the key-label rule for `.btn-trigger`. Add specimens
   for the icon buttons (rest, hover, pressed) and the context chip.
-- [ ] **Step 7:** Run the scoped checks, then fill in the Progress row.
+- [x] **Step 7:** Run the scoped checks, then fill in the Progress row.
 
 ### Task 6: Project rows and session times
 
@@ -360,7 +360,7 @@ the session-row builder it calls, and the Projects heading in `index.html`
 - Consumes `icon("compose")` and `icon("folderPlus")` (Task 5).
 - Produces `formatRelativeTime(ms: number, now = Date.now()) -> string`.
 
-- [ ] **Step 1: Console asserts**
+- [x] **Step 1: Console asserts**
 
 ```js
 const now = Date.parse("2026-10-29T12:00:00");
@@ -375,20 +375,20 @@ console.assert(formatRelativeTime(Date.parse("2026-10-20T09:00:00"), now) === "O
 days that is not today. Otherwise the format is `toLocaleDateString(undefined, {
 month: "short", day: "numeric" })`.
 
-- [ ] **Step 2: Project row.** The caret moves to the left and replaces the
+- [x] **Step 2: Project row.** The caret moves to the left and replaces the
   folder glyph. *New session* uses `icon("compose")` and keeps its
   `aria-label`. *New session* and ⋮ get `opacity: 0`, shown on `:hover`,
   `:focus-within`, `.active` and `[aria-expanded="true"]`. The heading's *Add
   folder* uses `icon("folderPlus")`.
-- [ ] **Step 3: Session rows.** Append `<span class="session-when">` with
+- [x] **Step 3: Session rows.** Append `<span class="session-when">` with
   `formatRelativeTime(session.updatedAtMs)`. Truncate the title before the
   time, never the time.
-- [ ] **Step 4: Walk.** Tab through a project row: *New session* and ⋮ appear
+- [x] **Step 4: Walk.** Tab through a project row: *New session* and ⋮ appear
   as they take focus. A collapsed project's caret points right. Times show on
   every row.
-- [ ] **Step 5: Style guide.** Update the §4 hover-reveal note to name the
+- [x] **Step 5: Style guide.** Update the §4 hover-reveal note to name the
   project row, and add a project-row specimen.
-- [ ] **Step 6:** Run the scoped checks, then fill in the Progress row.
+- [x] **Step 6:** Run the scoped checks, then fill in the Progress row.
 
 ### Task 7: Close-out
 
@@ -420,7 +420,7 @@ month: "short", day: "numeric" })`.
 | 1 · Inspection fixture | Done 2026-10-29 | `command_activity_session` helper in the `serves_the_ui_for_manual_inspection` fixture seeds one finished task titled "Command activity" with the 18 messages in order plus one recorded usage row (~5,840 tokens, 1 model call); printed as `command activity session = session_<hex>_<hex>_<hex>`. The cause line uses `workspace_engine::ApprovalCause::plain_words()` (exported). Clippy `-p desktop-shell` clean, fmt and typos clean. Before figure observed in the running app: 3 usage rows (under the first activity group, under the "cargo check" group, and under the "rm -rf" group ahead of the answer), where one is wanted. Note: the fixture's "Add retry" task records no usage; the row here comes from `record_task_usage_for_task_id`. |
 | 2 · Usage once, duration | Done 2026-10-29 | `turnDurationMs` and `pausedTasksOf` (interim predicate, a named helper for Task 3 to replace) added; `renderMessages` draws usage only under `endsTheTurn`. `markMessageUsage` takes `durationMs`; the indicator exposes `startedAt`. Live rule: the four non-resume paths (verification stream, patch proposal, `sendChatPrompt`, ask-again) pass `Date.now() - indicator.startedAt`; the seven approval/question/offer resume paths pass `null`. Console asserts: 0 `turnDurationMs` at HEAD (ReferenceError), 4/4 pass after. Command activity session: 3 usage rows before, 1 after (under "The crate builds; the clean was declined.", no duration, task paused). The fixture's "Add retry" task records no usage, so it shows none; the refused-in-Ask session shows one row per turn with a duration. biome, `node --check`, typos clean. |
 | 3 · Command steps and approvals | Done 2026-10-29 | `parseCommandResult` (proposal §5.1 pattern, greedy STDOUT, trailing single-line `` Hook ` `` split into `hookNote`), `commandReason` (exact `` Ran `<cmd>` — `` prefix), `approvalRequestFor(message, next, nextResult, endsTheTurn)` (both messages groupable, same task, result parses, action starts `` Ran `<parsed command>` ``, request contains it) and `unparsedRequestFor` (every condition but the parse; the command is found by trying each closing backtick). `renderCommandStep` draws the `.activity-command` disclosure row; the walk in `renderMessages` absorbs a request into the following step (3 messages). `.activity-approved` is the muted "approved" span after the exit mark, not a class on the step. Paused predicate: `pausedTasksOf(messages, endsTheTurn, tasks)` = task holds a `question`, an absorbed request, an unparsed (declined) request, or has status `waiting_for_approval` (covers a request still pending at reload, whose `endsTheTurn` message is the request). Live rule: `liveTurnDurationMs(payload, indicator)` returns null when the `done` payload carries `commandProposal`, `fetchProposal`, `planProposal` or `questionProposal`; used by all four live non-resume paths (verification stream, patch proposal, `sendChatPrompt`, ask-again). Console asserts: RED `parseCommandResult is not defined`; GREEN 11/11, plus synthetic predicate checks (absorbed, declined not absorbed but paused, waiting status paused, live null on a pending proposal). Walk (Command activity session): Activity (3 steps) — `ls target` `✓ 0`, no cwd, stdout only; first `cargo check` `approved` with the request under *Approval request*; second not approved. `rm -rf` request stays a bubble before the second Activity (4 steps), whose first step is the declined text as the plain `<pre>`. `sleep 999` reads `timed out`, shows `<root>/sub`, stderr `slow`, hook note last. Quote test reads `exit 1`, reason `Quote test.`, stdout keeps `x\n\nSTDERR:\nHalf`. `src/lib.rs` is the plain `<pre>`. One usage row, no duration; the refused-in-Ask session still shows `· 0s` durations. Style guide §7 "Command steps" and a specimen (approved + failed row) added. biome, `node --check`, typos clean. |
-| 4 · Sidebar visibility | Not started | |
-| 5 · Icons, header, composer | Not started | |
-| 6 · Project rows and times | Not started | |
+| 4 · Sidebar visibility | Done 2026-10-29 | `renderWorkersEntry` returns null with no undismissed workers, else a `.worker-dot` of the most urgent state (needs-you, running, paused, failed, finished), `Workers · N running`, and the needs-you badge; `dismissWorker` redraws the project list. Project menu gains *Workers board* (`workers-board` action). `resetUpdateButton` hides the footer; new `showRestartNotice()` (guarded by `appUpdateRestartPending` so a later check does not hide it) and `#update-restart-notice`; Settings → General `#check-updates-btn` (`.btn-quiet`, disabled while checking). `#repo-state` is `hidden`. Asserts 4/4 pass. Walk: empty project shows no entry, one running worker shows "Workers · 1 running"; the project menu lists Workers board; with a stubbed `tauriUpdater` returning null the footer stays hidden and Check for updates toasts "Damaian is up to date". Style guide §4 Sidebar paragraph and the specimen updated. biome, `node --check`, typos clean. |
+| 5 · Icons, header, composer | Done 2026-10-29 | `icon(name)` and `contextMeterText` added; symbol search and terminal are `.icon-btn` (ids, labels, titles kept; icons mounted from JS), attach uses the paperclip; context chip is borderless with a 36x4 `.context-meter`, a `.thread-actions-divider`, label "38% of budget", and `; model window <n>` in the title. Composer shows `Mode Code` and `Effort Default` via `.trigger-key`. Removed `.topbar-button`, `.terminal-button`, `.symbol-*`, `.attach-icon` CSS (`.terminal-icon` kept for the tab bar). Asserts 4/4 pass. Header height: 45px before (30px controls, 14px padding, 1px border; the ⋮ menu button stays 30px), 45px after (measured), so no growth. Pressed terminal computes the accent tint. Tab order follows DOM order (not walked by keyboard). Style guide §3 table, footer-row rule and specimens added. |
+| 6 · Project rows and times | Done 2026-10-29 | Caret leads the project row and replaces the folder glyph (collapsed points right); New session uses `icon("compose")`; Add folder uses `icon("folderPlus")`; New session and ⋮ are `opacity: 0` until hover, focus-within, active project or expanded menu (checked: 0 inactive, 1 on focus). `formatRelativeTime` and `.session-when` appended to session rows, never truncated. Asserts 5/5 pass; 7 session rows show times. Empty-state text no longer says "+" ("Add a working folder to begin"). Style guide hover-reveal note and a project-row specimen added. All three tasks landed in one commit. |
 | 7 · Close-out | Not started | |
