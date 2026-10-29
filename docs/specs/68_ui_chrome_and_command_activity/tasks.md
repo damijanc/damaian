@@ -186,7 +186,7 @@ console.assert(turnDurationMs("t", [m("t", undefined, "user"), m("t", 9000)], ne
   `.exit-mark[data-state="ok"|"failed"|"timed_out"|"cancelled"]`,
   `.activity-approved`, `.activity-hook-note`, `.activity-request`.
 
-- [ ] **Step 1: Console asserts**
+- [x] **Step 1: Console asserts**
 
 ```js
 const R = (cwd, exit, out, err) =>
@@ -213,9 +213,9 @@ Review focus 2 needs the last-marker split, and that only works with a greedy
 STDOUT group. The `parseCommandResult(R(…, "x", "Half\n\nSTDERR:\nreal"))`
 assert pins it.
 
-- [ ] **Step 2: Implement `parseCommandResult` and `commandReason`.** Use
+- [x] **Step 2: Implement `parseCommandResult` and `commandReason`.** Use
   proposal §5.1's pattern with a greedy STDOUT group, then the hook-note split.
-- [ ] **Step 3: The command step.** In `renderActivityGroup`, a parsed pair
+- [x] **Step 3: The command step.** In `renderActivityGroup`, a parsed pair
   becomes a `.activity-command` row: caret, `$ command` (ellipsis, full text in
   `title`), `.exit-mark` (`✓ 0`, `exit N`, `timed out`, `cancelled`), and the
   muted reason. The row is the `createDisclosure` trigger. Its panel holds:
@@ -225,12 +225,12 @@ assert pins it.
   - the `.activity-hook-note`.
 
   An unparsed pair keeps #67's title and `<pre>`.
-- [ ] **Step 4: Absorption.** In the grouping walk, an assistant message for
+- [x] **Step 4: Absorption.** In the grouping walk, an assistant message for
   which `approvalRequestFor` holds starts or joins the run. Its step gets
   `.activity-approved` ("approved" after the exit mark), and its text goes at
   the top of the panel under a quiet *Approval request* label
   (`.activity-request`). Every other message renders as today.
-- [ ] **Step 5: Walk the Task 1 session.** Open the Activity:
+- [x] **Step 5: Walk the Task 1 session.** Open the Activity:
   - `ls target` reads `✓ 0`, has no working directory, and has no stderr
     section.
   - The first `cargo check` reads *approved*; the second does not (review
@@ -241,11 +241,11 @@ assert pins it.
     note under the output, not in stderr.
   - The quote test's reason reads `Quote test.`
   - The `src/lib.rs` step is the plain `<pre>`.
-- [ ] **Step 6: Style guide.** In §7 (or §4 beside Activity), add the command
+- [x] **Step 6: Style guide.** In §7 (or §4 beside Activity), add the command
   step: exit-mark states, and the rule that a hook note is never stderr. Add a
   command-step specimen with an approved and a failed row to
   `ui-style-guide.html`.
-- [ ] **Step 7:** Run the scoped checks, then fill in the Progress row.
+- [x] **Step 7:** Run the scoped checks, then fill in the Progress row.
 
 ### Task 4: Sidebar shows only what has something to say
 
@@ -419,7 +419,7 @@ month: "short", day: "numeric" })`.
 |---|---|---|
 | 1 · Inspection fixture | Done 2026-10-29 | `command_activity_session` helper in the `serves_the_ui_for_manual_inspection` fixture seeds one finished task titled "Command activity" with the 18 messages in order plus one recorded usage row (~5,840 tokens, 1 model call); printed as `command activity session = session_<hex>_<hex>_<hex>`. The cause line uses `workspace_engine::ApprovalCause::plain_words()` (exported). Clippy `-p desktop-shell` clean, fmt and typos clean. Before figure observed in the running app: 3 usage rows (under the first activity group, under the "cargo check" group, and under the "rm -rf" group ahead of the answer), where one is wanted. Note: the fixture's "Add retry" task records no usage; the row here comes from `record_task_usage_for_task_id`. |
 | 2 · Usage once, duration | Done 2026-10-29 | `turnDurationMs` and `pausedTasksOf` (interim predicate, a named helper for Task 3 to replace) added; `renderMessages` draws usage only under `endsTheTurn`. `markMessageUsage` takes `durationMs`; the indicator exposes `startedAt`. Live rule: the four non-resume paths (verification stream, patch proposal, `sendChatPrompt`, ask-again) pass `Date.now() - indicator.startedAt`; the seven approval/question/offer resume paths pass `null`. Console asserts: 0 `turnDurationMs` at HEAD (ReferenceError), 4/4 pass after. Command activity session: 3 usage rows before, 1 after (under "The crate builds; the clean was declined.", no duration, task paused). The fixture's "Add retry" task records no usage, so it shows none; the refused-in-Ask session shows one row per turn with a duration. biome, `node --check`, typos clean. |
-| 3 · Command steps and approvals | Not started | |
+| 3 · Command steps and approvals | Done 2026-10-29 | `parseCommandResult` (proposal §5.1 pattern, greedy STDOUT, trailing single-line `` Hook ` `` split into `hookNote`), `commandReason` (exact `` Ran `<cmd>` — `` prefix), `approvalRequestFor(message, next, nextResult, endsTheTurn)` (both messages groupable, same task, result parses, action starts `` Ran `<parsed command>` ``, request contains it) and `unparsedRequestFor` (every condition but the parse; the command is found by trying each closing backtick). `renderCommandStep` draws the `.activity-command` disclosure row; the walk in `renderMessages` absorbs a request into the following step (3 messages). `.activity-approved` is the muted "approved" span after the exit mark, not a class on the step. Paused predicate: `pausedTasksOf(messages, endsTheTurn, tasks)` = task holds a `question`, an absorbed request, an unparsed (declined) request, or has status `waiting_for_approval` (covers a request still pending at reload, whose `endsTheTurn` message is the request). Live rule: `liveTurnDurationMs(payload, indicator)` returns null when the `done` payload carries `commandProposal`, `fetchProposal`, `planProposal` or `questionProposal`; used by all four live non-resume paths (verification stream, patch proposal, `sendChatPrompt`, ask-again). Console asserts: RED `parseCommandResult is not defined`; GREEN 11/11, plus synthetic predicate checks (absorbed, declined not absorbed but paused, waiting status paused, live null on a pending proposal). Walk (Command activity session): Activity (3 steps) — `ls target` `✓ 0`, no cwd, stdout only; first `cargo check` `approved` with the request under *Approval request*; second not approved. `rm -rf` request stays a bubble before the second Activity (4 steps), whose first step is the declined text as the plain `<pre>`. `sleep 999` reads `timed out`, shows `<root>/sub`, stderr `slow`, hook note last. Quote test reads `exit 1`, reason `Quote test.`, stdout keeps `x\n\nSTDERR:\nHalf`. `src/lib.rs` is the plain `<pre>`. One usage row, no duration; the refused-in-Ask session still shows `· 0s` durations. Style guide §7 "Command steps" and a specimen (approved + failed row) added. biome, `node --check`, typos clean. |
 | 4 · Sidebar visibility | Not started | |
 | 5 · Icons, header, composer | Not started | |
 | 6 · Project rows and times | Not started | |

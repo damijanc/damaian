@@ -5168,6 +5168,108 @@ body.worker-view #chat-model-menu {
   overflow-wrap: anywhere;
 }
 
+/* A command step inside an Activity (spec 68 §5.2): one row — `$ command`,
+   exit mark, reason — that is the trigger for its own collapsed output. The
+   command truncates so the row stays one line; the full text is its title. */
+.activity-command {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  gap: 8px;
+  text-align: left;
+}
+
+.activity-command-text {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.exit-mark {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.exit-mark[data-state="ok"] {
+  color: var(--ok);
+}
+
+.exit-mark[data-state="failed"] {
+  color: var(--danger);
+}
+
+.exit-mark[data-state="timed_out"],
+.exit-mark[data-state="cancelled"] {
+  color: var(--warn);
+}
+
+.activity-approved,
+.activity-command-reason {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.activity-approved {
+  flex: 0 0 auto;
+}
+
+.activity-command-reason {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-command-panel {
+  display: grid;
+  gap: 4px;
+  padding-left: 16px;
+}
+
+.activity-command-panel[hidden] {
+  display: none;
+}
+
+.activity-stream-label,
+.activity-command-cwd,
+.activity-no-output {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.activity-command-cwd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
+/* The approval request the user answered, kept with the step it allowed. */
+.activity-request {
+  display: grid;
+  gap: 2px;
+  border-left: 2px solid var(--line);
+  padding-left: 8px;
+}
+
+.activity-request-text {
+  color: var(--ink);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* An after_tool hook's verdict. It is Damaian's note, not the command's
+   stderr, so it never sits inside a stream. */
+.activity-hook-note {
+  color: var(--warn);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 /* The browser diagnostic card. Spec 12 §5.3. A secondary surface under the
    answer, built on the plan panel's tokens. */
 .web-diagnostic-card {

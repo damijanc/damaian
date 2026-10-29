@@ -442,6 +442,31 @@ Used for rationale, file lists, and any detail that is occasionally wanted.
   declaration beats the UA `[hidden]` rule, and the panel stays on screen
   while every scripted check reports it hidden.
 
+### Command steps
+
+Inside a turn's Activity (spec 67), a command whose result has the engine's
+fixed shape (`Command: … Exit code: … STDOUT: … STDERR: …`, spec 68 §5.1) is
+one row, `.activity-command`, which is itself the trigger for its output:
+
+- `$ <command>` in monospace, truncated with an ellipsis, full text in `title`.
+- An `.exit-mark[data-state]`: `✓ 0` in `--ok`, `exit N` in `--danger`, and
+  `timed out` or `cancelled` in `--warn`. Exit `-1` is a failure, never `✓`.
+- The model's reason in `--muted`, and `approved` after the exit mark when the
+  user approved this run.
+- The collapsed-by-default panel holds the working directory only when it is not the
+  repository, one labelled `<pre>` per non-empty stream (stored bytes,
+  `[truncated]` kept), or `No output` when both are empty.
+- **A hook note is never stderr.** The `after_tool` hook's trailing
+  `` Hook `<id>` `` line is Damaian's note, not the command's output: it is
+  split off and shown under the output in `--warn` (`.activity-hook-note`).
+- The approval request the run answered is drawn inside its step, under a
+  quiet *Approval request* label, not as its own bubble. Only a request
+  followed by a run that parses is absorbed; a declined or pending one stays a
+  bubble. This is history, not consent, so §5 does not apply to it; the live
+  approval card is unchanged.
+- A result that does not parse keeps the plain title and `<pre>`: nothing is
+  hidden by a failed parse.
+
 ---
 
 ## 8. Anti-patterns

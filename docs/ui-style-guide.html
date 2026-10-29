@@ -1020,6 +1020,62 @@ The cause enum is fed by the classifier in validation.rs.</pre>
         <p class="sg-note">Expanded; the detail scrolls at 420px and each result at 240px.</p>
       </div>
       <div class="sg-card">
+        <div class="message activity">
+          <div class="visually-hidden">Activity</div>
+          <div class="activity-body">
+            <button type="button" class="disclosure" aria-expanded="true">
+              <span class="disclosure-caret" aria-hidden="true"></span> Activity (2 steps)
+            </button>
+            <div class="activity-detail">
+              <section class="activity-step">
+                <button type="button" class="disclosure activity-command" aria-expanded="true">
+                  <span class="disclosure-caret" aria-hidden="true"></span>
+                  <span class="activity-command-text" title="cargo check 2>&amp;1 | tail -5"
+                    >$ cargo check 2&gt;&amp;1 | tail -5</span
+                  >
+                  <span class="exit-mark" data-state="ok">✓ 0</span>
+                  <span class="activity-approved">approved</span>
+                  <span class="activity-command-reason">Compile the crate.</span>
+                </button>
+                <div class="activity-command-panel">
+                  <div class="activity-request">
+                    <div class="activity-stream-label">Approval request</div>
+                    <div class="activity-request-text">Asks first: uses `|` — Damaian never runs shell control without asking
+
+`cargo check 2&gt;&amp;1 | tail -5`</div>
+                  </div>
+                  <div class="activity-stream-label">stdout</div>
+                  <pre class="activity-step-result">Finished dev</pre>
+                </div>
+              </section>
+              <section class="activity-step">
+                <button type="button" class="disclosure activity-command" aria-expanded="true">
+                  <span class="disclosure-caret" aria-hidden="true"></span>
+                  <span class="activity-command-text" title="cargo fmt --check">$ cargo fmt --check</span>
+                  <span class="exit-mark" data-state="failed">exit 1</span>
+                  <span class="activity-command-reason">Check formatting.</span>
+                </button>
+                <div class="activity-command-panel">
+                  <div class="activity-command-cwd">/Users/me/project/sub</div>
+                  <div class="activity-stream-label">stderr</div>
+                  <pre class="activity-step-result">Diff in src/lib.rs at line 4</pre>
+                  <div class="activity-hook-note">Hook `fmt-guard`: refused after the action.</div>
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+        <p class="sg-note">
+          Command steps, expanded: an approved row and a failed row. The exit mark reads
+          <span class="exit-mark" data-state="ok">✓ 0</span>,
+          <span class="exit-mark" data-state="failed">exit N</span>,
+          <span class="exit-mark" data-state="timed_out">timed out</span> or
+          <span class="exit-mark" data-state="cancelled">cancelled</span>. The working directory
+          shows only when it is not the repository; an empty stream is omitted. The hook note sits
+          under the output, never in stderr. Spec 68.
+        </p>
+      </div>
+      <div class="sg-card">
         <div class="plan-panel">
           <div class="plan-panel-header">
             <strong>Plan</strong>

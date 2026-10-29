@@ -6135,8 +6135,174 @@ function isGroupableAction(message, endsTheTurn) {
   );
 }
 
+// A command's `tool` result as `sandbox_command_context` writes it (spec 68
+// §5.1), or null for anything else. STDOUT is greedy, so the split is at the
+// last STDERR marker and stdout that quotes one keeps it. A trailing
+// `\n\nHook `…` line is the after_tool hook's note, not the command's stderr.
+const commandResultPattern =
+  /^Command: (.*)\nWorking directory: (.*)\nExit code: (-?\d+|none \(timed out\)|none \(cancelled by user\))\n\nSTDOUT:\n([\s\S]*)\n\nSTDERR:\n([\s\S]*)$/;
+
+function parseCommandResult(text) {
+  const match = commandResultPattern.exec(text);
+  if (!match) return null;
+  const [, command, workingDirectory, exitText, stdout, capturedStderr] = match;
+  let exit;
+  if (exitText === "none (timed out)") exit = { state: "timed_out", code: null };
+  else if (exitText === "none (cancelled by user)") exit = { state: "cancelled", code: null };
+  else {
+    const code = Number(exitText);
+    exit = { state: code === 0 ? "ok" : "failed", code };
+  }
+  let stderr = capturedStderr;
+  let hookNote = null;
+  const hook = /\n\n(Hook `[^\n]*)$/.exec(capturedStderr);
+  if (hook) {
+    hookNote = hook[1];
+    stderr = capturedStderr.slice(0, hook.index);
+  }
+  return { command, workingDirectory, exit, stdout, stderr, hookNote };
+}
+
+// The model's reason from `Ran \`<command>\` — <reason>`. The prefix is built
+// from the known command rather than split on the first "` — ", because a
+// command may itself contain one.
+function commandReason(actionContent, command) {
+  const prefix = `Ran \`${command}\` — `;
+  return actionContent.startsWith(prefix) ? actionContent.slice(prefix.length).trim() : "";
+}
+
+// Spec 68 §5.2: `message` is an approval request whose command then ran.
+// Both it and the "Ran" action are groupable, all three share a task, the
+// result parses as a command result (a declined one never does), the action
+// names that command, and the request contains it verbatim.
+function approvalRequestFor(message, next, nextResult, endsTheTurn = () => false) {
+  if (!requestShaped(message, next, nextResult, endsTheTurn)) return false;
+  const parsed = parseCommandResult(nextResult.content);
+  if (!parsed) return false;
+  return (
+    next.content.startsWith(`Ran \`${parsed.command}\``) && message.content.includes(parsed.command)
+  );
+}
+
+// Every condition of `approvalRequestFor` but the parse: a request whose
+// command was declined (or did not run). It stays a bubble, but its task still
+// waited on the user.
+function unparsedRequestFor(message, next, nextResult, endsTheTurn = () => false) {
+  if (!requestShaped(message, next, nextResult, endsTheTurn)) return false;
+  if (parseCommandResult(nextResult.content)) return false;
+  // Without a parse the command is not known, so try each closing backtick:
+  // the action is `Ran \`X\` — …`, and X may itself hold backticks.
+  const action = next.content;
+  for (let end = action.indexOf("`", 5); end !== -1; end = action.indexOf("`", end + 1)) {
+    const command = action.slice(5, end);
+    if (command && message.content.includes(command)) return true;
+  }
+  return false;
+}
+
+function requestShaped(message, next, nextResult, endsTheTurn) {
+  return Boolean(
+    message &&
+      next &&
+      nextResult &&
+      isGroupableAction(message, endsTheTurn) &&
+      isGroupableAction(next, endsTheTurn) &&
+      next.taskId === message.taskId &&
+      nextResult.role === "tool" &&
+      nextResult.taskId === message.taskId &&
+      next.content.startsWith("Ran `"),
+  );
+}
+
+const exitMarkText = {
+  ok: () => "✓ 0",
+  failed: (code) => `exit ${code}`,
+  timed_out: () => "timed out",
+  cancelled: () => "cancelled",
+};
+
+// A parsed command pair as one row: `$ command`, exit mark, reason. The row is
+// the trigger for its own collapsed output (spec 68 §3 req. 2–3). Every stored
+// string goes in through `textContent`.
+function renderCommandStep(step, action, parsed, request) {
+  const panel = document.createElement("div");
+  panel.className = "activity-command-panel";
+  if (request) {
+    const approval = document.createElement("div");
+    approval.className = "activity-request";
+    const label = document.createElement("div");
+    label.className = "activity-stream-label";
+    label.textContent = "Approval request";
+    const text = document.createElement("div");
+    text.className = "activity-request-text";
+    text.textContent = request.content;
+    approval.append(label, text);
+    panel.append(approval);
+  }
+  if (parsed.workingDirectory !== repo()) {
+    const cwd = document.createElement("div");
+    cwd.className = "activity-command-cwd";
+    cwd.textContent = parsed.workingDirectory;
+    panel.append(cwd);
+  }
+  const streams = [
+    ["stdout", parsed.stdout],
+    ["stderr", parsed.stderr],
+  ].filter(([, text]) => text !== "");
+  streams.forEach(([name, text]) => {
+    const label = document.createElement("div");
+    label.className = "activity-stream-label";
+    label.textContent = name;
+    const output = document.createElement("pre");
+    output.className = "activity-step-result";
+    output.dataset.stream = name;
+    output.textContent = text;
+    panel.append(label, output);
+  });
+  if (!streams.length) {
+    const empty = document.createElement("div");
+    empty.className = "activity-no-output";
+    empty.textContent = "No output";
+    panel.append(empty);
+  }
+  if (parsed.hookNote) {
+    const note = document.createElement("div");
+    note.className = "activity-hook-note";
+    note.textContent = parsed.hookNote;
+    panel.append(note);
+  }
+
+  const trigger = createDisclosure("", panel);
+  trigger.classList.add("activity-command");
+  const text = document.createElement("span");
+  text.className = "activity-command-text";
+  text.textContent = `$ ${parsed.command}`;
+  text.title = parsed.command;
+  const mark = document.createElement("span");
+  mark.className = "exit-mark";
+  mark.dataset.state = parsed.exit.state;
+  mark.textContent = exitMarkText[parsed.exit.state](parsed.exit.code);
+  trigger.append(text, mark);
+  if (request) {
+    const approved = document.createElement("span");
+    approved.className = "activity-approved";
+    approved.textContent = "approved";
+    trigger.append(approved);
+  }
+  const reason = commandReason(action.content, parsed.command);
+  if (reason) {
+    const why = document.createElement("span");
+    why.className = "activity-command-reason";
+    why.textContent = reason;
+    trigger.append(why);
+  }
+  step.append(trigger, panel);
+}
+
 // One collapsed run of action/result pairs. The result is kept as preformatted
 // text: tool output is not Markdown, and the exact bytes matter to a diff.
+// A pair whose result parses as a command result is drawn as a command row
+// instead; anything else keeps #67's title and `<pre>`.
 function renderActivityGroup(pairs) {
   const article = document.createElement("article");
   article.className = "message activity";
@@ -6149,9 +6315,15 @@ function renderActivityGroup(pairs) {
   detail.className = "activity-detail";
   detail.tabIndex = 0;
   detail.setAttribute("aria-label", "Activity detail");
-  pairs.forEach(({ action, result }) => {
+  pairs.forEach(({ action, result, request }) => {
     const step = document.createElement("section");
     step.className = "activity-step";
+    const parsed = parseCommandResult(result.content);
+    if (parsed) {
+      renderCommandStep(step, action, parsed, request);
+      detail.append(step);
+      return;
+    }
     const title = document.createElement("div");
     title.className = "activity-step-title";
     title.innerHTML = renderMarkdown(action.content);
@@ -6173,27 +6345,28 @@ function renderActivityGroup(pairs) {
   return { message: article, body };
 }
 
-// Tasks that stopped for the user: they hold a question, or an approval
-// request. Until the engine marks approvals, a request is an assistant message
-// that is not the turn's last and is followed in its task by a "Ran `" result.
-function pausedTasksOf(messages, endsTheTurn) {
-  const paused = new Set();
+// Tasks that stopped for the user (spec 68 §5.3): they hold a question, an
+// approval request absorbed into its step, or a request that matched every
+// absorption condition but the parse (declined). A request still pending at
+// reload has no "Ran" step yet; its task's status says it is waiting instead.
+function pausedTasksOf(messages, endsTheTurn, tasks = []) {
+  const paused = new Set(
+    tasks.filter((task) => task.status === "waiting_for_approval").map((task) => task.id),
+  );
   messages.forEach((message, index) => {
     if (!message.taskId) return;
     if (message.role === "question") {
       paused.add(message.taskId);
       return;
     }
-    if (message.role !== "assistant" || endsTheTurn(message)) return;
-    const later = messages
-      .slice(index + 1)
-      .some(
-        (next) =>
-          next.taskId === message.taskId &&
-          next.role === "assistant" &&
-          next.content.startsWith("Ran `"),
-      );
-    if (later) paused.add(message.taskId);
+    const next = messages[index + 1];
+    const nextResult = messages[index + 2];
+    if (
+      approvalRequestFor(message, next, nextResult, endsTheTurn) ||
+      unparsedRequestFor(message, next, nextResult, endsTheTurn)
+    ) {
+      paused.add(message.taskId);
+    }
   });
   return paused;
 }
@@ -6208,6 +6381,18 @@ function turnDurationMs(taskId, messages, pausedTaskIds) {
   const end = inTask.findLast((message) => message.role === "assistant")?.createdAtMs;
   if (typeof start !== "number" || typeof end !== "number" || end < start) return null;
   return end - start;
+}
+
+// The live counterpart of `turnDurationMs`: a turn that ended by asking the
+// user (a pending command, fetch, plan or question) is paused, so it gets no
+// duration live either, and live agrees with reload.
+function liveTurnDurationMs(payload, indicator) {
+  const paused =
+    payload.commandProposal ||
+    payload.fetchProposal ||
+    payload.planProposal ||
+    payload.questionProposal;
+  return paused ? null : Date.now() - indicator.startedAt;
 }
 
 // `tasks` carries each task's final status so a stopped turn stays marked as
@@ -6269,7 +6454,7 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
     }
   });
   const endsTheTurn = (message) => lastAssistantByTask.get(message.taskId) === message.id;
-  const pausedTaskIds = pausedTasksOf(messages, endsTheTurn);
+  const pausedTaskIds = pausedTasksOf(messages, endsTheTurn, tasks);
   // A task with no usage events carries no token fields at all, which is how
   // a session written before token accounting stays silent instead of
   // claiming a free turn.
@@ -6289,6 +6474,17 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
     const pairs = [];
     let cursor = index;
     while (cursor + 1 < messages.length) {
+      // An approval request whose command then ran joins the run inside that
+      // step, rather than as its own bubble (spec 68 §5.2).
+      const request = messages[cursor];
+      if (approvalRequestFor(request, messages[cursor + 1], messages[cursor + 2], endsTheTurn)) {
+        pairs.push({ action: messages[cursor + 1], result: messages[cursor + 2], request });
+        groupedMessageIds.add(request.id);
+        groupedMessageIds.add(messages[cursor + 1].id);
+        groupedMessageIds.add(messages[cursor + 2].id);
+        cursor += 3;
+        continue;
+      }
       const action = messages[cursor];
       const result = messages[cursor + 1];
       if (!isGroupableAction(action, endsTheTurn)) break;
@@ -11520,7 +11716,7 @@ async function runVerificationStream(streamCall, targetRepo) {
         }
         appendProposals(target, payload, targetRepo);
         appendContextDisclosure(target.body, payload.contextFiles || []);
-        markMessageUsage(target, payload.usage, Date.now() - indicator.startedAt);
+        markMessageUsage(target, payload.usage, liveTurnDurationMs(payload, indicator));
         markMessageTurnStop(target, payload);
         indicator.finish(chatCompletionState(payload));
       },
@@ -13857,7 +14053,7 @@ async function proposePatchFromChat(prompt, assistantMessage) {
   assistantMessage.body.append(createPatchPreview(payload, patchRepo));
   appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
   appendTurnNotes(assistantMessage.body, payload.turnNotes);
-  markMessageUsage(assistantMessage, payload.usage, Date.now() - indicator.startedAt);
+  markMessageUsage(assistantMessage, payload.usage, liveTurnDurationMs(payload, indicator));
 }
 
 // The turn currently in flight, so Stop (button or Escape) can reach its
@@ -13991,7 +14187,7 @@ async function sendChatPrompt(options = {}) {
           appendProposals(assistantMessage, payload, chatRepo);
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           appendTurnNotes(assistantMessage.body, payload.turnNotes);
-          markMessageUsage(assistantMessage, payload.usage, Date.now() - indicator.startedAt);
+          markMessageUsage(assistantMessage, payload.usage, liveTurnDurationMs(payload, indicator));
           void refreshMemoryProposals(currentSessionId);
           if (payload.cancelled) {
             if (indicator) indicator.finish("stopped");
@@ -14096,7 +14292,7 @@ async function askAgainFromExhausted(sessionId, taskId) {
           appendProposals(assistantMessage, payload, chatRepo);
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           appendTurnNotes(assistantMessage.body, payload.turnNotes);
-          markMessageUsage(assistantMessage, payload.usage, Date.now() - indicator.startedAt);
+          markMessageUsage(assistantMessage, payload.usage, liveTurnDurationMs(payload, indicator));
           void refreshMemoryProposals(currentSessionId);
           if (payload.cancelled) {
             indicator.finish("stopped");
