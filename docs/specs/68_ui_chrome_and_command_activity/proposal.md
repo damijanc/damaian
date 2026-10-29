@@ -1,6 +1,6 @@
 # Feature Spec: Quieter Chrome and Readable Command Activity
 
-Status: Specified 2026-10-29. Not started.
+Status: Done 2026-10-29
 Order: 68 of 68
 Reference: [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) — this spec
 changes its Worker sessions (§4), header and composer rules, and adds
@@ -312,4 +312,58 @@ per §3).
 
 ## 7. Implementation Notes
 
-To be filled in as tasks land.
+Built and finished 2026-10-29. Presentation only: no route, stored message,
+setting key or engine string changed.
+
+**What landed, by task**
+
+1. *Fixture.* `serves_the_ui_for_manual_inspection` seeds a "Command activity"
+   task: an approved command, a declined one, a timeout with a hook note, a
+   quote-bearing command and a plain read, plus one usage row.
+2. *Usage once.* The usage row is drawn only under a task's last assistant
+   message; `turnDurationMs` works from `createdAtMs`. Live, the four non-resume
+   paths pass a duration and the approval/question/offer resume paths pass null.
+3. *Command steps.* `parseCommandResult` (§5.1), `renderCommandStep`, and an
+   approval request folded into the step that ran it (*approved*, request under
+   *Approval request*). Declined requests and unparsable results render as
+   before.
+4. *Sidebar.* *Workers* is drawn only with undismissed workers; *Workers board*
+   joins the project menu; the update footer shows only for an available,
+   installing or restart-pending update; Settings → General has *Check for
+   updates*; the brand drops the folder name.
+5. *Icons, header, composer.* One `icon()` set and `.icon-btn`; Context is a
+   meter with `N% of budget`; composer triggers carry `Mode` and `Effort` keys;
+   attach is a paperclip.
+6. *Project rows and times.* Caret leads the row, controls reveal on hover or
+   focus, session rows show relative times.
+7. *Close-out and review fixes.* The whole-branch review found six things,
+   fixed in one change: `.context-inspector-button[hidden]` was beaten by its
+   own `display`; fetch, MCP, plan and browser-diagnostic approvals (a
+   non-final assistant message directly followed by another of the same task)
+   now count as paused, so they get no misleading duration; worker rows got
+   their own two-column grid so their ⋮ aligns with session rows; the header ⋮
+   joined `.icon-btn` at 28px, which removed the style guide's exemption;
+   `checkForAppUpdate` returns early while an install runs.
+
+**Discoveries**
+
+- The paused-turn rule cannot be read from the approval request alone: a
+  request still pending at reload has no step yet, so the task's
+  `waiting_for_approval` status is part of it.
+- A command may itself contain backticks or ` — `, so the reason is found by
+  the known command's prefix, not by splitting.
+- Header height is unchanged (the ⋮ going from 30px to 28px took 1px off).
+- The Browser pane renders a `file://` page as a `data:` snapshot, so the style
+  guide's relative stylesheet cannot be checked there; see the Result section in
+  `tasks.md`.
+
+**Known limits (not fixed)**
+
+- The working-directory comparison is an exact string match against `repo()`:
+  a trailing slash or a symlinked path differs, and a worker's worktree always
+  shows its directory.
+- Duration starts at the task's first user message, so a task with none (for
+  example a verification continuation) shows no duration.
+- Only a single trailing `Hook` note line is split from stderr; a hook that
+  writes several lines leaves the rest in the stderr stream.
+

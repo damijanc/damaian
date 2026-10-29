@@ -2,7 +2,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) · agreed look in [`mockup.html`](mockup.html)
 **Style reference:** [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) · rendered at `docs/ui-style-guide.html`
-**Started:** 2026-10-29
+**Started:** 2026-10-29 — **Done:** 2026-10-29
 
 > **For agentic workers:** use superpowers:subagent-driven-development or
 > superpowers:executing-plans to work through this list task by task. Steps use
@@ -394,23 +394,23 @@ month: "short", day: "numeric" })`.
 
 **Proposal:** §3 req. 17–18, §6, plus AGENTS.md "When a spec becomes Done".
 
-- [ ] **Step 1:** Walk every §6 acceptance line in the inspection app. Record
+- [x] **Step 1:** Walk every §6 acceptance line in the inspection app. Record
   each line as *Real* or *Simulated* (say what was stubbed) in a `## Result`
   section of this file.
-- [ ] **Step 2:** Add style guide §8's row: "Chrome with nothing to say — an
+- [x] **Step 2:** Add style guide §8's row: "Chrome with nothing to say — an
   empty *Workers* entry and a permanent *Check Updates* button cost space on
   every screen to report nothing."
-- [ ] **Step 3: `docs/USER_GUIDE.md`.** Cover where *Check for updates* moved,
+- [x] **Step 3: `docs/USER_GUIDE.md`.** Cover where *Check for updates* moved,
   when *Workers* appears, and how to read a command step (exit mark,
   *approved*, the hook note). `TROUBLESHOOTING.md` gets a line only if a
   failure reads differently.
-- [ ] **Step 4: Records.** Set `Status: Done <date>` in the proposal, and fill
+- [x] **Step 4: Records.** Set `Status: Done <date>` in the proposal, and fill
   in its §7 Implementation Notes. Update the README row and *What to build
   next*, remove the CHANGELOG Unreleased line, and update this header's
   `Started`/`Done` and the Progress table. Run `grep -rn
   "68_ui_chrome_and_command_activity" docs/specs/*.md docs/specs/*/*.md` for any
   `Depends on:` lines.
-- [ ] **Step 5:** Run the scoped checks and `npm run specs:check`. Report that
+- [x] **Step 5:** Run the scoped checks and `npm run specs:check`. Report that
   the workspace clippy and nextest are left to CI.
 
 ## Progress
@@ -423,4 +423,28 @@ month: "short", day: "numeric" })`.
 | 4 · Sidebar visibility | Done 2026-10-29 | `renderWorkersEntry` returns null with no undismissed workers, else a `.worker-dot` of the most urgent state (needs-you, running, paused, failed, finished), `Workers · N running`, and the needs-you badge; `dismissWorker` redraws the project list. Project menu gains *Workers board* (`workers-board` action). `resetUpdateButton` hides the footer; new `showRestartNotice()` (guarded by `appUpdateRestartPending` so a later check does not hide it) and `#update-restart-notice`; Settings → General `#check-updates-btn` (`.btn-quiet`, disabled while checking). `#repo-state` is `hidden`. Asserts 4/4 pass. Walk: empty project shows no entry, one running worker shows "Workers · 1 running"; the project menu lists Workers board; with a stubbed `tauriUpdater` returning null the footer stays hidden and Check for updates toasts "Damaian is up to date". Style guide §4 Sidebar paragraph and the specimen updated. biome, `node --check`, typos clean. |
 | 5 · Icons, header, composer | Done 2026-10-29 | `icon(name)` and `contextMeterText` added; symbol search and terminal are `.icon-btn` (ids, labels, titles kept; icons mounted from JS), attach uses the paperclip; context chip is borderless with a 36x4 `.context-meter`, a `.thread-actions-divider`, label "38% of budget", and `; model window <n>` in the title. Composer shows `Mode Code` and `Effort Default` via `.trigger-key`. Removed `.topbar-button`, `.terminal-button`, `.symbol-*`, `.attach-icon` CSS (`.terminal-icon` kept for the tab bar). Asserts 4/4 pass. Header height: 45px before (30px controls, 14px padding, 1px border; the ⋮ menu button stays 30px), 45px after (measured), so no growth. Pressed terminal computes the accent tint. Tab order follows DOM order (not walked by keyboard). Style guide §3 table, footer-row rule and specimens added. |
 | 6 · Project rows and times | Done 2026-10-29 | Caret leads the project row and replaces the folder glyph (collapsed points right); New session uses `icon("compose")`; Add folder uses `icon("folderPlus")`; New session and ⋮ are `opacity: 0` until hover, focus-within, active project or expanded menu (checked: 0 inactive, 1 on focus). `formatRelativeTime` and `.session-when` appended to session rows, never truncated. Asserts 5/5 pass; 7 session rows show times. Empty-state text no longer says "+" ("Add a working folder to begin"). Style guide hover-reveal note and a project-row specimen added. All three tasks landed in one commit. |
-| 7 · Close-out | Not started | |
+| 7 · Close-out | Done 2026-10-29 | Acceptance walk run in the inspection app (see Result); style guide §8 row; USER_GUIDE (updates, context meter, paperclip, `</>`, Workers entry, command steps); proposal Done with §7 notes; README row and What to build next; CHANGELOG Unreleased line removed; no `Depends on:` references to #68 exist. The whole-branch review's six fixes landed first. Scoped checks: `node --check`, `npm run lint:web`, `typos`. Workspace clippy and nextest are left to CI. |
+
+## Result
+
+Walked 2026-10-29 in the `serves_the_ui_for_manual_inspection` app on port 4899
+(Browser pane, 800px wide). *Real* means the rendered DOM of a seeded or
+reloaded session; *Simulated* names what was stubbed.
+
+| §6 line | Result |
+|---|---|
+| One usage row per multi-step turn, under the answer, with a duration | One row: **Real** (Command activity: 18 messages, 1 row, was 3). The duration: **Simulated** for a multi-step turn, because that task is paused (it holds an approval request) and shows none by design. Durations are **Real** on the "warm up" session's single-call turns (`· 0s`), and the pause rule is asserted on synthetic messages. |
+| Activity collapsed; opened, `$ cmd`, exit mark, reason; output has no empty STDERR and no root directory; timeout reads `timed out` | **Real.** Both Activities load collapsed; rows read `$ ls target ✓ 0`, `exit 1`, `timed out`; expanded output shows stdout only, the `sleep 999` step shows its `/sub` directory, and the hook note is last. "No output" is **Simulated**: a synthetic empty-stdout result rendered through `renderCommandStep`. |
+| Any other result shape shows its whole text | **Real:** `src/lib.rs` and the declined text render as the plain `<pre>`. |
+| Approved command: no bubble, step reads *approved*, request inside; pending shows the card; declined keeps its bubble | **Real** for approved and declined (0 request bubbles for the approved one, the `rm -rf` request still a bubble). A pending card: **Simulated** (predicate asserted with a `waiting_for_approval` task; no live pending request). |
+| No *Workers* entry with no workers; menu opens the board; running worker shows dot and `1 running` | **Simulated:** `renderWorkersEntry` called with empty, running and dismissed rows, and `workersEnabled` set true to read the project menu (it lists *New worker* and *Workers board*). The fixture has no workers. |
+| No footer when up to date; Settings *Check for updates* says up to date | **Simulated:** `window.__TAURI__.updater` stubbed (null, then an update, then mid-install, then restart notice). The footer stayed hidden when up to date, showed `Update 9.9.9`, ignored a check mid-install (0 calls), and showed the restart line. Settings button present and runs the check. |
+| Brand shows no folder name; project controls on hover/focus; Tab reaches them | **Real.** Brand text is `Damaian`. With the project made inactive, *New session* and ⋮ computed opacity 0, and a real Tab key press onto them made it 1. |
+| Session rows show relative times | **Real:** seven rows show `1m`–`3m`. |
+| Header: *Context* meter, then `</>`, `>_`, ⋮ in one style with tooltips; pressed terminal tinted | **Real** for `</>`, `>_`, ⋮: all 28x28 `.icon-btn` with `aria-label` and `title`; the pressed terminal is tinted. Context: **Simulated** (`setContextManifest` with 3,800 of 10,000 tokens: label `38% of budget`, meter 38%, title with the model window, hidden again at null with `display: none`). Header height 44px. |
+| Keyboard Tab walk through the header and a project row | **Real**, keys sent to the page: search, add folder, project select, *New session*, project ⋮, session, session ⋮, then symbol search, terminal, ⋮ (the hidden Context chip is skipped), then the log. The ⋮ shows a focus ring. |
+| Composer reads *Mode Code*, *Effort Default*; attach is a paperclip | **Real.** |
+| `npm run lint:web` clean; style-guide page renders the new specimens | Lint **Real**. The page: **not verified styled.** `file://` is blocked for the Playwright browser, and the Browser pane renders it as a `data:` snapshot in which the relative stylesheet link does not load. The new specimens are present in the DOM (command rows, exit marks, approved note, icon buttons including ⋮); the link target exists on disk. Open it from Finder to see it styled. |
+
+Worker rows (review fix 3) were checked by building one with
+`renderProjectWorker`: its ⋮ right edge matched a session row's (261px).
