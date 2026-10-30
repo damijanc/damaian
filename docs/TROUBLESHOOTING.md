@@ -2385,6 +2385,11 @@ Check in this order:
    used the provider in the saved config rather than the chat's model picker.
    A failure such as `OPENAI_API_KEY is required` after the first answer, with
    no `model_provider` line in `user.conf`, is that defect in an older build.
+   Before spec 75, a config made only in Settings had no `model_provider`
+   line, so a new project, a worker session or a commit draft used the
+   built-in OpenAI default and asked for `OPENAI_API_KEY`. Saving any
+   provider once in a current build adds the line; so does
+   `model_provider=<id>` in the config editor.
 5. The audit log — a `model_request_prepared` with no matching
    `model_response_completed` means the request left and the response never
    arrived. Compare against stderr for the transport error.

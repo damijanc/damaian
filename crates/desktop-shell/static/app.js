@@ -1835,6 +1835,7 @@ function showCommitDialog(preparation, repoPath, sessionId) {
           session_id: sessionId,
           prepare_id: preparation.prepareId,
           paths: [...selected].join("\n"),
+          ...chatModelFormFields(),
         }),
       );
       message = payload.message || message;
@@ -5225,8 +5226,17 @@ async function saveProviderConfig() {
   let content = $("config-editor").value;
   if (originalId && originalId !== provider.id) {
     content = removeProviderConfig(content, originalId);
+    if (configValue(content, "model_provider") === originalId) {
+      content = upsertConfigValue(content, "model_provider", provider.id);
+    }
   }
   content = upsertProviderConfig(content, provider);
+  // Nothing else in Settings writes `model_provider`, so without this a config
+  // made only here kept the built-in OpenAI default: each new project's picker,
+  // worker sessions and commit drafts asked for OPENAI_API_KEY (spec 75).
+  if (!configValue(content, "model_provider")) {
+    content = upsertConfigValue(content, "model_provider", provider.id);
+  }
   $("config-editor").value = content;
   const payload = await saveConfigFile();
   $("provider-api-key-input").value = "";
@@ -5239,7 +5249,10 @@ async function removeProviderConfigFromSettings() {
     $("provider-id-input").dataset.originalId || $("provider-id-input").value,
   );
   if (!id || !configuredProviderIds.has(id)) return;
-  $("config-editor").value = removeProviderConfig($("config-editor").value, id);
+  $("config-editor").value = withoutDefaultProvider(
+    removeProviderConfig($("config-editor").value, id),
+    id,
+  );
   if (selectedChatModelOptions().provider === id) {
     localStorage.removeItem(chatModelPrefsStorageKey());
     applyChatModelOptions(modelOptionsFromPolicy(""), { resetModel: true, persist: true });
@@ -5247,6 +5260,35 @@ async function removeProviderConfigFromSettings() {
   const payload = await saveConfigFile();
   renderProviderConfigSelect();
   return payload;
+}
+
+// Removing the default provider must not leave `model_provider` naming an
+// entry that is gone, nor `model_name` one of its models: the next configured
+// provider becomes the default, or the lines go when none is left (spec 75).
+function withoutDefaultProvider(content, removedId) {
+  if (configValue(content, "model_provider") !== removedId) return content;
+  const remaining = providerIdsInConfig(content);
+  let next = removeConfigValue(content, "model_name");
+  if (remaining.length) return upsertConfigValue(next, "model_provider", remaining[0]);
+  next = removeConfigValue(next, "model_provider");
+  return next;
+}
+
+function providerIdsInConfig(content) {
+  const ids = [];
+  for (const line of String(content || "").split(/\r?\n/)) {
+    const match = line.trim().match(/^model_provider\.([a-zA-Z0-9_.-]+)\.label=/);
+    if (match && !ids.includes(match[1])) ids.push(match[1]);
+  }
+  return ids;
+}
+
+function removeConfigValue(content, key) {
+  const prefix = `${key}=`;
+  return String(content || "")
+    .split(/\r?\n/)
+    .filter((line) => !line.trim().startsWith(prefix))
+    .join("\n");
 }
 
 function upsertProviderConfig(content, provider) {

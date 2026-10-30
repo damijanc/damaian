@@ -1956,7 +1956,10 @@ fn handle_commit_message(stream: &mut TcpStream, request: &Request) -> Result<()
     let repo = required_form(&form, "repo")?;
     let session_id = required_form(&form, "session_id")?;
     let prepare_id = required_form(&form, "prepare_id")?;
-    let engine = engine_for_repo(&repo)?;
+    // The draft is a model call, so it uses the chat's selection like a turn
+    // (spec 75); a failed adapter only means no draft.
+    let (config, report) = config_for_repo_with_model_options(&repo, &form)?;
+    let engine = WorkspaceEngine::new_with_report(config, &report);
     let record = engine
         .commit
         .load_record(&prepare_id)
