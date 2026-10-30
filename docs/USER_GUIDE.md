@@ -262,7 +262,7 @@ Two settings control how many tokens each request may use. They are independent:
 - **Max output tokens** caps the reply the model generates in a single response. Set too low, a large multi-file patch is cut off mid-way. Damaian detects this, tells the model its call was truncated, and asks it to retry with fewer files per patch, so the request recovers instead of failing silently.
 - **Context budget** caps how much repository content Damaian packs into each request. Raising it lets the assistant see more of a large repository, which can improve answers. This content is re-sent and re-billed on every turn, so a higher budget increases cost and latency on all requests, not just large ones.
 
-Leave a field blank to use the built-in default for the selected model. The defaults are:
+Leave a field blank to use the built-in default for the selected model. A blank field shows that default as its placeholder, for the first model in the provider's **Models** list — `Default: 64,000`, or `Default: none sent, the provider decides` for an output ceiling Damaian does not send. When the listed models have different defaults, a note under the fields lists each one. The defaults are:
 
 - `deepseek-v4-flash` and `deepseek-v4-pro`: 65536 output tokens, 64000 context budget.
 - `deepseek-chat` and `deepseek-reasoner` (retired aliases): 8192 output tokens, 16000 context budget.

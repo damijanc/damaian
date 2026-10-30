@@ -26,8 +26,8 @@ use workspace_engine::{
     TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationReport,
     WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
     WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
-    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
-    import_profile, normalize_mcp_server_id, normalize_model_provider,
+    builtin_token_defaults, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
+    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
     normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
     profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
     select_profile,
@@ -294,6 +294,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("GET", "/api/config") => handle_config(stream, &request),
         ("GET", "/api/config-file") => handle_get_config_file(stream, &request),
         ("GET", "/api/effective-policy") => handle_effective_policy(stream, &request),
+        ("GET", "/api/provider-token-defaults") => handle_provider_token_defaults(stream, &request),
         ("POST", "/api/permission-profile") => handle_permission_profile(stream, &request),
         ("GET", "/api/permission-profiles") => handle_permission_profiles(stream, &request),
         ("GET", "/api/permission-profile-export") => {
@@ -456,6 +457,51 @@ fn handle_config(stream: &mut TcpStream, request: &Request) -> Result<(), String
             "{{\"policy\":\"{}\"}}",
             escape_json(&config.to_policy_text())
         ),
+    )
+}
+
+/// `GET /api/provider-token-defaults?provider=<id>&models=<a,b>`: what each
+/// model gets when the provider editor's *Max output tokens* and *Context
+/// budget* are left blank. Only the engine knows these per-model numbers, so
+/// the editor asks rather than showing "Automatic" with no value. No models
+/// asks for the provider's own default.
+fn handle_provider_token_defaults(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let requested = request.param("provider").unwrap_or_default();
+    // A provider still being named in the editor has no id yet; it gets the
+    // defaults of an unknown provider.
+    let provider = if requested.trim().is_empty() {
+        String::new()
+    } else {
+        normalize_model_provider(&requested).map_err(|error| error.to_string())?
+    };
+    let models_param = request.param("models").unwrap_or_default();
+    let mut models: Vec<&str> = models_param
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .collect();
+    if models.is_empty() {
+        models.push("");
+    }
+    let entries = models
+        .iter()
+        .map(|model| {
+            let (output, context) = builtin_token_defaults(&provider, model);
+            format!(
+                "{{\"model\":\"{}\",\"maxOutputTokens\":{},\"contextTokenBudget\":{}}}",
+                escape_json(model),
+                output.map_or_else(|| "null".to_string(), |value| value.to_string()),
+                context
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"models\":[{entries}]}}"),
     )
 }
 
@@ -9136,6 +9182,37 @@ mod tests {
         })
         .expect("spawn the test shell");
         (port, token)
+    }
+
+    /// The provider editor's placeholders show these numbers, so the endpoint
+    /// must answer per model with what a blank field resolves to, including
+    /// "no ceiling" for the output of a provider that sets none.
+    #[test]
+    fn provider_token_defaults_answers_per_model() {
+        let (port, token) = serve_for_test();
+        let get = |query: &str| {
+            response_json(&send_for_test(
+                port,
+                format!(
+                    "GET /api/provider-token-defaults?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n"
+                ),
+            ))
+        };
+
+        let deepseek = get("provider=deepseek&models=deepseek-v4-flash,deepseek-chat");
+        assert_eq!(deepseek["models"][0]["model"], "deepseek-v4-flash");
+        assert_eq!(deepseek["models"][0]["maxOutputTokens"], 65_536);
+        assert_eq!(deepseek["models"][0]["contextTokenBudget"], 64_000);
+        assert_eq!(deepseek["models"][1]["maxOutputTokens"], 8_192);
+        assert_eq!(deepseek["models"][1]["contextTokenBudget"], 16_000);
+
+        let unnamed = get("provider=&models=");
+        assert_eq!(unnamed["models"][0]["model"], "");
+        assert!(unnamed["models"][0]["maxOutputTokens"].is_null());
+        assert_eq!(
+            unnamed["models"][0]["contextTokenBudget"],
+            workspace_engine::DEFAULT_CONTEXT_TOKEN_BUDGET
+        );
     }
 
     fn send_for_test(port: u16, request: String) -> String {

@@ -2234,11 +2234,7 @@ impl Config {
     pub fn max_output_tokens(&self) -> Option<u32> {
         self.model_provider_config(&self.model_provider)
             .and_then(|provider| provider.max_output_tokens)
-            .or_else(|| builtin_model_output_tokens(&self.model_provider, &self.model_name))
-            .or_else(|| {
-                builtin_model_provider_config(&self.model_provider)
-                    .and_then(|provider| provider.max_output_tokens)
-            })
+            .or_else(|| builtin_token_defaults(&self.model_provider, &self.model_name).0)
     }
 
     /// How many tokens of repository context to pack into a request, resolved
@@ -2249,12 +2245,8 @@ impl Config {
     pub fn context_token_budget(&self) -> usize {
         self.model_provider_config(&self.model_provider)
             .and_then(|provider| provider.context_token_budget)
-            .or_else(|| builtin_model_context_budget(&self.model_provider, &self.model_name))
-            .or_else(|| {
-                builtin_model_provider_config(&self.model_provider)
-                    .and_then(|provider| provider.context_token_budget)
-            })
-            .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET) as usize
+            .unwrap_or_else(|| builtin_token_defaults(&self.model_provider, &self.model_name).1)
+            as usize
     }
 
     /// The category shares must fit the window: an oversubscribed set is a
@@ -4651,6 +4643,26 @@ fn builtin_model_output_tokens(provider: &str, model: &str) -> Option<u32> {
         ("deepseek", "deepseek-chat" | "deepseek-reasoner") => Some(8_192),
         _ => None,
     }
+}
+
+/// The output ceiling and context budget a model gets when its provider's
+/// config leaves the field blank: the per-model built-in, then the built-in
+/// provider's, then (context only) [`DEFAULT_CONTEXT_TOKEN_BUDGET`]. `None`
+/// output means no ceiling is sent. [`Config::max_output_tokens`] and
+/// [`Config::context_token_budget`] resolve through this, and the provider
+/// editor shows it as the default, so the two cannot disagree.
+pub fn builtin_token_defaults(provider: &str, model: &str) -> (Option<u32>, u32) {
+    let builtin = builtin_model_provider_config(provider);
+    let output = builtin_model_output_tokens(provider, model)
+        .or_else(|| builtin.as_ref().and_then(|config| config.max_output_tokens));
+    let context = builtin_model_context_budget(provider, model)
+        .or_else(|| {
+            builtin
+                .as_ref()
+                .and_then(|config| config.context_token_budget)
+        })
+        .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET);
+    (output, context)
 }
 
 /// Built-in repository-context budget per model, consulted when the provider

@@ -104,8 +104,8 @@ pub use config::{
     HookSource, LANGUAGE_SERVER_LANGUAGES, MAX_HOOK_TIMEOUT_MS, McpServerConfig,
     McpServerConfigOverlay, McpTransport, ModelProviderConfig, ModelProviderConfigOverlay,
     OverlayOutcome, RejectedConfigKey, RepositoryConfigReport, RepositoryKeyClass,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    overlay_field_kinds, parse_mcp_transport,
+    builtin_token_defaults, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, overlay_field_kinds, parse_mcp_transport,
 };
 pub use context_manager::{
     CategoryUsage, CollectionSource, ContextBudget, ContextCategory, ContextItem, ContextKind,

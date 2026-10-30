@@ -4765,6 +4765,56 @@ function renderProviderConfigForm(providerId = $("provider-config-select").value
   $("provider-max-output-tokens-input").value = provider.maxOutputTokens || "";
   $("provider-context-budget-input").value = provider.contextTokenBudget || "";
   $("provider-remove-btn").disabled = !configuredProviderIds.has(id);
+  void showProviderTokenDefaults();
+}
+
+function formatTokenCount(value) {
+  return Number(value).toLocaleString("en-US");
+}
+
+// A blank *Max output tokens* or *Context budget* falls back to a per-model
+// default that only the engine knows, so the placeholders ask it for the
+// number rather than saying "Automatic". The first listed model is the one a
+// new chat uses; the note lists every model when their defaults differ.
+async function showProviderTokenDefaults() {
+  const providerId = $("provider-id-input").value.trim();
+  const models = splitModelList($("provider-models-input").value);
+  const params = new URLSearchParams({ provider: providerId, models: models.join(",") });
+  let defaults;
+  try {
+    defaults = (await api(`/api/provider-token-defaults?${params}`)).models || [];
+  } catch {
+    return;
+  }
+  // The form may have moved to another provider while the request ran.
+  if ($("provider-id-input").value.trim() !== providerId) return;
+  const describeOutput = (entry) =>
+    entry.maxOutputTokens == null
+      ? "none sent, the provider decides"
+      : formatTokenCount(entry.maxOutputTokens);
+  const first = defaults[0];
+  $("provider-max-output-tokens-input").placeholder = first
+    ? `Default: ${describeOutput(first)}`
+    : "Automatic";
+  $("provider-context-budget-input").placeholder = first
+    ? `Default: ${formatTokenCount(first.contextTokenBudget)}`
+    : "Automatic";
+  const note = $("provider-token-defaults-note");
+  const distinct = new Set(
+    defaults.map((entry) => `${entry.maxOutputTokens}/${entry.contextTokenBudget}`),
+  );
+  if (distinct.size > 1) {
+    note.textContent = `Defaults per model: ${defaults
+      .map(
+        (entry) =>
+          `${entry.model} — output ${describeOutput(entry)}, context ${formatTokenCount(entry.contextTokenBudget)}`,
+      )
+      .join("; ")}.`;
+    note.hidden = false;
+  } else {
+    note.textContent = "";
+    note.hidden = true;
+  }
 }
 
 function clearProviderConfigForm() {
@@ -4781,6 +4831,7 @@ function clearProviderConfigForm() {
   $("provider-max-output-tokens-input").value = "";
   $("provider-context-budget-input").value = "";
   $("provider-remove-btn").disabled = true;
+  void showProviderTokenDefaults();
 }
 
 function newProviderConfigForm() {
@@ -14529,6 +14580,10 @@ $("custom-model-input").addEventListener("keydown", (event) => {
   applyCustomModel();
 });
 
+// The defaults depend on the provider id and its models, so they follow edits
+// to either.
+$("provider-models-input").addEventListener("change", () => void showProviderTokenDefaults());
+$("provider-id-input").addEventListener("change", () => void showProviderTokenDefaults());
 $("provider-config-select").addEventListener("change", () => {
   renderProviderConfigForm($("provider-config-select").value);
 });
