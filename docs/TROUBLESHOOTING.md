@@ -2374,7 +2374,14 @@ Check in this order:
    This does not apply to a loopback endpoint.
 3. `config-show` — is `model_base_url` the provider you think it is? A repo or
    admin overlay may be redirecting it.
-4. The audit log — a `model_request_prepared` with no matching
+4. Is the key the one you last saved? `config-show` prints the
+   `model_api_key_env` turns use. A provider's own `keychain:` reference
+   (`model_provider.<id>.api_key_env`) wins over the global line, so a key
+   saved on the provider's page and one saved in the Model API Key panel can
+   be different Keychain items; an old item keeps answering with a revoked
+   key. A worker session holds the key it was spawned with, so restart it
+   after changing the key.
+5. The audit log — a `model_request_prepared` with no matching
    `model_response_completed` means the request left and the response never
    arrived. Compare against stderr for the transport error.
 

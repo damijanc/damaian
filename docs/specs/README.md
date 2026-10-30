@@ -97,7 +97,7 @@ and worktree delivery finished on 2026-10-28 and were merged into `main` that
 day; the full seven-check gate passed in CI on 2026-10-29 for the `main` push
 that contains both (Quality run 40902516310).
 
-#60–#71 are also Done (see their rows below). Several were evidence-driven or
+#60–#73 are also Done (see their rows below). Several were evidence-driven or
 usability specs added outside the roadmap order; being finished, none of them
 changes what may be built next.
 
@@ -125,7 +125,7 @@ changes what may be built next.
   tool list and per-tool dispatch, so it owns that file while it is in flight.
   Every Done spec no longer constrains anything. See
   [Parallel work](#parallel-work).
-- **Open decision:** the priority table below predates #59–#71 and does not
+- **Open decision:** the priority table below predates #59–#73 and does not
   rank them; the text after it now calls #23 the priority with #65 done.
 
 ### History
@@ -831,6 +831,7 @@ is ready.
 | 70 | [70_read_only_sequences_and_file_reads.md](70_read_only_sequences_and_file_reads.md) | **Done 2026-10-30** (specified 2026-10-29, built 2026-10-29–30; local checks passed). The full seven-check gate passed in CI on 2026-10-30 (Quality run 41028254554). Evidence-driven, like #64 and #69: the model writes its surveys as `;`-separated lines with `echo` headings, `2>/dev/null` and short file reads, and every one asked. The read-only boundary now admits `;` and newlines, `/dev/null` redirects and `2>&1`, `echo`, the git listings (`worktree list`, `branch`, `remote`, `rev-parse`, `rev-list`, `for-each-ref`, `merge-base`), `git -C <dir>`, bare `head`/`tail` filters, and `cat`, `head`, `tail`, `wc`, print-only `sed -n` and non-recursive `grep` on named files inside the repository. Restricted or outside files, recursion, globs and a `cd` line with `;` still ask. Re-measured: 26 of 125 distinct approved commands in the audit log would now run unasked. |
 | 71 | [71_provider_editor_shows_token_defaults.md](71_provider_editor_shows_token_defaults.md) | **Done 2026-10-30** (specified and built the same day; local checks passed). The full seven-check gate passed in CI on 2026-10-30 (Quality run 41034494208). Usability feedback, like #67 and #68: a blank *Max output tokens* or *Context budget* in the provider editor said `Automatic` without the number. The placeholders now show the value the engine resolves for the first listed model (`Default: 64,000`), a note lists each model when they differ, and the numbers come from one engine function, `builtin_token_defaults`, that the resolvers also use, so the editor cannot disagree with them. No default changed. |
 | 72 | [72_change_requests_reach_the_agent_loop.md](72_change_requests_reach_the_agent_loop.md) | **Done 2026-10-30** (specified and built the same day; local checks passed, the full gate is left to CI). Evidence-driven: Damaian's first implementation task never reached the agent loop, because a word-matching heuristic in `app.js` sent every "add/implement/fix … test/code/docs" request to the one-shot patch flow, which has no tools, reads nothing and runs nothing. With native tool-calling on, every request now runs as an agentic turn; the one-shot flow remains only for providers without native tools, whose text envelope cannot propose a patch. |
+| 73 | [73_provider_key_reference_wins.md](73_provider_key_reference_wins.md) | **Done 2026-10-30** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: a key saved on the DeepSeek provider page was reported `Saved`, but turns sent a revoked key from an older `model_api_key_env=keychain:model-api-key` line, because loading the config applied the global reference after the provider while a per-request provider switch preferred the provider's own `keychain:` reference. The global reference is now applied first in each scope, so loading and switching resolve the same key; a provider without a key reference no longer blanks the global one, and `config-set`'s provider-switch warning names `model_api_key_env` only when it really overrides. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:

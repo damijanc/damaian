@@ -524,7 +524,10 @@ does, and fails on any failed assertion or when none was evaluated.
   The command now warns about each explicit setting that differs from the new
   provider's default and prints the exact `config-set` command that replaces
   it, without deleting the user's lines. The desktop app was never affected:
-  its form re-applies provider defaults per request.
+  its form re-applies provider defaults per request. Since
+  [#73](../73_provider_key_reference_wins.md), the key line is applied before
+  the provider, so it overrides only a built-in provider's
+  environment-variable default, and the warning names it only then.
 - **OpenRouter's reasoning fields are not read (observation #47).** The
   adapter replays only DeepSeek's `reasoning_content`. A live streaming request
   to `openai/gpt-oss-20b` on 2026-10-25 showed OpenRouter sending the reasoning

@@ -1191,6 +1191,10 @@ fn print_provider_switch_warnings(
     provider: &str,
 ) -> workspace_engine::Result<()> {
     let config = Config::load_for_repository(None)?;
+    // What the next load actually resolves. An explicit key reference no
+    // longer wins over a provider's own keychain key (spec 73), so a line
+    // that differs from the default is not always overriding it.
+    let effective = Config::load_for_repository(repo.map(Path::new))?;
     // The defaults the next load would fill in. Clearing the key reference
     // first stops `apply_model_provider_defaults` from deliberately preserving
     // a keychain reference carried over from the old provider.
@@ -1229,7 +1233,13 @@ fn print_provider_switch_warnings(
             "model_name" => defaults.model_name.as_str(),
             _ => continue,
         };
-        if current == default {
+        let resolved = match key {
+            "model_base_url" => effective.model_base_url.as_str(),
+            "model_api_key_env" => effective.model_api_key_env.as_str(),
+            "model_name" => effective.model_name.as_str(),
+            _ => continue,
+        };
+        if current == default || resolved != current {
             continue;
         }
         let command = match owner {

@@ -125,3 +125,29 @@ fn an_explicit_value_matching_the_new_default_is_not_a_warning() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A provider's own keychain key wins over the global reference (spec 73), so
+/// the global line is not overriding anything and naming it would send the
+/// user to change a setting that has no effect.
+#[test]
+fn a_global_key_reference_the_provider_key_outranks_is_not_a_warning() {
+    let data_dir = temp_data_dir("provider-key");
+    write_user_config(
+        &data_dir,
+        "model_provider=openrouter\n\
+         model_api_key_env=keychain:model-api-key\n\
+         model_provider.deepseek.api_key_env=keychain:DEEPSEEK_API_KEY\n",
+    );
+
+    let output = config_set(&data_dir, &["user", "model_provider", "deepseek"]);
+    assert!(
+        output.status.success(),
+        "config-set should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("model_api_key_env"),
+        "the provider's own key is the one used: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

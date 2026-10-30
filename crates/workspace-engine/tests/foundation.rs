@@ -5593,6 +5593,45 @@ fn provider_defaults_preserve_keychain_references() {
     assert_eq!(config.model_api_key_env, "keychain:model-api-key");
 }
 
+/// The key a loaded config names must be the one switching to its provider
+/// names, whatever order the file lists them in (spec 73). A user who saved a
+/// new key on the provider's page kept being sent the stale global one.
+#[test]
+fn a_providers_own_keychain_key_wins_over_the_global_reference() {
+    for text in [
+        "model_provider=deepseek\n\
+         model_api_key_env=keychain:model-api-key\n\
+         model_provider.deepseek.api_key_env=keychain:DEEPSEEK_API_KEY\n",
+        "model_api_key_env=keychain:model-api-key\n\
+         model_provider.deepseek.api_key_env=keychain:DEEPSEEK_API_KEY\n\
+         model_provider=deepseek\n",
+    ] {
+        let mut config = Config::default();
+        config.apply_overlay(ConfigOverlay::parse(text).unwrap());
+        assert_eq!(config.model_api_key_env, "keychain:DEEPSEEK_API_KEY");
+
+        let mut switched = config.clone();
+        switched.apply_model_provider_defaults();
+        assert_eq!(switched.model_api_key_env, config.model_api_key_env);
+    }
+}
+
+#[test]
+fn a_custom_provider_without_a_key_reference_keeps_the_global_one() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "model_api_key_env=keychain:model-api-key\n\
+             model_provider.acme.base_url=https://api.acme.test\n\
+             model_provider.acme.models=acme-large\n\
+             model_provider=acme\n",
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(config.model_api_key_env, "keychain:model-api-key");
+}
+
 #[test]
 fn config_overlay_supports_custom_model_providers() {
     let overlay = ConfigOverlay::parse(

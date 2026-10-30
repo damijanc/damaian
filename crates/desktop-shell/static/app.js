@@ -5843,7 +5843,7 @@ async function refreshModelKeyStatus() {
 
 function keyOverrideWarning(savedReference, effectiveReference) {
   if (!effectiveReference || effectiveReference === savedReference) return "";
-  return `Saved user key, but effective config still uses ${effectiveReference}. Remove or update the model_api_key_env override in repository or admin config.`;
+  return `Saved user key, but effective config still uses ${effectiveReference}. Save the key under that account, change the active provider's API key reference, or remove the model_api_key_env override in admin config.`;
 }
 
 async function loadConfigFile() {

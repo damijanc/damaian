@@ -1373,6 +1373,20 @@ impl Config {
                 rejected.push(RejectedConfigKey::new(key, forbidden));
             }
         }
+        // Before the provider choice, so a scope that names both resolves the
+        // key the way switching to that provider does: the provider's own
+        // keychain key wins, and a built-in provider's environment-variable
+        // default does not displace a keychain key (spec 73).
+        if let Some(value) = scoped(
+            model_api_key_env,
+            "model_api_key_env",
+            trusted,
+            forbidden,
+            rejected,
+        ) {
+            self.model_api_key_env = value;
+            outcome.record(scope, "model_api_key_env", None, false);
+        }
         if let Some(value) = scoped(
             model_provider,
             "model_provider",
@@ -1413,16 +1427,6 @@ impl Config {
         ) {
             self.model_base_url = value;
             outcome.record(scope, "model_base_url", None, false);
-        }
-        if let Some(value) = scoped(
-            model_api_key_env,
-            "model_api_key_env",
-            trusted,
-            forbidden,
-            rejected,
-        ) {
-            self.model_api_key_env = value;
-            outcome.record(scope, "model_api_key_env", None, false);
         }
         if let Some(value) = scoped(
             model_reasoning_level,
@@ -2306,9 +2310,12 @@ impl Config {
             .or_else(|| builtin_model_provider_config(&self.model_provider))
         {
             self.model_base_url = provider.base_url;
-            if provider.api_key_env.starts_with("keychain:")
-                || !is_builtin_model_provider(&provider.id)
-                || !is_keychain_reference(&self.model_api_key_env)
+            // A custom entry with no key reference keeps the global one rather
+            // than resolving to an empty variable name.
+            if !provider.api_key_env.trim().is_empty()
+                && (provider.api_key_env.starts_with("keychain:")
+                    || !is_builtin_model_provider(&provider.id)
+                    || !is_keychain_reference(&self.model_api_key_env))
             {
                 self.model_api_key_env = provider.api_key_env;
             }

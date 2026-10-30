@@ -201,7 +201,7 @@ Damaian keeps a process-local in-memory copy after a successful Keychain save or
 
 Use **Remove Key** to delete the stored secret from Keychain. Saving a new key with the same account replaces the previous value.
 
-If the [effective policy view](#reading-the-effective-policy-view) still shows a different `model_api_key_env` after saving the key, a repository or admin config is overriding the user setting. Remove or update that override before retrying chat.
+If the [effective policy view](#reading-the-effective-policy-view) still shows a different `model_api_key_env` after saving the key, something else names the key. Either the active provider has its own `keychain:` reference (`model_provider.<id>.api_key_env`, set on the provider's page), which wins over this panel's line, or an admin config overrides the user setting. Save the key under the account the status names, or change that reference, before retrying chat.
 
 ### Native tool-calling
 
@@ -217,7 +217,7 @@ cargo run -p damaian-cli -- config-set user model_provider deepseek
 
 Naming a built-in provider fills in most of the setup. `model_provider=deepseek`, `model_provider=openrouter`, or `model_provider=openai` sets the base URL, the default model, and the key variable for that provider; set the other keys only to override one of those. [Native tool-calling](#native-tool-calling) is on by default.
 
-An explicit `model_base_url`, `model_api_key_env` or `model_name` line keeps winning after a provider switch, because those keys are applied after the provider's defaults. `config-set user model_provider <id>` therefore prints a warning for each one that differs from the new provider's default, naming the exact command that replaces it. Your lines are left in place, so apply the commands it prints (or edit the file) to finish the switch.
+An explicit `model_base_url` or `model_name` line keeps winning after a provider switch, because those keys are applied after the provider's defaults. `model_api_key_env` keeps winning only over a built-in provider's environment-variable default: when the provider has its own `keychain:` reference, or is one you defined, that reference is used instead. `config-set user model_provider <id>` therefore prints a warning for each one that differs from the new provider's default, naming the exact command that replaces it. Your lines are left in place, so apply the commands it prints (or edit the file) to finish the switch.
 
 Example DeepSeek configuration:
 
