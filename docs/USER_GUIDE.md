@@ -407,8 +407,9 @@ across the repository. None of them returns file content outside the selection.
 assembled; the panel shows the manifest while the turn runs. Turn on **Pause
 before sending to review context** in **Settings › Conversation** to hold each
 chat turn and each verification repair turn at that point instead. A one-shot
-edit request is the one path not held: it is a plain request with no pending-turn
-review to resume, so it assembles and sends in one step even with the setting on.
+edit request, which only a provider without native tool-calling makes, is the
+one path not held: it is a plain request with no pending-turn review to resume,
+so it assembles and sends in one step even with the setting on.
 The turn card then offers **Review context**, **Send** and **Decline**. While it is paused,
 expanding a category gives each optional item a **×** to remove it from this
 turn only; the removal appears under **Excluded** as **removed by you**, and the
@@ -720,7 +721,7 @@ Type in the prompt box at the bottom of the window to ask questions about the se
 
 Press `Enter` to send a chat message. Press `Shift+Enter` to insert a new line.
 
-Questions stream read-only answers. Code and file change requests, such as `create a test file` or `update the README`, generate an inline patch preview in the conversation. With Worker sessions on, a request to plan, split or hand off work stays in the conversation instead (see [Worker Sessions](#worker-sessions)).
+Questions stream read-only answers. Code and file change requests, such as `create a test file` or `update the README`, run as an ordinary turn: the assistant reads what it needs, proposes the change as an inline patch preview, and can run checks and keep a plan while it works. With a provider whose **Native tool-calling** is off, such a request instead goes to a one-shot patch flow that answers with a single patch preview and no tools; with Worker sessions on, a request to plan, split or hand off work stays in the conversation even then (see [Worker Sessions](#worker-sessions)).
 
 To pin specific repository files into the next chat request, select **+** at the bottom left of the prompt and then **Add file**, or drag files onto the window. Pinned files appear as chips above the prompt and are included before automatic retrieval. Select **×** on a chip to remove that file.
 

@@ -14364,6 +14364,17 @@ for (const id of ["profile-import-text", "profile-import-name", "profile-import-
 const PLANNING_REQUEST =
   /\b(split|plan|planning|tasks?|hand\s*off|handoffs?|parallel|workers?|sessions?)\b|\bbreak\b.*\b(down|up|into)\b/;
 
+// Whether a change request may take the one-shot patch flow. Only a provider
+// without native tool calling needs it: its text envelope can request a
+// command but cannot propose a patch. With native tools the agentic turn
+// proposes patches itself (`propose_patch`, `edit_file`) and can also read the
+// repository, run checks and keep a plan, which the one-shot flow cannot, so
+// every request goes to the turn (spec 72).
+function changeRequestsUseOneShotPatch() {
+  const { provider } = selectedChatModelOptions();
+  return modelProviderPresets[provider]?.supportsNativeTools === false;
+}
+
 function looksLikeEditRequest(prompt) {
   const text = prompt.trim().toLowerCase();
   if (!text) return false;
@@ -14490,8 +14501,9 @@ async function sendChatPrompt(options = {}) {
     // A scoped repair from the findings panel needs the agentic turn, which
     // reads, edits and re-runs. Its text ("Fix the 2 findings… error…") would
     // otherwise match the edit heuristic and go to the one-shot patch flow
-    // (spec 22 `context.md` §17).
-    if (!options.agentic && looksLikeEditRequest(prompt)) {
+    // (spec 22 `context.md` §17). With native tools nothing takes that flow
+    // (spec 72).
+    if (!options.agentic && changeRequestsUseOneShotPatch() && looksLikeEditRequest(prompt)) {
       await proposePatchFromChat(prompt, assistantMessage);
       dismissContextChips();
       return;

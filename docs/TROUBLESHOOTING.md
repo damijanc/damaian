@@ -2035,11 +2035,12 @@ is deliberately not matched, so that no button lands on the wrong thing
 for this reason. If a model still writes it wrongly, ask it to rewrite the
 prompts as `worker-prompt` blocks, or paste the text into **New worker**. If
 the request produced a patch preview instead of an answer, it went to the
-one-shot patch flow, whose prompt has no handoff paragraph. That happens to a
-request with an edit verb and a code word (`looksLikeEditRequest` in
-`app.js`) unless Worker sessions is on and the request also says *split*,
-*plan*, *tasks*, *hand off*, *parallel*, *worker* or *session*. Reword it with
-one of those.
+one-shot patch flow, whose prompt has no handoff paragraph. Only a provider
+with **Native tool-calling** off sends requests there: one with an edit verb
+and a code word (`looksLikeEditRequest` in `app.js`), unless Worker sessions is
+on and the request also says *split*, *plan*, *tasks*, *hand off*, *parallel*,
+*worker* or *session*. Reword it with one of those, or use a provider with
+native tool-calling.
 
 #### A worker shows *Interrupted*, or *Ended*
 
@@ -2746,6 +2747,17 @@ reads as complete is the failure the caps exist to prevent. The caps are
 `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and
 `max_match_line_chars` (500); a repository config may lower one but never raise
 it.
+
+### A change request answered with one patch and no tools
+
+With a provider that has **Native tool-calling** on, every request runs as an
+ordinary turn, which reads files, runs checks and proposes patches itself
+(spec 72). Before 2026-10-30 a request such as "add tests for X" was sent to
+the one-shot patch flow instead: one model call, no tools, only the files
+context assembly happened to include, and nothing run. That flow now serves
+only providers without native tool-calling. If a change request still comes
+back as a single patch with no reads in its **Activity**, check that the
+provider's **Native tool-calling** box is ticked in Settings › Providers.
 
 ### A search said "No file was searched"
 
