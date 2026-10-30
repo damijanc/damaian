@@ -15,7 +15,7 @@ use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::compaction::ConversationSummary;
 use crate::config::{Config, ConfigOverlay, CostEstimate, McpTransport};
 use crate::context_manager::{
-    ContextManager, ContextManifest, ContextPlan, ContextRequest, PreparedContext,
+    ContextManager, ContextManifest, ContextPlan, ContextRequest, MemoryRecallRef, PreparedContext,
     PromptSectionName, TokenEstimate,
 };
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
@@ -37,8 +37,9 @@ use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::language::detect_language;
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
 use crate::memory::{
-    EvidenceRef as MemoryEvidence, MemoryCategory, MemoryProposal, MemoryScope, MemoryStore,
-    ProposalOrigin,
+    EvidenceRef as MemoryEvidence, MemoryCategory, MemoryEntry, MemoryMatchReason, MemoryProposal,
+    MemoryProvenance, MemoryScope, MemoryState, MemoryStore, ProjectIdentity, ProposalOrigin,
+    RecalledMemory, Verification,
 };
 use crate::mode::{Permission, SessionMode, permits, refusal_message};
 use crate::model::{
@@ -760,6 +761,33 @@ enum FetchDispatch {
     NeedsApproval(Inspection),
 }
 
+/// One recalled memory resolved for the context inspector (spec 30 §5.4, C3).
+///
+/// The manifest carries only the entry id, match reason and recall-time
+/// verification because it is written to the audit log. This is the display-time
+/// read that turns a row back into the fields a user can inspect. The statement
+/// is `None` when the id no longer resolves in a scope this project and session
+/// may read, or when the entry has been deleted, so a deleted entry reads as
+/// "deleted" without leaving its text in the panel.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryDisplayEntry {
+    pub entry_id: String,
+    pub statement: Option<String>,
+    pub scope: Option<MemoryScope>,
+    pub category: Option<MemoryCategory>,
+    pub provenance: Option<MemoryProvenance>,
+    pub created_at_ms: Option<u128>,
+    pub verification: Verification,
+    pub match_reason: MemoryMatchReason,
+    /// Whether the secret scanner removed a detected credential from
+    /// `statement`. The stored record is not rewritten (spec 30 C13.2).
+    pub redacted: bool,
+    /// True for an id that no longer resolves here, including one owned by
+    /// another project or a `Deleted` entry.
+    pub deleted: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatOrchestrator {
     config: Config,
@@ -1407,7 +1435,17 @@ impl ChatOrchestrator {
         // as the last and lowest-priority category. A page fetched in this very
         // turn is already a tool result; it reaches the plan on the next turn.
         let external_references = self.session_store.read_external_references(&session.id)?;
-        let context = self.context_manager.build_context(ContextRequest {
+        // Spec 30 §5.3: recall before assembly, from the turn's own prompt and
+        // named paths. The entries travel as ordinary context items; there is
+        // no second path to the model (§5.1).
+        let (project_identity, recalled) = self.recall_memory_for_turn(
+            repository_root,
+            &index.repository_id,
+            &session.id,
+            prompt,
+            explicit_paths,
+        )?;
+        let mut context = self.context_manager.build_context(ContextRequest {
             repository_root,
             repository_id: &index.repository_id,
             task_id: &task.id,
@@ -1421,7 +1459,19 @@ impl ChatOrchestrator {
             restriction: context_restriction.as_deref(),
             conversation_summary: conversation.summary.as_ref(),
             external_references: &external_references,
+            memory: &recalled,
         })?;
+        // Spec 30 §5.6: the world can change between assembly and the call.
+        // This drops an entry that is no longer sendable and its manifest row,
+        // before the manifest is streamed, so what the user is shown is what
+        // the request carries.
+        let recalled = self.recheck_memory_before_send(
+            repository_root,
+            &project_identity,
+            &session.id,
+            &mut context,
+            recalled,
+        )?;
         // What this turn is about to send (spec 27 §5.1, C9). Sent before the
         // first call, so the default (no pause) still gives the user a
         // pre-send view; the shell relays it as its `context` event.
@@ -1466,6 +1516,7 @@ impl ChatOrchestrator {
                 context,
                 prompt_conversation,
                 conversation.summary.clone(),
+                recalled,
                 messages,
                 turn_notes,
                 options,
@@ -1484,6 +1535,9 @@ impl ChatOrchestrator {
         context_fields.extend(context.manifest.audit_fields());
         self.audit_log
             .record("context_assembled", &context_fields)?;
+        // Spec 30 C9: a recall is recorded at send, not at assembly. A pause
+        // returned above, and a declined review never reaches here.
+        self.record_memory_recall(&context.manifest, &recalled)?;
 
         self.run_agentic_turn(
             repository_root,
@@ -1502,6 +1556,105 @@ impl ChatOrchestrator {
         )
     }
 
+    /// Recalls the entries that apply to this task (spec 30 §5.3).
+    ///
+    /// Runs once per turn, before assembly: the returned list is what the
+    /// request carries and what a paused review keeps. A store that cannot be
+    /// read fails the turn rather than silently sending without memory — the
+    /// user is entitled to know that what they confirmed was not consulted.
+    fn recall_memory_for_turn(
+        &self,
+        repository_root: &Path,
+        repository_id: &str,
+        session_id: &str,
+        prompt: &str,
+        explicit_paths: &[String],
+    ) -> Result<(ProjectIdentity, Vec<RecalledMemory>)> {
+        let identity =
+            ProjectIdentity::resolve(repository_root, repository_id.to_string(), &self.git)?;
+        let recalled = self.memory_store.recall(
+            repository_root,
+            &identity,
+            session_id,
+            prompt,
+            explicit_paths,
+            self.config.memory_max_entries as usize,
+        )?;
+        Ok((identity, recalled))
+    }
+
+    /// The send-time half of spec 30 §5.6.
+    ///
+    /// An entry deleted, expired, superseded, or withdrawn between assembly and
+    /// the model call must not be sent, and its `memory` manifest row must go
+    /// with it or the inspector names a statement the request no longer
+    /// carries (C14). Returns the entries the plan still sends, so the caller
+    /// records a recall only for what actually went out.
+    fn recheck_memory_before_send(
+        &self,
+        repository_root: &Path,
+        identity: &ProjectIdentity,
+        session_id: &str,
+        plan: &mut ContextPlan,
+        recalled: Vec<RecalledMemory>,
+    ) -> Result<Vec<RecalledMemory>> {
+        // Only entries this plan actually carries: one the category budget
+        // left out is not part of the request, and re-checking it would audit
+        // an expiry for something never sent.
+        let mut sent: Vec<RecalledMemory> = recalled
+            .into_iter()
+            .filter(|recalled| {
+                plan.manifest
+                    .memory
+                    .iter()
+                    .any(|reference| reference.entry_id == recalled.entry.id)
+            })
+            .collect();
+        if sent.is_empty() {
+            return Ok(sent);
+        }
+        let exclusions =
+            self.memory_store
+                .recheck_recall(repository_root, identity, session_id, &sent)?;
+        if exclusions.is_empty() {
+            return Ok(sent);
+        }
+        let mut prepared = PreparedContext::from_plan(plan);
+        for exclusion in &exclusions {
+            prepared.remove_memory(&exclusion.entry_id, exclusion.detail())?;
+        }
+        *plan = prepared.into_plan();
+        sent.retain(|recalled| {
+            !exclusions
+                .iter()
+                .any(|exclusion| exclusion.entry_id == recalled.entry.id)
+        });
+        Ok(sent)
+    }
+
+    /// Records one recall per entry the request carries, once, at send
+    /// (spec 30 C9). The manifest names what was included after the budget,
+    /// user removals and the send-time re-check, so it is the truth to record
+    /// from rather than the list recall returned.
+    fn record_memory_recall(
+        &self,
+        manifest: &ContextManifest,
+        recalled: &[RecalledMemory],
+    ) -> Result<()> {
+        let entries: Vec<MemoryEntry> = manifest
+            .memory
+            .iter()
+            .filter_map(|reference| {
+                recalled
+                    .iter()
+                    .find(|recalled| recalled.entry.id == reference.entry_id)
+            })
+            .map(|recalled| recalled.entry.clone())
+            .collect();
+        self.memory_store.record_recall(&entries)?;
+        Ok(())
+    }
+
     /// Parks a turn after assembly and before its first model call so the user
     /// can review and edit what it is about to send (spec 27 §5.1).
     ///
@@ -1517,6 +1670,7 @@ impl ChatOrchestrator {
         plan: ContextPlan,
         conversation: PromptConversation,
         summary: Option<ConversationSummary>,
+        recalled_memory: Vec<RecalledMemory>,
         messages: Vec<ModelMessage>,
         turn_notes: TurnNotesState,
         turn_options: ChatTurnOptions,
@@ -1559,6 +1713,7 @@ impl ChatOrchestrator {
                 conversation,
                 summary,
                 summary_removed: false,
+                recalled_memory,
             }),
         })?;
         self.note_pending_approvals(
@@ -1728,7 +1883,25 @@ impl ChatOrchestrator {
             });
         }
 
-        let plan = review.prepared.into_plan();
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let mut plan = review.prepared.into_plan();
+        // Spec 30 §5.6: the review may have sat open long enough for an entry
+        // to be deleted, expired or withdrawn. This is the same turn, so it
+        // re-checks the entries the plan carries and never recalls again: a
+        // second recall could rank differently and put in the request an entry
+        // the user never reviewed.
+        let recalled_memory = if plan.manifest.memory.is_empty() {
+            review.recalled_memory
+        } else {
+            let identity = ProjectIdentity::resolve_for_root(&repository_root, &self.git)?;
+            self.recheck_memory_before_send(
+                &repository_root,
+                &identity,
+                &pending.session.id,
+                &mut plan,
+                review.recalled_memory,
+            )?
+        };
         let conversation = if review.summary_removed {
             let covered = review
                 .summary
@@ -1767,8 +1940,11 @@ impl ChatOrchestrator {
         self.audit_log
             .record("context_assembled", &context_fields)?;
         sink.context(&plan.manifest);
+        // Spec 30 C9: one recall record per entry this send actually carries.
+        // A removal in the review and a send-time rejection both dropped their
+        // manifest rows, so neither is recorded.
+        self.record_memory_recall(&plan.manifest, &recalled_memory)?;
 
-        let repository_root = PathBuf::from(&pending.repository_root);
         let verification_turn = pending.turn_options.verification_turn;
         let result = self.run_agentic_turn(
             &repository_root,
@@ -1854,6 +2030,70 @@ impl ChatOrchestrator {
         )?;
         self.save_context_review(&pending, review.clone())?;
         Ok(review.prepared.manifest)
+    }
+
+    /// Resolves the manifest's memory rows against the store for the inspector
+    /// (spec 30 §5.4, C3, C17).
+    ///
+    /// The manifest is content-free and is written to the audit log, so this is
+    /// the only place a recalled statement is reconstructed for display. It
+    /// reads exactly the scopes recall reads — this project, this session, and
+    /// user scope only while that scope is enabled — so an id owned by another
+    /// project cannot resolve and is reported as `deleted` rather than exposed.
+    /// Every resolved statement passes the secret scanner, because a memory
+    /// file edited outside Damaian may hold a credential even though the store
+    /// refuses one at write time (C13.2). Nothing here is written or audited.
+    pub fn resolve_memory_display(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        references: &[MemoryRecallRef],
+    ) -> Result<Vec<MemoryDisplayEntry>> {
+        if references.is_empty() {
+            return Ok(Vec::new());
+        }
+        let identity = ProjectIdentity::resolve_for_root(repository_root, &self.git)?;
+        let project_entries = self.memory_store.project_entries(&identity)?;
+        let session_entries = self.memory_store.session_entries(session_id)?;
+        let user_entries = self.memory_store.user_entries()?;
+        let mut entries: HashMap<&str, &MemoryEntry> = HashMap::new();
+        for entry in project_entries
+            .iter()
+            .chain(session_entries.iter())
+            .chain(user_entries.iter())
+        {
+            entries.insert(entry.id.as_str(), entry);
+        }
+        Ok(references
+            .iter()
+            .map(|reference| {
+                let entry = entries
+                    .get(reference.entry_id.as_str())
+                    .copied()
+                    .filter(|entry| entry.state != MemoryState::Deleted);
+                let (statement, redacted) = match entry {
+                    Some(entry) => {
+                        let redaction = self.scanner.redact(&entry.statement);
+                        (Some(redaction.text), !redaction.findings.is_empty())
+                    }
+                    None => (None, false),
+                };
+                MemoryDisplayEntry {
+                    entry_id: reference.entry_id.clone(),
+                    statement,
+                    scope: entry.map(|entry| entry.scope),
+                    category: entry.map(|entry| entry.category),
+                    provenance: entry.map(|entry| entry.provenance.clone()),
+                    created_at_ms: entry.map(|entry| entry.created_at_ms),
+                    verification: entry
+                        .map(|entry| entry.verification)
+                        .unwrap_or(reference.verification),
+                    match_reason: reference.match_reason.clone(),
+                    redacted,
+                    deleted: entry.is_none(),
+                }
+            })
+            .collect())
     }
 
     fn save_context_review(
@@ -2818,6 +3058,10 @@ impl ChatOrchestrator {
             // ordinary turn's assembly is where the session's references enter
             // (spec 51 D5).
             external_references: &[],
+            // A repair continuation is a new request built from check findings,
+            // not the paused turn: it recalls nothing. Whatever the original
+            // turn recalled was sent with that request (spec 30 Task 4).
+            memory: &[],
         })?;
         let turn_notes = self.carry_notes_from_the_previous_turn(&session.id, &task)?;
         let prompt_conversation = build_conversation(
@@ -2855,6 +3099,7 @@ impl ChatOrchestrator {
                 context,
                 prompt_conversation,
                 conversation.summary.clone(),
+                Vec::new(),
                 messages,
                 turn_notes,
                 options,
@@ -10167,6 +10412,14 @@ struct PendingContextReview {
     conversation: PromptConversation,
     summary: Option<ConversationSummary>,
     summary_removed: bool,
+    /// The entries the paused turn recalled, as assembly rendered them
+    /// (spec 30 §5.6). A send is the same turn, so it re-checks these rather
+    /// than recalling again: a new recall could rank differently and would put
+    /// entries in the request the user never reviewed. `#[serde(default)]`
+    /// keeps a review written before this field existed loadable; the memory
+    /// category was empty in those reviews anyway.
+    #[serde(default)]
+    recalled_memory: Vec<RecalledMemory>,
 }
 
 /// The persisted half of a round-budget pause (spec 61). `rounds_granted` is
@@ -16008,6 +16261,7 @@ mod approval_prompt_wording_tests {
                 excluded: Vec::new(),
                 conversation_summary: None,
                 symbol_provenance: None,
+                memory: Vec::new(),
             },
         };
         let with_result = build_model_prompt(
@@ -16080,6 +16334,7 @@ mod approval_prompt_wording_tests {
                 excluded: Vec::new(),
                 conversation_summary: None,
                 symbol_provenance: None,
+                memory: Vec::new(),
             },
         };
         let prompt = build_model_prompt(
@@ -16129,6 +16384,7 @@ mod approval_prompt_wording_tests {
                 excluded: Vec::new(),
                 conversation_summary: None,
                 symbol_provenance: None,
+                memory: Vec::new(),
             },
         }
     }

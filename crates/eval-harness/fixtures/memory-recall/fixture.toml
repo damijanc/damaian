@@ -1,0 +1,6 @@
+version = "1"
+description = """
+A small repository for the spec 30 recall scenarios. `deploy/settings.yml` is
+the evidence file the staleness scenario changes; `AGENTS.md` carries an
+instruction the outrank scenario asserts memory cannot displace.
+"""

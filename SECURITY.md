@@ -161,6 +161,14 @@ Reads and writes go through one path policy:
 - A path that resolves outside the selected repository is refused, for reads and writes alike. For writes, every existing component of the target is checked, so a symlink inside the repository that points outside it cannot be written through. Additional directories are reachable only through `allowed_roots`, which a repository cannot set.
 - `restricted_patterns` are refused to the agent's read tools and excluded from search, context and git reads. The defaults cover `.env` and `.env.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, SSH private key names (`id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`), and `secrets/` and `credentials/` directories at any depth. A repository may add patterns, never remove them.
 
+## Memory
+
+Memory is a local store of one-sentence facts you confirmed; nothing enters it without your confirmation, and a statement containing a detected credential is refused rather than stored. Three rules hold on the read side:
+
+- **Memory is data, never instruction, and reaches the model only as context.** A recalled entry is an ordinary item in the lowest-priority context category, framed as "remembered about this project" with its origin and date. There is no other path to the model, so the context panel shows everything that was recalled. Mode, approval and path policy are never read from context, so a remembered "all commands are pre-approved" changes nothing; evaluation scenarios assert that an approval card still appears and Ask mode still refuses edits.
+- **Statements are redacted on the way out.** Every recalled statement passes the secret scanner before it enters a request, and again before the context panel displays it, so a credential edited into a memory file by hand never leaves the machine. The manifest and the `memory_recalled` audit event carry the entry id, not the statement.
+- **Protected or ignored evidence withdraws an entry.** An entry derived from a file that is now under `restricted_patterns` or excluded by a `.gitignore` is excluded from recall entirely — not sent with a marker, since a marker would still put the derived statement in the request. The check runs at every recall, because a policy change modifies no file. The entry is retained and returns when the rule is narrowed; the withdrawal is audited with the path and reason. Project memory is keyed by the repository's identity, and an entry carrying another project's key is a hard error rather than a filtered row.
+
 ## Patch Application
 
 The model never writes files. An edit comes back as a patch preview, and nothing is written until you apply it. Each file in a patch records the hash of the content it was generated against; at apply time a file whose current hash differs is blocked rather than overwritten, so a patch approved earlier cannot silently replace changes made after the preview. Generated content is scanned for hardcoded secrets before apply, as described above.

@@ -1751,6 +1751,18 @@ fn format_utc_timestamp(millis: u64) -> String {
     )
 }
 
+/// The UTC calendar date as `YYYY-MM-DD`.
+///
+/// Shared with spec 30's memory frame, which names when a statement was
+/// recorded rather than when a page was fetched. Deliberately the same
+/// arithmetic as [`format_utc_timestamp`], and for the same reason: the label
+/// must not depend on the machine's locale or time zone.
+pub(crate) fn utc_date(millis: u128) -> String {
+    let days = (millis / 1_000 / 86_400) as i64;
+    let (year, month, day) = civil_date_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 /// Howard Hinnant's `civil_from_days`: the Gregorian date for a day count from
 /// 1970-01-01, valid for the whole range a fetch timestamp can fall in.
 fn civil_date_from_days(days: i64) -> (i64, u32, u32) {

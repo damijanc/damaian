@@ -1,0 +1,23 @@
+name = "memory_project_isolation"
+fixture = "memory-recall"
+tier = "deterministic"
+prompt = "Which release channel applies to this project?"
+
+# The second entry lives in another project key's file. It is a real stored
+# entry — the seed writes it through the store — and the prompt would match it,
+# so a leak would be visible as two recalls and both statements in the request.
+[[seed_memory]]
+statement = "The release channel for this project is stable."
+
+[[seed_memory]]
+statement = "The release channel for this project is beta."
+project_key = "root_0000000000000000000000000000000000000000000000000000000000000000"
+
+[[turn]]
+content = "This project uses the stable release channel."
+
+[assert]
+memory_recalls = 1
+request_contains = ["The release channel for this project is stable."]
+request_excludes = ["The release channel for this project is beta."]
+deterministic_only = ["memory_recalls", "request_contains", "request_excludes"]

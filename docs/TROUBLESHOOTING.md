@@ -51,6 +51,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | A command that used to run unasked now asks | [A command that used to run unasked now asks](#a-command-that-used-to-run-unasked-now-asks) |
 | A setting will not stick, or a repository config key has no effect | [Configuration layers](#configuration-layers), [Why a rule is in force](#why-a-rule-is-in-force) |
 | Memory will not save, a project's memory is missing (including a shallow clone), or the store was refused | [Memory](#memory) |
+| A memory was or was not recalled, is marked "may be out of date", or disappeared from recall | [Memory](#memory) |
 | A permission profile key has no effect | [A permission profile key had no effect](#a-permission-profile-key-had-no-effect) |
 | A file read or search result was cut short | [A file read or search result was truncated](#a-file-read-or-search-result-was-truncated) |
 | A page the agent tried to read was not fetched, or a fetch approval did not appear after a reload | [A fetch was refused](#a-fetch-was-refused) |
@@ -456,8 +457,63 @@ by a `.gitignore`, with a message naming which of the two applied but not the
 protected path.
 
 Pattern matching cannot see every credential. That is why the confirmation step
-shows the exact sentence that will persist, and why a stored memory will be
-redacted again on its way into a request once recall ships.
+shows the exact sentence that will persist, and why a stored memory is redacted
+again on its way into a request and into the context panel. A credential edited
+into a memory file by hand is replaced by the redaction marker in both places;
+the line in the file is left as it is, so delete it there.
+
+**Why a memory was or was not recalled.** Each turn, recall reads the active
+entries of this session, this project's `project_key` and — only when
+`memory_user_scope_enabled=true` — user scope. It scores each entry by the words
+its statement shares with your message and the paths you named, ignoring common
+words; an entry with no shared word is not recalled. An `environment` or
+`command` entry ranks higher when the task is about running something, a
+`convention` or `decision` entry when it is about editing; that boost changes
+rank only and never makes an unrelated entry eligible. The top
+`memory_max_entries` (default 5) are offered to context assembly, which may
+still drop them when the `memory` share runs out — memory is the last category
+and the first dropped.
+
+| What you see | Why |
+|---|---|
+| The entry is in the context panel with `matched docker, tests` | Those statement words were in the prompt or a named path. `category fitted the task` means the boost applied. |
+| The entry is in the store but not in the panel | No shared word; another entry ranked higher under the cap; the `memory` share was used up (a `category_budget_exhausted` record); or one of the cases below. |
+| It is gone from recall and the store says `"state":"expired"` | Its own `expiry` or `memory_retention_days` passed. Recall marks it expired and records `memory_expired`. |
+| It is not recalled but is still `active` in the store | Its evidence path is now under `restricted_patterns` or ignored by a `.gitignore`. See *withdrawn* below. |
+| Removed at send with `memory_no_longer_active` in the manifest | It was deleted, superseded, expired or withdrawn between assembly and send — for example while the pre-send review was paused. It was not sent. |
+
+Recall is audited:
+
+| Audit event | Meaning |
+|---|---|
+| `memory_recalled` | The entry was in the request that was actually sent — once per entry per send. A declined review, a removal and a budget drop record nothing. This answers "when was this last used?". |
+| `memory_verification_changed` | An entry derived from a file changed state: `fromVerification` and `toVerification` are `evidence_current` or `evidence_stale`. |
+| `memory_recall_withdrawn` | An entry was skipped because its evidence is no longer readable by policy. `reason` is `evidence_restricted`, `evidence_ignored` or `evidence_not_relative`, with the `path`. Recorded once per entry and reason per app run. |
+
+**Staleness.** An entry derived from a repository file records that file's
+content hash. Every time recall is about to use the entry it hashes the file
+again: a different hash, or a deleted or unreadable file, makes it
+`evidence_stale`; the same hash (including after a revert) makes it
+`evidence_current` again. The check runs at recall rather than on file-watcher
+events, so a missed watcher event cannot leave a stale entry looking current. A
+stale entry is still recalled, with *may be out of date — that file has changed
+since* in the text the model reads and a **stale** count on the panel's Memory
+line. If the fact is still true, nothing needs doing; if it is not, remove it
+from the turn in the pre-send review and delete or replace the entry. Editing
+and deleting entries from the app arrive with the memory management view; until
+then, append a record with the same `id` and `"state":"deleted"` to the project
+file, as described under *Read one* above.
+
+**Withdrawn, not stale.** An evidence path that becomes protected or ignored is
+a different event: you told Damaian to stay out of that file, so a statement
+derived from it is not sent at all, not even with a marker. The entry stays
+`active` in the store and returns as soon as the rule is narrowed. No file
+changed, so this is checked at recall too.
+
+**Retention.** `memory_retention_days` in your user config (default `0`, no
+expiry) expires entries older than that many days the next time recall reads
+them. A repository and a permission profile cannot set it. An entry's own
+`expiry` applies regardless of the setting.
 
 **A newer schema.** Opening a store written by a newer build fails with the
 marker path and both versions and changes nothing. Upgrade Damaian, or point
@@ -995,10 +1051,11 @@ Inside the manifest:
 | `limit` | The token limit categories divided, and where it came from — see [Declared and observed limits](#declared-and-observed-limits). |
 | `totalTokens` | Sum of the included items' estimated tokens. |
 | `categories` | One entry per category **in budget order**: `category`, `allocated` (after redistribution from earlier categories), `used`, `items`, `truncated`, `estimated`. `estimated` is always `true` for assembly: the figure is the estimator's, never a provider measurement. |
-| `included` | One entry per item: `category`, `kind`, `path`, `lineRange`, `tokens`, `rootPath`, `provenance`. `kind` is the source label the prompt header shows (`explicit_file`, `retrieved_file`, `agent_instruction`, `project_rule`, `hook_context`, `repository_map`, `symbols`, `plan_state`); your own message is listed as `user_prompt` with no path. `category` is the budget bucket, which is not always the same thing: a search hit is `kind: retrieved_file` but `category: search_results`. The entry records where the item came from and how big it was, never its text. |
+| `included` | One entry per item: `category`, `kind`, `path`, `lineRange`, `tokens`, `rootPath`, `provenance`. `kind` is the source label the prompt header shows (`explicit_file`, `retrieved_file`, `agent_instruction`, `project_rule`, `hook_context`, `repository_map`, `symbols`, `plan_state`, `memory`); your own message is listed as `user_prompt` with no path. `category` is the budget bucket, which is not always the same thing: a search hit is `kind: retrieved_file` but `category: search_results`. The entry records where the item came from and how big it was, never its text. |
 | `excluded` | One entry per item left out or shortened: `reason`, `path`, `lineRange`, `category`, `detail`. |
 | `conversationSummary` | The #55 summary this turn sent, when it has one: `tokens`, `messages`, `throughSeq`, `factsOnly`. It is not an `included` item because it travels inside `Recent conversation:`; `null` when there is no summary. |
 | `symbolProvenance` | For the symbols block, `total`, `languageServer` and `heuristic`. The one `included` entry for the block can only carry the weakest provenance; these are the counts behind "12 symbols (4 heuristic)". |
+| `memory` | One row per recalled memory the request carries, in the order of the `memory` items: `entryId`, `matchReason` (`matchedTerms`, `categoryBoost`) and `verification` at recall. **Never the statement** — the panel resolves the id against the store when it displays the row. A dropped or removed memory has no row. See [Memory](#memory). |
 
 `rootPath` is the repository root that owns the path: `""` means the repository
 root itself, `"packages/api"` a nested root from the repository map. It is
@@ -1029,6 +1086,7 @@ carries one today; a file item, an instruction file and hook context are `null`.
 | `user_removed` | You removed an optional item in a paused pre-send review, or removed the conversation summary. It applies to that turn only. | Yes, spec 27 |
 | `path_not_selected` | The session's path restriction admits only selected paths, and this one is not among them. `AGENTS.md` is exempt by design. | Yes, spec 27 |
 | `missing` | A pinned file no longer reads: it was deleted or became unreadable. The pin stays in the session. | Yes, spec 27 |
+| `memory_no_longer_active` | A recalled memory was deleted, superseded, expired or withdrawn between assembly and send, so it was taken out of the request. `detail` names the entry id, never the statement. | Yes, spec 30 |
 
 `secret_bearing` and `total_budget_exhausted` are not produced by this version;
 they arrive with the stages that generate them. A file that is simply missing or

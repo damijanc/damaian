@@ -371,7 +371,7 @@ use workspace_engine::{
     AuditLog, EvidenceRef, MAX_SUGGESTIONS_PER_TASK, MEMORY_SCHEMA_VERSION, MemoryCategory,
     MemoryEntry, MemoryError, MemoryExpiry, MemoryProposal, MemoryProposalGate, MemoryProvenance,
     MemorySchemaOutcome, MemoryScope, MemoryState, MemoryStore, MemoryStoreConfig, PathPolicy,
-    ProposalOrigin, Sensitivity, UserConfirmation, Verification,
+    ProposalOrigin, Sensitivity, UserConfirmation, Verification, evidence_ref_for,
 };
 
 fn memory_store(root: &Path, user_scope_enabled: bool) -> MemoryStore {
@@ -392,6 +392,7 @@ fn memory_store_with(
             data_dir: config.data_dir.clone(),
             user_scope_enabled,
             ignore_patterns: config.ignore_patterns.clone(),
+            retention_days: config.memory_retention_days,
         },
         audit,
         scanner,
@@ -768,6 +769,7 @@ fn the_store_follows_config_default_data_dir() {
             data_dir: data_dir.clone(),
             user_scope_enabled: false,
             ignore_patterns: Vec::new(),
+            retention_days: 0,
         },
         audit,
         scanner,
@@ -1459,6 +1461,7 @@ fn a_disabled_audit_log_writes_no_memory_events() {
             data_dir: config.data_dir.clone(),
             user_scope_enabled: false,
             ignore_patterns: config.ignore_patterns.clone(),
+            retention_days: config.memory_retention_days,
         },
         audit,
         scanner,
@@ -2754,4 +2757,1382 @@ fn ignored_evidence_is_refused_after_the_file_was_indexed() {
     );
     assert!(audit_text(&root).contains("evidence_ignored"));
     assert!(store.pending_proposals(&session).unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Spec 30 Task 2: recall and retrieval-time lifecycle.
+// ---------------------------------------------------------------------------
+
+/// An evidence-derived entry whose verification is current when inserted.
+fn evidence_entry(
+    root: &Path,
+    identity: &ProjectIdentity,
+    statement: &str,
+    paths: &[&str],
+) -> MemoryEntry {
+    let mut entry = project_entry(&identity.key, statement);
+    entry.provenance = MemoryProvenance::RepositoryEvidence {
+        paths: paths
+            .iter()
+            .map(|path| evidence_ref_for(root, path).unwrap())
+            .collect(),
+    };
+    entry.verification = Verification::EvidenceCurrent;
+    entry
+}
+
+fn recall_for(
+    store: &MemoryStore,
+    root: &Path,
+    identity: &ProjectIdentity,
+    session_id: &str,
+    prompt: &str,
+    cap: usize,
+) -> Vec<workspace_engine::RecalledMemory> {
+    let no_paths: Vec<String> = Vec::new();
+    store
+        .recall(root, identity, session_id, prompt, &no_paths, cap)
+        .unwrap()
+}
+
+#[test]
+fn recall_selects_each_scope_and_never_another_session() {
+    let root = temp_dir("recall-scopes");
+    let store = memory_store(&root, true);
+    let identity = project_identity("root_recall_scopes");
+    let sessions = SessionStore::new(root.join(".damaian"));
+    let first = sessions.create_session("repo_fixture", "first").unwrap();
+    let second = sessions.create_session("repo_fixture", "second").unwrap();
+    let statement = "The review checkout uses the staging database.";
+
+    let session_memory = store
+        .insert(&root, None, session_entry(&first.id, statement))
+        .unwrap();
+    let project_memory = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, statement),
+        )
+        .unwrap();
+    let user_memory = store.insert(&root, None, user_entry(statement)).unwrap();
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        &first.id,
+        "review checkout staging database",
+        5,
+    );
+    assert_eq!(recalled.len(), 3);
+    let mut scopes: Vec<&str> = recalled
+        .iter()
+        .map(|recalled| recalled.entry.scope.as_str())
+        .collect();
+    scopes.sort();
+    assert_eq!(scopes, vec!["project", "session", "user"]);
+    for id in [&session_memory.id, &project_memory.id, &user_memory.id] {
+        assert!(
+            recalled.iter().any(|recalled| &recalled.entry.id == id),
+            "missing {id}"
+        );
+    }
+
+    let other_session = recall_for(
+        &store,
+        &root,
+        &identity,
+        &second.id,
+        "review checkout staging database",
+        5,
+    );
+    assert_eq!(
+        other_session.len(),
+        2,
+        "the first session's fact is private"
+    );
+    assert!(
+        !other_session
+            .iter()
+            .any(|recalled| recalled.entry.id == session_memory.id)
+    );
+}
+
+#[test]
+fn disabling_user_scope_stops_recall_without_deleting_the_entry() {
+    let root = temp_dir("recall-user-off");
+    let enabled = memory_store(&root, true);
+    let identity = project_identity("root_recall_user_off");
+    let stored = enabled
+        .insert(
+            &root,
+            None,
+            user_entry("Prefer short commit subjects for this person."),
+        )
+        .unwrap();
+
+    let recalled = recall_for(
+        &enabled,
+        &root,
+        &identity,
+        "session_missing",
+        "commit subjects",
+        5,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].entry.id, stored.id);
+
+    let disabled = memory_store(&root, false);
+    assert!(
+        recall_for(
+            &disabled,
+            &root,
+            &identity,
+            "session_missing",
+            "commit subjects",
+            5
+        )
+        .is_empty(),
+        "a disabled user scope must not influence recall"
+    );
+    assert!(disabled.user_entries().unwrap().is_empty());
+    assert_eq!(
+        enabled.user_entries().unwrap().len(),
+        1,
+        "turning the scope off does not delete the entry"
+    );
+}
+
+#[test]
+fn expired_superseded_and_deleted_entries_are_never_recalled() {
+    let root = temp_dir("recall-state-filter");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_state");
+    let target = MemoryTarget::Project(&identity);
+    let statement = "Docker compose defines the Postgres service.";
+
+    let active = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, statement),
+        )
+        .unwrap();
+    let expired = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, statement),
+        )
+        .unwrap();
+    store
+        .mark_state(target, &expired.id, MemoryState::Expired)
+        .unwrap();
+    let superseded = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, statement),
+        )
+        .unwrap();
+    store
+        .mark_state(target, &superseded.id, MemoryState::Superseded)
+        .unwrap();
+    let deleted = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, statement),
+        )
+        .unwrap();
+    store
+        .mark_state(target, &deleted.id, MemoryState::Deleted)
+        .unwrap();
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "docker compose postgres",
+        10,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].entry.id, active.id);
+    assert_eq!(recalled[0].entry.state, MemoryState::Active);
+}
+
+#[test]
+fn the_cap_selects_the_strongest_overlap_and_reports_why() {
+    let root = temp_dir("recall-cap");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_cap");
+
+    let weak = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(
+                &identity.key,
+                "The parser uses a rope buffer for large files.",
+            ),
+        )
+        .unwrap();
+    let strong = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "The parser rejects trailing commas."),
+        )
+        .unwrap();
+    store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "The linter enforces two-space indentation."),
+        )
+        .unwrap();
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "fix the parser trailing commas",
+        1,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].entry.id, strong.id);
+    assert_eq!(
+        recalled[0].match_reason.matched_terms,
+        vec!["commas", "parser", "trailing"]
+    );
+    assert!(recalled[0].match_reason.category_boost);
+    assert!(recalled[0].match_reason.describe().contains("commas"));
+
+    let all = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "fix the parser trailing commas",
+        5,
+    );
+    assert_eq!(all.len(), 2, "the unrelated entry has no overlap");
+    assert!(all.iter().any(|recalled| recalled.entry.id == weak.id));
+
+    assert!(
+        recall_for(
+            &store,
+            &root,
+            &identity,
+            "session_missing",
+            "fix the parser trailing commas",
+            0
+        )
+        .is_empty(),
+        "a zero cap recalls nothing"
+    );
+}
+
+#[test]
+fn a_running_task_boosts_environment_entries_over_equally_matched_facts() {
+    let root = temp_dir("recall-boost");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_boost");
+
+    let mut environment = project_entry(&identity.key, "Docker service is required.");
+    environment.category = MemoryCategory::Environment;
+    let environment = store.insert(&root, Some(&identity), environment).unwrap();
+    let mut fact = project_entry(&identity.key, "Docker service is pinned.");
+    fact.category = MemoryCategory::Fact;
+    store.insert(&root, Some(&identity), fact).unwrap();
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "run the service",
+        5,
+    );
+    assert_eq!(recalled.len(), 2);
+    assert_eq!(
+        recalled[0].entry.id, environment.id,
+        "the running-task boost ranks the environment entry first"
+    );
+    assert!(recalled[0].match_reason.category_boost);
+    assert!(!recalled[1].match_reason.category_boost);
+
+    let without_intent = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "the service",
+        5,
+    );
+    assert_eq!(without_intent.len(), 2);
+    assert!(
+        without_intent
+            .iter()
+            .all(|recalled| !recalled.match_reason.category_boost),
+        "no running term means no boost"
+    );
+}
+
+#[test]
+fn explicit_paths_contribute_relevance_terms() {
+    let root = temp_dir("recall-explicit-paths");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_paths");
+    let stored = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(
+                &identity.key,
+                "The docker-compose file defines the Postgres service.",
+            ),
+        )
+        .unwrap();
+
+    let paths = vec!["docker-compose.yml".to_string()];
+    let recalled = store
+        .recall(
+            &root,
+            &identity,
+            "session_missing",
+            "review this change",
+            &paths,
+            5,
+        )
+        .unwrap();
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].entry.id, stored.id);
+    assert!(
+        recalled[0]
+            .match_reason
+            .matched_terms
+            .iter()
+            .any(|term| term == "docker-compose")
+    );
+}
+
+#[test]
+fn grammatical_overlap_alone_is_not_relevance() {
+    let root = temp_dir("recall-stopwords");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_stopwords");
+    store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "The project uses the standard layout."),
+        )
+        .unwrap();
+
+    assert!(
+        recall_for(
+            &store,
+            &root,
+            &identity,
+            "session_missing",
+            "Add a button to the project.",
+            5
+        )
+        .is_empty(),
+        "sharing only grammatical words must not recall an unrelated entry"
+    );
+}
+
+#[test]
+fn evidence_staleness_is_detected_at_recall_and_reverts() {
+    let root = temp_dir("recall-stale");
+    let original = "services:\n  postgres:\n    ports: ['5433:5432']\n";
+    fs::write(root.join("docker-compose.yml"), original).unwrap();
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_stale");
+    let stored = store
+        .insert(
+            &root,
+            Some(&identity),
+            evidence_entry(
+                &root,
+                &identity,
+                "The Postgres service listens on port 5433.",
+                &["docker-compose.yml"],
+            ),
+        )
+        .unwrap();
+
+    let current = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "postgres port 5433",
+        5,
+    );
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].verification, Verification::EvidenceCurrent);
+    assert!(!current[0].redacted);
+
+    fs::write(root.join("docker-compose.yml"), "changed externally\n").unwrap();
+    let stale = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "postgres port 5433",
+        5,
+    );
+    assert_eq!(stale[0].verification, Verification::EvidenceStale);
+    assert_eq!(stale[0].entry.verification, Verification::EvidenceStale);
+    let loaded = store.project_entries(&identity).unwrap();
+    assert_eq!(loaded[0].id, stored.id);
+    assert_eq!(loaded[0].state, MemoryState::Active);
+    assert_eq!(loaded[0].verification, Verification::EvidenceStale);
+    let audit = audit_text(&root);
+    assert!(audit.contains("memory_verification_changed"));
+    assert!(audit.contains("evidence_stale"));
+
+    // The revert is the same equality check in the other direction: a file
+    // that matches its recorded hash is current again, with no penalty.
+    fs::write(root.join("docker-compose.yml"), original).unwrap();
+    let reverted = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "postgres port 5433",
+        5,
+    );
+    assert_eq!(reverted[0].verification, Verification::EvidenceCurrent);
+    assert_eq!(
+        audit_text(&root)
+            .lines()
+            .filter(|line| line.contains("memory_verification_changed"))
+            .count(),
+        2,
+        "one transition to stale and one back to current"
+    );
+}
+
+#[test]
+fn a_deleted_evidence_path_is_stale_not_deleted() {
+    let root = temp_dir("recall-evidence-gone");
+    fs::write(root.join("settings.yml"), "port: 5433\n").unwrap();
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_evidence_gone");
+    let stored = store
+        .insert(
+            &root,
+            Some(&identity),
+            evidence_entry(
+                &root,
+                &identity,
+                "The settings file defines the Postgres port.",
+                &["settings.yml"],
+            ),
+        )
+        .unwrap();
+
+    fs::remove_file(root.join("settings.yml")).unwrap();
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "settings postgres port",
+        5,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].verification, Verification::EvidenceStale);
+    let loaded = store.project_entries(&identity).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].id, stored.id);
+    assert_eq!(loaded[0].state, MemoryState::Active);
+}
+
+#[test]
+fn restricted_and_ignored_evidence_is_withdrawn_and_restored() {
+    let root = temp_dir("recall-withdraw");
+    fs::create_dir_all(root.join("deploy")).unwrap();
+    fs::write(root.join("deploy/settings.yml"), "port: 5433\n").unwrap();
+    let identity = project_identity("root_recall_withdraw");
+    let open = memory_store(&root, false);
+    let stored = open
+        .insert(
+            &root,
+            Some(&identity),
+            evidence_entry(
+                &root,
+                &identity,
+                "The deploy settings define the Postgres port.",
+                &["deploy/settings.yml"],
+            ),
+        )
+        .unwrap();
+    let prompt = "deploy postgres port";
+
+    assert_eq!(
+        recall_for(&open, &root, &identity, "session_missing", prompt, 5).len(),
+        1
+    );
+
+    // A restriction added after creation fires no file event; retrieval is the
+    // only place that can notice it.
+    let restricted = memory_store_with(&root, false, |config| {
+        config
+            .restricted_patterns
+            .push("deploy/settings.yml".to_string());
+    });
+    assert!(recall_for(&restricted, &root, &identity, "session_missing", prompt, 5).is_empty());
+    let audit = audit_text(&root);
+    assert!(audit.contains("memory_recall_withdrawn"));
+    assert!(audit.contains("evidence_restricted"));
+    let loaded = restricted.project_entries(&identity).unwrap();
+    assert_eq!(loaded.len(), 1, "withdrawal is not deletion");
+    assert_eq!(loaded[0].id, stored.id);
+    assert_eq!(loaded[0].state, MemoryState::Active);
+
+    // Narrowing the restriction restores the entry, from the same store.
+    assert_eq!(
+        recall_for(&open, &root, &identity, "session_missing", prompt, 5).len(),
+        1
+    );
+
+    // The `.gitignore` route is the same event with a different rule source.
+    fs::write(root.join(".gitignore"), "deploy/\n").unwrap();
+    assert!(recall_for(&open, &root, &identity, "session_missing", prompt, 5).is_empty());
+    assert!(audit_text(&root).contains("evidence_ignored"));
+
+    fs::write(root.join(".gitignore"), "").unwrap();
+    assert_eq!(
+        recall_for(&open, &root, &identity, "session_missing", prompt, 5).len(),
+        1
+    );
+}
+
+#[test]
+fn recall_refuses_a_project_record_that_names_another_project() {
+    let root = temp_dir("recall-cross-project");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_mismatch");
+    store.ensure_schema().unwrap();
+    let foreign = full_entry("root_someone_else");
+    write_lines(
+        &store.project_path(&identity.key),
+        &[serde_json::to_string(&foreign).unwrap()],
+    );
+
+    let error = store
+        .recall(
+            &root,
+            &identity,
+            "session_missing",
+            "docker postgres",
+            &[],
+            5,
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Invalid(_)));
+    assert!(error.to_string().contains("cross a project boundary"));
+}
+
+#[test]
+fn recall_is_isolated_at_each_project_key_tier() {
+    let data_root = temp_dir("recall-isolation-tiers");
+    let store = memory_store(&data_root, false);
+    let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+    pairs.push((
+        repo_with_a_commit("recall-tier-root-first"),
+        repo_with_a_commit("recall-tier-root-second"),
+    ));
+
+    let remote_first = temp_dir("recall-tier-remote-first");
+    let remote_second = temp_dir("recall-tier-remote-second");
+    for (root, remote) in [
+        (&remote_first, "git@github.com:owner/recall-first.git"),
+        (&remote_second, "git@github.com:owner/recall-second.git"),
+    ] {
+        init_repo(root);
+        git(root, &["remote", "add", "origin", remote]);
+    }
+    pairs.push((remote_first, remote_second));
+
+    let path_first = temp_dir("recall-tier-path-first");
+    let path_second = temp_dir("recall-tier-path-second");
+    init_repo(&path_first);
+    init_repo(&path_second);
+    pairs.push((path_first, path_second));
+
+    for (tier, (owner_root, other_root)) in pairs.iter().enumerate() {
+        let owner = shared_identity(owner_root, &data_root);
+        let other = shared_identity(other_root, &data_root);
+        assert_ne!(owner.key, other.key, "tier {tier} needs distinct keys");
+        let stored = store
+            .insert(
+                owner_root,
+                Some(&owner),
+                project_entry(&owner.key, "Integration tests need Docker."),
+            )
+            .unwrap();
+
+        let recalled = recall_for(
+            &store,
+            owner_root,
+            &owner,
+            "session_missing",
+            "integration tests docker",
+            5,
+        );
+        assert_eq!(recalled.len(), 1, "owner recalls at tier {tier}");
+        assert_eq!(recalled[0].entry.id, stored.id);
+
+        assert!(
+            recall_for(
+                &store,
+                other_root,
+                &other,
+                "session_missing",
+                "integration tests docker",
+                5
+            )
+            .is_empty(),
+            "tier {tier} must not cross repositories"
+        );
+    }
+}
+
+#[test]
+fn retention_and_entry_expiry_transition_to_expired_before_ranking() {
+    let root = temp_dir("recall-retention");
+    let store = memory_store_with(&root, false, |config| config.memory_retention_days = 30);
+    let identity = project_identity("root_recall_retention");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let old_created = now.saturating_sub(31 * 24 * 60 * 60 * 1000);
+
+    let old = tampered(
+        project_entry(
+            &identity.key,
+            "Docker data is kept for thirty days of build output.",
+        ),
+        serde_json::json!({ "createdAtMs": old_created as u64 }),
+    );
+    let old = store.insert(&root, Some(&identity), old).unwrap();
+
+    let expiring = project_entry(
+        &identity.key,
+        "The staging URL is temporary during the migration.",
+    )
+    .with_expiry(MemoryExpiry {
+        expires_at_ms: Some(now.saturating_sub(1)),
+        revalidate_on_evidence_change: false,
+    });
+    let expiring = store.insert(&root, Some(&identity), expiring).unwrap();
+
+    let fresh = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Docker data is current."),
+        )
+        .unwrap();
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "docker data staging url build output",
+        10,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].entry.id, fresh.id);
+
+    let loaded = store.project_entries(&identity).unwrap();
+    for id in [&old.id, &expiring.id] {
+        let entry = loaded
+            .iter()
+            .find(|entry| &entry.id == id)
+            .expect("the expired entry remains in the store");
+        assert_eq!(entry.state, MemoryState::Expired);
+    }
+    assert_eq!(
+        audit_text(&root)
+            .lines()
+            .filter(|line| line.contains("memory_expired"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn a_credential_added_directly_to_the_memory_file_is_redacted_on_recall() {
+    let root = temp_dir("recall-secret");
+    let store = memory_store(&root, false);
+    let identity = project_identity("root_recall_secret");
+    let stored = store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Deploy uses a harmless token."),
+        )
+        .unwrap();
+    let poisoned = tampered(
+        stored,
+        serde_json::json!({
+            "statement": format!("Deploy with {SEEDED_SECRET} token."),
+            "sensitivity": "ordinary",
+        }),
+    );
+    write_lines(
+        &store.project_path(&identity.key),
+        &[serde_json::to_string(&poisoned).unwrap()],
+    );
+
+    let recalled = recall_for(
+        &store,
+        &root,
+        &identity,
+        "session_missing",
+        "deploy token",
+        5,
+    );
+    assert_eq!(recalled.len(), 1);
+    assert!(recalled[0].redacted);
+    assert!(!recalled[0].entry.statement.contains(SEEDED_SECRET));
+    assert!(recalled[0].entry.statement.contains("[REDACTED_"));
+    assert!(
+        fs::read_to_string(store.project_path(&identity.key))
+            .unwrap()
+            .contains(SEEDED_SECRET),
+        "recall redacts the read, it does not rewrite the user's file"
+    );
+
+    store
+        .record_recall(std::slice::from_ref(&recalled[0].entry))
+        .unwrap();
+    assert!(
+        !audit_text(&root).contains(SEEDED_SECRET),
+        "the audit log redacts a recalled statement too"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Turn wiring and the send-time re-check (spec 30 Task 4).
+// ---------------------------------------------------------------------------
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use workspace_engine::context_manager::ExclusionReason;
+use workspace_engine::{
+    CancelToken, ChatTurnResult, ContextCategory, ContextDecision, ContextManifest,
+    MemoryMatchReason, MemoryRecallRef, MockModelAdapter, ModelAdapter, RecallExclusionReason,
+    TaskStatus, TurnProgress, TurnSink, WorkspaceEngine,
+};
+
+type ProgressLog = Rc<RefCell<Vec<TurnProgress>>>;
+
+fn turn_engine(root: &Path, pause: bool) -> WorkspaceEngine {
+    let mut config = test_config(root);
+    config.pause_for_context_review = pause;
+    WorkspaceEngine::new(config)
+}
+
+fn turn_identity(engine: &WorkspaceEngine, root: &Path) -> ProjectIdentity {
+    ProjectIdentity::resolve_for_root(root, &engine.git).expect("the fixture has an identity")
+}
+
+fn insert_recalled(
+    engine: &WorkspaceEngine,
+    root: &Path,
+    identity: &ProjectIdentity,
+    statement: &str,
+) -> String {
+    engine
+        .memory_store
+        .insert(
+            root,
+            Some(identity),
+            project_entry(&identity.key, statement),
+        )
+        .expect("the fixture entry should be stored")
+        .id
+}
+
+fn ask_collecting(
+    engine: &WorkspaceEngine,
+    root: &Path,
+    prompt: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> (ChatTurnResult, ProgressLog) {
+    let cancel = CancelToken::new();
+    let mut tokens = |_token: &str| {};
+    let progress: ProgressLog = Rc::new(RefCell::new(Vec::new()));
+    let collected = Rc::clone(&progress);
+    let mut on_progress = move |event: TurnProgress| collected.borrow_mut().push(event);
+    let mut sink = TurnSink {
+        on_token: &mut tokens,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let result = engine
+        .chat_orchestrator
+        .ask_with_session(root, prompt, &[], None, adapter, &mut sink)
+        .expect("the turn should run or pause");
+    (result, progress)
+}
+
+fn resume_collecting(
+    engine: &WorkspaceEngine,
+    proposal: &str,
+    decision: ContextDecision,
+    adapter: &mut dyn ModelAdapter,
+) -> (workspace_engine::Result<ChatTurnResult>, ProgressLog) {
+    let cancel = CancelToken::new();
+    let mut tokens = |_token: &str| {};
+    let progress: ProgressLog = Rc::new(RefCell::new(Vec::new()));
+    let collected = Rc::clone(&progress);
+    let mut on_progress = move |event: TurnProgress| collected.borrow_mut().push(event);
+    let mut sink = TurnSink {
+        on_token: &mut tokens,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let result = engine.chat_orchestrator.resume_after_context_decision(
+        proposal,
+        decision,
+        "desktop_user",
+        adapter,
+        &mut sink,
+    );
+    (result, progress)
+}
+
+fn last_manifest(progress: &ProgressLog) -> ContextManifest {
+    progress
+        .borrow()
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            TurnProgress::Context(manifest) => Some((**manifest).clone()),
+            _ => None,
+        })
+        .expect("the turn emitted its context manifest")
+}
+
+const TURN_STATEMENT: &str = "Integration tests require Docker to be running.";
+const TURN_PROMPT: &str = "How do I run the integration tests?";
+
+#[test]
+fn a_turn_sends_recalled_memory_as_a_context_item_and_records_it_once() {
+    let root = repo_with_a_commit("turn-recall");
+    let engine = turn_engine(&root, false);
+    let identity = turn_identity(&engine, &root);
+    let entry_id = insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (result, progress) = ask_collecting(&engine, &root, TURN_PROMPT, &mut adapter);
+
+    assert_eq!(adapter.requests.len(), 1);
+    let sent = &adapter.requests[0].messages[1].content;
+    assert!(sent.contains("--- memory ---"), "{sent}");
+    assert!(
+        sent.contains("Remembered about this project (user-confirmed, "),
+        "{sent}"
+    );
+    assert!(sent.contains(TURN_STATEMENT), "{sent}");
+    assert_eq!(
+        sent.matches(TURN_STATEMENT).count(),
+        1,
+        "memory must not be duplicated elsewhere in the request: {sent}"
+    );
+
+    let manifest = last_manifest(&progress);
+    assert_eq!(manifest.memory.len(), 1);
+    assert_eq!(manifest.memory[0].entry_id, entry_id);
+    assert!(
+        !serde_json::to_string(&manifest)
+            .unwrap()
+            .contains(TURN_STATEMENT),
+        "the manifest names the entry, never its statement"
+    );
+
+    let audit = audit_text(&root);
+    let recalled_events: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains("\"eventType\":\"memory_recalled\""))
+        .collect();
+    assert_eq!(
+        recalled_events.len(),
+        1,
+        "one send is one recall record: {audit}"
+    );
+    assert!(recalled_events[0].contains(&entry_id), "{audit}");
+    assert_eq!(result.task.status, TaskStatus::Complete);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_declined_review_records_no_recall() {
+    let root = repo_with_a_commit("decline-no-recall");
+    let engine = turn_engine(&root, true);
+    let identity = turn_identity(&engine, &root);
+    insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (paused, _) = ask_collecting(&engine, &root, TURN_PROMPT, &mut adapter);
+    assert!(adapter.requests.is_empty(), "a pause sends nothing");
+    let review = paused.context_review.expect("the review is present");
+    assert_eq!(review.manifest.memory.len(), 1);
+    assert!(
+        !audit_text(&root).contains("memory_recalled"),
+        "assembly alone is not a recall"
+    );
+
+    let (declined, _) =
+        resume_collecting(&engine, &review.id, ContextDecision::Decline, &mut adapter);
+    let declined = declined.expect("declining is a result, not an error");
+    assert!(declined.cancelled);
+    assert!(adapter.requests.is_empty());
+    assert!(
+        !audit_text(&root).contains("memory_recalled"),
+        "a declined review sends nothing, so nothing was recalled"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn an_entry_deleted_between_assembly_and_send_is_absent_from_the_request() {
+    let root = repo_with_a_commit("delete-before-send");
+    let engine = turn_engine(&root, true);
+    let identity = turn_identity(&engine, &root);
+    let entry_id = insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (paused, _) = ask_collecting(&engine, &root, TURN_PROMPT, &mut adapter);
+    let review = paused.context_review.expect("the review is present");
+    assert_eq!(review.manifest.memory.len(), 1);
+    assert_eq!(review.manifest.memory[0].entry_id, entry_id);
+
+    engine
+        .memory_store
+        .mark_state(
+            MemoryTarget::Project(&identity),
+            &entry_id,
+            MemoryState::Deleted,
+        )
+        .unwrap();
+
+    let (resumed, progress) =
+        resume_collecting(&engine, &review.id, ContextDecision::Send, &mut adapter);
+    let resumed = resumed.expect("the amended context should send");
+
+    assert_eq!(adapter.requests.len(), 1);
+    let sent = &adapter.requests[0].messages[1].content;
+    assert!(
+        !sent.contains(TURN_STATEMENT),
+        "a deleted entry reached the model: {sent}"
+    );
+
+    let manifest = last_manifest(&progress);
+    assert!(
+        manifest.memory.is_empty(),
+        "the send-time drop must remove the manifest row too: {:?}",
+        manifest.memory
+    );
+    let dropped = manifest
+        .excluded
+        .iter()
+        .find(|record| record.reason == ExclusionReason::MemoryNoLongerActive)
+        .expect("the drop is recorded as an exclusion");
+    assert_eq!(dropped.category, ContextCategory::Memory);
+    assert!(
+        dropped
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(&entry_id) && detail.contains("no longer active")),
+        "{:?}",
+        dropped.detail
+    );
+    assert!(
+        !audit_text(&root).contains("memory_recalled"),
+        "an entry that was not sent is not recorded as recalled"
+    );
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_continuation_keeps_the_entries_the_turn_recalled_and_does_not_recall_again() {
+    let root = repo_with_a_commit("continuation-memory");
+    let engine = turn_engine(&root, true);
+    let identity = turn_identity(&engine, &root);
+    let reviewed_id = insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (paused, _) = ask_collecting(&engine, &root, TURN_PROMPT, &mut adapter);
+    let review = paused.context_review.expect("the review is present");
+    assert_eq!(review.manifest.memory.len(), 1);
+
+    // Relevant, but added after assembly. A second recall would pick it up; a
+    // continuation must send what the review showed instead.
+    let late_statement = "Integration tests run against a staging database.";
+    let late_id = insert_recalled(&engine, &root, &identity, late_statement);
+
+    let (resumed, progress) =
+        resume_collecting(&engine, &review.id, ContextDecision::Send, &mut adapter);
+    let resumed = resumed.expect("the reviewed context should send");
+
+    assert_eq!(adapter.requests.len(), 1);
+    let sent = &adapter.requests[0].messages[1].content;
+    assert!(sent.contains(TURN_STATEMENT), "{sent}");
+    assert!(
+        !sent.contains(late_statement),
+        "the continuation recalled again instead of keeping the reviewed entries: {sent}"
+    );
+
+    let manifest = last_manifest(&progress);
+    assert_eq!(manifest.memory.len(), 1);
+    assert_eq!(manifest.memory[0].entry_id, reviewed_id);
+
+    let audit = audit_text(&root);
+    let recalled_events: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains("\"eventType\":\"memory_recalled\""))
+        .collect();
+    assert_eq!(recalled_events.len(), 1, "{audit}");
+    assert!(recalled_events[0].contains(&reviewed_id), "{audit}");
+    assert!(!recalled_events[0].contains(&late_id), "{audit}");
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_send_time_recheck_names_what_it_drops() {
+    let root = temp_dir("recall-recheck");
+    fs::create_dir_all(root.join("deploy")).unwrap();
+    fs::write(root.join("deploy/settings.yml"), "port: 5433\n").unwrap();
+    let identity = project_identity("root_recall_recheck");
+    let open = memory_store(&root, false);
+
+    let active = open
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Docker is available on every build agent."),
+        )
+        .unwrap();
+    let deleted = open
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Docker publishes the deploy port."),
+        )
+        .unwrap();
+    let expiring = open
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "The deploy port is temporary.").with_expiry(
+                MemoryExpiry {
+                    expires_at_ms: Some(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis()
+                            + 3_600_000,
+                    ),
+                    revalidate_on_evidence_change: false,
+                },
+            ),
+        )
+        .unwrap();
+    let withdrawn = open
+        .insert(
+            &root,
+            Some(&identity),
+            evidence_entry(
+                &root,
+                &identity,
+                "The deploy settings define the Docker port.",
+                &["deploy/settings.yml"],
+            ),
+        )
+        .unwrap();
+
+    let recalled = recall_for(
+        &open,
+        &root,
+        &identity,
+        "session_missing",
+        "docker deploy port settings",
+        10,
+    );
+    assert_eq!(recalled.len(), 4, "{recalled:?}");
+
+    // The world changes after assembly: one entry is deleted and one has its
+    // expiry moved into the past. Rewriting the replay file is how a clock
+    // passes without the test sleeping.
+    open.mark_state(
+        MemoryTarget::Project(&identity),
+        &deleted.id,
+        MemoryState::Deleted,
+    )
+    .unwrap();
+    let mut entries = open.project_entries(&identity).unwrap();
+    for entry in &mut entries {
+        if entry.id == expiring.id {
+            entry.expiry = Some(MemoryExpiry {
+                expires_at_ms: Some(0),
+                revalidate_on_evidence_change: false,
+            });
+        }
+    }
+    let lines: Vec<String> = entries
+        .iter()
+        .map(|entry| serde_json::to_string(entry).unwrap())
+        .collect();
+    write_lines(&open.project_path(&identity.key), &lines);
+
+    let restricted = memory_store_with(&root, false, |config| {
+        config
+            .restricted_patterns
+            .push("deploy/settings.yml".to_string());
+    });
+    let exclusions = restricted
+        .recheck_recall(&root, &identity, "session_missing", &recalled)
+        .unwrap();
+
+    let reason = |id: &str| {
+        exclusions
+            .iter()
+            .find(|exclusion| exclusion.entry_id == id)
+            .map(|exclusion| exclusion.reason)
+    };
+    assert_eq!(reason(&active.id), None, "a live entry is still sent");
+    assert_eq!(reason(&deleted.id), Some(RecallExclusionReason::NotActive));
+    assert_eq!(reason(&expiring.id), Some(RecallExclusionReason::Expired));
+    assert_eq!(
+        reason(&withdrawn.id),
+        Some(RecallExclusionReason::EvidenceWithdrawn)
+    );
+    assert!(exclusions.iter().all(|exclusion| {
+        let detail = exclusion.detail();
+        !detail.contains("Docker") && detail.contains(&exclusion.entry_id)
+    }));
+
+    let loaded = restricted.project_entries(&identity).unwrap();
+    let stored = |id: &str| loaded.iter().find(|entry| entry.id == id).unwrap();
+    assert_eq!(stored(&expiring.id).state, MemoryState::Expired);
+    assert_eq!(
+        stored(&withdrawn.id).state,
+        MemoryState::Active,
+        "withdrawal is not deletion"
+    );
+    assert!(audit_text(&root).contains("memory_recall_withdrawn"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The inspector's display read (spec 30 Task 5).
+// ---------------------------------------------------------------------------
+
+fn display_ref(entry_id: &str) -> MemoryRecallRef {
+    MemoryRecallRef {
+        entry_id: entry_id.to_string(),
+        match_reason: MemoryMatchReason {
+            matched_terms: vec!["integration".to_string()],
+            category_boost: false,
+        },
+        verification: Verification::UserConfirmed,
+    }
+}
+
+#[test]
+fn a_display_read_resolves_only_entries_this_project_and_session_may_see() {
+    let root = repo_with_a_commit("display-scope");
+    let other_root = repo_with_a_commit("display-other");
+    let engine = turn_engine(&root, false);
+    let identity = turn_identity(&engine, &root);
+    let other_identity = turn_identity(&engine, &other_root);
+    let visible = insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let hidden_statement = "The other project deploys on Friday.";
+    let hidden = engine
+        .memory_store
+        .insert(
+            &other_root,
+            Some(&other_identity),
+            project_entry(&other_identity.key, hidden_statement),
+        )
+        .unwrap();
+    let audited_before = audit_text(&root).matches(hidden_statement).count();
+
+    let entries = engine
+        .chat_orchestrator
+        .resolve_memory_display(
+            &root,
+            "session_display",
+            &[
+                display_ref(&visible),
+                display_ref(&hidden.id),
+                display_ref("entry_missing"),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(entries.len(), 3);
+    assert!(!entries[0].deleted);
+    assert_eq!(entries[0].statement.as_deref(), Some(TURN_STATEMENT));
+    assert_eq!(entries[0].scope, Some(MemoryScope::Project));
+    assert_eq!(entries[0].category, Some(MemoryCategory::Convention));
+    assert!(entries[0].provenance.is_some());
+    assert_eq!(entries[0].match_reason.matched_terms, vec!["integration"]);
+    assert!(
+        entries[1].deleted,
+        "another project's entry must not resolve"
+    );
+    assert!(entries[1].statement.is_none());
+    assert!(entries[2].deleted, "a missing id reads as deleted");
+    assert!(entries[2].statement.is_none());
+    let serialized = serde_json::to_string(&entries).unwrap();
+    assert!(!serialized.contains(hidden_statement));
+    assert_eq!(
+        audit_text(&root).matches(hidden_statement).count(),
+        audited_before,
+        "a display read must not add the statement to the audit log"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(other_root).unwrap();
+}
+
+#[test]
+fn a_deleted_entry_reads_as_deleted_in_the_inspector() {
+    let root = repo_with_a_commit("display-deleted");
+    let engine = turn_engine(&root, false);
+    let identity = turn_identity(&engine, &root);
+    let entry_id = insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    engine
+        .memory_store
+        .mark_state(
+            MemoryTarget::Project(&identity),
+            &entry_id,
+            MemoryState::Deleted,
+        )
+        .unwrap();
+
+    let entries = engine
+        .chat_orchestrator
+        .resolve_memory_display(&root, "session_display", &[display_ref(&entry_id)])
+        .unwrap();
+    assert!(entries[0].deleted);
+    assert!(entries[0].statement.is_none());
+    assert!(
+        !serde_json::to_string(&entries)
+            .unwrap()
+            .contains(TURN_STATEMENT)
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_credential_in_the_memory_file_is_redacted_for_the_inspector() {
+    let root = repo_with_a_commit("display-secret");
+    let engine = turn_engine(&root, false);
+    let identity = turn_identity(&engine, &root);
+    let stored = engine
+        .memory_store
+        .insert(
+            &root,
+            Some(&identity),
+            project_entry(&identity.key, "Deploy uses a harmless token."),
+        )
+        .unwrap();
+    let poisoned = tampered(
+        stored,
+        serde_json::json!({
+            "statement": format!("Deploy with {SEEDED_SECRET} token."),
+            "sensitivity": "ordinary",
+        }),
+    );
+    write_lines(
+        &engine.memory_store.project_path(&identity.key),
+        &[serde_json::to_string(&poisoned).unwrap()],
+    );
+
+    let entries = engine
+        .chat_orchestrator
+        .resolve_memory_display(&root, "session_display", &[display_ref(&poisoned.id)])
+        .unwrap();
+    assert!(entries[0].redacted);
+    let statement = entries[0].statement.as_deref().unwrap();
+    assert!(!statement.contains(SEEDED_SECRET));
+    assert!(statement.contains("[REDACTED_"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_memory_removed_in_the_review_is_absent_from_the_resumed_request() {
+    let root = repo_with_a_commit("remove-before-send");
+    let engine = turn_engine(&root, true);
+    let identity = turn_identity(&engine, &root);
+    insert_recalled(&engine, &root, &identity, TURN_STATEMENT);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (paused, _) = ask_collecting(&engine, &root, TURN_PROMPT, &mut adapter);
+    let review = paused.context_review.expect("the review is present");
+    assert_eq!(review.manifest.memory.len(), 1);
+    let index = review
+        .manifest
+        .included
+        .iter()
+        .position(|item| item.category == ContextCategory::Memory)
+        .expect("the memory item is included");
+
+    let amended = engine
+        .chat_orchestrator
+        .remove_context_item(&review.id, index)
+        .unwrap();
+    assert!(amended.memory.is_empty(), "{:?}", amended.memory);
+    assert!(
+        amended
+            .excluded
+            .iter()
+            .any(|record| record.reason == ExclusionReason::UserRemoved),
+        "{:?}",
+        amended.excluded
+    );
+
+    let (resumed, progress) =
+        resume_collecting(&engine, &review.id, ContextDecision::Send, &mut adapter);
+    let resumed = resumed.expect("the amended review should send");
+    assert_eq!(adapter.requests.len(), 1);
+    let sent = &adapter.requests[0].messages[1].content;
+    assert!(!sent.contains(TURN_STATEMENT), "{sent}");
+    assert!(last_manifest(&progress).memory.is_empty());
+    assert!(
+        !audit_text(&root).contains("memory_recalled"),
+        "a removed entry was not sent, so it was not recalled"
+    );
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+
+    fs::remove_dir_all(root).unwrap();
 }

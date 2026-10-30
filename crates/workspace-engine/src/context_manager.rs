@@ -1,10 +1,11 @@
 use crate::command_policy::CommandPolicy;
 use crate::compaction::ConversationSummary;
 use crate::error::{ClientError, Result};
-use crate::external_reference::ExternalReference;
+use crate::external_reference::{ExternalReference, utc_date};
 use crate::file_access::{FileAccessController, LineRange};
 use crate::hash::now_millis;
 use crate::indexer::RepositoryIndex;
+use crate::memory::{MemoryMatchReason, MemoryProvenance, RecalledMemory, Verification};
 use crate::path_policy::PathPolicy;
 use crate::plan::TaskPlan;
 use crate::repository_map::{RepositoryMap, RepositoryMapStore};
@@ -53,9 +54,14 @@ pub enum ContextCategory {
     Findings,
     /// Reserved for spec 55.
     ConversationSummary,
-    /// A page fetched by spec 51's `fetch_url`. Last, so a crowded context
-    /// drops a fetched page before any repository content (spec 51 D6).
+    /// A page fetched by spec 51's `fetch_url`. It precedes every
+    /// repository-content category in drop order; spec 30's `Memory` is the one
+    /// category declared after it (spec 51 D6).
     ExternalReference,
+    /// Remembered statements the user confirmed (spec 30 §5.1). Last, so a
+    /// crowded context drops memory before anything else: losing a remembered
+    /// fact costs a little convenience, while losing code costs the answer.
+    Memory,
 }
 
 impl ContextCategory {
@@ -73,12 +79,13 @@ impl ContextCategory {
             Self::Findings => "findings",
             Self::ConversationSummary => "conversation_summary",
             Self::ExternalReference => "external_reference",
+            Self::Memory => "memory",
         }
     }
 
     /// The budgeted categories, in pipeline order after `Required`, which has no
     /// share (proposal §5.2). Declaration order of the enum is the same order.
-    pub const BUDGETED: [ContextCategory; 11] = [
+    pub const BUDGETED: [ContextCategory; 12] = [
         ContextCategory::Instructions,
         ContextCategory::HookContext,
         ContextCategory::Pinned,
@@ -90,6 +97,7 @@ impl ContextCategory {
         ContextCategory::Findings,
         ContextCategory::ConversationSummary,
         ContextCategory::ExternalReference,
+        ContextCategory::Memory,
     ];
 
     /// The index into [`ContextBudget::shares`]; `None` for `Required`.
@@ -107,6 +115,7 @@ impl ContextCategory {
             Self::Findings => Some(8),
             Self::ConversationSummary => Some(9),
             Self::ExternalReference => Some(10),
+            Self::Memory => Some(11),
         }
     }
 }
@@ -122,7 +131,7 @@ pub struct ContextBudget {
     /// One share per [`ContextCategory::BUDGETED`] category, in that order.
     /// The sum must be at most 10,000; a set that oversubscribes is a config
     /// error rather than a silent scale-down.
-    pub shares: [u16; 11],
+    pub shares: [u16; 12],
     /// The share of an observed window reserved for estimate error. It is not
     /// applied to the declared `context_token_budget` (proposal §5.7).
     pub safety_margin_bps: u16,
@@ -140,9 +149,10 @@ impl Default for ContextBudget {
                 1_000, // symbols
                 1_000, // search_results
                 2_500, // file_ranges
-                500,   // findings
+                200,   // findings — pays for memory; it has no producer yet
                 500,   // conversation_summary
                 500,   // external_reference
+                300,   // memory
             ],
             safety_margin_bps: 1_000,
         }
@@ -268,6 +278,8 @@ pub enum ContextKind {
     Pinned,
     /// Text of a page `fetch_url` retrieved (spec 51 §5.4).
     ExternalReference,
+    /// A remembered statement (spec 30 §5.2).
+    Memory,
 }
 
 impl ContextKind {
@@ -284,6 +296,7 @@ impl ContextKind {
             Self::PlanState => "plan_state",
             Self::Pinned => "pinned",
             Self::ExternalReference => "external_reference",
+            Self::Memory => "memory",
         }
     }
 
@@ -305,6 +318,7 @@ impl ContextKind {
             Self::RetrievedFile => ContextCategory::SearchResults,
             Self::ExplicitFile => ContextCategory::FileRanges,
             Self::ExternalReference => ContextCategory::ExternalReference,
+            Self::Memory => ContextCategory::Memory,
         }
     }
 }
@@ -461,6 +475,10 @@ pub enum ExclusionReason {
     /// A pinned file no longer reads: it was deleted, or became unreadable.
     /// Recorded instead of dropping the pin silently (spec 27 §5.4).
     Missing,
+    /// A memory recalled at assembly was deleted, expired, superseded, or had
+    /// its evidence withdrawn before the request was sent (spec 30 §5.6). The
+    /// item and its `memory` manifest row are both dropped.
+    MemoryNoLongerActive,
 }
 
 /// One item that did not enter the plan, with the reason. Never content.
@@ -546,6 +564,31 @@ pub struct SymbolProvenanceCounts {
     pub heuristic: usize,
 }
 
+/// One recalled memory as the manifest records it (spec 30 §5.4, C3, C10).
+///
+/// The id resolves to the statement in the store at display time. The manifest
+/// is written to the audit log, so a statement here would copy personal and
+/// environmental text into an append-only record — the exposure spec 28 §5.8
+/// refuses. The match reason comes from the prompt rather than the entry, and
+/// the verification is the state recall left the entry in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRecallRef {
+    pub entry_id: String,
+    pub match_reason: MemoryMatchReason,
+    pub verification: Verification,
+}
+
+impl MemoryRecallRef {
+    pub fn from_recalled(recalled: &RecalledMemory) -> Self {
+        Self {
+            entry_id: recalled.entry.id.clone(),
+            match_reason: recalled.match_reason.clone(),
+            verification: recalled.verification,
+        }
+    }
+}
+
 /// What one assembly included and left out, by path, range, count and reason
 /// (proposal §5.5).
 ///
@@ -576,6 +619,11 @@ pub struct ContextManifest {
     /// Provenance counts for the symbols block, when one was included.
     #[serde(default)]
     pub symbol_provenance: Option<SymbolProvenanceCounts>,
+    /// One row per included `Memory` item, in item order (spec 30 C3, C10,
+    /// C14). Never the statement. `#[serde(default)]` keeps a
+    /// `context_assembled` event written before this field readable.
+    #[serde(default)]
+    pub memory: Vec<MemoryRecallRef>,
 }
 
 impl ContextManifest {
@@ -725,14 +773,84 @@ impl PreparedContext {
                 "Required context cannot be removed".to_string(),
             ));
         }
+        Ok(self.remove_item(
+            index,
+            ExclusionReason::UserRemoved,
+            "removed for this turn by the user".to_string(),
+        ))
+    }
+
+    /// Drops a memory item whose entry may no longer be sent (spec 30 §5.6).
+    ///
+    /// The send-time re-check names the entry id, not an item index, because
+    /// the turn may have paused and resumed since assembly. Its `memory`
+    /// manifest row goes with the item (C14), so the inspector cannot name a
+    /// statement the request no longer carries. An entry already removed from
+    /// the review, or one the budget never included, has no row and yields
+    /// `None`.
+    pub fn remove_memory(
+        &mut self,
+        entry_id: &str,
+        detail: String,
+    ) -> Result<Option<ExclusionRecord>> {
+        let Some(position) = self
+            .manifest
+            .memory
+            .iter()
+            .position(|reference| reference.entry_id == entry_id)
+        else {
+            return Ok(None);
+        };
+        let index = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.category == ContextCategory::Memory)
+            .nth(position)
+            .map(|(index, _)| index)
+            .ok_or_else(|| {
+                ClientError::InvalidInput(format!(
+                    "the manifest names memory entry {entry_id} but the plan has no such item"
+                ))
+            })?;
+        Ok(Some(self.remove_item(
+            index,
+            ExclusionReason::MemoryNoLongerActive,
+            detail,
+        )))
+    }
+
+    /// The one removal path. Callers decide the reason and the detail; the
+    /// manifest bookkeeping is identical for a user removal and a send-time
+    /// rejection.
+    fn remove_item(
+        &mut self,
+        index: usize,
+        reason: ExclusionReason,
+        detail: String,
+    ) -> ExclusionRecord {
+        let item = &self.items[index];
         let category = item.category;
         let record = ExclusionRecord {
-            reason: ExclusionReason::UserRemoved,
+            reason,
             path: item.path.clone(),
             range: item.range,
             category,
-            detail: Some("removed for this turn by the user".to_string()),
+            detail: Some(detail),
         };
+        // A memory ref exists only for an included `Memory` item and the refs
+        // are 1:1 with those items in item order (C14), so the ref for this
+        // index is the count of `Memory` items before it. Leaving it behind
+        // would show a statement the request no longer carries.
+        if category == ContextCategory::Memory {
+            let position = self.items[..index]
+                .iter()
+                .filter(|item| item.category == ContextCategory::Memory)
+                .count();
+            if position < self.manifest.memory.len() {
+                self.manifest.memory.remove(position);
+            }
+        }
         self.items.remove(index);
         push_exclusion(&mut self.manifest.excluded, record.clone());
         if let Some(usage) = self
@@ -755,7 +873,7 @@ impl PreparedContext {
         }
         self.manifest.included = self.items.iter().map(IncludedRef::from_item).collect();
         self.manifest.total_tokens = self.items.iter().map(|item| item.tokens).sum();
-        Ok(record)
+        record
     }
 
     /// Removes the #55 conversation summary for this turn.
@@ -911,6 +1029,11 @@ pub struct ContextRequest<'a> {
     /// `SessionStore` by the caller. Each becomes an `ExternalReference` item
     /// with the text already converted by the fetch task.
     pub external_references: &'a [ExternalReference],
+    /// The entries recall selected for this turn (spec 30 §5.1), read from
+    /// `MemoryStore` by the caller. Each becomes its own `Memory` item, so one
+    /// entry can be removed without removing the others (C4). Empty for every
+    /// caller with no turn to recall for (C5).
+    pub memory: &'a [RecalledMemory],
 }
 
 /// A gap of at most this many lines still merges two ranges (proposal §5.4).
@@ -1356,6 +1479,7 @@ impl ContextManager {
             restriction,
             conversation_summary,
             external_references,
+            memory,
         } = request;
 
         // Normalise the restriction once, with the read path's own resolver,
@@ -1638,16 +1762,33 @@ impl ContextManager {
             &mut excluded,
         );
 
-        // A fetched page (spec 51 §5.4, D5). Collected after everything else so
-        // it is last in the prompt, and charged to the last category so a
-        // crowded context drops it before any repository content. The text is
-        // already converted, redacted and bounded by the fetch task: this is
-        // not a second conversion, and the provenance label travels with it.
+        // A fetched page (spec 51 §5.4, D5). Collected after every repository
+        // source so it follows repository content in the prompt, and charged to
+        // the fetched-page category, which drops before any repository content.
+        // Memory (spec 30) is the one category that drops earlier still. The
+        // text is already converted, redacted and bounded by the fetch task:
+        // this is not a second conversion, and the provenance label travels
+        // with it.
         for reference in external_references {
             push_text(
                 &mut pending,
                 external_reference_item(&self.scanner, reference),
             );
+        }
+
+        // Recalled memory (spec 30 §5.1). One item per entry, collected last
+        // because `Memory` is the lowest-priority category and first dropped
+        // under pressure. A statement is untrusted contextual data rendered
+        // inside the §5.2 frame, never instructions. The ref is kept beside the
+        // pending index so `apply_budget` can record only what it actually
+        // included (C14).
+        let mut memory_refs = Vec::new();
+        for recalled in memory {
+            let Some(item) = memory_item(&self.scanner, recalled) else {
+                continue;
+            };
+            memory_refs.push((pending.len(), MemoryRecallRef::from_recalled(recalled)));
+            pending.push(PendingItem::Item(item));
         }
 
         self.apply_budget(
@@ -1657,6 +1798,7 @@ impl ContextManager {
             EffectiveLimit::declared(limit),
             excluded,
             summary_usage,
+            memory_refs,
         )
     }
 
@@ -1668,6 +1810,10 @@ impl ContextManager {
     /// must see. Unused allocation is released to later categories in pipeline
     /// order; a category over its share truncates within itself rather than
     /// stealing from the next.
+    // Each argument is one independent input to the pass, and the manifest
+    // fields travel beside the item list they describe; a params struct would
+    // only be destructured here, as with `build_manifest`.
+    #[allow(clippy::too_many_arguments)]
     fn apply_budget(
         &self,
         repository_id: &str,
@@ -1676,6 +1822,7 @@ impl ContextManager {
         limit: EffectiveLimit,
         mut excluded: Vec<ExclusionRecord>,
         conversation_summary: Option<ConversationSummaryUsage>,
+        memory_refs: Vec<(usize, MemoryRecallRef)>,
     ) -> Result<ContextPlan> {
         let mut symbol_provenance: Option<SymbolProvenanceCounts> = None;
         let required_tokens: usize = pending
@@ -1691,13 +1838,13 @@ impl ContextManager {
         }
         let available = limit.tokens - required_tokens;
 
-        let mut indices: [Vec<usize>; 12] = std::array::from_fn(|_| Vec::new());
+        let mut indices: [Vec<usize>; 13] = std::array::from_fn(|_| Vec::new());
         for (index, item) in pending.iter().enumerate() {
             indices[item.category() as usize].push(index);
         }
 
         let mut placed: Vec<Option<ContextItem>> = vec![None; pending.len()];
-        let mut categories = Vec::with_capacity(12);
+        let mut categories = Vec::with_capacity(13);
 
         // Required is never budgeted and never dropped (proposal §5.1).
         let required = &indices[ContextCategory::Required as usize];
@@ -1716,12 +1863,23 @@ impl ContextManager {
         });
 
         // Unused allocation, released to the next category in pipeline order.
+        //
+        // A zero share is switched off. It takes no allocation and does not
+        // intercept what earlier categories released; the carry passes through
+        // to the next enabled category. Otherwise the last categories would
+        // always spend other categories' leftovers and `context_budget.*=0`
+        // could never turn one off — the assumption the test helper that zeroes
+        // every share already makes.
         let mut carry = 0usize;
         for category in ContextCategory::BUDGETED {
             let share = self.budget.share(category);
             // Integer basis points all the way: no float decides inclusion.
             let nominal = (available as u128 * u128::from(share) / 10_000) as usize;
-            let allocation = nominal.saturating_add(carry);
+            let allocation = if share == 0 {
+                0
+            } else {
+                nominal.saturating_add(carry)
+            };
             let mut used = 0usize;
             let mut kept = 0usize;
             let mut truncated = false;
@@ -1813,7 +1971,11 @@ impl ContextManager {
                 }
             }
 
-            carry = allocation.saturating_sub(used);
+            carry = if share == 0 {
+                carry
+            } else {
+                allocation.saturating_sub(used)
+            };
             categories.push(CategoryUsage {
                 category,
                 allocated: allocation,
@@ -1824,6 +1986,13 @@ impl ContextManager {
             });
         }
 
+        // Only an included memory item keeps its manifest row. A dropped entry
+        // is reported through `excluded` like any other category item (C14).
+        let memory = memory_refs
+            .into_iter()
+            .filter(|(index, _)| placed[*index].is_some())
+            .map(|(_, reference)| reference)
+            .collect::<Vec<_>>();
         let items: Vec<ContextItem> = placed.into_iter().flatten().collect();
         let token_estimate = items.iter().map(|item| item.tokens).sum();
         let manifest = build_manifest(
@@ -1835,6 +2004,7 @@ impl ContextManager {
             excluded,
             conversation_summary,
             symbol_provenance,
+            memory,
         );
 
         Ok(ContextPlan {
@@ -2224,6 +2394,7 @@ fn build_manifest(
     excluded: Vec<ExclusionRecord>,
     conversation_summary: Option<ConversationSummaryUsage>,
     symbol_provenance: Option<SymbolProvenanceCounts>,
+    memory: Vec<MemoryRecallRef>,
 ) -> ContextManifest {
     ContextManifest {
         repository_id: repository_id.to_string(),
@@ -2236,6 +2407,7 @@ fn build_manifest(
         excluded,
         conversation_summary,
         symbol_provenance,
+        memory,
     }
 }
 
@@ -2409,6 +2581,69 @@ fn external_reference_item(
         }
         item
     })
+}
+
+/// A recalled memory as a context item (spec 30 §5.2).
+///
+/// The frame is descriptive, never imperative: a statement is a claim about the
+/// world the model may act on or disbelieve, like a file's contents, not an
+/// instruction. Provenance, date and staleness travel inside the text the model
+/// reads, because a flag in the manifest satisfies requirement 4 for nobody.
+/// Redaction runs in [`add_text`]; recall has already cleaned the statement it
+/// returns, so `recalled.redacted` restores the status the second scan cannot
+/// see past the replacement marker (context.md C13.2).
+fn memory_item(scanner: &SecretScanner, recalled: &RecalledMemory) -> Option<ContextItem> {
+    add_text(
+        scanner,
+        ContextKind::Memory,
+        None,
+        None,
+        None,
+        &render_memory(recalled),
+    )
+    .map(|mut item| {
+        if recalled.redacted {
+            item.redaction_status = "redacted".to_string();
+        }
+        item
+    })
+}
+
+/// The proposal §5.2 frame, with the provenance and date inline.
+///
+/// `created_at_ms` is the entry's own date, not today's: the frame answers when
+/// the statement was recorded. A check performed now is said as a check rather
+/// than written onto the statement as a fact.
+fn render_memory(recalled: &RecalledMemory) -> String {
+    let entry = &recalled.entry;
+    let date = utc_date(entry.created_at_ms);
+    let frame = match (&entry.provenance, recalled.verification) {
+        (MemoryProvenance::RepositoryEvidence { paths }, Verification::EvidenceStale) => {
+            let changed = if paths.len() == 1 {
+                "that file has changed since"
+            } else {
+                "those files have changed since"
+            };
+            format!(
+                "Remembered about this project (derived from {}, recorded {date}, may be out of date — {changed}):",
+                evidence_paths(paths)
+            )
+        }
+        (MemoryProvenance::RepositoryEvidence { paths }, _) => format!(
+            "Remembered about this project (derived from {}, recorded {date}, evidence unchanged):",
+            evidence_paths(paths)
+        ),
+        _ => format!("Remembered about this project (user-confirmed, {date}):"),
+    };
+    format!("{frame}\n  {}\n", entry.statement)
+}
+
+fn evidence_paths(paths: &[crate::memory::EvidenceRef]) -> String {
+    paths
+        .iter()
+        .map(|evidence| evidence.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn push_text(pending: &mut Vec<PendingItem>, item: Option<ContextItem>) -> bool {
@@ -2585,6 +2820,10 @@ mod tests {
             "\"conversation_summary\""
         );
         assert_eq!(ContextCategory::HookContext.as_str(), "hook_context");
+        assert_eq!(
+            serde_json::to_string(&ContextCategory::Memory).unwrap(),
+            "\"memory\""
+        );
     }
 
     #[test]
@@ -2600,6 +2839,8 @@ mod tests {
             (ContextKind::RetrievedFile, "retrieved_file"),
             (ContextKind::PlanState, "plan_state"),
             (ContextKind::Pinned, "pinned"),
+            (ContextKind::ExternalReference, "external_reference"),
+            (ContextKind::Memory, "memory"),
         ] {
             assert_eq!(kind.as_str(), spelling);
             assert_eq!(
@@ -2646,6 +2887,7 @@ mod tests {
             excluded.clone(),
             None,
             None,
+            Vec::new(),
         );
 
         assert_eq!(manifest.excluded, excluded);
@@ -2860,5 +3102,511 @@ mod tests {
         assert_eq!(value["lineRange"]["end"], 40);
         assert_eq!(value["provenance"], "heuristic");
         assert_eq!(value["rootPath"], serde_json::Value::Null);
+    }
+
+    // -----------------------------------------------------------------
+    // Memory delivery (spec 30 Task 3)
+    // -----------------------------------------------------------------
+
+    use crate::config::Config;
+    use crate::memory::{EvidenceRef, MemoryCategory, MemoryEntry, MemoryScope, MemoryState};
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MEMORY_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    /// 2026-03-14T00:00:00Z, the date the rendered frame must show.
+    const MEMORY_DATE_MS: u128 = 1_773_446_400_000;
+    const MEMORY_STATEMENT: &str = "Integration tests require Docker to be running.";
+    const SECOND_STATEMENT: &str = "The Compose file names the web service.";
+
+    fn memory_repo(
+        name: &str,
+        configure: impl FnOnce(&mut Config),
+    ) -> (crate::workspace_engine::WorkspaceEngine, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "damaian-memory-context-{name}-{}-{}",
+            std::process::id(),
+            MEMORY_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/lib.rs"), "pub fn answer() -> usize { 42 }\n").unwrap();
+        let mut config = Config {
+            data_dir: dir.join(".damaian"),
+            enable_index_watcher: false,
+            ..Config::default()
+        };
+        configure(&mut config);
+        (crate::workspace_engine::WorkspaceEngine::new(config), dir)
+    }
+
+    /// A recalled entry, built the way the store deserializes one. The store
+    /// has no public constructor on purpose (spec 29's consent boundary); the
+    /// delivery path only needs the shape recall returns.
+    fn recall(
+        id: &str,
+        statement: &str,
+        verification: Verification,
+        provenance: MemoryProvenance,
+    ) -> RecalledMemory {
+        RecalledMemory {
+            entry: MemoryEntry {
+                id: id.to_string(),
+                scope: MemoryScope::Project,
+                project_key: Some("root_fixture".to_string()),
+                session_id: None,
+                category: MemoryCategory::Environment,
+                statement: statement.to_string(),
+                provenance,
+                verification,
+                sensitivity: crate::memory::Sensitivity::Ordinary,
+                state: MemoryState::Active,
+                created_at_ms: MEMORY_DATE_MS,
+                updated_at_ms: MEMORY_DATE_MS,
+                supersedes: None,
+                expiry: None,
+            },
+            match_reason: MemoryMatchReason {
+                matched_terms: vec!["docker".to_string()],
+                category_boost: true,
+            },
+            verification,
+            redacted: false,
+        }
+    }
+
+    fn user_confirmed(id: &str, statement: &str) -> RecalledMemory {
+        recall(
+            id,
+            statement,
+            Verification::UserConfirmed,
+            MemoryProvenance::UserRequest {
+                session_id: "session_fixture".to_string(),
+                message_id: "message_fixture".to_string(),
+            },
+        )
+    }
+
+    fn assemble(
+        engine: &crate::workspace_engine::WorkspaceEngine,
+        repo: &Path,
+        memory: &[RecalledMemory],
+        explicit_paths: &[String],
+        limit: usize,
+    ) -> ContextPlan {
+        engine
+            .context_manager
+            .build_context(ContextRequest {
+                repository_root: repo,
+                repository_id: "repo_memory",
+                task_id: "task_memory",
+                prompt: "Review the Docker setup",
+                index: None,
+                explicit_paths,
+                limit,
+                hook_context: &[],
+                plan: None,
+                pinned: &[],
+                restriction: None,
+                conversation_summary: None,
+                external_references: &[],
+                memory,
+            })
+            .expect("the assembly should succeed")
+    }
+
+    /// The rendered repository-context string, which is what the prompt builder
+    /// places before the user request.
+    fn rendered(plan: &ContextPlan) -> String {
+        plan.sections()
+            .into_iter()
+            .map(|section| section.text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_recalled_entry_reaches_the_prompt_as_its_own_memory_item() {
+        let (engine, repo) = memory_repo("delivery", |_| {});
+        let entry = user_confirmed("mem_docker", MEMORY_STATEMENT);
+        let limit = engine.config.context_token_budget();
+        let plan = assemble(&engine, &repo, std::slice::from_ref(&entry), &[], limit);
+
+        let memory_items = plan
+            .items
+            .iter()
+            .filter(|item| item.category == ContextCategory::Memory)
+            .collect::<Vec<_>>();
+        assert_eq!(memory_items.len(), 1, "{:?}", plan.items);
+        let item = memory_items[0];
+        assert_eq!(item.kind, ContextKind::Memory);
+        assert!(item.path.is_none(), "memory has no file identity");
+        assert_eq!(
+            item.content,
+            "Remembered about this project (user-confirmed, 2026-03-14):\n  \
+             Integration tests require Docker to be running.\n"
+        );
+        assert_eq!(item.redaction_status, "clean");
+        // Collected last, so the prompt puts memory after every other category.
+        assert_eq!(
+            plan.items.last().map(|item| item.kind),
+            Some(ContextKind::Memory)
+        );
+
+        // The manifest carries the explanation, never the statement.
+        assert_eq!(plan.manifest.memory.len(), 1);
+        let reference = &plan.manifest.memory[0];
+        assert_eq!(reference.entry_id, "mem_docker");
+        assert_eq!(reference.verification, Verification::UserConfirmed);
+        assert_eq!(reference.match_reason.matched_terms, vec!["docker"]);
+        assert!(reference.match_reason.category_boost);
+        let manifest_json = serde_json::to_string(&plan.manifest).unwrap();
+        assert!(
+            manifest_json.contains("\"entryId\":\"mem_docker\""),
+            "{manifest_json}"
+        );
+        assert!(
+            !manifest_json.contains("Integration tests require Docker"),
+            "the manifest must stay content-free: {manifest_json}"
+        );
+        assert!(rendered(&plan).contains("Remembered about this project"));
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn zero_memory_share_keeps_every_statement_out_of_the_prompt() {
+        let (engine, repo) = memory_repo("share-zero", |config| {
+            config.context_budget.set_share(ContextCategory::Memory, 0);
+        });
+        let entry = user_confirmed("mem_docker", MEMORY_STATEMENT);
+        let limit = engine.config.context_token_budget();
+        let plan = assemble(&engine, &repo, std::slice::from_ref(&entry), &[], limit);
+
+        assert!(
+            plan.items
+                .iter()
+                .all(|item| item.category != ContextCategory::Memory),
+            "{:?}",
+            plan.items
+        );
+        let prompt = rendered(&plan);
+        assert!(
+            !prompt.contains("Integration tests require Docker"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("Remembered about this project"),
+            "{prompt}"
+        );
+        assert!(plan.manifest.memory.is_empty());
+        assert!(
+            plan.manifest.excluded.iter().any(|record| {
+                record.category == ContextCategory::Memory
+                    && record.reason == ExclusionReason::CategoryBudgetExhausted
+            }),
+            "the drop must be recorded: {:?}",
+            plan.manifest.excluded
+        );
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn memory_is_dropped_before_file_content_under_pressure() {
+        // The acceptance criterion is the enum ordering, which Task 1 landed:
+        // memory is the last budgeted category, so released carry reaches it
+        // only after every other category has had its allocation.
+        assert_eq!(
+            ContextCategory::BUDGETED.last().copied(),
+            Some(ContextCategory::Memory)
+        );
+
+        // A direct budget pass with every earlier category exactly at its
+        // share, so nothing is released and the contest is real. The earlier
+        // categories keep their items; memory cannot fit its own share and is
+        // dropped. A whole engine fixture cannot express this as crisply,
+        // because a file that under-uses its share releases the remainder.
+        let (engine, repo) = memory_repo("pressure", |config| {
+            for category in ContextCategory::BUDGETED {
+                config.context_budget.set_share(category, 0);
+            }
+            config
+                .context_budget
+                .set_share(ContextCategory::Instructions, 1_000);
+            config
+                .context_budget
+                .set_share(ContextCategory::FileRanges, 2_500);
+            config
+                .context_budget
+                .set_share(ContextCategory::Memory, 300);
+        });
+        let item = |category, kind, tokens| {
+            PendingItem::Item(ContextItem {
+                category,
+                kind,
+                path: None,
+                range: None,
+                content: "x".repeat(tokens * 4),
+                tokens,
+                redaction_status: "clean".to_string(),
+                provenance: None,
+                root_path: None,
+                origin: None,
+            })
+        };
+        let plan = engine
+            .context_manager
+            .apply_budget(
+                "repo_memory",
+                "task_memory",
+                vec![
+                    item(
+                        ContextCategory::Instructions,
+                        ContextKind::AgentInstruction,
+                        100,
+                    ),
+                    item(ContextCategory::FileRanges, ContextKind::ExplicitFile, 250),
+                    item(ContextCategory::Memory, ContextKind::Memory, 40),
+                ],
+                EffectiveLimit::declared(1_000),
+                Vec::new(),
+                None,
+                vec![(
+                    2,
+                    MemoryRecallRef {
+                        entry_id: "mem_docker".to_string(),
+                        match_reason: MemoryMatchReason {
+                            matched_terms: vec!["docker".to_string()],
+                            category_boost: false,
+                        },
+                        verification: Verification::UserConfirmed,
+                    },
+                )],
+            )
+            .expect("the budget pass should succeed");
+
+        let categories = plan
+            .items
+            .iter()
+            .map(|item| item.category)
+            .collect::<Vec<_>>();
+        assert!(
+            categories.contains(&ContextCategory::Instructions),
+            "{categories:?}"
+        );
+        assert!(
+            categories.contains(&ContextCategory::FileRanges),
+            "{categories:?}"
+        );
+        assert!(
+            !categories.contains(&ContextCategory::Memory),
+            "{categories:?}"
+        );
+        assert!(plan.manifest.memory.is_empty());
+        let memory = plan
+            .manifest
+            .categories
+            .iter()
+            .find(|usage| usage.category == ContextCategory::Memory)
+            .expect("the memory category is always reported");
+        assert_eq!(memory.items, 0);
+        assert!(memory.truncated);
+        assert!(
+            plan.manifest.excluded.iter().any(|record| {
+                record.category == ContextCategory::Memory
+                    && record.reason == ExclusionReason::CategoryBudgetExhausted
+            }),
+            "{:?}",
+            plan.manifest.excluded
+        );
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn a_stale_entry_renders_the_out_of_date_marker_in_the_prompt() {
+        let (engine, repo) = memory_repo("stale", |_| {});
+        let provenance = || MemoryProvenance::RepositoryEvidence {
+            paths: vec![EvidenceRef::new("docker-compose.yml", "sha256:abc")],
+        };
+        let stale = recall(
+            "mem_stale",
+            "The Postgres service listens on port 5433.",
+            Verification::EvidenceStale,
+            provenance(),
+        );
+        let current = recall(
+            "mem_current",
+            SECOND_STATEMENT,
+            Verification::EvidenceCurrent,
+            provenance(),
+        );
+        let limit = engine.config.context_token_budget();
+        let plan = assemble(&engine, &repo, &[stale, current], &[], limit);
+
+        let prompt = rendered(&plan);
+        assert!(
+            prompt.contains(
+                "derived from docker-compose.yml, recorded 2026-03-14, \
+                 may be out of date — that file has changed since"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "derived from docker-compose.yml, recorded 2026-03-14, evidence unchanged"
+            ),
+            "a current entry states why it is current: {prompt}"
+        );
+        let verifications = plan
+            .manifest
+            .memory
+            .iter()
+            .map(|reference| reference.verification)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            verifications,
+            vec![Verification::EvidenceStale, Verification::EvidenceCurrent]
+        );
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn a_statement_with_a_credential_is_redacted_on_the_way_into_the_item() {
+        let (engine, repo) = memory_repo("redaction", |_| {});
+        let raw = user_confirmed("mem_raw", "Use AKIAIOSFODNN7EXAMPLE for the test bucket.");
+        let limit = engine.config.context_token_budget();
+        let plan = assemble(&engine, &repo, std::slice::from_ref(&raw), &[], limit);
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.category == ContextCategory::Memory)
+            .expect("the entry should be included");
+        assert_eq!(item.redaction_status, "redacted");
+        assert!(
+            !item.content.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the raw credential reached the prompt: {}",
+            item.content
+        );
+
+        // Recall has already replaced the secret and reports the fact; the
+        // second scan only sees the marker, so the flag is what keeps the item
+        // from claiming to be clean (context.md C13.2).
+        let mut cleaned =
+            user_confirmed("mem_cleaned", "Use the redacted value for the test bucket.");
+        cleaned.redacted = true;
+        let plan = assemble(&engine, &repo, std::slice::from_ref(&cleaned), &[], limit);
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.category == ContextCategory::Memory)
+            .expect("the entry should be included");
+        assert_eq!(item.redaction_status, "redacted");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn a_memory_item_is_removable_like_any_optional_item() {
+        let (engine, repo) = memory_repo("removal", |_| {});
+        let first = user_confirmed("mem_first", MEMORY_STATEMENT);
+        let second = user_confirmed("mem_second", SECOND_STATEMENT);
+        let limit = engine.config.context_token_budget();
+        let plan = assemble(&engine, &repo, &[first, second], &[], limit);
+        let mut prepared = PreparedContext::from_plan(&plan);
+        assert_eq!(prepared.manifest.memory.len(), 2);
+
+        let index = prepared
+            .items
+            .iter()
+            .position(|item| item.category == ContextCategory::Memory)
+            .expect("two memory items were assembled");
+        let record = prepared
+            .remove_optional(index)
+            .expect("memory is optional, like every non-Required category");
+        assert_eq!(record.reason, ExclusionReason::UserRemoved);
+        assert_eq!(record.category, ContextCategory::Memory);
+
+        // The ref for the removed entry goes with it; the other entry keeps its
+        // own row, so the inspector still names what was sent (C14).
+        assert_eq!(prepared.manifest.memory.len(), 1);
+        assert_eq!(prepared.manifest.memory[0].entry_id, "mem_second");
+        assert_eq!(
+            prepared
+                .manifest
+                .included
+                .iter()
+                .filter(|row| row.category == ContextCategory::Memory)
+                .count(),
+            1
+        );
+        let prompt = prepared
+            .sections()
+            .into_iter()
+            .map(|section| section.text)
+            .collect::<String>();
+        assert!(
+            !prompt.contains("Integration tests require Docker"),
+            "{prompt}"
+        );
+        assert!(prompt.contains(SECOND_STATEMENT), "{prompt}");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn a_send_time_drop_removes_the_memory_item_and_its_ref() {
+        let (engine, repo) = memory_repo("send-drop", |_| {});
+        let first = user_confirmed("mem_first", MEMORY_STATEMENT);
+        let second = user_confirmed("mem_second", SECOND_STATEMENT);
+        let limit = engine.config.context_token_budget();
+        let plan = assemble(&engine, &repo, &[first, second], &[], limit);
+        let mut prepared = PreparedContext::from_plan(&plan);
+
+        let record = prepared
+            .remove_memory(
+                "mem_first",
+                "memory entry mem_first was deleted; it was not sent".to_string(),
+            )
+            .expect("the entry has a manifest row")
+            .expect("the row names an item");
+        assert_eq!(record.reason, ExclusionReason::MemoryNoLongerActive);
+        assert_eq!(record.category, ContextCategory::Memory);
+        assert!(record.path.is_none(), "memory has no file identity");
+
+        // The ref goes with the item, and the row for the entry that stayed is
+        // still the right one (C14).
+        assert_eq!(prepared.manifest.memory.len(), 1);
+        assert_eq!(prepared.manifest.memory[0].entry_id, "mem_second");
+        let prompt = prepared
+            .sections()
+            .into_iter()
+            .map(|section| section.text)
+            .collect::<String>();
+        assert!(!prompt.contains(MEMORY_STATEMENT), "{prompt}");
+        assert!(prompt.contains(SECOND_STATEMENT), "{prompt}");
+        assert!(
+            prepared
+                .manifest
+                .included
+                .iter()
+                .filter(|row| row.category == ContextCategory::Memory)
+                .count()
+                == 1
+        );
+
+        // A second rejection, or one for an entry the budget never included,
+        // has nothing to remove.
+        assert!(
+            prepared
+                .remove_memory("mem_first", "again".to_string())
+                .expect("a missing row is not an error")
+                .is_none()
+        );
+
+        fs::remove_dir_all(repo).unwrap();
     }
 }

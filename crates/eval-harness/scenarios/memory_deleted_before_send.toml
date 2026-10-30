@@ -1,0 +1,32 @@
+name = "memory_deleted_before_send"
+fixture = "memory-recall"
+tier = "deterministic"
+prompt = "How do I run the integration tests?"
+config_overlay = "pause_for_context_review = true"
+
+# Both entries are recalled into the review. One is removed there and the other
+# is deleted after assembly; neither may appear in the resumed request, and the
+# send must record no recall for either.
+remove_recalled_memory_before_send = ["Integration tests require Docker to be running."]
+delete_recalled_memory_before_send = ["Integration tests run against the staging database."]
+
+[[seed_memory]]
+statement = "Integration tests require Docker to be running."
+category = "command"
+
+[[seed_memory]]
+statement = "Integration tests run against the staging database."
+category = "environment"
+
+[[turn]]
+content = "The integration tests need Docker; the reviewed memories were removed."
+
+[assert]
+memory_recalls = 0
+request_contains = ["How do I run the integration tests?"]
+request_excludes = [
+  "Integration tests require Docker to be running.",
+  "Integration tests run against the staging database.",
+]
+memory_audit_contains = ["context_item_removed", "memory_deleted"]
+deterministic_only = ["memory_recalls", "request_contains", "request_excludes"]

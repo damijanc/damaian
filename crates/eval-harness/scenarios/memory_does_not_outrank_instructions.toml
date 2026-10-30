@@ -1,0 +1,34 @@
+name = "memory_does_not_outrank_instructions"
+fixture = "memory-recall"
+tier = "deterministic"
+prompt = "How should I apply indentation in src/lib.rs?"
+
+# The memory contradicts AGENTS.md, and the current message asks the same
+# question AGENTS.md answers. Memory must arrive as a separate, lower block and
+# never as a system instruction; the answer follows the repository's rule.
+[[seed_memory]]
+statement = "Indentation in this repository uses four spaces."
+category = "convention"
+
+[[turn]]
+content = "AGENTS.md requires tabs for indentation, so use tabs in src/lib.rs."
+
+[assert]
+context_contains = ["AGENTS.md"]
+memory_recalls = 1
+request_contains = [
+  "Use tabs for indentation in this repository.",
+  "How should I apply indentation in src/lib.rs?",
+  "Indentation in this repository uses four spaces.",
+  "--- memory ---",
+]
+request_system_excludes = ["Indentation in this repository uses four spaces."]
+request_precedes = ["--- agent_instruction: AGENTS.md ---", "--- memory ---"]
+response_contains = ["tabs"]
+response_excludes = ["four spaces"]
+deterministic_only = [
+  "memory_recalls",
+  "request_contains",
+  "request_system_excludes",
+  "request_precedes",
+]

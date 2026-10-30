@@ -117,6 +117,7 @@ fn assemble(
             restriction,
             conversation_summary: None,
             external_references: &[],
+            memory: &[],
         })
         .expect("the assembly should run")
 }
@@ -170,6 +171,7 @@ fn the_manifest_has_a_summary_row_with_its_message_count() {
             restriction: None,
             conversation_summary: Some(&summary),
             external_references: &[],
+            memory: &[],
         })
         .expect("the assembly should run");
 
@@ -655,6 +657,7 @@ fn removing_the_summary_records_its_category_and_hides_the_row() {
             restriction: None,
             conversation_summary: Some(&summary()),
             external_references: &[],
+            memory: &[],
         })
         .unwrap();
     let mut prepared = workspace_engine::PreparedContext::from_plan(&plan);
@@ -1425,6 +1428,7 @@ fn the_inspector_lists_the_category() {
             restriction: None,
             conversation_summary: None,
             external_references: &[reference],
+            memory: &[],
         })
         .expect("the assembly should run");
 

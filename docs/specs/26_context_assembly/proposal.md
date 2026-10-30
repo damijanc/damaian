@@ -242,6 +242,8 @@ pub enum ContextCategory {
     FileRanges,
     Findings,       // spec 22 (reserved; see §5.11)
     ConversationSummary, // spec 55 (reserved)
+    ExternalReference,   // spec 51: a fetched page
+    Memory,              // spec 30: recalled facts, dropped first
 }
 
 /// The source label the prompt header shows. The spelling is today's, so a
@@ -332,17 +334,25 @@ context_budget.repository_map=0.05
 context_budget.symbols=0.10
 context_budget.search_results=0.10
 context_budget.file_ranges=0.25
-context_budget.findings=0.05
+context_budget.findings=0.02
 context_budget.conversation_summary=0.05
 context_budget.external_reference=0.05
+context_budget.memory=0.03
 context_budget.safety_margin=0.10
 ```
 
 The eleventh category, `external_reference`, is the text of a page fetched by
 [spec 51](../51_external_reference_retrieval/proposal.md)'s `fetch_url` tool. It
-is declared last, so a crowded context drops a fetched page before any
-repository content; its 0.05 share is funded from `search_results` (0.15 →
-0.10), so the defaults still total exactly 1.00.
+is declared after every repository-content category, so a crowded context drops
+a fetched page before any repository content; its 0.05 share is funded from
+`search_results` (0.15 → 0.10), so the defaults still total exactly 1.00.
+
+The twelfth category, `memory`, carries statements recalled by
+[spec 30](../30_memory_retrieval_and_lifecycle/proposal.md). It is declared last,
+after `external_reference`, because spec 29 requirement 5 and spec 30's
+acceptance criteria require memory to be dropped before any other category; its
+0.03 share is funded from `findings` (0.05 → 0.02), which has no producer yet,
+so the defaults still total exactly 1.00.
 
 Fractions of the effective limit (§5.7) rather than absolute counts, so one set
 of settings works across a 64k and a 200k budget. They are parsed as decimals and
@@ -362,7 +372,10 @@ Two rules make the allocation useful rather than merely tidy:
   share releases the remainder to later categories in pipeline order. Without
   this, a repository with no findings, no pinned context and no conversation
   summary wastes up to 30% of the window on nothing — strict per-category caps
-  would make the common case worse than today's flat budget.
+  would make the common case worse than today's flat budget. A category whose
+  configured share is zero is switched off: it receives no allocation and
+  passes the released remainder on rather than intercepting it, so
+  `context_budget.*=0` means "do not spend budget here" (spec 30 C15).
 - **A category over its share is truncated within itself**, dropping its
   lowest-priority members (§5.3) rather than stealing from another category. A
   block item (map, symbols, plan state) is first re-rendered at the smaller

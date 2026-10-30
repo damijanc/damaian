@@ -1,0 +1,3 @@
+# Local deploy settings for the memory-recall fixture.
+service: deploy
+port: 5433

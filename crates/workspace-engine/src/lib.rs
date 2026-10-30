@@ -69,9 +69,9 @@ pub use chat::{
     AgentCheckBatch, AgentCommandProposal, AgentContextReview, AgentFallbackProposal,
     AgentFetchProposal, AgentPatchProposal, AgentPlanProposal, AgentQuestionProposal,
     AgentRoundBudgetProposal, ChatOrchestrator, ChatTurnOptions, ChatTurnResult, ContextDecision,
-    FetchComponentFlag, FetchDecision, McpTokenResolver, PausedTurns, PendingFetchCall, PhaseKind,
-    PlanRevisionStep, ResumeDecisionOptions, RoundBudgetDecision, RoundBudgetPause, TurnPhase,
-    TurnProgress, TurnSink,
+    FetchComponentFlag, FetchDecision, McpTokenResolver, MemoryDisplayEntry, PausedTurns,
+    PendingFetchCall, PhaseKind, PlanRevisionStep, ResumeDecisionOptions, RoundBudgetDecision,
+    RoundBudgetPause, TurnPhase, TurnProgress, TurnSink,
 };
 pub use checkpoint::{
     CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,
@@ -110,8 +110,9 @@ pub use config::{
 pub use context_manager::{
     CategoryUsage, CollectionSource, ContextBudget, ContextCategory, ContextItem, ContextKind,
     ContextManager, ContextManifest, ContextPlan, ContextRequest, ConversationSummaryUsage,
-    EffectiveLimit, ExclusionRecord, IncludedRef, LimitSource, PreparedContext, PromptSection,
-    PromptSectionName, RepositoryMapSource, SymbolProvenanceCounts, SymbolSource, TokenEstimate,
+    EffectiveLimit, ExclusionRecord, IncludedRef, LimitSource, MemoryRecallRef, PreparedContext,
+    PromptSection, PromptSectionName, RepositoryMapSource, SymbolProvenanceCounts, SymbolSource,
+    TokenEstimate,
 };
 pub use data_schema::{
     CURRENT_DATA_SCHEMA_VERSION, DataSchemaError, DataSchemaOutcome, ensure_data_dir_schema,
@@ -163,12 +164,13 @@ pub use mcp::{
 pub use memory::{
     EvidenceRef, EvidenceRefusal, ExplicitMemoryRequest, ExplicitMemoryRequestOutcome,
     MAX_SUGGESTIONS_PER_TASK, MEMORY_SCHEMA_VERSION, MemoryCategory, MemoryEntry, MemoryError,
-    MemoryExpiry, MemoryProposal, MemoryProposalGate, MemoryProvenance, MemoryRefusal,
-    MemoryResult, MemorySchemaOutcome, MemoryScope, MemoryState, MemoryStore, MemoryStoreConfig,
-    MemoryTarget, ProjectIdentity, ProjectKeySource, ProposalOrigin, ProposalOutcome,
-    STATEMENT_MAX_CHARS, Sensitivity, UserConfirmation, Verification, evidence_ref_for,
-    explicit_memory_request, explicit_memory_request_outcome, is_instruction_shaped,
-    normalize_remote_url, normalize_statement,
+    MemoryExpiry, MemoryMatchReason, MemoryProposal, MemoryProposalGate, MemoryProvenance,
+    MemoryRefusal, MemoryResult, MemorySchemaOutcome, MemoryScope, MemoryState, MemoryStore,
+    MemoryStoreConfig, MemoryTarget, ProjectIdentity, ProjectKeySource, ProposalOrigin,
+    ProposalOutcome, RecallExclusion, RecallExclusionReason, RecalledMemory, STATEMENT_MAX_CHARS,
+    Sensitivity, UserConfirmation, Verification, evidence_ref_for, explicit_memory_request,
+    explicit_memory_request_outcome, is_instruction_shaped, normalize_remote_url,
+    normalize_statement,
 };
 pub use mode::SessionMode;
 pub use model::{

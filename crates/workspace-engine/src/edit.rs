@@ -538,6 +538,8 @@ impl EditOrchestrator {
             restriction: context_restriction.as_deref(),
             conversation_summary: None,
             external_references: &[],
+            // A one-shot edit has no turn to recall for (spec 30 C5).
+            memory: &[],
         }) {
             Ok(context) => context,
             // A required prompt that cannot fit is the user's to see, and the

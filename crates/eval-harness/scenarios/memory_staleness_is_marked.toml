@@ -1,0 +1,23 @@
+name = "memory_staleness_is_marked"
+fixture = "memory-recall"
+tier = "deterministic"
+prompt = "What port does the deploy service listen on?"
+
+# The entry records `deploy/settings.yml`'s hash when it is stored, then the
+# file changes. Recall compares the hash and must put the marker in the rendered
+# text, not only in the manifest.
+modify_after_memory_seed = { path = "deploy/settings.yml", content = "service: deploy\nport: 5444\n" }
+
+[[seed_memory]]
+statement = "The deploy service listens on port 5433."
+category = "environment"
+evidence_path = "deploy/settings.yml"
+
+[[turn]]
+content = "The deploy service listens on port 5433, but that may be out of date."
+
+[assert]
+memory_recalls = 1
+request_contains = ["--- memory ---", "The deploy service listens on port 5433.", "may be out of date"]
+memory_audit_contains = ["memory_recalled", "memory_verification_changed"]
+deterministic_only = ["memory_recalls", "request_contains"]

@@ -267,6 +267,15 @@ pub struct Config {
     /// statement recalled in every other repository, which is neither a
     /// restriction nor the repository's business.
     pub memory_user_scope_enabled: bool,
+    /// The most memory entries one turn may recall (spec 30 §5.3). Restrict-only
+    /// lower-wins: every recalled statement spends the user's context budget, so
+    /// a repository may lower the cap and never raise it.
+    pub memory_max_entries: u32,
+    /// How long a memory entry is kept before retrieval expires it (spec 30
+    /// §5.6). `0` means no retention expiry. Forbidden to repository and profile
+    /// config: a clone must not extend how long its own derived statements are
+    /// kept.
+    pub memory_retention_days: u64,
     /// Per-category shares of the context limit and the observed-window safety
     /// margin (spec 26 §5.2, §5.7). Restrict-only: a repository may lower a
     /// share and raise the margin, never the reverse.
@@ -1189,6 +1198,8 @@ impl Config {
             conversation_window_share,
             pause_for_context_review,
             memory_user_scope_enabled,
+            memory_max_entries,
+            memory_retention_days,
             context_budget_instructions,
             context_budget_hook_context,
             context_budget_pinned,
@@ -1200,6 +1211,7 @@ impl Config {
             context_budget_findings,
             context_budget_conversation_summary,
             context_budget_external_reference,
+            context_budget_memory,
             context_budget_safety_margin,
             max_command_output_bytes,
             command_timeout_secs,
@@ -1834,6 +1846,19 @@ impl Config {
                 outcome.record(scope, key, None, loosened);
             }
         }
+        // Spec 30 §5.3: the recall cap is a numeric limit like the read caps
+        // above, but `u32`-typed, so it uses the u32 helper.
+        if let Some(value) = memory_max_entries
+            && let Some(loosened) = restrict_only_u32(
+                &mut self.memory_max_entries,
+                value,
+                "memory_max_entries",
+                trusted,
+                rejected,
+            )
+        {
+            outcome.record(scope, "memory_max_entries", None, loosened);
+        }
 
         // Spec 55 §5.5: the off switch decides whether a clone can spend the
         // user's money on a summarisation call, and neither direction is a
@@ -1869,6 +1894,19 @@ impl Config {
         ) {
             self.memory_user_scope_enabled = value;
             outcome.record(scope, "memory_user_scope_enabled", None, false);
+        }
+        // Spec 30 §5.6: a repository must not extend how long its own derived
+        // statements are kept, and shortening retention is not a direction the
+        // key is worth a second classification rule for.
+        if let Some(value) = scoped(
+            memory_retention_days,
+            "memory_retention_days",
+            trusted,
+            forbidden,
+            rejected,
+        ) {
+            self.memory_retention_days = value;
+            outcome.record(scope, "memory_retention_days", None, false);
         }
         if let Some(value) = conversation_window_share {
             // Spec 55 §5.1: a repository may lower the window, but not below
@@ -1952,6 +1990,11 @@ impl Config {
                 "context_budget.external_reference",
                 ContextCategory::ExternalReference,
                 context_budget_external_reference,
+            ),
+            (
+                "context_budget.memory",
+                ContextCategory::Memory,
+                context_budget_memory,
             ),
         ] {
             if let Some(value) = incoming
@@ -2814,6 +2857,16 @@ impl Config {
                 "false"
             },
         );
+        push_line(
+            &mut output,
+            "memory_max_entries",
+            &self.memory_max_entries.to_string(),
+        );
+        push_line(
+            &mut output,
+            "memory_retention_days",
+            &self.memory_retention_days.to_string(),
+        );
         for (key, value) in context_budget_policy_lines(&self.context_budget) {
             push_line(&mut output, key, &format_basis_points(value));
         }
@@ -3067,6 +3120,12 @@ impl Default for Config {
             conversation_window_share: crate::compaction::DEFAULT_WINDOW_SHARE_BPS,
             pause_for_context_review: false,
             memory_user_scope_enabled: false,
+            // Five short statements are roughly 1,400 characters, under 1% of a
+            // 128k window (spec 30 §5.3).
+            memory_max_entries: 5,
+            // No expiry by default: a project convention does not become false
+            // because it is old (spec 30 §5.6).
+            memory_retention_days: 0,
             context_budget: ContextBudget::default(),
             max_command_output_bytes: 1024 * 1024,
             command_timeout_secs: 600,
@@ -3168,6 +3227,10 @@ pub struct ConfigOverlay {
     pub pause_for_context_review: Option<bool>,
     /// Spec 28 §5.6: off by default, and forbidden to repository and profile.
     pub memory_user_scope_enabled: Option<bool>,
+    /// Spec 30 §5.3: the most entries one turn may recall. Restrict-only.
+    pub memory_max_entries: Option<u32>,
+    /// Spec 30 §5.6: `0` means no expiry. Forbidden to repository and profile.
+    pub memory_retention_days: Option<u64>,
     /// `context_budget.*` shares, in basis points. Each is its own field so the
     /// overlay macro classifies it and a repository raise is refused by name.
     pub context_budget_instructions: Option<u16>,
@@ -3182,6 +3245,8 @@ pub struct ConfigOverlay {
     pub context_budget_conversation_summary: Option<u16>,
     /// Spec 51 §5.4: the fetched-page share, restrict-only like every other.
     pub context_budget_external_reference: Option<u16>,
+    /// Spec 30 §5.1: the remembered-facts share, restrict-only like every other.
+    pub context_budget_memory: Option<u16>,
     pub context_budget_safety_margin: Option<u16>,
     pub max_command_output_bytes: Option<usize>,
     pub command_timeout_secs: Option<usize>,
@@ -3347,6 +3412,11 @@ classify_overlay_fields! {
     // Spec 28 §5.6: cross-project recall widens where knowledge comes from, and
     // enabling it is not a narrowing a repository may make.
     memory_user_scope_enabled => Capability,
+    // Spec 30 §5.3: restrict-only, because every recalled statement spends the
+    // user's context budget.
+    memory_max_entries => Capability,
+    // Spec 30 §5.6: forbidden to repository and profile, like user-scope recall.
+    memory_retention_days => Capability,
     // Spec 26 §5.2: a share steers model traffic toward or away from a
     // repository's own content, so a clone may lower one but never raise it.
     // The safety margin is the reverse direction (higher is restrictive).
@@ -3363,6 +3433,9 @@ classify_overlay_fields! {
     // Spec 51 §5.4: a fetched page competes with repository content, so a
     // clone may lower its share and never raise it.
     context_budget_external_reference => Capability,
+    // Spec 30 §5.1: the remembered-facts share is restrict-only like every
+    // other, and memory is dropped before any repository content.
+    context_budget_memory => Capability,
     context_budget_safety_margin => Capability,
     max_command_output_bytes => Preference,
     command_timeout_secs => Capability,
@@ -3592,6 +3665,10 @@ impl ConfigOverlay {
             "memory_user_scope_enabled" => {
                 self.memory_user_scope_enabled = Some(parse_bool(key, value)?)
             }
+            "memory_max_entries" => {
+                self.memory_max_entries = Some(parse_memory_entries(key, value)?)
+            }
+            "memory_retention_days" => self.memory_retention_days = Some(parse_u64(key, value)?),
             // A zero window would compact on every turn; a window above the
             // whole budget would leave nothing to compact against. The parser
             // accepts the smallest value for the user's own config; an
@@ -3640,6 +3717,9 @@ impl ConfigOverlay {
             }
             "context_budget.external_reference" => {
                 self.context_budget_external_reference = Some(parse_basis_points(key, value)?)
+            }
+            "context_budget.memory" => {
+                self.context_budget_memory = Some(parse_basis_points(key, value)?)
             }
             "context_budget.safety_margin" => {
                 self.context_budget_safety_margin = Some(parse_basis_points(key, value)?)
@@ -4080,6 +4160,8 @@ impl ConfigOverlay {
             conversation_window_share,
             pause_for_context_review,
             memory_user_scope_enabled,
+            memory_max_entries,
+            memory_retention_days,
             context_budget_instructions,
             context_budget_hook_context,
             context_budget_pinned,
@@ -4091,6 +4173,7 @@ impl ConfigOverlay {
             context_budget_findings,
             context_budget_conversation_summary,
             context_budget_external_reference,
+            context_budget_memory,
             context_budget_safety_margin,
             max_command_output_bytes,
             command_timeout_secs,
@@ -4198,6 +4281,12 @@ impl ConfigOverlay {
                 if *value { "true" } else { "false" },
             );
         }
+        if let Some(value) = memory_max_entries {
+            push_line(&mut output, "memory_max_entries", &value.to_string());
+        }
+        if let Some(value) = memory_retention_days {
+            push_line(&mut output, "memory_retention_days", &value.to_string());
+        }
         for (key, value) in [
             ("context_budget.instructions", context_budget_instructions),
             ("context_budget.hook_context", context_budget_hook_context),
@@ -4222,6 +4311,7 @@ impl ConfigOverlay {
                 "context_budget.external_reference",
                 context_budget_external_reference,
             ),
+            ("context_budget.memory", context_budget_memory),
             ("context_budget.safety_margin", context_budget_safety_margin),
         ] {
             if let Some(value) = value {
@@ -5301,6 +5391,10 @@ fn context_budget_policy_lines(budget: &ContextBudget) -> Vec<(&'static str, u16
             "context_budget.external_reference",
             budget.share(ContextCategory::ExternalReference),
         ),
+        (
+            "context_budget.memory",
+            budget.share(ContextCategory::Memory),
+        ),
     ];
     lines.push(("context_budget.safety_margin", budget.safety_margin_bps));
     lines
@@ -5436,6 +5530,16 @@ fn parse_round_count(key: &str, value: &str) -> Result<u32> {
             "{key} must be between 1 and 16"
         )))
     }
+}
+
+/// `memory_max_entries` (spec 30 §5.3): zero is valid and recalls nothing, and
+/// any count a `u32` holds is accepted. The default is small; the config budget
+/// and the per-entry statement ceiling bound what a large value can actually
+/// carry.
+fn parse_memory_entries(key: &str, value: &str) -> Result<u32> {
+    let parsed = parse_u64(key, value)?;
+    u32::try_from(parsed)
+        .map_err(|_| ClientError::InvalidInput(format!("{key} must be at most {}", u32::MAX)))
 }
 
 /// The exploration allowance differs from `parse_round_count`: `0` is valid
@@ -5796,9 +5900,11 @@ mod tests {
             "context_budget.instructions=0.10\n",
             "context_budget.repository_map=0.0500\n",
             "context_budget.safety_margin=0.15\n",
+            "context_budget.memory=0.03\n",
         ))
         .unwrap();
         assert_eq!(overlay.context_budget_instructions, Some(1_000));
+        assert_eq!(overlay.context_budget_memory, Some(300));
         assert_eq!(
             ConfigOverlay::parse(&overlay.to_policy_text()).unwrap(),
             overlay,
@@ -5814,11 +5920,17 @@ mod tests {
             500
         );
         assert_eq!(config.context_budget.safety_margin_bps, 1_500);
+        assert_eq!(config.context_budget.share(ContextCategory::Memory), 300);
         assert!(config.validate_context_budget().is_ok());
         assert!(
             config
                 .to_policy_text()
                 .contains("context_budget.instructions=0.1000")
+        );
+        assert!(
+            config
+                .to_policy_text()
+                .contains("context_budget.memory=0.0300")
         );
 
         // More decimal places than a basis point can express is refused rather
@@ -5838,5 +5950,48 @@ mod tests {
             error.to_string().contains("context_budget"),
             "the error must name the key family: {error}"
         );
+
+        let defaults = ContextBudget::default();
+        assert_eq!(defaults.shares.len(), 12, "one share per budgeted category");
+        assert_eq!(defaults.total_share_bps(), 10_000);
+    }
+
+    /// Spec 30 §5.3, §5.6: five short entries by default, and retention that
+    /// never expires unless the user sets a window.
+    #[test]
+    fn memory_defaults_are_five_entries_and_no_retention_expiry() {
+        let config = Config::default();
+        assert_eq!(config.memory_max_entries, 5);
+        assert_eq!(config.memory_retention_days, 0);
+
+        let overlay = ConfigOverlay::parse(concat!(
+            "memory_max_entries=2\n",
+            "memory_retention_days=30\n",
+        ))
+        .unwrap();
+        assert_eq!(overlay.memory_max_entries, Some(2));
+        assert_eq!(overlay.memory_retention_days, Some(30));
+        assert_eq!(
+            ConfigOverlay::parse(&overlay.to_policy_text()).unwrap(),
+            overlay,
+            "the overlay serializer must round-trip the new keys"
+        );
+
+        let mut applied = Config::default();
+        applied.apply_overlay(overlay);
+        assert_eq!(applied.memory_max_entries, 2);
+        assert_eq!(applied.memory_retention_days, 30);
+        let policy = applied.to_policy_text();
+        assert!(policy.contains("memory_max_entries=2"), "{policy}");
+        assert!(policy.contains("memory_retention_days=30"), "{policy}");
+
+        // Zero recalls nothing and is meaningful, not a broken cap.
+        assert_eq!(
+            ConfigOverlay::parse("memory_max_entries=0\n")
+                .unwrap()
+                .memory_max_entries,
+            Some(0)
+        );
+        assert!(ConfigOverlay::parse("memory_max_entries=-1\n").is_err());
     }
 }

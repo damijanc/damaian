@@ -29,9 +29,9 @@ harness, and **Release** covers packaging, signing and distribution.
 
 | | |
 |---|---|
-| **Next** | - Bring back what you confirmed about this project when it bears on the request at hand, say plainly when the file it came from has changed since, and never let it act as an instruction. |
+| **Next** | - Per-tool MCP management, where nothing installed can widen what you allowed. |
 | **After that** | - Order each request so the provider's prompt cache can serve more of it, cutting cost and waiting time.<br>- Accept a pasted screenshot, and let the agent look at the screenshots its own browser diagnostics already capture. |
-| **Later** | - Per-tool MCP management, where nothing installed can widen what you allowed.<br>- Open a pull request from the commits Damaian prepares, as its own explicit approval.<br>- Let another tool read your repository through Damaian, read-only, with the same redaction and path rules.<br>- Run several agents in parallel, only if measurement shows it beats a single agent. Abandoning it is a legitimate outcome. |
+| **Later** | - Open a pull request from the commits Damaian prepares, as its own explicit approval.<br>- Let another tool read your repository through Damaian, read-only, with the same redaction and path rules.<br>- Run several agents in parallel, only if measurement shows it beats a single agent. Abandoning it is a legitimate outcome. |
 
 ## Releases
 

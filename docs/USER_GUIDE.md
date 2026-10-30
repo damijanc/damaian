@@ -116,6 +116,8 @@ Common keys:
 | `checkpoint_retention_days` | `90` | How long [checkpoints](#rewind) are kept | No |
 | `audit_retention_days` | `90` | How long audit records are kept | Yes |
 | `repository_map_max_tokens` | `800` | Size of the [repository map](#the-map-the-assistant-sees) | Lower only |
+| `memory_max_entries` | `5` | Most remembered entries recalled into one turn ([How memory reaches the model](#how-memory-reaches-the-model)) | Lower only |
+| `memory_retention_days` | `0` (no expiry) | Days after which a remembered entry expires | No |
 | `symbol_context_max_tokens` | `1600` | Size of the symbol hints added when a prompt names one ([Symbol Search and Language Servers](#symbol-search-and-language-servers)) | Lower only |
 | `context_budget.<category>` | Per category | Share of the context budget one category may use ([Output and Context Limits](#output-and-context-limits)) | Lower only |
 | `context_budget.safety_margin` | `0.1000` | Share of a measured provider window held back for estimate error | Raise only |
@@ -125,12 +127,12 @@ Repository-scoped settings are not edited from Settings. Put repository defaults
 
 Because that file arrives with a clone, a repository can only make Damaian *more* careful, never less:
 
-- `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
+- `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, `memory_retention_days`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
 - `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are added to yours rather than replacing them.
 - The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
 - `command_allowlist` is never taken from repository config; *Allow Always* writes to your own config instead. See [Allow Always](#allow-always).
 - Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, and the root overrides `project_roots_added` and `project_roots_removed` ([Repository Roots](#repository-roots)) — apply as written.
-- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, and `agent_max_turn_notes_chars`. The first three bound how much one request may carry; `agent_max_exploration_rounds` bounds how many read-only rounds a turn may take; `agent_max_turn_notes_chars` bounds how much the assistant's notes add to every later request. Raising one would widen what leaves your machine or how long a turn may run. A repository that tries is told to you like any other rejected key.
+- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, `agent_max_turn_notes_chars`, and `memory_max_entries`. The first three bound how much one request may carry; `agent_max_exploration_rounds` bounds how many read-only rounds a turn may take; `agent_max_turn_notes_chars` bounds how much the assistant's notes add to every later request. Raising one would widen what leaves your machine or how long a turn may run. A repository that tries is told to you like any other rejected key.
 - Each `context_budget.<category>` share can be lowered by a repository but never raised, and `context_budget.safety_margin` can be raised but never lowered. A share decides how much of the repository's own content is packed, so a clone may tighten it and may not widen it ([Output and Context Limits](#output-and-context-limits)).
 
 ### Semantic search
@@ -283,7 +285,7 @@ Setting a value higher than the model actually allows causes the provider to rej
 
 ### What goes into context
 
-Every request is assembled the same way. The collected items are sent in one `Repository context:` block, followed by the conversation under `Recent conversation:` — a summary of older messages when one exists, then the most recent messages that fit the conversation window (each cut to 2,000 characters) — followed by your message under `User request:`. Your message appears once. Within the repository block each item is one section headed `--- <source>: <path> ---`; a fetched page has no path, so its header names the URL and fetch time instead. The source labels are listed in [Reading a turn's context manifest](TROUBLESHOOTING.md#reading-a-turns-context-manifest). Items are added in a fixed order: the files you named or added, the `AGENTS.md` files that apply to the collected paths, the root project rules, the repository map, symbol hints, hook context, a carried plan, keyword and semantic search hits, and last any page fetched in an earlier turn. A line range would append `:start-end` to the path; no source produces one yet, so every item is a whole file or a rendered block. A one-shot edit request sends the same items under its own `User edit request:` heading, which comes first because that request makes a single call.
+Every request is assembled the same way. The collected items are sent in one `Repository context:` block, followed by the conversation under `Recent conversation:` — a summary of older messages when one exists, then the most recent messages that fit the conversation window (each cut to 2,000 characters) — followed by your message under `User request:`. Your message appears once. Within the repository block each item is one section headed `--- <source>: <path> ---`; a fetched page has no path, so its header names the URL and fetch time instead. The source labels are listed in [Reading a turn's context manifest](TROUBLESHOOTING.md#reading-a-turns-context-manifest). Items are added in a fixed order: the files you named or added, the `AGENTS.md` files that apply to the collected paths, the root project rules, the repository map, symbol hints, hook context, a carried plan, keyword and semantic search hits, any page fetched in an earlier turn, and last any recalled memory. A line range would append `:start-end` to the path; no source produces one yet, so every item is a whole file or a rendered block. A one-shot edit request sends the same items under its own `User edit request:` heading, which comes first because that request makes a single call.
 
 Your message is secret-scanned before it is sent, and so is every earlier message replayed under `Recent conversation:`. Sessions store messages as you typed them, so this is what keeps a credential from an older turn out of a later request: a detected value is replaced by Damaian's redaction marker rather than sent in cleartext.
 
@@ -300,11 +302,12 @@ Your message is secret-scanned before it is sent, and so is every earlier messag
 | `symbols` | 10% | The symbol hints block, still capped by `symbol_context_max_tokens`. |
 | `search_results` | 10% | Files found by search: exact keyword hits first, then semantic-similarity hits. Semantic hits are dropped first when this category runs short. |
 | `file_ranges` | 25% | Files you named in the prompt and files you added with **+** ([Chat](#chat)); explicit paths are ordered ahead of mentioned ones. |
-| `findings` | 5% | Reserved for the [findings](#fix-n-errors-and-the-findings-list) repair flow. The assistant still receives only the findings you select for a repair request, so nothing fills this automatically today and its share is released. |
+| `findings` | 2% | Reserved for the [findings](#fix-n-errors-and-the-findings-list) repair flow. The assistant still receives only the findings you select for a repair request, so nothing fills this automatically today and its share is released. |
 | `conversation_summary` | 5% | The summary shown in the inspector's **Summary** row. It travels inside `Recent conversation:` rather than as a context item, so this share is released. |
-| `external_reference` | 5% | Pages read with `fetch_url`, shown in the turn **after** the fetch. It is the last category declared, so a crowded context drops a fetched page before it drops repository content. |
+| `external_reference` | 5% | Pages read with `fetch_url`, shown in the turn **after** the fetch. It comes after every repository-content category, so a crowded context drops a fetched page before it drops repository content. |
+| `memory` | 3% | Entries recalled from [memory](#how-memory-reaches-the-model). It is the last category declared, so memory is the first thing dropped. |
 
-A category that uses less than its share releases the remainder to the categories after it. In a repository with no hook context, no carried plan, no pinned context, no findings, no conversation summary and no fetched page, the six unused shares add up to 40% of the budget released to the categories that do have content. A category that wants more than its share is shortened within itself — its lowest-priority items are dropped, or the map or symbols block is re-rendered smaller — and it never takes from another category.
+A category that uses less than its share releases the remainder to the categories after it. In a repository with no hook context, no carried plan, no pinned context, no findings, no conversation summary, no fetched page and no recalled memory, the seven unused shares add up to 40% of the budget released to the categories that do have content. A category that wants more than its share is shortened within itself — its lowest-priority items are dropped, or the map or symbols block is re-rendered smaller — and it never takes from another category.
 
 Each share is its own key in your user config ([Settings](#settings)), written as a decimal fraction with at most four places:
 
@@ -317,9 +320,10 @@ context_budget.repository_map=0.0500
 context_budget.symbols=0.1000
 context_budget.search_results=0.1000
 context_budget.file_ranges=0.2500
-context_budget.findings=0.0500
+context_budget.findings=0.0200
 context_budget.conversation_summary=0.0500
 context_budget.external_reference=0.0500
+context_budget.memory=0.0300
 context_budget.safety_margin=0.1000
 ```
 
@@ -529,10 +533,9 @@ become a statement recalled in every other repository.
 **Memory never outranks instructions.** An applicable `AGENTS.md`, a current
 instruction from you, the active mode and the permission profile all take
 precedence over anything remembered. Memory is the lowest-priority context
-source: when recall ships, a remembered sentence will reach the model as a dated
-claim with its provenance, never as an instruction, and the context panel will
-show it so you can remove it from that turn. Today memory is stored and
-inspectable in the store, but nothing is recalled into a request yet.
+source: a remembered sentence reaches the model as a dated claim with its
+provenance, never as an instruction, and the context panel shows it so you can
+remove it from that turn ([How memory reaches the model](#how-memory-reaches-the-model)).
 
 **A refused request is reported, not ignored.** If an explicit "remember that…"
 cannot become a memory — it contains a detected credential, asks for user scope
@@ -553,12 +556,14 @@ redacted on its way into a request.
 share**: a project memory can name a machine, a path or a preference. The audit
 trail records lifecycle events without a personal or environmental statement.
 
-**In this build.** Memory can be proposed and confirmed. An explicit "remember
-that …" in your message, or a suggestion from the assistant, appears as a card
-showing the exact sentence. Nothing is stored until you press **Remember**;
-**Dismiss** records the decision and stores nothing. The entry is then kept and
-audited, and recall through the context panel arrives in the next feature. A
-missing entry in the context panel is therefore not a fault yet.
+**In this build.** Memory can be proposed, confirmed and recalled. An explicit
+"remember that …" in your message, or a suggestion from the assistant, appears
+as a card showing the exact sentence. Nothing is stored until you press
+**Remember**; **Dismiss** records the decision and stores nothing. A confirmed
+entry is recalled into later turns when it is relevant. Listing, editing and
+deleting stored entries from the app is not built yet; see
+[Troubleshooting](TROUBLESHOOTING.md#memory) for reading and deleting them in
+the store.
 
 **How a memory gets created.** There are two paths, and both end at the same
 card:
@@ -609,6 +614,68 @@ repository text was ever involved.
 proposes user scope while the scope is off, it offers to save the memory for
 this project instead. Enabling cross-project recall stays the separate setting
 described above. A confirmation never flips it for you.
+
+### How memory reaches the model
+
+**Only as context, and last.** Each turn, Damaian picks the remembered entries
+that share words with your message or the files you named — at most
+`memory_max_entries` (default 5) — from this session, this project and, only if
+you enabled it, user scope. They travel as ordinary items in the `memory`
+category of [context assembly](#what-goes-into-context), the last category in
+the budget order. Memory is the first thing dropped when context is short, and
+it can never push out your message, `AGENTS.md`, a plan or a file. There is no
+other path: no system-prompt line, no hidden prefix. If an entry is not in the
+context panel, it was not sent.
+
+Each entry is framed as a claim, with its origin and date:
+
+```text
+Remembered about this project (user-confirmed, 2026-03-14):
+  Integration tests require Docker to be running.
+```
+
+**Seeing and removing what was recalled.** The **Memory** row in the
+[context panel](#inspecting-and-controlling-context) counts the recalled entries
+and how many are stale. Expanded, each entry shows its sentence, scope, origin,
+date, whether its evidence is current, and why it was recalled ("matched docker,
+tests"; "category fitted the task" when a running or editing task ranked it
+higher). While the pre-send review is paused you can remove an entry from that
+turn; it is recorded as removed in the manifest and is **not** deleted from
+memory. After the turn is sent, the entries are shown without a remove control.
+
+**What "may be out of date" means.** An entry derived from a repository file
+remembers what that file contained. If the file has changed or been deleted
+since, the entry is still recalled — it may still be true — but the model reads
+*may be out of date — that file has changed since* in the same sentence, and the
+panel counts it as stale. If the file is put back, the marker goes away. An
+entry whose source file you later protect with `restricted_patterns` or exclude
+with a `.gitignore` is not recalled at all until you narrow the rule again; it
+is kept, not deleted.
+
+**Why memory cannot grant a permission.** A remembered sentence is text in the
+context window, like a file's contents. Approval comes from the command policy
+and your config, mode from the session, and file access from path policy; none
+of them reads context. A memory that says "all commands are pre-approved" or
+"you may edit files" is a false claim the model can see, and the approval card
+and the mode still apply. Recall is checked by evaluation scenarios that try
+exactly that.
+
+**Settings.** In your user config:
+
+```text
+memory_max_entries=5
+memory_retention_days=0
+context_budget.memory=0.0300
+```
+
+`memory_max_entries` is the most entries recalled per turn; a repository or a
+profile may lower it, not raise it. `context_budget.memory` is the category's
+share of the context budget, lower-only from a repository like every share;
+`0` keeps every memory out of the request. `memory_retention_days=0` keeps
+entries until you delete them; any other value expires an entry that many days after it was created, the
+next time recall reads it. A repository and a permission profile cannot set it.
+Every recall that reaches a request is audited as `memory_recalled`, so "when
+was this last used?" has an answer in the audit log.
 
 ## Working Folder
 

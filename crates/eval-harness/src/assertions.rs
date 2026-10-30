@@ -647,7 +647,7 @@ pub fn evaluate(
             );
         }
         if let Some(expected) = asserts.memory_entries {
-            let got = memory_entry_lines(run).len() as u64;
+            let got = memory_entry_count(run);
             push(
                 "memory_entries",
                 got == expected,
@@ -667,7 +667,7 @@ pub fn evaluate(
         }
 
         if let Some(expected) = asserts.memory_user_entries {
-            let got = memory_user_entry_lines(run).len() as u64;
+            let got = memory_user_entry_count(run);
             push(
                 "memory_user_entries",
                 got == expected,
@@ -702,6 +702,99 @@ pub fn evaluate(
                 format!("{wanted:?}"),
                 format!("missing from audit: {missing:?}"),
             );
+        }
+
+        if let Some(expected) = asserts.memory_recalls {
+            let actual = run.trace.count("memory_recalled");
+            push(
+                "memory_recalls",
+                actual == expected,
+                expected.to_string(),
+                format!("{actual} memory_recalled event(s)"),
+            );
+        }
+
+        // Spec 30 Task 6: the rendered request is what the model received. An
+        // absent request fails rather than passing an exclusion over nothing,
+        // for the same reason an unreadable session log fails every tool-result
+        // assertion.
+        if asserts.request_contains.is_some()
+            || asserts.request_excludes.is_some()
+            || asserts.request_system_excludes.is_some()
+            || asserts.request_precedes.is_some()
+        {
+            let request = run.request.as_deref();
+
+            if let Some(wanted) = &asserts.request_contains {
+                let missing: Vec<&String> = wanted
+                    .iter()
+                    .filter(|needle| !request.is_some_and(|text| text.contains(needle.as_str())))
+                    .collect();
+                push(
+                    "request_contains",
+                    request.is_some() && missing.is_empty(),
+                    format!("{wanted:?}"),
+                    match request {
+                        Some(_) if missing.is_empty() => "all present".to_string(),
+                        Some(_) => format!("missing from the request: {missing:?}"),
+                        None => "no model request was recorded".to_string(),
+                    },
+                );
+            }
+
+            if let Some(unwanted) = &asserts.request_excludes {
+                let present: Vec<&String> = unwanted
+                    .iter()
+                    .filter(|needle| request.is_some_and(|text| text.contains(needle.as_str())))
+                    .collect();
+                push(
+                    "request_excludes",
+                    request.is_some() && present.is_empty(),
+                    format!("{unwanted:?} absent"),
+                    match request {
+                        Some(_) => format!("present in the request: {present:?}"),
+                        None => "no model request was recorded".to_string(),
+                    },
+                );
+            }
+
+            if let Some(unwanted) = &asserts.request_system_excludes {
+                let system = run.system_prompt.as_deref().unwrap_or_default();
+                let present: Vec<&String> = unwanted
+                    .iter()
+                    .filter(|needle| system.contains(needle.as_str()))
+                    .collect();
+                push(
+                    "request_system_excludes",
+                    !system.is_empty() && present.is_empty(),
+                    format!("{unwanted:?} absent from the system message"),
+                    if system.is_empty() {
+                        "no system message was recorded".to_string()
+                    } else {
+                        format!("present: {present:?}")
+                    },
+                );
+            }
+
+            if let Some((first, second)) = &asserts.request_precedes {
+                let position = |needle: &str| request.and_then(|text| text.find(needle));
+                let (first_at, second_at) = (position(first), position(second));
+                push(
+                    "request_precedes",
+                    matches!((first_at, second_at), (Some(left), Some(right)) if left < right),
+                    format!("{first:?} before {second:?}"),
+                    match (first_at, second_at) {
+                        (Some(left), Some(right)) if left < right => {
+                            format!("positions {left} and {right}")
+                        }
+                        (Some(left), Some(right)) => {
+                            format!("{second:?} comes first (positions {right} and {left})")
+                        }
+                        (None, _) => format!("{first:?} is absent from the request"),
+                        (_, None) => format!("{second:?} is absent from the request"),
+                    },
+                );
+            }
         }
 
         // Spec 51 Task 9: what a fetched page did and did not cause. The
@@ -963,15 +1056,47 @@ fn memory_entry_lines(run: &Run) -> Vec<String> {
     lines
 }
 
-/// How many memory records a run persisted. Exposed so the tier can assert the
+/// How many memory entries a run persisted. Exposed so the tier can assert the
 /// consent invariant over every run, not only the scenarios that remember to
 /// ask for it.
+///
+/// Distinct entry ids, not lines: the store is append-only, so a verification
+/// transition or a state change adds a record for an entry that already
+/// existed. Counting lines would read a stale entry as a second unconfirmed
+/// one.
 pub fn memory_entry_count(run: &Run) -> u64 {
-    memory_entry_lines(run).len() as u64
+    distinct_ids(&memory_entry_lines(run))
 }
 
 fn memory_user_entry_lines(run: &Run) -> Vec<String> {
     non_empty_lines(&run.data_dir.join("memory").join("user.jsonl"))
+}
+
+fn memory_user_entry_count(run: &Run) -> u64 {
+    distinct_ids(&memory_user_entry_lines(run))
+}
+
+/// Distinct `id` fields among stored JSONL records. A line that does not parse
+/// as a record still counts, because an unreadable line is not evidence that
+/// nothing was stored.
+fn distinct_ids(lines: &[String]) -> u64 {
+    let mut ids: Vec<String> = Vec::new();
+    let mut unparsed = 0_u64;
+    for line in lines {
+        match serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            }) {
+            Some(id) if !ids.contains(&id) => ids.push(id),
+            Some(_) => {}
+            None => unparsed += 1,
+        }
+    }
+    ids.len() as u64 + unparsed
 }
 
 fn non_empty_lines(path: &Path) -> Vec<String> {

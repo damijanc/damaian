@@ -1,6 +1,9 @@
 # Feature Spec: Memory Retrieval, Lifecycle, and Injection Resistance
 
-Status: In progress (planned 2026-10-28; no task implemented yet).
+Status: Done 2026-10-30 (planned 2026-10-28; Tasks 1–6 built 2026-10-28, Tasks
+7–8 on 2026-10-30). Scoped checks passed locally; the full seven-check gate is
+outstanding until CI runs. The phase's two-week real-session observation is
+recorded as outstanding in §7.3.
 Order: 30 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 4 (Must). That directory is local-only and not committed, so the
@@ -139,6 +142,7 @@ placed last:
 pub enum ContextCategory {
     Required,
     Instructions,
+    HookContext,
     Pinned,
     PlanState,
     RepositoryMap,
@@ -147,6 +151,7 @@ pub enum ContextCategory {
     FileRanges,
     Findings,
     ConversationSummary,
+    ExternalReference,
     /// Lowest priority. Dropped first, per spec 29 requirement 5.
     Memory,
 }
@@ -159,6 +164,12 @@ instructions, plan state, or file content. Requirement 5 of
 [spec 29](29_memory_creation_and_consent/proposal.md) ("memory is the lowest-priority
 context source") is therefore a property of the enum's ordering, not a rule
 someone must remember.
+
+`ExternalReference` is spec 51's fetched-page category. It was declared last
+when it landed, so a fetched page would drop before any repository content; this
+spec puts `Memory` after it, because spec 29 requirement 5 and this spec's
+acceptance criteria require memory to be the first thing dropped. The fetched
+page keeps its guarantee: it still precedes every repository-content category.
 
 `context_budget.memory` gets a deliberately small default share. A memory
 category that routinely consumes a tenth of the window has stopped being a
@@ -434,15 +445,98 @@ where memory retention is configured.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+Built in Tasks 1–6 on 2026-10-28 and documented and closed on 2026-10-30. The
+per-task record, including every correction to the written plan, is the
+progress table in [`tasks.md`](tasks.md); [`context.md`](context.md) C1–C18
+holds the corrections themselves.
 
-- The `context_budget.memory` default and the entry cap, plus how much of the
-  budget memory actually consumed in real sessions.
-- Measured recall usefulness after at least two weeks across at least two
-  repositories, per the phase's validation requirement. The phase is not
-  complete on the day the tests pass — record the elapsed-time observation
-  explicitly, including any entry that turned out to be quietly wrong.
-- Whether lexical retrieval proved sufficient. If recall usefulness is poor,
-  record the failing cases before proposing semantic ranking, so the later work
-  package has evidence rather than an assumption.
-- Whether an in-process retrieval cache was added, and how it is invalidated.
+### 7.1 Defaults chosen
+
+- **`context_budget.memory` = 0.0300 (300 basis points).** Funded by lowering
+  `findings` from 0.0500 to 0.0200, because `findings` has no producer in the
+  tree and would otherwise release its share anyway; file content was not
+  touched and the shares still total 1.0000. A share of `0` turns recall off
+  (`apply_budget` treats a zero share as off rather than letting the released
+  carry fill it; C15).
+- **`memory_max_entries` = 5.** Restrict-only: a repository or profile may
+  lower it.
+- **`memory_retention_days` = 0 (no expiry).** User-only: forbidden to
+  repository and profile config, like `memory_user_scope_enabled`.
+- All three are `Capability` in spec 31's partition, not `Preference` as the
+  draft said (C12).
+
+### 7.2 Design as built, where it differs from §5
+
+- **Revalidation is lazy only.** §5.5 described an eager transition on watcher
+  events *and* a check at retrieval. The watcher thread has no seam to the
+  memory store (C6), and the retrieval check alone satisfies every acceptance
+  criterion, including the one about missed watcher events, because recall
+  hashes every evidence path it is about to use. No watcher-driven transition
+  was built.
+- **`Memory` comes after `ExternalReference`.** Spec 51 landed first and
+  declared its category last; memory was placed after it so memory is still
+  the first thing dropped (C2, §5.1).
+- **Withdrawal also covers a non-relative evidence path** (`../…` or absolute),
+  checked before any file read, because a memory file edited outside Damaian
+  could otherwise turn recall into a read outside the repository.
+- **The send-time re-check** (`MemoryStore::recheck_recall`,
+  `PreparedContext::remove_memory`) runs before the manifest is streamed and
+  again on a resumed `Send`, and drops the manifest's `memory` row with the
+  item, recording `memory_no_longer_active` (C16).
+- **The inspector resolves statements by id** through `POST
+  /api/context-memory`, scanning each statement again before display; the
+  manifest and audit stay content-free (C3, C17).
+
+### 7.3 Measurement
+
+- **Deterministic proxies.** Over the seven deterministic scenarios on the
+  `memory-recall` fixture, `memory_recall_usefulness` = 0.750 and
+  `memory_correction_rate` = 0.125 across eight recalled-entry observations.
+  Both are labelled proxies in spec 18 §5.6: a fixture designed to recall
+  memory cannot measure whether recall helps a real task.
+- **Real sessions: not yet measured.** The phase's validation requirement — at
+  least two weeks across at least two repositories — has not elapsed; the
+  feature first runs on `main` with this close-out. How much of the budget
+  memory consumes in real sessions, measured usefulness, and any entry that
+  turns out to be quietly wrong are **outstanding**, and are the evidence to
+  record here before Phase 3b is called complete. The spec is Done on its
+  acceptance criteria; the phase's elapsed-time observation is not.
+- **Whether lexical retrieval is sufficient** is therefore unanswered beyond
+  the fixture. What the fixture did show: stopword-only overlap is not
+  relevance (`grammatical_overlap_alone_is_not_relevance`), and a
+  sentence-final `.` had to be trimmed for `commas.` to match `commas` (C13). If
+  real usefulness proves poor, record the failing prompts and entries here
+  before proposing semantic ranking.
+- **No in-process retrieval cache was added.** Recall reads the store every
+  turn and the turn resolves `ProjectIdentity` each time (two `git` reads).
+  §5.6's rule stands for any later cache: key it by entry id and invalidate on
+  state change, or the deleted-entry criterion fails.
+
+### 7.4 Acceptance criteria and their evidence
+
+Tests named below are in `crates/workspace-engine/tests/memory.rs` unless
+another file is named; `context_manager` means the inline tests in
+`crates/workspace-engine/src/context_manager.rs`.
+
+| Criterion | Evidence |
+|---|---|
+| Memory reaches the model only as `ContextItem`s in `Memory` | `context_manager`: `a_recalled_entry_reaches_the_prompt_as_its_own_memory_item`, `zero_memory_share_keeps_every_statement_out_of_the_prompt`; `a_turn_sends_recalled_memory_as_a_context_item_and_records_it_once` |
+| `Memory` is lowest priority and truncated first | `context_manager`: `memory_is_dropped_before_file_content_under_pressure`; `tests/context_assembly.rs`: `an_external_reference_drops_before_repository_content` and the category-count tests |
+| Inspector shows statement, scope, provenance, date, verification, match reason | `a_display_read_resolves_only_entries_this_project_and_session_may_see`; `desktop-shell`: `the_context_memory_route_resolves_ids_without_crossing_projects`, `the_inspector_labels_memory_and_reports_its_stale_entries`. No manual browser walk was performed (Task 5) |
+| Removing a recalled entry removes it from the request and records `UserRemoved`, without deleting | `a_memory_removed_in_the_review_is_absent_from_the_resumed_request`; `context_manager`: `a_memory_item_is_removable_like_any_optional_item`; eval `memory_deleted_before_send` (user removal) |
+| Category line reports the stale count | `desktop-shell`: `the_inspector_labels_memory_and_reports_its_stale_entries` |
+| Stale entry rendered with the marker in the model's text | `context_manager`: `a_stale_entry_renders_the_out_of_date_marker_in_the_prompt`; eval `memory_staleness_is_marked` (`request_contains` on the rendered request) |
+| `EvidenceStale` on change, `EvidenceCurrent` on revert | `evidence_staleness_is_detected_at_recall_and_reverts` |
+| A deleted evidence path is stale, not deleted | `a_deleted_evidence_path_is_stale_not_deleted` |
+| Protected or ignored evidence excluded entirely, detected at retrieval | `restricted_and_ignored_evidence_is_withdrawn_and_restored` (adds a `restricted_patterns` entry and a `.gitignore` line, neither touching the file) |
+| Such an entry is retained, reported, and returns when narrowed | the same test; `memory_recall_withdrawn` audit |
+| Staleness detected even when the watcher missed it | revalidation runs only at recall (§7.2), so every staleness test is this case |
+| `Superseded`/`Expired`/`Deleted` filtered before ranking | `expired_superseded_and_deleted_entries_are_never_recalled`; `retention_and_entry_expiry_transition_to_expired_before_ranking` |
+| A deleted entry never reappears, including between assembly and send | `an_entry_deleted_between_assembly_and_send_is_absent_from_the_request`; `a_send_time_recheck_names_what_it_drops`; `context_manager`: `a_send_time_drop_removes_the_memory_item_and_its_ref`; eval `memory_deleted_before_send` |
+| A mismatched `project_key` is a hard error | `recall_refuses_a_project_record_that_names_another_project` |
+| No cross-repository recall at each resolution tier | `recall_is_isolated_at_each_project_key_tier`; eval `memory_project_isolation` |
+| User scope off recalls nothing from it | `disabling_user_scope_stops_recall_without_deleting_the_entry`; eval `memory_user_scope_off` |
+| Instruction-like memory does not change behaviour | evals `memory_instruction_shaped_still_requires_approval`, `memory_does_not_widen_ask_mode`, `memory_does_not_outrank_instructions`; each was shown to fail with its guard removed (Task 6 row) |
+| Every recall is audited | `a_turn_sends_recalled_memory_as_a_context_item_and_records_it_once`, `a_declined_review_records_no_recall`; eval assertion `memory_recalls` |
+| The two spec 18 memory metrics carry real values | `tests/harness.rs`: `the_memory_metrics_report_the_counts_the_run_recorded`; spec 18 §5.6 |
+| Quality gate passes; baseline shows no regression | Scoped checks passed locally (see `tasks.md` Task 8); the deterministic tier passes every scenario with approval-policy, restricted-path and secret violations all 0. The full seven-check gate runs on CI and is recorded in `tasks.md` when it passes. |
