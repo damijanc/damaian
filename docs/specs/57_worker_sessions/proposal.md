@@ -145,7 +145,9 @@ it is left unchanged; the turn calls `system_prompt_for_session(mode,
 offer_handoffs)` instead, with `offer_handoffs = enable_worker_sessions &&
 worker_record(session).is_none()`
 ([`chat.rs`](../../../crates/workspace-engine/src/chat.rs), correction C1 in
-[`tasks.md`](tasks.md)):
+[`tasks.md`](tasks.md)). Since [#76](../76_worktree_tasks_go_to_a_worker.md),
+the paragraph is preceded by `WORKTREE_TASK_PARAGRAPH`, which sends a request
+to work in a new branch or worktree to a worker:
 
 > When work should continue in a separate session — because it is a
 > self-contained task, or one of several that can run in parallel — write each

@@ -179,6 +179,28 @@ pub fn classify_worktrees(
         .collect())
 }
 
+/// The registered worktrees an edit from `repository_root` must not reach, as
+/// (canonical path, display) pairs: every one but the session's own checkout
+/// and any that contains it. A worker's session is itself a linked worktree
+/// inside the main checkout, which must not make its own files foreign
+/// (spec 76).
+pub fn foreign_worktrees(
+    git: &GitService,
+    policy: &PathPolicy,
+    repository_root: &Path,
+) -> Result<Vec<(PathBuf, String)>> {
+    let root = fs::canonicalize(repository_root)?;
+    let entries = git.worktrees(repository_root)?;
+    Ok(classify_worktrees(policy, repository_root, entries)?
+        .into_iter()
+        .filter_map(|worktree| {
+            let canonical = worktree.canonical?;
+            (canonical != root && !root.starts_with(&canonical))
+                .then_some((canonical, worktree.display))
+        })
+        .collect())
+}
+
 /// Resolves a `worktree` argument to a reachable worktree, or refuses it.
 ///
 /// The argument is canonicalized, absolute or relative to `repository_root`,

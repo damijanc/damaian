@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use workspace_engine::worktree_access::{WorktreeRefusal, classify_worktrees, resolve_worktree};
+use workspace_engine::worktree_access::{
+    WorktreeRefusal, classify_worktrees, foreign_worktrees, resolve_worktree,
+};
 use workspace_engine::{
     AuditLog, ClientError, Config, DiffOptions, GitReadCaps, GitService, MockModelAdapter,
     ModelProviderConfig, PathPolicy, SecretScanner, ToolCall, WorkspaceEngine, WorktreeListing,
@@ -1500,5 +1502,89 @@ fn list_worktrees_and_read_git_log_batch_read_only_and_audit() {
             .lines()
             .any(|line| line.contains("git_log_read")),
         "read_git_log must audit"
+    );
+}
+
+// Spec 76: edits land only in the session's checkout. A path that reaches a
+// worktree through it is refused, and a worker's own checkout, itself a
+// linked worktree inside the main one, is not foreign to it.
+
+#[test]
+fn from_the_main_checkout_every_linked_worktree_is_foreign() {
+    let fixture = fixture("foreign-from-main");
+    let foreign: Vec<PathBuf> = foreign_worktrees(&fixture.git, &policy(), &fixture.repo)
+        .unwrap()
+        .into_iter()
+        .map(|(canonical, _)| canonical)
+        .collect();
+    assert_eq!(foreign, vec![fixture.worktree("a"), fixture.worktree("b")]);
+}
+
+#[test]
+fn from_a_linked_worktree_its_own_checkout_and_the_one_holding_it_are_not_foreign() {
+    let fixture = fixture("foreign-from-linked");
+    let session_root = fixture.worktree("a");
+    let foreign: Vec<PathBuf> =
+        foreign_worktrees(&fixture.git, &policy_allowing(&fixture.repo), &session_root)
+            .unwrap()
+            .into_iter()
+            .map(|(canonical, _)| canonical)
+            .collect();
+    assert_eq!(foreign, vec![fixture.worktree("b")]);
+}
+
+#[test]
+fn an_edit_inside_a_worktree_is_refused_and_proposes_no_patch() {
+    let fixture = fixture("edit-into-worktree");
+    let turn = fixture.tools(&[(
+        "edit_file",
+        "{\"summary\":\"Change a\",\"edits\":[{\"path\":\".claude/worktrees/a/README.md\",\
+         \"old_text\":\"readme\",\"new_text\":\"changed\"}]}",
+    )]);
+    assert!(
+        turn.results[0].contains("is inside the git worktree `.claude/worktrees/a`"),
+        "{:?}",
+        turn.results
+    );
+    assert!(
+        turn.results[0].contains("Edits apply only to this session's checkout"),
+        "{:?}",
+        turn.results
+    );
+    assert!(!turn.records.contains("awaiting_review"));
+    assert_eq!(
+        fs::read_to_string(fixture.worktree("a").join("README.md")).unwrap(),
+        "readme\n"
+    );
+}
+
+#[test]
+fn a_patch_into_a_worktree_is_refused_too() {
+    let fixture = fixture("patch-into-worktree");
+    let turn = fixture.tools(&[(
+        "propose_patch",
+        "{\"summary\":\"Add to b\",\"files\":[{\"path\":\".claude/worktrees/b/new.txt\",\
+         \"status\":\"added\",\"content\":\"new\\n\"}]}",
+    )]);
+    assert!(
+        turn.results[0].contains("is inside the git worktree `.claude/worktrees/b`"),
+        "{:?}",
+        turn.results
+    );
+    assert!(!turn.records.contains("awaiting_review"));
+}
+
+#[test]
+fn an_edit_in_the_sessions_own_checkout_still_proposes_a_patch() {
+    let fixture = fixture("edit-own-checkout");
+    let turn = fixture.tools(&[(
+        "edit_file",
+        "{\"summary\":\"Change readme\",\"edits\":[{\"path\":\"README.md\",\
+         \"old_text\":\"readme\",\"new_text\":\"changed\"}]}",
+    )]);
+    assert!(
+        turn.records.contains("awaiting_review"),
+        "{:?}",
+        turn.results
     );
 }

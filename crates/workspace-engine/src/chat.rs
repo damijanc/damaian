@@ -70,7 +70,7 @@ use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
     WebDiagnosticReport, WebDiagnosticsRunnerHandle,
 };
-use crate::worktree_access::resolve_worktree;
+use crate::worktree_access::{foreign_worktrees, resolve_worktree};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -7368,12 +7368,22 @@ impl ChatOrchestrator {
                             )
                         }
                         ToolAction::ProposePatch(generated_edit) => {
-                            match self.patch_engine.create_patch(
-                                repository_root,
-                                &generated_edit.changes,
-                                Some(&task.id),
-                                &generated_edit.summary,
-                            ) {
+                            match self
+                                .refuse_edit_in_worktree(
+                                    repository_root,
+                                    generated_edit
+                                        .changes
+                                        .iter()
+                                        .map(|change| change.path.as_str()),
+                                )
+                                .and_then(|()| {
+                                    self.patch_engine.create_patch(
+                                        repository_root,
+                                        &generated_edit.changes,
+                                        Some(&task.id),
+                                        &generated_edit.summary,
+                                    )
+                                }) {
                                 Ok(patch) => {
                                     // See `ProposedPatch::session_id`: the engine does
                                     // not know the session, this orchestrator does.
@@ -7620,19 +7630,26 @@ impl ChatOrchestrator {
                             }
                         },
                         ToolAction::EditFile { summary, edits } => {
-                            match region_edits_to_changes(
-                                repository_root,
-                                &self.path_policy,
-                                &edits,
-                            )
-                            .and_then(|changes| {
-                                self.patch_engine.create_patch(
+                            match self
+                                .refuse_edit_in_worktree(
                                     repository_root,
-                                    &changes,
-                                    Some(&task.id),
-                                    &summary,
+                                    edits.iter().map(|edit| edit.path.as_str()),
                                 )
-                            }) {
+                                .and_then(|()| {
+                                    region_edits_to_changes(
+                                        repository_root,
+                                        &self.path_policy,
+                                        &edits,
+                                    )
+                                })
+                                .and_then(|changes| {
+                                    self.patch_engine.create_patch(
+                                        repository_root,
+                                        &changes,
+                                        Some(&task.id),
+                                        &summary,
+                                    )
+                                }) {
                                 Ok(patch) => {
                                     // See `ProposedPatch::session_id`: the engine does
                                     // not know the session, this orchestrator does.
@@ -9308,6 +9325,46 @@ impl ChatOrchestrator {
         }
     }
 
+    /// Refuses an edit whose path lies in another git worktree. Edits apply to
+    /// this session's checkout only (spec 60 §4, spec 76): a path that reaches
+    /// a worktree through this checkout, such as `.claude/worktrees/x/src`,
+    /// would write into a checkout the user never opened, without that
+    /// worktree's verification or recovery. A repository git cannot list
+    /// worktrees for has none to protect.
+    fn refuse_edit_in_worktree<'a>(
+        &self,
+        repository_root: &Path,
+        paths: impl Iterator<Item = &'a str>,
+    ) -> Result<()> {
+        let worktrees = match foreign_worktrees(&self.git, &self.path_policy, repository_root) {
+            Ok(worktrees) if !worktrees.is_empty() => worktrees,
+            _ => return Ok(()),
+        };
+        for path in paths {
+            let Ok(target) = self.path_policy.resolve_for_write(repository_root, path) else {
+                continue;
+            };
+            if let Some((_, display)) = worktrees
+                .iter()
+                .find(|(canonical, _)| target.absolute_path.starts_with(canonical))
+            {
+                let next = if self.config.enable_worker_sessions {
+                    "To change a worktree, hand the task to a worker session in a \
+                     ```worker-prompt block; it runs in a worktree of its own."
+                } else {
+                    "Tell the user that working in a separate worktree needs Worker \
+                     sessions (Settings › General), or ask whether to make the change \
+                     in this checkout."
+                };
+                return Err(ClientError::AccessDenied(format!(
+                    "`{path}` is inside the git worktree `{display}`. Edits apply only to \
+                     this session's checkout, never to another worktree. {next}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// A read path as `PathPolicy` resolves it relative to its checkout. A path
     /// the policy refuses is kept as given: a retry of the same refused path is
     /// still the same call.
@@ -10690,6 +10747,12 @@ const ABSOLUTE_TURN_ROUND_CAP: u32 = 64;
 /// the `worker-prompt` tag.
 pub const WORKER_HANDOFF_PARAGRAPH: &str = "When work should continue in a separate session — because it is a self-contained task, or one of several that can run in parallel — write each task as a prompt in its own fenced block whose opening line is exactly ```worker-prompt, with the tag on the fence line itself and not inside the block. The user can start a worker from that block. A worker starts with a fresh context in its own git worktree and sees only the repository and that prompt, so say what to read, what to change, which checks to run, and when to stop. Do not use the `worker-prompt` tag for anything else.";
 
+/// Said before the handoff paragraph: a session's edits and commands always
+/// land in its own checkout, so a request to work in a new branch or worktree
+/// is a worker's task. A session that made a worktree itself and then edited
+/// the main checkout is how this was found (spec 76).
+pub const WORKTREE_TASK_PARAGRAPH: &str = "Your edits and commands always apply to this session's checkout. The `worktree` argument of the read tools only reads. When the user asks for work on a new branch or in a separate git worktree, do not create a worktree yourself and do not make the change here: hand the task to a worker in a ```worker-prompt block, which runs it in a worktree of its own.";
+
 /// [`system_prompt`] plus the handoff paragraph when the session is offered
 /// handoffs. `system_prompt` itself never changes, which is how the setting
 /// being off stays byte-for-byte off (spec 57 requirement 1).
@@ -10701,7 +10764,7 @@ fn system_prompt_for_session(
 ) -> String {
     let prompt = system_prompt(mode, user_present, shell);
     if offer_handoffs {
-        format!("{prompt}\n\n{WORKER_HANDOFF_PARAGRAPH}")
+        format!("{prompt}\n\n{WORKTREE_TASK_PARAGRAPH}\n\n{WORKER_HANDOFF_PARAGRAPH}")
     } else {
         prompt
     }
@@ -12120,7 +12183,7 @@ fn run_command_tool_definition(shell: &str) -> ToolDefinition {
 fn propose_patch_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "propose_patch".to_string(),
-        description: "Propose a code change as a reviewable patch. Nothing is written to disk until the user approves it.".to_string(),
+        description: "Propose a code change as a reviewable patch. Nothing is written to disk until the user approves it. Paths are relative to this session's checkout, which is where the change lands; a `worktree` you read from is never written, and a path inside one is refused.".to_string(),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\",\"description\":\"Short summary of the change\"},\"files\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Repository-relative file path\"},\"status\":{\"type\":\"string\",\"enum\":[\"added\",\"modified\",\"deleted\"],\"description\":\"Optional; inferred from whether the file currently exists if omitted\"},\"content\":{\"type\":\"string\",\"description\":\"Full replacement file content; use an empty string for deleted files\"}},\"required\":[\"path\",\"content\"]}}},\"required\":[\"summary\",\"files\"]}".to_string(),
     }
 }
@@ -12215,7 +12278,7 @@ fn search_content_tool_definition() -> ToolDefinition {
 fn edit_file_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "edit_file".to_string(),
-        description: "Propose a change to part of a file by replacing an exact snippet. old_text must appear exactly once, or the edit is refused. Nothing is written to disk until the user approves it.".to_string(),
+        description: "Propose a change to part of a file by replacing an exact snippet. old_text must appear exactly once, or the edit is refused. Nothing is written to disk until the user approves it. Paths are relative to this session's checkout, which is where the change lands; a `worktree` you read from is never written, and a path inside one is refused.".to_string(),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\",\"description\":\"Short summary of the change\"},\"edits\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old_text\":{\"type\":\"string\",\"description\":\"Exact text to replace; must match once\"},\"new_text\":{\"type\":\"string\"}},\"required\":[\"path\",\"old_text\",\"new_text\"]}}},\"required\":[\"summary\",\"edits\"]}".to_string(),
     }
 }
@@ -14448,13 +14511,16 @@ mod worker_handoff_tests {
         // constant has to be an edit to the spec too.
         let from_the_spec = "When work should continue in a separate session — because it is a self-contained task, or one of several that can run in parallel — write each task as a prompt in its own fenced block whose opening line is exactly ```worker-prompt, with the tag on the fence line itself and not inside the block. The user can start a worker from that block. A worker starts with a fresh context in its own git worktree and sees only the repository and that prompt, so say what to read, what to change, which checks to run, and when to stop. Do not use the `worker-prompt` tag for anything else.";
         assert_eq!(WORKER_HANDOFF_PARAGRAPH, from_the_spec);
+        // Verbatim from spec 76 §4, for the same reason.
+        let worktree_task = "Your edits and commands always apply to this session's checkout. The `worktree` argument of the read tools only reads. When the user asks for work on a new branch or in a separate git worktree, do not create a worktree yourself and do not make the change here: hand the task to a worker in a ```worker-prompt block, which runs it in a worktree of its own.";
+        assert_eq!(WORKTREE_TASK_PARAGRAPH, worktree_task);
 
         for mode in ALL_MODES {
             for user_present in [true, false] {
                 assert_eq!(
                     system_prompt_for_session(mode, user_present, true, "/bin/zsh"),
                     format!(
-                        "{}\n\n{from_the_spec}",
+                        "{}\n\n{worktree_task}\n\n{from_the_spec}",
                         system_prompt(mode, user_present, "/bin/zsh")
                     ),
                     "{mode:?}"
@@ -14527,6 +14593,15 @@ mod worker_handoff_tests {
 
         assert!(
             system_message(&adapter).ends_with(WORKER_HANDOFF_PARAGRAPH),
+            "{}",
+            system_message(&adapter)
+        );
+        // Spec 76: a worktree request goes to a worker, said just before the
+        // handoff paragraph and only when handoffs are offered.
+        assert!(
+            system_message(&adapter).ends_with(&format!(
+                "{WORKTREE_TASK_PARAGRAPH}\n\n{WORKER_HANDOFF_PARAGRAPH}"
+            )),
             "{}",
             system_message(&adapter)
         );

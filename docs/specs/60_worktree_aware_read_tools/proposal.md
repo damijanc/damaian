@@ -122,7 +122,11 @@ entry. This spec applies it to the one place #47's tools stop.
   which #47 requirement 3 and AGENTS.md forbid without a spec of its own. It
   stays a separate question ([`context.md`](context.md) §5).
 - Writing to a worktree: edits, patches, commands or checkpoints. A patch
-  proposed against a worktree path is out of scope and is refused as today.
+  proposed against a worktree path is out of scope. This line once said such
+  a patch "is refused as today", but nothing refused it: a path such as
+  `.claude/worktrees/x/src/a.rs` resolved inside the repository and was
+  written there. [#76](../76_worktree_tasks_go_to_a_worker.md) added the
+  refusal and sends worktree tasks to a worker session.
 - Indexing worktrees for `search_codebase`, the symbol index or context
   assembly. Those are per-repository and building them per worktree is a cost
   this spec does not take on.
