@@ -11,6 +11,12 @@ round_budget_decision = "answer_now"
 # The eight rounds are command rounds for the reason `continue_keeps_state.toml`
 # records: a command is an action round under spec 59 too, so the script reaches
 # the round budget before and after that spec.
+# Pinned to the old default: the scenario counts rounds against this
+# budget, and the product default (16) is not what it tests.
+config_overlay = """
+agent_max_tool_rounds=8
+"""
+
 [[turn]]
 content = ""
 tool_calls = [

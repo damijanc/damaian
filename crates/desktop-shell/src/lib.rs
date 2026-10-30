@@ -12677,9 +12677,10 @@ mod tests {
         #[test]
         fn a_worker_answers_a_round_budget_pause_in_process() {
             let repo = fixture("rb");
-            // Eight read-only rounds hit the default eight-round budget; the
-            // ninth response answers after *Continue* re-enters the turn.
-            let responses: Vec<String> = (0..8)
+            // Read-only rounds up to the default budget hit it; the next
+            // response answers after *Continue* re-enters the turn.
+            let budget = Config::default().agent_max_tool_rounds;
+            let responses: Vec<String> = (0..budget)
                 .map(|_| read_only_round())
                 .chain(std::iter::once("Done looking.".to_string()))
                 .collect();

@@ -3113,8 +3113,10 @@ impl Default for Config {
             enable_semantic_search: false,
             enable_worker_sessions: false,
             enable_index_watcher: true,
-            agent_max_tool_rounds: 8,
-            agent_web_debug_max_tool_rounds: 12,
+            // The segment ceiling (`ABSOLUTE_TOOL_ROUND_CAP`): at 8, a typical
+            // implementation task paused about five times (spec 59 context §5).
+            agent_max_tool_rounds: 16,
+            agent_web_debug_max_tool_rounds: 16,
             agent_tool_retry_limit: 2,
             agent_max_questions_per_turn: 2,
             // Spec 51 D12: a model that fetches twelve pages has lost the

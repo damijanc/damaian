@@ -1491,7 +1491,7 @@ themselves.
 
 ### A turn stopped early: which budget ran out
 
-What happens at `agent_max_tool_rounds` (default 8) depends on whether a token
+What happens at `agent_max_tool_rounds` (default 16) depends on whether a token
 ceiling is set ([spec 61](specs/61_continue_the_stopped_turn/proposal.md)).
 That budget counts **action rounds**. A round in which every call was a read —
 `read_file`, `list_directory`, `search_content`, `search_codebase`,

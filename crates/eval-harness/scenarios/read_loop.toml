@@ -17,6 +17,12 @@ round_budget_decision = "answer_now"
 #
 # The range is explicit so "the same read" is unambiguous: a continued window
 # after a truncated read is not a repeat, and this scenario is not that.
+# Pinned to the old default: the scenario counts rounds against this
+# budget, and the product default (16) is not what it tests.
+config_overlay = """
+agent_max_tool_rounds=8
+"""
+
 [[turn]]
 content = ""
 tool_calls = [

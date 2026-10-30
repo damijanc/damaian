@@ -10392,8 +10392,8 @@ const ABSOLUTE_TOOL_ROUND_CAP: u32 = 16;
 const ABSOLUTE_EXPLORATION_ROUND_CAP: u32 = 32;
 
 /// Absolute bound on the rounds of one turn across all round-budget
-/// continuations (spec 61 §5.3): the initial eight-round segment plus seven
-/// continuations of eight. Distinct from [`ABSOLUTE_TOOL_ROUND_CAP`], which
+/// continuations (spec 61 §5.3): four segments at the default of sixteen
+/// rounds. Distinct from [`ABSOLUTE_TOOL_ROUND_CAP`], which
 /// bounds a single configured segment — and #47's token-ceiling continuation,
 /// which the manual *Continue* is not tied to.
 const ABSOLUTE_TURN_ROUND_CAP: u32 = 64;

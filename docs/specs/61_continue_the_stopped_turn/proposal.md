@@ -179,6 +179,18 @@ continuations of eight. At the bound, the pause offers only *Answer now*. It is
 distinct from the existing `ABSOLUTE_TOOL_ROUND_CAP` (`chat.rs:4539`, value 16),
 which bounds a single configured segment and #47's token-ceiling continuation.
 
+> **Amended 2026-10-30.** `agent_max_tool_rounds` now defaults to 16, the
+> segment ceiling, and `agent_web_debug_max_tool_rounds` to 16 with it (it was
+> 12, and `web_debug_tool_round_limit` already raised it to the default). At
+> 8, spec 59's measured implementation tasks (27–78 action rounds, median 41)
+> paused about five times each; at 16 the median task pauses two or three
+> times. The bound of 64 is unchanged and is now four segments. Neither
+> ceiling moved, so a repository can set no more than it could before. The
+> deterministic scenarios that count rounds against the budget
+> (`continue_keeps_state`, `read_loop`, `answer_now_ends_the_turn`,
+> `long_discovery`, `failed_validation_retry`) pin `agent_max_tool_rounds=8` in
+> their `config_overlay`, because the pause is what they test, not the default.
+
 Each request inside the turn stays bounded by `agent_max_turn_messages` through
 `bounded_messages`, so continuing grows the number of calls, not their size.
 The token ceiling, when set, still stops the turn before the call that would
