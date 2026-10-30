@@ -748,7 +748,7 @@ Below the prompt, after the **+** button and the [mode](#working-modes) pill, tw
 - **Effort** offers **Default**, **Minimal**, **Low**, **Medium** and **Extra High**.
 - **Reset to default** goes back to the provider, model and effort in your configuration (`model_provider`, `model_name` and `model_reasoning_level`).
 
-The choice is remembered in the app for each working folder and sent with each request. It is not written to your config file.
+The choice is remembered in the app for each working folder and sent with each request, including the ones that continue a paused turn: approving a command, a fetch or a plan, answering a question, *Continue* or *Answer now*, verification, checks, and **Compact**. Accepting an offer to answer with another provider is the exception, because it switches to the offered one. It is not written to your config file.
 
 ### While a turn runs, and how it ended
 

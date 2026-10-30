@@ -955,14 +955,19 @@ fn handle_compact(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
     let form = parse_form(&request.body);
     let repo = required_form(&form, "repo")?;
     let session_id = required_form(&form, "session_id")?;
-    let body = run_compact_request(&repo, &session_id)?;
+    let body = run_compact_request(&repo, &session_id, &form)?;
     write_response(stream, request, 200, "application/json", &body)
 }
 
 /// The body of the manual compaction route, split out so the refusal path is
 /// testable without a stream.
-fn run_compact_request(repo: &str, session_id: &str) -> Result<String, String> {
-    let engine = engine_for_repo(repo)?;
+fn run_compact_request(
+    repo: &str,
+    session_id: &str,
+    form: &HashMap<String, String>,
+) -> Result<String, String> {
+    let (config, report) = config_for_repo_with_model_options(repo, form)?;
+    let engine = WorkspaceEngine::new_with_report(config, &report);
     compact_session(&engine, repo, session_id)
 }
 
@@ -2955,7 +2960,9 @@ fn handle_propose_command(stream: &mut TcpStream, request: &Request) -> Result<(
 fn handle_run_command(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let proposal_id = required_form(&form, "proposal_id")?;
-    let mut engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
+    let repo = form.get("repo").map(String::as_str).unwrap_or_default();
+    let (config, report) = config_for_repo_with_model_options(repo, &form)?;
+    let mut engine = WorkspaceEngine::new_with_report(config, &report);
 
     // Persist the permanent allowance *before* running. If the write
     // fails the command must not run either: silently downgrading
@@ -3031,7 +3038,9 @@ fn handle_run_command(stream: &mut TcpStream, request: &Request) -> Result<(), S
 fn handle_reject_command(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let proposal_id = required_form(&form, "proposal_id")?;
-    let mut engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
+    let repo = form.get("repo").map(String::as_str).unwrap_or_default();
+    let (config, report) = config_for_repo_with_model_options(repo, &form)?;
+    let mut engine = WorkspaceEngine::new_with_report(config, &report);
 
     if engine
         .chat_orchestrator
@@ -3237,7 +3246,7 @@ fn run_resume_command_request(
     let repo = required_form(form, "repo")?;
     let proposal_id = required_form(form, "proposal_id")?;
     let approved = form.get("approved").map(String::as_str) == Some("true");
-    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+    let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
 
     if !engine
         .chat_orchestrator
@@ -3324,7 +3333,7 @@ fn run_fetch_decision_request_with(
             ));
         }
     };
-    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+    let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
     let mut adapter = adapter_for(&engine.config)?;
     let mut on_token = |token: &str| {
         let _ = events.send(TurnEvent::Token(token.to_string()));
@@ -3363,7 +3372,7 @@ fn run_verify_request(
 ) -> Result<ChatTurnResult, String> {
     let repo = required_form(form, "repo")?;
     let session_id = required_form(form, "session_id")?;
-    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+    let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
     let mut adapter = chat_model_adapter(&engine.config, || {
         resolve_shell_model_api_key(&engine.config)
     })?;
@@ -3400,7 +3409,7 @@ fn run_resume_checks_request(
     let repo = required_form(form, "repo")?;
     let proposal_id = required_form(form, "proposal_id")?;
     let decisions = parse_check_decisions(&required_form(form, "decisions")?)?;
-    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+    let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
     // *Allow Always* is still per check and exact-command: it writes the same
     // repository-qualified allowlist entry the single command card does, before
     // the resumed turn runs anything (spec 23 proposal §5.3).
@@ -3485,7 +3494,7 @@ fn run_resume_plan_request(
         Some(raw) => Some(parse_plan_revision(raw)?),
         None => None,
     };
-    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+    let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
 
     let mut adapter = chat_model_adapter(&engine.config, || {
         resolve_shell_model_api_key(&engine.config)
@@ -3537,7 +3546,7 @@ fn run_resume_context_request(
             ));
         }
     };
-    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+    let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
 
     let mut model_adapter: Box<dyn ModelAdapter> = match decision {
         ContextDecision::Send => chat_model_adapter(&engine.config, || {
@@ -3617,7 +3626,7 @@ fn run_answer_question_request(
         ),
         None => None,
     };
-    let engine = chat_engine(config_and_report_for_repo(&repo)?);
+    let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
 
     // `has_pending_chat_command` is true for every non-question pause. Asking
     // for one of those here is a client error, and checking before the adapter
@@ -3763,7 +3772,8 @@ fn resume_fallback_decision(
 
 /// Continues a turn paused at its round budget (spec 61 §5.6). Unlike the
 /// fallback there is no provider switch: the decision is only *Continue* or
-/// *Answer now*, and the engine is the repository's configured one.
+/// *Answer now*, and the engine uses the chat's selected model, as every
+/// resume does (spec 74).
 fn run_resume_round_budget_request(
     form: &HashMap<String, String>,
     cancel: &CancelToken,
@@ -3775,7 +3785,7 @@ fn run_resume_round_budget_request(
         cancel,
         events,
         &|| {
-            let engine = chat_engine(config_and_report_for_repo(&repo)?);
+            let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
             Ok(engine)
         },
         &mut |config| chat_model_adapter(config, || resolve_shell_model_api_key(config)),
@@ -5187,6 +5197,10 @@ fn engine_for_repo(repo: &str) -> Result<WorkspaceEngine, String> {
     Ok(WorkspaceEngine::new_with_report(config, &report))
 }
 
+/// The config with the chat's model selection applied. The first request of a
+/// turn and every route that resumes one take it, so a paused turn continues on
+/// the provider it started with, not on whatever the saved config names
+/// (spec 74).
 fn config_for_repo_with_model_options(
     repo: &str,
     form: &HashMap<String, String>,
@@ -7212,6 +7226,44 @@ mod tests {
         assert_eq!(body["code"], "not_fetch_pause");
         assert_eq!(body["error"], error);
         assert_eq!(body["message"], error);
+    }
+
+    /// A resume must use the provider the chat selected, not the saved
+    /// config's (spec 74). With the provider line gone from `user.conf`, every
+    /// approval after the first answer ran on the built-in default and failed
+    /// with "OPENAI_API_KEY is required".
+    #[test]
+    fn a_resume_uses_the_chats_selected_provider() {
+        isolated_data_dir();
+        let repo = question_repo("resume-chat-provider");
+        let paused = paused_on_question(&repo);
+        let question_id = paused
+            .question_proposal
+            .as_ref()
+            .expect("the question pauses")
+            .question_id
+            .clone();
+        let form = form_fields(&[
+            ("repo", repo.to_str().unwrap()),
+            ("proposal_id", question_id.as_str()),
+            ("decision", "once"),
+            ("session_id", paused.session.id.as_str()),
+            ("model_provider", "deepseek"),
+            ("model", "deepseek-v4-pro"),
+        ]);
+        let cancel = CancelToken::new();
+        let (events, _discard) = std::sync::mpsc::channel();
+        let mut used = None;
+        let mut adapter_for = |config: &Config| {
+            used = Some((config.model_provider.clone(), config.model_name.clone()));
+            Ok(Box::new(MockModelAdapter::new("Done.")) as Box<dyn workspace_engine::ModelAdapter>)
+        };
+        let _ = run_fetch_decision_request_with(&form, &cancel, &events, &mut adapter_for);
+
+        assert_eq!(
+            used,
+            Some(("deepseek".to_string(), "deepseek-v4-pro".to_string()))
+        );
     }
 
     fn form_fields(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -15413,6 +15465,7 @@ mod commit_message_tests {
 #[cfg(test)]
 mod conversation_compaction_tests {
     use super::{conversation_json, run_compact_request};
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -15650,8 +15703,12 @@ mod conversation_compaction_tests {
     #[test]
     fn the_compact_route_refuses_a_repository_without_a_session() {
         let repo = temp_repo();
-        let error = run_compact_request(&repo.to_string_lossy(), "session_that_does_not_exist")
-            .expect_err("an unknown session is an error");
+        let error = run_compact_request(
+            &repo.to_string_lossy(),
+            "session_that_does_not_exist",
+            &HashMap::new(),
+        )
+        .expect_err("an unknown session is an error");
         assert!(error.contains("Unknown session"), "{error}");
     }
 }

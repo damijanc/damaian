@@ -2381,6 +2381,10 @@ Check in this order:
    be different Keychain items; an old item keeps answering with a revoked
    key. A worker session holds the key it was spawned with, so restart it
    after changing the key.
+   Before spec 74, a turn resumed after an approval, a question or *Continue*
+   used the provider in the saved config rather than the chat's model picker.
+   A failure such as `OPENAI_API_KEY is required` after the first answer, with
+   no `model_provider` line in `user.conf`, is that defect in an older build.
 5. The audit log — a `model_request_prepared` with no matching
    `model_response_completed` means the request left and the response never
    arrived. Compare against stderr for the transport error.

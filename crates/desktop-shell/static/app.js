@@ -7015,7 +7015,10 @@ function summaryBody(summary) {
 async function compactConversationNow() {
   if (!currentSessionId || !repo()) return;
   try {
-    const payload = await api("/api/compact", form({ repo: repo(), session_id: currentSessionId }));
+    const payload = await api(
+      "/api/compact",
+      form(withChatModel({ repo: repo(), session_id: currentSessionId })),
+    );
     if (payload.kind === "compacted") {
       toast("Conversation compacted. The full transcript is still here.");
     } else if (payload.kind === "nothing") {
@@ -13899,32 +13902,45 @@ async function loadSession(sessionId) {
   syncWorkerView();
 }
 
+// A resumed turn is built from the saved config like the first request, so it
+// has to carry the same model selection or it runs on whatever provider
+// `user.conf` names (spec 74). The fallback decision is left out: its
+// provider is the offer's, chosen by the server.
+function withChatModel(data) {
+  return { ...chatModelFormFields(), ...data };
+}
+
 async function streamChatRequest(data, handlers, signal) {
   return streamRequest("/api/ask-stream", "/api/ask", data, handlers, signal);
 }
 
 async function streamResumeCommandRequest(data, handlers) {
   const fallbackPath = data.approved === "true" ? "/api/run-command" : "/api/reject-command";
-  return streamRequest("/api/resume-command-stream", fallbackPath, data, handlers);
+  return streamRequest("/api/resume-command-stream", fallbackPath, withChatModel(data), handlers);
 }
 
 // A fetch decision resumes the turn, so the non-streaming fallback carries the
 // same decision and answers with the whole turn result.
 async function streamResumeFetchRequest(data, handlers) {
-  return streamRequest("/api/resume-fetch-stream", "/api/fetch-decision", data, handlers);
+  return streamRequest(
+    "/api/resume-fetch-stream",
+    "/api/fetch-decision",
+    withChatModel(data),
+    handlers,
+  );
 }
 
 // No non-streaming fallback: resuming a plan decision *is* a turn, and there is
 // no one-shot endpoint that could stand in for one. `streamRequest` raises
 // rather than posting the decision somewhere that would not carry it.
 async function streamResumePlanRequest(data, handlers) {
-  return streamRequest("/api/resume-plan-stream", null, data, handlers);
+  return streamRequest("/api/resume-plan-stream", null, withChatModel(data), handlers);
 }
 
 // Like a plan decision, answering a question *is* a turn, so there is no
 // one-shot endpoint to fall back to.
 async function streamResumeAnswerRequest(data, handlers) {
-  return streamRequest("/api/answer-question-stream", null, data, handlers);
+  return streamRequest("/api/answer-question-stream", null, withChatModel(data), handlers);
 }
 
 // Like a plan decision, answering a fallback offer *is* a turn, so there is no
@@ -13936,21 +13952,21 @@ async function streamResumeFallbackRequest(data, handlers) {
 // Like a fallback decision, answering a round-budget pause *is* a turn, so
 // there is no one-shot endpoint to fall back to.
 async function streamResumeRoundBudgetRequest(data, handlers) {
-  return streamRequest("/api/resume-round-budget-stream", null, data, handlers);
+  return streamRequest("/api/resume-round-budget-stream", null, withChatModel(data), handlers);
 }
 
 async function streamResumeContextRequest(data, handlers) {
-  return streamRequest("/api/resume-context-stream", null, data, handlers);
+  return streamRequest("/api/resume-context-stream", null, withChatModel(data), handlers);
 }
 
 // Verification is a continuation turn the engine starts, not a user prompt, so
 // there is no one-shot endpoint behind it.
 async function streamVerifyRequest(data, handlers) {
-  return streamRequest("/api/verify-stream", null, data, handlers);
+  return streamRequest("/api/verify-stream", null, withChatModel(data), handlers);
 }
 
 async function streamResumeChecksRequest(data, handlers) {
-  return streamRequest("/api/resume-checks-stream", null, data, handlers);
+  return streamRequest("/api/resume-checks-stream", null, withChatModel(data), handlers);
 }
 
 async function streamRequest(streamPath, fallbackPath, data, handlers, signal) {
