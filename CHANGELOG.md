@@ -39,6 +39,7 @@ harness, and **Release** covers packaging, signing and distribution.
 
 | | |
 |---|---|
+| **v0.56.0** | **Engine**<br>- Recover DeepSeek textual tool calls and audit OpenRouter routes per model call.<br>- Show recalled memory in the context inspector.<br>- Wire recalled memory into the turn with a send-time re-check.<br>- Deliver recalled memory through context assembly.<br>- Add lexical memory recall with retrieval-time revalidation.<br>- Add the memory context category and its configuration keys.<br><br>**App**<br>- Send change requests to the agent loop when the provider has native tools.<br><br>**Evaluation**<br>- Measure memory recall with eval scenarios and metrics. |
 | **v0.54.0** | **Engine**<br>- Say when a content search read no file, and record its glob. |
 | **v0.53.0** | **Engine**<br>- Show the default output and context limits in the provider editor.<br>- Raise the default action rounds per turn from 8 to 16.<br>- Run read-only sequences, git listings and named-file reads without approval. |
 | **v0.52.0** | **Engine**<br>- Give commands the PATH of the user's interactive shell.<br>- Clear a blocked plan step when the same command later succeeds. |
