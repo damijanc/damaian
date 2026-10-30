@@ -556,7 +556,9 @@ does, and fails on any failed assertion or when none was evaluated.
   override raises it. The `max_output_tokens: None` comment in `live_config`
   holds only for providers that have a built-in ceiling.
 
-Nothing from the 2026-10-25 run remains open.
+Nothing from the 2026-10-25 run remains open. The fixes and the decision above
+reached `main` on 2026-10-30, and the full seven-check gate passed in CI on
+2026-10-30 for the `main` push that contains them (Quality run 41064895391).
 
 ### What the review gate caught
 

@@ -1,8 +1,8 @@
 # Feature Spec: Memory Retrieval, Lifecycle, and Injection Resistance
 
 Status: Done 2026-10-30 (planned 2026-10-28; Tasks 1–6 built 2026-10-28, Tasks
-7–8 on 2026-10-30). Scoped checks passed locally; the full seven-check gate is
-outstanding until CI runs. The phase's two-week real-session observation is
+7–8 on 2026-10-30). Scoped checks passed locally, and the full seven-check gate
+passed in CI on 2026-10-30 (Quality run 41063831118). The phase's two-week real-session observation is
 recorded as outstanding in §7.3.
 Order: 30 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
@@ -539,4 +539,4 @@ another file is named; `context_manager` means the inline tests in
 | Instruction-like memory does not change behaviour | evals `memory_instruction_shaped_still_requires_approval`, `memory_does_not_widen_ask_mode`, `memory_does_not_outrank_instructions`; each was shown to fail with its guard removed (Task 6 row) |
 | Every recall is audited | `a_turn_sends_recalled_memory_as_a_context_item_and_records_it_once`, `a_declined_review_records_no_recall`; eval assertion `memory_recalls` |
 | The two spec 18 memory metrics carry real values | `tests/harness.rs`: `the_memory_metrics_report_the_counts_the_run_recorded`; spec 18 §5.6 |
-| Quality gate passes; baseline shows no regression | Scoped checks passed locally (see `tasks.md` Task 8); the deterministic tier passes every scenario with approval-policy, restricted-path and secret violations all 0. The full seven-check gate runs on CI and is recorded in `tasks.md` when it passes. |
+| Quality gate passes; baseline shows no regression | Scoped checks passed locally (see `tasks.md` Task 8); the deterministic tier passes every scenario with approval-policy, restricted-path and secret violations all 0. The full seven-check gate passed in CI on 2026-10-30 (Quality run 41063831118). |

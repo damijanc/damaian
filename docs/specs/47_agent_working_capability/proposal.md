@@ -613,4 +613,6 @@ Three changes, all in the result's shape rather than the search:
 Brace expansion itself was not added: the honest result is enough for the
 model to search again, and a richer glob syntax is a separate decision.
 Pinned by `a_search_whose_glob_matches_no_file_says_it_searched_nothing`
-(`tests/agent_tools.rs`).
+(`tests/agent_tools.rs`). The full seven-check gate passed in CI on 2026-10-30
+for the `main` push that contains it (Quality run 41050532576; the run on the
+change's own commit was cancelled by the next push).
