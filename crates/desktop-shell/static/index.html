@@ -923,7 +923,7 @@
                   />
                 </label>
                 <label class="field">
-                  <span>Context budget</span>
+                  <span>Context per turn</span>
                   <input
                     id="provider-context-budget-input"
                     type="number"
@@ -932,13 +932,26 @@
                     placeholder="Automatic"
                   />
                 </label>
+                <label class="field">
+                  <span>Model context window</span>
+                  <input
+                    id="provider-context-window-input"
+                    type="number"
+                    min="1"
+                    step="1"
+                    placeholder="Unknown"
+                  />
+                </label>
               </div>
               <small id="provider-token-defaults-note" class="field-note" hidden></small>
               <small class="field-note"
                 >Leave blank to use the built-in default for the selected model. Max output tokens
                 caps what the model writes in one reply — too low truncates large patches. Context
-                budget caps how much of the repository is sent with each request; raising it can
-                improve answers but is billed on every turn.</small
+                per turn is how much of the repository Damaian packs into each request before the
+                assistant reads anything; it is billed on every turn, and the assistant reads more
+                with its tools, so keep it well below the window. Model context window is how much
+                the model accepts at all: the context meter measures against it, and the per-turn
+                context is never larger.</small
               >
               <div class="inline-actions">
                 <button id="provider-save-btn" class="btn-primary" type="button">Save Provider</button>

@@ -1101,8 +1101,10 @@ its absence is the user's standing request failing, so it is recorded as
 `limit.source` says how `limit.tokens` was decided:
 
 - `declared` — `context_token_budget` for the selected provider and model, used
-  unchanged: `safetyMarginBps` is `0` and `window` is `null`. **This is what
-  every turn records today.** `context_token_budget` is a packing budget, not a
+  unchanged (clamped to the model's window when one is known): `safetyMarginBps`
+  is `0`, and `window` is the model's `context_window` when one is configured
+  or built in, else `null` (spec 79). **This is what every turn records
+  today.** `context_token_budget` is a packing budget, not a
   provider's context window, so subtracting a safety margin from it would only
   shrink a number that is already well below the window.
 - `observed` — a measured provider window: `window` is the window, and
@@ -1113,7 +1115,18 @@ its absence is the user's standing request failing, so it is recorded as
 The limit bounds the assembled repository context and your message only. The
 system prompt, the tool definitions and the `Recent conversation:` block are
 added outside it, so the request body the provider sees can be larger than
-`limit.tokens`.
+`limit.tokens`. A chat turn records two of those beside the limit, estimated at
+`len / 4`: `conversationTokens` and `systemPromptTokens`. The context panel's
+overview adds them to `totalTokens` and measures the sum against `window`.
+
+#### Every turn sends hundreds of thousands of tokens
+
+Read `limit` in the turn's manifest. If `limit.tokens` is near the model's
+window, the per-turn budget has been set to the window: assembly packs to the
+budget, so it fills it with whole large files whatever the question. Move the
+number to **Model context window** (`model_provider.<id>.context_window`) and
+leave **Context per turn** blank for the built-in default, or set it to a small
+fraction of the window.
 
 #### When content is `category_budget_exhausted`
 

@@ -111,6 +111,7 @@ fn assemble(
             index: Some(&index),
             explicit_paths: &[],
             limit: 16_000,
+            window: None,
             hook_context: &[],
             plan: None,
             pinned,
@@ -165,6 +166,7 @@ fn the_manifest_has_a_summary_row_with_its_message_count() {
             index: Some(&index),
             explicit_paths: &[],
             limit: 16_000,
+            window: None,
             hook_context: &[],
             plan: None,
             pinned: &[],
@@ -651,6 +653,7 @@ fn removing_the_summary_records_its_category_and_hides_the_row() {
             index: Some(&index),
             explicit_paths: &[],
             limit: 16_000,
+            window: None,
             hook_context: &[],
             plan: None,
             pinned: &[],
@@ -798,6 +801,46 @@ fn the_default_turn_emits_its_manifest_before_the_first_request() {
     assert!(
         context_at < model_at,
         "the manifest must precede the first model phase: {events:?}"
+    );
+}
+
+/// Spec 79: the manifest a turn shows carries the model's window and what the
+/// turn sends beside the assembled context, so the meter can measure the
+/// whole request against the window.
+#[test]
+fn a_turns_manifest_carries_the_window_and_what_the_turn_adds() {
+    let repo = fixture_repo("window-overhead");
+    let mut config = test_config(&repo);
+    config.model_provider = "deepseek".to_string();
+    config.model_name = "deepseek-v4-flash".to_string();
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (_result, progress) = ask_with(&engine, &repo, "What is this?", &mut adapter);
+
+    let events = progress.borrow();
+    let manifest = events
+        .iter()
+        .find_map(|event| match event {
+            TurnProgress::Context(manifest) => Some(manifest.clone()),
+            _ => None,
+        })
+        .expect("the manifest was emitted");
+    assert_eq!(manifest.limit.window, Some(1_000_000));
+    assert_eq!(
+        manifest.limit.tokens, 64_000,
+        "the packing budget is unchanged"
+    );
+    let system = &adapter.requests[0].messages[0];
+    assert_eq!(system.role, "system");
+    assert_eq!(
+        manifest.system_prompt_tokens,
+        Some(system.content.len().div_ceil(4))
+    );
+    assert_eq!(
+        manifest.conversation_tokens,
+        Some(0),
+        "a first turn has none"
     );
 }
 
@@ -1422,6 +1465,7 @@ fn the_inspector_lists_the_category() {
             index: Some(&index),
             explicit_paths: &[],
             limit: 16_000,
+            window: None,
             hook_context: &[],
             plan: None,
             pinned: &[],
@@ -1480,6 +1524,7 @@ fn native_tool_provider() -> workspace_engine::ModelProviderConfig {
         supports_native_tools: true,
         max_output_tokens: None,
         context_token_budget: None,
+        context_window: None,
         provider_reports_usage: true,
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,

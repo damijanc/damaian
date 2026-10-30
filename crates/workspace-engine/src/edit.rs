@@ -531,6 +531,7 @@ impl EditOrchestrator {
             index: Some(&index),
             explicit_paths,
             limit: self.config.context_token_budget(),
+            window: self.config.context_window(),
             hook_context: &hook_context,
             // A one-shot edit has no turn whose plan it could carry.
             plan: None,

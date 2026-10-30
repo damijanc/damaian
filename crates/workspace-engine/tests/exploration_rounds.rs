@@ -53,6 +53,7 @@ fn native_tool_provider() -> ModelProviderConfig {
         supports_native_tools: true,
         max_output_tokens: None,
         context_token_budget: None,
+        context_window: None,
         provider_reports_usage: true,
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,

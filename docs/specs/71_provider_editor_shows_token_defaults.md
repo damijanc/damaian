@@ -71,6 +71,10 @@ form moved to another provider.
 
 ## 7. Implementation Notes
 
+Since [#79](79_context_window_and_turn_budget.md), the editor labels the budget
+**Context per turn** and adds **Model context window**, whose placeholder comes
+from the same route's new `contextWindow` field.
+
 Tests: `builtin_token_defaults_match_what_a_blank_field_resolves_to`
 (`workspace-engine/tests/foundation.rs`) checks the function against both
 resolvers for five provider/model pairs; `provider_token_defaults_answers_per_model`

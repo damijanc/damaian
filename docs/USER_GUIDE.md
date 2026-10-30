@@ -102,7 +102,8 @@ Common keys:
 | `model_reasoning_level` | `default` | Reasoning effort: `default`, `minimal`, `low`, `medium` or `high` | No |
 | `model_provider.<id>.supports_native_tools` | on | Use the provider's native tool-calling API ([Native tool-calling](#native-tool-calling)) | No |
 | `model_provider.<id>.max_output_tokens` | Per model | Largest reply the model may generate, in tokens ([Output and Context Limits](#output-and-context-limits)) | No |
-| `model_provider.<id>.context_token_budget` | Per model | How much repository content is sent with each request, in tokens | No |
+| `model_provider.<id>.context_token_budget` | Per model | How much repository content is packed into each request, in tokens (**Context per turn**); never more than the window | No |
+| `model_provider.<id>.context_window` | Per model | How many input tokens the model accepts at all (**Model context window**); the context meter measures against it | No |
 | `enable_semantic_search` | `false` | Embedding-based retrieval ([Semantic search](#semantic-search)) | Yes |
 | `enable_worker_sessions` | `false` | [Worker Sessions](#worker-sessions) | No |
 | `command_path_from_interactive_shell` | `true` | Commands find programs on the `PATH` your Terminal has, including what `~/.zshrc` adds ([Which programs a command finds](#which-programs-a-command-finds)) | No |
@@ -177,7 +178,7 @@ The **Providers** page lists your **Configured providers**, then **Popular provi
 - **API Key Reference** and **API Key**: when the reference starts with `keychain:`, a key pasted into **API Key** is stored in macOS Keychain under that account when you save. Only the reference is written to your config. A key cannot be saved against any other kind of reference.
 - **Models** lists the model ids to offer, one per line.
 - **Native tool-calling** ([below](#native-tool-calling)).
-- **Max output tokens** and **Context budget** ([Output and Context Limits](#output-and-context-limits)).
+- **Max output tokens**, **Context per turn** and **Model context window** ([Output and Context Limits](#output-and-context-limits)).
 
 Select **Save Provider** to write it to your user config, or **Remove** to delete it. **Settings › Models** lists each configured provider's models, with **Configure** to open it here. The first provider you save also becomes your default (`model_provider`) when your config does not name one yet. The default is what a project with no choice of its own starts on, what [worker sessions](#worker-sessions) and commit-message drafts use when no chat choice applies, and what **Reset to default** returns to. Saving another provider does not change it: pick that one in the composer's [model picker](#choosing-the-model-and-effort), or set `model_provider`. Removing the default provider makes the next configured provider the default and removes `model_name`.
 
@@ -261,15 +262,18 @@ If `model_api_key_env` names a variable you did not choose, the configuration wa
 
 ## Output and Context Limits
 
-Two settings control how many tokens each request may use. They are independent: one bounds what the model writes, the other bounds what it reads. Both live in Settings under **Providers**, in the **Provider details** panel, and both apply per provider.
+Three settings describe how many tokens each request may use. Max output tokens bounds what the model writes; Context per turn bounds what Damaian packs for it to read; Model context window is how much the model can take at all. All three live in Settings under **Providers**, in the **Provider details** panel, and apply per provider.
 
 - **Max output tokens** caps the reply the model generates in a single response. Set too low, a large multi-file patch is cut off mid-way. Damaian detects this, tells the model its call was truncated, and asks it to retry with fewer files per patch, so the request recovers instead of failing silently.
-- **Context budget** caps how much repository content Damaian packs into each request. Raising it lets the assistant see more of a large repository, which can improve answers. This content is re-sent and re-billed on every turn, so a higher budget increases cost and latency on all requests, not just large ones.
+- **Context per turn** (`context_token_budget`) caps how much repository content Damaian packs into each request before the assistant reads anything. The assistant reads more with its tools as it works, so this is a starting point, not a ceiling on what it can see. This content is re-sent and re-billed on every turn, so a higher value increases cost and latency on all requests, not just large ones. It is never larger than the window.
+- **Model context window** (`context_window`) is how many input tokens the model accepts. It is not packed to: setting `1000000` here does not send a million tokens. The context meter measures each turn against it.
+
+Do not put the model's window into **Context per turn**. A budget of `1000000` makes every turn pack whole large files until it is full, about 800,000 tokens per request on this repository, whatever the question.
 
 Leave a field blank to use the built-in default for the selected model. A blank field shows that default as its placeholder, for the first model in the provider's **Models** list — `Default: 64,000`, or `Default: none sent, the provider decides` for an output ceiling Damaian does not send. When the listed models have different defaults, a note under the fields lists each one. The defaults are:
 
-- `deepseek-v4-flash` and `deepseek-v4-pro`: 65536 output tokens, 64000 context budget.
-- `deepseek-chat` and `deepseek-reasoner` (retired aliases): 8192 output tokens, 16000 context budget.
+- `deepseek-v4-flash` and `deepseek-v4-pro`: 65536 output tokens, 64000 context per turn, a 1000000 window.
+- `deepseek-chat` and `deepseek-reasoner` (retired aliases): 8192 output tokens, 16000 context per turn, no known window.
 - Other DeepSeek models: 8192 output tokens, 16000 context budget.
 - All other models: no output cap is sent, and the context budget is 16000.
 
@@ -333,11 +337,18 @@ A repository's `.damaian/config.conf` may lower a share and raise the margin, an
 
 ### Inspecting and controlling context
 
-The **Context** control in the conversation header shows this turn's assembled
-context as a small meter and `N% of budget`, the share of Damaian's packing
-budget in use (hover it for the token counts and the model's window). The control
-is hidden until a turn has context to show. Open it to see what Damaian is about to send, or
-what an earlier turn sent:
+The **Context** control in the conversation header shows how full the model's
+window is for this turn, as a small meter and `N% used`. It counts the assembled
+context, the conversation messages and the system prompt; tool definitions are
+not counted. With no known window it falls back to `N% of budget`, the share of
+the per-turn packing budget. Hover it for the token counts. The control is hidden
+until a turn has context to show. Open it to see what Damaian is about to send,
+or what an earlier turn sent:
+
+- **An overview** of the whole request against the window: one bar segment and
+  one row per part (each category in use, **Conversation**, **System prompt**)
+  with its tokens and share of the window, then **Free space**, and a line
+  naming the per-turn budget.
 
 - **Every category**, with the tokens it used and how many items it holds.
   Expanding a category lists its items by path, and a line range where one

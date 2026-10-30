@@ -624,6 +624,15 @@ pub struct ContextManifest {
     /// `context_assembled` event written before this field readable.
     #[serde(default)]
     pub memory: Vec<MemoryRecallRef>,
+    /// What a chat turn sends beside the assembled context, estimated at
+    /// `len / 4` like prose (spec 79): the conversation messages and the
+    /// system prompt. `None` when the caller sends neither, such as the
+    /// one-shot edit. Tool definitions are not counted. Assembly fills in
+    /// neither; the turn does, before the manifest is shown.
+    #[serde(default)]
+    pub conversation_tokens: Option<usize>,
+    #[serde(default)]
+    pub system_prompt_tokens: Option<usize>,
 }
 
 impl ContextManifest {
@@ -1011,6 +1020,9 @@ pub struct ContextRequest<'a> {
     pub index: Option<&'a RepositoryIndex>,
     pub explicit_paths: &'a [String],
     pub limit: usize,
+    /// The model's context window when known (spec 79). Reported in the
+    /// manifest beside `limit`; assembly never packs to it.
+    pub window: Option<usize>,
     pub hook_context: &'a [(String, String)],
     /// The plan a resumed turn carries, read from `SessionStore` by the caller.
     /// `None` for a new turn, an edit, and every caller that has no plan.
@@ -1473,6 +1485,7 @@ impl ContextManager {
             index,
             explicit_paths,
             limit,
+            window,
             hook_context,
             plan,
             pinned,
@@ -1795,7 +1808,10 @@ impl ContextManager {
             repository_id,
             task_id,
             pending,
-            EffectiveLimit::declared(limit),
+            EffectiveLimit {
+                window,
+                ..EffectiveLimit::declared(limit)
+            },
             excluded,
             summary_usage,
             memory_refs,
@@ -2408,6 +2424,8 @@ fn build_manifest(
         conversation_summary,
         symbol_provenance,
         memory,
+        conversation_tokens: None,
+        system_prompt_tokens: None,
     }
 }
 
@@ -3205,6 +3223,7 @@ mod tests {
                 index: None,
                 explicit_paths,
                 limit,
+                window: None,
                 hook_context: &[],
                 plan: None,
                 pinned: &[],

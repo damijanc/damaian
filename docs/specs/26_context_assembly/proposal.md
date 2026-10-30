@@ -619,6 +619,12 @@ observed window does exist, the margin applies to the real window and is recorde
 with it. `tasks.md`'s open questions records this as the owner's call, with the
 alternative (treat the config value as a window) as a one-line change.
 
+Since [#79](../79_context_window_and_turn_budget.md), the model's window is its own
+field, `model_provider.<id>.context_window`. The declared limit is clamped to it,
+and it is recorded as the limit's `window`, still with no margin. A user who
+mistook the packing budget for the window and set it to 1M is how this was
+found.
+
 Phase 1 WP3 is Should-tier and may not have shipped, so the declared path is the
 realistic one and is treated as the primary case rather than a fallback.
 

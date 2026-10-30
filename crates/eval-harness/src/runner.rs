@@ -103,6 +103,7 @@ pub fn mock_provider() -> ModelProviderConfig {
         supports_native_tools: true,
         max_output_tokens: None,
         context_token_budget: None,
+        context_window: None,
         // The mock adapter is not a provider and reports no usage, so asking
         // for it changes nothing here. Left on so the deterministic tier sends
         // the same request shape the live tier does.
@@ -451,6 +452,7 @@ pub fn live_config(data_dir: &Path, provider: &str, model: &str) -> Config {
         // budgets the default 16,000-token context.
         max_output_tokens: None,
         context_token_budget: None,
+        context_window: None,
         provider_reports_usage: true,
         // No rates, for the same reason `mock_provider` carries none: a priced
         // figure could not be reproduced on another machine.

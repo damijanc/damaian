@@ -26,11 +26,11 @@ use workspace_engine::{
     TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationReport,
     WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
     WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
-    builtin_token_defaults, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
-    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
-    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
-    select_profile,
+    builtin_context_window, builtin_token_defaults, command_approval_prompt, custom_profile_ids,
+    ensure_data_dir_schema, export_profile, import_profile, normalize_mcp_server_id,
+    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
+    review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -490,11 +490,13 @@ fn handle_provider_token_defaults(stream: &mut TcpStream, request: &Request) -> 
         .iter()
         .map(|model| {
             let (output, context) = builtin_token_defaults(&provider, model);
+            let window = builtin_context_window(&provider, model);
             format!(
-                "{{\"model\":\"{}\",\"maxOutputTokens\":{},\"contextTokenBudget\":{}}}",
+                "{{\"model\":\"{}\",\"maxOutputTokens\":{},\"contextTokenBudget\":{},\"contextWindow\":{}}}",
                 escape_json(model),
                 output.map_or_else(|| "null".to_string(), |value| value.to_string()),
-                context
+                context,
+                window.map_or_else(|| "null".to_string(), |value| value.to_string())
             )
         })
         .collect::<Vec<_>>()
@@ -7313,6 +7315,7 @@ mod tests {
                 supports_native_tools: true,
                 max_output_tokens: None,
                 context_token_budget: None,
+                context_window: None,
                 provider_reports_usage: true,
                 price_per_million_input_tokens: None,
                 price_per_million_output_tokens: None,
@@ -7701,6 +7704,7 @@ mod tests {
                 supports_native_tools: true,
                 max_output_tokens: None,
                 context_token_budget: None,
+                context_window: None,
                 provider_reports_usage: true,
                 price_per_million_input_tokens: None,
                 price_per_million_output_tokens: None,
@@ -9299,6 +9303,9 @@ mod tests {
         assert_eq!(deepseek["models"][0]["contextTokenBudget"], 64_000);
         assert_eq!(deepseek["models"][1]["maxOutputTokens"], 8_192);
         assert_eq!(deepseek["models"][1]["contextTokenBudget"], 16_000);
+        // Spec 79: the window is its own field, known only for V4.
+        assert_eq!(deepseek["models"][0]["contextWindow"], 1_000_000);
+        assert!(deepseek["models"][1]["contextWindow"].is_null());
 
         let unnamed = get("provider=&models=");
         assert_eq!(unnamed["models"][0]["model"], "");
@@ -10270,6 +10277,7 @@ mod tests {
                 supports_native_tools: true,
                 max_output_tokens: None,
                 context_token_budget: None,
+                context_window: None,
                 provider_reports_usage: true,
                 price_per_million_input_tokens: None,
                 price_per_million_output_tokens: None,
@@ -12210,6 +12218,8 @@ mod tests {
                 conversation_summary: None,
                 symbol_provenance: None,
                 memory: Vec::new(),
+                conversation_tokens: None,
+                system_prompt_tokens: None,
             },
         );
 
@@ -12243,6 +12253,8 @@ mod tests {
             conversation_summary: None,
             symbol_provenance: None,
             memory: Vec::new(),
+            conversation_tokens: None,
+            system_prompt_tokens: None,
         };
         let event = crate::turn_progress_event(TurnProgress::Context(Box::new(manifest)));
         assert!(matches!(event, Some(crate::TurnEvent::Context(_))));
@@ -15007,6 +15019,7 @@ mod provider_fallback_tests {
             supports_native_tools: false,
             max_output_tokens: None,
             context_token_budget: None,
+            context_window: None,
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,

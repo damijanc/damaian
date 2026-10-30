@@ -2829,13 +2829,106 @@ function contextPathButton(path, range) {
   return button;
 }
 
-// The header chip shows how full this turn's context budget is.
-function contextMeterText(totalTokens, limitTokens) {
-  const total = Number(totalTokens) || 0;
-  const limit = Number(limitTokens) || 0;
-  if (limit <= 0) return { percent: null, label: `${formatContextTokens(total)} tokens` };
-  const percent = Math.round((total / limit) * 100);
-  return { percent, label: `${percent}% of budget` };
+// What one turn puts in front of the model, by part (spec 79): the assembled
+// categories, then what the turn adds beside them. Tool definitions are not
+// counted. `base` is the model's window when known, else the packing budget.
+function contextUsage(manifest) {
+  const rows = (manifest.categories || [])
+    .filter((entry) => (entry.used || 0) > 0)
+    .map((entry) => ({
+      key: entry.category,
+      label: CONTEXT_CATEGORY_LABELS[entry.category] || entry.category,
+      tokens: entry.used,
+    }));
+  if (manifest.conversationTokens) {
+    rows.push({ key: "conversation", label: "Conversation", tokens: manifest.conversationTokens });
+  }
+  if (manifest.systemPromptTokens) {
+    rows.push({
+      key: "system_prompt",
+      label: "System prompt",
+      tokens: manifest.systemPromptTokens,
+    });
+  }
+  const used = rows.reduce((sum, row) => sum + row.tokens, 0);
+  const window = Number(manifest.limit?.window) || 0;
+  const budget = Number(manifest.limit?.tokens) || 0;
+  return { rows, used, window, budget, base: window || budget };
+}
+
+// The header chip: how full the model's window is, or this turn's budget when
+// no window is known.
+function contextMeterText(usage) {
+  if (usage.base <= 0) return { percent: null, label: `${formatContextTokens(usage.used)} tokens` };
+  const percent = Math.round((usage.used / usage.base) * 100);
+  return { percent, label: usage.window ? `${percent}% used` : `${percent}% of budget` };
+}
+
+function contextPercent(tokens, base) {
+  if (base <= 0) return "";
+  const percent = (tokens / base) * 100;
+  return `${percent < 10 ? percent.toFixed(1) : Math.round(percent)}%`;
+}
+
+// The panel's overview, after Claude's: the whole request against the window,
+// one bar segment and one row per part, then the space left.
+function contextOverview(manifest) {
+  const usage = contextUsage(manifest);
+  const section = document.createElement("section");
+  section.className = "context-overview";
+  const head = document.createElement("div");
+  head.className = "context-overview-head";
+  const used = document.createElement("strong");
+  used.textContent = usage.base
+    ? `${contextPercent(usage.used, usage.base)} ${usage.window ? "of window" : "of budget"}`
+    : `${formatContextTokens(usage.used)} tokens`;
+  const total = document.createElement("span");
+  total.textContent = usage.base
+    ? `${formatContextTokens(usage.used)} / ${formatContextTokens(usage.base)}`
+    : "";
+  head.append(used, total);
+  const bar = document.createElement("div");
+  bar.className = "context-overview-bar";
+  const list = document.createElement("div");
+  list.className = "context-overview-rows";
+  usage.rows.forEach((row, index) => {
+    const segment = document.createElement("span");
+    segment.dataset.part = String(index % 6);
+    segment.style.width = usage.base ? `${Math.min(100, (row.tokens / usage.base) * 100)}%` : "0";
+    segment.title = `${row.label}: ${formatContextTokens(row.tokens)}`;
+    bar.append(segment);
+    list.append(contextOverviewRow(row.label, row.tokens, usage.base, String(index % 6)));
+  });
+  if (usage.base) {
+    list.append(
+      contextOverviewRow("Free space", Math.max(0, usage.base - usage.used), usage.base, "free"),
+    );
+  }
+  const note = document.createElement("p");
+  note.className = "context-overview-note";
+  note.textContent = usage.window
+    ? `This turn packs up to ${formatContextTokens(usage.budget)} of repository context; the assistant reads more with its tools. Tool definitions are not counted.`
+    : "No model window is known, so this measures against the per-turn budget. Tool definitions are not counted.";
+  section.append(head, bar, list, note);
+  return section;
+}
+
+function contextOverviewRow(label, tokens, base, part) {
+  const row = document.createElement("div");
+  row.className = "context-overview-row";
+  const swatch = document.createElement("span");
+  swatch.className = "context-overview-swatch";
+  swatch.dataset.part = part;
+  const name = document.createElement("span");
+  name.textContent = label;
+  const amount = document.createElement("span");
+  amount.className = "context-overview-tokens";
+  amount.textContent = formatContextTokens(tokens);
+  const share = document.createElement("span");
+  share.className = "context-overview-share";
+  share.textContent = contextPercent(tokens, base);
+  row.append(swatch, name, amount, share);
+  return row;
 }
 
 function renderContextButton() {
@@ -2850,18 +2943,14 @@ function renderContextButton() {
   }
   button.hidden = false;
   if (divider) divider.hidden = false;
-  const totalTokens = lastContextManifest.totalTokens;
-  const limitTokens = lastContextManifest.limit?.tokens ?? 0;
-  const total = formatContextTokens(totalTokens);
-  const limit = formatContextTokens(limitTokens);
-  const { percent, label } = contextMeterText(totalTokens, limitTokens);
+  const usage = contextUsage(lastContextManifest);
+  const { percent, label } = contextMeterText(usage);
   $("context-inspector-label").textContent = label;
   $("context-meter-fill").style.width = `${Math.min(100, percent ?? 0)}%`;
   $("context-meter").hidden = percent === null;
-  const window = lastContextManifest.limit?.window;
-  button.title = `Context for this turn: ${total} of ${limit} tokens${
-    window ? `; model window ${formatContextTokens(window)}` : ""
-  }`;
+  button.title = `Context for this turn: ${formatContextTokens(usage.used)} tokens${
+    usage.window ? ` of a ${formatContextTokens(usage.window)} window` : ""
+  }; repository context ${formatContextTokens(lastContextManifest.totalTokens)} of a ${formatContextTokens(usage.budget)} per-turn budget`;
 }
 
 function setContextManifest(manifest, target = "") {
@@ -3172,9 +3261,10 @@ function renderContextPanel() {
   }
   const manifest = lastContextManifest;
   const limit = manifest.limit?.tokens ?? 0;
-  summary.textContent = `${formatContextTokens(manifest.totalTokens)} / ${formatContextTokens(
-    limit,
-  )} tokens · ${manifest.limit?.source === "observed" ? "observed" : "declared"} limit`;
+  summary.textContent = `repository context ${formatContextTokens(
+    manifest.totalTokens,
+  )} / ${formatContextTokens(limit)} per turn`;
+  body.append(contextOverview(manifest));
   if (contextCanRemove()) {
     const hint = document.createElement("p");
     hint.className = "context-panel-hint";
@@ -4555,7 +4645,7 @@ function syncProviderCatalogFromPolicy(policyText) {
   const providers = {};
   configEntries(policyText).forEach(([key, value]) => {
     const match = key.match(
-      /^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models|supports_native_tools|max_output_tokens|context_token_budget)$/,
+      /^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models|supports_native_tools|max_output_tokens|context_token_budget|context_window)$/,
     );
     if (!match) return;
     const id = normalizeChatProvider(match[1]);
@@ -4568,6 +4658,7 @@ function syncProviderCatalogFromPolicy(policyText) {
     if (field === "supports_native_tools") providers[id].supportsNativeTools = value === "true";
     if (field === "max_output_tokens") providers[id].maxOutputTokens = value.trim();
     if (field === "context_token_budget") providers[id].contextTokenBudget = value.trim();
+    if (field === "context_window") providers[id].contextWindow = value.trim();
   });
 
   Object.entries(providers).forEach(([id, provider]) => {
@@ -4585,6 +4676,7 @@ function syncProviderCatalogFromPolicy(policyText) {
       // than substituting a number of its own.
       maxOutputTokens: provider.maxOutputTokens ?? existing.maxOutputTokens ?? "",
       contextTokenBudget: provider.contextTokenBudget ?? existing.contextTokenBudget ?? "",
+      contextWindow: provider.contextWindow ?? existing.contextWindow ?? "",
     };
   });
 
@@ -4872,7 +4964,11 @@ function providerConfigFromForm() {
   );
   const contextTokenBudget = optionalTokenCount(
     $("provider-context-budget-input"),
-    "Context budget",
+    "Context per turn",
+  );
+  const contextWindow = optionalTokenCount(
+    $("provider-context-window-input"),
+    "Model context window",
   );
   if (!label) throw new Error("Provider name is required");
   if (!id) throw new Error("Provider ID is required");
@@ -4889,6 +4985,7 @@ function providerConfigFromForm() {
     supportsNativeTools,
     maxOutputTokens,
     contextTokenBudget,
+    contextWindow,
   };
 }
 
@@ -4941,6 +5038,7 @@ function renderProviderConfigForm(providerId = $("provider-config-select").value
   $("provider-native-tools-input").checked = provider.supportsNativeTools !== false;
   $("provider-max-output-tokens-input").value = provider.maxOutputTokens || "";
   $("provider-context-budget-input").value = provider.contextTokenBudget || "";
+  $("provider-context-window-input").value = provider.contextWindow || "";
   $("provider-remove-btn").disabled = !configuredProviderIds.has(id);
   void showProviderTokenDefaults();
 }
@@ -4976,15 +5074,19 @@ async function showProviderTokenDefaults() {
   $("provider-context-budget-input").placeholder = first
     ? `Default: ${formatTokenCount(first.contextTokenBudget)}`
     : "Automatic";
+  $("provider-context-window-input").placeholder =
+    first?.contextWindow == null ? "Unknown" : `Default: ${formatTokenCount(first.contextWindow)}`;
   const note = $("provider-token-defaults-note");
   const distinct = new Set(
-    defaults.map((entry) => `${entry.maxOutputTokens}/${entry.contextTokenBudget}`),
+    defaults.map(
+      (entry) => `${entry.maxOutputTokens}/${entry.contextTokenBudget}/${entry.contextWindow}`,
+    ),
   );
   if (distinct.size > 1) {
     note.textContent = `Defaults per model: ${defaults
       .map(
         (entry) =>
-          `${entry.model} — output ${describeOutput(entry)}, context ${formatTokenCount(entry.contextTokenBudget)}`,
+          `${entry.model} — output ${describeOutput(entry)}, context per turn ${formatTokenCount(entry.contextTokenBudget)}${entry.contextWindow == null ? "" : `, window ${formatTokenCount(entry.contextWindow)}`}`,
       )
       .join("; ")}.`;
     note.hidden = false;
@@ -5007,6 +5109,7 @@ function clearProviderConfigForm() {
   $("provider-native-tools-input").checked = true;
   $("provider-max-output-tokens-input").value = "";
   $("provider-context-budget-input").value = "";
+  $("provider-context-window-input").value = "";
   $("provider-remove-btn").disabled = true;
   void showProviderTokenDefaults();
 }
@@ -5316,6 +5419,13 @@ function upsertProviderConfig(content, provider) {
       next,
       `model_provider.${provider.id}.context_token_budget`,
       provider.contextTokenBudget,
+    );
+  }
+  if (provider.contextWindow) {
+    next = upsertConfigValue(
+      next,
+      `model_provider.${provider.id}.context_window`,
+      provider.contextWindow,
     );
   }
   return next;

@@ -2,7 +2,7 @@
 
 Status: Done 2026-10-30 (specified and built the same day; local checks in §7,
 the full gate is left to CI).
-Order: 80 of 80 (#79, the context budget work, is reserved and in flight)
+Order: 80 of 80 (#79 is the context budget work, built alongside)
 Plan: none. A defect reported in use, like #73–#78: an exception to the rule
 in [`README.md`](README.md).
 Depends on: [#23](23_verification_loop/proposal.md),

@@ -3200,6 +3200,7 @@ impl Repo {
                 index: Some(&index),
                 explicit_paths: &[],
                 limit: 16_000,
+                window: None,
                 hook_context: &[],
                 plan: None,
                 pinned: &[],

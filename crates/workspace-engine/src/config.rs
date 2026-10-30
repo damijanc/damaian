@@ -514,6 +514,11 @@ pub struct ModelProviderConfig {
     /// on large repositories but is billed on every turn, so the defaults stay
     /// well below what a model's context window technically allows.
     pub context_token_budget: Option<u32>,
+    /// The model's context window: how many input tokens it accepts at all.
+    /// `None` falls back to the built-in per-model window, or none known. It
+    /// is not a packing budget: assembly packs [`Self::context_token_budget`],
+    /// clamped to this, and the window is shown beside it (spec 79).
+    pub context_window: Option<u32>,
     /// Whether to ask this provider to report token usage on a stream.
     /// Defaults to true: `stream_options` is standard for OpenAI-compatible
     /// APIs, and the adapter probes once for a provider that rejects it. Set
@@ -603,6 +608,7 @@ pub struct ModelProviderConfigOverlay {
     pub supports_native_tools: Option<bool>,
     pub max_output_tokens: Option<u32>,
     pub context_token_budget: Option<u32>,
+    pub context_window: Option<u32>,
     pub provider_reports_usage: Option<bool>,
     pub price_per_million_input_tokens: Option<f64>,
     pub price_per_million_output_tokens: Option<f64>,
@@ -903,6 +909,7 @@ impl ModelProviderConfigOverlay {
             supports_native_tools,
             max_output_tokens,
             context_token_budget,
+            context_window,
             provider_reports_usage,
             price_per_million_input_tokens,
             price_per_million_output_tokens,
@@ -917,6 +924,7 @@ impl ModelProviderConfigOverlay {
             ("supports_native_tools", supports_native_tools.is_some()),
             ("max_output_tokens", max_output_tokens.is_some()),
             ("context_token_budget", context_token_budget.is_some()),
+            ("context_window", context_window.is_some()),
             ("provider_reports_usage", provider_reports_usage.is_some()),
             (
                 "price_per_million_input_tokens",
@@ -2289,11 +2297,27 @@ impl Config {
     /// to [`DEFAULT_CONTEXT_TOKEN_BUDGET`]. Always returns a usable number —
     /// unlike the output ceiling, there is no "omit it" option, since some
     /// budget has to be chosen before context can be assembled.
+    ///
+    /// Clamped to [`Self::context_window`] when one is known: more than the
+    /// model accepts cannot be sent (spec 79).
     pub fn context_token_budget(&self) -> usize {
-        self.model_provider_config(&self.model_provider)
+        let budget = self
+            .model_provider_config(&self.model_provider)
             .and_then(|provider| provider.context_token_budget)
             .unwrap_or_else(|| builtin_token_defaults(&self.model_provider, &self.model_name).1)
-            as usize
+            as usize;
+        self.context_window()
+            .map_or(budget, |window| budget.min(window))
+    }
+
+    /// The model's context window, when known: the provider's
+    /// `context_window`, then the built-in per-model value (spec 79). Shown
+    /// beside the packing budget; it is never packed to.
+    pub fn context_window(&self) -> Option<usize> {
+        self.model_provider_config(&self.model_provider)
+            .and_then(|provider| provider.context_window)
+            .or_else(|| builtin_context_window(&self.model_provider, &self.model_name))
+            .map(|window| window as usize)
     }
 
     /// The category shares must fit the window: an oversubscribed set is a
@@ -2382,6 +2406,7 @@ impl Config {
             self.model_providers.push(ModelProviderConfig {
                 max_output_tokens: None,
                 context_token_budget: None,
+                context_window: None,
                 ..builtin
             });
         }
@@ -2412,6 +2437,9 @@ impl Config {
             if let Some(value) = overlay.context_token_budget {
                 provider.context_token_budget = Some(value);
             }
+            if let Some(value) = overlay.context_window {
+                provider.context_window = Some(value);
+            }
             if let Some(value) = overlay.provider_reports_usage {
                 provider.provider_reports_usage = value;
             }
@@ -2439,6 +2467,7 @@ impl Config {
             supports_native_tools: overlay.supports_native_tools.unwrap_or(true),
             max_output_tokens: overlay.max_output_tokens,
             context_token_budget: overlay.context_token_budget,
+            context_window: overlay.context_window,
             provider_reports_usage: overlay.provider_reports_usage.unwrap_or(true),
             price_per_million_input_tokens: overlay.price_per_million_input_tokens,
             price_per_million_output_tokens: overlay.price_per_million_output_tokens,
@@ -3964,6 +3993,9 @@ impl ConfigOverlay {
                 provider.context_token_budget =
                     Some(parse_token_count(provider_key, field, value)?);
             }
+            "context_window" => {
+                provider.context_window = Some(parse_token_count(provider_key, field, value)?);
+            }
             "provider_reports_usage" => {
                 provider.provider_reports_usage = Some(parse_bool(field, value)?);
             }
@@ -4640,6 +4672,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             supports_native_tools: true,
             max_output_tokens: None,
             context_token_budget: None,
+            context_window: None,
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
@@ -4663,6 +4696,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             // an extra round trip whereas a too-large one is a hard API error.
             max_output_tokens: Some(8192),
             context_token_budget: None,
+            context_window: None,
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
@@ -4694,6 +4728,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             supports_native_tools: true,
             max_output_tokens: None,
             context_token_budget: None,
+            context_window: None,
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
@@ -4709,6 +4744,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             supports_native_tools: true,
             max_output_tokens: None,
             context_token_budget: None,
+            context_window: None,
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
@@ -4770,6 +4806,15 @@ pub fn builtin_token_defaults(provider: &str, model: &str) -> (Option<u32>, u32)
 /// re-billed on every single turn, so the budget is tuned to "enough of the
 /// repository to answer well" rather than "everything that fits". Installs
 /// that want more can raise `model_provider.<id>.context_token_budget`.
+/// The model's whole context window, where it is known (spec 79). Not a
+/// budget: [`builtin_model_context_budget`] is what a turn packs.
+pub fn builtin_context_window(provider: &str, model: &str) -> Option<u32> {
+    match (provider, model) {
+        ("deepseek", "deepseek-v4-flash" | "deepseek-v4-pro") => Some(1_000_000),
+        _ => None,
+    }
+}
+
 fn builtin_model_context_budget(provider: &str, model: &str) -> Option<u32> {
     match (provider, model) {
         ("deepseek", "deepseek-v4-flash" | "deepseek-v4-pro") => Some(64_000),
@@ -4854,6 +4899,13 @@ fn push_model_provider_config(output: &mut String, provider: &ModelProviderConfi
             &value.to_string(),
         );
     }
+    if let Some(value) = provider.context_window {
+        push_line(
+            output,
+            &format!("model_provider.{}.context_window", provider.id),
+            &value.to_string(),
+        );
+    }
 }
 
 fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConfigOverlay) {
@@ -4873,6 +4925,7 @@ fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConf
         supports_native_tools,
         max_output_tokens,
         context_token_budget,
+        context_window,
         provider_reports_usage,
         price_per_million_input_tokens,
         price_per_million_output_tokens,
@@ -4914,6 +4967,13 @@ fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConf
         push_line(
             output,
             &format!("model_provider.{id}.context_token_budget"),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = context_window {
+        push_line(
+            output,
+            &format!("model_provider.{id}.context_window"),
             &value.to_string(),
         );
     }

@@ -1453,6 +1453,7 @@ impl ChatOrchestrator {
             index: Some(&index),
             explicit_paths,
             limit: self.config.context_token_budget(),
+            window: self.config.context_window(),
             hook_context: &hook_context,
             plan: carried_plan.as_ref(),
             pinned: &context_pins,
@@ -1481,8 +1482,8 @@ impl ChatOrchestrator {
         // `resume_after_context_decision`). A pause has assembled a plan but
         // sent nothing, and a declined turn never sends: recording at assembly
         // would put a "what this turn was sent" manifest on a task that sent
-        // nothing (proposal §5.3, C9).
-        sink.context(&context.manifest);
+        // nothing (proposal §5.3, C9). Shown once the messages are built, so
+        // it can count what they add (spec 79).
         let prompt_conversation = build_conversation(
             &conversation.messages,
             conversation.summary.as_ref(),
@@ -1504,6 +1505,8 @@ impl ChatOrchestrator {
             )),
             ModelMessage::user(model_prompt),
         ];
+        note_turn_overhead(&mut context.manifest, &prompt_conversation, &messages);
+        sink.context(&context.manifest);
 
         // The one interruption point between assembly and sending (spec 27
         // §5.1). Off by default: a confirmation on every message is how the
@@ -3075,7 +3078,7 @@ impl ChatOrchestrator {
             .context_pins(&session.id)
             .unwrap_or_default();
         let context_restriction = self.session_store.context_restriction(&session.id)?;
-        let context = self.context_manager.build_context(ContextRequest {
+        let mut context = self.context_manager.build_context(ContextRequest {
             repository_root,
             repository_id: &index.repository_id,
             task_id: &task.id,
@@ -3083,6 +3086,7 @@ impl ChatOrchestrator {
             index: Some(&index),
             explicit_paths: &changed,
             limit: self.config.context_token_budget(),
+            window: self.config.context_window(),
             hook_context: &[],
             plan: Some(plan),
             pinned: &context_pins,
@@ -3117,6 +3121,7 @@ impl ChatOrchestrator {
                 None,
             )),
         ];
+        note_turn_overhead(&mut context.manifest, &prompt_conversation, &messages);
         let options = ChatTurnOptions {
             verification_turn: true,
             ..Default::default()
@@ -3283,7 +3288,7 @@ impl ChatOrchestrator {
             .context_pins(&session.id)
             .unwrap_or_default();
         let context_restriction = self.session_store.context_restriction(&session.id)?;
-        let context = self.context_manager.build_context(ContextRequest {
+        let mut context = self.context_manager.build_context(ContextRequest {
             repository_root,
             repository_id: &index.repository_id,
             task_id: &task.id,
@@ -3291,6 +3296,7 @@ impl ChatOrchestrator {
             index: Some(&index),
             explicit_paths: &changed,
             limit: self.config.context_token_budget(),
+            window: self.config.context_window(),
             hook_context: &[],
             plan: Some(&plan),
             pinned: &context_pins,
@@ -3324,6 +3330,7 @@ impl ChatOrchestrator {
                 None,
             )),
         ];
+        note_turn_overhead(&mut context.manifest, &prompt_conversation, &messages);
         let options = ChatTurnOptions::default();
         if self.config.pause_for_context_review {
             return self.pause_for_context_review(
@@ -11175,6 +11182,27 @@ impl PromptConversation {
     }
 }
 
+/// Records on the manifest what a turn sends beside the assembled context:
+/// the conversation messages (the summary is already its own category) and
+/// the system prompt, at `len / 4` like prose. The context panel measures
+/// these against the model's window (spec 79).
+fn note_turn_overhead(
+    manifest: &mut crate::context_manager::ContextManifest,
+    conversation: &PromptConversation,
+    messages: &[ModelMessage],
+) {
+    manifest.conversation_tokens = Some(
+        conversation
+            .body
+            .as_deref()
+            .map_or(0, |body| body.len().div_ceil(4)),
+    );
+    manifest.system_prompt_tokens = messages
+        .iter()
+        .find(|message| message.role == "system")
+        .map(|message| message.content.len().div_ceil(4));
+}
+
 fn build_conversation(
     prior_messages: &[ChatMessage],
     summary: Option<&ConversationSummary>,
@@ -14217,6 +14245,7 @@ mod mode_tool_list_tests {
             supports_native_tools: true,
             max_output_tokens: None,
             context_token_budget: None,
+            context_window: None,
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
@@ -15090,6 +15119,7 @@ mod mode_refusal_tests {
             supports_native_tools: true,
             max_output_tokens: None,
             context_token_budget: None,
+            context_window: None,
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
@@ -16538,6 +16568,8 @@ mod approval_prompt_wording_tests {
                 conversation_summary: None,
                 symbol_provenance: None,
                 memory: Vec::new(),
+                conversation_tokens: None,
+                system_prompt_tokens: None,
             },
         };
         let with_result = build_model_prompt(
@@ -16611,6 +16643,8 @@ mod approval_prompt_wording_tests {
                 conversation_summary: None,
                 symbol_provenance: None,
                 memory: Vec::new(),
+                conversation_tokens: None,
+                system_prompt_tokens: None,
             },
         };
         let prompt = build_model_prompt(
@@ -16661,6 +16695,8 @@ mod approval_prompt_wording_tests {
                 conversation_summary: None,
                 symbol_provenance: None,
                 memory: Vec::new(),
+                conversation_tokens: None,
+                system_prompt_tokens: None,
             },
         }
     }
@@ -17040,6 +17076,7 @@ mod memory_proposal_tests {
             supports_native_tools: true,
             max_output_tokens: None,
             context_token_budget: None,
+            context_window: None,
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,

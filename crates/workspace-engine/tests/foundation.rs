@@ -2104,6 +2104,7 @@ fn chat_dispatches_native_tool_call_when_provider_supports_it() {
         supports_native_tools: true,
         max_output_tokens: None,
         context_token_budget: None,
+        context_window: None,
         provider_reports_usage: true,
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
@@ -2674,6 +2675,7 @@ fn chat_chains_multiple_native_tool_calls_within_one_turn() {
         supports_native_tools: true,
         max_output_tokens: None,
         context_token_budget: None,
+        context_window: None,
         provider_reports_usage: true,
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
@@ -2752,6 +2754,7 @@ fn native_tool_provider() -> ModelProviderConfig {
         supports_native_tools: true,
         max_output_tokens: None,
         context_token_budget: None,
+        context_window: None,
         provider_reports_usage: true,
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
@@ -5630,6 +5633,72 @@ fn a_custom_provider_without_a_key_reference_keeps_the_global_one() {
     );
 
     assert_eq!(config.model_api_key_env, "keychain:model-api-key");
+}
+
+/// Spec 79: the model's window is its own field. The per-turn packing budget
+/// keeps its default when only the window is declared, and is never larger
+/// than the window.
+#[test]
+fn the_context_window_is_separate_from_the_per_turn_budget() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider=deepseek\n\
+             model_name=deepseek-v4-flash\n\
+             model_provider.deepseek.context_window=1000000\n",
+        )
+        .unwrap(),
+    );
+    assert_eq!(config.context_window(), Some(1_000_000));
+    assert_eq!(config.context_token_budget(), 64_000);
+
+    // The built-in window applies without the line.
+    let mut builtin = Config::default();
+    builtin.apply_overlay(ConfigOverlay::parse("model_provider=deepseek\n").unwrap());
+    assert_eq!(builtin.context_window(), Some(1_000_000));
+
+    // A budget above the window is clamped to it.
+    let mut clamped = Config::default();
+    clamped.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider.acme.base_url=https://api.acme.test\n\
+             model_provider.acme.models=acme-large\n\
+             model_provider.acme.context_token_budget=500000\n\
+             model_provider.acme.context_window=128000\n\
+             model_provider=acme\n",
+        )
+        .unwrap(),
+    );
+    assert_eq!(clamped.context_window(), Some(128_000));
+    assert_eq!(clamped.context_token_budget(), 128_000);
+
+    // No window known: the budget stands alone.
+    let mut unknown = Config::default();
+    unknown.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider.acme.base_url=https://api.acme.test\n\
+             model_provider.acme.models=acme-large\n\
+             model_provider=acme\n",
+        )
+        .unwrap(),
+    );
+    assert_eq!(unknown.context_window(), None);
+    assert_eq!(
+        unknown.context_token_budget(),
+        DEFAULT_CONTEXT_TOKEN_BUDGET as usize
+    );
+}
+
+#[test]
+fn the_context_window_round_trips_through_policy_text() {
+    let overlay = ConfigOverlay::parse("model_provider.deepseek.context_window=1000000\n").unwrap();
+    let text = overlay.to_policy_text();
+    assert!(
+        text.contains("model_provider.deepseek.context_window=1000000"),
+        "{text}"
+    );
+    assert_eq!(ConfigOverlay::parse(&text).unwrap(), overlay);
+    assert!(ConfigOverlay::parse("model_provider.deepseek.context_window=0\n").is_err());
 }
 
 #[test]
