@@ -1,7 +1,7 @@
 # Feature Spec: The Provider Editor Shows Its Default Limits
 
-Status: Done 2026-10-30 (specified and built the same day; local checks in §7,
-the full gate is left to CI). The user: when they open their provider's
+Status: Done 2026-10-30 (specified and built the same day; local checks in §7).
+The full seven-check gate passed in CI on 2026-10-30 (Quality run 41034494208). The user: when they open their provider's
 configuration, it "just shows it is default, without actually displaying the
 number."
 Order: 71 of 71
@@ -81,5 +81,6 @@ the three §6 cases render as written, and the longest placeholder fits the
 field at the default window width.
 
 Local checks: scoped clippy and tests for `workspace-engine` and
-`desktop-shell`, and the fast checks (fmt, node, web lint, typos, deny). The
-workspace clippy and test suite are left to CI.
+`desktop-shell`, and the fast checks (fmt, node, web lint, typos, deny).
+The full seven-check gate passed in CI on 2026-10-30 for the `main` push that
+contains this spec (Quality run 41034494208).

@@ -1608,6 +1608,11 @@ Fill this table as each task lands, and use the Notes cell for what the plan
 got wrong — the file is not a record if the column stays empty. Per
 `AGENTS.md`, a task is not done until its row is updated.
 
+The step checkboxes of Tasks 8–18 were left unticked when the tasks landed;
+they were ticked on 2026-10-30 from the rows above, which record each task as
+Done. Task 14 Step 4 (regenerate the baseline) was deferred on purpose and done
+in Task 18, as its row says.
+
 ## Global Constraints (later slices)
 
 The first slice's Global Constraints still bind. These are added or restated
@@ -1694,7 +1699,7 @@ because they are the ones this half can most easily break.
   for both killed cases, so `finish_command_action`'s `None → unknown` rule
   (spec 17) is untouched.
 
-- [ ] **Step 1: Write the failing unit tests**
+- [x] **Step 1: Write the failing unit tests**
 
 The load-bearing decisions must be testable without spawning a shell. Factor
 them as functions over plain data and test those first:
@@ -1719,19 +1724,19 @@ fn a_reaped_child_is_exited_whatever_the_clock_says() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo nextest run -p workspace-engine -E 'test(command_runner)'`
 Expected: FAIL to compile — `classify_wait` and `WaitDecision` do not exist.
 
-- [ ] **Step 3: Add `classify_wait` and the termination reason**
+- [x] **Step 3: Add `classify_wait` and the termination reason**
 
 A pure function over `(deadline: Option<Instant>, now, cancelled)` returning
 `WaitDecision { Exited, TimedOut, Cancelled }`, with a comment saying why it is
 separate from the process plumbing: the decision is the part that must be
 testable on the default suite. Add `CommandTermination` and the config key.
 
-- [ ] **Step 4: Add the config key and its trust classification**
+- [x] **Step 4: Add the config key and its trust classification**
 
 `command_timeout_secs: u64`, default `600`, a `parse_positive` arm that refuses
 zero (a zero timeout would kill every command at spawn), Restrict-only in the
@@ -1739,7 +1744,7 @@ overlay, and the serialization row. Add it to spec 34 §5.1's Restrict-only row
 with the reason: a repository may shorten how long its own commands run, never
 lengthen one past the user's setting.
 
-- [ ] **Step 5: Rewrite `run` to drain, watch and stream**
+- [x] **Step 5: Rewrite `run` to drain, watch and stream**
 
 Spawn as today, then:
 1. Take `child.stdout`/`child.stderr`; spawn one reader thread per pipe that
@@ -1758,7 +1763,7 @@ Spawn as today, then:
    tail behaviour; changing it is a separate `OBSERVATIONS.md` entry
    (`context.md` §4), not this task.
 
-- [ ] **Step 6: Write the ignored shell tests and run them by hand**
+- [x] **Step 6: Write the ignored shell tests and run them by hand**
 
 In `tests/command_lifecycle.rs`, each `#[ignore]`d with its manual command:
 `a_command_past_its_timeout_is_killed_and_reports_no_exit_code` (a `sleep` with
@@ -1768,14 +1773,14 @@ kill), and `a_secret_in_streamed_output_is_redacted` (echo a fake key). Run
 them with `cargo test -p workspace-engine --test command_lifecycle -- --ignored`
 and record the result in the Progress row.
 
-- [ ] **Step 7: Mutation-test the deadline**
+- [x] **Step 7: Mutation-test the deadline**
 
 Change `classify_wait` to ignore the deadline (always `Exited` unless
 cancelled) and re-run Step 1. `a_command_past_its_deadline_is_timed_out_not_exited`
 must fail. Restore it. A timeout the tests cannot distinguish from no timeout is
 not a timeout.
 
-- [ ] **Step 8: Targeted tests, fmt and clippy; show the change and ask**
+- [x] **Step 8: Targeted tests, fmt and clippy; show the change and ask**
 
 Run `cargo nextest run -p workspace-engine -E 'test(command_runner)'`, then
 `cargo fmt --all -- --check` and
@@ -1796,20 +1801,20 @@ Suggested subject: `Give a command a deadline, a stop, and a live output stream`
   `PhaseKind::Output` (`as_str() == "output"`), carried through the existing
   `TurnProgress::Phase` event. The shell renders it as a log line.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 A native-tool provider, a `CancelToken` the test cancels from a second thread
 after the command starts, and a marker assertion: the turn returns
 `cancelled: true`, and the session log's `run_command` marker finishes
 `unknown` — never `ok`. Add the ignored companion that cancels mid-`sleep`.
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo nextest run -p workspace-engine --test checkpoint_wiring` (the test
 can live here) or the new file. Expected: FAIL to compile — `run_proposal`
 takes three arguments.
 
-- [ ] **Step 3: Thread the side channel**
+- [x] **Step 3: Thread the side channel**
 
 Update `run_proposal` and its four call sites (`chat.rs` ×2, `desktop-shell`,
 `damaian-cli`). The CLI and any non-turn caller pass `&CancelToken::new()` and
@@ -1820,14 +1825,14 @@ a no-op callback. In the chat command arm, build an output closure that calls
 and route through `finish_cancelled_turn` so a stop during a command is the
 same stop the rest of the loop already produces.
 
-- [ ] **Step 4: Shell wiring**
+- [x] **Step 4: Shell wiring**
 
 `turn_progress_event` and the SSE phase writer already handle `TurnPhase`;
 `PhaseKind::Output` flows through unchanged. Update the web UI's phase handler so
 an `output` kind is appended as a line rather than replacing the status label.
 Run `node --check crates/desktop-shell/static/app.js` and `npm run lint:web`.
 
-- [ ] **Step 5: Run the targeted tests, fmt and clippy; show the change and ask**
+- [x] **Step 5: Run the targeted tests, fmt and clippy; show the change and ask**
 
 Suggested subject: `Let a running command report progress and take the turn's stop`
 
@@ -1838,7 +1843,7 @@ Suggested subject: `Let a running command report progress and take the turn's st
 **Files:**
 - Modify: `crates/workspace-engine/tests/command_lifecycle.rs`, `docs/TROUBLESHOOTING.md`, `CHANGELOG.md`
 
-- [ ] **Step 1: Cover the acceptance criteria**
+- [x] **Step 1: Cover the acceptance criteria**
 
 The criteria no earlier task proves: (a) a command past its timeout is
 terminated and reports no exit code; (b) a stop during a command takes effect
@@ -1846,18 +1851,18 @@ during it rather than after; (c) output before exit. Because all three need a
 real shell, they are `#[ignore]`d, and this is stated in the Progress row
 rather than hidden.
 
-- [ ] **Step 2: Mutation-test the ordering**
+- [x] **Step 2: Mutation-test the ordering**
 
 Break the post-`run_proposal` cancel check (remove it) and confirm the
 cancelled-turn test fails. Restore it. This is the assertion that a stop is
 honoured during a command rather than after it.
 
-- [ ] **Step 3: Docs**
+- [x] **Step 3: Docs**
 
 `TROUBLESHOOTING.md`: what a killed/timed-out command looks like and which key
 raises the timeout. `CHANGELOG.md`: an `Unreleased` / **Engine** row.
 
-- [ ] **Step 4: Show the change and the gate result, and ask before committing**
+- [x] **Step 4: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Prove a command can be stopped, timed out and watched`
 
@@ -1872,7 +1877,7 @@ transparent for the one-call round, which is every round today.
 - Modify: `crates/workspace-engine/src/chat.rs`
 - Test: `crates/workspace-engine/tests/agent_tools.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -1887,13 +1892,13 @@ Use `MockModelAdapter::new_sequence_with_tool_calls` with two `ToolCall`s in
 the first turn. Assert the second call's result appears in the following
 request (or in the session log) — not just that the turn ends.
 
-- [ ] **Step 2: Run to verify it fails for the intended reason**
+- [x] **Step 2: Run to verify it fails for the intended reason**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools -E 'test(every_read_only)'`.
 Expected: FAIL because only the first call is dispatched — confirm the failure
 message says the second result is missing, not a compile error.
 
-- [ ] **Step 3: Replace `first_decodable_tool_action` with `decodable_tool_actions`**
+- [x] **Step 3: Replace `first_decodable_tool_action` with `decodable_tool_actions`**
 
 Return every call that decodes, in order, plus the per-call decode errors, plus
 whether the text-envelope fallback applies (it applies only when no native call
@@ -1901,7 +1906,7 @@ decoded, preserving today's rule). Keep the single-call path behaviour
 identical: one assistant message carrying the calls, one tool message per call,
 in order.
 
-- [ ] **Step 4: Widen the pending-turn state**
+- [x] **Step 4: Widen the pending-turn state**
 
 `PendingChatTurn.matched_tool_call: Option<ToolCall>` becomes
 `matched_tool_calls: Vec<ToolCall>` with `#[serde(default)]`, and the old
@@ -1909,7 +1914,7 @@ singular field is kept as a read-only fallback so pending turns written before
 the upgrade still resume. Both `resume_after_command_decision` and the plan
 review path replay the calls.
 
-- [ ] **Step 5: Run the agent-tool tests; fmt and clippy; show and ask**
+- [x] **Step 5: Run the agent-tool tests; fmt and clippy; show and ask**
 
 Suggested subject: `Run every tool call a round asked for, not just the first`
 
@@ -1944,19 +1949,19 @@ fn action_is_batchable_read_only(action: &ToolAction) -> bool {
 That keeps one source of truth but changes `tool_action_marker`'s body; spec
 17's tests are the guard that the bool did not change value.
 
-- [ ] **Step 1: Write the failing equivalence test**
+- [x] **Step 1: Write the failing equivalence test**
 
 A round whose calls are all read-only must produce byte-identical results and
 session-log order to the same calls run sequentially. Assert on the tool
 results, the action-marker order, and the appended messages; do not assert on
 wall-clock alone (§6 says so explicitly).
 
-- [ ] **Step 2: Run to verify it fails for the intended reason**
+- [x] **Step 2: Run to verify it fails for the intended reason**
 
 Expected: FAIL because there is one shared result path, or because ordering
 differs — not a compile error.
 
-- [ ] **Step 3: Add the effect classification and dispatch**
+- [x] **Step 3: Add the effect classification and dispatch**
 
 If every decoded call is `ActionEffect::ReadOnly`, run them on
 `std::thread::scope` collecting `Vec<Result<...>>` by index; otherwise dispatch
@@ -1967,12 +1972,12 @@ session-log `seq` order is deterministic by construction. Do not start markers
 before the batch: a crash mid-batch has no external side effect because the
 batch is read-only, and recording after keeps the sequential log shape.
 
-- [ ] **Step 4: Falsify the ordering guarantee**
+- [x] **Step 4: Falsify the ordering guarantee**
 
 Make the collection read into arbitrary order (e.g. collect by completion) and
 confirm the equivalence test fails. Restore index-order collection.
 
-- [ ] **Step 5: Run the targeted tests; fmt and clippy; show and ask**
+- [x] **Step 5: Run the targeted tests; fmt and clippy; show and ask**
 
 Suggested subject: `Dispatch a round's read-only calls concurrently, in order`
 
@@ -1983,30 +1988,30 @@ Suggested subject: `Dispatch a round's read-only calls concurrently, in order`
 **Files:**
 - Test: `crates/workspace-engine/tests/agent_tools.rs`
 
-- [ ] **Step 1: Mixed round**
+- [x] **Step 1: Mixed round**
 
 A round with a read and a command/`propose_patch` runs the mutating one
 sequentially. Assert the mutating action's marker is the same shape as today
 and the read's result still appears.
 
-- [ ] **Step 2: Stop during a concurrent batch**
+- [x] **Step 2: Stop during a concurrent batch**
 
 With the token cancelled before dispatch, no tool result is fed back and the
 turn is `cancelled`. The mid-batch case needs a slow tool and is an
 `#[ignore]`d timing test with its manual command; state that in the row.
 
-- [ ] **Step 3: `seq` determinism**
+- [x] **Step 3: `seq` determinism**
 
 Run the same all-read-only round five times and assert the session log's
 `seq`-ordered marker/message sequence is identical each time.
 
-- [ ] **Step 4: Mutation-test the batch boundary**
+- [x] **Step 4: Mutation-test the batch boundary**
 
 Make `action_is_batchable_read_only` return true for `ActionEffect::ShapesTurn`
 and confirm the mixed-round test fails (a patch proposal ran concurrently with
 a read). Restore it.
 
-- [ ] **Step 5: Show the change and the gate result, and ask before committing**
+- [x] **Step 5: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Pin the concurrent batch's ordering and its boundaries`
 
@@ -2021,21 +2026,21 @@ be said in the scenario's comment, as `navigated_edit` already does.
 **Files:**
 - Modify: `crates/eval-harness/src/scenario.rs`, `crates/eval-harness/src/assertions.rs`, `crates/eval-harness/scenarios/` (new scenario), `crates/eval-harness/tests/harness.rs`, `docs/specs/18_local_evaluation_harness/proposal.md`, `docs/specs/README.md`, `evals/baseline.json`
 
-- [ ] **Step 1: Add the two assertions**
+- [x] **Step 1: Add the two assertions**
 
 `tool_calls_at_least: Option<u64>` and `tool_rounds_at_most: Option<u64>` on
 `Asserts`, evaluated against the run record (which already reads the session
 log, so they are not script-derived). A scenario using them lists them in
 `deterministic_only` because they depend on the scripted calls.
 
-- [ ] **Step 2: Add the scenario**
+- [x] **Step 2: Add the scenario**
 
 A deterministic scenario whose first turn carries two read-only calls in one
 message, with `tool_calls_at_least = 2` and `tool_rounds_at_most = 1`. Before
 Task 11 this scenario fails (the second call is dropped), which is the
 falsification that it measures batching.
 
-- [ ] **Step 3: Update the two count guards and the summaries**
+- [x] **Step 3: Update the two count guards and the summaries**
 
 `tests/harness.rs` currently asserts 15 in two places; update both to 16 and
 the doc comments. Update spec 18's `Status:`/§5.4 count (already stale at
@@ -2043,7 +2048,7 @@ the doc comments. Update spec 18's `Status:`/§5.4 count (already stale at
 rule. Tests whose numbers change because of the scenario count are part of
 this task.
 
-- [ ] **Step 4: Regenerate the baseline — deliberately**
+- [x] **Step 4: Regenerate the baseline — deliberately**
 
 Only now, and only because a scenario was added. Run
 `cargo run -q -p eval-harness --bin damaian-eval -- --tier deterministic --format json > evals/baseline.json`,
@@ -2051,7 +2056,7 @@ then read every changed number before accepting it; a baseline nobody read is
 worse than none (spec 18 §5.7). Record in the Progress row whether a human
 reviewed it.
 
-- [ ] **Step 5: Show the change and the gate result, and ask before committing**
+- [x] **Step 5: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Measure that a round runs every read-only call it was given`
 
@@ -2074,30 +2079,30 @@ tool result, not only on continuation.
   single notice naming how many rounds were elided. Never split an assistant
   `tool_calls` message from its `tool` results.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Drive a turn with many tool rounds and capture the messages the adapter was
 asked to send. Assert the array never exceeds the cap, that the first two
 messages are intact, and that the elision notice names a nonzero count. Assert
 the session log still holds every round — only the request is bounded.
 
-- [ ] **Step 2: Run to verify it fails for the intended reason**
+- [x] **Step 2: Run to verify it fails for the intended reason**
 
 Expected: FAIL because no clamp exists, so the request grows past the cap.
 
-- [ ] **Step 3: Add the key, the classification, and the clamp**
+- [x] **Step 3: Add the key, the classification, and the clamp**
 
 Add the key exactly as Task 8 added its own, including the spec 34 row. Apply
 the clamp in the loop before building the `ModelRequest`. Elide in whole
 round-pairs and state the count.
 
-- [ ] **Step 4: Mutation-test the clamp**
+- [x] **Step 4: Mutation-test the clamp**
 
 Set the cap to a value larger than the array and confirm the test fails
 (nothing is elided when it should be), then set it to a value that would split
 a pair and confirm the pairing assertion fails. Restore.
 
-- [ ] **Step 5: Show the change and the gate result, and ask before committing**
+- [x] **Step 5: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Bound the in-turn message array and say what was elided`
 
@@ -2120,7 +2125,7 @@ pre-call token check then bounds the turn, and `StopReason::TokenBudget` /
 bounds total rounds even if a provider reports no usage, so a mock cannot loop
 forever.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 1. **Continuation happens and is recorded.** A token ceiling high enough not to
    bind, a low `agent_max_tool_rounds`, and a mock that requests tools for two
@@ -2135,26 +2140,26 @@ forever.
    before the cap still has its current step after the continuation, and a
    `complete_step` across the boundary advances it.
 
-- [ ] **Step 2: Run to verify they fail for the intended reason**
+- [x] **Step 2: Run to verify they fail for the intended reason**
 
 Expected: test 1 fails with `ToolBudgetExhausted` today; tests 2–4 encode
 existing behaviour and must pass before and after (they are the regression
 guard).
 
-- [ ] **Step 3: Implement the continuation**
+- [x] **Step 3: Implement the continuation**
 
 Add the `turn_continued` audit event, the continuation branch at `force_final`,
 the extended `max_rounds`, and the hard constant. Do not reset `round`, the
 task id, or the plan.
 
-- [ ] **Step 4: Falsify the bound**
+- [x] **Step 4: Falsify the bound**
 
 Remove the `agent_max_task_tokens.is_some()` guard and confirm test 3 fails
 (continuation without a ceiling would make the turn unbounded). Remove the hard
 constant and confirm a no-usage mock loops past the intended bound. Restore
 both.
 
-- [ ] **Step 5: Show the change and the gate result, and ask before committing**
+- [x] **Step 5: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Continue past the round cap under the token budget`
 
@@ -2165,14 +2170,14 @@ Suggested subject: `Continue past the round cap under the token budget`
 **Files:**
 - Modify: `crates/workspace-engine/tests/token_ceiling.rs`, `docs/specs/47_agent_working_capability/proposal.md`, `docs/PLAN/OBSERVATIONS.md` (local-only)
 
-- [ ] **Step 1: Cover the acceptance criterion**
+- [x] **Step 1: Cover the acceptance criterion**
 
 "A task exceeding its tool-round budget continues with its state intact, and
 the continuation is bounded and appears in the audit log": assert all three
 clauses in one test, reading the plan from the session store after the turn and
 the continuation from the audit log.
 
-- [ ] **Step 2: Write what was actually decided**
+- [x] **Step 2: Write what was actually decided**
 
 In `proposal.md` §7, record R6 as built on today's evidence (the cliff and the
 array), **not** on the opening premise, and state plainly that §7.2 did not
@@ -2180,7 +2185,7 @@ support the premise. Resolve `OBSERVATIONS.md` entry 6 with a disposition:
 bounded in this slice by `agent_max_turn_messages`, recording that the in-turn
 array and conversation compaction remain separate problems.
 
-- [ ] **Step 3: Show the change and the gate result, and ask before committing**
+- [x] **Step 3: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Carry a turn past its round cap under the token budget`
 
@@ -2191,24 +2196,24 @@ Suggested subject: `Carry a turn past its round cap under the token budget`
 **Files:**
 - Modify: `docs/specs/47_agent_working_capability/proposal.md`, `docs/specs/47_agent_working_capability/tasks.md`, `docs/specs/README.md`, `docs/USER_GUIDE.md`, `CHANGELOG.md`
 
-- [ ] **Step 1: Fill in the Progress table and header**
+- [x] **Step 1: Fill in the Progress table and header**
 
 Every task's row with what actually landed, the test count, and any deviation;
 the `**Started:**` date and, when the last task lands, `— **Done:** …`.
 
-- [ ] **Step 2: Update the four summaries**
+- [x] **Step 2: Update the four summaries**
 
 `proposal.md` `Status:` (requirements 5, 6 and 8 done; if R6 was dropped, say
 so and why), its §7 notes, this file's row/header, and the `docs/specs/README.md`
 row 47. If R6 was deferred, `README.md` must say that, not imply it shipped.
 
-- [ ] **Step 3: Docs**
+- [x] **Step 3: Docs**
 
 `USER_GUIDE.md`: commands can be stopped and timed out; reads-only rounds may
 run together; a turn may continue past the round cap when a token ceiling is
 set. `CHANGELOG.md`: Engine rows under `Unreleased`.
 
-- [ ] **Step 4: Full quality gate — all seven commands**
+- [x] **Step 4: Full quality gate — all seven commands**
 
 ```sh
 cargo fmt --all -- --check
@@ -2223,7 +2228,7 @@ cargo deny check
 Run them once, here, on the finished state. Quote the test count in the
 Progress row. If `evals/baseline.json` changed, state who read it.
 
-- [ ] **Step 5: Show the change and the gate result, and ask before committing**
+- [x] **Step 5: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Close the agent working capability spec`
 

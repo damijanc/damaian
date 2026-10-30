@@ -79,39 +79,38 @@ directory was renamed from `ROADMAP` to `PLAN` because it was never a roadmap:
 
 ## What to build next, and what may run in parallel
 
-### Current state (2026-10-28)
+### Current state (2026-10-30)
 
 A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
 reports the disagreement.
 
-#23, #25, #26, #27, #28, #29, #32, #35, #36, #50, #55, #59, #62, #65 and #66 are
-all Done and merged into `main` or finished on their branch. #23 and #26 both
-finished on 2026-10-25, so the two keystones are no longer in flight; #35 and
-#55 finished on 2026-10-26, and the full seven-check gate passed in CI on
-2026-10-26 (Quality run 40323902715). #27 finished on 2026-10-26, and the full
-seven-check gate passed in CI on 2026-10-26 (Quality run 40340511717); #28 and
-#29 finished on 2026-10-26, and the full seven-check gate passed in CI on
-2026-10-26 for the `main` push that contains both. #67
-(conversation activity and plan hierarchy) finished on 2026-10-26 as a
-presentation follow-up to #41, #42 and #66; it edits no `chat.rs`, so it did not
-constrain #29. **#51 external reference retrieval finished on 2026-10-28** on
-branch `spec-51-external-reference` (Tasks 1–10, then Task 11's review fixes);
-the full seven-check gate passed in CI on 2026-10-29 for the `main` push that
-contains it (Quality run 40902516310).
+#23, #25, #26, #27, #28, #29, #32, #35, #36, #50, #51, #55, #59, #62, #65 and
+#66 are all Done and merged into `main`. #23 and #26 both finished on
+2026-10-25, so the two keystones are no longer in flight; #35 and #55 finished
+on 2026-10-26, and the full seven-check gate passed in CI on 2026-10-26
+(Quality run 40323902715). #27 finished on 2026-10-26, and the full seven-check
+gate passed in CI on 2026-10-26 (Quality run 40340511717); #28 and #29 finished
+on 2026-10-26, and the full seven-check gate passed in CI on 2026-10-26 for the
+`main` push that contains both. #51 external reference retrieval and #36 branch
+and worktree delivery finished on 2026-10-28 and were merged into `main` that
+day; the full seven-check gate passed in CI on 2026-10-29 for the `main` push
+that contains both (Quality run 40902516310).
+
+#60–#71 are also Done (see their rows below). Several were evidence-driven or
+usability specs added outside the roadmap order; being finished, none of them
+changes what may be built next.
 
 - **In progress:** #30 memory retrieval and lifecycle, planned on 2026-10-28
   into [`proposal.md`](30_memory_retrieval_and_lifecycle/proposal.md),
   [`context.md`](30_memory_retrieval_and_lifecycle/context.md) and
-  [`tasks.md`](30_memory_retrieval_and_lifecycle/tasks.md); no task is built yet,
-  and it is a solo `chat.rs` track because retrieval changes the turn path and
-  adds the `Memory` category. #36 branch and worktree delivery finished on
-  2026-10-28 (see its [`tasks.md`](36_branch_and_worktree_delivery/tasks.md));
-  review fixes landed after that first Done and before merge, and its scoped
-  checks passed locally, and the full seven-check gate passed in CI on
-  2026-10-29 for the `main` push that contains it (Quality run 40902516310). #51 and #36 were merged into `main` on
-  2026-10-28, and `main` also carries the review-fix branches for #35, #27, #55
-  and #28/#29. #49 prompt cache's accounting slice is done and the reuse slice
+  [`tasks.md`](30_memory_retrieval_and_lifecycle/tasks.md). Tasks 1–6 were
+  built on 2026-10-28 on the unmerged branch `spec-30-memory-recall`, whose own
+  `tasks.md` records them as Done; Task 7 (documentation) and Task 8
+  (close-out) remain. `main`'s copy of `tasks.md` still says "Not started" for
+  every task, and catches up when the branch is merged. It is a solo `chat.rs`
+  track because retrieval changes the turn path and adds the `Memory` category.
+  #49 prompt cache's accounting slice is done and the reuse slice
   (requirement 4) is still unbuilt; #26's ordering exists, and #55 replaced the
   eight-message sliding window on 2026-10-26, so the reuse slice is no longer
   blocked by either. #49's own `Depends on:` line still names Phase 1 WP3
@@ -119,22 +118,17 @@ contains it (Quality run 40902516310).
   set.
 - **Also ready:** #33 MCP management. It edits `chat.rs`, which #30 now
   owns, so the two are serialised.
-- **Blocked:** #37 on #33 (its #36 dependency is now built; #36 finished on
-  2026-10-28); #52 on #33;
-  #39 on #38; #40 on #38 and #39; #54 on Phase 1 WP3 (provider capability
-  validation), which is unspecified.
+- **Blocked:** #37 on #33; #52 on #33; #39 on #38; #40 on #38 and #39; #54 on
+  Phase 1 WP3 (provider capability validation), which is unspecified.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
 - **Pairing:** two specs may run together only if at most one of them edits
-- **Pairing:** two specs may run together only if at most one of them edits
   `chat.rs`, and #49's reuse slice is a solo `chat.rs` track while it rewrites
-  the request around `build_model_prompt`. #51's `chat.rs` work is finished, so
-  it no longer constrains anything. **#30 and #33 both edit `chat.rs`** — #30
-  through the turn path and the `Memory` category, #33 through the MCP tool list
-  and per-tool dispatch — so they are not safe together; one must own that file
-  and the other wait or rebase. #26, #27, #28, #29, #35, #36, #51, #55, #65 and
-  #66 are Done and no longer constrain anything. See
-  [Parallel work](#parallel-work).
-- **Open decision:** the priority table below predates #59–#64 and does not
+  the request around `build_model_prompt`. **#30 and #33 both edit `chat.rs`** —
+  #30 through the turn path and the `Memory` category, #33 through the MCP tool
+  list and per-tool dispatch — so they are not safe together; one must own that
+  file and the other wait or rebase. Every Done spec no longer constrains
+  anything. See [Parallel work](#parallel-work).
+- **Open decision:** the priority table below predates #59–#71 and does not
   rank them; the text after it now calls #23 the priority with #65 done.
 
 ### History
@@ -784,7 +778,7 @@ is ready.
 | 27 | [27_context_inspector/](27_context_inspector/proposal.md) | **Done 2026-10-26** (planned and built 2026-10-26; Tasks 1–10; the manual browser walk is in its §7; seven-check gate green in CI, Quality run 40340511717). Roadmap Phase 3 WP5. Renders #26's manifest pre- and post-send, and adds session pins and a path restriction. The view sees `ContextManifest` and never item content; removal is available only on a paused pre-send review, and `Required` is refused at the API. Its `chat.rs` work was a solo track. Its manual walk exercised the pre-send pause, a Required refusal, an item removed before send (74 → 67 tokens), the post-send Context link, pins and the restriction. It promoted #28. Makes "the user can see what context the agent uses" true; Phase 3b's memory arrives as one more category in this view. |
 | 28 | [28_memory_model_and_storage/](28_memory_model_and_storage/proposal.md) | **Done 2026-10-26** (planned and built 2026-10-26; Tasks 1–8). Roadmap Phase 3b WP1. The memory record and store: a `project_key` resolved from the root commit, then a normalized origin, then the path hash — because `repository_id` is a path hash and cannot give the sharing property the roadmap asks for — and append-only JSONL under `<data dir>/memory/` with its own schema marker. Memory refuses detected secrets rather than storing a redaction, checks evidence against `restricted_patterns` and per-directory `.gitignore` on the write path, derives `Sensitivity` by rule (raise-only), and audits every lifecycle transition without a personal or environmental statement. Session scope lives in the session log through a `pub(crate)` `SessionStore` path; user scope is off by default and enforced on read and write. Its [`context.md`](28_memory_model_and_storage/context.md) records the pre-implementation state and the re-checked line references; [`tasks.md`](28_memory_model_and_storage/tasks.md) holds the eight tasks, 52 integration tests and 15 inline unit tests. The project identity (including the shallow-clone limit) and the secret-refusal path are the parts to review first. The full seven-check gate passed in CI on 2026-10-26 for the `main` push. |
 | 29 | [29_memory_creation_and_consent/proposal.md](29_memory_creation_and_consent/proposal.md) | **Done 2026-10-26** (planned and built 2026-10-26; Tasks 1–9). Roadmap Phase 3b WP2. The consent gate: `MemoryProposal` and `MemoryEntry` are separate types; `MemoryEntry` is `#[non_exhaustive]` with no constructor except `confirm` and deserialization, and `confirm` requires a `UserConfirmation`. Instruction-shaped candidates from non-user origins, detected secrets, and evidence from protected or ignored paths produce no proposal at all; the refusal is audited with the path and reason, never the statement. Proposals live in the session log, survive a reload, and are confirmed one at a time through a route that takes an id and re-reads the proposal. The `propose_memory` tool and an explicit "remember that" are the two creation paths; the card is a collapsed stack below the conversation. Six deterministic eval scenarios cover repository and external injection, secret refusal, restricted and ignored evidence, no unconfirmed persistence, and user scope off; `run_scenarios` also asserts the no-unconfirmed-persistence invariant on every run. The manual walk on port 4899 confirmed the card, scope choices, Remember, Dismiss and reload behaviour. Its [`context.md`](29_memory_creation_and_consent/context.md) records the pre-implementation state and the decisions; the constructor barrier, the non-user-origin instruction path and evidence eligibility are the parts to review first. The full seven-check gate passed in CI on 2026-10-26 for the `main` push. |
-| 30 | [30_memory_retrieval_and_lifecycle/](30_memory_retrieval_and_lifecycle/proposal.md) | **In progress** (planned 2026-10-28; no task implemented yet). Roadmap Phase 3b WP4. Memory reaches the model only as a `ContextItem` in the lowest-priority category, is visible and removable in #27, and is marked stale by hash comparison against its evidence. Proven by prompt-injection evals, not design argument. [`context.md`](30_memory_retrieval_and_lifecycle/context.md) records the pre-implementation state and eleven corrections; [`tasks.md`](30_memory_retrieval_and_lifecycle/tasks.md) holds eight tasks. |
+| 30 | [30_memory_retrieval_and_lifecycle/](30_memory_retrieval_and_lifecycle/proposal.md) | **In progress** (planned 2026-10-28; Tasks 1–6 built 2026-10-28 on the unmerged branch `spec-30-memory-recall`, whose `tasks.md` records them; Tasks 7–8 remain). Roadmap Phase 3b WP4. Memory reaches the model only as a `ContextItem` in the lowest-priority category, is visible and removable in #27, and is marked stale by hash comparison against its evidence. Proven by prompt-injection evals, not design argument. [`context.md`](30_memory_retrieval_and_lifecycle/context.md) records the pre-implementation state and eleven corrections; [`tasks.md`](30_memory_retrieval_and_lifecycle/tasks.md) holds eight tasks. |
 | 31 | [31_permission_profiles/](31_permission_profiles/proposal.md) | **Done (2026-10-06).** Roadmap Phase 4 WP3, built in nine tasks on top of #34's security subset. Four built-in profiles (Read-only, Safe local, Full, Offline private) plus imported custom ones are applied last and can only narrow; `profile ∩ mode` is checked at every refusal point. Two documented limits: `local` is a command-name heuristic, not a sandbox, and Offline private does not stop model traffic. |
 | 32 | [32_hooks/](32_hooks/proposal.md) | **Done 2026-10-24** (started 2026-10-07; Tasks 1–10, the last on 2026-10-24; see its `tasks.md`). Roadmap Phase 4 WP2. Nine lifecycle events, hooks as external programs returning a verdict — `deny`/`request_approval`/`warn`/`allow`, with no `approve`, so widening is unrepresentable. A repository may define a hook that stays inactive until reviewed at a hash, and may never touch a user hook. The workspace gate is left to CI; its own §7.1 records one criterion (the context inspector) as met by #27's `HookContext` category row. |
 | 33 | [33_mcp_management_and_deferred_discovery.md](33_mcp_management_and_deferred_discovery.md) | **Not started.** Roadmap Phase 4 WP4. Every enabled server's full schema currently reaches every request, outside #26's accounting. Adds a search tool with on-demand schemas, per-tool enable, lazy startup, and treats a remote read-only claim as an assertion that cannot lower an approval requirement. |
@@ -823,9 +817,9 @@ is ready.
 | 66 | [66_plan_left_open_at_turn_end/](66_plan_left_open_at_turn_end/proposal.md) | **Done 2026-10-25 (implementation, live acceptance, and the full seven-check gate green in CI)** (started 2026-10-24; Tasks 1–10, the last on 2026-10-25; §6's manual and deterministic criteria walked in its §7, and the deterministic `plan_answer_without_complete_step` and `plan_left_open_at_end` scenarios pass). Specified 2026-10-24 from a session that answered in full and left step 1 of 4 *running*. One reminder per turn when the model answers with open steps, sent after `before_task_complete` allows and only when the round and token budgets leave room for a tool-carrying call; step evidence persists in `PendingChatTurn` across every pause and is attached at a true turn end without closing the step; a declined plan's remaining steps are marked skipped; and an ended turn's open step reads "not finished" with "Turn ended with N steps not marked done." Nothing is closed on the model's behalf (#21 requirement 6). |
 | 67 | [67_conversation_activity_and_plan_hierarchy.md](67_conversation_activity_and_plan_hierarchy.md) | **Done 2026-10-26** (started and finished the same day; the running-app walk and local checks are in its §7). Usability-driven, not a roadmap graduation: a real reporting session wrote 100 messages for 72 actions, each action a full bubble beside its result, and left the five-step plan expanded under the last message, so the answer was buried. Groups consecutive action/result pairs into one collapsed **Activity** disclosure, puts the plan's step list behind a collapsed `Steps (N)` disclosure, and previews the exact finding-repair prompt before it is sent, warning when the target is an environment/`PATH` failure rather than a code defect. Presentation only: it uses the session log's existing order, changes no stored message or model context, and old sessions group identically. |
 | 68 | [68_ui_chrome_and_command_activity/](68_ui_chrome_and_command_activity/proposal.md) | **Done 2026-10-29** (started and finished the same day; the running-app walk and local checks passed, the full gate is left to CI). Usability-driven, like #41–#44, #58 and #67, with a before/after mockup agreed first. A turn's usage row is drawn once rather than under every ungrouped message; a command step inside an Activity reads `$ cmd`, an exit mark and the reason, with output folded and empty streams dropped; an approved command's request folds into its step. The sidebar draws *Workers* only when a project has workers and the update footer only when there is an update, the brand drops the folder name, and project-row controls show on hover or focus. Header icons share one style, *Context* becomes a meter, and composer triggers name what they set. Presentation only, and it edits no `chat.rs`. |
-| 69 | [69_interactive_shell_path.md](69_interactive_shell_path.md) | **Done 2026-10-29** (specified and built the same day; local checks passed, the full gate is left to CI). Evidence-driven, like #47 and #64: a live session could not find `npm` because commands run in `<shell> -lc`, which never reads `~/.zshrc`. Damaian now asks the user's interactive login shell for its `PATH` once per run, in `$HOME`, under a five-second limit, and gives commands only that `PATH`, in its order; aliases, functions and other variables never cross. `command_path_from_interactive_shell` (user and admin only) turns it off. |
-| 70 | [70_read_only_sequences_and_file_reads.md](70_read_only_sequences_and_file_reads.md) | **Done 2026-10-30** (specified 2026-10-29, built 2026-10-29–30; local checks passed, the full gate is left to CI). Evidence-driven, like #64 and #69: the model writes its surveys as `;`-separated lines with `echo` headings, `2>/dev/null` and short file reads, and every one asked. The read-only boundary now admits `;` and newlines, `/dev/null` redirects and `2>&1`, `echo`, the git listings (`worktree list`, `branch`, `remote`, `rev-parse`, `rev-list`, `for-each-ref`, `merge-base`), `git -C <dir>`, bare `head`/`tail` filters, and `cat`, `head`, `tail`, `wc`, print-only `sed -n` and non-recursive `grep` on named files inside the repository. Restricted or outside files, recursion, globs and a `cd` line with `;` still ask. Re-measured: 26 of 125 distinct approved commands in the audit log would now run unasked. |
-| 71 | [71_provider_editor_shows_token_defaults.md](71_provider_editor_shows_token_defaults.md) | **Done 2026-10-30** (specified and built the same day; local checks passed, the full gate is left to CI). Usability feedback, like #67 and #68: a blank *Max output tokens* or *Context budget* in the provider editor said `Automatic` without the number. The placeholders now show the value the engine resolves for the first listed model (`Default: 64,000`), a note lists each model when they differ, and the numbers come from one engine function, `builtin_token_defaults`, that the resolvers also use, so the editor cannot disagree with them. No default changed. |
+| 69 | [69_interactive_shell_path.md](69_interactive_shell_path.md) | **Done 2026-10-29** (specified and built the same day; local checks passed). The full seven-check gate passed in CI on 2026-10-29 (Quality run 40940844885). Evidence-driven, like #47 and #64: a live session could not find `npm` because commands run in `<shell> -lc`, which never reads `~/.zshrc`. Damaian now asks the user's interactive login shell for its `PATH` once per run, in `$HOME`, under a five-second limit, and gives commands only that `PATH`, in its order; aliases, functions and other variables never cross. `command_path_from_interactive_shell` (user and admin only) turns it off. |
+| 70 | [70_read_only_sequences_and_file_reads.md](70_read_only_sequences_and_file_reads.md) | **Done 2026-10-30** (specified 2026-10-29, built 2026-10-29–30; local checks passed). The full seven-check gate passed in CI on 2026-10-30 (Quality run 41028254554). Evidence-driven, like #64 and #69: the model writes its surveys as `;`-separated lines with `echo` headings, `2>/dev/null` and short file reads, and every one asked. The read-only boundary now admits `;` and newlines, `/dev/null` redirects and `2>&1`, `echo`, the git listings (`worktree list`, `branch`, `remote`, `rev-parse`, `rev-list`, `for-each-ref`, `merge-base`), `git -C <dir>`, bare `head`/`tail` filters, and `cat`, `head`, `tail`, `wc`, print-only `sed -n` and non-recursive `grep` on named files inside the repository. Restricted or outside files, recursion, globs and a `cd` line with `;` still ask. Re-measured: 26 of 125 distinct approved commands in the audit log would now run unasked. |
+| 71 | [71_provider_editor_shows_token_defaults.md](71_provider_editor_shows_token_defaults.md) | **Done 2026-10-30** (specified and built the same day; local checks passed). The full seven-check gate passed in CI on 2026-10-30 (Quality run 41034494208). Usability feedback, like #67 and #68: a blank *Max output tokens* or *Context budget* in the provider editor said `Automatic` without the number. The placeholders now show the value the engine resolves for the first listed model (`Default: 64,000`), a note lists each model when they differ, and the numbers come from one engine function, `builtin_token_defaults`, that the resolvers also use, so the editor cannot disagree with them. No default changed. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:

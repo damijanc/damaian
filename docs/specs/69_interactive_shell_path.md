@@ -1,7 +1,7 @@
 # Feature Spec: Commands See the PATH the User's Terminal Sees
 
-Status: Done 2026-10-29 (specified and built the same day; local checks in §7,
-the full gate is left to CI). A live session could not run `npm`, because the
+Status: Done 2026-10-29 (specified and built the same day; local checks in §7).
+The full seven-check gate passed in CI on 2026-10-29 (Quality run 40940844885). A live session could not run `npm`, because the
 app's command shell never reads the file where nvm sets `PATH`.
 Order: 69 of 69
 Plan: none. Evidence-driven, like #47 and #64 — an exception to the rule in
@@ -221,8 +221,9 @@ the scope refusals. Removing the `export` prefix fails the two tests that read
 
 Local checks: scoped clippy for `workspace-engine` and `desktop-shell`, the
 `workspace-engine` and `desktop-shell` test suites, the deterministic eval
-tier, and the fast checks (fmt, node, web lint, typos, deny). The workspace
-clippy and test suite are left to CI.
+tier, and the fast checks (fmt, node, web lint, typos, deny). The full seven-check gate
+passed in CI on 2026-10-29 for the `main` push that contains this spec (Quality
+run 40940844885).
 
 `the_users_own_shell_answers_with_a_usable_path` is `#[ignore]`d, since it
 starts the developer's real interactive shell; run by hand on 2026-10-29 with

@@ -1,7 +1,7 @@
 # Feature Spec: Read-Only Sequences and Named-File Reads
 
 Status: Done 2026-10-30 (specified 2026-10-29, built 2026-10-29–30; local
-checks in §7, the full gate is left to CI). The user, after two reporting sessions: "shell
+checks in §7). The full seven-check gate passed in CI on 2026-10-30 (Quality run 41028254554). The user, after two reporting sessions: "shell
 command with `;` needs an update, it is super annoying."
 Order: 70 of 70
 Plan: none. Evidence-driven, like #47, #64 and #69 — an exception to the rule
@@ -199,5 +199,6 @@ Local, on 2026-10-30: the `workspace-engine` suite (2071 tests, run outside
 the sandbox because the `external_reference` tests need a loopback port; two
 pins updated, then all pass), the `desktop-shell` suite (224 passed), scoped
 clippy for `workspace-engine`, the deterministic eval tier (40 scenarios
-pass), and the fast checks (fmt, node, web lint, typos, deny). The workspace
-clippy and test suite are left to CI. Not yet tried in the running app.
+pass), and the fast checks (fmt, node, web lint, typos, deny). The full seven-check
+gate passed in CI on 2026-10-30 for the `main` push that contains this spec
+(Quality run 41028254554). Not yet tried in the running app.

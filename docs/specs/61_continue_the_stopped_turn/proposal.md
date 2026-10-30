@@ -190,6 +190,8 @@ which bounds a single configured segment and #47's token-ceiling continuation.
 > (`continue_keeps_state`, `read_loop`, `answer_now_ends_the_turn`,
 > `long_discovery`, `failed_validation_retry`) pin `agent_max_tool_rounds=8` in
 > their `config_overlay`, because the pause is what they test, not the default.
+> The full seven-check gate passed in CI on 2026-10-30 for the `main` push that
+> contains this amendment (Quality run 41034494208).
 
 Each request inside the turn stays bounded by `agent_max_turn_messages` through
 `bounded_messages`, so continuing grows the number of calls, not their size.
