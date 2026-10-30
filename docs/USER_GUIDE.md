@@ -1442,7 +1442,7 @@ characters.
 
 ## Command Approval
 
-When the assistant needs a local command result, it asks Damaian to run the command. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, and `git log`, run without asking, in the selected working folder. They run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Simple pipelines made only of such commands, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
+When the assistant needs a local command result, it asks Damaian to run the command. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, `git log`, `git branch -a`, and `sed -n '1,40p' README.md`, run without asking, in the selected working folder. They run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Such commands joined by `&&`, `;` or a newline, or filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
 
 ### What runs without asking
 
@@ -1459,8 +1459,21 @@ asks for approval.
 | `ls` | `-a`, `-l`, `-1`, `-d`, `-h`, `-R`, and paths, alone or combined; `-R` only with a path that is not the repository root |
 | `git status` | `--short`/`-s`, `--porcelain`, `--porcelain=v1`, `--branch`/`-b`, `--untracked-files=no` |
 | `git log` | `--oneline`, `-n N` (or `-nN`, `-N`), `--max-count=N`, `--stat`, `--name-only`, `--name-status`, `--format=…`, `--pretty` or `--pretty=…`, `--decorate`, `--graph`, revisions and paths — but not `-p`, `--patch` or `-u` |
+| `git worktree list` | `--porcelain`, `-v` |
+| `git branch` | `-a`, `-r`, `-v`, `-vv`, `--list`, `--show-current` — listing only, no branch names |
+| `git remote` | alone or `-v` |
+| `git rev-parse` | `--short`, `--abbrev-ref`, `--verify`, `-q`, `--show-toplevel`, `--git-dir`, revisions |
+| `git rev-list` | `--count`, `--left-right`, `--max-count=N`, revisions and ranges |
+| `git for-each-ref` | `--sort=…`, `--format=…`, `--count=N`, ref patterns |
+| `git merge-base` | `--is-ancestor`, revisions |
 | `git diff`, `git show` | not admitted — they print file contents a command line cannot bound or keep restricted paths out of; the assistant reads them through the `read_git_diff` tool instead |
-| `git` (global) | `--no-pager` only |
+| `git` (global) | `--no-pager`, and one `-C <dir>` where `<dir>` is inside the repository |
+| `echo` | any literal text |
+| `cat` | `-n` and at least one file |
+| `head`, `tail` | `-n N` (or `-nN`, `-N`) and at least one file; not `tail -f` |
+| `wc` | `-l`, `-w`, `-c` and at least one file |
+| `sed` | `-n` (optionally `-E`), a script that only prints — such as `1,80p`, `$p` or `/^## /p` — and at least one file |
+| `grep` | `-i -v -n -c -E -F -l -L -h -H -w -o -s -q`, `-m N`, `-A N`, `-B N`, `-C N`, one pattern (or `-e pattern`), and at least one file; not `-r` |
 
 Every path in an admitted command is resolved against the repository and
 `restricted_patterns`: a path outside the repository, behind a symlink, or
@@ -1471,26 +1484,42 @@ directories unasked. A restricted entry inside a directory you named is still
 listed by name — `ls` is not policed per entry the way the `list_directory` tool
 is.
 
-### Read-only pipelines
+The file-reading forms (`cat`, `head`, `tail`, `wc`, `sed -n`, `grep`) run
+without asking only when they name their files, and each file passes the same
+check: `cat .env`, `sed -n 1p secrets/key` and `head -n 5 ../other/file` ask. A
+recursive or globbed read (`grep -r`, `cat *.md`) asks, because the command line
+does not say which files it reaches. Any other form of these programs — `sed -i`,
+`cat a > b` — is judged as it always was.
 
-A pipeline runs without asking when it is built only from those commands and a
-small set of filters, joined by `&&` and `|`. It may begin with `cd <dir> &&`,
-where `<dir>` is inside the repository, not restricted, and exists. Each command
-before a `|` must itself be an admitted command from the table, checked against
-the directory it will run in. Each command after a `|` must be a filter that
-reads only its input, with no file argument:
+`git -C <dir>` checks `<dir>` like a `cd` directory, and resolves the paths
+after it against `<dir>`.
 
-- `head -n N`, `tail -n N`
+### Read-only pipelines and sequences
+
+A line runs without asking when it is built only from those commands and a
+small set of filters, joined by `&&`, `;`, a newline, and `|`. It may begin with
+`cd <dir> &&`, where `<dir>` is inside the repository, not restricted, and
+exists; a line that begins with `cd` may not also use `;` or a newline, because
+after `;` the next command runs even when `cd` failed. Each command before a `|`
+must itself be an admitted command from the table, checked against the directory
+it will run in. A command may discard output with `>/dev/null` or
+`2>/dev/null`, or merge it with `2>&1`; no other redirect is admitted. Each
+command after a `|` must be a filter that reads only its input, with no file
+argument:
+
+- `head` and `tail`, bare or with `-n N` or `-N`
 - `wc` with `-l`, `-w` or `-c`
 - `sort` with `-r`, `-n` or `-u`
 - `uniq` with `-c`
 - `cut` with `-d` and `-f`
 - `grep` with `-i`, `-v`, `-n`, `-c`, `-E` or `-F` and one pattern
 
-So `git log --oneline | grep -i fix | wc -l` and
-`cd crates && git status --short | head -n 3` run without asking. `git status;
-rm x`, `git log > out.txt` and `ls | xargs cat` do not: `;`, `>` and a filter
-with a file argument are outside the admitted shape.
+So `git log --oneline | grep -i fix | wc -l`,
+`cd crates && git status --short | head -n 3` and
+`echo '=== branches ==='; git branch -a 2>/dev/null; echo; git remote -v` run
+without asking. `git status; rm x`, `git log > out.txt`, `ls | xargs cat` and
+`git log || true` do not: `rm`, a redirect to a file, a filter with a file
+argument and `||` are outside the admitted shape.
 
 Every other command appears as an approval card in the conversation. Its first line names why Damaian is asking — which shell-control characters, network keyword, restricted path, setting, or [hook](#hooks) — and the same reason appears on the card beside the risk badge. **Why this command** holds the full prompt with every reason, and, when the agent gave one, **The agent says: …** is the agent's own stated purpose for the command. Review the command, risk, working directory and both reasons, then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
 

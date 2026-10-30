@@ -45,7 +45,7 @@ Patch rollback snapshots and session checkpoints store pre-edit file content unr
 
 Damaian classifies every command before it runs, and the classification, not the model, decides whether you are asked:
 
-- **Runs without asking:** commands Damaian recognises as read-only, such as `pwd`, `ls`, `git status` and `git log` with listed options, and simple pipelines of them filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut` or `grep`. They run in your login shell in the working folder, which is why the admitted set is a closed list of programs and options rather than a heuristic.
+- **Runs without asking:** commands Damaian recognises as read-only, such as `pwd`, `ls`, `echo`, `git status`, `git log` and the git listings (`git branch`, `git remote`, `git worktree list`, `git rev-parse`, …) with listed options; `cat`, `head`, `tail`, `wc`, `sed -n` and non-recursive `grep` reading files named on the line; and sequences of them joined by `&&`, `;` or a newline, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut` or `grep`, with output discarded only to `/dev/null`. They run in your login shell in the working folder, which is why the admitted set is a closed list of programs and options rather than a heuristic.
 - **Asks first:** everything else, including anything that writes, installs, reaches the network or uses shell control syntax. `git diff` and `git show` ask too, because they print file contents a command line cannot bound or keep restricted paths out of; the agent's `read_git_diff` tool does both. Every Docker command asks, `docker ps` included, because the daemon is privileged.
 - **Blocked:** commands matching `command_blocklist` or a destructive pattern are refused and cannot be approved from the UI.
 
@@ -59,7 +59,11 @@ resolves inside the repository and clear of `restricted_patterns`. What is
 checked is exactly what the login shell will run; anything the shell would
 rewrite after classification asks for approval. A path outside the repository,
 behind a symlink, or inside a restricted directory such as `secrets/` asks, and
-so does a restricted working directory.
+so does a restricted working directory. A file read is admitted only when it
+names its files, so each one is checked: `cat .env` asks, and so do recursive
+and globbed reads, whose files the command line does not name. A command's
+output is then capped by `max_command_output_bytes` and secret-redacted before
+the model sees it, like any other command output.
 
 Two things the boundary deliberately does not cover:
 

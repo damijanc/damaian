@@ -3716,7 +3716,9 @@ fn classification_results_are_unchanged_for_existing_policy_tests() {
         ("ls", CommandRisk::Low, false, false),
         ("git log --stat", CommandRisk::Low, false, false),
         ("git diff", CommandRisk::High, true, false),
-        ("ls | head", CommandRisk::High, true, false),
+        // Spec 70 requirement 7 admitted a bare `| head`.
+        ("ls | head", CommandRisk::Low, false, false),
+        ("ls | xargs cat", CommandRisk::High, true, false),
         ("npm test", CommandRisk::Medium, true, false),
         ("cargo test", CommandRisk::Medium, true, false),
         ("docker ps", CommandRisk::High, true, false),

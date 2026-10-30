@@ -2443,6 +2443,14 @@ without asking now ask, and each is deliberate:
   used to slip past the prefix match. `$`, `~` and unquoted globs now ask,
   because the shell would run something other than what was checked.
 
+The reverse also happened: `;`-separated sequences, `echo` headings,
+`2>/dev/null`, the git listings (`git branch -a`, `git remote -v`,
+`git worktree list`, …) and reads of named files (`cat`, `head`, `sed -n`,
+`grep` without `-r`) used to ask and now run without asking, as long as every
+piece is admitted and every file is inside the repository and not restricted.
+A sequence still asks as a whole when any one piece is not admitted, and so
+does a line that starts with `cd` and uses `;`.
+
 If a command that looks harmless asks, check it against the admitted table in
 the user guide's [Command Approval](USER_GUIDE.md#command-approval). The first
 line of the approval card names the deciding cause — for shell control and

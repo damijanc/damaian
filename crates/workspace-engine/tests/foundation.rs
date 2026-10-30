@@ -522,7 +522,13 @@ fn classifies_command_risk() {
     );
     assert_eq!(policy.classify("npm test", root).risk, CommandRisk::Medium);
     assert_eq!(policy.classify("rm -rf .", root).risk, CommandRisk::Blocked);
-    assert_eq!(policy.classify("ls | head", root).risk, CommandRisk::High);
+    // Spec 70 requirement 7 admits a bare `| head`; a filter that is not
+    // admitted still asks.
+    assert_eq!(policy.classify("ls | head", root).risk, CommandRisk::Low);
+    assert_eq!(
+        policy.classify("ls | xargs cat", root).risk,
+        CommandRisk::High
+    );
 }
 
 #[test]
@@ -2301,7 +2307,7 @@ fn chat_replays_reasoning_content_after_command_approval() {
     write_fixture(&repo, "README.md", "# Reasoning replay test\n");
     let engine = WorkspaceEngine::new(test_config(&repo));
     let mut adapter = MockModelAdapter::new_sequence(vec![
-        "DAMAIAN_COMMAND_V1\nCOMMAND: echo checking-repo\nREASON: Inspect before answering.\nEND_COMMAND\n"
+        "DAMAIAN_COMMAND_V1\nCOMMAND: printf checking-repo\nREASON: Inspect before answering.\nEND_COMMAND\n"
             .to_string(),
         "The repository looks as expected.".to_string(),
     ])
@@ -2484,7 +2490,7 @@ fn chat_replays_reasoning_content_when_a_batched_round_resumes_after_approval() 
                     id: "call_2".to_string(),
                     name: "run_command".to_string(),
                     arguments_json:
-                        "{\"command\":\"echo checking-repo\",\"reason\":\"Inspect before answering\"}"
+                        "{\"command\":\"printf checking-repo\",\"reason\":\"Inspect before answering\"}"
                             .to_string(),
                 },
             ],
@@ -4136,7 +4142,7 @@ fn chat_resume_after_command_approval_surfaces_a_patch_proposal() {
     let engine = WorkspaceEngine::new(config);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
         vec![
-            "DAMAIAN_COMMAND_V1\nCOMMAND: echo checking-repo\nREASON: Inspect before scaffolding.\nEND_COMMAND\n"
+            "DAMAIAN_COMMAND_V1\nCOMMAND: printf checking-repo\nREASON: Inspect before scaffolding.\nEND_COMMAND\n"
                 .to_string(),
             "I've prepared the scaffold for review.".to_string(),
         ],
@@ -4193,7 +4199,7 @@ fn chat_resumes_after_command_approval_and_answers_using_the_result() {
     // bucket (`requires_approval: true` regardless of config flags) while
     // still being something every test machine can actually execute.
     let mut adapter = MockModelAdapter::new_sequence(vec![
-        "DAMAIAN_COMMAND_V1\nCOMMAND: echo hello-from-sandbox\nREASON: Verify sandbox execution.\nEND_COMMAND\n"
+        "DAMAIAN_COMMAND_V1\nCOMMAND: printf hello-from-sandbox\nREASON: Verify sandbox execution.\nEND_COMMAND\n"
             .to_string(),
         "The sandbox printed the expected marker.".to_string(),
     ]);
@@ -4245,7 +4251,7 @@ fn chat_resumes_after_command_rejection_and_answers_without_it() {
     write_fixture(&repo, "README.md", "# Chat resume reject test\n");
     let engine = WorkspaceEngine::new(test_config(&repo));
     let mut adapter = MockModelAdapter::new_sequence(vec![
-        "DAMAIAN_COMMAND_V1\nCOMMAND: echo hello-from-sandbox\nREASON: Verify sandbox execution.\nEND_COMMAND\n"
+        "DAMAIAN_COMMAND_V1\nCOMMAND: printf hello-from-sandbox\nREASON: Verify sandbox execution.\nEND_COMMAND\n"
             .to_string(),
         "Understood, I'll answer without running that command.".to_string(),
     ]);

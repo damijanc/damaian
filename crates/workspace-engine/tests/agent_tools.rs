@@ -913,7 +913,17 @@ fn the_low_risk_read_only_set_is_unchanged_by_this_spec() {
     let policy = CommandPolicy::new(test_config(&repo));
     // Requirement 5 of spec 64 removed `git diff` and `git show` from the
     // read-only set; `git log` without patch output stays.
-    for command in ["pwd", "ls", "git status", "git log"] {
+    // Spec 70 added `echo`, `;` sequences and reads of named files inside
+    // the repository.
+    for command in [
+        "pwd",
+        "ls",
+        "git status",
+        "git log",
+        "echo hi; git branch -a",
+        "cat src/lib.rs",
+        "head -n 5 a",
+    ] {
         assert!(
             !policy.classify(command, &repo).requires_approval,
             "{command} must stay approval-free"
@@ -925,8 +935,8 @@ fn the_low_risk_read_only_set_is_unchanged_by_this_spec() {
         "git log -p",
         "grep -r foo .",
         "find . -name x",
-        "cat src/lib.rs",
-        "head -n 5 a",
+        "cat /etc/hosts",
+        "head -n 5 .env",
     ] {
         assert!(
             policy.classify(command, &repo).requires_approval,

@@ -127,6 +127,10 @@ narrow class of pipelines through under that precise meaning.
 
 ## 4. Non-goals
 
+[#70](70_read_only_sequences_and_file_reads.md) later admitted `;`, `/dev/null`
+redirects, `echo`, the git listings and reads of named files; recursive and
+globbed reads, `||` and other redirects remain non-goals.
+
 - Admitting file-reading commands such as `cat`, `grep -r`, `sed -n` or `find`
   without approval. They would need requirement 3 applied to every file they
   could touch, including recursive ones, which a command line does not tell you.
