@@ -538,6 +538,10 @@ events on `taskId` (context §3.5).
   on whatever repository it is given. No turn is running while it applies, so
   nothing races the worker. Continuing a turn after a patch is applied would be new turn
   semantics; if wanted, it belongs in the engine for both hosts, not here.
+  [#77](../77_continue_the_task_after_verification.md) put it in the engine,
+  and [#80](../80_worker_verifies_after_its_patch.md) has the worker run it: a
+  settled patch card sends `verify`, and a check card is answered with
+  `checks`.
 - **Provider fallback offers** (#56) end the turn the same way, with the
   worker idle. The worker holds only the configured provider's key, so the
   offer is answered through the shell's existing route with the worktree as

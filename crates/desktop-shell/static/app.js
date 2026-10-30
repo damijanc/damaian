@@ -9787,7 +9787,7 @@ async function sendWorkerComposer(override = "") {
 function workerApprovalToShow(view) {
   const approval = view.approval;
   if (!view.caughtUp || !approval?.proposal) return null;
-  if (approval.kind === "command" || approval.kind === "plan") {
+  if (approval.kind === "command" || approval.kind === "plan" || approval.kind === "checks") {
     return view.alive && view.state === "waiting_for_approval" ? approval : null;
   }
   if (approval.kind === "patch" || approval.kind === "fallback") {
@@ -9816,9 +9816,18 @@ function renderWorkerApproval(view) {
       ? createCommandApprovalPreview(proposal, worktree, { decide })
       : approval.kind === "plan"
         ? createPlanReview(proposal, worktree, { decide })
-        : approval.kind === "patch"
-          ? createPatchPreview(proposal, worktree)
-          : createFallbackOffer(proposal, worktree);
+        : approval.kind === "checks"
+          ? createCheckBatchCard(proposal, worktree, {
+              decide: (decisions) => sendWorkerChecks(view, proposal, decisions),
+            })
+          : approval.kind === "patch"
+            ? createPatchPreview(proposal, worktree, {
+                // The shell applies a worker's patch; the worker verifies it
+                // and carries on with its plan (spec 80), as a turn of the
+                // shell's own does after spec 77.
+                onResolved: () => verifyWorker(view),
+              })
+            : createFallbackOffer(proposal, worktree);
   card.dataset.workerApproval = key;
   // Beside the last answer's body, not in it: the body is re-rendered once
   // its markdown is finalized, which would take the card with it.
@@ -9826,6 +9835,28 @@ function renderWorkerApproval(view) {
   const host = answers[answers.length - 1];
   if (host) host.append(card);
   else log.append(card);
+}
+
+async function verifyWorker(view) {
+  try {
+    await api("/api/worker-control", form({ session_id: view.sessionId, command: "verify" }));
+  } catch (error) {
+    toast(error.message);
+  }
+  pollWorkerProgressNow(view);
+}
+
+async function sendWorkerChecks(view, proposal, decisions) {
+  await api(
+    "/api/worker-control",
+    form({
+      session_id: view.sessionId,
+      command: "checks",
+      proposal_id: proposal.proposalId,
+      decisions: JSON.stringify(decisions),
+    }),
+  );
+  pollWorkerProgressNow(view);
 }
 
 async function decideWorkerApproval(view, proposal, approved) {
@@ -12160,7 +12191,14 @@ function checkLabel(check) {
 // One card for every check that needs approval (spec 23 §5.3). Unchecked
 // checks are declined and reported as skipped; the batch still resolves, so
 // declining everything is a valid answer rather than a stall.
-function createCheckBatchCard(batch, batchRepo, { reattached = false, onSubmitted = null } = {}) {
+// `decide` sends the decisions somewhere else than the shell's check route: a
+// worker's card goes to its own process (spec 80), and offers no Always allow,
+// as a worker's command card offers none.
+function createCheckBatchCard(
+  batch,
+  batchRepo,
+  { reattached = false, onSubmitted = null, decide = null } = {},
+) {
   const card = document.createElement("section");
   card.className = "check-batch";
 
@@ -12207,7 +12245,7 @@ function createCheckBatchCard(batch, batchRepo, { reattached = false, onSubmitte
     row.append(run, command, risk, cause);
 
     let always = null;
-    if (check.allowAlways) {
+    if (check.allowAlways && !decide) {
       const grant = document.createElement("label");
       grant.className = "check-batch-allow";
       always = document.createElement("input");
@@ -12244,6 +12282,10 @@ function createCheckBatchCard(batch, batchRepo, { reattached = false, onSubmitte
     card.classList.add("submitted");
     try {
       if (onSubmitted) onSubmitted();
+      if (decide) {
+        await decide(decisions);
+        return;
+      }
       await runVerificationStream(
         (handlers) =>
           streamResumeChecksRequest(

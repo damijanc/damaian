@@ -354,12 +354,31 @@ fn load_worker_config(
 /// A control request, validated against proposal §5.2's table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlCommand {
-    Message { text: String },
+    Message {
+        text: String,
+    },
     Pause,
-    Resume { note: Option<String> },
-    Note { text: String },
-    Approve { proposal_id: String },
-    Reject { proposal_id: String },
+    Resume {
+        note: Option<String>,
+    },
+    Note {
+        text: String,
+    },
+    Approve {
+        proposal_id: String,
+    },
+    Reject {
+        proposal_id: String,
+    },
+    /// Runs the verification a settled patch made due, and the spec 77
+    /// continuation after it, in this process (spec 80).
+    Verify,
+    /// Answers a verification's check card: `decisions` is the same JSON list
+    /// the shell's check route takes (spec 80).
+    Checks {
+        proposal_id: String,
+        decisions: String,
+    },
     Stop,
     Shutdown,
     Status,
@@ -421,6 +440,11 @@ fn parse_command(
         },
         "reject" => ControlCommand::Reject {
             proposal_id: required(take("proposalId", MAX_PROPOSAL_ID_BYTES)?)?,
+        },
+        "verify" => ControlCommand::Verify,
+        "checks" => ControlCommand::Checks {
+            proposal_id: required(take("proposalId", MAX_PROPOSAL_ID_BYTES)?)?,
+            decisions: required(take("decisions", MAX_REQUEST_BYTES as usize)?)?,
         },
         "stop" => ControlCommand::Stop,
         "shutdown" => ControlCommand::Shutdown,
@@ -510,6 +534,9 @@ enum DecisionKind {
     /// *Continue* and `reject` means *Answer now*, both of which resume the
     /// same turn through `resume_round_budget`.
     RoundBudget,
+    /// A verification's check card (spec 80). Answered with `checks`, which
+    /// carries a decision per check; `approve` and `reject` refuse it.
+    Checks,
 }
 
 /// The turn the host holds. The cancel token and the steering belong to the
@@ -529,6 +556,13 @@ enum TurnJob {
         proposal_id: String,
         kind: DecisionKind,
         approved: bool,
+    },
+    /// The verification a settled patch made due (spec 80).
+    Verify,
+    /// A check card's decisions, resuming the verification that paused.
+    Checks {
+        proposal_id: String,
+        decisions: Vec<(String, bool)>,
     },
 }
 
@@ -620,6 +654,11 @@ impl WorkerHost {
             ControlCommand::Message { text } => (self.start(TurnJob::Message(text)), false),
             ControlCommand::Approve { proposal_id } => (self.decide(proposal_id, true), false),
             ControlCommand::Reject { proposal_id } => (self.decide(proposal_id, false), false),
+            ControlCommand::Verify => (self.start(TurnJob::Verify), false),
+            ControlCommand::Checks {
+                proposal_id,
+                decisions,
+            } => (self.decide_checks(proposal_id, &decisions), false),
             ControlCommand::Pause => (self.steer(|slot| slot.steering.pause()), false),
             ControlCommand::Resume { note } => (
                 self.steer(|slot| {
@@ -687,12 +726,39 @@ impl WorkerHost {
             }
             _ => return refusal("no approval with that id is pending"),
         };
+        if kind == DecisionKind::Checks {
+            return refusal("a check card is answered with `checks`");
+        }
         let answer = self.hand_over(
             &mut slot,
             TurnJob::Decide {
                 proposal_id,
                 kind,
                 approved,
+            },
+        );
+        if answer["ok"] == true {
+            slot.pending = None;
+        }
+        answer
+    }
+
+    /// `checks`: the pending check card's decisions, one per check.
+    fn decide_checks(&self, proposal_id: String, raw: &str) -> Value {
+        let mut slot = self.slot();
+        match &slot.pending {
+            Some((pending, DecisionKind::Checks))
+                if slot.state == WorkerState::WaitingForApproval && *pending == proposal_id => {}
+            _ => return refusal("no check card with that id is pending"),
+        }
+        let Ok(decisions) = crate::parse_check_decisions(raw) else {
+            return refusal("the decisions are not a list of checks");
+        };
+        let answer = self.hand_over(
+            &mut slot,
+            TurnJob::Checks {
+                proposal_id,
+                decisions,
             },
         );
         if answer["ok"] == true {
@@ -714,8 +780,8 @@ impl WorkerHost {
             return refusal("this worker hosts no turns");
         };
         let carried = match job {
-            TurnJob::Decide { .. } => slot.steering.drain_notes(),
-            TurnJob::Message(_) => Vec::new(),
+            TurnJob::Decide { .. } | TurnJob::Checks { .. } => slot.steering.drain_notes(),
+            TurnJob::Message(_) | TurnJob::Verify => Vec::new(),
         };
         slot.cancel = CancelToken::new();
         slot.steering = Arc::new(TurnSteering::new());
@@ -907,6 +973,26 @@ impl TurnDriver {
                 adapter.as_mut(),
                 &mut sink,
             ),
+            // `decide` refuses this before a job is made; kept total.
+            TurnJob::Decide {
+                kind: DecisionKind::Checks,
+                ..
+            } => Err(workspace_engine::ClientError::InvalidInput(
+                "a check card is answered with `checks`".to_string(),
+            )),
+            TurnJob::Verify => {
+                chat.verify_due(&repository, &self.session_id, adapter.as_mut(), &mut sink)
+            }
+            TurnJob::Checks {
+                proposal_id,
+                decisions,
+            } => chat.resume_after_check_decision(
+                &proposal_id,
+                &decisions,
+                "desktop_user",
+                adapter.as_mut(),
+                &mut sink,
+            ),
         };
         progress.borrow_mut().flush();
         result.map_err(|error| error.to_string())
@@ -1071,6 +1157,9 @@ fn pending_decision(result: &ChatTurnResult) -> Option<(String, DecisionKind)> {
     if result.task.status != TaskStatus::WaitingForApproval {
         return None;
     }
+    if let Some(batch) = &result.check_batch {
+        return Some((batch.id.clone(), DecisionKind::Checks));
+    }
     if let Some(plan) = &result.plan_proposal {
         return Some((plan.id.clone(), DecisionKind::Plan));
     }
@@ -1104,6 +1193,11 @@ fn approval_payload(result: &ChatTurnResult) -> Option<Value> {
         (
             "round_budget",
             crate::round_budget_proposal_json(result.round_budget_proposal.as_ref()),
+        )
+    } else if result.check_batch.is_some() {
+        (
+            "checks",
+            crate::check_batch_json(result.check_batch.as_ref()),
         )
     } else {
         return None;
@@ -1373,7 +1467,20 @@ mod tests {
                 text: "go".to_string()
             })
         );
+        assert_eq!(
+            with_token(r#""command":"verify""#),
+            ParsedRequest::Command(ControlCommand::Verify)
+        );
+        assert_eq!(
+            with_token(r#""command":"checks","proposalId":"b1","decisions":"[]""#),
+            ParsedRequest::Command(ControlCommand::Checks {
+                proposal_id: "b1".to_string(),
+                decisions: "[]".to_string(),
+            })
+        );
         for invalid in [
+            r#""command":"verify","text":"x""#,
+            r#""command":"checks","proposalId":"b1""#,
             r#""command":"status","text":"x""#,
             r#""command":"note""#,
             r#""command":"note","text":7"#,

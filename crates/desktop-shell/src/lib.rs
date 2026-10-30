@@ -12934,6 +12934,90 @@ mod tests {
             assert_eq!(settle(&host)["state"], "idle");
         }
 
+        /// Spec 80: after the shell applies a worker's patch, `verify` runs the
+        /// verification in the worker itself, and the patch card's approval is
+        /// superseded by the new job.
+        #[test]
+        fn verify_runs_the_due_verification_in_the_worker() {
+            let repo = fixture("vrfy");
+            let (host, session) = hosted(
+                &repo,
+                calls_then(
+                    "propose_patch",
+                    r#"{"summary":"Add a file","files":[{"path":"new.txt","content":"hello\n"}]}"#,
+                    "Proposed.",
+                ),
+            );
+            assert_eq!(
+                send(&host, ControlCommand::Verify)["ok"],
+                true,
+                "an idle worker accepts verify"
+            );
+            assert_eq!(settle(&host)["state"], "idle");
+            assert!(
+                payloads(&progress(&session), "status")
+                    .iter()
+                    .any(|status| status["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("No verification is due"))),
+                "with nothing applied there is nothing to verify"
+            );
+
+            assert_eq!(send(&host, message("Add a file."))["ok"], true);
+            assert_eq!(settle(&host)["state"], "idle");
+            let patch_id = payloads(&progress(&session), "approval")[0]["proposal"]["patchId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let (port, token) = serve_for_test();
+            let response = post_form_for_test(
+                port,
+                &token,
+                "/api/apply-patch",
+                &format!(
+                    "repo={}&patch_id={patch_id}",
+                    percent_encode_for_test(&repo.to_string_lossy())
+                ),
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+            assert_eq!(send(&host, ControlCommand::Verify)["ok"], true);
+            assert_eq!(settle(&host)["state"], "idle");
+            let events = store().read_verification_events(&session, &[]).unwrap();
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    workspace_engine::VerificationEvent::Finished { .. }
+                )),
+                "the worker ran the verification: {events:?}"
+            );
+            let statuses = payloads(&progress(&session), "status");
+            assert_eq!(
+                statuses
+                    .iter()
+                    .filter(|status| status["state"] == "running")
+                    .count(),
+                3,
+                "each job, verify included, is a new running job: {statuses:?}"
+            );
+        }
+
+        #[test]
+        fn a_check_card_is_answered_with_checks_not_approve() {
+            let (host, _session) = hosted(&fixture("chks"), calls_then("x", "{}", "Done."));
+            assert_eq!(
+                send(
+                    &host,
+                    ControlCommand::Checks {
+                        proposal_id: "checkbatch_none".to_string(),
+                        decisions: "[]".to_string(),
+                    }
+                )["ok"],
+                false,
+                "no check card is pending"
+            );
+        }
+
         /// `pause` holds the turn at the next round boundary, a note queued
         /// there reaches the conversation, and `resume` continues the turn.
         #[test]

@@ -901,7 +901,11 @@ fn control_route(
         "message" | "note" => forward("text", "text", true)?,
         "resume" => forward("note", "note", false)?,
         "approve" | "reject" => forward("proposal_id", "proposalId", true)?,
-        "pause" | "status" => {}
+        "checks" => {
+            forward("proposal_id", "proposalId", true)?;
+            forward("decisions", "decisions", true)?;
+        }
+        "pause" | "status" | "verify" => {}
         "stop" => {
             let answer = supervisor
                 .stop(&session)
