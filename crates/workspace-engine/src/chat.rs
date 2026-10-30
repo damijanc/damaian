@@ -6314,6 +6314,7 @@ impl ChatOrchestrator {
                     ],
                 )?;
             }
+            model_run.record_quirks(&self.audit_log, &session.id, &task.id)?;
 
             let redacted = self.scanner.redact(&model_run.content).text;
 
@@ -14899,6 +14900,50 @@ done
             require_approval,
         });
         (WorkspaceEngine::new(config), marker)
+    }
+
+    /// Spec 18 §7, observation #43: the recovery is audited by the turn loop
+    /// for the round it happened in, not by whoever reads the final run. Here
+    /// the recovered call is round one and the turn ends on a plain answer, so
+    /// an audit taken from the returned run alone would miss it — which is
+    /// what the CLI-only version did, and the desktop shell had no audit at all.
+    #[test]
+    fn a_recovered_textual_call_is_audited_for_its_own_round() {
+        let repo = temp_repo("textual-call-audit");
+        let engine = engine_with(&repo);
+        let mut adapter = MockModelAdapter::new_sequence(vec![
+            concat!(
+                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>read_file\n",
+                "```json\n",
+                r#"{"path":"README.md"}"#,
+                "\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            )
+            .to_string(),
+            "The README is a heading.".to_string(),
+        ]);
+        let mut on_token = |_token: &str| {};
+        let result = engine
+            .chat_orchestrator
+            .ask(
+                &repo,
+                "What is in the README?",
+                &[],
+                &mut adapter,
+                &mut on_token,
+            )
+            .unwrap();
+
+        let audit = fs::read_to_string(repo.join(".damaian/audit/events.jsonl")).unwrap();
+        fs::remove_dir_all(&repo).unwrap();
+        assert!(!result.model_run.tool_call_markup_recovered);
+        assert!(audit.contains("\"eventType\":\"file_read\""), "{audit}");
+        assert_eq!(
+            audit
+                .matches("\"eventType\":\"model_tool_call_markup_recovered\"")
+                .count(),
+            1,
+            "{audit}"
+        );
     }
 
     /// A session exists before its mode can be set, so this runs a warm-up

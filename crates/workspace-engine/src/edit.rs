@@ -619,6 +619,7 @@ impl EditOrchestrator {
                 Some("retried_attempt"),
             )?;
         }
+        run.record_quirks(&self.audit_log, &session.id, &task.id)?;
         let raw_output = self.scanner.redact(&run.content).text;
         let generated = parse_generated_edit(&raw_output)
             .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;

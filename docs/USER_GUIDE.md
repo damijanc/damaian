@@ -215,6 +215,8 @@ cargo run -p damaian-cli -- config-set user model_provider deepseek
 
 Naming a built-in provider fills in most of the setup. `model_provider=deepseek`, `model_provider=openrouter`, or `model_provider=openai` sets the base URL, the default model, and the key variable for that provider; set the other keys only to override one of those. [Native tool-calling](#native-tool-calling) is on by default.
 
+An explicit `model_base_url`, `model_api_key_env` or `model_name` line keeps winning after a provider switch, because those keys are applied after the provider's defaults. `config-set user model_provider <id>` therefore prints a warning for each one that differs from the new provider's default, naming the exact command that replaces it. Your lines are left in place, so apply the commands it prints (or edit the file) to finish the switch.
+
 Example DeepSeek configuration:
 
 ```text
@@ -224,7 +226,7 @@ model_base_url=https://api.deepseek.com
 model_api_key_env=keychain:model-api-key
 ```
 
-The same pattern applies to OpenAI, OpenRouter, or any OpenAI-compatible provider. OpenRouter defaults to `https://openrouter.ai/api/v1` with `anthropic/claude-sonnet-5.5` and a starter list of tool-capable models from Anthropic, OpenAI, Google, DeepSeek, xAI, Moonshot, Z.ai and Qwen. Any other model OpenRouter serves can be added under **Models** (one id per line) or selected with `model_name`.
+The same pattern applies to OpenAI, OpenRouter, or any OpenAI-compatible provider. OpenRouter defaults to `https://openrouter.ai/api/v1` with `anthropic/claude-sonnet-5.5` and a starter list of tool-capable models from Anthropic, OpenAI, Google, DeepSeek, xAI, Moonshot, Z.ai and Qwen. Any other model OpenRouter serves can be added under **Models** (one id per line) or selected with `model_name`. Damaian sends OpenRouter no output ceiling by default, so each routed model uses its own; set `model_provider.openrouter.max_output_tokens` if you want one.
 
 If an older configuration still names `deepseek-chat` or `deepseek-reasoner`, update it. Those were compatibility aliases that DeepSeek retired on 24 July 2026; the current models are `deepseek-v4-flash` and `deepseek-v4-pro`.
 

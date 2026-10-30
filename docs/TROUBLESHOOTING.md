@@ -857,7 +857,7 @@ Event types grouped by what they tell you:
 
 | Area | Event types |
 |------|-------------|
-| Model turn | `context_assembled`, `model_request_prepared`, `model_response_completed`, `edit_model_request_prepared`, `chat_turn_cancelled`, `model_usage_reporting_unsupported`, `turn_continued` |
+| Model turn | `context_assembled`, `model_request_prepared`, `model_response_completed`, `edit_model_request_prepared`, `chat_turn_cancelled`, `model_usage_reporting_unsupported`, `model_tool_call_markup_recovered`, `model_upstream_provider`, `turn_continued` |
 | Round budget | `round_budget_paused`, `round_budget_decision`, `turn_budget_extended` |
 | Plan review | `plan_review_decision` |
 | Patches | `patch_proposed`, `edit_patch_ready_for_approval`, `edit_failed`, `patch_applied`, `patch_hunks_rejected`, `patch_rollback_started`, `patch_rolled_back`, `stored_patch_applied`, `stored_patch_files_rejected`, `stored_patch_rejected`, `stored_patch_rolled_back` |
@@ -883,6 +883,15 @@ Useful reads:
   `complete_with_command`, `command_approval_required`, and
   `patch_proposal_ready`. A turn that "did nothing" usually ended `complete`
   when you expected `patch_proposal_ready`.
+- `model_tool_call_markup_recovered` means a provider wrote a complete tool call
+  as DeepSeek text (`function<｜tool▁sep｜>name` plus a fenced JSON object) rather
+  than into `tool_calls`, and Damaian recovered it. `model_upstream_provider`
+  names the route OpenRouter used (for example `Darkbloom`), which is how a
+  route-specific quirk is told apart from a prompt or model one. The engine
+  writes one of the two for each model call that has something to say — every
+  round of a chat turn and the edit path's call — so the CLI and the desktop
+  app log them alike; a recovered call carries `upstreamProvider` on its own
+  event instead of a separate `model_upstream_provider`.
 - `command_proposed` carries `risk` and `requiresApproval` — check here before
   assuming the command policy is wrong.
 - `command_proposal_stored` carries `causes`, the approval reasons as variant

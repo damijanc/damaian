@@ -418,7 +418,8 @@ pub fn live_config(data_dir: &Path, provider: &str, model: &str) -> Config {
         supports_native_tools: true,
         // Left unset so the built-in per-model ceiling applies where one
         // exists. Only DeepSeek's models have one: an OpenRouter run sends no
-        // `max_tokens` and budgets the default 16,000-token context.
+        // `max_tokens`, deliberately (spec 18 §7, observation #44), and
+        // budgets the default 16,000-token context.
         max_output_tokens: None,
         context_token_budget: None,
         provider_reports_usage: true,

@@ -515,3 +515,13 @@ two sentences, so it was done here rather than left to rot.
 `AGENTS.md`, `docs/USER_GUIDE.md`, and `docs/TROUBLESHOOTING.md` are updated,
 including a per-key table of what repository scope can and cannot do and the new
 `damaian config-review` / `damaian config-allowlist-keep` commands.
+
+**Provider-switch warning, 2026-10-25 (observation #45).** `damaian config-set
+user model_provider <id>` now warns when an explicit `model_base_url`,
+`model_api_key_env` or `model_name` in an effective scope will keep overriding
+the new provider's defaults. Precedence is deliberately unchanged: the warning
+names the value, the provider default, and the exact `config-set` command that
+replaces it, and never deletes the user's line. It uses the same
+warning-after-write shape as the repository-scope refusal above. Tests live in
+`crates/damaian-cli/tests/provider_switch_warning.rs`; each runs with a
+throwaway `DAMAIAN_DATA_DIR`.

@@ -335,6 +335,15 @@ upstream reported 3,264–7,168 of about 7,265 input tokens cached on a turn's
 second call, while GPT-4.1 and Claude reported zero, which is recorded as a
 measured zero rather than as missing.
 
+**The route is recorded too, since it changes the bill.** OpenRouter's
+top-level `provider` field (observed as `Darkbloom` on every chunk of a
+2026-10-25 reasoning call) is now carried on `ModelRun::upstream_provider`;
+the engine audits it per model call as `model_upstream_provider` (CLI and
+desktop shell alike), and includes it on `model_tool_call_markup_recovered`
+when that fallback fires. A later cost that
+does not match the catalogue rate can therefore be explained by the route
+instead of guessed at.
+
 **`ModelRun::reported_cost` now has a live producer.** It had none after the
 DeepSeek run. OpenRouter's `usage.cost` arrived on every call and is stored as
 `reportedCost`; across sixteen engine-driven calls it matched the catalogue

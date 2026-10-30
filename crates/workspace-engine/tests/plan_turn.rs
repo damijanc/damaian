@@ -1794,6 +1794,8 @@ impl ModelAdapter for PlansReadsThenFails {
             tool_calls,
             truncated: false,
             reasoning_content: None,
+            tool_call_markup_recovered: false,
+            upstream_provider: None,
             usage: TokenUsage::estimated(10, 5),
             reported_cost: None,
             usage_reporting_unsupported: false,

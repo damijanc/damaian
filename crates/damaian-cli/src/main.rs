@@ -1119,6 +1119,9 @@ fn set_config_value(args: &[String]) -> workspace_engine::Result<()> {
             overlay.set(key, value)?;
             overlay.save(&path)?;
             println!("wrote {}", path.to_string_lossy());
+            if key == "model_provider" {
+                print_provider_switch_warnings(None, value)?;
+            }
         }
         "repo" => {
             let repo = require_arg(args, 2, "<repo>")?;
@@ -1138,6 +1141,9 @@ fn set_config_value(args: &[String]) -> workspace_engine::Result<()> {
                     rejected.class.as_str()
                 );
             }
+            if key == "model_provider" {
+                print_provider_switch_warnings(Some(repo), value)?;
+            }
         }
         "admin" => {
             let key = require_arg(args, 2, "<key>")?;
@@ -1148,12 +1154,96 @@ fn set_config_value(args: &[String]) -> workspace_engine::Result<()> {
             overlay.set(key, value)?;
             overlay.save(&path)?;
             println!("wrote {}", path.to_string_lossy());
+            if key == "model_provider" {
+                print_provider_switch_warnings(None, value)?;
+            }
         }
         _ => {
             return Err(workspace_engine::ClientError::InvalidInput(
                 "config-set scope must be user, repo, or admin".to_string(),
             ));
         }
+    }
+    Ok(())
+}
+
+/// The explicit globals applied after `model_provider`, in the order
+/// `config.rs` applies them. None is cleared by a provider switch, so leaving
+/// one behind points the new provider at the old endpoint, key variable, or
+/// model. Spec 18 §7, observation #45.
+const PROVIDER_OVERRIDE_KEYS: [&str; 3] = ["model_base_url", "model_api_key_env", "model_name"];
+
+fn explicit_provider_override<'a>(overlay: &'a ConfigOverlay, key: &str) -> Option<&'a str> {
+    match key {
+        "model_base_url" => overlay.model_base_url.as_deref(),
+        "model_api_key_env" => overlay.model_api_key_env.as_deref(),
+        "model_name" => overlay.model_name.as_deref(),
+        _ => None,
+    }
+}
+
+/// Warns when a provider switch leaves explicit settings that will keep
+/// overriding the new provider's defaults. The user's lines are never deleted:
+/// each warning names the setting, what it currently says, the provider's
+/// default, and the exact command that replaces it.
+fn print_provider_switch_warnings(
+    repo: Option<&str>,
+    provider: &str,
+) -> workspace_engine::Result<()> {
+    let config = Config::load_for_repository(None)?;
+    // The defaults the next load would fill in. Clearing the key reference
+    // first stops `apply_model_provider_defaults` from deliberately preserving
+    // a keychain reference carried over from the old provider.
+    let mut defaults = config.clone();
+    defaults.model_provider = provider.to_string();
+    defaults.model_api_key_env = String::new();
+    defaults.apply_model_provider_defaults();
+
+    let admin = ConfigOverlay::load_or_default(config.admin_config_path())?;
+    let user = ConfigOverlay::load_or_default(config.user_config_path())?;
+    let repo_overlay = match repo {
+        Some(repo) => Some(ConfigOverlay::load_or_default(
+            Config::repository_config_path(repo),
+        )?),
+        None => None,
+    };
+
+    for key in PROVIDER_OVERRIDE_KEYS {
+        // Admin wins over repository, which wins over user; warning about a
+        // lower layer would name a command that changes nothing.
+        let found = explicit_provider_override(&admin, key)
+            .map(|value| (value, "admin"))
+            .or_else(|| {
+                repo_overlay
+                    .as_ref()
+                    .and_then(|overlay| explicit_provider_override(overlay, key))
+                    .map(|value| (value, "repo"))
+            })
+            .or_else(|| explicit_provider_override(&user, key).map(|value| (value, "user")));
+        let Some((current, owner)) = found else {
+            continue;
+        };
+        let default = match key {
+            "model_base_url" => defaults.model_base_url.as_str(),
+            "model_api_key_env" => defaults.model_api_key_env.as_str(),
+            "model_name" => defaults.model_name.as_str(),
+            _ => continue,
+        };
+        if current == default {
+            continue;
+        }
+        let command = match owner {
+            "admin" => format!("damaian config-set admin {key} {default}"),
+            "repo" => format!(
+                "damaian config-set repo {} {key} {default}",
+                repo.unwrap_or("<repo>")
+            ),
+            _ => format!("damaian config-set user {key} {default}"),
+        };
+        eprintln!(
+            "warning: {key} is set explicitly in {owner} config ({current}) and overrides \
+             {provider}'s default ({default}).\n  To use the provider default: {command}"
+        );
     }
     Ok(())
 }

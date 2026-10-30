@@ -486,26 +486,68 @@ defined as keeping a scenario's assertions; a run whose answer was raw tool-call
 markup would have passed it. It now runs through `run_scenarios`, as the binary
 does, and fails on any failed assertion or when none was evaluated.
 
-**Still open, found by the same run:**
+**Fixed after the run (2026-10-25):**
 
-- **`deepseek/deepseek-chat` sometimes writes its tool call as text.** In two of
-  five task runs the model put a complete, valid `propose_patch` call into the
-  message content in DeepSeek's own separator syntax rather than into
-  `tool_calls`. Nothing recognised it, so the turn ended `complete` with no patch
+- **`deepseek/deepseek-chat` sometimes writes its tool call as text (observation
+  #43).** In two of five task runs the model put a complete, valid
+  `propose_patch` call into the message content in DeepSeek's own separator
+  syntax rather than into `tool_calls`. Nothing recognised it, so the turn ended `complete` with no patch
   and the markup stored as the answer. Both failures used a prompt that asked
-  for "a patch" without naming the tool; runs that named it succeeded. Damaian
-  does not record which upstream provider OpenRouter routed a request to, so
-  this cannot yet be tied to a route rather than to the prompt.
-- **No output ceiling is sent to OpenRouter.** Its built-in entry and both
-  per-model tables carry nothing for it, so requests go without `max_tokens`
-  and the context budget falls back to 16,000 tokens for models that accept far
-  more. The `max_output_tokens: None` comment in `live_config` ("the built-in
-  per-model ceiling still applies") holds only for DeepSeek. No truncation was
-  seen; the largest output was 260 tokens.
-- **OpenRouter's reasoning fields are not read.** The adapter replays only
-  DeepSeek's `reasoning_content`. No response in this run carried OpenRouter's
-  `reasoning` or `reasoning_details`, so the gap is unexercised rather than
-  observed.
+  for "a patch" without naming the tool; runs that named it succeeded.
+  `model.rs` now recovers the exact `function<｜tool▁sep｜>name` plus fenced JSON
+  object shape when no native call is present, and only when the whole content
+  is that markup; a partial match stays plain text. The recovered call goes
+  through the existing dispatch, approval and patch-review path unchanged, and
+  the run records `tool_call_markup_recovered`. The adapter also records
+  OpenRouter's top-level `provider` field as `upstream_provider`, so a later
+  occurrence can be tied to a route. Both are audited by the engine for every
+  model call, in the chat loop and on the edit path, so the CLI and the desktop
+  shell record them alike: `model_tool_call_markup_recovered` (carrying
+  `upstreamProvider`) for a recovered call, otherwise `model_upstream_provider`
+  when the provider named a route. Auditing per call rather than from the
+  turn's final run matters: a recovered `read_file` in round one is followed by
+  a plain answer, and the final run no longer carries the flag.
+- **The CLI's provider switch left the old settings in force (observation
+  #45).** `damaian config-set user model_provider <id>` kept explicit
+  `model_base_url`,
+  `model_api_key_env` and `model_name` lines, so the file named OpenRouter
+  while the process still used DeepSeek's endpoint, key variable and model.
+  The command now warns about each explicit setting that differs from the new
+  provider's default and prints the exact `config-set` command that replaces
+  it, without deleting the user's lines. The desktop app was never affected:
+  its form re-applies provider defaults per request.
+- **OpenRouter's reasoning fields are not read (observation #47).** The
+  adapter replays only DeepSeek's `reasoning_content`. A live streaming request
+  to `openai/gpt-oss-20b` on 2026-10-25 showed OpenRouter sending the reasoning
+  twice per chunk — as `reasoning` and as a `reasoning_details` entry of type
+  `reasoning.text` — before a `read_file` tool call. `extract_reasoning_content`
+  now reads `reasoning` (and `reasoning_details` when `reasoning` is absent),
+  preferring one source per chunk so the duplicated pair is not concatenated
+  twice, and a tool-call turn replays it as before.
+
+**Decided, found by the same run:**
+
+- **No built-in output ceiling for OpenRouter (observation #44).** Its built-in
+  entry and both per-model tables carry nothing for it, so requests go without
+  `max_tokens`, and this is now deliberate. OpenRouter's parameter reference
+  (read 2026-10-30) says an absent sampling parameter is omitted upstream so the
+  serving provider applies its own default, and that the maximum is the context
+  length minus the prompt. One provider-wide number would be wrong across the
+  routed models in one direction or the other: too high is an error for a
+  small-window model, too low truncates a reasoning model, whose limit on most
+  providers covers reasoning and visible output together and can end `length`
+  with empty content. A per-model table would have to track ten routed models
+  whose limits change upstream. The built-in OpenAI entry sends none for the
+  same reason. DeepSeek is the exception because its API default is lower than
+  what the models allow. No truncation was seen; the largest output was 260
+  tokens. A user who wants a ceiling sets
+  `model_provider.openrouter.max_output_tokens`, which the provider editor shows
+  (spec 71). The context budget likewise stays at the 16,000-token default:
+  context is re-sent and re-billed every round, and spec 71's per-provider
+  override raises it. The `max_output_tokens: None` comment in `live_config`
+  holds only for providers that have a built-in ceiling.
+
+Nothing from the 2026-10-25 run remains open.
 
 ### What the review gate caught
 

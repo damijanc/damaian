@@ -1,3 +1,4 @@
+use crate::audit::AuditLog;
 use crate::audit::escape_json as audit_escape_json;
 use crate::cancel::CancelToken;
 use crate::error::{ClientError, ProviderRefusal, Result};
@@ -297,7 +298,26 @@ pub struct ModelRun {
     /// Hidden thinking-mode reasoning, when the provider returned any. Not for
     /// display: its only use is being replayed on the assistant message that
     /// carries [`Self::tool_calls`] — see [`ModelMessage::reasoning_content`].
+    ///
+    /// Filled from DeepSeek's `reasoning_content` and from OpenRouter's
+    /// `reasoning` / `reasoning_details`, which is the same reasoning under a
+    /// different name (spec 18 §7, observation #47).
     pub reasoning_content: Option<String>,
+    /// The response carried a complete tool call in DeepSeek's textual
+    /// separator syntax instead of in `tool_calls`, and
+    /// [`recover_textual_tool_calls`] turned it back into
+    /// [`Self::tool_calls`].
+    ///
+    /// A provider quirk recorded on the run, the same way
+    /// [`Self::usage_reporting_unsupported`] is: the adapter has no audit log
+    /// of its own, so the orchestrator that owns the turn is where this becomes
+    /// visible in the session or audit trail. Spec 03 §7.
+    pub tool_call_markup_recovered: bool,
+    /// The upstream provider the router used, when the response names one.
+    /// OpenRouter puts a `provider` field on every chunk (`Darkbloom`, say),
+    /// which is how a route-specific behaviour can be told apart from a model
+    /// or prompt one. `None` when the provider did not say.
+    pub upstream_provider: Option<String>,
     /// What this call cost in tokens. Always populated: measured when the
     /// provider reported it, estimated when it did not. Spec 19 §5.1.
     pub usage: TokenUsage,
@@ -335,10 +355,52 @@ impl ModelRun {
             tool_calls: Vec::new(),
             truncated: false,
             reasoning_content: None,
+            tool_call_markup_recovered: false,
+            upstream_provider: None,
             usage: TokenUsage::measured_zero(),
             reported_cost: None,
             usage_reporting_unsupported: false,
         }
+    }
+
+    /// Makes this call's provider quirks visible in the audit log. The adapter
+    /// has no audit log of its own, so the orchestrator that owns the turn
+    /// calls this once per model call — the chat loop for every round, the
+    /// edit path for its one call — which covers the CLI and the desktop shell
+    /// alike.
+    ///
+    /// `tool_call_markup_recovered` is spec 18 §7 / observation #43;
+    /// `upstream_provider` is the route OpenRouter actually used, which is what
+    /// tells a route-specific behaviour apart from a prompt or model one. A
+    /// recovered call carries the route on its own event, so the plain
+    /// `model_upstream_provider` event is skipped for that call.
+    pub(crate) fn record_quirks(
+        &self,
+        audit_log: &AuditLog,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<()> {
+        let upstream = self.upstream_provider.clone().unwrap_or_default();
+        let event = if self.tool_call_markup_recovered {
+            "model_tool_call_markup_recovered"
+        } else if !upstream.is_empty() {
+            "model_upstream_provider"
+        } else {
+            return Ok(());
+        };
+        audit_log.record(
+            event,
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("taskId", task_id.to_string()),
+                ("runId", self.run_id.clone()),
+                ("provider", self.provider.clone()),
+                ("model", self.model.clone()),
+                ("upstreamProvider", upstream),
+            ],
+        )?;
+        Ok(())
     }
 }
 
@@ -447,7 +509,7 @@ impl ModelAdapter for MockModelAdapter {
             .or_else(|| self.responses.last())
             .cloned()
             .unwrap_or_default();
-        let tool_calls = self
+        let mut tool_calls = self
             .tool_calls
             .get(index)
             .or_else(|| self.tool_calls.last())
@@ -456,13 +518,38 @@ impl ModelAdapter for MockModelAdapter {
         if self.next_response + 1 < self.responses.len() {
             self.next_response += 1;
         }
-        for chunk in response.as_bytes().chunks(24) {
+        // Chunk by characters, not bytes: a byte slice can split a multi-byte
+        // character, and `from_utf8_lossy` would then replace it — enough to
+        // corrupt a scripted response that carries DeepSeek's `｜`/`▁` markup.
+        let mut token = String::new();
+        let mut characters = 0;
+        for character in response.chars() {
             if cancel.is_cancelled() {
                 break;
             }
-            let token = String::from_utf8_lossy(chunk);
+            token.push(character);
+            characters += 1;
+            if characters == 24 {
+                content.push_str(&token);
+                on_token(&token);
+                token.clear();
+                characters = 0;
+            }
+        }
+        if !token.is_empty() {
             content.push_str(&token);
             on_token(&token);
+        }
+        // A scripted response carrying DeepSeek's textual tool-call markup is
+        // recovered exactly as a live one is, so `DAMAIAN_MOCK_MODEL_RESPONSE`
+        // can exercise the fallback end to end. Native calls, when scripted,
+        // always win.
+        let mut tool_call_markup_recovered = false;
+        if tool_calls.is_empty()
+            && let Some(recovered) = recover_textual_tool_calls(&content)
+        {
+            tool_calls = recovered;
+            tool_call_markup_recovered = true;
         }
         // Before the struct literal moves `content` out of scope. The mock is
         // not a provider and reports no usage, so its figure is an estimate
@@ -485,6 +572,8 @@ impl ModelAdapter for MockModelAdapter {
             tool_calls,
             truncated: self.truncated.get(index).copied().unwrap_or(false),
             reasoning_content: self.reasoning_content.get(index).cloned().flatten(),
+            tool_call_markup_recovered,
+            upstream_provider: None,
             usage,
             reported_cost: None,
             usage_reporting_unsupported: false,
@@ -1296,7 +1385,16 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             break (raw, content, total_retries, body);
         };
 
-        let tool_calls = extract_tool_calls(&raw);
+        let mut tool_calls = extract_tool_calls(&raw);
+        // A native `tool_calls` array always wins: the textual fallback exists
+        // only for a response that carried the whole call in `content`.
+        let mut tool_call_markup_recovered = false;
+        if tool_calls.is_empty()
+            && let Some(recovered) = recover_textual_tool_calls(&content)
+        {
+            tool_calls = recovered;
+            tool_call_markup_recovered = true;
+        }
         if content.is_empty() && tool_calls.is_empty() && !cancel.is_cancelled() {
             return Err(ClientError::Io(
                 "Model provider returned no assistant content".to_string(),
@@ -1335,6 +1433,8 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             tool_calls,
             truncated: response_was_truncated(&raw),
             reasoning_content: extract_reasoning_content(&raw),
+            tool_call_markup_recovered,
+            upstream_provider: extract_upstream_provider(&raw),
             usage,
             reported_cost: reported.and_then(|reported| reported.cost),
             usage_reporting_unsupported,
@@ -1713,23 +1813,161 @@ fn extract_tool_calls(raw: &str) -> Vec<ToolCall> {
     calls
 }
 
+/// DeepSeek's textual tool-call protocol puts the literal word `function`, this
+/// separator, and the tool name into the message content instead of using the
+/// native `tool_calls` array. Spec 18 §7 caught `deepseek/deepseek-chat`
+/// through OpenRouter doing exactly that for a complete `propose_patch` call,
+/// which used to end the turn as a plain answer.
+const TEXTUAL_TOOL_CALL_SEPARATOR: &str = "function<｜tool▁sep｜>";
+
+/// Whether the text between and around recovered calls is made only of
+/// DeepSeek's special-token markers (`<｜tool▁calls▁begin｜>`, and so on) and
+/// whitespace. Prose, an explanation, or a truncated token makes the response
+/// something other than the markup, which is not treated as a call.
+fn is_textual_tool_call_filler(text: &str) -> bool {
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        let Some(inner) = rest.strip_prefix("<｜") else {
+            return false;
+        };
+        let Some(end) = inner.find("｜>") else {
+            return false;
+        };
+        if end == 0 {
+            return false;
+        }
+        rest = inner[end + "｜>".len()..].trim();
+    }
+    true
+}
+
+fn is_tool_name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+}
+
+/// One fenced JSON object, which is how DeepSeek wraps a textual call's
+/// arguments. The opening fence's info string must be empty or `json`, and the
+/// body must parse as a JSON object. Successive `\n``` candidates are tried, so
+/// a patch whose own file contents contain a fence does not end the block
+/// early: only the fence that leaves a parseable object counts.
+fn take_fenced_json_object(text: &str) -> Option<(String, &str)> {
+    let mut search = 0;
+    while let Some(offset) = text[search..].find("\n```") {
+        let fence_at = search + offset;
+        let body = text[..fence_at].trim();
+        let after_newline = &text[fence_at + 1..];
+        let line_end = after_newline.find('\n').unwrap_or(after_newline.len());
+        let after_fence = &after_newline[3..line_end];
+        // DeepSeek may put its end markers on the closing-fence line, so the
+        // line ends with control tokens rather than the fence alone.
+        if is_textual_tool_call_filler(after_fence)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(body)
+            && value.is_object()
+        {
+            return Some((body.to_string(), &after_newline[line_end..]));
+        }
+        search = fence_at + 1;
+    }
+    None
+}
+
+/// Recovers tool calls a model wrote as text in DeepSeek's separator syntax.
+///
+/// Returns `None` unless **every** non-whitespace, non-control-token byte of
+/// the content belongs to a complete `function<｜tool▁sep｜>name` plus a fenced
+/// JSON object. That strictness is deliberate: a partial or embedded example is
+/// not a call, and guessing would turn ordinary prose about tool calls into an
+/// action. The generated ids stand in for the ids a native call would carry, so
+/// the existing dispatch and tool-result replay work unchanged.
+fn recover_textual_tool_calls(content: &str) -> Option<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+    let mut rest = content;
+    loop {
+        let Some(start) = rest.find(TEXTUAL_TOOL_CALL_SEPARATOR) else {
+            if is_textual_tool_call_filler(rest) && !calls.is_empty() {
+                return Some(calls);
+            }
+            return None;
+        };
+        if !is_textual_tool_call_filler(&rest[..start]) {
+            return None;
+        }
+        let after = &rest[start + TEXTUAL_TOOL_CALL_SEPARATOR.len()..];
+        let name_len = after
+            .find(|character: char| !is_tool_name_char(character))
+            .unwrap_or(after.len());
+        if name_len == 0 {
+            return None;
+        }
+        let name = &after[..name_len];
+        let after_name = after[name_len..].trim_start();
+        if !after_name.starts_with("```") {
+            return None;
+        }
+        let line_end = after_name.find('\n')?;
+        let info = after_name[3..line_end].trim();
+        if !info.is_empty() && !info.eq_ignore_ascii_case("json") {
+            return None;
+        }
+        let (arguments_json, remainder) = take_fenced_json_object(&after_name[line_end + 1..])?;
+        calls.push(ToolCall {
+            id: create_id("call"),
+            name: name.to_string(),
+            arguments_json,
+        });
+        rest = remainder;
+    }
+}
+
 /// The thinking-mode reasoning a response carried, or `None` if the model
 /// didn't think. Handles both a non-streaming object (`choices[].message`) and
 /// an SSE stream, where reasoning arrives fragmented across `delta` chunks just
 /// like `content` and has to be reassembled in arrival order.
 ///
+/// DeepSeek names it `reasoning_content`; OpenRouter also sends the same text as
+/// `reasoning` and, in parallel, as `reasoning_details` entries. Exactly one
+/// source is read per chunk, in that order, so the duplicated OpenRouter pair
+/// is not concatenated twice. Spec 18 §7, observation #47.
+///
 /// This exists purely so the reasoning can be handed back on the next request:
 /// DeepSeek rejects a follow-up whose assistant tool-call message is missing
 /// it. It is never shown to the user.
 fn extract_reasoning_content(raw: &str) -> Option<String> {
-    fn chunk_reasoning(value: &serde_json::Value) -> Option<&str> {
+    fn details_text(details: &serde_json::Value) -> Option<String> {
+        let mut text = String::new();
+        for detail in details.as_array()? {
+            let kind = detail.get("type").and_then(|value| value.as_str());
+            if !matches!(kind, Some("reasoning.text" | "reasoning.summary")) {
+                continue;
+            }
+            if let Some(fragment) = detail
+                .get("text")
+                .or_else(|| detail.get("summary"))
+                .and_then(|value| value.as_str())
+            {
+                text.push_str(fragment);
+            }
+        }
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn chunk_reasoning(value: &serde_json::Value) -> Option<String> {
         value.get("choices")?.as_array()?.iter().find_map(|choice| {
             // A stream carries `delta`, a whole response `message`.
-            choice
-                .get("delta")
-                .or_else(|| choice.get("message"))?
-                .get("reasoning_content")?
-                .as_str()
+            let source = choice.get("delta").or_else(|| choice.get("message"))?;
+            source
+                .get("reasoning_content")
+                .and_then(|value| value.as_str())
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    source
+                        .get("reasoning")
+                        .and_then(|value| value.as_str())
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string)
+                })
+                .or_else(|| source.get("reasoning_details").and_then(details_text))
         })
     }
 
@@ -1746,16 +1984,53 @@ fn extract_reasoning_content(raw: &str) -> Option<String> {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload)
                 && let Some(fragment) = chunk_reasoning(&value)
             {
-                reasoning.push_str(fragment);
+                reasoning.push_str(&fragment);
             }
         }
     } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw)
         && let Some(fragment) = chunk_reasoning(&value)
     {
-        reasoning.push_str(fragment);
+        reasoning.push_str(&fragment);
     }
 
     (!reasoning.is_empty()).then_some(reasoning)
+}
+
+/// The upstream provider a router used, when the response names one. OpenRouter
+/// puts a top-level `provider` on every chunk, so this is the route the call
+/// actually took rather than the configured provider. The last one wins, since
+/// a stream repeats it per chunk and a rerouted call would only be knowable
+/// from the final frames.
+fn extract_upstream_provider(raw: &str) -> Option<String> {
+    fn provider_of(value: &serde_json::Value) -> Option<&str> {
+        value
+            .get("provider")
+            .and_then(|provider| provider.as_str())
+            .filter(|provider| !provider.is_empty())
+    }
+
+    let mut provider: Option<String> = None;
+    if raw.contains("data:") {
+        for line in raw.lines() {
+            let Some(payload) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload == "[DONE]" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload)
+                && let Some(found) = provider_of(&value)
+            {
+                provider = Some(found.to_string());
+            }
+        }
+    } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw)
+        && let Some(found) = provider_of(&value)
+    {
+        provider = Some(found.to_string());
+    }
+    provider
 }
 
 /// Whether the provider stopped because it ran out of output budget. Handles
@@ -3317,6 +3592,55 @@ mod tests {
         );
     }
 
+    /// The wire shape observed from `openai/gpt-oss-20b` through OpenRouter on
+    /// 2026-10-25 (spec 18 §7, observation #47): every reasoning chunk carries
+    /// the same text twice, as `reasoning` and as one `reasoning_details`
+    /// entry, and the tool call follows the reasoning. Damaian used to read
+    /// neither name and so replayed nothing on the tool-call turn.
+    #[test]
+    fn openrouter_reasoning_is_recovered_on_a_tool_call_turn_without_doubling_it() {
+        let streamed = concat!(
+            "data: {\"id\":\"gen-1\",\"model\":\"openai/gpt-oss-20b\",\"provider\":\"Darkbloom\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"We\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"We\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"gen-1\",\"model\":\"openai/gpt-oss-20b\",\"provider\":\"Darkbloom\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\" need to\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" need to\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"gen-1\",\"model\":\"openai/gpt-oss-20b\",\"provider\":\"Darkbloom\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\" read it.\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" read it.\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"gen-1\",\"model\":\"openai/gpt-oss-20b\",\"provider\":\"Darkbloom\",\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"gen-1\",\"model\":\"openai/gpt-oss-20b\",\"provider\":\"Darkbloom\",\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"src/main.rs\\\"}\"}}]},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"gen-1\",\"model\":\"openai/gpt-oss-20b\",\"provider\":\"Darkbloom\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":null},\"finish_reason\":\"tool_calls\"}]}\n",
+            "data: [DONE]\n",
+        );
+        assert_eq!(
+            extract_reasoning_content(streamed).as_deref(),
+            Some("We need to read it.")
+        );
+        let run = run_against(streamed.to_string());
+        assert_eq!(
+            run.reasoning_content.as_deref(),
+            Some("We need to read it.")
+        );
+        assert_eq!(run.tool_calls.len(), 1);
+        assert_eq!(run.tool_calls[0].name, "read_file");
+        assert_eq!(run.upstream_provider.as_deref(), Some("Darkbloom"));
+    }
+
+    #[test]
+    fn reasoning_details_alone_are_read_when_reasoning_is_absent() {
+        let streamed = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"Only \"},{\"type\":\"reasoning.text\",\"text\":\"details.\"}]}}]}\n",
+            "data: [DONE]\n",
+        );
+        assert_eq!(
+            extract_reasoning_content(streamed).as_deref(),
+            Some("Only details.")
+        );
+        assert_eq!(
+            extract_reasoning_content(
+                r#"{"choices":[{"message":{"role":"assistant","reasoning":"Thinking.","content":"hi"}}]}"#
+            )
+            .as_deref(),
+            Some("Thinking.")
+        );
+    }
+
     #[test]
     fn reasoning_content_is_none_when_the_model_did_not_think() {
         assert!(
@@ -3387,6 +3711,135 @@ mod tests {
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].name, "run_command");
         assert_eq!(calls[0].arguments_json, "{\"command\":\"git log\"}");
+    }
+
+    /// The exact failing shape from spec 18 §7: a complete `propose_patch` call
+    /// written into `content` in DeepSeek's separator syntax instead of into
+    /// `tool_calls`.
+    fn deepseek_textual_propose_patch() -> String {
+        concat!(
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>propose_patch\n",
+            "```json\n",
+            r#"{"summary":"Retry uploads","files":[{"path":"src/upload.rs","status":"modified","content":"fn retry() {}\n"}]}"#,
+            "\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        )
+        .to_string()
+    }
+
+    fn response_with_content(content: &str) -> String {
+        serde_json::json!({"choices":[{"message":{"role":"assistant","content":content}}]})
+            .to_string()
+    }
+
+    fn run_against(raw: String) -> ModelRun {
+        let mut adapter =
+            OpenAICompatibleAdapter::new("textual-test", MockModelTransport::new(raw));
+        adapter
+            .stream_response(
+                &test_request(),
+                &CancelToken::new(),
+                &mut |_token| {},
+                &mut |_| {},
+            )
+            .expect("the response should produce a run")
+    }
+
+    #[test]
+    fn a_complete_textual_tool_call_becomes_the_same_tool_call_values() {
+        let content = deepseek_textual_propose_patch();
+        let run = run_against(response_with_content(&content));
+
+        assert!(run.tool_call_markup_recovered);
+        assert_eq!(run.tool_calls.len(), 1);
+        let call = &run.tool_calls[0];
+        assert_eq!(call.name, "propose_patch");
+        assert!(
+            !call.id.is_empty(),
+            "a recovered call needs an id to replay"
+        );
+        let arguments: serde_json::Value =
+            serde_json::from_str(&call.arguments_json).expect("arguments should be JSON");
+        assert_eq!(arguments["summary"], "Retry uploads");
+        assert_eq!(arguments["files"][0]["path"], "src/upload.rs");
+        assert_eq!(arguments["files"][0]["status"], "modified");
+    }
+
+    #[test]
+    fn a_truncated_or_malformed_textual_tool_call_is_not_a_call_and_keeps_the_content() {
+        let truncated = concat!(
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>propose_patch\n",
+            "```json\n",
+            r#"{"summary":"Retry uploads","files":[{"path":"src/upload.rs"#,
+        )
+        .to_string();
+        let malformed = concat!(
+            "function<｜tool▁sep｜>propose_patch\n",
+            "```json\n",
+            r#"{"summary":"not closed""#,
+        );
+        let not_an_object = concat!(
+            "function<｜tool▁sep｜>propose_patch\n",
+            "```json\n",
+            r#"["not","an","object"]"#,
+            "\n```",
+        );
+        let prose_before_the_markup = format!(
+            "Here is the call I would make:\n{}",
+            deepseek_textual_propose_patch()
+        );
+
+        for content in [
+            truncated,
+            malformed.to_string(),
+            not_an_object.to_string(),
+            prose_before_the_markup,
+        ] {
+            let run = run_against(response_with_content(&content));
+            assert!(
+                run.tool_calls.is_empty(),
+                "a partial or embedded match must not become a call: {content}"
+            );
+            assert!(!run.tool_call_markup_recovered);
+            assert_eq!(
+                run.content, content,
+                "the content is left as the model wrote it"
+            );
+        }
+    }
+
+    #[test]
+    fn native_tool_calls_win_over_textual_markup_in_the_same_response() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": deepseek_textual_propose_patch(),
+                    "tool_calls": [{
+                        "id": "call_native",
+                        "type": "function",
+                        "function": {"name": "run_command", "arguments": "{\"command\":\"pwd\"}"}
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let run = run_against(raw);
+
+        assert!(!run.tool_call_markup_recovered);
+        assert_eq!(run.tool_calls.len(), 1);
+        assert_eq!(run.tool_calls[0].id, "call_native");
+        assert_eq!(run.tool_calls[0].name, "run_command");
+    }
+
+    #[test]
+    fn a_router_reports_the_upstream_provider_it_used() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"provider\":\"Darkbloom\"}\n",
+            "data: [DONE]\n",
+        );
+        let run = run_against(raw.to_string());
+
+        assert_eq!(run.upstream_provider.as_deref(), Some("Darkbloom"));
+        assert!(!run.tool_call_markup_recovered);
     }
 
     #[test]
