@@ -3036,3 +3036,58 @@ fn a_failed_verification_is_not_continued() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);
 }
+
+// Spec 78: a verification whose every check was skipped is not a pass.
+
+#[test]
+fn declining_every_check_is_nothing_verified_not_passed() {
+    let root = temp_dir("all-skipped");
+    let data_dir = temp_dir("all-skipped-data");
+    cargofile(&root);
+    // No allowlist: `cargo test` needs approval, so it arrives on the card.
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+    let paused = run_verification(&engine, &root, &session, &mut adapter);
+    let batch = paused.check_batch.expect("the check needs approval");
+    let declined: Vec<(String, bool)> = batch
+        .checks
+        .iter()
+        .map(|check| (check.id.clone(), false))
+        .collect();
+
+    let result = resume_checks(&engine, &batch.id, &declined, &mut adapter);
+
+    let report = result.verification_report.expect("a report");
+    assert_eq!(report.outcome, Some(VerificationOutcome::NothingVerified));
+    assert!(report.passed.is_empty());
+    assert!(!report.skipped.is_empty());
+    assert!(
+        result.response.starts_with("No check ran:"),
+        "{}",
+        result.response
+    );
+    let summary = result.response.lines().next().unwrap_or_default();
+    assert!(!summary.contains("passed"), "{summary}");
+    // Declining is the user's choice, not a failure of the task.
+    assert_eq!(result.task.status, TaskStatus::Complete);
+    assert!(
+        !outcome_events(&engine, &session)
+            .iter()
+            .any(|event| matches!(
+                event,
+                VerificationEvent::Finished {
+                    outcome: VerificationOutcome::Passed,
+                    ..
+                }
+            )),
+        "no `passed` was recorded"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}

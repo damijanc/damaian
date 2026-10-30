@@ -998,7 +998,11 @@ failed verification does not continue; repair and the report handle it. A
 change made without a plan ends with the report, as before.
 
 **"No checks were available" is not "checks passed".** A project with no
-detected checks, or a documentation-only change, says so in its own words.
+detected checks, or a documentation-only change, says so in its own words. So
+does a verification where you declined every check, or policy blocked them: it
+ends as **nothing verified** ("No check ran: 2 checks skipped, so nothing was
+verified"), never as passed. The task still counts as complete, since declining
+was your choice, and a task with open plan steps still continues.
 
 **Browser checks.** When a changed path is a web asset and the session already
 has a diagnostic target, the loop reruns an inspection at that page under the

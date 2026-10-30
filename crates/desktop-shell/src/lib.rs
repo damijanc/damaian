@@ -8205,7 +8205,9 @@ mod tests {
         assert!(resumed.starts_with("HTTP/1.1 200"), "{resumed}");
         let done = sse_done(&resumed);
         let report = &done["verificationReport"];
-        assert_eq!(report["outcome"], "passed", "{done}");
+        // Both checks were declined, so nothing ran: spec 78 records that
+        // as `nothing_verified`, where this once pinned `passed`.
+        assert_eq!(report["outcome"], "nothing_verified", "{done}");
         let skipped = report["skipped"].as_array().expect("skipped checks");
         let declined = skipped
             .iter()

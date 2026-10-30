@@ -1315,7 +1315,7 @@ session events:
 | `verification_due` | a settled Code-mode patch needs verification; names the task and patch |
 | `verification_started` | one attempt, with its number and the selected checks |
 | `verification_check` | one check's outcome, or its skip reason, plus the hash of every changed file when it ran |
-| `verification_finished` | the attempt's outcome (`passed`, `failed`, `repair_limit_exhausted`, `no_repair_applied`, `no_checks_available`, `only_documentation_changed`) |
+| `verification_finished` | the attempt's outcome (`passed`, `nothing_verified` when every check was skipped (spec 78), `failed`, `repair_limit_exhausted`, `no_repair_applied`, `no_checks_available`, `only_documentation_changed`) |
 
 A check is identified by its command and root, so `cargo test` at the repository
 root and in `crates/engine` are two checks. Each appears in exactly one of

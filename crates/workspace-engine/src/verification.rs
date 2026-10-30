@@ -134,6 +134,11 @@ pub struct CheckRun {
 #[serde(rename_all = "snake_case")]
 pub enum VerificationOutcome {
     Passed,
+    /// Nothing failed, but no check ran either: every selected check was
+    /// skipped, declined by the user or blocked by policy. Recorded instead
+    /// of `Passed`, because an unrun check is never represented as passed
+    /// (proposal §3, spec 78).
+    NothingVerified,
     Failed,
     RepairLimitExhausted,
     NoRepairApplied,
@@ -146,6 +151,7 @@ impl VerificationOutcome {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Passed => "passed",
+            Self::NothingVerified => "nothing_verified",
             Self::Failed => "failed",
             Self::RepairLimitExhausted => "repair_limit_exhausted",
             Self::NoRepairApplied => "no_repair_applied",
@@ -493,6 +499,12 @@ impl VerificationReport {
             );
         }
         if self.passed.is_empty() {
+            if !self.skipped.is_empty() {
+                return format!(
+                    "No check ran: {} skipped, so nothing was verified. {plan_note}",
+                    count(self.skipped.len(), "check")
+                );
+            }
             return format!("No verification has run. {plan_note}");
         }
         if plan_report.is_complete {

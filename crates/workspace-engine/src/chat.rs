@@ -2971,7 +2971,12 @@ impl ChatOrchestrator {
             return self.finish_verification_with_outcome(
                 session,
                 task,
-                VerificationOutcome::Passed,
+                // Every check skipped is not a pass (spec 78).
+                if preliminary.passed.is_empty() {
+                    VerificationOutcome::NothingVerified
+                } else {
+                    VerificationOutcome::Passed
+                },
                 changed,
                 file_hashes,
             );
@@ -3208,6 +3213,7 @@ impl ChatOrchestrator {
         let response = format!("{}\n\n{}", report.summary(&plan.report()), report.render());
         let status = match outcome {
             VerificationOutcome::Passed
+            | VerificationOutcome::NothingVerified
             | VerificationOutcome::NoChecksAvailable
             | VerificationOutcome::OnlyDocumentationChanged => TaskStatus::Complete,
             VerificationOutcome::Failed

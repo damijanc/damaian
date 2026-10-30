@@ -32,6 +32,7 @@ time.
 ## 2. Requirements
 
 1. When a verification ends without failing (outcome `passed`,
+   `nothing_verified` since [#78](78_skipped_checks_are_not_passed.md),
    `no_checks_available` or `only_documentation_changed`) and the carried plan
    has steps that are not settled and are not the verification's own
    `verify_*` steps, the same turn continues the task. The model gets:
@@ -56,8 +57,8 @@ time.
 - Continuing after a failed verification. The repair loop already asks for a
   fix, and continuing past a failure would build on a broken change.
 - Treating a verification with every check skipped as anything other than
-  what #23 calls it. That a skipped-only run is recorded `passed` is a
-  separate defect. The continuation's instruction says only that verification
+  what #23 calls it. That a skipped-only run was recorded `passed` was a
+  separate defect, fixed by [#78](78_skipped_checks_are_not_passed.md). The continuation's instruction says only that verification
   "finished", and the summary line it quotes says what actually ran.
 - Asking the user before continuing. Applying a patch that a task proposed is
   already the go-ahead for that task. Every later patch and command still

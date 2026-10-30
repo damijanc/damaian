@@ -479,6 +479,7 @@ is not answered here.
 | Blocked check is skipped with the policy reason and never retried | `a_blocked_check_is_skipped_and_never_runs` |
 | `Checks passed` only exit-zero, including `exit_code: None` | `a_check_passes_only_on_exit_code_zero` |
 | Every proposed check appears once across passed/failed/skipped/stale | `every_selected_check_is_in_exactly_one_section` |
+| Every check skipped is distinct from passing ([#78](../78_skipped_checks_are_not_passed.md)) | `declining_every_check_is_nothing_verified_not_passed`; shell `resume_checks_endpoint_records_declined_checks` |
 | No detected checks is distinct from passing | `no_checks_available_is_not_checks_passed`; `verify_due_with_no_detected_checks_says_so`; shell `verify_endpoint_reports_no_checks_available` |
 | A sub-root change runs its root's and enclosing roots' checks only | `a_member_change_selects_its_own_root_and_every_enclosing_root` |
 | A docs-only change runs no checks and says so | `only_documentation_changes_select_nothing`; `a_documentation_only_patch_verifies_nothing_and_says_so` |

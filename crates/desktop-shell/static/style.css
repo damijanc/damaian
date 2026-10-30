@@ -5834,7 +5834,8 @@ body.worker-view #chat-model-menu {
   color: #8d1f1f;
 }
 
-.verification-report-outcome[data-outcome="due"] {
+.verification-report-outcome[data-outcome="due"],
+.verification-report-outcome[data-outcome="nothing_verified"] {
   border-color: #e3cba8;
   background: #fdf3e3;
   color: #7a4b12;
