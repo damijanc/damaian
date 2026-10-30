@@ -1887,6 +1887,62 @@ fn chat_reports_a_tool_phase_labelled_with_what_it_is_doing() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+// Spec 81: a thinking-mode model's reasoning shows as a `Thinking` phase with
+// its size, after the model phase and before the answer, and never its text.
+#[test]
+fn reasoning_is_reported_as_a_thinking_phase_with_its_size() {
+    let repo = temp_dir("chat-progress-thinking");
+    write_fixture(&repo, "README.md", "# Progress test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter =
+        MockModelAdapter::new("Done.").with_reasoning_content(vec![Some("x".repeat(1_234))]);
+
+    let (progress, _) = collect_turn_progress(&engine, &repo, "What is this?", &mut adapter);
+
+    let kinds: Vec<PhaseKind> = progress
+        .iter()
+        .filter_map(|event| match event {
+            TurnProgress::Phase(phase) => Some(phase.kind),
+            _ => None,
+        })
+        .collect();
+    let model = kinds.iter().position(|kind| *kind == PhaseKind::Model);
+    let thinking = kinds.iter().position(|kind| *kind == PhaseKind::Thinking);
+    assert!(model.is_some() && thinking > model, "got {kinds:?}");
+    let phase = progress
+        .iter()
+        .find_map(|event| match event {
+            TurnProgress::Phase(phase) if phase.kind == PhaseKind::Thinking => Some(phase),
+            _ => None,
+        })
+        .expect("a thinking phase");
+    assert_eq!(phase.reasoning_chars, 1_234);
+    assert_eq!(phase.round, 1);
+    assert!(phase.label.is_empty(), "label was {:?}", phase.label);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// A model that does not think never shows the phase.
+#[test]
+fn no_reasoning_means_no_thinking_phase() {
+    let repo = temp_dir("chat-progress-no-thinking");
+    write_fixture(&repo, "README.md", "# Progress test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (progress, _) = collect_turn_progress(&engine, &repo, "What is this?", &mut adapter);
+
+    assert!(
+        !progress.iter().any(
+            |event| matches!(event, TurnProgress::Phase(phase) if phase.kind == PhaseKind::Thinking)
+        ),
+        "got {progress:?}"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 // The loop counts rounds from zero; the indicator says "round 1 of 6". The
 // conversion happens once, here, rather than being re-derived in the frontend.
 #[test]

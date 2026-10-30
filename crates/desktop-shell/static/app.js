@@ -6322,9 +6322,15 @@ function appendChatMessage(role, content) {
 const TURN_PHASE_LABELS = {
   context: "Assembling context",
   model: "Waiting for model",
+  thinking: "Thinking",
   tool: "Working",
   finalizing: "Finalizing",
 };
+
+// "2.1k" from 2100, and small counts as they are.
+function formatCharCount(chars) {
+  return chars >= 1000 ? `${(chars / 1000).toFixed(1)}k` : String(chars);
+}
 
 // A live "something is happening" row inside an assistant bubble: the phase, an
 // elapsed clock, and a Stop button when `onStop` is given. A path with no
@@ -6392,14 +6398,22 @@ function startTurnIndicator(target, onStop = null) {
         output.textContent += payload.label;
         return;
       }
-      // Any non-model phase means this round's streaming is over, so the next
+      // Thinking (spec 81) belongs to the model call it reports on, like the
+      // model phase itself.
+      const modelCall = payload.phase === "model" || payload.phase === "thinking";
+      // Any other phase means this round's streaming is over, so the next
       // model round is free to say "Waiting for model" again instead of leaving
       // the previous tool's label up for the rest of the turn.
-      if (payload.phase !== "model") streaming = false;
+      if (!modelCall) streaming = false;
       // Within a round though, tokens are already flowing by the time the model
       // phase would repeat, and "Streaming" is the truer description.
       else if (streaming) return;
-      const text = payload.label || TURN_PHASE_LABELS[payload.phase] || "Working";
+      // Spec 81: how much the model has reasoned, never what.
+      const reasoned =
+        payload.phase === "thinking" && payload.reasoningChars > 0
+          ? ` · ${formatCharCount(payload.reasoningChars)} chars`
+          : "";
+      const text = `${payload.label || TURN_PHASE_LABELS[payload.phase] || "Working"}${reasoned}`;
       const rounds =
         payload.phase !== "context" && payload.maxRounds > 1 && payload.round > 1
           ? ` · round ${payload.round}/${payload.maxRounds}`
@@ -6414,11 +6428,7 @@ function startTurnIndicator(target, onStop = null) {
       // that has recorded nothing shows nothing.
       const notes =
         payload.phase !== "context" && payload.notesChars > 0
-          ? ` · notes ${
-              payload.notesChars >= 1000
-                ? `${(payload.notesChars / 1000).toFixed(1)}k`
-                : payload.notesChars
-            }`
+          ? ` · notes ${formatCharCount(payload.notesChars)}`
           : "";
       label.textContent = `${text}${rounds}${reads}${notes}`;
     },

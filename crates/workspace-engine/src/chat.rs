@@ -206,6 +206,10 @@ impl StopReason {
 pub enum PhaseKind {
     Context,
     Model,
+    /// The model is producing thinking-mode reasoning and no answer text yet
+    /// (spec 81). Follows the round's `Model` phase, repeated as
+    /// [`TurnPhase::reasoning_chars`] grows, so a long wait shows movement.
+    Thinking,
     Tool,
     Finalizing,
     /// A line of a running command's output, streamed before it exits
@@ -219,6 +223,7 @@ impl PhaseKind {
         match self {
             Self::Context => "context",
             Self::Model => "model",
+            Self::Thinking => "thinking",
             Self::Tool => "tool",
             Self::Finalizing => "finalizing",
             Self::Output => "output",
@@ -243,6 +248,9 @@ pub struct TurnPhase {
     /// Characters of `turn_notes` this turn holds (spec 65 §5.8). A count, not
     /// a budget: the label shows "· notes 2.1k" only when it is non-zero.
     pub notes_chars: usize,
+    /// Characters of reasoning this model call has streamed so far. Non-zero
+    /// only on a `Thinking` phase (spec 81); a count, never the text.
+    pub reasoning_chars: usize,
 }
 
 impl TurnPhase {
@@ -263,6 +271,7 @@ impl TurnPhase {
             exploration_round,
             max_exploration_rounds,
             notes_chars,
+            reasoning_chars: 0,
         }
     }
 }
@@ -6544,7 +6553,8 @@ impl ChatOrchestrator {
             let mut round_output = String::new();
             let stream_result = {
                 let on_token = &mut *sink.on_token;
-                let on_progress = &mut *sink.on_progress;
+                // Shared by the refusal wait and the reasoning count below.
+                let on_progress = std::cell::RefCell::new(&mut *sink.on_progress);
                 let mut accumulate = |token: &str| {
                     round_output.push_str(token);
                     on_token(token);
@@ -6553,7 +6563,7 @@ impl ChatOrchestrator {
                 // clean, and the phase carries the remaining seconds so the
                 // user watching "retrying in 47s" can stop it. Spec 48 §5.3.
                 let mut on_wait = |seconds: u64| {
-                    on_progress(TurnProgress::Phase(TurnPhase::new(
+                    (on_progress.borrow_mut())(TurnProgress::Phase(TurnPhase::new(
                         PhaseKind::Model,
                         format!("Provider refused — retrying in {seconds}s"),
                         action_rounds,
@@ -6563,7 +6573,34 @@ impl ChatOrchestrator {
                         turn_notes.text.chars().count(),
                     )));
                 };
-                model_adapter.stream_response(&request, sink.cancel, &mut accumulate, &mut on_wait)
+                // Reasoning arrives a few characters per chunk; one phase per
+                // chunk would be most of a worker's progress file. Spec 81 §4.
+                let mut last_thinking: Option<std::time::Instant> = None;
+                let mut on_reasoning = |reasoning_chars: usize| {
+                    if last_thinking.is_some_and(|last| last.elapsed() < THINKING_PROGRESS_INTERVAL)
+                    {
+                        return;
+                    }
+                    last_thinking = Some(std::time::Instant::now());
+                    let mut phase = TurnPhase::new(
+                        PhaseKind::Thinking,
+                        "",
+                        action_rounds,
+                        max_rounds,
+                        exploration_rounds,
+                        max_exploration_rounds,
+                        turn_notes.text.chars().count(),
+                    );
+                    phase.reasoning_chars = reasoning_chars;
+                    (on_progress.borrow_mut())(TurnProgress::Phase(phase));
+                };
+                model_adapter.stream_response_with_reasoning(
+                    &request,
+                    sink.cancel,
+                    &mut accumulate,
+                    &mut on_wait,
+                    &mut on_reasoning,
+                )
             };
             let model_run = match stream_result {
                 Ok(model_run) => model_run,
@@ -10926,6 +10963,11 @@ impl PendingCommandStore {
         Ok(pending)
     }
 }
+
+/// How often a model call's growing reasoning count is reported (spec 81 §4).
+/// Often enough that the count visibly moves; rare enough that a worker's
+/// progress file gains about two lines a second, not one per chunk.
+const THINKING_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Absolute upper bound for config-driven tool budgets. Raising past this
 /// requires explicit UI work so an agent cannot silently spend a whole session

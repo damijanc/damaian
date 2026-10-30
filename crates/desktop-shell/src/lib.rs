@@ -5632,14 +5632,15 @@ enum TurnEvent {
 /// turn's notes size for the progress label (spec 65 §5.8).
 fn phase_json(phase: &TurnPhase) -> String {
     format!(
-        "{{\"phase\":\"{}\",\"label\":\"{}\",\"round\":{},\"maxRounds\":{},\"explorationRound\":{},\"maxExplorationRounds\":{},\"notesChars\":{}}}",
+        "{{\"phase\":\"{}\",\"label\":\"{}\",\"round\":{},\"maxRounds\":{},\"explorationRound\":{},\"maxExplorationRounds\":{},\"notesChars\":{},\"reasoningChars\":{}}}",
         phase.kind.as_str(),
         escape_json(&phase.label),
         phase.round,
         phase.max_rounds,
         phase.exploration_round,
         phase.max_exploration_rounds,
-        phase.notes_chars
+        phase.notes_chars,
+        phase.reasoning_chars
     )
 }
 
@@ -11374,12 +11375,33 @@ mod tests {
             exploration_round: 2,
             max_exploration_rounds: 24,
             notes_chars: 2_100,
+            reasoning_chars: 0,
         };
 
         let json = phase_json(&phase);
 
         assert!(json.contains("\"explorationRound\":2"), "{json}");
         assert!(json.contains("\"notesChars\":2100"), "{json}");
+    }
+
+    #[test]
+    fn a_thinking_phase_carries_the_reasoning_count_and_no_text() {
+        let phase = TurnPhase {
+            kind: PhaseKind::Thinking,
+            label: String::new(),
+            round: 1,
+            max_rounds: 8,
+            exploration_round: 0,
+            max_exploration_rounds: 24,
+            notes_chars: 0,
+            reasoning_chars: 1_234,
+        };
+
+        let json = phase_json(&phase);
+
+        assert!(json.contains("\"phase\":\"thinking\""), "{json}");
+        assert!(json.contains("\"reasoningChars\":1234"), "{json}");
+        assert!(json.contains("\"label\":\"\""), "{json}");
     }
 
     #[test]

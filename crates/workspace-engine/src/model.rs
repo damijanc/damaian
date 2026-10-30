@@ -413,6 +413,25 @@ pub trait ModelAdapter {
         on_wait: &mut dyn FnMut(u64),
     ) -> Result<ModelRun>;
 
+    /// [`Self::stream_response`], also reporting how many characters of
+    /// thinking-mode reasoning have arrived so far, each time more arrive, so a
+    /// turn can show "Thinking" while no answer text is streaming yet (spec 81).
+    /// Only the count leaves: the text itself is never shown.
+    ///
+    /// The default reports nothing, which is right for an adapter that cannot
+    /// see reasoning before the response is whole.
+    fn stream_response_with_reasoning(
+        &mut self,
+        request: &ModelRequest,
+        cancel: &CancelToken,
+        on_token: &mut dyn FnMut(&str),
+        on_wait: &mut dyn FnMut(u64),
+        on_reasoning: &mut dyn FnMut(usize),
+    ) -> Result<ModelRun> {
+        let _ = on_reasoning;
+        self.stream_response(request, cancel, on_token, on_wait)
+    }
+
     fn estimate_tokens(&self, payload: &str) -> usize {
         payload.len().div_ceil(4)
     }
@@ -491,6 +510,27 @@ impl MockModelAdapter {
 }
 
 impl ModelAdapter for MockModelAdapter {
+    /// A scripted response's reasoning is reported whole, once, before its
+    /// first token: the order a thinking-mode provider streams them in.
+    fn stream_response_with_reasoning(
+        &mut self,
+        request: &ModelRequest,
+        cancel: &CancelToken,
+        on_token: &mut dyn FnMut(&str),
+        on_wait: &mut dyn FnMut(u64),
+        on_reasoning: &mut dyn FnMut(usize),
+    ) -> Result<ModelRun> {
+        if let Some(reasoning) = self
+            .reasoning_content
+            .get(self.next_response)
+            .cloned()
+            .flatten()
+        {
+            on_reasoning(reasoning.chars().count());
+        }
+        self.stream_response(request, cancel, on_token, on_wait)
+    }
+
     fn stream_response(
         &mut self,
         request: &ModelRequest,
@@ -1178,6 +1218,7 @@ impl<T: ModelTransport> OpenAICompatibleAdapter<T> {
         body: &str,
         cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
+        on_reasoning: &mut dyn FnMut(usize),
     ) -> Result<(String, String, u32)> {
         const MAX_ATTEMPTS: u32 = 3;
         const RETRY_BACKOFF_MS: [u64; 2] = [500, 1500];
@@ -1190,6 +1231,14 @@ impl<T: ModelTransport> OpenAICompatibleAdapter<T> {
             attempt += 1;
             let mut buffered_stream = String::new();
             let mut saw_sse_stream = false;
+            // Per attempt: a retried request reasons again from nothing.
+            let mut reasoning_chars = 0;
+            let mut count_reasoning = |line: &str| {
+                if let Some(fragment) = line_reasoning(line) {
+                    reasoning_chars += fragment.chars().count();
+                    on_reasoning(reasoning_chars);
+                }
+            };
             let mut emit_token = |token: String| {
                 if cancel.is_cancelled() {
                     return;
@@ -1205,6 +1254,7 @@ impl<T: ModelTransport> OpenAICompatibleAdapter<T> {
                     while let Some(line_end) = buffered_stream.find('\n') {
                         let line = buffered_stream[..line_end].to_string();
                         buffered_stream = buffered_stream[line_end + 1..].to_string();
+                        count_reasoning(&line);
                         for token in extract_model_tokens(&line) {
                             emit_token(token);
                         }
@@ -1292,6 +1342,17 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
         on_token: &mut dyn FnMut(&str),
         on_wait: &mut dyn FnMut(u64),
     ) -> Result<ModelRun> {
+        self.stream_response_with_reasoning(request, cancel, on_token, on_wait, &mut |_| {})
+    }
+
+    fn stream_response_with_reasoning(
+        &mut self,
+        request: &ModelRequest,
+        cancel: &CancelToken,
+        on_token: &mut dyn FnMut(&str),
+        on_wait: &mut dyn FnMut(u64),
+        on_reasoning: &mut dyn FnMut(usize),
+    ) -> Result<ModelRun> {
         let run_id = create_id("modelrun");
         let started_at_ms = now_millis();
 
@@ -1307,7 +1368,8 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
                 request_usage: ask_for_usage,
                 ..request.clone()
             });
-            let (raw, content, retry_count) = self.send_with_retries(&body, cancel, on_token)?;
+            let (raw, content, retry_count) =
+                self.send_with_retries(&body, cancel, on_token, on_reasoning)?;
             total_retries += retry_count;
 
             // A provider that rejects `stream_options` says so in the body of
@@ -1933,44 +1995,6 @@ fn recover_textual_tool_calls(content: &str) -> Option<Vec<ToolCall>> {
 /// DeepSeek rejects a follow-up whose assistant tool-call message is missing
 /// it. It is never shown to the user.
 fn extract_reasoning_content(raw: &str) -> Option<String> {
-    fn details_text(details: &serde_json::Value) -> Option<String> {
-        let mut text = String::new();
-        for detail in details.as_array()? {
-            let kind = detail.get("type").and_then(|value| value.as_str());
-            if !matches!(kind, Some("reasoning.text" | "reasoning.summary")) {
-                continue;
-            }
-            if let Some(fragment) = detail
-                .get("text")
-                .or_else(|| detail.get("summary"))
-                .and_then(|value| value.as_str())
-            {
-                text.push_str(fragment);
-            }
-        }
-        (!text.is_empty()).then_some(text)
-    }
-
-    fn chunk_reasoning(value: &serde_json::Value) -> Option<String> {
-        value.get("choices")?.as_array()?.iter().find_map(|choice| {
-            // A stream carries `delta`, a whole response `message`.
-            let source = choice.get("delta").or_else(|| choice.get("message"))?;
-            source
-                .get("reasoning_content")
-                .and_then(|value| value.as_str())
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-                .or_else(|| {
-                    source
-                        .get("reasoning")
-                        .and_then(|value| value.as_str())
-                        .filter(|text| !text.is_empty())
-                        .map(str::to_string)
-                })
-                .or_else(|| source.get("reasoning_details").and_then(details_text))
-        })
-    }
-
     let mut reasoning = String::new();
     if raw.contains("data:") {
         for line in raw.lines() {
@@ -1994,6 +2018,62 @@ fn extract_reasoning_content(raw: &str) -> Option<String> {
     }
 
     (!reasoning.is_empty()).then_some(reasoning)
+}
+
+/// The reasoning fragment one SSE line carries, if any. Read while the stream
+/// arrives, only to count it for the "Thinking" phase (spec 81); the reasoning
+/// that is stored and replayed still comes from [`extract_reasoning_content`]
+/// over the whole response.
+fn line_reasoning(line: &str) -> Option<String> {
+    let payload = line.trim().strip_prefix("data:")?.trim();
+    if payload == "[DONE]" {
+        return None;
+    }
+    chunk_reasoning(&serde_json::from_str::<serde_json::Value>(payload).ok()?)
+}
+
+/// One chunk's (or one whole response's) reasoning, from exactly one of the
+/// three places a provider puts it — see [`extract_reasoning_content`].
+fn chunk_reasoning(value: &serde_json::Value) -> Option<String> {
+    value.get("choices")?.as_array()?.iter().find_map(|choice| {
+        // A stream carries `delta`, a whole response `message`.
+        let source = choice.get("delta").or_else(|| choice.get("message"))?;
+        source
+            .get("reasoning_content")
+            .and_then(|value| value.as_str())
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                source
+                    .get("reasoning")
+                    .and_then(|value| value.as_str())
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                source
+                    .get("reasoning_details")
+                    .and_then(reasoning_details_text)
+            })
+    })
+}
+
+fn reasoning_details_text(details: &serde_json::Value) -> Option<String> {
+    let mut text = String::new();
+    for detail in details.as_array()? {
+        let kind = detail.get("type").and_then(|value| value.as_str());
+        if !matches!(kind, Some("reasoning.text" | "reasoning.summary")) {
+            continue;
+        }
+        if let Some(fragment) = detail
+            .get("text")
+            .or_else(|| detail.get("summary"))
+            .and_then(|value| value.as_str())
+        {
+            text.push_str(fragment);
+        }
+    }
+    (!text.is_empty()).then_some(text)
 }
 
 /// The upstream provider a router used, when the response names one. OpenRouter
@@ -3657,6 +3737,34 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"visible\"}}]}\n",
         );
         assert_eq!(extract_model_tokens(streamed), vec!["visible".to_string()]);
+    }
+
+    /// Spec 81: the count grows as reasoning streams in, from whichever field
+    /// the provider uses, and the stored reasoning is the same text as before.
+    #[test]
+    fn streamed_reasoning_is_counted_as_it_arrives() {
+        let transport = MockModelTransport::new(concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\" think\",",
+            "\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\" think\"}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n",
+            "data: [DONE]\n"
+        ));
+        let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+        let mut counts = Vec::new();
+        let run = adapter
+            .stream_response_with_reasoning(
+                &test_request(),
+                &CancelToken::new(),
+                &mut |_token| {},
+                &mut |_| {},
+                &mut |chars| counts.push(chars),
+            )
+            .expect("the mock stream should produce a run");
+
+        assert_eq!(counts, vec![6, 12]);
+        assert_eq!(run.content, "done");
+        assert_eq!(run.reasoning_content.as_deref(), Some("Let me think"));
     }
 
     #[test]
