@@ -39,6 +39,7 @@ harness, and **Release** covers packaging, signing and distribution.
 
 | | |
 |---|---|
+| **v0.54.0** | **Engine**<br>- Say when a content search read no file, and record its glob. |
 | **v0.53.0** | **Engine**<br>- Show the default output and context limits in the provider editor.<br>- Raise the default action rounds per turn from 8 to 16.<br>- Run read-only sequences, git listings and named-file reads without approval. |
 | **v0.52.0** | **Engine**<br>- Give commands the PATH of the user's interactive shell.<br>- Clear a blocked plan step when the same command later succeeds. |
 | **v0.51.0** | **Engine**<br>- Name worktrees list_worktrees cannot read, with branch, HEAD and why.<br>- Make ** in globs match zero directories. |
