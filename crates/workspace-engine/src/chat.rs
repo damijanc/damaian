@@ -2114,6 +2114,9 @@ impl ChatOrchestrator {
     /// auto-runnable it runs them and finishes with the report; with any
     /// requiring approval it pauses once on a check card and
     /// [`Self::resume_after_check_decision`] continues.
+    ///
+    /// A verification that does not fail, with the task's plan still open,
+    /// continues the task in the same turn (spec 77).
     pub fn verify_due(
         &self,
         repository_root: impl AsRef<Path>,
@@ -2122,6 +2125,17 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let repository_root = repository_root.as_ref();
+        let result = self.verify_due_report(repository_root, session_id, model_adapter, sink)?;
+        self.continue_task_after_verification(repository_root, result, model_adapter, sink)
+    }
+
+    fn verify_due_report(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
         let Some(session) = self.session_store.read_session(session_id)? else {
             return Err(ClientError::InvalidInput(format!(
                 "Unknown session: {session_id}"
@@ -2342,6 +2356,21 @@ impl ChatOrchestrator {
     /// refused rather than read as a decline, and the pause is put back so the
     /// client can retry.
     pub fn resume_after_check_decision(
+        &self,
+        batch_id: &str,
+        decisions: &[(String, bool)],
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let pending = self.pending_commands.load(batch_id)?;
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let result =
+            self.check_decision_report(batch_id, decisions, approved_by, model_adapter, sink)?;
+        self.continue_task_after_verification(&repository_root, result, model_adapter, sink)
+    }
+
+    fn check_decision_report(
         &self,
         batch_id: &str,
         decisions: &[(String, bool)],
@@ -3187,6 +3216,168 @@ impl ChatOrchestrator {
         };
         let task = self.session_store.update_task_status(&task, status, None)?;
         self.verification_turn_result(session, task, response, None, Some(report), changed)
+    }
+
+    /// Continues the task a verification interrupted (spec 77).
+    ///
+    /// A patch ends the turn that proposed it, and the verification after the
+    /// apply used to end the task with its report, so a plan of nine steps
+    /// stopped after the first patch. When the verification did not fail and
+    /// the carried plan still has open steps of the task's own, the model is
+    /// asked to carry on in the same turn. Its next patch ends that turn the
+    /// usual way, and the next verification comes back here. A failed
+    /// verification is not continued: repair and the report own that case.
+    fn continue_task_after_verification(
+        &self,
+        repository_root: &Path,
+        result: ChatTurnResult,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let Some(report) = result.verification_report.clone() else {
+            return Ok(result);
+        };
+        if result.task.status != TaskStatus::Complete || result.cancelled {
+            return Ok(result);
+        }
+        let session = result.session.clone();
+        let Some(plan) = self
+            .session_store
+            .read_task_plan(&session.id, &result.task.id)?
+        else {
+            return Ok(result);
+        };
+        let open: Vec<&PlanStep> = plan
+            .steps
+            .iter()
+            .filter(|step| !step.id.starts_with("verify_") && !step.status.is_terminal())
+            .collect();
+        if open.is_empty() {
+            return Ok(result);
+        }
+        let task = result.task.clone();
+        let original_request = self
+            .verification_origin_prompt(&session.id)?
+            .map(|prompt| format!("The request was:\n\n{prompt}\n\n"))
+            .unwrap_or_default();
+        let steps = open
+            .iter()
+            .map(|step| format!("- {} ({})", step.title, step.id))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!(
+            "{CONTINUE_AFTER_VERIFICATION_PROMPT}\n\n{original_request}Verification: {}\n\nOpen plan steps:\n{steps}",
+            report.summary(&plan.report()),
+        );
+        let changed = report.files_changed.clone();
+        let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
+        let conversation = self.session_store.read_conversation(&session.id)?;
+        let context_pins = self
+            .session_store
+            .context_pins(&session.id)
+            .unwrap_or_default();
+        let context_restriction = self.session_store.context_restriction(&session.id)?;
+        let context = self.context_manager.build_context(ContextRequest {
+            repository_root,
+            repository_id: &index.repository_id,
+            task_id: &task.id,
+            prompt: &prompt,
+            index: Some(&index),
+            explicit_paths: &changed,
+            limit: self.config.context_token_budget(),
+            hook_context: &[],
+            plan: Some(&plan),
+            pinned: &context_pins,
+            restriction: context_restriction.as_deref(),
+            conversation_summary: conversation.summary.as_ref(),
+            // Like a repair continuation: the original turn's references and
+            // recalled memory were sent with that request (spec 51 D5,
+            // spec 30 Task 4).
+            external_references: &[],
+            memory: &[],
+        })?;
+        let turn_notes = self.carry_notes_from_the_previous_turn(&session.id, &task)?;
+        let prompt_conversation = build_conversation(
+            &conversation.messages,
+            conversation.summary.as_ref(),
+            self.conversation_window_tokens(),
+            &self.scanner,
+        );
+        let offer_handoffs = self.config.enable_worker_sessions
+            && self.session_store.worker_record(&session.id)?.is_none();
+        let messages = vec![
+            ModelMessage::system(system_prompt_for_session(
+                SessionMode::Code,
+                false,
+                offer_handoffs,
+                &self.config.shell,
+            )),
+            ModelMessage::user(build_model_prompt_with_conversation(
+                &context,
+                &prompt_conversation,
+                None,
+            )),
+        ];
+        let options = ChatTurnOptions::default();
+        if self.config.pause_for_context_review {
+            return self.pause_for_context_review(
+                repository_root,
+                session,
+                task,
+                context,
+                prompt_conversation,
+                conversation.summary.clone(),
+                Vec::new(),
+                messages,
+                turn_notes,
+                options,
+            );
+        }
+        let mut fields = vec![
+            ("actor", "system".to_string()),
+            ("sessionId", session.id.clone()),
+        ];
+        fields.extend(context.manifest.audit_fields());
+        self.audit_log.record("context_assembled", &fields)?;
+        sink.context(&context.manifest);
+        let task =
+            self.session_store
+                .update_task_status(&task, TaskStatus::PreparingContext, None)?;
+        let mut continued = self.run_agentic_turn(
+            repository_root,
+            session,
+            task,
+            context.files,
+            messages,
+            0,
+            0,
+            turn_notes,
+            Vec::new(),
+            false,
+            model_adapter,
+            sink,
+            options,
+        )?;
+        // The report stays with the turn, so the card the user would have seen
+        // is still drawn above the continuation's answer.
+        continued.verification_report = Some(report);
+        Ok(continued)
+    }
+
+    /// The latest request the user typed in this session. A continuation runs
+    /// inside the verification task, whose prompt is Damaian's, so the user's
+    /// own words are found by skipping those.
+    fn verification_origin_prompt(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .session_store
+            .read_tasks(session_id)?
+            .into_iter()
+            .rev()
+            .find(|task| {
+                // A repair's prompt starts with the verification prompt.
+                !task.user_prompt.starts_with(VERIFICATION_TURN_PROMPT)
+            })
+            .map(|task| task.user_prompt))
     }
 
     /// Closes a repair turn that paused and later ended with a model answer
@@ -10774,6 +10965,10 @@ fn system_prompt_for_session(
 /// user request: the model is told what the turn is for when repair begins
 /// (spec 23 `context.md` §13).
 const VERIFICATION_TURN_PROMPT: &str = "Verify the patch that was just applied.";
+
+/// The opening of a continuation after a verification that left the task's
+/// plan open (spec 77). Damaian's words, like [`VERIFICATION_TURN_PROMPT`].
+const CONTINUE_AFTER_VERIFICATION_PROMPT: &str = "The patch was applied and its verification finished. The task is not finished: continue it from its plan. Work through the open steps in order, propose each change with `edit_file` or `propose_patch`, and call `complete_step` as each step is done. Stop when the plan is done, then answer with what changed and what is left.";
 
 /// What a verification turn says when it parks on the check card.
 const CHECK_BATCH_PAUSED_RESPONSE: &str =

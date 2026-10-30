@@ -990,6 +990,13 @@ remaining attempts; at the limit the task is marked failed.
 - **Unverified steps**, **Regressions**, **Remaining**, and **User action
   needed**.
 
+**After the report, the task goes on.** When the change was one step of a
+larger task and its plan still has open steps, the same reply continues: the
+report comes first, then the assistant carries on with the next step, which
+usually ends in the next patch preview. This repeats until the plan is done. A
+failed verification does not continue; repair and the report handle it. A
+change made without a plan ends with the report, as before.
+
 **"No checks were available" is not "checks passed".** A project with no
 detected checks, or a documentation-only change, says so in its own words.
 

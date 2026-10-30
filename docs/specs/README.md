@@ -97,7 +97,7 @@ and worktree delivery finished on 2026-10-28 and were merged into `main` that
 day; the full seven-check gate passed in CI on 2026-10-29 for the `main` push
 that contains both (Quality run 40902516310).
 
-#60–#76 are also Done (see their rows below). Several were evidence-driven or
+#60–#77 are also Done (see their rows below). Several were evidence-driven or
 usability specs added outside the roadmap order; being finished, none of them
 changes what may be built next.
 
@@ -125,7 +125,7 @@ changes what may be built next.
   tool list and per-tool dispatch, so it owns that file while it is in flight.
   Every Done spec no longer constrains anything. See
   [Parallel work](#parallel-work).
-- **Open decision:** the priority table below predates #59–#76 and does not
+- **Open decision:** the priority table below predates #59–#77 and does not
   rank them; the text after it now calls #23 the priority with #65 done.
 
 ### History
@@ -835,6 +835,7 @@ is ready.
 | 74 | [74_resumed_turns_keep_the_chat_model.md](74_resumed_turns_keep_the_chat_model.md) | **Done 2026-10-30** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use, found while fixing #73: only a turn's first request sent the composer's provider, model and effort. Every route that resumes a paused turn (command, fetch, plan, question, round budget, context, verification, checks, the two non-streaming command fallbacks) and manual compaction built their engine from the saved config, so with no `model_provider` line every approval failed with `OPENAI_API_KEY is required`, and with one they could run on another provider or key than the turn began with. They now apply the same form fields as the first request; the fallback offer keeps its own provider. |
 | 75 | [75_first_provider_becomes_the_default.md](75_first_provider_becomes_the_default.md) | **Done 2026-10-30** (specified and built the same day; local checks passed, the full gate is left to CI). A defect found reviewing a clean install: no Settings control has ever written `model_provider`, so a config made by the Quick start kept the built-in OpenAI default. Each new project's picker started on OpenAI, a worker session (which takes the configured provider, #57) failed to spawn with `OPENAI_API_KEY is required`, and the commit-message draft was silently skipped. Saving a provider now writes `model_provider` when none is set; renaming or removing the default provider keeps the line pointing at a configured one; and the commit draft uses the chat's selection like a turn. |
 | 76 | [76_worktree_tasks_go_to_a_worker.md](76_worktree_tasks_go_to_a_worker.md) | **Done 2026-10-30** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: asked to work in a new worktree, a session created one, read from it through #60's `worktree` argument, then edited the main checkout, because edits always land in the session's own checkout. #60 had left writing to a worktree a non-goal and said such a patch was refused, but nothing refused it. `edit_file` and `propose_patch` now refuse a path inside another registered worktree (a worker's own checkout is not foreign to it), their descriptions say where changes land, and with Worker sessions on the system prompt sends a branch or worktree request to a worker. No write path to worktrees was added. |
+| 77 | [77_continue_the_task_after_verification.md](77_continue_the_task_after_verification.md) | **Done 2026-10-30** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: a nine-step implementation task stopped after its first patch. A patch ends the turn that proposed it, and the #23 verification after the apply ended the task with its report, so nothing went back to the plan. When a verification does not fail and the carried plan still has open steps of the task's own, the model is now asked to continue in the same turn, with the user's request and the open steps; its next patch ends that turn and the cycle repeats. A failed verification, and a change without a plan, end as before. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:

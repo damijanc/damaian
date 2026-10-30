@@ -181,6 +181,10 @@ user types, and the plan carries into it the way spec 21 carries a plan across
 a resume. A task with verification due cannot be reported complete until the
 verification has run (`context.md` §1).
 
+Since [#77](../77_continue_the_task_after_verification.md), a verification
+that does not fail, with open steps left in the carried plan, continues the
+task in the same turn instead of ending it with the report.
+
 The loop is entered only in Code mode ([spec 20](../20_working_modes/proposal.md)); in Ask,
 Plan, and Review there is nothing applied to verify.
 

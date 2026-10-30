@@ -2895,3 +2895,144 @@ fn a_verification_interrupted_mid_check_is_offered_and_nothing_is_passed() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);
 }
+
+// Spec 77: a verification that leaves the task's plan open continues the task
+// in the same turn instead of ending it with the report.
+
+/// Gives `task_id` a plan with one finished step and the given open ones, as an
+/// agentic turn that proposed its first patch would leave it.
+fn open_plan(engine: &WorkspaceEngine, session_id: &str, task_id: &str, open: &[&str]) {
+    let task = engine
+        .session_store
+        .read_tasks(session_id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .expect("the patch's task");
+    let mut plan = complete_plan();
+    plan.task_id = task_id.to_string();
+    for (index, title) in open.iter().enumerate() {
+        plan.steps.push(PlanStep {
+            id: format!("step-{}", index + 2),
+            title: (*title).to_string(),
+            detail: None,
+            status: StepStatus::Pending,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+        });
+    }
+    engine.session_store.create_plan(&task, &plan).unwrap();
+}
+
+fn first_user_message(adapter: &MockModelAdapter) -> String {
+    adapter
+        .requests
+        .first()
+        .expect("the model was called")
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_passed_verification_with_open_steps_continues_the_task() {
+    let root = temp_dir("continue-open-plan");
+    let data_dir = temp_dir("continue-open-plan-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    open_plan(&engine, &session, &task, &["Update the docs", "Run clippy"]);
+    let mut adapter = MockModelAdapter::new("Docs updated; clippy is left.");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    // The continuation is the first call; spec 66's open-plan reminder may
+    // follow it, since this answer leaves steps open.
+    assert!(!adapter.requests.is_empty(), "the task was continued");
+    let prompt = first_user_message(&adapter);
+    assert!(prompt.contains("The task is not finished"), "{prompt}");
+    assert!(prompt.contains("- Update the docs (step-2)"), "{prompt}");
+    assert!(prompt.contains("- Run clippy (step-3)"), "{prompt}");
+    assert!(
+        !prompt.contains("understand existing retry logic ("),
+        "{prompt}"
+    );
+    assert!(
+        result.response.contains("Docs updated"),
+        "{}",
+        result.response
+    );
+    let report = result
+        .verification_report
+        .as_ref()
+        .expect("the report stays with the turn");
+    assert_eq!(report.outcome, Some(VerificationOutcome::Passed));
+    // The report was still recorded before the continuation answered.
+    let messages = engine.session_store.read_messages(&session).unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content.starts_with("Verification passed: 1 check")),
+        "{messages:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_plan_with_nothing_open_ends_with_the_report() {
+    let root = temp_dir("continue-closed-plan");
+    let data_dir = temp_dir("continue-closed-plan-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    open_plan(&engine, &session, &task, &[]);
+    let mut adapter = MockModelAdapter::new("unused");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert!(adapter.requests.is_empty(), "nothing to continue");
+    assert_eq!(result.task.status, TaskStatus::Complete);
+    assert!(result.response.contains("Verification complete"));
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_failed_verification_is_not_continued() {
+    let root = temp_dir("continue-failed");
+    let data_dir = temp_dir("continue-failed-data");
+    cargofile(&root);
+    // Retry limit 0: a failure reports at once instead of starting a repair.
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[]);
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    open_plan(&engine, &session, &task, &["Update the docs"]);
+    let mut adapter = MockModelAdapter::new("unused");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert!(adapter.requests.is_empty(), "a failure is not continued");
+    assert_eq!(result.task.status, TaskStatus::Failed);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
