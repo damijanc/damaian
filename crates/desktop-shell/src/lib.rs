@@ -26,8 +26,8 @@ use workspace_engine::{
     TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationReport,
     WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
     WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
-    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
-    import_profile, normalize_mcp_server_id, normalize_model_provider,
+    builtin_token_defaults, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
+    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
     normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
     profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
     select_profile,
@@ -294,6 +294,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("GET", "/api/config") => handle_config(stream, &request),
         ("GET", "/api/config-file") => handle_get_config_file(stream, &request),
         ("GET", "/api/effective-policy") => handle_effective_policy(stream, &request),
+        ("GET", "/api/provider-token-defaults") => handle_provider_token_defaults(stream, &request),
         ("POST", "/api/permission-profile") => handle_permission_profile(stream, &request),
         ("GET", "/api/permission-profiles") => handle_permission_profiles(stream, &request),
         ("GET", "/api/permission-profile-export") => {
@@ -459,6 +460,51 @@ fn handle_config(stream: &mut TcpStream, request: &Request) -> Result<(), String
             "{{\"policy\":\"{}\"}}",
             escape_json(&config.to_policy_text())
         ),
+    )
+}
+
+/// `GET /api/provider-token-defaults?provider=<id>&models=<a,b>`: what each
+/// model gets when the provider editor's *Max output tokens* and *Context
+/// budget* are left blank. Only the engine knows these per-model numbers, so
+/// the editor asks rather than showing "Automatic" with no value. No models
+/// asks for the provider's own default.
+fn handle_provider_token_defaults(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let requested = request.param("provider").unwrap_or_default();
+    // A provider still being named in the editor has no id yet; it gets the
+    // defaults of an unknown provider.
+    let provider = if requested.trim().is_empty() {
+        String::new()
+    } else {
+        normalize_model_provider(&requested).map_err(|error| error.to_string())?
+    };
+    let models_param = request.param("models").unwrap_or_default();
+    let mut models: Vec<&str> = models_param
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .collect();
+    if models.is_empty() {
+        models.push("");
+    }
+    let entries = models
+        .iter()
+        .map(|model| {
+            let (output, context) = builtin_token_defaults(&provider, model);
+            format!(
+                "{{\"model\":\"{}\",\"maxOutputTokens\":{},\"contextTokenBudget\":{}}}",
+                escape_json(model),
+                output.map_or_else(|| "null".to_string(), |value| value.to_string()),
+                context
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"models\":[{entries}]}}"),
     )
 }
 
@@ -6910,6 +6956,7 @@ mod tests {
                 marker_id: "action_1".to_string(),
                 exit_code: Some(0),
                 purpose: workspace_engine::CommandPurpose::Other,
+                command_hash: None,
             }],
         });
         plan.steps.push(PlanStep {
@@ -8547,6 +8594,7 @@ mod tests {
         let legacy_session = legacy_web_diagnostic_session(&engine, &repository_id, &data_dir);
         let findings_session = findings_to_review_session(&engine, &repository_id, &repo);
         let activity_session = activity_and_plan_session(&engine, &repository_id);
+        let command_activity_session = command_activity_session(&engine, &repository_id, &repo_arg);
 
         let options = ShellOptions {
             port: 4899,
@@ -8567,8 +8615,100 @@ mod tests {
         println!(
             "  activity + plan session (collapsed Activity and Steps disclosures) = {activity_session}"
         );
+        println!(
+            "  command activity session (spec 68: command steps, approval requests, one usage row) = {command_activity_session}"
+        );
         println!("  data_dir = {}", data_dir.display());
         run_server(options).expect("serve the UI");
+    }
+
+    /// A finished turn made of command steps in every stored shape spec 68
+    /// renders: ran, repeated, approval request, declined, timed out with a
+    /// hook note, a command containing a backtick and an em dash, a mixed
+    /// STDERR body, and a tool result that does not parse. Returns the
+    /// session id.
+    fn command_activity_session(
+        engine: &WorkspaceEngine,
+        repository_id: &str,
+        root: &str,
+    ) -> String {
+        let store = &engine.session_store;
+        let session = store
+            .create_session(repository_id, "Command activity")
+            .unwrap();
+        let task = store
+            .create_task(
+                &session.id,
+                "list the build output and check the crate",
+                "mock",
+                "mock",
+            )
+            .unwrap();
+        let cause = workspace_engine::ApprovalCause::ShellControl {
+            constructs: "`|`".into(),
+        }
+        .plain_words();
+        let check = format!(
+            "Command: cargo check 2>&1 | tail -5\nWorking directory: {root}\nExit code: 0\n\nSTDOUT:\nFinished dev\n\nSTDERR:\n"
+        );
+        let messages: Vec<(&str, String)> = vec![
+            ("user", "List the build output and check the crate.".into()),
+            ("assistant", "Ran `ls target` — See what the last build left.".into()),
+            (
+                "tool",
+                format!(
+                    "Command: ls target\nWorking directory: {root}\nExit code: 0\n\nSTDOUT:\ndebug\n\nSTDERR:\n"
+                ),
+            ),
+            ("assistant", format!("{cause}\n\n`cargo check 2>&1 | tail -5`")),
+            ("assistant", "Ran `cargo check 2>&1 | tail -5` — Compile the crate.".into()),
+            ("tool", check.clone()),
+            ("assistant", "Ran `cargo check 2>&1 | tail -5` — Check again.".into()),
+            ("tool", check),
+            ("assistant", format!("{cause}\n\n`rm -rf target | cat`")),
+            ("assistant", "Ran `rm -rf target | cat` — Clean the build.".into()),
+            (
+                "tool",
+                "The user declined to run `rm -rf target | cat`. Do not request it again; answer using what you already know, noting the limitation if it matters.".into(),
+            ),
+            ("assistant", "Ran `sleep 999` — Wait for the server.".into()),
+            (
+                "tool",
+                format!(
+                    "Command: sleep 999\nWorking directory: {root}/sub\nExit code: none (timed out)\n\nSTDOUT:\n\n\nSTDERR:\nslow\n\nHook `fmt-guard`: refused after the action."
+                ),
+            ),
+            ("assistant", "Ran `echo \"a ` — b\"` — Quote test.".into()),
+            (
+                "tool",
+                format!(
+                    "Command: echo \"a ` — b\"\nWorking directory: {root}\nExit code: 1\n\nSTDOUT:\nx\n\nSTDERR:\nHalf\n\nSTDERR:\nreal"
+                ),
+            ),
+            ("assistant", "Read `src/lib.rs`.".into()),
+            ("tool", "fn main() {}".into()),
+            ("assistant", "The crate builds; the clean was declined.".into()),
+        ];
+        for (role, content) in &messages {
+            store
+                .append_message(&session.id, Some(&task.id), role, content)
+                .unwrap();
+        }
+        store
+            .record_task_usage_for_task_id(
+                &session.id,
+                &task.id,
+                "run_command_activity",
+                None,
+                workspace_engine::TokenUsage::estimated(5200, 640),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .update_task_status(&task, workspace_engine::TaskStatus::Complete, None)
+            .unwrap();
+        session.id
     }
 
     /// A finished turn with a plan and a run of intermediate action/result
@@ -9079,6 +9219,37 @@ mod tests {
         })
         .expect("spawn the test shell");
         (port, token)
+    }
+
+    /// The provider editor's placeholders show these numbers, so the endpoint
+    /// must answer per model with what a blank field resolves to, including
+    /// "no ceiling" for the output of a provider that sets none.
+    #[test]
+    fn provider_token_defaults_answers_per_model() {
+        let (port, token) = serve_for_test();
+        let get = |query: &str| {
+            response_json(&send_for_test(
+                port,
+                format!(
+                    "GET /api/provider-token-defaults?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n"
+                ),
+            ))
+        };
+
+        let deepseek = get("provider=deepseek&models=deepseek-v4-flash,deepseek-chat");
+        assert_eq!(deepseek["models"][0]["model"], "deepseek-v4-flash");
+        assert_eq!(deepseek["models"][0]["maxOutputTokens"], 65_536);
+        assert_eq!(deepseek["models"][0]["contextTokenBudget"], 64_000);
+        assert_eq!(deepseek["models"][1]["maxOutputTokens"], 8_192);
+        assert_eq!(deepseek["models"][1]["contextTokenBudget"], 16_000);
+
+        let unnamed = get("provider=&models=");
+        assert_eq!(unnamed["models"][0]["model"], "");
+        assert!(unnamed["models"][0]["maxOutputTokens"].is_null());
+        assert_eq!(
+            unnamed["models"][0]["contextTokenBudget"],
+            workspace_engine::DEFAULT_CONTEXT_TOKEN_BUDGET
+        );
     }
 
     fn send_for_test(port: u16, request: String) -> String {
@@ -12622,9 +12793,10 @@ mod tests {
         #[test]
         fn a_worker_answers_a_round_budget_pause_in_process() {
             let repo = fixture("rb");
-            // Eight read-only rounds hit the default eight-round budget; the
-            // ninth response answers after *Continue* re-enters the turn.
-            let responses: Vec<String> = (0..8)
+            // Read-only rounds up to the default budget hit it; the next
+            // response answers after *Continue* re-enters the turn.
+            let budget = Config::default().agent_max_tool_rounds;
+            let responses: Vec<String> = (0..budget)
                 .map(|_| read_only_round())
                 .chain(std::iter::once("Done looking.".to_string()))
                 .collect();

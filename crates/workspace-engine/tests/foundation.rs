@@ -12,8 +12,8 @@ use workspace_engine::{
     PatchEngine, PatchStore, PathPolicy, PhaseKind, ProjectIndexer, ProposedChange, Result,
     ResumeDecisionOptions, SecretScanner, SessionStore, TaskStatus, TokenUsage, ToolCall,
     TurnProgress, TurnSink, UsageSource, WebDiagnosticCall, WebDiagnosticReport,
-    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, extract_model_tokens,
-    model_request_json, parse_generated_edit,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, builtin_token_defaults,
+    extract_model_tokens, model_request_json, parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -522,7 +522,13 @@ fn classifies_command_risk() {
     );
     assert_eq!(policy.classify("npm test", root).risk, CommandRisk::Medium);
     assert_eq!(policy.classify("rm -rf .", root).risk, CommandRisk::Blocked);
-    assert_eq!(policy.classify("ls | head", root).risk, CommandRisk::High);
+    // Spec 70 requirement 7 admits a bare `| head`; a filter that is not
+    // admitted still asks.
+    assert_eq!(policy.classify("ls | head", root).risk, CommandRisk::Low);
+    assert_eq!(
+        policy.classify("ls | xargs cat", root).risk,
+        CommandRisk::High
+    );
 }
 
 #[test]
@@ -2301,7 +2307,7 @@ fn chat_replays_reasoning_content_after_command_approval() {
     write_fixture(&repo, "README.md", "# Reasoning replay test\n");
     let engine = WorkspaceEngine::new(test_config(&repo));
     let mut adapter = MockModelAdapter::new_sequence(vec![
-        "DAMAIAN_COMMAND_V1\nCOMMAND: echo checking-repo\nREASON: Inspect before answering.\nEND_COMMAND\n"
+        "DAMAIAN_COMMAND_V1\nCOMMAND: printf checking-repo\nREASON: Inspect before answering.\nEND_COMMAND\n"
             .to_string(),
         "The repository looks as expected.".to_string(),
     ])
@@ -2484,7 +2490,7 @@ fn chat_replays_reasoning_content_when_a_batched_round_resumes_after_approval() 
                     id: "call_2".to_string(),
                     name: "run_command".to_string(),
                     arguments_json:
-                        "{\"command\":\"echo checking-repo\",\"reason\":\"Inspect before answering\"}"
+                        "{\"command\":\"printf checking-repo\",\"reason\":\"Inspect before answering\"}"
                             .to_string(),
                 },
             ],
@@ -4136,7 +4142,7 @@ fn chat_resume_after_command_approval_surfaces_a_patch_proposal() {
     let engine = WorkspaceEngine::new(config);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
         vec![
-            "DAMAIAN_COMMAND_V1\nCOMMAND: echo checking-repo\nREASON: Inspect before scaffolding.\nEND_COMMAND\n"
+            "DAMAIAN_COMMAND_V1\nCOMMAND: printf checking-repo\nREASON: Inspect before scaffolding.\nEND_COMMAND\n"
                 .to_string(),
             "I've prepared the scaffold for review.".to_string(),
         ],
@@ -4193,7 +4199,7 @@ fn chat_resumes_after_command_approval_and_answers_using_the_result() {
     // bucket (`requires_approval: true` regardless of config flags) while
     // still being something every test machine can actually execute.
     let mut adapter = MockModelAdapter::new_sequence(vec![
-        "DAMAIAN_COMMAND_V1\nCOMMAND: echo hello-from-sandbox\nREASON: Verify sandbox execution.\nEND_COMMAND\n"
+        "DAMAIAN_COMMAND_V1\nCOMMAND: printf hello-from-sandbox\nREASON: Verify sandbox execution.\nEND_COMMAND\n"
             .to_string(),
         "The sandbox printed the expected marker.".to_string(),
     ]);
@@ -4245,7 +4251,7 @@ fn chat_resumes_after_command_rejection_and_answers_without_it() {
     write_fixture(&repo, "README.md", "# Chat resume reject test\n");
     let engine = WorkspaceEngine::new(test_config(&repo));
     let mut adapter = MockModelAdapter::new_sequence(vec![
-        "DAMAIAN_COMMAND_V1\nCOMMAND: echo hello-from-sandbox\nREASON: Verify sandbox execution.\nEND_COMMAND\n"
+        "DAMAIAN_COMMAND_V1\nCOMMAND: printf hello-from-sandbox\nREASON: Verify sandbox execution.\nEND_COMMAND\n"
             .to_string(),
         "Understood, I'll answer without running that command.".to_string(),
     ]);
@@ -5676,6 +5682,40 @@ fn context_token_budget_follows_the_selected_model() {
     assert_eq!(
         Config::default().context_token_budget(),
         DEFAULT_CONTEXT_TOKEN_BUDGET as usize
+    );
+}
+
+// The provider editor shows `builtin_token_defaults` as the value of a blank
+// field, so it must be exactly what the resolvers fall back to.
+#[test]
+fn builtin_token_defaults_match_what_a_blank_field_resolves_to() {
+    for (provider, model) in [
+        ("deepseek", "deepseek-v4-flash"),
+        ("deepseek", "deepseek-chat"),
+        ("deepseek", "some-future-model"),
+        ("openai", "gpt-4.1"),
+        ("custom", "anything"),
+    ] {
+        let mut config = Config::default();
+        config.apply_overlay(
+            ConfigOverlay::parse(&format!("model_provider={provider}\nmodel_name={model}\n"))
+                .unwrap(),
+        );
+        let (output, context) = builtin_token_defaults(provider, model);
+        assert_eq!(config.max_output_tokens(), output, "{provider}/{model}");
+        assert_eq!(
+            config.context_token_budget(),
+            context as usize,
+            "{provider}/{model}"
+        );
+    }
+    assert_eq!(
+        builtin_token_defaults("deepseek", "deepseek-v4-pro"),
+        (Some(65_536), 64_000)
+    );
+    assert_eq!(
+        builtin_token_defaults("openai", "gpt-4.1"),
+        (None, DEFAULT_CONTEXT_TOKEN_BUDGET)
     );
 }
 

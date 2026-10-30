@@ -1,8 +1,9 @@
 # Feature Spec: Branch and Worktree Delivery
 
 Status: Done 2026-10-28; review fixes landed after that close-out and before
-merge. The full seven-check gate has **not** run for this branch yet; scoped
-checks passed locally (see `tasks.md` and §7).
+merge. Scoped checks passed locally (see `tasks.md` and §7), and the full
+seven-check gate passed in CI on 2026-10-29 for the `main` push that contains
+the branch (Quality run 40902516310).
 Order: 36 of 37
 Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 2 (Must). That directory is local-only and not committed, so the
@@ -504,7 +505,9 @@ own commands do, and no submodule-specific behaviour was added, as §4 says.
 ### Review fixes after the first Done
 
 These landed after the initial close-out and before merge; they change no
-approval, capability or execution boundary. The branch has still had no CI run.
+approval, capability or execution boundary. The branch had no CI run of its
+own; the full seven-check gate passed in CI on 2026-10-29 for the `main` push
+that contains it (Quality run 40902516310).
 
 - **Ignored-file switch (2a, confirmed).** The switch argv gained
   `--no-overwrite-ignore`, and `switching_never_overwrites_an_ignored_local_file`
@@ -574,7 +577,7 @@ Every criterion in §6 is listed below. Test names without a path are in
 | Each mutation is bracketed by side-effecting action markers, and an interrupted creation is resolved by comparing the ref, never by retrying. | Met at the engine level | `a_branch_apply_is_bracketed_by_a_marker_pair_and_audited`; `inspect_reports_a_dangling_record_truthfully`; `a_delete_that_already_landed_is_inspected_not_retried`. The desktop recovery card has no branch-specific **Inspect** row; the record and marker are the evidence. |
 | Branch operations are refused in Ask, Plan and Review modes and under a profile denying Git mutation; repository config cannot enable them. | Met | `mode_and_capability_refusals_name_the_reason_at_prepare_and_apply` (also at apply); `ask_mode_is_refused_before_a_record_or_a_ref_exists` through the route; `every_capability_key_resists_weakening_from_repository_scope`, `a_repository_may_deny_git_branches_and_may_not_grant_them`, `each_built_in_profile_resolves_to_its_table_row` and `allow_git_branches_is_a_capability_key_with_a_human_name` in `permission_profiles`. |
 | **Conditional on Phase 2 WP4:** worktree-to-branch mapping is reported; a checkpoint restore in a worktree touches only that worktree; deleting a dirty worktree needs a distinct confirmation naming the dirty paths; an externally deleted worktree is reported, not crashed on. | Conditional — not this spec's work | Phase 2 WP4 did not ship, so §5.7 is dormant (D7). Spec 60's `GitService::worktrees`/`list_worktrees` reports the mapping, spec 57 owns dirty-worktree removal, and `worktree_access.rs` reports a prunable worktree. Spec 36 added no worktree mutation and no externally-deleted-worktree message, and does not test a worktree checkpoint restore. |
-| Every quality-gate command from `AGENTS.md` passes, and the spec 18 baseline shows no regression. | **Outstanding** | Scoped checks passed locally: `scripts/quality-gate.sh fmt node lint typos deny`; `cargo clippy -p workspace-engine -p desktop-shell --all-targets --locked -- -D warnings`; `cargo nextest run -p workspace-engine --test branch_delivery`; `cargo nextest run -p desktop-shell --lib`; `node --check`; `npm run lint:web`. The workspace clippy and nextest gate is left to CI, and no CI run exists for this branch yet, so the full gate has **not** passed. |
+| Every quality-gate command from `AGENTS.md` passes, and the spec 18 baseline shows no regression. | **Met 2026-10-29** | The full seven-check gate passed in CI on 2026-10-29 for the `main` push containing this branch (Quality run 40902516310). Before that, scoped checks passed locally: `scripts/quality-gate.sh fmt node lint typos deny`; `cargo clippy -p workspace-engine -p desktop-shell --all-targets --locked -- -D warnings`; `cargo nextest run -p workspace-engine --test branch_delivery`; `cargo nextest run -p desktop-shell --lib`; `node --check`; `npm run lint:web`. The spec 18 baseline comparison was not rerun separately. |
 
 ### Manual walk
 

@@ -1,10 +1,9 @@
 # Feature Spec: External Reference Retrieval
 
-Status: Done 2026-10-28 — **with CI outstanding**. Tasks 1–10 landed on branch
+Status: Done 2026-10-28. Tasks 1–10 landed on branch
 `spec-51-external-reference`, and Task 11 fixed the review findings against that
-close-out. No Quality run has covered the branch yet, so the seven-check
-workspace gate remains unproven; the planner records the run id after the user
-pushes.
+close-out. The full seven-check gate passed in CI on 2026-10-29 for the `main`
+push that contains the branch (Quality run 40902516310).
 Order: 51 of 53
 Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 8 (Should). That directory is local-only and not committed, so the
@@ -364,10 +363,9 @@ content — with the refusal wording for each.
 `spec-51-external-reference`, and Task 11 fixed the review findings against that
 close-out: later-turn framing, the SSRF/rebinding check and connection pinning,
 proxy isolation, the egress guard reading the tool result rather than the file
-on disk, crash reattachment for a fetch pause, and the stale records. **CI has
-not run for that branch**, so the seven-check workspace gate is outstanding;
-scoped checks passed locally and the planner records the Quality run id after
-the user pushes. **No manual browser walk was performed.** The fetch dialog and
+on disk, crash reattachment for a fetch pause, and the stale records. Scoped checks
+passed locally, and the full seven-check gate passed in CI on 2026-10-29
+(Quality run 40902516310; recorded after this paragraph was written). **No manual browser walk was performed.** The fetch dialog and
 the inspector row are exercised by engine, shell, `app.js` and harness tests,
 never by a click-through against a running app; the crash path now has a restart
 test and a shell payload test. No live provider or live page was used.
@@ -391,7 +389,7 @@ conditional claim.
 | A stop during a fetch takes effect during the fetch | `a_stop_during_a_fetch_kills_curl`, bounded at 20 s by `.config/nextest.toml` so a regressed kill fails rather than hangs | Proven. |
 | `search_web` is absent from the tool list when no search provider is configured, and a search result is never fetched automatically | `search_web` was not built (D2): the tool list contains no such tool, and no path returns a search result that could be fetched | Met by construction. The second half is vacuous until a search tool exists. |
 | Every fetch is audited with URL, host, status, size and approval basis | `a_fetch_is_audited_with_url_host_status_size_and_approval_basis`; the harness's `fetch_audits` assertion; redirects audit `web_fetch_redirect`; the dialog audits `web_fetch_approval_decision` | Proven. The audit carries no body and no query in the approval decision. |
-| Every quality-gate command from `AGENTS.md` passes | Scoped local list in `tasks.md` Task 10 ran green; the workspace-wide clippy and test suite run on CI | **CI outstanding.** Do not read this spec as a green seven-check gate. |
+| Every quality-gate command from `AGENTS.md` passes | Scoped local list in `tasks.md` Task 10 ran green; the workspace-wide clippy and test suite run on CI | **Met 2026-10-29.** The full seven-check gate passed in CI (Quality run 40902516310). |
 
 ### 7.2 What the risk notes asked for
 

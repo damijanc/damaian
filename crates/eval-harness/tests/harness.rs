@@ -1013,7 +1013,7 @@ fn without_an_exploration_allowance_long_discovery_reaches_the_action_budget() {
     let path = scenario::scenarios_dir().join("long_discovery.toml");
     let mut loaded = scenario::load(&path).expect("scenario");
     loaded.config_overlay = Some(
-        ConfigOverlay::parse("agent_max_exploration_rounds=0\n")
+        ConfigOverlay::parse("agent_max_exploration_rounds=0\nagent_max_tool_rounds=8\n")
             .expect("the zero allowance is valid config"),
     );
     loaded.round_budget_decision = Some(scenario::RoundBudgetDecision::AnswerNow);
@@ -1219,11 +1219,17 @@ fn the_retry_bound_is_what_stops_the_loop() {
     let loaded = scenario::load(&path).expect("scenario");
     let run = eval_harness::runner::run(&loaded).expect("run");
 
-    // `agent_max_tool_rounds` bounds tool rounds; the engine makes one further
-    // call afterwards to write the closing answer, so the call ceiling is
-    // rounds + 1. Derived from the config rather than hardcoded, so raising the
-    // default does not silently loosen this.
-    let rounds = u64::from(workspace_engine::Config::default().agent_max_tool_rounds);
+    // `agent_max_tool_rounds` bounds tool rounds; at most one further call
+    // writes a closing answer, so the call ceiling is rounds + 1. Read from the
+    // scenario's own overlay, falling back to the default, so changing either
+    // does not silently loosen this.
+    let rounds = u64::from(
+        loaded
+            .config_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.agent_max_tool_rounds)
+            .unwrap_or(workspace_engine::Config::default().agent_max_tool_rounds),
+    );
     let call_ceiling = rounds + 1;
     assert!(
         run.record.model_calls > 1,

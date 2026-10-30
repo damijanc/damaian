@@ -45,7 +45,7 @@ Patch rollback snapshots and session checkpoints store pre-edit file content unr
 
 Damaian classifies every command before it runs, and the classification, not the model, decides whether you are asked:
 
-- **Runs without asking:** commands Damaian recognises as read-only, such as `pwd`, `ls`, `git status` and `git log` with listed options, and simple pipelines of them filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut` or `grep`. They run in your login shell in the working folder, which is why the admitted set is a closed list of programs and options rather than a heuristic.
+- **Runs without asking:** commands Damaian recognises as read-only, such as `pwd`, `ls`, `echo`, `git status`, `git log` and the git listings (`git branch`, `git remote`, `git worktree list`, `git rev-parse`, …) with listed options; `cat`, `head`, `tail`, `wc`, `sed -n` and non-recursive `grep` reading files named on the line; and sequences of them joined by `&&`, `;` or a newline, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut` or `grep`, with output discarded only to `/dev/null`. They run in your login shell in the working folder, which is why the admitted set is a closed list of programs and options rather than a heuristic.
 - **Asks first:** everything else, including anything that writes, installs, reaches the network or uses shell control syntax. `git diff` and `git show` ask too, because they print file contents a command line cannot bound or keep restricted paths out of; the agent's `read_git_diff` tool does both. Every Docker command asks, `docker ps` included, because the daemon is privileged.
 - **Blocked:** commands matching `command_blocklist` or a destructive pattern are refused and cannot be approved from the UI.
 
@@ -59,7 +59,11 @@ resolves inside the repository and clear of `restricted_patterns`. What is
 checked is exactly what the login shell will run; anything the shell would
 rewrite after classification asks for approval. A path outside the repository,
 behind a symlink, or inside a restricted directory such as `secrets/` asks, and
-so does a restricted working directory.
+so does a restricted working directory. A file read is admitted only when it
+names its files, so each one is checked: `cat .env` asks, and so do recursive
+and globbed reads, whose files the command line does not name. A command's
+output is then capped by `max_command_output_bytes` and secret-redacted before
+the model sees it, like any other command output.
 
 Two things the boundary deliberately does not cover:
 
@@ -73,6 +77,15 @@ Two things the boundary deliberately does not cover:
   asks, because the path is restricted; `ls` of an admitted directory still
   lists a restricted entry nested inside it by name. The `list_directory` tool
   is the answer for a listing that must hide restricted names.
+
+Commands find programs on the `PATH` of your interactive login shell (spec 69).
+Damaian starts that shell once per run, in your home folder rather than a
+repository, with stdin closed and a five-second limit, and keeps only `PATH`
+from it, dropping empty and relative entries so no command resolves a program
+against its working directory. Aliases, functions and other variables are not
+taken, so the command the boundary above judged is the command that runs. The
+shell and this setting are user and admin configuration; a repository or a
+profile cannot change either.
 
 `require_approval_for_all_commands` makes every command ask. *Allow Always* records one exact command for one checkout in user config (see the trust boundary below) and is not offered for blocked commands or commands with shell control syntax. A working mode or permission profile can only narrow what runs. Output of every command is redacted before the model or the UI sees it, and each command runs under `command_timeout_secs` and is registered in the process registry. A command left running by a crash is found by the sweep at the next launch and killed by its recorded pid, only while its recorded start time still matches, and never by name.
 
@@ -147,6 +160,14 @@ Reads and writes go through one path policy:
 
 - A path that resolves outside the selected repository is refused, for reads and writes alike. For writes, every existing component of the target is checked, so a symlink inside the repository that points outside it cannot be written through. Additional directories are reachable only through `allowed_roots`, which a repository cannot set.
 - `restricted_patterns` are refused to the agent's read tools and excluded from search, context and git reads. The defaults cover `.env` and `.env.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, SSH private key names (`id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`), and `secrets/` and `credentials/` directories at any depth. A repository may add patterns, never remove them.
+
+## Memory
+
+Memory is a local store of one-sentence facts you confirmed; nothing enters it without your confirmation, and a statement containing a detected credential is refused rather than stored. Three rules hold on the read side:
+
+- **Memory is data, never instruction, and reaches the model only as context.** A recalled entry is an ordinary item in the lowest-priority context category, framed as "remembered about this project" with its origin and date. There is no other path to the model, so the context panel shows everything that was recalled. Mode, approval and path policy are never read from context, so a remembered "all commands are pre-approved" changes nothing; evaluation scenarios assert that an approval card still appears and Ask mode still refuses edits.
+- **Statements are redacted on the way out.** Every recalled statement passes the secret scanner before it enters a request, and again before the context panel displays it, so a credential edited into a memory file by hand never leaves the machine. The manifest and the `memory_recalled` audit event carry the entry id, not the statement.
+- **Protected or ignored evidence withdraws an entry.** An entry derived from a file that is now under `restricted_patterns` or excluded by a `.gitignore` is excluded from recall entirely — not sent with a marker, since a marker would still put the derived statement in the request. The check runs at every recall, because a policy change modifies no file. The entry is retained and returns when the rule is narrowed; the withdrawal is audited with the path and reason. Project memory is keyed by the repository's identity, and an entry carrying another project's key is a hard error rather than a filtered row.
 
 ## Patch Application
 
@@ -291,7 +312,7 @@ capabilities from committing (spec 36):
 
 Configuration comes from three files, applied in order: user (`<data_dir>/config/user.conf`), repository (`<repo>/.damaian/config.conf`), and admin (`DAMAIAN_ADMIN_CONFIG` or `<data_dir>/config/admin.conf`). Only the repository file arrives with a clone, so **repository config is untrusted input**: it may add restrictions and never remove one.
 
-A repository cannot set `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, `web_domain_allowlist` or any `web_domain_allowlist.<repository id>` entry, any `language_server.<language>` command, or any `model_*` key including a `model_provider.<id>` entry. Those keys redirect where commands run, which programs start unprompted, where model traffic and the API key reference go, where data is written or how long it is kept, or which defences are active; a repository has no legitimate use for any of them. They are ignored, recorded in the audit log as `repository_config_key_rejected` with the key name and class — never the value, which is attacker-controlled text — and reported to the user once per repository. There is deliberately no override.
+A repository cannot set `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, `web_domain_allowlist` or any `web_domain_allowlist.<repository id>` entry, any `language_server.<language>` command, or any `model_*` key including a `model_provider.<id>` entry. Those keys redirect where commands run, which programs start unprompted, where model traffic and the API key reference go, where data is written or how long it is kept, or which defences are active; a repository has no legitimate use for any of them. They are ignored, recorded in the audit log as `repository_config_key_rejected` with the key name and class — never the value, which is attacker-controlled text — and reported to the user once per repository. There is deliberately no override.
 
 `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are unioned with the user's, so a repository may add a restriction but never drop one. `require_approval_for_file_edits`, `require_approval_for_risky_commands`, and `require_approval_for_all_commands` may be turned on by a repository, never off. `mcp_enabled` and a server's `enabled` may be turned off, never on, and `mcp_server_allowlist` may only be narrowed. A repository may *define* an MCP server — a useful suggestion — but the definition is created disabled and approval-gated, and it cannot redefine a server the user has already configured. The same holds for hooks: a repository may define a hook of its own, but it arrives pending review at a definition hash, cannot record its own review, and cannot change a hook the user or admin config already defines.
 

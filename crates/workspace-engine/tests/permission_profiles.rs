@@ -424,6 +424,13 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "shell=./tools/sh\n",
             Reported("shell"),
         ),
+        // Spec 69: which program a command name runs, like `shell`.
+        case(
+            "command_path_from_interactive_shell",
+            "command_path_from_interactive_shell=false\n",
+            "command_path_from_interactive_shell=true\n",
+            Reported("command_path_from_interactive_shell"),
+        ),
         case(
             "model_provider",
             "",
@@ -3833,7 +3840,9 @@ fn classification_results_are_unchanged_for_existing_policy_tests() {
         ("ls", CommandRisk::Low, false, false),
         ("git log --stat", CommandRisk::Low, false, false),
         ("git diff", CommandRisk::High, true, false),
-        ("ls | head", CommandRisk::High, true, false),
+        // Spec 70 requirement 7 admitted a bare `| head`.
+        ("ls | head", CommandRisk::Low, false, false),
+        ("ls | xargs cat", CommandRisk::High, true, false),
         ("npm test", CommandRisk::Medium, true, false),
         ("cargo test", CommandRisk::Medium, true, false),
         ("docker ps", CommandRisk::High, true, false),

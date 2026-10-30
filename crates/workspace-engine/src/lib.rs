@@ -45,6 +45,7 @@ pub mod repository_map;
 pub mod repository_trust;
 pub mod secret_scanner;
 pub mod session;
+pub mod shell_path;
 pub mod steering;
 pub mod symbol_index;
 pub mod tree_walk;
@@ -103,8 +104,8 @@ pub use config::{
     HookSource, LANGUAGE_SERVER_LANGUAGES, MAX_HOOK_TIMEOUT_MS, McpServerConfig,
     McpServerConfigOverlay, McpTransport, ModelProviderConfig, ModelProviderConfigOverlay,
     OverlayOutcome, RejectedConfigKey, RepositoryConfigReport, RepositoryKeyClass,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    overlay_field_kinds, parse_mcp_transport,
+    builtin_token_defaults, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, overlay_field_kinds, parse_mcp_transport,
 };
 pub use context_manager::{
     CategoryUsage, CollectionSource, ContextBudget, ContextCategory, ContextItem, ContextKind,
@@ -137,7 +138,8 @@ pub use fetch::{CurlFetchTransport, DEFAULT_MAX_RESPONSE_BYTES, FetchOutcome};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};
 pub use git_service::{
     BranchInfo, BranchNameCheck, DiffOptions, GitFileStatus, GitHubRepo, GitReadCaps, GitService,
-    GitStatus, GitSummary, WorktreeListing, WorktreeListingEntry, parse_github_remote,
+    GitStatus, GitSummary, UnreachableWorktree, WorktreeListing, WorktreeListingEntry,
+    parse_github_remote,
 };
 pub use hash::repository_id_for_root;
 pub use hooks::{

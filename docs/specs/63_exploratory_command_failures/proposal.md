@@ -132,6 +132,9 @@ the crate.
   starts with a program from a closed list: `ls`, `pwd`, `cat`, `head`, `tail`,
   `wc`, `grep`, `rg`, `find`, `sed` (any form without `-i` or `--in-place`),
   `awk`, `sort`, `uniq`, `cut`, `du`, `stat`, `file`, `echo`, `true`, `read`,
+  `which`, `type`, `whence`, `command -v` and `command -V` (added 2026-10-29:
+  a probe for a program that is not installed exits 1, which blocked a step
+  in a live session; plain `command <program>` runs it and stays `Other`),
   and `git` with `status`, `diff`, `log`, `show`, `rev-list`, `rev-parse`,
   `branch --list`, `worktree list`, `ls-files`, `grep`, optionally after
   `-C <dir>`. Programs are matched by their exact first word, so `./grep` and

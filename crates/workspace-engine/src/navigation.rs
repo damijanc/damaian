@@ -333,6 +333,13 @@ impl NavigationController {
                 ("matchCount", found.matches.len().to_string()),
                 ("totalFound", found.total_found.to_string()),
                 ("filesSearched", found.files_searched.to_string()),
+                // Model input like the pattern, so redacted the same way.
+                (
+                    "pathGlob",
+                    path_glob
+                        .map(|glob| self.scanner.redact(glob).text)
+                        .unwrap_or_default(),
+                ),
                 ("worktree", worktree.unwrap_or_default().to_string()),
             ],
         )?;

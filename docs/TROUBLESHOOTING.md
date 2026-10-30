@@ -51,6 +51,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | A command that used to run unasked now asks | [A command that used to run unasked now asks](#a-command-that-used-to-run-unasked-now-asks) |
 | A setting will not stick, or a repository config key has no effect | [Configuration layers](#configuration-layers), [Why a rule is in force](#why-a-rule-is-in-force) |
 | Memory will not save, a project's memory is missing (including a shallow clone), or the store was refused | [Memory](#memory) |
+| A memory was or was not recalled, is marked "may be out of date", or disappeared from recall | [Memory](#memory) |
 | A permission profile key has no effect | [A permission profile key had no effect](#a-permission-profile-key-had-no-effect) |
 | A file read or search result was cut short | [A file read or search result was truncated](#a-file-read-or-search-result-was-truncated) |
 | A page the agent tried to read was not fetched, or a fetch approval did not appear after a reload | [A fetch was refused](#a-fetch-was-refused) |
@@ -257,7 +258,7 @@ remove one
 
 | Key | In repository config |
 |-----|----------------------|
-| `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `language_server.<lang>`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, any `model_*` (including `model_provider.<id>.*`) | Ignored, audited, reported to the user once per repository |
+| `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `language_server.<lang>`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, any `model_*` (including `model_provider.<id>.*`) | Ignored, audited, reported to the user once per repository |
 | `command_allowlist`, `command_allowlist.<repo_id>`, `permission_profile.<repo_id>`, `hook_review.<repo_id>.<hook_id>` | Never honoured: they are the user's decisions, and `Allow Always` writes user scope instead |
 | `hook.<id>.*` | A new hook is kept, and runs only after you review it; one that names a hook you or an admin defined is ignored |
 | `restricted_patterns`, `ignore_patterns`, `command_blocklist` | Added to the user's list, never replacing it |
@@ -314,7 +315,8 @@ A profile only narrows. A profile key has no effect when:
 - **It would loosen what is already in force.** For example `command_access=all`
   in a custom profile over a user config that set `local`. Nothing is reported
   for this at load; import lists such keys under "Written but no effect here".
-- **A profile may not carry it.** `shell`, `data_dir`, `allowed_roots`,
+- **A profile may not carry it.** `shell`, `command_path_from_interactive_shell`,
+  `data_dir`, `allowed_roots`,
   `secret_patterns`, `audit_enabled`, `block_generated_secrets`, every `model_*`
   key, the preference keys (`max_file_bytes`, `enable_semantic_search`, the
   `agent_*` round limits, …), `command_allowlist`, a
@@ -455,8 +457,63 @@ by a `.gitignore`, with a message naming which of the two applied but not the
 protected path.
 
 Pattern matching cannot see every credential. That is why the confirmation step
-shows the exact sentence that will persist, and why a stored memory will be
-redacted again on its way into a request once recall ships.
+shows the exact sentence that will persist, and why a stored memory is redacted
+again on its way into a request and into the context panel. A credential edited
+into a memory file by hand is replaced by the redaction marker in both places;
+the line in the file is left as it is, so delete it there.
+
+**Why a memory was or was not recalled.** Each turn, recall reads the active
+entries of this session, this project's `project_key` and — only when
+`memory_user_scope_enabled=true` — user scope. It scores each entry by the words
+its statement shares with your message and the paths you named, ignoring common
+words; an entry with no shared word is not recalled. An `environment` or
+`command` entry ranks higher when the task is about running something, a
+`convention` or `decision` entry when it is about editing; that boost changes
+rank only and never makes an unrelated entry eligible. The top
+`memory_max_entries` (default 5) are offered to context assembly, which may
+still drop them when the `memory` share runs out — memory is the last category
+and the first dropped.
+
+| What you see | Why |
+|---|---|
+| The entry is in the context panel with `matched docker, tests` | Those statement words were in the prompt or a named path. `category fitted the task` means the boost applied. |
+| The entry is in the store but not in the panel | No shared word; another entry ranked higher under the cap; the `memory` share was used up (a `category_budget_exhausted` record); or one of the cases below. |
+| It is gone from recall and the store says `"state":"expired"` | Its own `expiry` or `memory_retention_days` passed. Recall marks it expired and records `memory_expired`. |
+| It is not recalled but is still `active` in the store | Its evidence path is now under `restricted_patterns` or ignored by a `.gitignore`. See *withdrawn* below. |
+| Removed at send with `memory_no_longer_active` in the manifest | It was deleted, superseded, expired or withdrawn between assembly and send — for example while the pre-send review was paused. It was not sent. |
+
+Recall is audited:
+
+| Audit event | Meaning |
+|---|---|
+| `memory_recalled` | The entry was in the request that was actually sent — once per entry per send. A declined review, a removal and a budget drop record nothing. This answers "when was this last used?". |
+| `memory_verification_changed` | An entry derived from a file changed state: `fromVerification` and `toVerification` are `evidence_current` or `evidence_stale`. |
+| `memory_recall_withdrawn` | An entry was skipped because its evidence is no longer readable by policy. `reason` is `evidence_restricted`, `evidence_ignored` or `evidence_not_relative`, with the `path`. Recorded once per entry and reason per app run. |
+
+**Staleness.** An entry derived from a repository file records that file's
+content hash. Every time recall is about to use the entry it hashes the file
+again: a different hash, or a deleted or unreadable file, makes it
+`evidence_stale`; the same hash (including after a revert) makes it
+`evidence_current` again. The check runs at recall rather than on file-watcher
+events, so a missed watcher event cannot leave a stale entry looking current. A
+stale entry is still recalled, with *may be out of date — that file has changed
+since* in the text the model reads and a **stale** count on the panel's Memory
+line. If the fact is still true, nothing needs doing; if it is not, remove it
+from the turn in the pre-send review and delete or replace the entry. Editing
+and deleting entries from the app arrive with the memory management view; until
+then, append a record with the same `id` and `"state":"deleted"` to the project
+file, as described under *Read one* above.
+
+**Withdrawn, not stale.** An evidence path that becomes protected or ignored is
+a different event: you told Damaian to stay out of that file, so a statement
+derived from it is not sent at all, not even with a marker. The entry stays
+`active` in the store and returns as soon as the rule is narrowed. No file
+changed, so this is checked at recall too.
+
+**Retention.** `memory_retention_days` in your user config (default `0`, no
+expiry) expires entries older than that many days the next time recall reads
+them. A repository and a permission profile cannot set it. An entry's own
+`expiry` applies regardless of the setting.
 
 **A newer schema.** Opening a store written by a newer build fails with the
 marker path and both versions and changes nothing. Upgrade Damaian, or point
@@ -985,10 +1042,11 @@ Inside the manifest:
 | `limit` | The token limit categories divided, and where it came from — see [Declared and observed limits](#declared-and-observed-limits). |
 | `totalTokens` | Sum of the included items' estimated tokens. |
 | `categories` | One entry per category **in budget order**: `category`, `allocated` (after redistribution from earlier categories), `used`, `items`, `truncated`, `estimated`. `estimated` is always `true` for assembly: the figure is the estimator's, never a provider measurement. |
-| `included` | One entry per item: `category`, `kind`, `path`, `lineRange`, `tokens`, `rootPath`, `provenance`. `kind` is the source label the prompt header shows (`explicit_file`, `retrieved_file`, `agent_instruction`, `project_rule`, `hook_context`, `repository_map`, `symbols`, `plan_state`); your own message is listed as `user_prompt` with no path. `category` is the budget bucket, which is not always the same thing: a search hit is `kind: retrieved_file` but `category: search_results`. The entry records where the item came from and how big it was, never its text. |
+| `included` | One entry per item: `category`, `kind`, `path`, `lineRange`, `tokens`, `rootPath`, `provenance`. `kind` is the source label the prompt header shows (`explicit_file`, `retrieved_file`, `agent_instruction`, `project_rule`, `hook_context`, `repository_map`, `symbols`, `plan_state`, `memory`); your own message is listed as `user_prompt` with no path. `category` is the budget bucket, which is not always the same thing: a search hit is `kind: retrieved_file` but `category: search_results`. The entry records where the item came from and how big it was, never its text. |
 | `excluded` | One entry per item left out or shortened: `reason`, `path`, `lineRange`, `category`, `detail`. |
 | `conversationSummary` | The #55 summary this turn sent, when it has one: `tokens`, `messages`, `throughSeq`, `factsOnly`. It is not an `included` item because it travels inside `Recent conversation:`; `null` when there is no summary. |
 | `symbolProvenance` | For the symbols block, `total`, `languageServer` and `heuristic`. The one `included` entry for the block can only carry the weakest provenance; these are the counts behind "12 symbols (4 heuristic)". |
+| `memory` | One row per recalled memory the request carries, in the order of the `memory` items: `entryId`, `matchReason` (`matchedTerms`, `categoryBoost`) and `verification` at recall. **Never the statement** — the panel resolves the id against the store when it displays the row. A dropped or removed memory has no row. See [Memory](#memory). |
 
 `rootPath` is the repository root that owns the path: `""` means the repository
 root itself, `"packages/api"` a nested root from the repository map. It is
@@ -1019,6 +1077,7 @@ carries one today; a file item, an instruction file and hook context are `null`.
 | `user_removed` | You removed an optional item in a paused pre-send review, or removed the conversation summary. It applies to that turn only. | Yes, spec 27 |
 | `path_not_selected` | The session's path restriction admits only selected paths, and this one is not among them. `AGENTS.md` is exempt by design. | Yes, spec 27 |
 | `missing` | A pinned file no longer reads: it was deleted or became unreadable. The pin stays in the session. | Yes, spec 27 |
+| `memory_no_longer_active` | A recalled memory was deleted, superseded, expired or withdrawn between assembly and send, so it was taken out of the request. `detail` names the entry id, never the statement. | Yes, spec 30 |
 
 `secret_bearing` and `total_budget_exhausted` are not produced by this version;
 they arrive with the stages that generate them. A file that is simply missing or
@@ -1223,6 +1282,13 @@ A step showing `"status":"completed"` with `"evidence":[]` is **completed
 unverified** — it finished with nothing observable behind it. That is a
 reported outcome, not a missing record. A step showing `"status":"blocked"` had
 a command that did not succeed; the steps after it stay `pending` on purpose.
+A `CommandExit` carries `commandHash`, the SHA-256 of the exact command line,
+and only the latest run of each command decides: an exit followed by another
+run with the same `commandHash` no longer blocks. So a blocked step that later
+shows `"status":"completed"` with a failing exit in its evidence is a check
+that was rerun and passed, not a block that was overridden. Evidence written
+before 2026-10-29 has no `commandHash`, and each of its exits still counts on
+its own.
 
 Rewinding takes plans and approvals with it: `read_task_plan` and
 `read_plan_approved` both read only events after the last
@@ -1483,7 +1549,7 @@ themselves.
 
 ### A turn stopped early: which budget ran out
 
-What happens at `agent_max_tool_rounds` (default 8) depends on whether a token
+What happens at `agent_max_tool_rounds` (default 16) depends on whether a token
 ceiling is set ([spec 61](specs/61_continue_the_stopped_turn/proposal.md)).
 That budget counts **action rounds**. A round in which every call was a read —
 `read_file`, `list_directory`, `search_content`, `search_codebase`,
@@ -2255,11 +2321,31 @@ one fact is behind several symptoms:
   that is set in your shell and missing in the app, so
   [model calls fail](#model-calls-fail). A `keychain:` reference avoids this.
   A loopback endpoint such as Ollama (local) does not need a key at all.
-- An MCP stdio server's `command`, or `docker`, resolves in Terminal and not in
-  the app. Use an absolute path to the executable.
+- An MCP stdio server's `command`, a hook, or a language server resolves in
+  Terminal and not in the app. These are started directly, not through your
+  shell, so use an absolute path to the executable.
 - A variable such as `DAMAIAN_MOCK_MODEL_RESPONSE` or `DAMAIAN_DATA_DIR`
   changes the behaviour of a shell started from a terminal and not of the app
   started from Finder.
+
+Commands the assistant runs are the exception for `PATH` (spec 69): once per
+run Damaian asks your interactive login shell for its `PATH`, so `npm`,
+`python` or `docker` installed through nvm, pyenv or Homebrew are found as in
+your Terminal. If one is still `command not found` (exit 127):
+
+- Read the audit event `shell_path_resolved`. `status` is `resolved`
+  (`entries` says how many directories were kept), `timed_out` (your rc files
+  took more than five seconds; skip slow setup when
+  `DAMAIAN_RESOLVING_SHELL_PATH` is set, see the user guide), `failed` (the
+  shell exited without printing a `PATH`), or `unsupported` (your `shell` is
+  not `sh`, `bash`, `zsh`, `ksh`, `dash` or `mksh`). There is no event when
+  `command_path_from_interactive_shell=false`. The `PATH` itself is not
+  recorded.
+- Check where the program comes from in a new Terminal window: `zsh -ilc
+  'command -v npm'`. If that fails too, the setup is not in your shell's
+  interactive files.
+- You edited `~/.zshrc` after Damaian started: the `PATH` is read once per run,
+  so restart Damaian.
 
 To see what the app does with your shell's environment, launch it from a
 terminal instead, as described in
@@ -2414,6 +2500,14 @@ without asking now ask, and each is deliberate:
   `ls $HOME/.ssh`, `ls ~`, `ls *` and `git diff --no-index $HOME/x README.md`
   used to slip past the prefix match. `$`, `~` and unquoted globs now ask,
   because the shell would run something other than what was checked.
+
+The reverse also happened: `;`-separated sequences, `echo` headings,
+`2>/dev/null`, the git listings (`git branch -a`, `git remote -v`,
+`git worktree list`, …) and reads of named files (`cat`, `head`, `sed -n`,
+`grep` without `-r`) used to ask and now run without asking, as long as every
+piece is admitted and every file is inside the repository and not restricted.
+A sequence still asks as a whole when any one piece is not admitted, and so
+does a line that starts with `cd` and uses `;`.
 
 If a command that looks harmless asks, check it against the admitted table in
 the user guide's [Command Approval](USER_GUIDE.md#command-approval). The first
@@ -2644,6 +2738,17 @@ reads as complete is the failure the caps exist to prevent. The caps are
 `max_match_line_chars` (500); a repository config may lower one but never raise
 it.
 
+### A search said "No file was searched"
+
+`search_content` read no file at all, so its result is not evidence that the
+text is absent. Usually the search's glob matched nothing: only `*` (within one
+directory), `**` (across directories) and `?` are wildcards, and `{a,b}` or
+`[...]` are matched character for character, so `{src/**,docs/**}` matches no
+path. The conversation's activity line names the glob (`Searched for "…" in
+`<glob>``), and the audit log's `content_searched` event records it as
+`pathGlob` beside `filesSearched: 0`. The assistant is told the same and can
+search again with one glob per directory.
+
 ### A fetch was refused
 
 `fetch_url` is the agent's page reader. Several different things can stop a
@@ -2737,31 +2842,40 @@ omitted exactly as in the main checkout.
 
 ### `list_worktrees` shows no worktrees from a worktree session
 
-`list_worktrees` lists only the worktrees that are **reachable from the session's
-own checkout**, not every registration git knows about. The containment root is
-the checkout the session opened. A session running in a linked worktree — a
-worker's `.damaian/worktrees/<slug>`, or a development worktree under
-`.claude/worktrees/` — therefore treats its own entry as the session checkout
-and the main checkout and every sibling as outside it. With the default empty
-`allowed_roots`, the reachable set is empty and the tool result is:
+`list_worktrees` reads only the worktrees that are **reachable from the session's
+own checkout**. The containment root is the checkout the session opened, so a
+registered worktree outside the repository root and `allowed_roots` cannot be
+read. That includes worktrees another tool keeps outside the repository, and,
+from a session running in a linked worktree — a worker's
+`.damaian/worktrees/<slug>`, or a development worktree under
+`.claude/worktrees/` — the main checkout and every sibling. With the default
+empty `allowed_roots`, such a session reads none of them, and the tool result
+looks like:
 
 ```
 Worktrees (0 listed, ahead/behind vs `main`):
+Not readable from this session (2); the read tools refuse these. Branch, HEAD and ahead/behind come from git's worktree list and this repository's commits, not from the worktree:
+/path/to/repo: main @ 23ee8bc, 0 ahead, 0 behind; it is outside the repository root and no `allowed_roots` entry contains it
+/path/to/repo/.claude/worktrees/b: wt-b @ 6b362a9, 1 ahead, 0 behind; it is outside the repository root and no `allowed_roots` entry contains it
 ```
 
-It does not enumerate the entries it withheld, so the assistant can read that as
-“no worktrees are registered”. They are registered; the tool cannot reach them.
+The second section names every registered worktree it cannot read and why
+(outside the allowed roots, prunable, missing, or bare), with what git and the
+repository's own commits say about it. It never shows a changed-file count for
+those, because that would mean reading the worktree. The session's own checkout
+is in neither section. Before 2026-10-29 the second section did not exist, and
+an assistant could read an empty listing as "no worktrees are registered".
 
-Check the truth with `git -C <repo> worktree list` or the audit event
-`git_worktrees_listed`: its `count` is the number listed and its `resourcePath`
-is the session root that decided reachability. A `count: 0` with a `resourcePath`
-inside a worktree is this case, not an empty repository.
+The audit event `git_worktrees_listed` records `count` (readable worktrees
+listed), `unreachable` (worktrees named as not readable) and `resourcePath`,
+the session root that decided reachability.
 
-To survey the repository from a worktree session, either add the main checkout
-to `allowed_roots` (then the main and its siblings are reachable, while the
-session's own checkout is still addressed by omitting `worktree`), or run the
-tool from the main checkout. This is deliberate (spec 60 §5.1, correction C1),
-pinned by `from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots`;
+To read those worktrees from the session, either add the main checkout (or the
+directory holding them) to `allowed_roots`, or run the tool from the main
+checkout. In a worktree session the session's own checkout is still addressed
+by omitting `worktree`. The containment rule is deliberate (spec 60 §5.1,
+correction C1), pinned by
+`from_a_linked_worktree_list_worktrees_reads_none_but_names_them_without_allowed_roots`;
 changing it would be a spec change, not a configuration fix.
 
 ### MCP server not working

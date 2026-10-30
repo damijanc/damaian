@@ -190,6 +190,33 @@ impl CommandRunner {
         }
     }
 
+    /// The interactive login shell's `PATH` for this runner's shell, resolved
+    /// once per process and audited when it is (spec 69), or `None` when the
+    /// setting is off or the resolution did not produce one.
+    fn interactive_path(&self) -> Option<String> {
+        if !self.config.command_path_from_interactive_shell {
+            return None;
+        }
+        crate::shell_path::cached(
+            &self.config.shell,
+            crate::shell_path::RESOLVE_TIMEOUT,
+            &self.config.data_dir,
+            |resolution| {
+                let _ = self.audit_log.record(
+                    "shell_path_resolved",
+                    &[
+                        ("actor", "system".to_string()),
+                        ("shell", self.config.shell.clone()),
+                        ("status", resolution.status.as_str().to_string()),
+                        ("entries", resolution.entries.to_string()),
+                        ("durationMs", resolution.duration_ms.to_string()),
+                    ],
+                );
+            },
+        )
+        .path
+    }
+
     /// Runs a command at the repository root.
     pub fn run(
         &self,
@@ -271,9 +298,22 @@ impl CommandRunner {
         // hides it, which is the only reason spec 17 concluded a command could
         // not be cleaned up — it orphans under `SIGKILL` like anything else.
         // Its own group so a pipeline's members are reachable too.
-        let mut child = Command::new(&self.config.shell)
-            .arg("-lc")
-            .arg(command)
+        // Spec 69: the `PATH` the user's Terminal has, which `-lc` alone does
+        // not read. Set before the caller's variables, which still win.
+        let mut process = Command::new(&self.config.shell);
+        process.arg("-lc");
+        match self.interactive_path() {
+            Some(path) => {
+                process
+                    .arg(crate::shell_path::command_with_path(command))
+                    .env("PATH", &path)
+                    .env(crate::shell_path::PATH_VARIABLE, &path);
+            }
+            None => {
+                process.arg(command);
+            }
+        }
+        let mut child = process
             .current_dir(cwd.as_ref())
             .envs(env.iter().map(|(key, value)| (*key, value.as_str())))
             .stdout(Stdio::piped())

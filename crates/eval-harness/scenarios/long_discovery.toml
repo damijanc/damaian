@@ -11,6 +11,12 @@ prompt = "Survey this crate before answering: read its source files, list src, a
 # Each call is distinct: twelve different files, then a listing and a search.
 # Two rounds that read the same path with the same arguments would make the
 # second an action round, which is exactly what `read_loop` measures.
+# Pinned to the old default: the scenario counts rounds against this
+# budget, and the product default (16) is not what it tests.
+config_overlay = """
+agent_max_tool_rounds=8
+"""
+
 [[turn]]
 content = ""
 tool_calls = [

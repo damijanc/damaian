@@ -331,6 +331,158 @@ fn a_second_complete_step_after_a_block_is_refused_and_starts_nothing() {
     );
 }
 
+/// A repository whose `./check` fails the first time and passes after: the
+/// shape of "the check failed, the cause was fixed, the check was run again".
+fn engine_with_a_check_that_passes_on_its_second_run(repo: &Path) -> WorkspaceEngine {
+    fs::write(
+        repo.join("check"),
+        "#!/bin/sh\nif [ -f .fixed ]; then exit 0; fi\ntouch .fixed\nexec ls no-such-directory\n",
+    )
+    .unwrap();
+    fs::set_permissions(repo.join("check"), fs::Permissions::from_mode(0o755)).unwrap();
+    WorkspaceEngine::new(Config {
+        command_allowlist: vec!["./check".to_string(), "ls src".to_string()],
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        ..Config::default()
+    })
+}
+
+fn tool_results(engine: &WorkspaceEngine, result: &ChatTurnResult) -> Vec<String> {
+    engine
+        .session_store
+        .read_messages(&result.session.id)
+        .expect("messages should read")
+        .into_iter()
+        .map(|message| message.content)
+        .collect()
+}
+
+/// Found in a session on 2026-10-29: after a step blocked, nothing the model
+/// did could clear it, and four `complete_step` calls got the same refusal.
+/// Running the failed command again, successfully, now clears the block.
+#[test]
+fn a_blocked_step_recovers_when_the_same_command_later_passes() {
+    let repo = temp_repo("blocked-recovers");
+    let engine = engine_with_a_check_that_passes_on_its_second_run(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"A"},{"title":"B"}]}"#,
+        )],
+        vec![call(
+            "run_command",
+            r#"{"command":"./check","reason":"Check it"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"./check","reason":"Check it again after the fix"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+
+    let result = ask(&engine, &repo, "Do it", &mut adapter);
+    let plan = plan_of(&engine, &result).expect("the turn proposed a plan");
+
+    assert_eq!(plan.steps[0].status, StepStatus::Completed);
+    assert_eq!(plan.steps[1].status, StepStatus::InProgress);
+    assert!(!plan.violates_single_in_progress());
+    // Both runs stay on the step: the failure is history, not erased.
+    let exits: Vec<Option<i32>> = plan.steps[0]
+        .evidence
+        .iter()
+        .filter_map(|item| match item {
+            Evidence::CommandExit { exit_code, .. } => Some(*exit_code),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(exits.len(), 2, "{:?}", plan.steps[0].evidence);
+    assert_ne!(exits[0], Some(0));
+    assert_eq!(exits[1], Some(0));
+    let messages = tool_results(&engine, &result);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("is no longer blocked")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn a_different_command_passing_leaves_the_step_blocked() {
+    let repo = temp_repo("blocked-other-command");
+    let engine = engine_with_a_check_that_passes_on_its_second_run(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"A"},{"title":"B"}]}"#,
+        )],
+        vec![call(
+            "run_command",
+            r#"{"command":"./check","reason":"Check it"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"ls src","reason":"Something else that works"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+
+    let result = ask(&engine, &repo, "Do it", &mut adapter);
+    let plan = plan_of(&engine, &result).expect("the turn proposed a plan");
+
+    assert_eq!(plan.steps[0].status, StepStatus::Blocked);
+    assert_eq!(plan.steps[1].status, StepStatus::Pending);
+    // What was observed since is kept on the step for the next re-check.
+    assert_eq!(
+        plan.steps[0]
+            .evidence
+            .iter()
+            .filter(|item| matches!(item, Evidence::CommandExit { .. }))
+            .count(),
+        2,
+        "{:?}",
+        plan.steps[0].evidence
+    );
+    let messages = tool_results(&engine, &result);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("is still blocked")
+                && message.contains("same command")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn a_check_that_failed_then_passed_within_the_step_completes_it() {
+    let repo = temp_repo("fail-then-pass");
+    let engine = engine_with_a_check_that_passes_on_its_second_run(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"A"},{"title":"B"}]}"#,
+        )],
+        vec![call(
+            "run_command",
+            r#"{"command":"./check","reason":"Check it"}"#,
+        )],
+        vec![call(
+            "run_command",
+            r#"{"command":"./check","reason":"Check it again"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+
+    let result = ask(&engine, &repo, "Do it", &mut adapter);
+    let plan = plan_of(&engine, &result).expect("the turn proposed a plan");
+
+    assert_eq!(plan.steps[0].status, StepStatus::Completed);
+    assert_eq!(plan.steps[1].status, StepStatus::InProgress);
+}
+
 #[test]
 fn a_step_whose_command_passed_completes_and_carries_its_evidence() {
     let repo = temp_repo("passed");

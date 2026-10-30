@@ -19,6 +19,13 @@ prompt = "Check whether the no-such-directory folder lists cleanly, and keep try
 # An approval-gated failing command (`false`, say) would NOT test this: the turn
 # would stop at the proposal after one round and the assertion would pass
 # without the loop ever running.
+#
+# Pinned to the old default of 8 so the loop stays short; the bound is what is
+# tested, not the product default (16).
+config_overlay = """
+agent_max_tool_rounds=8
+"""
+
 [[turn]]
 content = ""
 tool_calls = [
@@ -26,11 +33,11 @@ tool_calls = [
 ]
 
 [assert]
-# 9, and the extra one is not slack. `agent_max_tool_rounds` is 8
-# (config.rs:1175) and bounds the *tool rounds*; after the last round the engine
-# makes one more model call to produce the closing answer, so a correctly bounded
-# run makes 8 + 1 = 9 calls. Measured, not assumed: the first version of this
-# scenario asserted 8 and observed exactly 9.
+# 9: `agent_max_tool_rounds` is pinned to 8 above and bounds the *tool rounds*.
+# Before spec 61 the engine then made one closing call, so a bounded run made
+# 8 + 1 = 9 calls (measured: the first version asserted 8 and observed 9). Since
+# spec 61 the turn pauses before that call and the harness does not answer the
+# pause, so the run makes 8; the ceiling of 9 still holds.
 #
 # This still catches the failure it exists for — an unenforced bound produces an
 # unbounded call count, not 10 — and the companion test

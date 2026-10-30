@@ -128,13 +128,22 @@ enum ActionOutcome {
 /// [`ActionOutcome::Failed`] likewise: it carries no code, so there is nothing
 /// to record that would not be invented, and the step's status follows from
 /// the *absence* of confirming evidence.
-fn evidence_for(outcome: &ActionOutcome, marker_id: &str) -> Option<crate::plan::Evidence> {
+///
+/// `command` is the command line that ran, when the action was one. Only its
+/// hash is kept, so a later run of the same command can supersede this exit
+/// (spec 21 §5.3).
+fn evidence_for(
+    outcome: &ActionOutcome,
+    marker_id: &str,
+    command: Option<&str>,
+) -> Option<crate::plan::Evidence> {
     match outcome {
         ActionOutcome::CommandExit(exit_code, purpose) => {
             Some(crate::plan::Evidence::CommandExit {
                 marker_id: marker_id.to_string(),
                 exit_code: *exit_code,
                 purpose: *purpose,
+                command_hash: command.map(command_hash),
             })
         }
         // No marker id: unlike a command, the fact worth keeping is *which
@@ -146,6 +155,20 @@ fn evidence_for(outcome: &ActionOutcome, marker_id: &str) -> Option<crate::plan:
             hash: hash.clone(),
         }),
         ActionOutcome::Ok | ActionOutcome::Failed | ActionOutcome::Cancelled => None,
+    }
+}
+
+/// The hash `Evidence::CommandExit::command_hash` holds: of the exact text, so
+/// only an identical command line counts as the same command.
+fn command_hash(command: &str) -> String {
+    crate::hash::sha256(command)
+}
+
+/// The command line a tool action runs, if it runs one.
+fn action_command(action: &ToolAction) -> Option<&str> {
+    match action {
+        ToolAction::Command(request) => Some(request.command.as_str()),
+        _ => None,
     }
 }
 
@@ -2646,6 +2669,7 @@ impl ChatOrchestrator {
             marker_id: marker_id.clone(),
             exit_code,
             purpose: record.execution.purpose,
+            command_hash: Some(command_hash(&record.execution.command)),
         }];
         if let Some(findings) = findings {
             evidence.push(findings);
@@ -2736,6 +2760,8 @@ impl ChatOrchestrator {
             marker_id: record.id.clone(),
             exit_code: Some(exit_code),
             purpose: CommandPurpose::Check,
+            // A browser check is not a command line; each run stands alone.
+            command_hash: None,
         };
         if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
             step.evidence = vec![evidence];
@@ -3600,6 +3626,7 @@ impl ChatOrchestrator {
                         record.execution.purpose,
                     ),
                     &record.execution.id,
+                    Some(&command_request.command),
                 ) {
                     step_evidence.push(evidence);
                 }
@@ -7465,41 +7492,40 @@ impl ChatOrchestrator {
                             ),
                             Some(current) => {
                                 // A step can only be closed while it is the one
-                                // running. A second `complete_step` after a block
+                                // running, or re-judged while it is the one
+                                // blocked. A second `complete_step` after a block
                                 // used to find no open step, leave `status` at its
                                 // default `Completed`, and start the next pending
                                 // step — laundering the block into a handoff
-                                // (found in a session on 2026-10-26).
-                                match current.steps.iter().position(|step| {
+                                // (found in a session on 2026-10-26). It then
+                                // became a refusal with no way out, so a block
+                                // stood for the rest of the turn even after the
+                                // model fixed it (2026-10-29). A blocked step is
+                                // now judged again on everything observed since,
+                                // by the same rule: it clears only when the
+                                // command that failed has since passed.
+                                let running = current.steps.iter().position(|step| {
                                     step.status == crate::plan::StepStatus::InProgress
-                                }) {
-                                    None => {
-                                        let blocked = current
-                                            .steps
-                                            .iter()
-                                            .find(|step| {
-                                                step.status == crate::plan::StepStatus::Blocked
-                                            })
-                                            .map(|step| step.title.clone());
-                                        let result = match blocked {
-                                            Some(title) => format!(
-                                                "No step is in progress. Step \"{title}\" is blocked: resolve what blocked it before moving on; the remaining steps are still pending."
-                                            ),
-                                            None => "No step is in progress, so there is nothing to complete. Do not call complete_step again.".to_string(),
-                                        };
-                                        (
-                                            "Attempted to complete a step.".to_string(),
-                                            result,
-                                            ActionOutcome::Failed,
-                                        )
-                                    }
+                                });
+                                let blocked = current.steps.iter().position(|step| {
+                                    step.status == crate::plan::StepStatus::Blocked
+                                });
+                                match running.or(blocked) {
+                                    None => (
+                                        "Attempted to complete a step.".to_string(),
+                                        "No step is in progress, so there is nothing to complete. Do not call complete_step again.".to_string(),
+                                        ActionOutcome::Failed,
+                                    ),
                                     Some(open_index) => {
+                                        let was_blocked = current.steps[open_index].status
+                                            == crate::plan::StepStatus::Blocked;
                                         // The model asked to move on; it does not get
                                         // to say how the step ended. §5.3: the status
                                         // is a function of the evidence, and this is
                                         // the only place a step reaches a terminal
                                         // status.
                                         let accrued = std::mem::take(&mut step_evidence);
+                                        let observed_more = !accrued.is_empty();
                                         let now = now_millis();
                                         let open = &mut current.steps[open_index];
                                         // Extends rather than replaces. A step can
@@ -7514,54 +7540,80 @@ impl ChatOrchestrator {
                                         open.evidence.extend(accrued);
                                         let status =
                                             crate::plan::status_from_evidence(&open.evidence);
-                                        open.status = status;
-                                        open.completed_at_ms = Some(now);
                                         let finished_title = open.title.clone();
-                                        let closed = open.clone();
-                                        self.session_store.update_plan_step(&task, &closed)?;
+                                        if was_blocked && status == crate::plan::StepStatus::Blocked {
+                                            // Still blocked: nothing hands off, and the
+                                            // block keeps its time. What was observed
+                                            // since is kept, so the next re-check
+                                            // weighs it too.
+                                            if observed_more {
+                                                let kept = open.clone();
+                                                self.session_store.update_plan_step(&task, &kept)?;
+                                                sink.plan(current);
+                                            }
+                                            (
+                                                "Attempted to complete a step.".to_string(),
+                                                format!(
+                                                    "No step is in progress. Step \"{finished_title}\" is still blocked: a command it ran failed, and that same command has not succeeded since. Fix the cause, run exactly the same command again (a different command does not clear it), then call complete_step. The remaining steps are still pending."
+                                                ),
+                                                ActionOutcome::Failed,
+                                            )
+                                        } else {
+                                            open.status = status;
+                                            open.completed_at_ms = Some(now);
+                                            let closed = open.clone();
+                                            self.session_store.update_plan_step(&task, &closed)?;
 
-                                        // A blocked step does not hand off: the next
-                                        // step's prerequisite failed, and starting it
-                                        // anyway would build on work that did not
-                                        // happen.
-                                        let mut next_title = None;
-                                        if status == crate::plan::StepStatus::Completed
-                                            && let Some(next) =
-                                                current.steps.iter_mut().find(|step| {
-                                                    step.status == crate::plan::StepStatus::Pending
-                                                })
-                                        {
-                                            next.status = crate::plan::StepStatus::InProgress;
-                                            next.started_at_ms = Some(now);
-                                            next_title = Some(next.title.clone());
-                                            let started = next.clone();
-                                            self.session_store.update_plan_step(&task, &started)?;
+                                            // A blocked step does not hand off: the next
+                                            // step's prerequisite failed, and starting it
+                                            // anyway would build on work that did not
+                                            // happen.
+                                            let mut next_title = None;
+                                            if status == crate::plan::StepStatus::Completed
+                                                && let Some(next) =
+                                                    current.steps.iter_mut().find(|step| {
+                                                        step.status
+                                                            == crate::plan::StepStatus::Pending
+                                                    })
+                                            {
+                                                next.status = crate::plan::StepStatus::InProgress;
+                                                next.started_at_ms = Some(now);
+                                                next_title = Some(next.title.clone());
+                                                let started = next.clone();
+                                                self.session_store
+                                                    .update_plan_step(&task, &started)?;
+                                            }
+                                            // Once, after the handoff rather than after
+                                            // each of its two writes: between them the
+                                            // closing step is already terminal and the
+                                            // next has not opened, so a panel updated
+                                            // mid-handoff would blink through a state
+                                            // with no current step. The log keeps both
+                                            // writes; the panel does not need them.
+                                            sink.plan(current);
+
+                                            let done = if was_blocked {
+                                                format!(
+                                                    "Step \"{finished_title}\" is no longer blocked: the command that failed has since succeeded."
+                                                )
+                                            } else {
+                                                format!("Step \"{finished_title}\" is complete.")
+                                            };
+                                            let result = match (status, &next_title) {
+                                                (crate::plan::StepStatus::Blocked, _) => format!(
+                                                    "Step \"{finished_title}\" is blocked: a command it ran did not succeed. Fix the cause and run that same command again; complete_step then checks the step again. The remaining steps are still pending."
+                                                ),
+                                                (_, Some(next)) => {
+                                                    format!("{done} The current step is now: {next}.")
+                                                }
+                                                (_, None) => format!("{done} That was the last step."),
+                                            };
+                                            (
+                                                format!("Finished: {finished_title}"),
+                                                result,
+                                                ActionOutcome::Ok,
+                                            )
                                         }
-                                        // Once, after the handoff rather than after
-                                        // each of its two writes: between them the
-                                        // closing step is already terminal and the
-                                        // next has not opened, so a panel updated
-                                        // mid-handoff would blink through a state with
-                                        // no current step. The log keeps both writes;
-                                        // the panel does not need them.
-                                        sink.plan(current);
-
-                                        let result = match (status, &next_title) {
-                                            (crate::plan::StepStatus::Blocked, _) => format!(
-                                                "Step \"{finished_title}\" is blocked: a command it ran did not succeed. Fix that before moving on; the remaining steps are still pending."
-                                            ),
-                                            (_, Some(next)) => format!(
-                                                "Step \"{finished_title}\" is complete. The current step is now: {next}."
-                                            ),
-                                            (_, None) => format!(
-                                                "Step \"{finished_title}\" is complete. That was the last step."
-                                            ),
-                                        };
-                                        (
-                                            format!("Finished: {finished_title}"),
-                                            result,
-                                            ActionOutcome::Ok,
-                                        )
                                     }
                                 }
                             }
@@ -8251,7 +8303,11 @@ impl ChatOrchestrator {
                 // belongs to whichever step is open; with no plan there is nothing
                 // to attach it to and this is a no-op.
                 if plan.is_some()
-                    && let Some(evidence) = evidence_for(&action_outcome, action_marker.id())
+                    && let Some(evidence) = evidence_for(
+                        &action_outcome,
+                        action_marker.id(),
+                        action_command(&after_tool_action),
+                    )
                 {
                     step_evidence.push(evidence);
                 }
@@ -9711,12 +9767,19 @@ impl ChatOrchestrator {
                 // A literal glob is a path request, so it can be refused
                 // outright. A pattern with wildcards is filtered while walking,
                 // below, because no single path can answer it.
+                // The glob is part of what was searched, so the session log
+                // names it: without it, "0 matches" cannot be told apart from
+                // a search that covered nothing.
+                let in_glob = path_glob
+                    .as_deref()
+                    .map(|glob| format!(" in `{glob}`"))
+                    .unwrap_or_default();
                 if let Some(glob) = path_glob
                     && !glob.contains(['*', '?', '[', '{'])
                     && outside_restriction(Some(glob))
                 {
                     return (
-                        format!("Searched for \"{pattern}\"{scope}"),
+                        format!("Searched for \"{pattern}\"{in_glob}{scope}"),
                         format!(
                             "Cannot search {glob}{scope}: the path is outside this session's path restriction."
                         ),
@@ -9749,16 +9812,42 @@ impl ChatOrchestrator {
                         } else {
                             ""
                         };
-                        let content = format!(
-                            "{} matches for \"{}\" across {} files{scope}{note} (showing {}):\n{}",
-                            found.total_found,
-                            pattern,
-                            found.files_searched,
-                            found.matches.len(),
-                            lines,
-                        );
+                        // A search that read no file found nothing because it
+                        // looked nowhere. Saying "0 matches" would read as
+                        // evidence of absence, so it says what happened instead.
+                        let content = if found.files_searched == 0 {
+                            match path_glob {
+                                Some(glob) => format!(
+                                    "No file was searched for \"{pattern}\"{scope}{note}: the glob \
+                                     `{glob}` matched no readable file. Only `*` (within one \
+                                     directory), `**` (across directories) and `?` are \
+                                     wildcards; `{{a,b}}` and `[...]` are matched literally. \
+                                     This is not evidence that the text is absent: search \
+                                     again with one glob per directory, or without a glob.\n"
+                                ),
+                                None if context_restriction.is_some() => format!(
+                                    "No file was searched for \"{pattern}\"{scope}: this \
+                                     session's path restriction admits no file to search. \
+                                     This is not evidence that the text is absent.\n"
+                                ),
+                                None => format!(
+                                    "No file was searched for \"{pattern}\"{scope}: there is \
+                                     no readable text file to search. This is not evidence \
+                                     that the text is absent.\n"
+                                ),
+                            }
+                        } else {
+                            format!(
+                                "{} matches for \"{}\" across {} files{scope}{note} (showing {}):\n{}",
+                                found.total_found,
+                                pattern,
+                                found.files_searched,
+                                found.matches.len(),
+                                lines,
+                            )
+                        };
                         (
-                            format!("Searched for \"{pattern}\"{scope}"),
+                            format!("Searched for \"{pattern}\"{in_glob}{scope}"),
                             content,
                             ActionOutcome::Ok,
                         )
@@ -10589,8 +10678,8 @@ const ABSOLUTE_TOOL_ROUND_CAP: u32 = 16;
 const ABSOLUTE_EXPLORATION_ROUND_CAP: u32 = 32;
 
 /// Absolute bound on the rounds of one turn across all round-budget
-/// continuations (spec 61 §5.3): the initial eight-round segment plus seven
-/// continuations of eight. Distinct from [`ABSOLUTE_TOOL_ROUND_CAP`], which
+/// continuations (spec 61 §5.3): four segments at the default of sixteen
+/// rounds. Distinct from [`ABSOLUTE_TOOL_ROUND_CAP`], which
 /// bounds a single configured segment — and #47's token-ceiling continuation,
 /// which the manual *Continue* is not tied to.
 const ABSOLUTE_TURN_ROUND_CAP: u32 = 64;
@@ -11955,10 +12044,17 @@ fn tool_action_label(action: &ToolAction) -> String {
             (None, None) => "Listing the repository".to_string(),
         },
         ToolAction::SearchContent {
-            pattern, worktree, ..
+            pattern,
+            path_glob,
+            worktree,
+            ..
         } => {
             format!(
-                "Searching for \"{pattern}\"{}",
+                "Searching for \"{pattern}\"{}{}",
+                path_glob
+                    .as_deref()
+                    .map(|glob| format!(" in `{glob}`"))
+                    .unwrap_or_default(),
                 in_worktree(worktree.as_deref())
             )
         }
@@ -12111,7 +12207,7 @@ fn search_content_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "search_content".to_string(),
         description: "Search file contents by regular expression and return path, line number and the matching line. Use this to find call sites; use search_codebase to find which files are about a topic. With `worktree`, search a git worktree of this repository instead.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"pattern\":{\"type\":\"string\",\"description\":\"Regular expression\"},\"path_glob\":{\"type\":\"string\",\"description\":\"Optional glob limiting which files are searched\"},\"max_matches\":{\"type\":\"integer\",\"description\":\"Fewer matches than the configured cap; it cannot raise it\"}},\"required\":[\"pattern\"]}".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"pattern\":{\"type\":\"string\",\"description\":\"Regular expression\"},\"path_glob\":{\"type\":\"string\",\"description\":\"Optional glob over repository-relative paths limiting which files are searched. Only * (within one directory), ** (across directories) and ? are wildcards; {a,b} and [...] are matched literally, so search once per directory instead\"},\"max_matches\":{\"type\":\"integer\",\"description\":\"Fewer matches than the configured cap; it cannot raise it\"}},\"required\":[\"pattern\"]}".to_string(),
     }
 }
 
@@ -12150,7 +12246,7 @@ fn read_git_diff_tool_definition() -> ToolDefinition {
 fn list_worktrees_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "list_worktrees".to_string(),
-        description: "List this repository's git worktrees: each one's path, branch (or `detached`), short HEAD, count of changed files, and how far it is ahead of and behind a base branch. Use this to discover the worktrees, then pass one's path as `worktree` to the read tools. Restricted files are not counted. Prefer this over running git in a shell: it needs no approval.".to_string(),
+        description: "List this repository's git worktrees: each one's path, branch (or `detached`), short HEAD, count of changed files, and how far it is ahead of and behind a base branch. Use this to discover the worktrees, then pass one's path as `worktree` to the read tools. Worktrees this session cannot read (for example outside the repository root and `allowed_roots`) are listed after them with branch, HEAD, ahead/behind and why, so the list is every registered worktree but this session's own checkout. Restricted files are not counted. Prefer this over running git in a shell: it needs no approval.".to_string(),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"base\":{\"type\":\"string\",\"description\":\"A branch name to measure ahead/behind against; defaults to the main worktree's branch, and is omitted when it is detached\"}},\"required\":[]}".to_string(),
     }
 }
@@ -13101,6 +13197,35 @@ fn format_worktree_listing(listing: &WorktreeListing) -> String {
             listing.entries.len() + listing.omitted
         ));
     }
+    // Spec 60 §5.1: without this section a survey that cannot read a worktree
+    // reads as complete, and a model concludes the worktree does not exist.
+    if !listing.unreachable.is_empty() {
+        text.push_str(&format!(
+            "Not readable from this session ({}); the read tools refuse these. Branch, HEAD and ahead/behind come from git's worktree list and this repository's commits, not from the worktree:\n",
+            listing.unreachable.len() + listing.unreachable_omitted
+        ));
+        for worktree in &listing.unreachable {
+            let mut line = format!(
+                "{}: {} @ {}",
+                worktree.path,
+                worktree.branch.as_deref().unwrap_or("detached"),
+                worktree.head.as_deref().unwrap_or("unknown"),
+            );
+            if let (Some(ahead), Some(behind)) = (worktree.ahead, worktree.behind) {
+                line.push_str(&format!(", {ahead} ahead, {behind} behind"));
+            }
+            line.push_str(&format!("; it {}", worktree.reason));
+            text.push_str(&line);
+            text.push('\n');
+        }
+        if listing.unreachable_omitted > 0 {
+            text.push_str(&format!(
+                "[Unreadable worktrees truncated: {} of {} listed.]\n",
+                listing.unreachable.len(),
+                listing.unreachable.len() + listing.unreachable_omitted
+            ));
+        }
+    }
     text
 }
 
@@ -13233,12 +13358,14 @@ mod evidence_tests {
         assert_eq!(
             evidence_for(
                 &ActionOutcome::CommandExit(Some(1), CommandPurpose::Check),
-                "action_1"
+                "action_1",
+                Some("cargo test")
             ),
             Some(Evidence::CommandExit {
                 marker_id: "action_1".to_string(),
                 exit_code: Some(1),
                 purpose: CommandPurpose::Check,
+                command_hash: Some(crate::hash::sha256("cargo test")),
             })
         );
     }
@@ -13251,12 +13378,14 @@ mod evidence_tests {
         assert_eq!(
             evidence_for(
                 &ActionOutcome::CommandExit(None, CommandPurpose::Other),
-                "action_1"
+                "action_1",
+                None
             ),
             Some(Evidence::CommandExit {
                 marker_id: "action_1".to_string(),
                 exit_code: None,
                 purpose: CommandPurpose::Other,
+                command_hash: None,
             })
         );
     }
@@ -13268,12 +13397,14 @@ mod evidence_tests {
         assert_eq!(
             evidence_for(
                 &ActionOutcome::CommandExit(Some(1), CommandPurpose::Exploration),
-                "action_1"
+                "action_1",
+                None
             ),
             Some(Evidence::CommandExit {
                 marker_id: "action_1".to_string(),
                 exit_code: Some(1),
                 purpose: CommandPurpose::Exploration,
+                command_hash: None,
             })
         );
     }
@@ -13284,7 +13415,7 @@ mod evidence_tests {
         // served is done. Manufacturing a success record from it is exactly
         // the letter-not-spirit failure requirement 6 guards against — it
         // would make every step look verified.
-        assert_eq!(evidence_for(&ActionOutcome::Ok, "action_1"), None);
+        assert_eq!(evidence_for(&ActionOutcome::Ok, "action_1", None), None);
     }
 
     #[test]
@@ -13292,7 +13423,7 @@ mod evidence_tests {
         // `Failed` carries no exit code, so there is nothing to record that
         // would not be invented. The step's own status comes from the absence
         // of confirming evidence, not from a fabricated failure record.
-        assert_eq!(evidence_for(&ActionOutcome::Failed, "action_1"), None);
+        assert_eq!(evidence_for(&ActionOutcome::Failed, "action_1", None), None);
     }
 
     /// Requirement 5: a command that was killed reports why it stopped. `-1` is

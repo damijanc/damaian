@@ -205,6 +205,15 @@ The status rule:
 | `CommandExit` with `exit_code: None` | **not** `completed`. The command did not report an exit status, so nothing is known. `blocked` |
 | `PatchApplied` with hashes matching what was written | `completed` |
 | No evidence of any kind | `completed_unverified` in the report; `completed` in the plan, with an empty `evidence` vec |
+| A `CommandExit` followed by a later run of the **same command** | superseded: only the latest run of a command decides (added 2026-10-29, §7) |
+
+"The same command" is the exact command line, compared by
+`CommandExit::command_hash` (SHA-256 of the text, so the text itself, which can
+hold a secret, never reaches the plan). A check that failed, was fixed and then
+passed is a step that succeeded; one that passed and then failed is not. A
+different command passing says nothing about the one that failed and supersedes
+nothing. Evidence without a hash — written before the field existed, or a
+browser check — is judged one exit at a time, as before.
 
 `exit_code: None` is called out because `CommandExecution.exit_code` is
 `Option<i32>` (`command_runner.rs:19`) — a killed or signalled command has no
@@ -484,3 +493,40 @@ forbid. A call with no step in progress is now refused with
 the pending evidence untouched. Pinned by
 `a_second_complete_step_after_a_block_is_refused_and_starts_nothing`, which
 fails on the old code at the third step becoming `InProgress`.
+
+### A blocked step is judged again, and clears only on the same command
+
+Found in a session on 2026-10-29. The 2026-10-26 fix above made a second
+`complete_step` after a block a refusal, but nothing could ever clear the
+block: the refusal said "resolve what blocked it", and no action did. In a
+live run a probe (`command -v node; …`, exit 1) and `npm run specs:check`
+(exit 127, `npm` not on the shell's PATH) blocked a reporting step; the model
+then found `node` and ran the script directly, and four further
+`complete_step` calls got the same refusal, so the turn ended with three steps
+open. Two changes:
+
+- **Only the latest run of a command decides** (§5.3, the row added to the
+  status rule). Evidence gains `command_hash`, minted beside the exit in
+  `evidence_for` and in the verification loop's own check, so a check that
+  failed and was rerun successfully, within a step or after a block, no longer
+  blocks it. This is not a soft pass: the failure stays in the evidence, and
+  only an identical command line passing clears it, never a different command.
+- **`complete_step` re-judges a blocked step.** With no step in progress and
+  one blocked, the call adds what was observed since to the blocked step and
+  applies the same rule. If it now completes, the step closes and hands off
+  as any completion does, with "is no longer blocked" in the result. If not, it
+  stays blocked, its new evidence is kept, nothing hands off, and the call is
+  refused with `ActionOutcome::Failed` and a message saying exactly what
+  clears it: the same command, run again, succeeding. The 2026-10-26 guarantee
+  holds: `a_second_complete_step_after_a_block_is_refused_and_starts_nothing`
+  still passes unchanged.
+
+The probe that started it is fixed separately: `which`, `type`, `whence`,
+`command -v` and `command -V` are now exploration (spec 63 §5.3), so a lookup
+that finds nothing no longer blocks. Pinned by
+`a_blocked_step_recovers_when_the_same_command_later_passes`,
+`a_different_command_passing_leaves_the_step_blocked` and
+`a_check_that_failed_then_passed_within_the_step_completes_it`
+(`tests/plan_turn.rs`), and the status-rule tests beside
+`one_failure_among_successes_still_blocks` (`tests/plan.rs`); with the
+supersession rule disabled, the three that rerun a command fail.

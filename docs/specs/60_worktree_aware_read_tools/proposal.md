@@ -160,19 +160,26 @@ session's own canonical root. A session whose root is a linked worktree — a
 spec 57 worker, or a development worktree — therefore sees its own entry as the
 own checkout and every other entry, including the main checkout and its
 siblings, as outside that root. With the default empty `allowed_roots` the
-reachable set is empty, and `list_worktrees` prints
-`Worktrees (0 listed, ahead/behind vs <base>):`. It lists only reachable
-entries, so it does not name the refusals; a model reading that result alone can
-conclude no worktree is registered. `git worktree list` and the
-`git_worktrees_listed` audit record (`count: 0`, `resourcePath` = the session's
-root) show what is actually registered. To survey the repository from such a
-session, add the main checkout to `allowed_roots` or run the tool from the main
-checkout. This is deliberate (`tasks.md` C1): the location rule exists so a
-session is not silently given another checkout, and the containment root is the
-checkout the user opened, not the repository's main worktree. The pinned
-behavior is
-`from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots`
+reachable set is empty: `list_worktrees` reads none of them and names each one
+as not readable (§5.2). To read them from such a session, add the main checkout
+to `allowed_roots` or run the tool from the main checkout. This is deliberate
+(`tasks.md` C1): the location rule exists so a session is not silently given
+another checkout, and the containment root is the checkout the user opened, not
+the repository's main worktree. The pinned behavior is
+`from_a_linked_worktree_list_worktrees_reads_none_but_names_them_without_allowed_roots`
 (`tests/worktree_reads.rs`).
+
+**An unreachable worktree is named, never read.** Until 2026-10-29
+`list_worktrees` listed only reachable entries, so a model reading the result
+could conclude a worktree it could not reach did not exist (§7). It now lists
+every registered worktree except the session's own checkout: the reachable ones
+as before, then the unreachable ones with their refusal. For those, branch and
+`HEAD` come from git's porcelain list, and ahead/behind from
+`rev-list --left-right --count base...<HEAD>` run at the session's root, which
+shares the repository's object store. Nothing runs in, or reads from, the
+worktree's directory, so the location rule still decides every read; naming a
+registration git already holds for this repository gives nothing the rule
+protects. The `HEAD` id is passed back to git only when it is all hex digits.
 
 A `worktree` argument is resolved by canonicalizing it — as given, absolute or
 relative to the repository root — and comparing it with the canonical paths of
@@ -197,7 +204,7 @@ extra git spawn per call that names a worktree.
 
 | Tool | New or changed arguments | Returns |
 |---|---|---|
-| `list_worktrees` (new) | `base?` | One entry per reachable worktree: repository-relative path (absolute when outside the root), branch or `detached`, short `HEAD`, changed-file count, and commits ahead and behind `base` |
+| `list_worktrees` (new) | `base?` | One entry per reachable worktree: repository-relative path (absolute when outside the root), branch or `detached`, short `HEAD`, changed-file count, and commits ahead and behind `base`; then, when there are any, one entry per unreachable worktree other than the session's own checkout: path, branch, short `HEAD`, ahead and behind, and the refusal (§5.1) |
 | `read_file` | `worktree?` | Unchanged, with paths relative to the worktree |
 | `list_directory` | `worktree?` | Unchanged, walking the worktree under its own `.gitignore` |
 | `search_content` | `worktree?` | Unchanged, searching the worktree |
@@ -213,7 +220,8 @@ the default is absent and `ahead`/`behind` are omitted rather than guessed.
 spent a round, and an approval, per worktree to get them. With `n` worktrees it
 spawns `1 + 3n` git processes (the list, then `status`, `rev-parse --short HEAD`
 and `rev-list --left-right --count` per worktree), capped at 20 worktrees with
-the rest counted. On this machine a spawn is usually milliseconds and
+the rest counted, plus `rev-parse` and `rev-list` per unreachable worktree under
+its own cap of 20. On this machine a spawn is usually milliseconds and
 occasionally ~280 ms (`docs/DEVELOPMENT.md`, "The quality gate is slow
 locally"), so the cap also bounds the worst case.
 
@@ -284,7 +292,8 @@ the gaps are the same ([`context.md`](context.md) §3).
 - The audit records of the five read tools (`file_read`, `directory_listed`,
   `content_searched`, `git_status_read` and `git_diff_read`) gain a `worktree`
   field, the worktree's display path, empty for the session's own checkout. `list_worktrees` records
-  `git_worktrees_listed` with the count, and `read_git_log` records
+  `git_worktrees_listed` with the count, the omitted count and the number of
+  unreachable worktrees named, and `read_git_log` records
   `git_log_read`.
 - The action marker's `ref` carries the worktree prefix
   (`.claude/worktrees/spec25-task8:crates/…/symbol_index.rs`), so the session log
@@ -327,10 +336,13 @@ and why: not registered, outside the allowed roots, or prunable), and
 
 - `list_worktrees` on this repository lists every worktree `git worktree list`
   shows inside the repository root, except the main one, with branch, `HEAD`,
-  dirty count and ahead/behind against the main worktree's branch. From a
-  session whose own checkout is a linked worktree it lists nothing unless
-  `allowed_roots` contains the main checkout; that limitation is recorded in
-  §5.1 and pinned by `from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots`.
+  dirty count and ahead/behind against the main worktree's branch. Every other
+  registered worktree but the session's own checkout is named after them with
+  branch, `HEAD`, ahead/behind and its refusal, and without a dirty count. From
+  a session whose own checkout is a linked worktree it reads none unless
+  `allowed_roots` contains the main checkout, and names them all; recorded in
+  §5.1 and pinned by
+  `from_a_linked_worktree_list_worktrees_reads_none_but_names_them_without_allowed_roots`.
 - Each of the five existing read tools, given `worktree`, reads that worktree;
   without it, its output is byte-identical to before on the existing
   deterministic scenarios.
@@ -415,6 +427,21 @@ and why: not registered, outside the allowed roots, or prunable), and
   main checkout to `allowed_roots` or run the tool from the main checkout.
   Observed in the spec 65 live run, whose session root was this repository's
   spec 65 worktree. Pinned by
-  `from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots`.
-  Deliberate under `tasks.md` C1; using the main worktree as the containment
+  `from_a_linked_worktree_list_worktrees_is_empty_without_allowed_roots`
+  (renamed and extended on 2026-10-29; see the next note). Deliberate under `tasks.md` C1; using the main worktree as the containment
   root would be a design change, not a bug fix.
+- **Unreachable worktrees are named, 2026-10-29.** The limitation above also
+  hid worktrees outside the repository root from a session in the main
+  checkout. In a live run that day (`deepseek-v4-flash`, "check what specs are
+  left to implement, also check worktrees…"), eight of this repository's eleven
+  worktrees lived under another tool's data directory. `list_worktrees` showed
+  the other three, and the model reported that nothing was in progress and that
+  spec 30 had no branch, while `spec-30-memory-recall` was six commits ahead.
+  A second run found the eight only by running `git worktree list` and other
+  compound git commands, at seven approvals. `list_worktrees` now names every
+  unreachable worktree but the session's own checkout, with branch, `HEAD`,
+  ahead/behind and the refusal, read from git's list and the shared object
+  store and never from the worktree (§5.1, §5.2). The containment rule is
+  unchanged: those worktrees are still refused to every read tool. The pinned
+  test is renamed
+  `from_a_linked_worktree_list_worktrees_reads_none_but_names_them_without_allowed_roots`.

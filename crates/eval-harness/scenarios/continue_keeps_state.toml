@@ -17,10 +17,16 @@ round_budget_decision = "continue"
 # `list_directory` would stop reaching the round budget once that spec lands.
 # A command round is an action round in both worlds.
 #
-# Eight rounds reach the default `agent_max_tool_rounds` (8). The turn pauses
+# Eight rounds reach `agent_max_tool_rounds` (8, pinned below). The turn pauses
 # before making its ninth model call, so responses nine through twelve are only
 # consumed after *Continue*. The ninth asks for the same call again — the pause
 # happened before it dispatched — and the last response answers.
+# Pinned to the old default: the scenario counts rounds against this
+# budget, and the product default (16) is not what it tests.
+config_overlay = """
+agent_max_tool_rounds=8
+"""
+
 [[turn]]
 content = ""
 tool_calls = [

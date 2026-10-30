@@ -115,6 +115,7 @@ fn a_plan_round_trips_through_json_unchanged() {
                 marker_id: "action_1".to_string(),
                 exit_code: Some(0),
                 purpose: CommandPurpose::Other,
+                command_hash: None,
             }],
         }],
     };
@@ -142,6 +143,7 @@ fn an_absent_exit_code_survives_the_round_trip_as_absent() {
         marker_id: "action_1".to_string(),
         exit_code: None,
         purpose: CommandPurpose::Other,
+        command_hash: None,
     };
     let text = serde_json::to_string(&evidence).expect("evidence serializes");
     assert_eq!(
@@ -194,6 +196,7 @@ fn the_newest_event_per_step_wins_on_replay() {
         marker_id: "action_1".to_string(),
         exit_code: Some(0),
         purpose: CommandPurpose::Other,
+        command_hash: None,
     }];
     fixture.store.update_plan_step(&task, &first).unwrap();
 
@@ -569,6 +572,7 @@ fn command_exit(exit_code: Option<i32>) -> Evidence {
         marker_id: "action_1".to_string(),
         exit_code,
         purpose: CommandPurpose::Other,
+        command_hash: None,
     }
 }
 
@@ -647,7 +651,8 @@ fn an_absent_exit_code_blocks_the_step() {
 
 #[test]
 fn one_failure_among_successes_still_blocks() {
-    // A step is not done because most of its checks passed.
+    // A step is not done because most of its checks passed. These carry no
+    // command hash, so they are different commands as far as the rule knows.
     assert_eq!(
         status_from_evidence(&[command_exit(Some(0)), command_exit(Some(1))]),
         StepStatus::Blocked
@@ -656,6 +661,75 @@ fn one_failure_among_successes_still_blocks() {
         status_from_evidence(&[command_exit(Some(1)), command_exit(Some(0))]),
         StepStatus::Blocked
     );
+}
+
+fn run_of(command: &str, exit_code: Option<i32>) -> Evidence {
+    Evidence::CommandExit {
+        marker_id: "action_1".to_string(),
+        exit_code,
+        purpose: CommandPurpose::Other,
+        command_hash: Some(format!("hash-of:{command}")),
+    }
+}
+
+#[test]
+fn a_failure_the_same_command_later_passed_no_longer_blocks() {
+    // Fix, then run it again: only the latest run of a command decides.
+    assert_eq!(
+        status_from_evidence(&[run_of("cargo test", Some(1)), run_of("cargo test", Some(0))]),
+        StepStatus::Completed
+    );
+    assert_eq!(
+        status_from_evidence(&[run_of("cargo test", None), run_of("cargo test", Some(0))]),
+        StepStatus::Completed
+    );
+}
+
+#[test]
+fn a_pass_the_same_command_later_failed_still_blocks() {
+    assert_eq!(
+        status_from_evidence(&[
+            run_of("cargo test", Some(1)),
+            run_of("cargo test", Some(0)),
+            run_of("cargo test", Some(1)),
+        ]),
+        StepStatus::Blocked
+    );
+}
+
+#[test]
+fn a_different_command_passing_does_not_clear_a_failure() {
+    // The case the rule must not open: `npm run check` cannot run, so the
+    // model runs something else that works. Nothing says the failed check
+    // passed, so the step stays blocked.
+    assert_eq!(
+        status_from_evidence(&[
+            run_of("npm run check", Some(127)),
+            run_of("node scripts/check.mjs", Some(0)),
+        ]),
+        StepStatus::Blocked
+    );
+    // Nor does a run without a hash stand in for one with.
+    assert_eq!(
+        status_from_evidence(&[run_of("cargo test", Some(1)), command_exit(Some(0))]),
+        StepStatus::Blocked
+    );
+}
+
+#[test]
+fn a_command_hash_is_omitted_when_absent_and_read_back_when_present() {
+    let old = command_exit(Some(0));
+    let text = serde_json::to_string(&old).unwrap();
+    assert!(!text.contains("commandHash"), "{text}");
+    assert_eq!(serde_json::from_str::<Evidence>(&text).unwrap(), old);
+
+    let new = run_of("cargo test", Some(0));
+    let text = serde_json::to_string(&new).unwrap();
+    assert!(
+        text.contains("\"commandHash\":\"hash-of:cargo test\""),
+        "{text}"
+    );
+    assert_eq!(serde_json::from_str::<Evidence>(&text).unwrap(), new);
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +741,7 @@ fn exit_with_purpose(exit_code: Option<i32>, purpose: CommandPurpose) -> Evidenc
         marker_id: "action_1".to_string(),
         exit_code,
         purpose,
+        command_hash: None,
     }
 }
 

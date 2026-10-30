@@ -996,11 +996,15 @@ impl PathArgument {
     }
 }
 
-/// The two operators a read-only pipeline may use (spec 64 requirement 6).
+/// The operators a read-only line may use (spec 64 requirement 6; spec 70
+/// requirement 1 added `Sequence`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Operator {
     And,
     Pipe,
+    /// `;` or a newline. Judged like `&&`: every segment must be admitted on
+    /// its own.
+    Sequence,
 }
 
 /// The command line as the shell will see it, or the reason it cannot be
@@ -1019,11 +1023,12 @@ struct ShellLine {
 }
 
 /// Splits `command` into simple commands and words the way a POSIX shell or
-/// zsh would, without performing any expansion. `&&` and `|` separate
-/// commands. `None` means the text uses syntax this tokenizer does not model
-/// (a backslash, an unclosed quote, any other operator: `;`, `||`, `&`,
-/// `|&`, a redirect), which is a parsing gap and so must ask rather than run
-/// (§5.1).
+/// zsh would, without performing any expansion. `&&`, `|`, `;` and a newline
+/// separate commands. A redirect to `/dev/null`, `2>&1` or `1>&2` is read and
+/// dropped (spec 70 requirement 3). `None` means the text uses syntax this
+/// tokenizer does not model (a backslash, an unclosed quote, `||`, `&`, `|&`,
+/// any other redirect), which is a parsing gap and so must ask rather than run
+/// (spec 64 §5.1).
 fn shell_line(command: &str) -> Option<ShellLine> {
     let mut commands = Vec::new();
     let mut operators = Vec::new();
@@ -1031,6 +1036,9 @@ fn shell_line(command: &str) -> Option<ShellLine> {
     let mut expansion = None;
     let mut current = String::new();
     let mut in_word = false;
+    // Whether the word in progress has a quoted part: `'2'>x` is a word
+    // followed by a redirect, not a redirect of descriptor 2.
+    let mut word_quoted = false;
     // The previous unquoted character, for the positions where `~` expands.
     let mut previous: Option<char> = None;
     let mut characters = command.chars().peekable();
@@ -1043,6 +1051,59 @@ fn shell_line(command: &str) -> Option<ShellLine> {
                 if in_word {
                     words.push(std::mem::take(&mut current));
                     in_word = false;
+                    word_quoted = false;
+                }
+                previous = None;
+                continue;
+            }
+            ';' | '\n' => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                    word_quoted = false;
+                }
+                commands.push(std::mem::take(&mut words));
+                operators.push(Operator::Sequence);
+                previous = None;
+                continue;
+            }
+            '>' => {
+                // The descriptor is a bare `1` or `2` written against `>`;
+                // any other word before it is the redirect's target name.
+                let descriptor = if in_word {
+                    if word_quoted || !matches!(current.as_str(), "1" | "2") {
+                        return None;
+                    }
+                    in_word = false;
+                    std::mem::take(&mut current)
+                } else {
+                    "1".to_string()
+                };
+                if characters.peek() == Some(&'>') {
+                    return None;
+                }
+                while characters.peek() == Some(&' ') {
+                    characters.next();
+                }
+                let mut target = String::new();
+                if characters.peek() == Some(&'&') {
+                    characters.next();
+                    target.push('&');
+                    while let Some(digit) = characters.next_if(char::is_ascii_digit) {
+                        target.push(digit);
+                    }
+                } else {
+                    while let Some(character) = characters.next_if(|character| {
+                        !character.is_whitespace() && !matches!(character, ';' | '|' | '&')
+                    }) {
+                        target.push(character);
+                    }
+                }
+                let admitted = target == "/dev/null"
+                    || (descriptor == "2" && target == "&1")
+                    || (descriptor == "1" && target == "&2");
+                if !admitted {
+                    return None;
                 }
                 previous = None;
                 continue;
@@ -1060,6 +1121,7 @@ fn shell_line(command: &str) -> Option<ShellLine> {
                 if in_word {
                     words.push(std::mem::take(&mut current));
                     in_word = false;
+                    word_quoted = false;
                 }
                 commands.push(std::mem::take(&mut words));
                 operators.push(operator);
@@ -1074,6 +1136,7 @@ fn shell_line(command: &str) -> Option<ShellLine> {
                     }
                 }
                 in_word = true;
+                word_quoted = true;
                 previous = Some('\'');
                 continue;
             }
@@ -1090,10 +1153,11 @@ fn shell_line(command: &str) -> Option<ShellLine> {
                     }
                 }
                 in_word = true;
+                word_quoted = true;
                 previous = Some('"');
                 continue;
             }
-            '\\' | ';' | '<' | '>' | '\n' | '\r' => return None,
+            '\\' | '<' | '\r' => return None,
             control if control.is_control() => return None,
             '$' => note("`$`", &mut expansion),
             '`' => note("a backtick", &mut expansion),
@@ -1122,6 +1186,12 @@ fn shell_line(command: &str) -> Option<ShellLine> {
         words.push(current);
     }
     commands.push(words);
+    // A trailing `;` or newline ends the line; it does not start an empty
+    // command.
+    if operators.last() == Some(&Operator::Sequence) && commands.last().is_some_and(Vec::is_empty) {
+        commands.pop();
+        operators.pop();
+    }
     Some(ShellLine {
         commands,
         operators,
@@ -1130,6 +1200,18 @@ fn shell_line(command: &str) -> Option<ShellLine> {
 }
 
 const READ_ONLY_GIT_SUBCOMMANDS: [&str; 4] = ["status", "diff", "log", "show"];
+
+/// Spec 70 requirement 5: listings that print names, hashes and counts,
+/// never file contents.
+const READ_ONLY_GIT_LISTINGS: [&str; 7] = [
+    "worktree",
+    "branch",
+    "remote",
+    "rev-parse",
+    "rev-list",
+    "for-each-ref",
+    "merge-base",
+];
 
 /// git's global options that take the next word as their value, so the
 /// subcommand can be found after them.
@@ -1145,11 +1227,24 @@ const GIT_GLOBAL_OPTIONS_WITH_VALUE: [&str; 6] = [
 /// Whether `words` names one of the read-only programs, whatever its
 /// options. Decides between `Refused` (ask) and `NotReadOnly` (let the
 /// later branches decide), so `git -C /tmp commit` keeps its old answer.
+///
+/// Spec 70 requirement 9: a program it added (the file readers and the git
+/// listings) is named only in an admitted form, so any other form of it —
+/// `sed -i`, `grep -r`, `git branch -D` — is judged exactly as before.
 fn names_read_only_program(words: &[&str]) -> bool {
     match words.first() {
-        Some(&"pwd") | Some(&"ls") => true,
-        Some(&"git") => git_subcommand(&words[1..])
-            .is_some_and(|(_, subcommand, _)| READ_ONLY_GIT_SUBCOMMANDS.contains(&subcommand)),
+        Some(&"pwd") | Some(&"ls") | Some(&"echo") => true,
+        Some(&"git") => git_subcommand(&words[1..]).is_some_and(|(_, subcommand, arguments)| {
+            READ_ONLY_GIT_SUBCOMMANDS.contains(&subcommand)
+                || (READ_ONLY_GIT_LISTINGS.contains(&subcommand)
+                    && matches!(
+                        git_verdict(subcommand, &arguments),
+                        ReadOnlyVerdict::Admitted(_)
+                    ))
+        }),
+        Some(&("cat" | "head" | "tail" | "wc" | "sed" | "grep")) => {
+            file_read_admission(words).is_some()
+        }
         _ => false,
     }
 }
@@ -1240,6 +1335,15 @@ fn pipeline_verdict(
                     .to_string(),
             );
         }
+        // Spec 70 requirement 2: after `;` a command runs even when `cd`
+        // failed, somewhere other than where its paths were checked.
+        if operators.contains(&Operator::Sequence) {
+            return ReadOnlyVerdict::Refused(
+                "A line that starts with `cd` may use only `&&` and `|`, because after `;` the \
+                 rest runs even when `cd` failed, so the command needs review"
+                    .to_string(),
+            );
+        }
         start = 1;
     }
     for (index, words) in commands.iter().enumerate().skip(start) {
@@ -1286,9 +1390,14 @@ fn is_stdin_filter(words: &[&str]) -> bool {
         .split_first()
         .expect("the caller refuses empty commands");
     match *program {
+        // Spec 70 requirement 7: bare, and `-N`, beside `-n N`.
         "head" | "tail" => match arguments {
+            [] => true,
             ["-n", count] => is_count(count),
-            [option] => option.strip_prefix("-n").is_some_and(is_count),
+            [option] => {
+                option.strip_prefix("-n").is_some_and(is_count)
+                    || option.strip_prefix('-').is_some_and(is_count)
+            }
             _ => false,
         },
         "wc" => arguments.iter().all(|argument| flags_from(argument, "lwc")),
@@ -1340,15 +1449,68 @@ fn command_verdict(words: &[&str]) -> ReadOnlyVerdict {
         "pwd" if words.len() == 1 => ReadOnlyVerdict::Admitted(Admission::default()),
         "pwd" => refuse_argument("pwd", words[1]),
         "ls" => ls_verdict(&words[1..]),
-        _ => {
-            let (global, subcommand, arguments) =
-                git_subcommand(&words[1..]).expect("names_read_only_program found a subcommand");
-            if let Some(option) = global.iter().find(|option| **option != "--no-pager") {
-                return refuse_argument("git", option);
+        // Spec 70 requirement 4: expansion is already refused, so `echo`
+        // prints only its literal words.
+        "echo" => ReadOnlyVerdict::Admitted(Admission::default()),
+        "cat" | "head" | "tail" | "wc" | "sed" | "grep" => match file_read_admission(words) {
+            Some(admission) => ReadOnlyVerdict::Admitted(admission),
+            None => refuse_argument(words[0], words.get(1).copied().unwrap_or_default()),
+        },
+        _ => git_command_verdict(&words[1..]),
+    }
+}
+
+/// `git [--no-pager] [-C <dir>] <subcommand> …`. `-C` is held to a `cd`
+/// directory's rules, and the subcommand's paths resolve against it (spec 70
+/// requirement 6).
+fn git_command_verdict(arguments: &[&str]) -> ReadOnlyVerdict {
+    let mut directory = None;
+    let mut index = 0;
+    while let Some(word) = arguments.get(index).copied() {
+        if !word.starts_with('-') {
+            break;
+        }
+        match word {
+            "--no-pager" => index += 1,
+            "-C" if directory.is_none() => {
+                match arguments.get(index + 1).copied() {
+                    Some(value) if !value.is_empty() && !value.starts_with('-') => {
+                        directory = Some(value);
+                    }
+                    _ => return refuse_argument("git", word),
+                }
+                index += 2;
             }
-            git_verdict(subcommand, &arguments)
+            _ => return refuse_argument("git", word),
         }
     }
+    let Some(subcommand) = arguments.get(index).copied() else {
+        return ReadOnlyVerdict::NotReadOnly;
+    };
+    let verdict = git_verdict(subcommand, &arguments[index + 1..]);
+    let (Some(directory), ReadOnlyVerdict::Admitted(admission)) = (directory, &verdict) else {
+        return verdict;
+    };
+    let mut paths = vec![PathArgument::relative_to_working_directory(directory)];
+    for path in &admission.paths {
+        // `<rev>:<path>` is relative to that worktree's top level, which the
+        // check cannot place without running git.
+        if path.from_repository_root {
+            return ReadOnlyVerdict::Refused(
+                "A `<rev>:<path>` argument under `git -C` names a path in another checkout, so \
+                 the command needs review"
+                    .to_string(),
+            );
+        }
+        paths.push(PathArgument {
+            text: format!("{}/{}", directory.trim_end_matches('/'), path.text),
+            ..path.clone()
+        });
+    }
+    ReadOnlyVerdict::Admitted(Admission {
+        directory: None,
+        paths,
+    })
 }
 
 fn refuse_argument(program: &str, argument: &str) -> ReadOnlyVerdict {
@@ -1407,6 +1569,9 @@ fn git_verdict(subcommand: &str, arguments: &[&str]) -> ReadOnlyVerdict {
             "`git {subcommand}` prints file contents, so it needs approval; use the \
              `read_git_diff` tool, which bounds its output and excludes restricted paths"
         ));
+    }
+    if READ_ONLY_GIT_LISTINGS.contains(&subcommand) {
+        return git_listing_verdict(subcommand, arguments);
     }
     let program = format!("git {subcommand}");
     let mut paths = Vec::new();
@@ -1487,6 +1652,239 @@ fn git_verdict(subcommand: &str, arguments: &[&str]) -> ReadOnlyVerdict {
         directory: None,
         paths,
     })
+}
+
+/// Spec 70 requirement 5: git listings that print names, hashes and counts.
+/// Their positional arguments are revisions or ref patterns, path-checked as
+/// any git positional is, since git decides what a word is only when it runs.
+fn git_listing_verdict(subcommand: &str, arguments: &[&str]) -> ReadOnlyVerdict {
+    let program = format!("git {subcommand}");
+    let refuse = |argument: &str| refuse_argument(&program, argument);
+    let only_flags = |allowed: &[&str]| {
+        arguments
+            .iter()
+            .find(|argument| !allowed.contains(argument))
+            .map_or(
+                ReadOnlyVerdict::Admitted(Admission::default()),
+                |argument| refuse(argument),
+            )
+    };
+    match subcommand {
+        "worktree" => match arguments.split_first() {
+            Some((&"list", rest)) => match rest
+                .iter()
+                .find(|option| !matches!(**option, "--porcelain" | "-v" | "--verbose"))
+            {
+                Some(option) => refuse(option),
+                None => ReadOnlyVerdict::Admitted(Admission::default()),
+            },
+            Some((other, _)) => refuse(other),
+            None => refuse(""),
+        },
+        "branch" => only_flags(&[
+            "-a",
+            "--all",
+            "-r",
+            "--remotes",
+            "-v",
+            "-vv",
+            "--verbose",
+            "--list",
+            "--show-current",
+        ]),
+        "remote" => only_flags(&["-v", "--verbose"]),
+        _ => {
+            let flag_admitted = |argument: &str| match subcommand {
+                "rev-parse" => {
+                    matches!(
+                        argument,
+                        "--short"
+                            | "--abbrev-ref"
+                            | "--verify"
+                            | "-q"
+                            | "--quiet"
+                            | "--show-toplevel"
+                            | "--git-dir"
+                    ) || argument.strip_prefix("--short=").is_some_and(is_count)
+                }
+                "rev-list" => {
+                    matches!(argument, "--count" | "--left-right")
+                        || argument.strip_prefix("--max-count=").is_some_and(is_count)
+                }
+                "for-each-ref" => {
+                    argument.starts_with("--sort=")
+                        || argument.starts_with("--format=")
+                        || argument.strip_prefix("--count=").is_some_and(is_count)
+                }
+                "merge-base" => argument == "--is-ancestor",
+                _ => false,
+            };
+            let mut paths = Vec::new();
+            for argument in arguments {
+                if argument.starts_with('-') {
+                    if !flag_admitted(argument) {
+                        return refuse(argument);
+                    }
+                    continue;
+                }
+                match git_path_argument(argument, false) {
+                    Some(path) => paths.extend(path),
+                    None => return refuse(argument),
+                }
+            }
+            ReadOnlyVerdict::Admitted(Admission {
+                directory: None,
+                paths,
+            })
+        }
+    }
+}
+
+/// Spec 70 requirement 8: `cat`, `head`, `tail`, `wc`, `sed -n` and `grep`
+/// reading files named on the line, in the listed forms only. `None` for any
+/// other form, which then is judged as it was before spec 70 (requirement
+/// 9). The files become path arguments, so each must pass the spec 64 path
+/// check: inside the repository and clear of `restricted_patterns`.
+fn file_read_admission(words: &[&str]) -> Option<Admission> {
+    let (program, arguments) = words.split_first()?;
+    let flags_from = |argument: &str, allowed: &str| {
+        argument.strip_prefix('-').is_some_and(|flags| {
+            !flags.is_empty() && flags.chars().all(|flag| allowed.contains(flag))
+        })
+    };
+    let mut files = Vec::new();
+    let mut remaining = arguments.iter().copied();
+    match *program {
+        "cat" => {
+            for argument in remaining {
+                if argument == "-n" {
+                    continue;
+                }
+                if argument.starts_with('-') {
+                    return None;
+                }
+                files.push(argument);
+            }
+        }
+        "head" | "tail" => {
+            while let Some(argument) = remaining.next() {
+                if argument == "-n" {
+                    if !is_count(remaining.next()?) {
+                        return None;
+                    }
+                } else if let Some(option) = argument.strip_prefix('-') {
+                    let count = option.strip_prefix('n').unwrap_or(option);
+                    if !is_count(count) {
+                        return None;
+                    }
+                } else {
+                    files.push(argument);
+                }
+            }
+        }
+        "wc" => {
+            for argument in remaining {
+                if argument.starts_with('-') {
+                    if !flags_from(argument, "lwc") {
+                        return None;
+                    }
+                } else {
+                    files.push(argument);
+                }
+            }
+        }
+        "sed" => {
+            let mut quiet = false;
+            let mut script = None;
+            for argument in remaining {
+                if script.is_none() && argument.starts_with('-') {
+                    if !flags_from(argument, "nE") {
+                        return None;
+                    }
+                    quiet |= argument.contains('n');
+                } else if script.is_none() {
+                    script = Some(argument);
+                } else if argument.starts_with('-') {
+                    return None;
+                } else {
+                    files.push(argument);
+                }
+            }
+            if !quiet || !is_print_only_sed_script(script?) {
+                return None;
+            }
+        }
+        "grep" => {
+            let mut pattern = false;
+            while let Some(argument) = remaining.next() {
+                if matches!(argument, "-m" | "-A" | "-B" | "-C") {
+                    if !is_count(remaining.next()?) {
+                        return None;
+                    }
+                } else if argument == "-e" {
+                    remaining.next()?;
+                    pattern = true;
+                } else if argument.starts_with('-') {
+                    let attached_count = ["-m", "-A", "-B", "-C"]
+                        .iter()
+                        .any(|option| argument.strip_prefix(option).is_some_and(is_count));
+                    if !attached_count && !flags_from(argument, "ivncEFlLhHwosq") {
+                        return None;
+                    }
+                } else if !pattern {
+                    pattern = true;
+                } else {
+                    files.push(argument);
+                }
+            }
+            if !pattern {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    if files.is_empty() {
+        return None;
+    }
+    Some(Admission {
+        directory: None,
+        paths: files
+            .into_iter()
+            .map(PathArgument::relative_to_working_directory)
+            .collect(),
+    })
+}
+
+/// A `sed -n` script that only prints: `;`-separated items, each an address
+/// or `address,address` followed by `p`. An address is a line number, `$`, or
+/// `/regex/` with no `/` or newline inside, so no item can hide `w`, `r`, `e`
+/// or any other command.
+fn is_print_only_sed_script(script: &str) -> bool {
+    fn address(text: &str) -> Option<&str> {
+        if let Some(rest) = text.strip_prefix('$') {
+            return Some(rest);
+        }
+        if let Some(body) = text.strip_prefix('/') {
+            let end = body.find('/')?;
+            return (!body[..end].contains('\n')).then(|| &body[end + 1..]);
+        }
+        let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+        (digits > 0).then(|| &text[digits..])
+    }
+    !script.is_empty()
+        && script.split(';').all(|item| {
+            let Some(rest) = address(item.trim()) else {
+                return false;
+            };
+            let rest = match rest.strip_prefix(',') {
+                Some(second) => match address(second) {
+                    Some(after) => after,
+                    None => return false,
+                },
+                None => rest,
+            };
+            rest == "p"
+        })
 }
 
 /// A git positional argument: a revision, a range, `<rev>:<path>` or a
@@ -1849,8 +2247,8 @@ mod tests {
     /// exercised for real.
     mod read_only_boundary {
         use super::super::{
-            ApprovalCause, CommandClassification, CommandPolicy, CommandRisk, Operator, ShellLine,
-            is_low_risk_read_only, shell_line,
+            ApprovalCause, CommandClassification, CommandPolicy, CommandRisk, Operator,
+            ReadOnlyVerdict, ShellLine, is_low_risk_read_only, read_only_verdict, shell_line,
         };
         use crate::config::Config;
         use std::fs;
@@ -1979,7 +2377,6 @@ mod tests {
             let repo = Repository::new("git-options");
             for command in [
                 "git -c core.pager=x log",
-                "git -C /tmp status",
                 "git --git-dir=x log",
                 "git --work-tree=/tmp status",
                 "git --exec-path=/tmp log",
@@ -1993,6 +2390,18 @@ mod tests {
                 assert_needs_approval(&classification);
                 assert_eq!(classification.risk, CommandRisk::High, "{command}");
             }
+            // Spec 70 requirement 6: `-C` is path-checked like a `cd`
+            // directory, so outside the repository it asks for that reason.
+            let classification = repo.classify("git -C /tmp status");
+            assert_needs_approval(&classification);
+            assert!(
+                classification
+                    .causes
+                    .iter()
+                    .any(|cause| matches!(cause, ApprovalCause::OutsideRepository { .. })),
+                "{:?}",
+                classification.causes
+            );
         }
 
         /// Spec 64 §6, "After #60" (requirement 5): `git diff`, `git show`
@@ -2164,7 +2573,9 @@ mod tests {
             assert!(!is_low_risk_read_only("git statusx"));
             assert!(!is_low_risk_read_only("pwd -P"));
             assert!(!is_low_risk_read_only("ls --color=always"));
-            assert!(!is_low_risk_read_only("git status | head"));
+            // Spec 70 requirement 7: a bare `head` filter is admitted.
+            assert!(is_low_risk_read_only("git status | head"));
+            assert!(!is_low_risk_read_only("git status | head -x"));
         }
 
         // Spec 64 §6, "Pipelines" (requirements 6–7).
@@ -2244,8 +2655,8 @@ mod tests {
                 "git log $(id) | head -n 1",
                 "git log | grep x *",
                 "cd ~ && ls",
-                // Filters with options or arguments outside requirement 7.
-                "git log | head",
+                // Filters with options or arguments outside requirement 7
+                // (spec 70 admitted a bare `head`).
                 "git log | head -c 10",
                 "git log | tail -f",
                 "git log | head -n 3 x",
@@ -2347,10 +2758,175 @@ mod tests {
             );
             assert_eq!(line.operators, vec![Operator::And, Operator::Pipe]);
             for refused in [
-                "a || b", "a |& b", "a & b", "a &| b", "a; b", "a > b", "a\nb",
+                "a || b",
+                "a |& b",
+                "a & b",
+                "a &| b",
+                "a > b",
+                "a >> /dev/null",
+                "a < b",
+                "a 2>x",
+                "a &> /dev/null",
+                "a 2>&3",
+                "a '2'>/dev/null",
+                "a\rb",
             ] {
                 assert!(shell_line(refused).is_none(), "{refused}");
             }
+            // Spec 70 requirements 1 and 3: `;` and a newline separate
+            // commands, a trailing one ends the line, and the admitted
+            // redirects are dropped from the words.
+            let line = shell_line("a 2>/dev/null; b >/dev/null 2>&1\nc 2> /dev/null;").unwrap();
+            assert_eq!(
+                line.commands,
+                vec![
+                    vec!["a".to_string()],
+                    vec!["b".to_string()],
+                    vec!["c".to_string()],
+                ]
+            );
+            assert_eq!(line.operators, vec![Operator::Sequence, Operator::Sequence]);
+        }
+
+        // Spec 70: `;` sequences, `echo`, `/dev/null` redirects, git
+        // listings, `git -C`, and named-file reads.
+
+        #[test]
+        fn the_motivating_sequences_run_unasked() {
+            let repo = Repository::new("sequences");
+            fs::write(repo.root.join("CHANGELOG.md"), "# Changelog\n").unwrap();
+            for command in [
+                "echo '=== CHANGELOG Unreleased ==='; sed -n '1,80p' CHANGELOG.md",
+                "git log --oneline -20 2>/dev/null; echo \"---\"; git branch -a; echo \"---\"; git remote -v",
+                "git worktree list --porcelain | head -30",
+                "git rev-list --left-right --count main...HEAD",
+                "git for-each-ref --sort=-committerdate '--format=%(refname:short)' refs/heads",
+                "git rev-parse --abbrev-ref HEAD; git merge-base --is-ancestor main HEAD",
+                "ls src | head",
+                "ls src | tail -80",
+                "pwd\nls -la\n",
+                "echo done;",
+            ] {
+                let classification = repo.classify(command);
+                assert!(
+                    runs_unasked(&classification),
+                    "{command}: {:?}",
+                    classification.reasons
+                );
+            }
+        }
+
+        #[test]
+        fn named_file_reads_inside_the_repository_run_unasked() {
+            let repo = Repository::new("file-reads");
+            fs::write(repo.root.join("notes.md"), "a\nb\n").unwrap();
+            fs::create_dir_all(repo.root.join("src")).unwrap();
+            fs::write(repo.root.join("src/lib.rs"), "").unwrap();
+            for command in [
+                "cat notes.md",
+                "cat -n notes.md src/lib.rs",
+                "head -n 5 notes.md",
+                "head -20 notes.md",
+                "tail -n3 notes.md",
+                "wc -l notes.md",
+                "sed -n '1,40p' notes.md",
+                "sed -n '/^## /p;$p' notes.md",
+                "sed -nE '3p' notes.md",
+                "grep -n Status notes.md",
+                "grep -c -e Status notes.md src/lib.rs",
+                "grep -A 2 -B2 -m 1 TODO notes.md",
+                "grep -nE '^## (Task|Status)' notes.md | head -20",
+                "cd src && cat lib.rs",
+            ] {
+                let classification = repo.classify(command);
+                assert!(
+                    runs_unasked(&classification),
+                    "{command}: {:?}",
+                    classification.reasons
+                );
+            }
+        }
+
+        #[test]
+        fn reads_outside_their_admitted_form_still_ask() {
+            let repo = Repository::new("file-reads-refused");
+            fs::write(repo.root.join("notes.md"), "a\n").unwrap();
+            fs::create_dir_all(repo.root.join("secrets")).unwrap();
+            fs::write(repo.root.join("secrets/key.txt"), "k\n").unwrap();
+            fs::write(repo.root.join(".env"), "TOKEN=x\n").unwrap();
+            for command in [
+                // Restricted, or outside the repository.
+                "cat .env",
+                "sed -n 1p secrets/key.txt",
+                "head -n 5 ../outside.txt",
+                "cat /etc/hosts",
+                "grep x notes.md .env",
+                // Forms that are not plain reads of named files.
+                "grep -r x .",
+                "grep -R x src",
+                "grep --include=*.md x notes.md",
+                "grep -f patterns notes.md",
+                "grep x",
+                "cat",
+                "sed -n 'w out' notes.md",
+                "sed -n '1p;w out' notes.md",
+                "sed -n '1e date' notes.md",
+                "sed '1p' notes.md",
+                "sed -i s/a/b/ notes.md",
+                "tail -f notes.md",
+                "tail -n +2 notes.md",
+                "cat notes.md > copy.md",
+                "echo $HOME",
+                "echo hi > f",
+                "echo \"$(id)\"",
+                // `cd` followed by `;`, where a failed `cd` runs the rest
+                // elsewhere (requirement 2).
+                "cd src; ls",
+                "cd src && ls; ls ..",
+                // Git listings outside their forms.
+                "git branch -D old",
+                "git branch new-branch",
+                "git remote add x y",
+                "git worktree add ../x",
+                "git rev-parse --git-path x --output y",
+                "git -C src show HEAD:lib.rs",
+                "git -C src -C . status",
+                "git status; rm x",
+            ] {
+                let classification = repo.classify(command);
+                assert_needs_approval(&classification);
+            }
+        }
+
+        /// Requirement 9: a form of a program spec 70 added that it does not
+        /// admit is classified exactly as before spec 70, not as an unknown
+        /// read-only program.
+        #[test]
+        fn an_unadmitted_form_of_a_new_program_is_judged_as_before() {
+            for command in [
+                "sed -i s/a/b/ notes.md",
+                "grep -r x .",
+                "git branch -D old",
+                "cat",
+            ] {
+                assert_eq!(
+                    read_only_verdict(command),
+                    ReadOnlyVerdict::NotReadOnly,
+                    "{command}"
+                );
+            }
+        }
+
+        #[test]
+        fn git_dash_c_resolves_paths_against_its_directory() {
+            let repo = Repository::new("git-dash-c");
+            fs::create_dir_all(repo.root.join("sub/secrets")).unwrap();
+            assert!(runs_unasked(&repo.classify("git -C src status --short")));
+            assert!(runs_unasked(
+                &repo.classify("git -C sub log --oneline -n 3")
+            ));
+            assert_needs_approval(&repo.classify("git -C sub log -- secrets"));
+            assert_needs_approval(&repo.classify("git -C secrets status"));
         }
 
         #[test]

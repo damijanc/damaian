@@ -86,6 +86,15 @@ pub fn glob_match(pattern: &str, value: &str) -> bool {
         }
         if pattern[pi] == b'*' {
             if pi + 1 < pattern.len() && pattern[pi + 1] == b'*' {
+                // `**/` also matches zero directories, as in gitignore:
+                // `src/**/*.rs` matches `src/lib.rs`. Without this the `/`
+                // after `**` demands at least one directory.
+                if pattern.get(pi + 2) == Some(&b'/')
+                    && (vi == 0 || value[vi - 1] == b'/')
+                    && inner(pattern, value, pi + 3, vi)
+                {
+                    return true;
+                }
                 for next in vi..=value.len() {
                     if inner(pattern, value, pi + 2, next) {
                         return true;
@@ -112,4 +121,40 @@ pub fn glob_match(pattern: &str, value: &str) -> bool {
     }
 
     inner(pattern.as_bytes(), value.as_bytes(), 0, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn double_star_slash_matches_zero_directories() {
+        assert!(glob_match("crates/*/src/**/*.rs", "crates/a/src/lib.rs"));
+        assert!(glob_match("**/*.rs", "lib.rs"));
+        assert!(glob_match("a/**/b", "a/b"));
+    }
+
+    #[test]
+    fn double_star_slash_still_matches_nested_directories() {
+        assert!(glob_match(
+            "crates/*/src/**/*.rs",
+            "crates/a/src/finding/x.rs"
+        ));
+        assert!(glob_match("**/*.rs", "a/b/c.rs"));
+        assert!(glob_match("a/**/b", "a/x/y/b"));
+    }
+
+    #[test]
+    fn double_star_slash_matches_only_at_a_directory_boundary() {
+        assert!(!glob_match("a/**/b", "ab"));
+        assert!(!glob_match("x**/b", "xb"));
+        assert!(!glob_match("crates/*/src/**/*.rs", "crates/a/src.rs"));
+    }
+
+    #[test]
+    fn a_leading_double_star_ignore_rule_matches_at_the_root() {
+        let rules = parse_ignore_patterns(&["**/node_modules".to_string()], "");
+        assert!(is_ignored_by_rules(&rules, "node_modules", true));
+        assert!(is_ignored_by_rules(&rules, "web/node_modules", true));
+    }
 }

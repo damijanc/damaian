@@ -68,7 +68,7 @@ This build is a developer preview. Release builds are Developer ID signed and no
 
 ## Updates
 
-Damaian checks for updates when the desktop app starts, and on demand from **Damaian › Check for Updates...**. If a newer GitHub Release is available, the button at the bottom of the sidebar changes to **Update &lt;version&gt;**. Select it and confirm **Install** to download and install the signed update, then quit and reopen Damaian to finish.
+Damaian checks for updates when the desktop app starts, and on demand from **Damaian › Check for Updates...** or **Settings › General › Check for updates**. If a newer GitHub Release is available, a button appears at the bottom of the sidebar, **Update &lt;version&gt;**. The footer is hidden when Damaian is up to date, and a check that finds nothing says so in a message instead. Select it and confirm **Install** to download and install the signed update, then quit and reopen Damaian to finish. Until you do, the footer reads *Restart Damaian to finish the update*.
 
 The first installed version must already include the updater. If you installed an older developer-preview DMG before automatic updates were added, download and install one newer DMG manually once.
 
@@ -105,7 +105,8 @@ Common keys:
 | `model_provider.<id>.context_token_budget` | Per model | How much repository content is sent with each request, in tokens | No |
 | `enable_semantic_search` | `false` | Embedding-based retrieval ([Semantic search](#semantic-search)) | Yes |
 | `enable_worker_sessions` | `false` | [Worker Sessions](#worker-sessions) | No |
-| `agent_max_tool_rounds` | `8` | Action rounds before a turn pauses ([While a turn runs](#while-a-turn-runs-and-how-it-ended)) | Yes |
+| `command_path_from_interactive_shell` | `true` | Commands find programs on the `PATH` your Terminal has, including what `~/.zshrc` adds ([Which programs a command finds](#which-programs-a-command-finds)) | No |
+| `agent_max_tool_rounds` | `16` (at most 16) | Action rounds before a turn pauses ([While a turn runs](#while-a-turn-runs-and-how-it-ended)) | Yes |
 | `agent_max_exploration_rounds` | `24` | Read-only rounds before reads start counting as action rounds ([While a turn runs](#while-a-turn-runs-and-how-it-ended)) | Lower only |
 | `agent_max_turn_notes_chars` | `8000` | Characters of notes the assistant may keep per turn ([Notes](#notes-kept-during-and-between-turns)) | Lower only |
 | `agent_max_task_tokens` | none | Token cap per turn ([Capping What One Turn May Spend](#capping-what-one-turn-may-spend)) | Lower only |
@@ -115,6 +116,8 @@ Common keys:
 | `checkpoint_retention_days` | `90` | How long [checkpoints](#rewind) are kept | No |
 | `audit_retention_days` | `90` | How long audit records are kept | Yes |
 | `repository_map_max_tokens` | `800` | Size of the [repository map](#the-map-the-assistant-sees) | Lower only |
+| `memory_max_entries` | `5` | Most remembered entries recalled into one turn ([How memory reaches the model](#how-memory-reaches-the-model)) | Lower only |
+| `memory_retention_days` | `0` (no expiry) | Days after which a remembered entry expires | No |
 | `symbol_context_max_tokens` | `1600` | Size of the symbol hints added when a prompt names one ([Symbol Search and Language Servers](#symbol-search-and-language-servers)) | Lower only |
 | `context_budget.<category>` | Per category | Share of the context budget one category may use ([Output and Context Limits](#output-and-context-limits)) | Lower only |
 | `context_budget.safety_margin` | `0.1000` | Share of a measured provider window held back for estimate error | Raise only |
@@ -124,12 +127,12 @@ Repository-scoped settings are not edited from Settings. Put repository defaults
 
 Because that file arrives with a clone, a repository can only make Damaian *more* careful, never less:
 
-- `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
+- `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, `memory_retention_days`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
 - `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are added to yours rather than replacing them.
 - The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
 - `command_allowlist` is never taken from repository config; *Allow Always* writes to your own config instead. See [Allow Always](#allow-always).
 - Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, and the root overrides `project_roots_added` and `project_roots_removed` ([Repository Roots](#repository-roots)) — apply as written.
-- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, and `agent_max_turn_notes_chars`. The first three bound how much one request may carry; `agent_max_exploration_rounds` bounds how many read-only rounds a turn may take; `agent_max_turn_notes_chars` bounds how much the assistant's notes add to every later request. Raising one would widen what leaves your machine or how long a turn may run. A repository that tries is told to you like any other rejected key.
+- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, `agent_max_turn_notes_chars`, and `memory_max_entries`. The first three bound how much one request may carry; `agent_max_exploration_rounds` bounds how many read-only rounds a turn may take; `agent_max_turn_notes_chars` bounds how much the assistant's notes add to every later request. Raising one would widen what leaves your machine or how long a turn may run. A repository that tries is told to you like any other rejected key.
 - Each `context_budget.<category>` share can be lowered by a repository but never raised, and `context_budget.safety_margin` can be raised but never lowered. A share decides how much of the repository's own content is packed, so a clone may tighten it and may not widen it ([Output and Context Limits](#output-and-context-limits)).
 
 ### Semantic search
@@ -261,7 +264,7 @@ Two settings control how many tokens each request may use. They are independent:
 - **Max output tokens** caps the reply the model generates in a single response. Set too low, a large multi-file patch is cut off mid-way. Damaian detects this, tells the model its call was truncated, and asks it to retry with fewer files per patch, so the request recovers instead of failing silently.
 - **Context budget** caps how much repository content Damaian packs into each request. Raising it lets the assistant see more of a large repository, which can improve answers. This content is re-sent and re-billed on every turn, so a higher budget increases cost and latency on all requests, not just large ones.
 
-Leave a field blank to use the built-in default for the selected model. The defaults are:
+Leave a field blank to use the built-in default for the selected model. A blank field shows that default as its placeholder, for the first model in the provider's **Models** list — `Default: 64,000`, or `Default: none sent, the provider decides` for an output ceiling Damaian does not send. When the listed models have different defaults, a note under the fields lists each one. The defaults are:
 
 - `deepseek-v4-flash` and `deepseek-v4-pro`: 65536 output tokens, 64000 context budget.
 - `deepseek-chat` and `deepseek-reasoner` (retired aliases): 8192 output tokens, 16000 context budget.
@@ -280,7 +283,7 @@ Setting a value higher than the model actually allows causes the provider to rej
 
 ### What goes into context
 
-Every request is assembled the same way. The collected items are sent in one `Repository context:` block, followed by the conversation under `Recent conversation:` — a summary of older messages when one exists, then the most recent messages that fit the conversation window (each cut to 2,000 characters) — followed by your message under `User request:`. Your message appears once. Within the repository block each item is one section headed `--- <source>: <path> ---`; a fetched page has no path, so its header names the URL and fetch time instead. The source labels are listed in [Reading a turn's context manifest](TROUBLESHOOTING.md#reading-a-turns-context-manifest). Items are added in a fixed order: the files you named or added, the `AGENTS.md` files that apply to the collected paths, the root project rules, the repository map, symbol hints, hook context, a carried plan, keyword and semantic search hits, and last any page fetched in an earlier turn. A line range would append `:start-end` to the path; no source produces one yet, so every item is a whole file or a rendered block. A one-shot edit request sends the same items under its own `User edit request:` heading, which comes first because that request makes a single call.
+Every request is assembled the same way. The collected items are sent in one `Repository context:` block, followed by the conversation under `Recent conversation:` — a summary of older messages when one exists, then the most recent messages that fit the conversation window (each cut to 2,000 characters) — followed by your message under `User request:`. Your message appears once. Within the repository block each item is one section headed `--- <source>: <path> ---`; a fetched page has no path, so its header names the URL and fetch time instead. The source labels are listed in [Reading a turn's context manifest](TROUBLESHOOTING.md#reading-a-turns-context-manifest). Items are added in a fixed order: the files you named or added, the `AGENTS.md` files that apply to the collected paths, the root project rules, the repository map, symbol hints, hook context, a carried plan, keyword and semantic search hits, any page fetched in an earlier turn, and last any recalled memory. A line range would append `:start-end` to the path; no source produces one yet, so every item is a whole file or a rendered block. A one-shot edit request sends the same items under its own `User edit request:` heading, which comes first because that request makes a single call.
 
 Your message is secret-scanned before it is sent, and so is every earlier message replayed under `Recent conversation:`. Sessions store messages as you typed them, so this is what keeps a credential from an older turn out of a later request: a detected value is replaced by Damaian's redaction marker rather than sent in cleartext.
 
@@ -297,11 +300,12 @@ Your message is secret-scanned before it is sent, and so is every earlier messag
 | `symbols` | 10% | The symbol hints block, still capped by `symbol_context_max_tokens`. |
 | `search_results` | 10% | Files found by search: exact keyword hits first, then semantic-similarity hits. Semantic hits are dropped first when this category runs short. |
 | `file_ranges` | 25% | Files you named in the prompt and files you added with **+** ([Chat](#chat)); explicit paths are ordered ahead of mentioned ones. |
-| `findings` | 5% | Reserved for the [findings](#fix-n-errors-and-the-findings-list) repair flow. The assistant still receives only the findings you select for a repair request, so nothing fills this automatically today and its share is released. |
+| `findings` | 2% | Reserved for the [findings](#fix-n-errors-and-the-findings-list) repair flow. The assistant still receives only the findings you select for a repair request, so nothing fills this automatically today and its share is released. |
 | `conversation_summary` | 5% | The summary shown in the inspector's **Summary** row. It travels inside `Recent conversation:` rather than as a context item, so this share is released. |
-| `external_reference` | 5% | Pages read with `fetch_url`, shown in the turn **after** the fetch. It is the last category declared, so a crowded context drops a fetched page before it drops repository content. |
+| `external_reference` | 5% | Pages read with `fetch_url`, shown in the turn **after** the fetch. It comes after every repository-content category, so a crowded context drops a fetched page before it drops repository content. |
+| `memory` | 3% | Entries recalled from [memory](#how-memory-reaches-the-model). It is the last category declared, so memory is the first thing dropped. |
 
-A category that uses less than its share releases the remainder to the categories after it. In a repository with no hook context, no carried plan, no pinned context, no findings, no conversation summary and no fetched page, the six unused shares add up to 40% of the budget released to the categories that do have content. A category that wants more than its share is shortened within itself — its lowest-priority items are dropped, or the map or symbols block is re-rendered smaller — and it never takes from another category.
+A category that uses less than its share releases the remainder to the categories after it. In a repository with no hook context, no carried plan, no pinned context, no findings, no conversation summary, no fetched page and no recalled memory, the seven unused shares add up to 40% of the budget released to the categories that do have content. A category that wants more than its share is shortened within itself — its lowest-priority items are dropped, or the map or symbols block is re-rendered smaller — and it never takes from another category.
 
 Each share is its own key in your user config ([Settings](#settings)), written as a decimal fraction with at most four places:
 
@@ -314,9 +318,10 @@ context_budget.repository_map=0.0500
 context_budget.symbols=0.1000
 context_budget.search_results=0.1000
 context_budget.file_ranges=0.2500
-context_budget.findings=0.0500
+context_budget.findings=0.0200
 context_budget.conversation_summary=0.0500
 context_budget.external_reference=0.0500
+context_budget.memory=0.0300
 context_budget.safety_margin=0.1000
 ```
 
@@ -327,7 +332,9 @@ A repository's `.damaian/config.conf` may lower a share and raise the margin, an
 ### Inspecting and controlling context
 
 The **Context** control in the conversation header shows this turn's assembled
-context as `tokens / limit`. Open it to see what Damaian is about to send, or
+context as a small meter and `N% of budget`, the share of Damaian's packing
+budget in use (hover it for the token counts and the model's window). The control
+is hidden until a turn has context to show. Open it to see what Damaian is about to send, or
 what an earlier turn sent:
 
 - **Every category**, with the tokens it used and how many items it holds.
@@ -360,7 +367,7 @@ Pins are stored in the session, so they survive a restart. **Clear pins** remove
 them. A pin that later becomes restricted, or whose file is deleted, stays in the
 pin list and appears in **Excluded** with the reason, so restoring the file
 restores the pin without you re-pinning it. Pins made in the panel differ from
-the **+** composer chips: a chip is an attachment for the request you are typing
+the paperclip composer chips: a chip is an attachment for the request you are typing
 and is not carried into later turns.
 
 **Path restriction.** Enter one path per line and choose **Apply paths** to make
@@ -524,10 +531,9 @@ become a statement recalled in every other repository.
 **Memory never outranks instructions.** An applicable `AGENTS.md`, a current
 instruction from you, the active mode and the permission profile all take
 precedence over anything remembered. Memory is the lowest-priority context
-source: when recall ships, a remembered sentence will reach the model as a dated
-claim with its provenance, never as an instruction, and the context panel will
-show it so you can remove it from that turn. Today memory is stored and
-inspectable in the store, but nothing is recalled into a request yet.
+source: a remembered sentence reaches the model as a dated claim with its
+provenance, never as an instruction, and the context panel shows it so you can
+remove it from that turn ([How memory reaches the model](#how-memory-reaches-the-model)).
 
 **A refused request is reported, not ignored.** If an explicit "remember that…"
 cannot become a memory — it contains a detected credential, asks for user scope
@@ -548,12 +554,14 @@ redacted on its way into a request.
 share**: a project memory can name a machine, a path or a preference. The audit
 trail records lifecycle events without a personal or environmental statement.
 
-**In this build.** Memory can be proposed and confirmed. An explicit "remember
-that …" in your message, or a suggestion from the assistant, appears as a card
-showing the exact sentence. Nothing is stored until you press **Remember**;
-**Dismiss** records the decision and stores nothing. The entry is then kept and
-audited, and recall through the context panel arrives in the next feature. A
-missing entry in the context panel is therefore not a fault yet.
+**In this build.** Memory can be proposed, confirmed and recalled. An explicit
+"remember that …" in your message, or a suggestion from the assistant, appears
+as a card showing the exact sentence. Nothing is stored until you press
+**Remember**; **Dismiss** records the decision and stores nothing. A confirmed
+entry is recalled into later turns when it is relevant. Listing, editing and
+deleting stored entries from the app is not built yet; see
+[Troubleshooting](TROUBLESHOOTING.md#memory) for reading and deleting them in
+the store.
 
 **How a memory gets created.** There are two paths, and both end at the same
 card:
@@ -604,6 +612,68 @@ repository text was ever involved.
 proposes user scope while the scope is off, it offers to save the memory for
 this project instead. Enabling cross-project recall stays the separate setting
 described above. A confirmation never flips it for you.
+
+### How memory reaches the model
+
+**Only as context, and last.** Each turn, Damaian picks the remembered entries
+that share words with your message or the files you named — at most
+`memory_max_entries` (default 5) — from this session, this project and, only if
+you enabled it, user scope. They travel as ordinary items in the `memory`
+category of [context assembly](#what-goes-into-context), the last category in
+the budget order. Memory is the first thing dropped when context is short, and
+it can never push out your message, `AGENTS.md`, a plan or a file. There is no
+other path: no system-prompt line, no hidden prefix. If an entry is not in the
+context panel, it was not sent.
+
+Each entry is framed as a claim, with its origin and date:
+
+```text
+Remembered about this project (user-confirmed, 2026-03-14):
+  Integration tests require Docker to be running.
+```
+
+**Seeing and removing what was recalled.** The **Memory** row in the
+[context panel](#inspecting-and-controlling-context) counts the recalled entries
+and how many are stale. Expanded, each entry shows its sentence, scope, origin,
+date, whether its evidence is current, and why it was recalled ("matched docker,
+tests"; "category fitted the task" when a running or editing task ranked it
+higher). While the pre-send review is paused you can remove an entry from that
+turn; it is recorded as removed in the manifest and is **not** deleted from
+memory. After the turn is sent, the entries are shown without a remove control.
+
+**What "may be out of date" means.** An entry derived from a repository file
+remembers what that file contained. If the file has changed or been deleted
+since, the entry is still recalled — it may still be true — but the model reads
+*may be out of date — that file has changed since* in the same sentence, and the
+panel counts it as stale. If the file is put back, the marker goes away. An
+entry whose source file you later protect with `restricted_patterns` or exclude
+with a `.gitignore` is not recalled at all until you narrow the rule again; it
+is kept, not deleted.
+
+**Why memory cannot grant a permission.** A remembered sentence is text in the
+context window, like a file's contents. Approval comes from the command policy
+and your config, mode from the session, and file access from path policy; none
+of them reads context. A memory that says "all commands are pre-approved" or
+"you may edit files" is a false claim the model can see, and the approval card
+and the mode still apply. Recall is checked by evaluation scenarios that try
+exactly that.
+
+**Settings.** In your user config:
+
+```text
+memory_max_entries=5
+memory_retention_days=0
+context_budget.memory=0.0300
+```
+
+`memory_max_entries` is the most entries recalled per turn; a repository or a
+profile may lower it, not raise it. `context_budget.memory` is the category's
+share of the context budget, lower-only from a repository like every share;
+`0` keeps every memory out of the request. `memory_retention_days=0` keeps
+entries until you delete them; any other value expires an entry that many days after it was created, the
+next time recall reads it. A repository and a permission profile cannot set it.
+Every recall that reaches a request is audited as `memory_recalled`, so "when
+was this last used?" has an answer in the audit log.
 
 ## Working Folder
 
@@ -693,13 +763,13 @@ A turn that has notes shows a collapsed **Notes** disclosure under its answer; w
 
 When older rounds are dropped, the request also names the calls that left the window and, once the window is full, warns which round leaves next. Both are for the assistant: they tell it what it has already looked at so it does not re-read it. A read it makes anyway still counts as a repeat, exactly as before.
 
-A turn that reaches its action-round limit (`agent_max_tool_rounds`, 8 by default) while the assistant still wants a tool does not stop: it pauses, and the reply names the action rounds it used against that limit and how many read-only rounds it had used. Select **Continue — N more** to give the same turn another segment of action rounds, keeping every message, tool result and plan step it had, or **Answer now** to have the assistant answer with what it has, with no tools. The pause comes before that final call, so nothing is spent until you choose. A turn can be continued up to 64 action rounds in total; at that cap only **Answer now** is offered. The pause is saved, so after a restart the same offer is still waiting. With a token cap set, the turn continues on its own instead of pausing (see [Capping What One Turn May Spend](#capping-what-one-turn-may-spend)).
+A turn that reaches its action-round limit (`agent_max_tool_rounds`, 16 by default) while the assistant still wants a tool does not stop: it pauses, and the reply names the action rounds it used against that limit and how many read-only rounds it had used. Select **Continue — N more** to give the same turn another segment of action rounds, keeping every message, tool result and plan step it had, or **Answer now** to have the assistant answer with what it has, with no tools. The pause comes before that final call, so nothing is spent until you choose. A turn can be continued up to 64 action rounds in total; at that cap only **Answer now** is offered. The pause is saved, so after a restart the same offer is still waiting. With a token cap set, the turn continues on its own instead of pausing (see [Capping What One Turn May Spend](#capping-what-one-turn-may-spend)).
 
 A turn that ends any other way leaves a mark on its message: **Stopped by you**, **Tool budget exhausted** (after **Answer now**; the reply names the action and read-only rounds it had used, and **Ask again** starts a new turn from the stopped task's own request, carrying its plan forward), **Token budget exhausted**, **Stopped before finishing**, or the error itself when the request failed. The stop and budget marks are still there when you reopen the session. **Stopped before finishing** and a failure's error are shown only in the window where the turn ran; after a reload, a stopped turn reads **Stopped by you** and a failed one has no mark.
 
 ### Intermediate steps and the answer
 
-A turn records each action it takes — a file read, a search, a command, a note — as an assistant summary followed by its result. Those consecutive steps are folded into one collapsed **Activity (N steps)** row rather than left as a full bubble per action. Open it to see each action and its exact tool result; the content scrolls at a cap, and the answer stays its own message at the end of the turn. This is the same on reload: the activities are rebuilt from the session log, not stored as a second record.
+A turn records each action it takes — a file read, a search, a command, a note — as an assistant summary followed by its result. Those consecutive steps are folded into one collapsed **Activity (N steps)** row rather than left as a full bubble per action. Open it to see each action and its exact tool result; the content scrolls at a cap, and the answer stays its own message at the end of the turn. A command step reads `$ <command>`, an exit mark (`✓ 0`, `exit N`, *timed out* or *cancelled*) and the model's reason. Open the step for its output: the working directory appears only when it is not the repository root, an empty stream is left out, and a command that printed nothing reads *No output*. **approved** after the mark means you approved the command; the request you answered is inside the step under *Approval request*. A declined request keeps its own message, and a note from an `after_tool` hook appears last in the step. The turn's token and time row is drawn once, under the answer; a turn that stopped to ask you something shows no duration, since it would include your wait. This is the same on reload: the activities are rebuilt from the session log, not stored as a second record.
 
 The plan panel keeps its summary visible and puts its steps behind a collapsed **Steps (N)** row. Open it when you want the full plan, each step's outcome, and the evidence behind it; leave it closed when you only need the answer. See [The Plan Panel](#the-plan-panel).
 
@@ -737,7 +807,14 @@ Only worktrees git itself has registered are reachable. A directory that merely
 lives under `.claude/worktrees/` or `.damaian/worktrees/` without being
 registered, a symlink planted there, or a registered worktree outside the
 repository root and your `allowed_roots`, is refused with the reachable
-worktrees listed, so the assistant can correct itself. Reads inside a worktree
+worktrees listed, so the assistant can correct itself. `list_worktrees` still
+names a registered worktree it cannot read, after the readable ones: its path,
+branch, short `HEAD`, how far it is ahead of and behind the main branch, and
+why it is not readable. Those come from git's worktree list and the
+repository's own commits; nothing is read from the worktree's files, so there
+is no changed-file count. A worktree another tool created outside the
+repository, for example, shows up there, so the assistant knows the branch
+exists even though it cannot read its files. Reads inside a worktree
 apply the same policy as reads in the main checkout: restricted and ignore
 patterns, the read and search caps, and secret redaction. Git reads in a
 worktree or the main checkout exclude restricted paths and are bounded the same
@@ -745,10 +822,9 @@ way.
 
 A session whose own checkout is a linked worktree — a worker, or a development
 worktree — can reach only that worktree by default: the main checkout and its
-siblings count as outside it. `list_worktrees` then shows 0 even though
-`git worktree list` shows the repository's worktrees, because it lists only
-reachable ones. Add the main checkout to `allowed_roots`, or run the tool from
-the main checkout, to survey them.
+siblings count as outside it. `list_worktrees` then lists 0 readable worktrees
+and names the others as not readable. Add the main checkout to
+`allowed_roots`, or run the tool from the main checkout, to read them.
 
 When one model message asks for several read-only tools, they run together and
 their results are reported in the order the model asked for them.
@@ -1047,7 +1123,11 @@ Every finished step carries one of four outcomes:
 - **Blocked** — a check or other command the step ran did not succeed. The
   steps after it stay pending: continuing would build on work that did not
   happen. A look-around command that fails, such as a `grep` with no match or an
-  `ls` of a missing path, is kept as evidence but does not block the step.
+  `ls` of a missing path, is kept as evidence but does not block the step. A
+  block clears when the assistant fixes the cause and runs **the same command**
+  again and it succeeds: only the latest run of a command counts, so a check
+  that failed, was fixed and then passed confirms the step, with both runs
+  still listed. A different command succeeding does not clear it.
 - **Skipped** — the step was not needed.
 
 The one-line summary at the top of the panel **never says "complete" while any
@@ -1116,7 +1196,7 @@ An export is a one-way record. It cannot be imported back, and it never leaves y
 
 ## Symbol Search and Language Servers
 
-The `{ }` button in the thread header, beside the terminal control, opens symbol search for the current folder. It searches declarations rather than text. Each result gives the symbol's name, its kind (function, method, struct, class, and so on) and an exact `path:line`. The `path:line` is clickable and opens the file in Visual Studio Code at that line and column, the same way a file reference in a reply does. A result in a project root other than the repository root shows that root after its path.
+The `</>` button in the thread header, beside the terminal control, opens symbol search for the current folder. It searches declarations rather than text. Each result gives the symbol's name, its kind (function, method, struct, class, and so on) and an exact `path:line`. The `path:line` is clickable and opens the file in Visual Studio Code at that line and column, the same way a file reference in a reply does. A result in a project root other than the repository root shows that root after its path.
 
 Results put a language-server answer before a guess, then order exact names before prefix matches and prefix matches before fuzzy ones, and show at most 50. The index is local and built from source text, so search needs no setup, no network and no language server.
 
@@ -1429,7 +1509,7 @@ characters.
 
 ## Command Approval
 
-When the assistant needs a local command result, it asks Damaian to run the command. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, and `git log`, run without asking, in the selected working folder. They run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Simple pipelines made only of such commands, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
+When the assistant needs a local command result, it asks Damaian to run the command. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, `git log`, `git branch -a`, and `sed -n '1,40p' README.md`, run without asking, in the selected working folder. They run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Such commands joined by `&&`, `;` or a newline, or filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
 
 ### What runs without asking
 
@@ -1446,8 +1526,21 @@ asks for approval.
 | `ls` | `-a`, `-l`, `-1`, `-d`, `-h`, `-R`, and paths, alone or combined; `-R` only with a path that is not the repository root |
 | `git status` | `--short`/`-s`, `--porcelain`, `--porcelain=v1`, `--branch`/`-b`, `--untracked-files=no` |
 | `git log` | `--oneline`, `-n N` (or `-nN`, `-N`), `--max-count=N`, `--stat`, `--name-only`, `--name-status`, `--format=…`, `--pretty` or `--pretty=…`, `--decorate`, `--graph`, revisions and paths — but not `-p`, `--patch` or `-u` |
+| `git worktree list` | `--porcelain`, `-v` |
+| `git branch` | `-a`, `-r`, `-v`, `-vv`, `--list`, `--show-current` — listing only, no branch names |
+| `git remote` | alone or `-v` |
+| `git rev-parse` | `--short`, `--abbrev-ref`, `--verify`, `-q`, `--show-toplevel`, `--git-dir`, revisions |
+| `git rev-list` | `--count`, `--left-right`, `--max-count=N`, revisions and ranges |
+| `git for-each-ref` | `--sort=…`, `--format=…`, `--count=N`, ref patterns |
+| `git merge-base` | `--is-ancestor`, revisions |
 | `git diff`, `git show` | not admitted — they print file contents a command line cannot bound or keep restricted paths out of; the assistant reads them through the `read_git_diff` tool instead |
-| `git` (global) | `--no-pager` only |
+| `git` (global) | `--no-pager`, and one `-C <dir>` where `<dir>` is inside the repository |
+| `echo` | any literal text |
+| `cat` | `-n` and at least one file |
+| `head`, `tail` | `-n N` (or `-nN`, `-N`) and at least one file; not `tail -f` |
+| `wc` | `-l`, `-w`, `-c` and at least one file |
+| `sed` | `-n` (optionally `-E`), a script that only prints — such as `1,80p`, `$p` or `/^## /p` — and at least one file |
+| `grep` | `-i -v -n -c -E -F -l -L -h -H -w -o -s -q`, `-m N`, `-A N`, `-B N`, `-C N`, one pattern (or `-e pattern`), and at least one file; not `-r` |
 
 Every path in an admitted command is resolved against the repository and
 `restricted_patterns`: a path outside the repository, behind a symlink, or
@@ -1458,26 +1551,42 @@ directories unasked. A restricted entry inside a directory you named is still
 listed by name — `ls` is not policed per entry the way the `list_directory` tool
 is.
 
-### Read-only pipelines
+The file-reading forms (`cat`, `head`, `tail`, `wc`, `sed -n`, `grep`) run
+without asking only when they name their files, and each file passes the same
+check: `cat .env`, `sed -n 1p secrets/key` and `head -n 5 ../other/file` ask. A
+recursive or globbed read (`grep -r`, `cat *.md`) asks, because the command line
+does not say which files it reaches. Any other form of these programs — `sed -i`,
+`cat a > b` — is judged as it always was.
 
-A pipeline runs without asking when it is built only from those commands and a
-small set of filters, joined by `&&` and `|`. It may begin with `cd <dir> &&`,
-where `<dir>` is inside the repository, not restricted, and exists. Each command
-before a `|` must itself be an admitted command from the table, checked against
-the directory it will run in. Each command after a `|` must be a filter that
-reads only its input, with no file argument:
+`git -C <dir>` checks `<dir>` like a `cd` directory, and resolves the paths
+after it against `<dir>`.
 
-- `head -n N`, `tail -n N`
+### Read-only pipelines and sequences
+
+A line runs without asking when it is built only from those commands and a
+small set of filters, joined by `&&`, `;`, a newline, and `|`. It may begin with
+`cd <dir> &&`, where `<dir>` is inside the repository, not restricted, and
+exists; a line that begins with `cd` may not also use `;` or a newline, because
+after `;` the next command runs even when `cd` failed. Each command before a `|`
+must itself be an admitted command from the table, checked against the directory
+it will run in. A command may discard output with `>/dev/null` or
+`2>/dev/null`, or merge it with `2>&1`; no other redirect is admitted. Each
+command after a `|` must be a filter that reads only its input, with no file
+argument:
+
+- `head` and `tail`, bare or with `-n N` or `-N`
 - `wc` with `-l`, `-w` or `-c`
 - `sort` with `-r`, `-n` or `-u`
 - `uniq` with `-c`
 - `cut` with `-d` and `-f`
 - `grep` with `-i`, `-v`, `-n`, `-c`, `-E` or `-F` and one pattern
 
-So `git log --oneline | grep -i fix | wc -l` and
-`cd crates && git status --short | head -n 3` run without asking. `git status;
-rm x`, `git log > out.txt` and `ls | xargs cat` do not: `;`, `>` and a filter
-with a file argument are outside the admitted shape.
+So `git log --oneline | grep -i fix | wc -l`,
+`cd crates && git status --short | head -n 3` and
+`echo '=== branches ==='; git branch -a 2>/dev/null; echo; git remote -v` run
+without asking. `git status; rm x`, `git log > out.txt`, `ls | xargs cat` and
+`git log || true` do not: `rm`, a redirect to a file, a filter with a file
+argument and `||` are outside the admitted shape.
 
 Every other command appears as an approval card in the conversation. Its first line names why Damaian is asking — which shell-control characters, network keyword, restricted path, setting, or [hook](#hooks) — and the same reason appears on the card beside the risk badge. **Why this command** holds the full prompt with every reason, and, when the agent gave one, **The agent says: …** is the agent's own stated purpose for the command. Review the command, risk, working directory and both reasons, then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
 
@@ -1549,6 +1658,32 @@ Error locations a command prints (`src/x.ts:3:5`) are matched to files relative 
 
 Elsewhere the UI names the root when a file is not in the working folder's own root: a pinned file chip reads `index.ts · packages/api`, and each file in a patch preview is tagged with its root. A turn that touches two packages shows both.
 
+### Which programs a command finds
+
+Commands run in your login shell (`zsh -lc` by default), which reads
+`~/.zprofile` but not `~/.zshrc`, and an app opened from Finder does not get
+your Terminal's `PATH`. Version managers such as nvm, pyenv and rbenv set
+`PATH` in `~/.zshrc`, so without help `npm` or `python` could be missing for
+the assistant while they work in your Terminal.
+
+So once per app run, before the first command, Damaian starts your shell as an
+interactive login shell in your home folder and reads its final `PATH`.
+Commands then find the same programs, in the same order, as in your Terminal.
+Only `PATH` is taken: your aliases, functions and other variables are not, so
+`ls` or `git` mean what they mean everywhere else. While Damaian asks,
+`DAMAIAN_RESOLVING_SHELL_PATH=1` is set, so your rc file can skip slow setup:
+
+```sh
+[ -n "$DAMAIAN_RESOLVING_SHELL_PATH" ] && return
+```
+
+placed after the lines that set `PATH`. If your shell takes more than five
+seconds, or does not answer, commands run as they did before. Edits to
+`~/.zshrc` take effect the next time Damaian starts. Set
+`command_path_from_interactive_shell=false` in your user config to turn it off.
+Only `sh`, `bash`, `zsh`, `ksh`, `dash` and `mksh` are asked; with another
+`shell`, such as fish, commands run with the login shell's `PATH`.
+
 ### `Allow Always` in a root
 
 [*Allow Always*](#allow-always) on a command that runs in a root other than the working folder records the grant for that root only. For `npm test` in `packages/api`, your config gets:
@@ -1581,7 +1716,7 @@ A **worker** is a session that runs on its own: it gets a prompt, works in a new
 
 **What a worker creates.** A branch `damaian/<name>` and a worktree at `<repository>/.damaian/worktrees/<name>`, the name taken from the prompt's first line. Damaian adds `.damaian/worktrees/` to `.git/info/exclude` once, so worktrees never show as untracked files. `.gitignore` is never edited. Clicking **Start worker** is your approval of those Git commands. They are recorded in the audit log and in the worker's session.
 
-**The Workers board.** **Workers** at the top of each project in the sidebar opens the board, and its badge counts the workers that need you. Workers are also listed in the sidebar under their parent, with a status dot. The board groups workers under *Needs you* (waiting for approval, or paused), *Running* and *Finished*, newest first. Each row shows the planner it came from, its rounds, what it is doing and how long it has run. Finished rows show files changed and commits ahead of where the worker started. Each row has one action — **Review** for an approval, **Pause** while running, **Open** otherwise — and a ⋯ menu with **Stop**, **Reveal worktree in Finder**, **Remove worktree** and **Dismiss from board**. Dismissing only hides the row. The session stays in the sidebar.
+**The Workers board.** **Workers** under a project in the sidebar opens the board. The entry appears only while the project has workers that you have not dismissed; it shows a dot for the most urgent state, *N running* when any are running, and a badge counting the workers that need you. With no workers the entry is absent, and **Workers board** on the project's ⋮ menu still opens the board. Workers are also listed in the sidebar under their parent, with a status dot. The board groups workers under *Needs you* (waiting for approval, or paused), *Running* and *Finished*, newest first. Each row shows the planner it came from, its rounds, what it is doing and how long it has run. Finished rows show files changed and commits ahead of where the worker started. Each row has one action — **Review** for an approval, **Pause** while running, **Open** otherwise — and a ⋯ menu with **Stop**, **Reveal worktree in Finder**, **Remove worktree** and **Dismiss from board**. Dismissing only hides the row. The session stays in the sidebar.
 
 **In a worker's session** a control strip under the header shows its state and round, with **Pause** and **Stop** while it runs, **Resume** and **Stop** while it is paused, and **Stop** while it waits or sits idle. The header says which session it came from and which branch it is on.
 
@@ -1949,7 +2084,7 @@ whether a failure becomes a finding.
   (`cargo build`, `cargo check`, `cargo clippy`, Biome).
 - **Exploration** commands do not. These are the assistant looking around:
   searches (`grep`, `rg`, `find`), listings (`ls`, `pwd`, `du`, `stat`,
-  `file`), text reads (`cat`, `head`, `tail`, `wc`, `sed` without `-i`, `awk`,
+  `file`), program lookups (`which`, `type`, `whence`, `command -v`), text reads (`cat`, `head`, `tail`, `wc`, `sed` without `-i`, `awk`,
   `sort`, `uniq`, `cut`, `echo`, `true`, `read`), and git reads (`status`,
   `diff`, `log`, `show`, `rev-list`, `rev-parse`, `branch --list`,
   `worktree list`, `ls-files`, `grep`), including pipelines and `&&`/`||`/`;`

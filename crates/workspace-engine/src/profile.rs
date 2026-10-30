@@ -401,6 +401,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         project_roots_added,
         project_roots_removed,
         shell,
+        command_path_from_interactive_shell,
         model_provider,
         model_name,
         model_base_url,
@@ -450,6 +451,11 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         // is the user's decision, like cross-project recall above.
         ("memory_retention_days", memory_retention_days.is_some()),
         ("shell", shell.is_some()),
+        // Spec 69: which program a command name runs, like `shell`.
+        (
+            "command_path_from_interactive_shell",
+            command_path_from_interactive_shell.is_some(),
+        ),
         ("model_provider", model_provider.is_some()),
         ("model_name", model_name.is_some()),
         ("model_base_url", model_base_url.is_some()),

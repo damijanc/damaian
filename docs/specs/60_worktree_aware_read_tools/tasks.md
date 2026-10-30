@@ -15,6 +15,7 @@
 | 4 · `list_worktrees` and `read_git_log` | Done 2026-10-18 | Details in the note below the table. |
 | 5 · `worktree_survey` eval scenario | Done 2026-10-18 | Details in the note below the table. |
 | 6 · Docs, live re-run and close-out | Done 2026-10-23 | Docs and cross-references 2026-10-19; live re-run 2026-10-23 with no approval stop; spec closed. Details in the note below the table. |
+| Follow-up · Name unreachable worktrees | Done 2026-10-29 | `WorktreeListing.unreachable` (`UnreachableWorktree`: path, branch, short `HEAD`, ahead/behind, `WorktreeRefusal`) and `unreachable_omitted`, capped at 20 like the reachable list; the session's own checkout is in neither. `HEAD` and ahead/behind are taken at the session root from the shared object store (`ahead_behind` now takes the rev), never in the worktree; a count that cannot be taken is `None`, not an error. `format_worktree_listing` adds a "Not readable from this session" section only when there is one, so output is unchanged otherwise; the audit gains `unreachable`; the tool description says the list is complete. Tests in `tests/worktree_reads.rs`: the linked-worktree test renamed and extended, plus an outside worktree named with ahead/behind, a removed directory named as prunable, and the tool text and audit. Why: proposal §7, 2026-10-29. The full seven-check gate passed in CI on 2026-10-29 (Quality run 40927385836). |
 
 **Task 1 (Done 2026-10-17).** New module `worktree_access.rs`:
 `parse_worktree_list` reads `git worktree list --porcelain -z` (NUL-terminated
