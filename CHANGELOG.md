@@ -39,6 +39,7 @@ harness, and **Release** covers packaging, signing and distribution.
 
 | | |
 |---|---|
+| **v0.58.0** | **Engine**<br>- Record nothing_verified instead of passed when every check was skipped.<br>- Continue the task after a verification that leaves its plan open.<br>- Refuse edits into another worktree and send worktree tasks to a worker. |
 | **v0.57.0** | **Engine**<br>- Use a provider's own keychain key over the global key reference.<br><br>**App**<br>- Make the first provider saved in Settings the default.<br>- Resume paused turns with the chat's selected provider and model. |
 | **v0.56.0** | **Engine**<br>- Recover DeepSeek textual tool calls and audit OpenRouter routes per model call.<br>- Show recalled memory in the context inspector.<br>- Wire recalled memory into the turn with a send-time re-check.<br>- Deliver recalled memory through context assembly.<br>- Add lexical memory recall with retrieval-time revalidation.<br>- Add the memory context category and its configuration keys.<br><br>**App**<br>- Send change requests to the agent loop when the provider has native tools.<br><br>**Evaluation**<br>- Measure memory recall with eval scenarios and metrics. |
 | **v0.54.0** | **Engine**<br>- Say when a content search read no file, and record its glob. |
