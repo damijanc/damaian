@@ -2680,6 +2680,17 @@ reads as complete is the failure the caps exist to prevent. The caps are
 `max_match_line_chars` (500); a repository config may lower one but never raise
 it.
 
+### A search said "No file was searched"
+
+`search_content` read no file at all, so its result is not evidence that the
+text is absent. Usually the search's glob matched nothing: only `*` (within one
+directory), `**` (across directories) and `?` are wildcards, and `{a,b}` or
+`[...]` are matched character for character, so `{src/**,docs/**}` matches no
+path. The conversation's activity line names the glob (`Searched for "…" in
+`<glob>``), and the audit log's `content_searched` event records it as
+`pathGlob` beside `filesSearched: 0`. The assistant is told the same and can
+search again with one glob per directory.
+
 ### A fetch was refused
 
 `fetch_url` is the agent's page reader. Several different things can stop a

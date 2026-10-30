@@ -9522,12 +9522,19 @@ impl ChatOrchestrator {
                 // A literal glob is a path request, so it can be refused
                 // outright. A pattern with wildcards is filtered while walking,
                 // below, because no single path can answer it.
+                // The glob is part of what was searched, so the session log
+                // names it: without it, "0 matches" cannot be told apart from
+                // a search that covered nothing.
+                let in_glob = path_glob
+                    .as_deref()
+                    .map(|glob| format!(" in `{glob}`"))
+                    .unwrap_or_default();
                 if let Some(glob) = path_glob
                     && !glob.contains(['*', '?', '[', '{'])
                     && outside_restriction(Some(glob))
                 {
                     return (
-                        format!("Searched for \"{pattern}\"{scope}"),
+                        format!("Searched for \"{pattern}\"{in_glob}{scope}"),
                         format!(
                             "Cannot search {glob}{scope}: the path is outside this session's path restriction."
                         ),
@@ -9560,16 +9567,42 @@ impl ChatOrchestrator {
                         } else {
                             ""
                         };
-                        let content = format!(
-                            "{} matches for \"{}\" across {} files{scope}{note} (showing {}):\n{}",
-                            found.total_found,
-                            pattern,
-                            found.files_searched,
-                            found.matches.len(),
-                            lines,
-                        );
+                        // A search that read no file found nothing because it
+                        // looked nowhere. Saying "0 matches" would read as
+                        // evidence of absence, so it says what happened instead.
+                        let content = if found.files_searched == 0 {
+                            match path_glob {
+                                Some(glob) => format!(
+                                    "No file was searched for \"{pattern}\"{scope}{note}: the glob \
+                                     `{glob}` matched no readable file. Only `*` (within one \
+                                     directory), `**` (across directories) and `?` are \
+                                     wildcards; `{{a,b}}` and `[...]` are matched literally. \
+                                     This is not evidence that the text is absent: search \
+                                     again with one glob per directory, or without a glob.\n"
+                                ),
+                                None if context_restriction.is_some() => format!(
+                                    "No file was searched for \"{pattern}\"{scope}: this \
+                                     session's path restriction admits no file to search. \
+                                     This is not evidence that the text is absent.\n"
+                                ),
+                                None => format!(
+                                    "No file was searched for \"{pattern}\"{scope}: there is \
+                                     no readable text file to search. This is not evidence \
+                                     that the text is absent.\n"
+                                ),
+                            }
+                        } else {
+                            format!(
+                                "{} matches for \"{}\" across {} files{scope}{note} (showing {}):\n{}",
+                                found.total_found,
+                                pattern,
+                                found.files_searched,
+                                found.matches.len(),
+                                lines,
+                            )
+                        };
                         (
-                            format!("Searched for \"{pattern}\"{scope}"),
+                            format!("Searched for \"{pattern}\"{in_glob}{scope}"),
                             content,
                             ActionOutcome::Ok,
                         )
@@ -11758,10 +11791,17 @@ fn tool_action_label(action: &ToolAction) -> String {
             (None, None) => "Listing the repository".to_string(),
         },
         ToolAction::SearchContent {
-            pattern, worktree, ..
+            pattern,
+            path_glob,
+            worktree,
+            ..
         } => {
             format!(
-                "Searching for \"{pattern}\"{}",
+                "Searching for \"{pattern}\"{}{}",
+                path_glob
+                    .as_deref()
+                    .map(|glob| format!(" in `{glob}`"))
+                    .unwrap_or_default(),
                 in_worktree(worktree.as_deref())
             )
         }
@@ -11914,7 +11954,7 @@ fn search_content_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "search_content".to_string(),
         description: "Search file contents by regular expression and return path, line number and the matching line. Use this to find call sites; use search_codebase to find which files are about a topic. With `worktree`, search a git worktree of this repository instead.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"pattern\":{\"type\":\"string\",\"description\":\"Regular expression\"},\"path_glob\":{\"type\":\"string\",\"description\":\"Optional glob limiting which files are searched\"},\"max_matches\":{\"type\":\"integer\",\"description\":\"Fewer matches than the configured cap; it cannot raise it\"}},\"required\":[\"pattern\"]}".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"pattern\":{\"type\":\"string\",\"description\":\"Regular expression\"},\"path_glob\":{\"type\":\"string\",\"description\":\"Optional glob over repository-relative paths limiting which files are searched. Only * (within one directory), ** (across directories) and ? are wildcards; {a,b} and [...] are matched literally, so search once per directory instead\"},\"max_matches\":{\"type\":\"integer\",\"description\":\"Fewer matches than the configured cap; it cannot raise it\"}},\"required\":[\"pattern\"]}".to_string(),
     }
 }
 

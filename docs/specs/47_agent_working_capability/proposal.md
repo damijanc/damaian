@@ -586,3 +586,31 @@ What implementing them found, in the order that mattered.
     all three of which failed on the split shape, and the clamp by
     `a_clamp_never_splits_a_batched_round` (`chat.rs`). The live confirmation is spec 12's
     Task 5 Step 1 re-run.
+
+### 7.4 A search that read no file (2026-10-30)
+
+A reporting run on 2026-10-30 passed `search_content` a brace glob, which
+`glob_match` matches literally, so no file was read. The result said
+`0 matches for "(?i)autonom" across 0 files`, the same shape as a search that
+looked everywhere and found nothing. The model was careful and called it
+inconclusive, but nothing recorded the glob, so the run could not be
+diagnosed afterwards.
+
+Three changes, all in the result's shape rather than the search:
+
+- When no file was read, the result says `No file was searched for "…"`,
+  names the glob, lists the wildcards `glob_match` supports (`*`, `**`, `?`;
+  `{a,b}` and `[...]` are literal), and says the result is not evidence of
+  absence. With no glob, it names the session's path restriction when one
+  admitted no file. A search that read files keeps its usual result;
+  `an_empty_restriction_refuses_every_read_but_not_a_plain_answer`
+  (`tests/context_inspector.rs`), which pinned `0 matches` for the empty
+  restriction, now pins this wording.
+- The `path_glob` argument's description states the same wildcard rules.
+- The session log's line names the glob (`Searched for "…" in `<glob>``), and
+  `content_searched` gains `pathGlob`, redacted like the pattern.
+
+Brace expansion itself was not added: the honest result is enough for the
+model to search again, and a richer glob syntax is a separate decision.
+Pinned by `a_search_whose_glob_matches_no_file_says_it_searched_nothing`
+(`tests/agent_tools.rs`).

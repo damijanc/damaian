@@ -1639,7 +1639,11 @@ fn an_empty_restriction_refuses_every_read_but_not_a_plain_answer() {
         results
     );
     assert!(
-        results[1].contains("0 matches") && !results[1].contains("README.md"),
+        // The search reads no file, so it says so and names the restriction
+        // rather than reporting "0 matches" (spec 47 §7.4).
+        results[1].contains("No file was searched")
+            && results[1].contains("path restriction admits no file")
+            && !results[1].contains("README.md"),
         "{:?}",
         results
     );

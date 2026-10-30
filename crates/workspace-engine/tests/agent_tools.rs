@@ -1156,6 +1156,83 @@ fn the_agent_read_tool_cannot_request_an_uncapped_context_range() {
     );
 }
 
+/// A reporting run searched with a brace glob, which `glob_match` matches
+/// literally, and got "0 matches … across 0 files": a search that looked
+/// nowhere, read as a search that found nothing. It must say so, and the
+/// session log and audit must name the glob so the run can be diagnosed.
+#[test]
+fn a_search_whose_glob_matches_no_file_says_it_searched_nothing() {
+    let repo = temp_dir("search-no-files");
+    write_fixture(&repo, "src/lib.rs", "pub fn autonomy() {}\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), String::new(), "Done.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "search_content".to_string(),
+                arguments_json: "{\"pattern\":\"autonom\",\"path_glob\":\"{src/**,docs/**}\"}"
+                    .to_string(),
+            }],
+            vec![ToolCall {
+                id: "call_2".to_string(),
+                name: "search_content".to_string(),
+                arguments_json: "{\"pattern\":\"autonom\",\"path_glob\":\"src/**\"}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Is there autonomy code?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    let tool_results: Vec<&str> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.content.as_str())
+        .collect();
+    assert!(
+        tool_results[0].starts_with("No file was searched for \"autonom\"")
+            && tool_results[0].contains("`{src/**,docs/**}` matched no readable file")
+            && tool_results[0].contains("not evidence that the text is absent"),
+        "{:?}",
+        tool_results[0]
+    );
+    assert!(
+        tool_results[1].starts_with("1 matches for \"autonom\" across 1 files"),
+        "a glob that matches keeps the usual result: {:?}",
+        tool_results[1]
+    );
+    assert!(
+        messages.iter().any(|message| message.role == "assistant"
+            && message.content == "Searched for \"autonom\" in `{src/**,docs/**}`"),
+        "the session log must name the glob"
+    );
+
+    let events = fs::read_to_string(repo.join(".damaian/audit/events.jsonl")).unwrap();
+    assert!(
+        events.contains("\"pathGlob\":\"{src/**,docs/**}\"")
+            && events.contains("\"filesSearched\":\"0\""),
+        "the audit must record the glob beside the empty search"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Requirement 8 · batching and concurrent dispatch
 // ---------------------------------------------------------------------------
