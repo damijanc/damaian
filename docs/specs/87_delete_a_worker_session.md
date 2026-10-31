@@ -61,6 +61,14 @@ the menu lacked the entry.
     the row's dismissal.
   - `removeWorkerWorktree` toasts the *gone* status.
 
+> **Amended 2026-10-31.** In use, **Delete session** on a worker whose
+> worktree was gone failed with "Session … does not belong to repository
+> <source>". `delete_session` accepted only the session's own repository, and
+> a worker's session is keyed by its worktree. It now also accepts the
+> worker's source repository (`WorkerRecord::source_repository`), where the
+> `session_end` hooks then run. Any other root is still refused. Pinned by
+> `a_worker_session_is_deleted_from_its_source_project` (`tests/hooks.rs`).
+
 ## 5. Acceptance
 
 - `removing_a_worktree_that_is_already_gone_prunes_it`

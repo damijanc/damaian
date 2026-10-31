@@ -3117,6 +3117,42 @@ fn session_end_runs_on_deletion_and_a_deny_does_not_stop_it() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Spec 87: a worker's session is keyed by its worktree, which may already be
+/// gone. It is deleted from its source project, and nothing else's root.
+#[test]
+fn a_worker_session_is_deleted_from_its_source_project() {
+    let root = temp_dir("worker-delete-source");
+    let other = temp_dir("worker-delete-other");
+    let (config, engine) = engine_for(&root, Vec::new());
+    let store = SessionStore::new(&config.data_dir);
+    let worktree = root.join(".damaian/worktrees/gone");
+    let session = store
+        .create_session(&repository_id_for_root(&worktree), "worker")
+        .unwrap();
+    store
+        .record_worker_spawned(
+            &session.id,
+            &workspace_engine::WorkerRecord {
+                parent_session_id: None,
+                source_repository: root.clone(),
+                worktree_path: worktree,
+                branch: "damaian/gone".to_string(),
+                base_commit: String::new(),
+                included_uncommitted: false,
+                git_commands: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    engine
+        .delete_session(&session.id, &other)
+        .expect_err("another project cannot delete the worker");
+    engine
+        .delete_session(&session.id, &root)
+        .expect("the source project deletes its worker's session");
+    assert!(store.read_session(&session.id).unwrap().is_none());
+}
+
 /// The root is a caller-supplied argument — the shell takes it from the
 /// request form — so it must be the session's own repository. Otherwise
 /// deleting A's session with `repo=B` would run B's `session_end` hooks with

@@ -266,7 +266,17 @@ impl WorkspaceEngine {
     ) -> Result<()> {
         let root = repository_root.as_ref();
         if let Some(session) = self.session_store.read_session(session_id)? {
-            if repository_id_for_root(root) != session.repository_id {
+            // A worker's session belongs to its worktree, which may already
+            // be gone; it is deleted from its source project, whose hooks
+            // then run for it (spec 87).
+            let worker_of_root =
+                self.session_store
+                    .worker_record(session_id)?
+                    .is_some_and(|record| {
+                        repository_id_for_root(&record.source_repository)
+                            == repository_id_for_root(root)
+                    });
+            if repository_id_for_root(root) != session.repository_id && !worker_of_root {
                 return Err(ClientError::InvalidInput(format!(
                     "Session {session_id} does not belong to repository {}",
                     root.display()
