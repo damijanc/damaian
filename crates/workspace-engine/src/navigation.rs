@@ -13,7 +13,7 @@
 use crate::audit::AuditLog;
 use crate::config::{Config, DEFAULT_IGNORE_PATTERNS};
 use crate::error::{ClientError, Result};
-use crate::ignore::{glob_match, parse_ignore_patterns};
+use crate::ignore::{glob_match_with_alternatives, parse_ignore_patterns};
 use crate::path_policy::PathPolicy;
 use crate::secret_scanner::SecretScanner;
 use crate::tree_walk::{WalkEvent, walk};
@@ -268,8 +268,11 @@ impl NavigationController {
                 {
                     return Ok(());
                 }
+                // Brace alternatives are a search convenience only: the
+                // ignore rules above still treat `{a,b}` literally, because
+                // git does (spec 47 §7.4).
                 if let Some(glob) = path_glob
-                    && !glob_match(glob, &file.relative_path)
+                    && !glob_match_with_alternatives(glob, &file.relative_path)
                 {
                     return Ok(());
                 }

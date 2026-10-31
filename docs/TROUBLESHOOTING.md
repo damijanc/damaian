@@ -2806,13 +2806,19 @@ provider's **Native tool-calling** box is ticked in Settings › Providers.
 ### A search said "No file was searched"
 
 `search_content` read no file at all, so its result is not evidence that the
-text is absent. Usually the search's glob matched nothing: only `*` (within one
-directory), `**` (across directories) and `?` are wildcards, and `{a,b}` or
-`[...]` are matched character for character, so `{src/**,docs/**}` matches no
-path. The conversation's activity line names the glob (`Searched for "…" in
-`<glob>``), and the audit log's `content_searched` event records it as
-`pathGlob` beside `filesSearched: 0`. The assistant is told the same and can
-search again with one glob per directory.
+text is absent. Usually the search's glob matched nothing. `*` (within one
+directory), `**` (across directories) and `?` are wildcards, and `{a,b}`
+matches any one of its comma-separated alternatives, including inside a longer
+pattern such as `src/{a,b}/*.rs` or `*.{rs,toml}`, so `{src/**,docs/**}` reads
+both directories. `[...]` is still matched character for character, and nested
+braces are not supported: an unsupported group falls back to being matched
+literally, so `{src,{a,b}}` reads nothing. Brace alternatives are a
+`search_content` convenience only — `.gitignore` and ignore rules keep matching
+`{a,b}` literally, because Git does not expand braces. The conversation's
+activity line names the glob (`Searched for "…" in `<glob>``), and the audit
+log's `content_searched` event records it as `pathGlob` beside
+`filesSearched: 0`. The assistant is told the same and can search again with
+one glob per directory.
 
 ### A fetch was refused
 

@@ -10181,9 +10181,10 @@ impl ChatOrchestrator {
                                     "No file was searched for \"{pattern}\"{scope}{note}: the glob \
                                      `{glob}` matched no readable file. Only `*` (within one \
                                      directory), `**` (across directories) and `?` are \
-                                     wildcards; `{{a,b}}` and `[...]` are matched literally. \
-                                     This is not evidence that the text is absent: search \
-                                     again with one glob per directory, or without a glob.\n"
+                                     wildcards, and `{{a,b}}` matches any one of its \
+                                     comma-separated alternatives; `[...]` is matched literally. \
+                                     This is not evidence that the text is absent: search again \
+                                     with one glob per directory, or without a glob.\n"
                                 ),
                                 None if context_restriction.is_some() => format!(
                                     "No file was searched for \"{pattern}\"{scope}: this \
@@ -12603,7 +12604,7 @@ fn search_content_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "search_content".to_string(),
         description: "Search file contents by regular expression and return path, line number and the matching line. Use this to find call sites; use search_codebase to find which files are about a topic. With `worktree`, search a git worktree of this repository instead.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"pattern\":{\"type\":\"string\",\"description\":\"Regular expression\"},\"path_glob\":{\"type\":\"string\",\"description\":\"Optional glob over repository-relative paths limiting which files are searched. Only * (within one directory), ** (across directories) and ? are wildcards; {a,b} and [...] are matched literally, so search once per directory instead\"},\"max_matches\":{\"type\":\"integer\",\"description\":\"Fewer matches than the configured cap; it cannot raise it\"}},\"required\":[\"pattern\"]}".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"pattern\":{\"type\":\"string\",\"description\":\"Regular expression\"},\"path_glob\":{\"type\":\"string\",\"description\":\"Optional glob over repository-relative paths limiting which files are searched. * (within one directory), ** (across directories) and ? are wildcards, and {a,b} matches any one of the comma-separated alternatives, including inside a longer pattern such as src/{a,b}/*.rs or *.{rs,toml}; [...] is matched literally, and nested braces are not supported, so search once per directory for those\"},\"max_matches\":{\"type\":\"integer\",\"description\":\"Fewer matches than the configured cap; it cannot raise it\"}},\"required\":[\"pattern\"]}".to_string(),
     }
 }
 

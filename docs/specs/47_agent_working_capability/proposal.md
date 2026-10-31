@@ -616,3 +616,23 @@ Pinned by `a_search_whose_glob_matches_no_file_says_it_searched_nothing`
 (`tests/agent_tools.rs`). The full seven-check gate passed in CI on 2026-10-30
 for the `main` push that contains it (Quality run 41050532576; the run on the
 change's own commit was cancelled by the next push).
+
+> **Amended 2026-10-30, after the decision above.** Brace alternatives were
+> added after all, but as the separate decision the last paragraph asks for
+> rather than as a change to `glob_match`. A new
+> `glob_match_with_alternatives` (`ignore.rs`) expands one or more top-level
+> `{a,b,…}` groups and calls `glob_match` on each alternative, and only
+> `search_content`'s `path_glob` uses it: `src/{a,b}/*.rs`, `*.{rs,toml}` and
+> `{src/**,docs/**}` now read the files they name. `.gitignore` and ignore-rule
+> matching keep calling `glob_match`, because Git does not expand braces and an
+> ignore rule that started matching a whole group would begin hiding files its
+> author never named. Nested groups, an unterminated `{`, and a pattern that
+> would expand past 256 alternatives are unsupported and fall back to literal
+> matching rather than panicking or matching nothing for an unstated reason, so
+> `{src,{a,b}}` still reads no file. The `path_glob` description and the
+> `No file was searched` result now say that `{a,b}` is an alternative group and
+> that `[...]` is still literal, so the three bullets above describe the state
+> before this amendment. Pinned by
+> `a_search_reads_each_of_its_brace_alternatives` (`tests/agent_tools.rs`), and
+> by the `ignore.rs` unit tests — `ignore_rules_still_treat_braces_literally` is
+> the one that fails if the helper is ever wired into the ignore path.

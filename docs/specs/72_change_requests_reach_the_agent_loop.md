@@ -27,6 +27,12 @@ included in the supplied repository context". The patch broke an existing test
 it never ran, changed `.gitignore` matching as a side effect, and its spec note
 described changes it had not made.
 
+> **Note, 2026-10-30.** That brace request was built later the same day, as
+> [#47](47_agent_working_capability/proposal.md) §7.4's amendment: a new
+> `glob_match_with_alternatives` used by `search_content`'s `path_glob`, with
+> `glob_match` and the ignore rules left literal. This spec is about the flow
+> that garbled the request, not about that feature.
+
 The turn never reached the agent loop. `looksLikeEditRequest` in `app.js`
 sends any prompt with an edit verb (`add`, `implement`, `fix`, …) and a code
 word (`test`, `code`, `docs`, …) to `/api/propose-edit`, the one-shot patch

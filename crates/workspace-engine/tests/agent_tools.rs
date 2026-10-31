@@ -1157,10 +1157,10 @@ fn the_agent_read_tool_cannot_request_an_uncapped_context_range() {
     );
 }
 
-/// A reporting run searched with a brace glob, which `glob_match` matches
-/// literally, and got "0 matches … across 0 files": a search that looked
-/// nowhere, read as a search that found nothing. It must say so, and the
-/// session log and audit must name the glob so the run can be diagnosed.
+/// A glob that opens no file at all yields "0 matches … across 0 files": a
+/// search that looked nowhere, read as a search that found nothing. It must say
+/// so, and the session log and audit must name the glob so the run can be
+/// diagnosed.
 #[test]
 fn a_search_whose_glob_matches_no_file_says_it_searched_nothing() {
     let repo = temp_dir("search-no-files");
@@ -1175,7 +1175,7 @@ fn a_search_whose_glob_matches_no_file_says_it_searched_nothing() {
             vec![ToolCall {
                 id: "call_1".to_string(),
                 name: "search_content".to_string(),
-                arguments_json: "{\"pattern\":\"autonom\",\"path_glob\":\"{src/**,docs/**}\"}"
+                arguments_json: "{\"pattern\":\"autonom\",\"path_glob\":\"nomatch/**\"}"
                     .to_string(),
             }],
             vec![ToolCall {
@@ -1210,7 +1210,7 @@ fn a_search_whose_glob_matches_no_file_says_it_searched_nothing() {
         .collect();
     assert!(
         tool_results[0].starts_with("No file was searched for \"autonom\"")
-            && tool_results[0].contains("`{src/**,docs/**}` matched no readable file")
+            && tool_results[0].contains("`nomatch/**` matched no readable file")
             && tool_results[0].contains("not evidence that the text is absent"),
         "{:?}",
         tool_results[0]
@@ -1222,15 +1222,84 @@ fn a_search_whose_glob_matches_no_file_says_it_searched_nothing() {
     );
     assert!(
         messages.iter().any(|message| message.role == "assistant"
-            && message.content == "Searched for \"autonom\" in `{src/**,docs/**}`"),
+            && message.content == "Searched for \"autonom\" in `nomatch/**`"),
         "the session log must name the glob"
     );
 
     let events = fs::read_to_string(repo.join(".damaian/audit/events.jsonl")).unwrap();
     assert!(
-        events.contains("\"pathGlob\":\"{src/**,docs/**}\"")
+        events.contains("\"pathGlob\":\"nomatch/**\"")
             && events.contains("\"filesSearched\":\"0\""),
         "the audit must record the glob beside the empty search"
+    );
+}
+
+/// Spec 47 §7.4's amendment: a brace group in `search_content`'s `path_glob`
+/// means "any one of these alternatives", so a model-written glob such as
+/// `{src/**,docs/**}` reads the files it names instead of opening none. The
+/// third file is the negative control: a path under no alternative stays
+/// unread. `glob_match` itself is unchanged, which is why the ignore rules keep
+/// treating braces literally (`ignore_rules_still_treat_braces_literally`).
+#[test]
+fn a_search_reads_each_of_its_brace_alternatives() {
+    let repo = temp_dir("search-brace-alternatives");
+    write_fixture(&repo, "src/lib.rs", "pub fn autonomy() {}\n");
+    write_fixture(&repo, "docs/guide.md", "autonomy is documented\n");
+    write_fixture(&repo, "tests/other.rs", "pub fn autonomy() {}\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Found it.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "search_content".to_string(),
+                arguments_json: "{\"pattern\":\"autonom\",\"path_glob\":\"{src/**,docs/**}\"}"
+                    .to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_chunk = |_: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Where is autonomy?",
+            &[],
+            &mut adapter,
+            &mut on_chunk,
+        )
+        .unwrap();
+
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    let tool_content = messages
+        .iter()
+        .find(|message| message.role == "tool")
+        .map(|message| message.content.as_str())
+        .expect("the search result should be in the session");
+
+    assert!(
+        tool_content.starts_with("2 matches for \"autonom\" across 2 files"),
+        "both alternatives must be searched: {tool_content:?}"
+    );
+    assert!(
+        tool_content.contains("src/lib.rs") && tool_content.contains("docs/guide.md"),
+        "each alternative's matches must be reported: {tool_content:?}"
+    );
+    assert!(
+        !tool_content.contains("tests/other.rs"),
+        "a path under no alternative must not be searched: {tool_content:?}"
+    );
+    assert!(
+        !tool_content.contains("No file was searched"),
+        "a glob that reads files keeps the usual result: {tool_content:?}"
     );
 }
 

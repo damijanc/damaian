@@ -123,6 +123,75 @@ pub fn glob_match(pattern: &str, value: &str) -> bool {
     inner(pattern.as_bytes(), value.as_bytes(), 0, 0)
 }
 
+/// How many patterns one `{a,b,..}` expansion may produce before the pattern is
+/// treated as unsupported. A model-written glob could otherwise multiply a
+/// handful of small groups into millions of strings.
+const MAX_ALTERNATIVES: usize = 256;
+
+/// [`glob_match`] with `{a,b,c}` alternatives, for `search_content`'s
+/// `path_glob` only.
+///
+/// Git does not expand braces, so `.gitignore` and ignore-rule matching keep
+/// using [`glob_match`] and keep treating `{a,b}` literally; an ignore rule that
+/// suddenly matched a whole brace group would start hiding files its author did
+/// not name. This helper exists for the search tool, whose glob is written by a
+/// model and cannot be corrected by editing a file (spec 47 §7.4).
+///
+/// A group matches any one of its comma-separated alternatives, and may sit
+/// inside a longer pattern (`src/{a,b}/*.rs`); several groups are expanded
+/// together. Nested groups (`{a,{b,c}}`), an unterminated `{`, and a pattern
+/// expanding past [`MAX_ALTERNATIVES`] are unsupported: the pattern is then
+/// matched literally, by [`glob_match`], rather than panicking or silently
+/// matching nothing for a reason the caller cannot see.
+pub fn glob_match_with_alternatives(pattern: &str, value: &str) -> bool {
+    let Some(alternatives) = expand_brace_groups(pattern) else {
+        return glob_match(pattern, value);
+    };
+    alternatives
+        .iter()
+        .any(|alternative| glob_match(alternative, value))
+}
+
+/// Every pattern `pattern` expands to, or `None` when it holds a brace group
+/// this helper does not support.
+fn expand_brace_groups(pattern: &str) -> Option<Vec<String>> {
+    let mut expanded = vec![String::new()];
+    let mut rest = pattern;
+    while let Some(open) = rest.find('{') {
+        let (prefix, from_open) = rest.split_at(open);
+        if !prefix.is_empty() {
+            for alternative in &mut expanded {
+                alternative.push_str(prefix);
+            }
+        }
+        let after_open = &from_open[1..];
+        let close = after_open.find('}')?;
+        let body = &after_open[..close];
+        if body.contains(['{', '}']) {
+            return None;
+        }
+        let mut next = Vec::new();
+        for alternative in &expanded {
+            for choice in body.split(',') {
+                let mut combination = alternative.clone();
+                combination.push_str(choice);
+                next.push(combination);
+            }
+        }
+        if next.len() > MAX_ALTERNATIVES {
+            return None;
+        }
+        expanded = next;
+        rest = &after_open[close + 1..];
+    }
+    if !rest.is_empty() {
+        for alternative in &mut expanded {
+            alternative.push_str(rest);
+        }
+    }
+    Some(expanded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +225,118 @@ mod tests {
         let rules = parse_ignore_patterns(&["**/node_modules".to_string()], "");
         assert!(is_ignored_by_rules(&rules, "node_modules", true));
         assert!(is_ignored_by_rules(&rules, "web/node_modules", true));
+    }
+
+    #[test]
+    fn a_brace_group_matches_any_one_of_its_alternatives() {
+        assert!(glob_match_with_alternatives("{a,b}", "a"));
+        assert!(glob_match_with_alternatives("{a,b}", "b"));
+        assert!(!glob_match_with_alternatives("{a,b}", "c"));
+        // The group is one path segment, not the whole path.
+        assert!(!glob_match_with_alternatives("{a,b}", "a/b"));
+    }
+
+    #[test]
+    fn a_brace_group_matches_inside_a_longer_pattern() {
+        assert!(glob_match_with_alternatives("*.{rs,toml}", "lib.rs"));
+        assert!(glob_match_with_alternatives("*.{rs,toml}", "Cargo.toml"));
+        assert!(!glob_match_with_alternatives("*.{rs,toml}", "lib.md"));
+
+        assert!(glob_match_with_alternatives(
+            "src/{a,b}/*.rs",
+            "src/a/lib.rs"
+        ));
+        assert!(glob_match_with_alternatives(
+            "src/{a,b}/*.rs",
+            "src/b/lib.rs"
+        ));
+        assert!(!glob_match_with_alternatives(
+            "src/{a,b}/*.rs",
+            "src/c/lib.rs"
+        ));
+
+        // Several groups expand together.
+        assert!(glob_match_with_alternatives(
+            "{src,tests}/{a,b}.rs",
+            "tests/b.rs"
+        ));
+        assert!(!glob_match_with_alternatives(
+            "{src,tests}/{a,b}.rs",
+            "docs/a.rs"
+        ));
+    }
+
+    #[test]
+    fn a_brace_group_of_whole_path_globs_matches_each_alternative() {
+        assert!(glob_match_with_alternatives("{src/**,docs/**}", "src/a.rs"));
+        assert!(glob_match_with_alternatives(
+            "{src/**,docs/**}",
+            "docs/a.md"
+        ));
+        assert!(!glob_match_with_alternatives(
+            "{src/**,docs/**}",
+            "tests/a.rs"
+        ));
+    }
+
+    /// An unsupported group falls back to literal matching rather than
+    /// matching nothing or panicking.
+    #[test]
+    fn nested_and_unterminated_groups_are_matched_literally() {
+        for pattern in ["{a,{b,c}}", "{a,b", "src/{a,{b,c}}/*.rs"] {
+            assert_eq!(
+                glob_match_with_alternatives(pattern, pattern),
+                glob_match(pattern, pattern),
+                "{pattern}"
+            );
+            assert_eq!(
+                glob_match_with_alternatives(pattern, "a"),
+                glob_match(pattern, "a"),
+                "{pattern}"
+            );
+        }
+    }
+
+    /// A pattern with no braces must behave exactly as `glob_match` does, so
+    /// every existing `path_glob` keeps its meaning.
+    #[test]
+    fn a_pattern_without_braces_behaves_exactly_as_before() {
+        for pattern in [
+            "src/**",
+            "src/*.rs",
+            "*.md",
+            "nomatch/**",
+            "crates/*/src/**/*.rs",
+            "**/*.rs",
+            "a?c",
+            "",
+        ] {
+            for value in [
+                "src/a.rs",
+                "src/lib.rs",
+                "docs/a.md",
+                "lib.rs",
+                "crates/a/src/lib.rs",
+                "abc",
+                "",
+            ] {
+                assert_eq!(
+                    glob_match_with_alternatives(pattern, value),
+                    glob_match(pattern, value),
+                    "{pattern} vs {value}"
+                );
+            }
+        }
+    }
+
+    /// Git does not expand braces, so an ignore rule must keep treating them
+    /// literally. This is the test that fails if the search helper is ever
+    /// wired into the ignore path.
+    #[test]
+    fn ignore_rules_still_treat_braces_literally() {
+        let rules = parse_ignore_patterns(&["{src,docs}/**".to_string()], "");
+        assert!(!is_ignored_by_rules(&rules, "src/lib.rs", false));
+        assert!(!is_ignored_by_rules(&rules, "docs/a.md", false));
+        assert!(!glob_match("{src,docs}/**", "src/lib.rs"));
     }
 }
