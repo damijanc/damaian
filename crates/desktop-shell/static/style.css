@@ -1618,10 +1618,14 @@ button:disabled {
 
 /* The findings list (spec 22 Task 11), now a popover off the repo bar's
    action chevron, opening upward over the conversation (spec 58 §1 req 17).
-   `.model-popover` positions it against `.repo-bar`; this sizes it, scoped so
-   it outranks that rule's 264px width. */
+   `.model-popover` positions it against `.repo-bar`. Only the width is scoped,
+   to outrank that rule's 264px; the layout and padding hold wherever the
+   panel is rendered, the style guide's specimen included. */
 .repo-bar .findings-panel {
   width: min(560px, 100%);
+}
+
+.findings-panel {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 8px;
