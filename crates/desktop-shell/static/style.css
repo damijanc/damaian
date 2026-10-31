@@ -5746,6 +5746,17 @@ body.worker-view #chat-model-menu {
   border-top: 0;
 }
 
+/* The global `input` rule gives every input a width, padding and border,
+   which squeezed these checkboxes into a dot. */
+.check-batch-run,
+.check-batch-allow input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0;
+}
+
 .check-batch-command {
   min-width: 0;
   overflow-wrap: anywhere;

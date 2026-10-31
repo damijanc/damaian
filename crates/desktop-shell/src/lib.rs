@@ -8313,6 +8313,22 @@ mod tests {
             "{card}"
         );
         assert!(card.contains("\"Run all\""), "{card}");
+        // A single unticked check still gets a run button, and skipping is
+        // never the primary one.
+        assert!(card.contains("\"Run the check\""), "{card}");
+        assert!(
+            card.contains("runAll.hidden = ticked === rows.length;"),
+            "{card}"
+        );
+        assert!(
+            card.contains("submit.classList.toggle(\"btn-primary\", ticked > 0);"),
+            "{card}"
+        );
+        let style = include_str!("../static/style.css");
+        assert!(
+            style.contains(".check-batch-run,"),
+            "the checkbox keeps its size"
+        );
     }
 
     /// Spec 32 Task 6: a `before_patch_apply` hook's denial is the error text

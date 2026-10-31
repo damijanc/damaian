@@ -12439,20 +12439,25 @@ function createCheckBatchCard(
   const actions = document.createElement("div");
   actions.className = "check-batch-actions";
   // Run all is the one-click approval of every listed check; it is left out
-  // where it would say the same as the button beside it.
+  // once every box is ticked, where it would say the same as the button
+  // beside it. A single unticked check keeps it too, or the card's only
+  // button would be Skip the check (spec 82 §2.3).
   const runAll = document.createElement("button");
   runAll.type = "button";
   runAll.className = "btn-sm";
-  runAll.textContent = "Run all";
+  runAll.textContent = rows.length === 1 ? "Run the check" : "Run all";
   const submit = document.createElement("button");
   submit.type = "button";
-  submit.className = "btn-sm btn-primary";
+  submit.className = "btn-sm";
   actions.append(runAll, submit);
 
   const syncSubmit = () => {
     const ticked = rows.filter(({ run }) => run.checked).length;
     submit.textContent = checkSubmitLabel(ticked, rows.length);
-    runAll.hidden = rows.length < 2 || ticked === rows.length;
+    runAll.hidden = ticked === rows.length;
+    // Skipping is never the suggested answer, so the main button is the
+    // primary one only once it runs something.
+    submit.classList.toggle("btn-primary", ticked > 0);
   };
   for (const { run } of rows) run.addEventListener("change", syncSubmit);
   syncSubmit();

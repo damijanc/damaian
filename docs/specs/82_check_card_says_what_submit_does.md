@@ -31,9 +31,14 @@ everything.
    - nothing ticked: **Skip all checks** (**Skip the check** for one check);
    - everything ticked: **Run 2 checks** (**Run 1 check** for one);
    - some ticked: **Run 1, skip 1**.
-3. A **Run all** button ticks every box and submits. It is shown only when
-   there are two or more checks and not all are ticked, so it never repeats
-   the main button.
+3. A **Run all** button (**Run the check** for one check) ticks every box and
+   submits. It is shown while any box is unticked, so it never repeats the
+   main button. An earlier version hid it for a single check too, which left
+   **Skip the check** as the card's only button.
+   - The main button is the primary one only once it runs something:
+     skipping is never the suggested answer.
+   - The boxes are 14 px checkboxes. The global `input` rule had squeezed
+     them into a dot.
 4. The card's note tells the user to tick the checks to run.
 5. The worker's card (#80, drawn with `decide`) behaves the same way. It still
    has no Always allow.
