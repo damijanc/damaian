@@ -422,9 +422,45 @@ fn is_placeholder_value(value: &str) -> bool {
     PLACEHOLDER_WORDS.iter().any(|word| lower.contains(word))
 }
 
+/// Every redaction placeholder in `text`, in order, as [`SecretScanner::redact`]
+/// writes them: `[REDACTED_<CATEGORY>_<10 hex digits>]`.
+///
+/// The model only ever sees redacted text, so a placeholder in content it
+/// writes is text it copied back rather than code (spec 84).
+pub fn redaction_placeholders(text: &str) -> Vec<&str> {
+    let mut placeholders = Vec::new();
+    let mut cursor = 0;
+    while let Some(index) = text[cursor..].find("[REDACTED_") {
+        let start = cursor + index;
+        let body_start = start + "[REDACTED_".len();
+        let body_end = take_while(text, body_start, |byte| {
+            byte.is_ascii_alphanumeric() || byte == b'_'
+        });
+        let body = &text[body_start..body_end];
+        let is_placeholder = text.as_bytes().get(body_end) == Some(&b']')
+            && body.rsplit_once('_').is_some_and(|(category, digest)| {
+                !category.is_empty()
+                    && digest.len() == 10
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        if is_placeholder {
+            placeholders.push(&text[start..=body_end]);
+            cursor = body_end + 1;
+        } else {
+            cursor = body_start;
+        }
+    }
+    placeholders
+}
+
 fn is_runtime_expression_value(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed.contains('.')
+    // A closure (`on_token = |_token: &str| {}`) or a borrow
+    // (`token = &token_slot`) is code, not a credential (spec 84).
+    trimmed.starts_with(['|', '&'])
+        || trimmed.contains('.')
         || trimmed.contains('(')
         || trimmed.contains(')')
         || trimmed.contains('[')

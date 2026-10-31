@@ -105,6 +105,9 @@ fn ignores_runtime_credential_assignments_in_source_code() {
         "const token = window.localStorage.token;",
         "password = getPassword();",
         "client_secret = config.oauth.clientSecret;",
+        // Spec 84: a closure and a borrow are code, not credentials.
+        "    let mut on_token = |_token: &str| {};",
+        "let token = &token_slot;",
     ] {
         assert!(
             scanner.scan(line).is_empty(),
@@ -1164,6 +1167,98 @@ fn redacts_secrets_from_patch_diffs_before_storage() {
     let stored_patch = fs::read_to_string(patch_path).unwrap();
     assert!(stored_patch.contains("[REDACTED_AWS_ACCESS_KEY_"));
     assert!(!stored_patch.contains(AWS_ACCESS_KEY));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Spec 84: the model reads through the scanner, so a placeholder in content it
+/// writes is the marker it was shown, not the file's text. Writing it would
+/// replace the hidden text, here a real key, with the marker.
+#[test]
+fn refuses_a_patch_that_copies_a_redaction_placeholder_into_a_file() {
+    let repo = temp_dir("patch-copied-placeholder");
+    let original = format!("export const awsKey = \"{AWS_ACCESS_KEY}\";\nexport const a = 1;\n");
+    write_fixture(&repo, "src/config.js", &original);
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner.clone(),
+        PathPolicy::new(&config),
+    );
+    // What the model saw, with one unrelated line changed.
+    let seen = scanner.redact(&original).text;
+    let rewritten = seen.replace("a = 1", "a = 2");
+
+    let error = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/config.js".to_string(),
+                new_content: rewritten,
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "bump a",
+        )
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("src/config.js line 1 would contain [REDACTED_AWS_ACCESS_KEY_")
+            && error.contains("redaction marker"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("src/config.js")).unwrap(),
+        original
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A placeholder the file already holds is its own text, so a patch may keep
+/// it, once per occurrence; a second copy is still refused.
+#[test]
+fn keeps_a_redaction_placeholder_the_file_already_holds() {
+    let repo = temp_dir("patch-existing-placeholder");
+    let marker = "[REDACTED_AWS_ACCESS_KEY_0123456789]";
+    write_fixture(&repo, "notes.md", &format!("Example: {marker}\n"));
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let change = |new_content: String| ProposedChange {
+        path: "notes.md".to_string(),
+        new_content,
+        status: None,
+        allow_restricted: false,
+    };
+
+    engine
+        .create_patch(
+            &repo,
+            &[change(format!("Example: {marker}\nMore.\n"))],
+            None,
+            "keep",
+        )
+        .unwrap();
+    let error = engine
+        .create_patch(
+            &repo,
+            &[change(format!("Example: {marker}\nAgain: {marker}\n"))],
+            None,
+            "copy",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("notes.md line 2 would contain"), "{error}");
 
     fs::remove_dir_all(repo).unwrap();
 }

@@ -4,7 +4,7 @@ use crate::diff::{Hunk, diff_file, reconstruct_content};
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, file_hash, now_millis, sha256};
 use crate::path_policy::PathPolicy;
-use crate::secret_scanner::SecretScanner;
+use crate::secret_scanner::{SecretScanner, redaction_placeholders};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -190,6 +190,11 @@ impl PatchEngine {
             self.path_policy
                 .assert_not_restricted(&target.relative_path, change.allow_restricted)?;
             let old_content = read_existing(&target.absolute_path)?;
+            refuse_copied_placeholders(
+                &target.relative_path,
+                old_content.as_deref().unwrap_or_default(),
+                &change.new_content,
+            )?;
             let status = old_content
                 .as_ref()
                 .map(|_| {
@@ -720,6 +725,36 @@ impl PatchEngine {
             warnings,
         })
     }
+}
+
+/// Refuses new content that holds a redaction placeholder the file does not
+/// already hold (spec 84).
+///
+/// The model reads files through the secret scanner, so where it saw a
+/// `[REDACTED_…]` marker the file holds other text. Content that carries the
+/// marker would write it over that text: the real code, or a real secret the
+/// user meant to keep. A placeholder the file already contains, counted per
+/// occurrence, is the file's own text and may stay.
+fn refuse_copied_placeholders(path: &str, old_content: &str, new_content: &str) -> Result<()> {
+    let mut existing = redaction_placeholders(old_content);
+    for (line_index, line) in new_content.lines().enumerate() {
+        for placeholder in redaction_placeholders(line) {
+            if let Some(position) = existing.iter().position(|known| *known == placeholder) {
+                existing.swap_remove(position);
+                continue;
+            }
+            return Err(ClientError::InvalidInput(format!(
+                "{path} line {} would contain {placeholder}, a redaction marker. Damaian \
+                 hid text it took for a secret from what you read and showed you this marker \
+                 instead, so writing it would replace the file's real text with the marker. \
+                 Leave the lines that held it unchanged (edit only the other lines with \
+                 edit_file), or write the line without the hidden text, for example by \
+                 renaming the variable.",
+                line_index + 1
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_existing(path: &Path) -> Result<Option<String>> {

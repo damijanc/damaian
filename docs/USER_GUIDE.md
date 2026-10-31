@@ -955,6 +955,8 @@ Detection is not perfect. Setup instructions and placeholder values can resemble
 
 From the CLI, `damaian apply-patch` prints the same findings and re-runs with `--allow-generated-secrets` to accept them.
 
+The assistant reads files with detected credentials replaced by markers such as `[REDACTED_AWS_ACCESS_KEY_…]`. It cannot write one of those markers back into a file: a patch that would do so is refused before you see it, and the assistant is told to leave those lines alone. Otherwise the marker would replace your real value.
+
 After files are applied, Damaian prints a concise Git status summary in the conversation.
 
 ## Verification

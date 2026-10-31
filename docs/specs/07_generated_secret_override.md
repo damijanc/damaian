@@ -90,6 +90,13 @@ The exemption lives in `scan`, so it applies to `redact` as well. That is the
 point: these values must survive into the model's context and into stored
 diffs, or the documentation they belong to stops making sense.
 
+> **Note, 2026-10-31.** Separately from this list,
+> `is_runtime_expression_value` exempts an unquoted value that reads as code
+> (`.`, `(`, `[`, `::`, `->`). [#84](84_redaction_markers_never_reach_a_patch.md)
+> added a value that starts with `|` (a closure) or `&` (a borrow), after a
+> closure was redacted and its marker was written back into a patch. #84 also
+> refuses any patch that would write a marker.
+
 Deliberately excluded from the word list: `test`. `sk_test_…` is a real
 provider key format.
 
