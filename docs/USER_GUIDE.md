@@ -966,6 +966,12 @@ leaving that to you. It discovers the project's own checks, runs the ones you
 approve, turns failures into findings, lets the agent repair within a limited
 number of attempts, reruns, and reports what was actually verified.
 
+The same happens when the agent changes files with a command you approved (a
+script, `sed -i`, a formatter): once the turn finishes, Damaian runs the checks
+for the files that command created, modified or deleted. A command that changed
+nothing Git tracks or reports, such as one that only made an empty folder,
+starts no verification.
+
 **Which checks run.** Detection is per project root. A change selects the root
 that owns each changed file plus every root that encloses it, because a member
 change is a workspace change. On this repository, changing `crates/engine`

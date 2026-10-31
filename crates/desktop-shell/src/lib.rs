@@ -12905,9 +12905,25 @@ mod tests {
                 repo.join("approved.txt").is_file(),
                 "the approved command ran"
             );
+            // The turn resumed rather than starting again. The second task is
+            // the verification the command's new file made due (spec 85),
+            // run in the worker as the end of the same resume.
             let tasks = store().read_tasks(&session).unwrap();
-            assert_eq!(tasks.len(), 1, "one turn, resumed, not a second one");
+            assert_eq!(tasks.len(), 2, "{tasks:?}");
+            assert_eq!(tasks[0].user_prompt, "Mark it.");
             assert_eq!(tasks[0].status, TaskStatus::Complete);
+            assert!(
+                store()
+                    .read_verification_events(&session, &[])
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(
+                        event,
+                        workspace_engine::VerificationEvent::Due { paths, .. }
+                            if paths == &vec!["approved.txt".to_string()]
+                    )),
+                "the command's file made verification due"
+            );
             assert_eq!(
                 send(&host, ControlCommand::Approve { proposal_id })["ok"],
                 false,

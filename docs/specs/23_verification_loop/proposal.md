@@ -185,6 +185,10 @@ Since [#77](../77_continue_the_task_after_verification.md), a verification
 that does not fail, with open steps left in the carried plan, continues the
 task in the same turn instead of ending it with the report.
 
+Since [#85](../85_verify_after_a_command_changes_files.md), an approved
+command that changes files makes verification due as well, and the turn that
+ran it ends with that verification once it finishes.
+
 The loop is entered only in Code mode ([spec 20](../20_working_modes/proposal.md)); in Ask,
 Plan, and Review there is nothing applied to verify.
 

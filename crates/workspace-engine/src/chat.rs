@@ -2206,11 +2206,16 @@ impl ChatOrchestrator {
         // a new patch after a finished verification does too. An interrupted
         // attempt (its due patch predates the running turn) is rerun at the
         // attempt it was already on (spec 23 `context.md` §5).
-        let due_patch_task = self
-            .patch_store
-            .load(&due.patch_id)
-            .ok()
-            .and_then(|patch| patch.task_id);
+        // A command's `Due` names the task that ran it, as a patch names the
+        // task that proposed it (spec 85).
+        let due_patch_task = if due.from_command() {
+            Some(due.task_id.clone())
+        } else {
+            self.patch_store
+                .load(&due.patch_id)
+                .ok()
+                .and_then(|patch| patch.task_id)
+        };
         let latest_started = events.iter().rev().find_map(|event| match event {
             VerificationEvent::Started { task_id, .. } => Some(task_id.as_str()),
             _ => None,
@@ -3482,6 +3487,16 @@ impl ChatOrchestrator {
                 }
             }
         }
+        // Files approved commands changed (spec 85), for the same reason every
+        // applied patch counts: the run checks the conversation's changes.
+        for event in self
+            .session_store
+            .read_verification_events(session_id, &[])?
+        {
+            if let VerificationEvent::Due { paths, .. } = event {
+                changed.extend(paths);
+            }
+        }
         if changed.is_empty()
             && let Ok(patch) = self.patch_store.load(&due.patch_id)
         {
@@ -3812,12 +3827,17 @@ impl ChatOrchestrator {
                     &pending.task,
                     &record.execution,
                 )?;
-                self.record_command_effects(
+                let changed = self.record_command_effects(
                     &repository_root,
                     &pending.session,
                     &pending.task,
                     &census,
                 );
+                self.record_command_verification_due(
+                    &pending.session.id,
+                    &pending.task.id,
+                    changed,
+                )?;
                 // Spec 55 requirement 6: the summary's approval digest is read
                 // from the log, and a shell-command decision is not otherwise
                 // there — the audit log carries it with no session id.
@@ -3962,10 +3982,58 @@ impl ChatOrchestrator {
             sink,
             pending.turn_options,
         )?;
-        if pending.turn_options.verification_turn {
-            return self.close_verification_resume(&repository_root, result);
+        self.verify_after_command_turn(
+            &repository_root,
+            result,
+            pending.turn_options.verification_turn,
+            model_adapter,
+            sink,
+        )
+    }
+
+    /// Ends a turn whose approved command changed files with the verification
+    /// that change made due (spec 85), as a patch's card does once it is
+    /// settled. Nothing else needs to ask: the shell, a worker and the CLI all
+    /// resume through here.
+    ///
+    /// Only once the turn has finished. A turn that paused again keeps the run
+    /// due, and whichever resume finishes the turn runs it; a patch proposed
+    /// after the command makes it due on its own, and that run covers the
+    /// command's files too. In a repair turn the command is the repair, so the
+    /// next attempt runs instead of closing it as `no_repair_applied`.
+    fn verify_after_command_turn(
+        &self,
+        repository_root: &Path,
+        result: ChatTurnResult,
+        verification_turn: bool,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let finished = !turn_is_paused(&result) && result.task.status == TaskStatus::Complete;
+        let command_due = finished && {
+            let events = self
+                .session_store
+                .read_verification_events(&result.session.id, &[])?;
+            fold_verification(events.iter())
+                .due
+                .is_some_and(|due| due.from_command())
+        };
+        if !command_due {
+            return if verification_turn {
+                self.close_verification_resume(repository_root, result)
+            } else {
+                Ok(result)
+            };
         }
-        Ok(result)
+        let answer = result.response.clone();
+        let mut verified =
+            self.verify_due(repository_root, &result.session.id, model_adapter, sink)?;
+        // The turn's own answer was streamed into the same message; keeping it
+        // in front means the final text does not replace it with the report.
+        if !answer.trim().is_empty() {
+            verified.response = format!("{answer}\n\n{}", verified.response);
+        }
+        Ok(verified)
     }
 
     /// Continues a chat turn that stopped to have its plan reviewed before
@@ -5224,7 +5292,8 @@ impl ChatOrchestrator {
         Ok((!refs.is_empty()).then_some(crate::plan::Evidence::Findings { refs, failing }))
     }
 
-    /// Adds what an approved command changed to the turn's checkpoint.
+    /// Adds what an approved command changed to the turn's checkpoint, and
+    /// returns the paths it changed, `None` when the census could not tell.
     /// Best-effort, like the rest of the checkpoint path.
     fn record_command_effects(
         &self,
@@ -5232,16 +5301,49 @@ impl ChatOrchestrator {
         session: &Session,
         task: &Task,
         census: &CommandCensus,
-    ) {
-        let Ok(Some(manifest)) = self
+    ) -> Option<Vec<String>> {
+        let after = self
+            .checkpoint_store
+            .begin_command_census(repository_root)
+            .unwrap_or_else(|_| CommandCensus::unavailable());
+        if let Ok(Some(manifest)) = self
             .checkpoint_store
             .read_checkpoint_for_task(&session.repository_id, &task.id)
-        else {
-            return;
+        {
+            let _ = self.checkpoint_store.record_command_effects_between(
+                repository_root,
+                &manifest,
+                census,
+                &after,
+            );
+        }
+        census.changed_paths(&after)
+    }
+
+    /// Makes verification due for the files an approved command changed
+    /// (spec 85). Only in Code mode, as for a patch (spec 23 §5.1), and only
+    /// when the census saw a change: a command that changed nothing, or one
+    /// whose effects could not be read, leaves verification as it was.
+    fn record_command_verification_due(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        changed: Option<Vec<String>>,
+    ) -> Result<()> {
+        let Some(paths) = changed.filter(|paths| !paths.is_empty()) else {
+            return Ok(());
         };
-        let _ = self
-            .checkpoint_store
-            .record_command_effects(repository_root, &manifest, census);
+        if self.session_store.session_mode(session_id) != SessionMode::Code {
+            return Ok(());
+        }
+        self.session_store.append_verification_event(
+            session_id,
+            &VerificationEvent::Due {
+                task_id: task_id.to_string(),
+                patch_id: String::new(),
+                paths,
+            },
+        )
     }
 
     /// Records what the turn left on disk, so a later rewind can tell the
@@ -11102,6 +11204,20 @@ fn root_label(working_directory: &str) -> &str {
 
 /// The hash of every changed file that still exists. A deleted file is absent,
 /// which the report reads as a staleness mismatch rather than a pass.
+/// The turn stopped for the user, or was stopped by them, rather than finishing.
+fn turn_is_paused(result: &ChatTurnResult) -> bool {
+    result.patch_proposal.is_some()
+        || result.command_proposal.is_some()
+        || result.plan_proposal.is_some()
+        || result.question_proposal.is_some()
+        || result.fetch_proposal.is_some()
+        || result.fallback_proposal.is_some()
+        || result.round_budget_proposal.is_some()
+        || result.check_batch.is_some()
+        || result.context_review.is_some()
+        || result.cancelled
+}
+
 fn hash_existing_files(root: &Path, paths: &[String]) -> BTreeMap<String, String> {
     let mut hashes = BTreeMap::new();
     for path in paths {

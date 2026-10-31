@@ -169,7 +169,16 @@ impl VerificationOutcome {
 #[serde(tag = "kind")]
 pub enum VerificationEvent {
     #[serde(rename = "verification_due", rename_all = "camelCase")]
-    Due { task_id: String, patch_id: String },
+    Due {
+        task_id: String,
+        /// Empty when an approved command, not a patch, made the run due.
+        #[serde(default)]
+        patch_id: String,
+        /// The files an approved command changed (spec 85). A patch's files
+        /// are read from its decisions instead, so a patch's `Due` has none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+    },
     #[serde(rename = "verification_started", rename_all = "camelCase")]
     Started {
         task_id: String,
@@ -210,6 +219,16 @@ impl VerificationEvent {
 pub struct VerificationDue {
     pub task_id: String,
     pub patch_id: String,
+    /// Set when an approved command made the run due (spec 85).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+impl VerificationDue {
+    /// An approved command, not a patch, made this run due (spec 85).
+    pub fn from_command(&self) -> bool {
+        self.patch_id.is_empty()
+    }
 }
 
 /// Everything the events say, folded once.
@@ -240,10 +259,15 @@ impl VerificationState {
     /// exactly the state a single fold produces.
     pub fn apply(&mut self, event: &VerificationEvent) {
         match event {
-            VerificationEvent::Due { task_id, patch_id } => {
+            VerificationEvent::Due {
+                task_id,
+                patch_id,
+                paths,
+            } => {
                 self.due = Some(VerificationDue {
                     task_id: task_id.clone(),
                     patch_id: patch_id.clone(),
+                    paths: paths.clone(),
                 });
             }
             VerificationEvent::Started {

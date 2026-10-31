@@ -12582,7 +12582,8 @@ function createVerificationOfferCard(due) {
   const note = document.createElement("p");
   note.className = "recovery-card-note";
   note.textContent =
-    "The patch was applied and the checks have not run. Verifying now runs the checks the " +
+    "A patch or an approved command changed files and the checks have not run. Verifying now " +
+    "runs the checks the " +
     "project detects; nothing has been assumed to pass.";
 
   const actions = document.createElement("div");

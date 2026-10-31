@@ -89,6 +89,7 @@ fn due() -> VerificationEvent {
     VerificationEvent::Due {
         task_id: "task".to_string(),
         patch_id: "patch".to_string(),
+        paths: Vec::new(),
     }
 }
 
@@ -395,6 +396,7 @@ fn events_serialise_in_the_shape_the_log_holds() {
         serde_json::to_value(VerificationEvent::Due {
             task_id: "t".to_string(),
             patch_id: "p".to_string(),
+            paths: Vec::new(),
         })
         .unwrap(),
         json!({"kind": "verification_due", "taskId": "t", "patchId": "p"})
@@ -1261,6 +1263,7 @@ fn verification_events_round_trip_through_a_fresh_store() {
                 &VerificationEvent::Due {
                     task_id: "task".to_string(),
                     patch_id: "patch".to_string(),
+                    paths: Vec::new(),
                 },
             )
             .unwrap();
@@ -3090,4 +3093,148 @@ fn declining_every_check_is_nothing_verified_not_passed() {
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// A real repository, because the command census asks git what changed.
+fn git_repository(root: &std::path::Path) {
+    for args in [
+        &["init", "--quiet"][..],
+        &["config", "user.email", "test@damaian.local"],
+        &["config", "user.name", "Damaian Test"],
+        &["config", "gc.auto", "0"],
+        &["config", "maintenance.auto", "false"],
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(output.status.success(), "git {args:?} failed");
+    }
+}
+
+fn command_call(command: &str) -> workspace_engine::ToolCall {
+    workspace_engine::ToolCall {
+        id: "command".to_string(),
+        name: "run_command".to_string(),
+        arguments_json: json!({"command": command, "reason": "Make the change"}).to_string(),
+    }
+}
+
+/// Asks for a turn that runs `command`, approves it, and returns the result
+/// of the resumed turn, which answers "Done." once the command has run.
+fn approve_command_turn(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    command: &str,
+) -> (ChatTurnResult, ChatTurnResult) {
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![vec![command_call(command)], Vec::new()],
+    );
+    let mut on_token = |_token: &str| {};
+    let asked = engine
+        .chat_orchestrator
+        .ask(root, "Make the change.", &[], &mut adapter, &mut on_token)
+        .expect("the turn should run");
+    let proposal = asked
+        .command_proposal
+        .as_ref()
+        .expect("a command that writes asks for approval")
+        .id
+        .clone();
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let resumed = engine
+        .chat_orchestrator
+        .resume_after_command_decision(&proposal, true, "tester", &mut adapter, &mut sink)
+        .expect("the approved command should resume the turn");
+    (asked, resumed)
+}
+
+/// Spec 85: an approved command that changes a file makes verification due,
+/// and the turn ends with that verification, as a settled patch does.
+#[test]
+fn an_approved_command_that_changes_a_file_is_verified_when_the_turn_ends() {
+    let root = temp_dir("command-verify");
+    let data_dir = temp_dir("command-verify-data");
+    git_repository(&root);
+    let engine = verify_engine(&root, &data_dir, "/bin/sh", &[], &[]);
+
+    let (asked, resumed) = approve_command_turn(&engine, &root, "touch notes.txt");
+
+    assert!(root.join("notes.txt").exists(), "the command ran");
+    let events = outcome_events(&engine, &asked.session.id);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            VerificationEvent::Due { patch_id, paths, .. }
+                if patch_id.is_empty() && paths == &vec!["notes.txt".to_string()]
+        )),
+        "the command's file makes verification due: {events:?}"
+    );
+    let report = resumed
+        .verification_report
+        .as_ref()
+        .expect("the turn ends with the verification");
+    assert_eq!(
+        report.outcome,
+        Some(VerificationOutcome::OnlyDocumentationChanged),
+        "{report:?}"
+    );
+    assert_eq!(report.files_changed, vec!["notes.txt".to_string()]);
+    assert!(
+        resumed.response.starts_with("Done."),
+        "the turn's own answer stays in front of the report: {:?}",
+        resumed.response
+    );
+    assert!(
+        pending_verifications(&engine.session_store, &asked.session.id)
+            .unwrap()
+            .is_empty(),
+        "nothing is left due"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// A command that changes nothing git sees leaves verification alone.
+#[test]
+fn an_approved_command_that_changes_nothing_is_not_verified() {
+    let root = temp_dir("command-no-change");
+    let data_dir = temp_dir("command-no-change-data");
+    git_repository(&root);
+    let engine = verify_engine(&root, &data_dir, "/bin/sh", &[], &[]);
+
+    let (asked, resumed) = approve_command_turn(&engine, &root, "mkdir -p empty");
+
+    assert!(root.join("empty").is_dir(), "the command ran");
+    assert!(resumed.verification_report.is_none());
+    assert_eq!(resumed.response, "Done.");
+    assert!(
+        !outcome_events(&engine, &asked.session.id)
+            .iter()
+            .any(|event| matches!(event, VerificationEvent::Due { .. })),
+        "an empty directory is no change to verify"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// A census that could not be taken claims no change, rather than "nothing
+/// changed": the command's effects are then unknown, not absent (spec 85).
+#[test]
+fn an_unavailable_census_reports_no_changed_paths() {
+    let census = workspace_engine::CommandCensus::unavailable();
+    assert_eq!(census.changed_paths(&census), None);
 }

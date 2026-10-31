@@ -1017,6 +1017,7 @@ impl EditOrchestrator {
             &VerificationEvent::Due {
                 task_id: task_id.to_string(),
                 patch_id: patch.id.clone(),
+                paths: Vec::new(),
             },
         )
     }

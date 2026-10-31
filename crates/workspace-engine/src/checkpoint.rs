@@ -210,6 +210,26 @@ impl CommandCensus {
     fn snapshot(&self, path: &str) -> Option<&CensusEntry> {
         self.entries.get(path).and_then(Option::as_ref)
     }
+
+    /// The paths whose state differs between this census and `after`, sorted:
+    /// what a command created, modified or deleted. `None` when either census
+    /// does not cover the repository, so a caller cannot read "nothing
+    /// changed" into a census that was never taken.
+    pub fn changed_paths(&self, after: &CommandCensus) -> Option<Vec<String>> {
+        if self.truncated || after.truncated {
+            return None;
+        }
+        let mut paths = self
+            .entries
+            .keys()
+            .chain(after.entries.keys())
+            .filter(|path| self.state(path) != after.state(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        Some(paths)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -749,6 +769,26 @@ impl CheckpointStore {
         manifest: &CheckpointManifest,
         before: &CommandCensus,
     ) -> Result<CheckpointManifest> {
+        if before.truncated {
+            let mut updated = manifest.clone();
+            updated.command_effects_covered = false;
+            self.write_manifest(&updated)?;
+            return Ok(updated);
+        }
+        let after = self.begin_command_census(&repository_root)?;
+        self.record_command_effects_between(repository_root, manifest, before, &after)
+    }
+
+    /// [`Self::record_command_effects`] with the after census already taken,
+    /// so a caller that also needs the changed paths (spec 85) reads the
+    /// working tree once.
+    pub fn record_command_effects_between(
+        &self,
+        repository_root: impl AsRef<Path>,
+        manifest: &CheckpointManifest,
+        before: &CommandCensus,
+        after: &CommandCensus,
+    ) -> Result<CheckpointManifest> {
         let root = self.path_policy.canonical_root(&repository_root)?;
         let mut updated = manifest.clone();
         if before.truncated {
@@ -756,8 +796,6 @@ impl CheckpointStore {
             self.write_manifest(&updated)?;
             return Ok(updated);
         }
-
-        let after = self.begin_command_census(&root)?;
         if after.truncated {
             updated.command_effects_covered = false;
             self.write_manifest(&updated)?;
