@@ -2072,6 +2072,121 @@ fn a_failed_check_is_repaired_and_the_rerun_passes() {
     let _ = fs::remove_dir_all(&data_dir);
 }
 
+/// Spec 92: the rerun reuses the step of a check it already has and adds one
+/// only for a check that is new, so the root's pass lands on its one step and
+/// nothing selected is left open after a passed run.
+#[test]
+fn a_rerun_reuses_the_step_of_a_check_it_already_has() {
+    let root = temp_dir("repair-steps");
+    let data_dir = temp_dir("repair-steps-data");
+    cargofile(&root);
+    write(
+        &root,
+        "packages/web/package.json",
+        "{\"scripts\":{\"test\":\"node test.js\"}}\n",
+    );
+    write(&root, "packages/web/src/index.ts", "export const x = 1;\n");
+    let allow = ["cargo test", "cd packages/web && npm run test"];
+    let engine = verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &allow, &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    // The repair touches the web package too, so the rerun selects a check
+    // attempt 0 did not have alongside the one it did.
+    let repair_call = workspace_engine::ToolCall {
+        id: "repair_patch".to_string(),
+        name: "propose_patch".to_string(),
+        arguments_json: json!({
+            "summary": "Fix the failing check",
+            "files": [
+                {"path": "src/a.rs", "content": "let a = 3;\n", "status": "modified"},
+                {
+                    "path": "packages/web/src/index.ts",
+                    "content": "export const x = 2;\n",
+                    "status": "modified",
+                },
+            ],
+        })
+        .to_string(),
+    };
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![repair_call]],
+    );
+    let first = run_verification(&engine, &root, &session, &mut repair);
+    let patch = first.patch_proposal.as_ref().expect("a repair patch");
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+        .expect("the repair patch applies");
+
+    let engine = verify_engine_with_retry(&root, &data_dir, "/usr/bin/true", &allow, &[], 2);
+    let mut adapter = MockModelAdapter::new("");
+    let second = run_verification(&engine, &root, &session, &mut adapter);
+    let report = second.verification_report.as_ref().unwrap();
+    assert_eq!(
+        report.outcome,
+        Some(VerificationOutcome::Passed),
+        "{report:?}"
+    );
+    let events = outcome_events(&engine, &session);
+    let rerun_checks = events
+        .iter()
+        .filter_map(|event| match event {
+            VerificationEvent::Started {
+                attempt: 1, checks, ..
+            } => Some(checks.clone()),
+            _ => None,
+        })
+        .next()
+        .expect("attempt 1 started")
+        .into_iter()
+        .filter(|check| !check.is_browser())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rerun_checks,
+        vec![
+            CheckId::new("", "cargo test"),
+            CheckId::new("packages/web", "npm run test"),
+        ]
+    );
+
+    let plan = engine
+        .session_store
+        .read_task_plan(&session, &second.task.id)
+        .unwrap()
+        .expect("the verification task has a plan");
+    let verify_steps: Vec<&PlanStep> = plan
+        .steps
+        .iter()
+        .filter(|step| step.id.starts_with("verify_") && step.id != "verify_browser")
+        .collect();
+    let mut ids: Vec<&str> = verify_steps.iter().map(|step| step.id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        verify_steps.len(),
+        "duplicate step ids: {plan:?}"
+    );
+    for check in &rerun_checks {
+        let steps: Vec<&&PlanStep> = verify_steps
+            .iter()
+            .filter(|step| {
+                step.detail.as_deref() == Some(&*format!("Verification check: {}", check.label()))
+            })
+            .collect();
+        assert_eq!(steps.len(), 1, "one step for {}: {plan:?}", check.label());
+        assert_eq!(steps[0].status, StepStatus::Completed, "{plan:?}");
+    }
+    assert_eq!(verify_steps.len(), 2, "{plan:?}");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
 #[test]
 fn exhausting_the_repair_limit_reports_what_still_fails() {
     let root = temp_dir("repair-limit");

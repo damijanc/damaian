@@ -2522,37 +2522,56 @@ impl ChatOrchestrator {
             .session_store
             .read_task_plan(&session.id, &task.id)?
             .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        // A rerun (proposal §5.5) reuses the step of a check an earlier attempt
+        // already has and adds one only for a check new in this attempt: the
+        // step is closed by id, so a second `verify_1` would take the old
+        // step's place and leave the new one open (spec 92).
         let mut step_ids = Vec::new();
-        for (index, (check, _)) in checks.iter().enumerate() {
-            let step_id = format!("verify_{}", index + 1);
-            plan.steps.push(PlanStep {
-                id: step_id.clone(),
-                title: format!(
-                    "Run `{}` in `{}`",
-                    check.command,
-                    root_label(&check.working_directory)
-                ),
-                detail: Some(format!("Verification check: {}", check.label())),
-                status: StepStatus::Pending,
-                depends_on: Vec::new(),
-                started_at_ms: None,
-                completed_at_ms: None,
-                evidence: Vec::new(),
-            });
+        for (check, _) in &checks {
+            let detail = format!("Verification check: {}", check.label());
+            let step_id = match plan.steps.iter().find(|step| {
+                step.id.starts_with("verify_") && step.detail.as_deref() == Some(detail.as_str())
+            }) {
+                Some(step) => step.id.clone(),
+                None => {
+                    let step_id = next_verify_step_id(&plan);
+                    plan.steps.push(PlanStep {
+                        id: step_id.clone(),
+                        title: format!(
+                            "Run `{}` in `{}`",
+                            check.command,
+                            root_label(&check.working_directory)
+                        ),
+                        detail: Some(detail),
+                        status: StepStatus::Pending,
+                        depends_on: Vec::new(),
+                        started_at_ms: None,
+                        completed_at_ms: None,
+                        evidence: Vec::new(),
+                    });
+                    step_id
+                }
+            };
+            reset_verify_step(&mut plan, &step_id);
             step_ids.push(step_id);
         }
         let browser_step = browser.as_ref().map(|browser| {
             let step_id = "verify_browser".to_string();
-            plan.steps.push(PlanStep {
-                id: step_id.clone(),
-                title: format!("Check browser behaviour: {}", browser.check().command),
-                detail: Some("Browser diagnostics for the changed web assets".to_string()),
-                status: StepStatus::Pending,
-                depends_on: Vec::new(),
-                started_at_ms: None,
-                completed_at_ms: None,
-                evidence: Vec::new(),
-            });
+            let title = format!("Check browser behaviour: {}", browser.check().command);
+            match plan.steps.iter_mut().find(|step| step.id == step_id) {
+                Some(step) => step.title = title,
+                None => plan.steps.push(PlanStep {
+                    id: step_id.clone(),
+                    title,
+                    detail: Some("Browser diagnostics for the changed web assets".to_string()),
+                    status: StepStatus::Pending,
+                    depends_on: Vec::new(),
+                    started_at_ms: None,
+                    completed_at_ms: None,
+                    evidence: Vec::new(),
+                }),
+            }
+            reset_verify_step(&mut plan, &step_id);
             step_id
         });
         self.session_store.revise_plan(&task, &plan)?;
@@ -11205,6 +11224,30 @@ const CHECK_BATCH_PAUSED_RESPONSE: &str =
     "These checks need your approval before verification can continue.";
 
 /// A check's root as the report names it.
+/// The first `verify_N` the plan does not use yet, so a check new in a rerun
+/// never shares an id with an earlier attempt's step.
+fn next_verify_step_id(plan: &TaskPlan) -> String {
+    let used = plan
+        .steps
+        .iter()
+        .filter_map(|step| step.id.strip_prefix("verify_")?.parse::<usize>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("verify_{}", used + 1)
+}
+
+/// Opens a reused verification step for this attempt. Its evidence goes too:
+/// the repair request reads findings from every `verify_` step, and an earlier
+/// attempt's are what the repair already answered.
+fn reset_verify_step(plan: &mut TaskPlan, step_id: &str) {
+    if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
+        step.status = StepStatus::Pending;
+        step.started_at_ms = None;
+        step.completed_at_ms = None;
+        step.evidence.clear();
+    }
+}
+
 fn root_label(working_directory: &str) -> &str {
     if working_directory.is_empty() {
         "repository root"

@@ -97,7 +97,7 @@ and worktree delivery finished on 2026-10-28 and were merged into `main` that
 day; the full seven-check gate passed in CI on 2026-10-29 for the `main` push
 that contains both (Quality run 40902516310).
 
-#60–#85 and #87–#91 are also Done (see their rows below). Several were evidence-driven or
+#60–#85 and #87–#92 are also Done (see their rows below). Several were evidence-driven or
 usability specs added outside the roadmap order; being finished, none of them
 changes what may be built next.
 
@@ -849,6 +849,7 @@ is ready.
 | 89 | [89_commit_draft_names_the_users_request.md](89_commit_draft_names_the_users_request.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: commit drafts read `chore: <file> The user reviewed the plan and approved it…` and `chore: <file> continue`, taken from the latest user-role message. The draft now uses the latest prompt the user typed to start a turn, skipping Damaian's own turns and bare continuations, and cut to its first line and 72 characters. |
 | 90 | [90_one_check_per_place_it_runs.md](90_one_check_per_place_it_runs.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: a check card listed `cargo test` twice, at the root and in `crates/workspace-engine`, without saying where either ran. The card now names each check's directory. A member's `cargo test` is not proposed when a selected virtual-workspace root's `cargo test` is known to run it, read conservatively from `Cargo.toml`, and any other case keeps both. |
 | 91 | [91_commit_button_only_when_it_can_act.md](91_commit_button_only_when_it_can_act.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: **Commit…** seemed to do nothing. With no session open it returned silently, and while a commit was being prepared it gave no sign, so a second press opened a second dialog that went stale. The button is now shown only with a session open, reads **Preparing…** while it works, and opens one dialog at a time. |
+| 92 | [92_rerun_reuses_its_plan_steps.md](92_rerun_reuses_its_plan_steps.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: a verification rerun appended a new `verify_` step for every check, numbered from `verify_1` again, beside the earlier attempt's. The pass closed the old step by id and left the new one open, so a passed run read "Stopped before finishing". A rerun now reuses the step of a check it already has, reset for the attempt, and adds a step only for a new check. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:

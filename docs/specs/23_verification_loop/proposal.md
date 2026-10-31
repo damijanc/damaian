@@ -309,6 +309,11 @@ Two rules keep the loop from being worse than no loop:
   rerun set is every check the loop has selected so far in the task, plus any
   the repair's own changed files select.
 
+A rerun reuses the plan step of a check an earlier attempt already has,
+resetting it for the new attempt, and adds a step only for a check that is new
+([spec 92](../92_rerun_reuses_its_plan_steps.md)). Each check has one step, and
+its latest outcome is the step's.
+
 On exhausting the limit, the task does **not** succeed. Status is `failed` with
 the still-failing findings attached, and the report leads with what still fails.
 

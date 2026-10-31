@@ -2,7 +2,7 @@
 
 Status: Done 2026-10-31 (specified and built the same day; local checks in §6,
 the full gate is left to CI).
-Order: 90 of 91
+Order: 90 of 92
 Plan: none. A defect reported in use, like #73–#89.
 Depends on: [#23](23_verification_loop/proposal.md) and
 [#82](82_check_card_says_what_submit_does.md), both built.

@@ -2,7 +2,7 @@
 
 Status: Done 2026-10-31 (specified and built the same day; local checks in §6,
 the full gate is left to CI).
-Order: 88 of 91
+Order: 88 of 92
 Plan: none. A defect reported in use, like #73–#87: an exception to the rule
 in [`README.md`](README.md).
 Depends on: [#07](07_generated_secret_override.md), built.

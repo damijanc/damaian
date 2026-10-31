@@ -2,7 +2,7 @@
 
 Status: Done 2026-10-31 (specified and built the same day; local checks in §6,
 the full gate is left to CI).
-Order: 89 of 91
+Order: 89 of 92
 Plan: none. A defect reported in use, like #73–#88.
 Depends on: [#35](35_commit_preparation/proposal.md), built.
 
