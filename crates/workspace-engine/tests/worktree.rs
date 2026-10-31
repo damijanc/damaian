@@ -548,6 +548,36 @@ fn removing_a_dirty_worktree_reports_paths_and_does_not_force() {
     assert!(branch_exists(&fixture, &created.branch));
 }
 
+/// Spec 87: a worker worktree removed outside Damaian is already gone, not a
+/// refusal, and git's stale record of it is pruned. The branch stays.
+#[test]
+fn removing_a_worktree_that_is_already_gone_prunes_it() {
+    let fixture = fixture("remove-gone");
+    let created = create_worker_worktree(&fixture.repo, "Gone already", false).unwrap();
+    fs::remove_dir_all(&created.path).unwrap();
+
+    let outcome = remove_worker_worktree(&fixture.repo, &created.path, false).unwrap();
+
+    assert_eq!(outcome, RemoveOutcome::AlreadyGone);
+    assert!(
+        !fixture
+            .git(&["worktree", "list", "--porcelain"])
+            .contains(&created.branch),
+        "git's record of the worktree is pruned"
+    );
+    assert!(branch_exists(&fixture, &created.branch));
+}
+
+/// A missing path anywhere else is still refused.
+#[test]
+fn a_missing_path_outside_the_worker_worktrees_is_still_refused() {
+    let fixture = fixture("remove-gone-elsewhere");
+
+    let error = remove_worker_worktree(&fixture.repo, &fixture.repo.join("nowhere/x"), false)
+        .expect_err("only a worker worktree may be reported gone");
+    assert!(matches!(error, ClientError::AccessDenied(_)), "{error:?}");
+}
+
 #[test]
 fn removal_refuses_a_path_that_is_not_a_worker_worktree() {
     let fixture = fixture("remove-elsewhere");

@@ -202,6 +202,9 @@ pub enum RemoveOutcome {
     Dirty {
         paths: Vec<String>,
     },
+    /// The worktree was already removed outside Damaian; git's stale record
+    /// of it was pruned (spec 87).
+    AlreadyGone,
 }
 
 /// `git worktree remove`, refusing anything but a worker worktree of `repo`.
@@ -214,6 +217,13 @@ pub fn remove_worker_worktree(
 ) -> Result<RemoveOutcome> {
     let repo = canonical_repository(repo)?;
     require_top_level(&mut Git::new(&repo))?;
+    if worker_worktree_is_gone(&repo, worktree) {
+        // Removed outside Damaian. Refusing would leave a removal that can
+        // never succeed; pruning drops only git's record of a worktree that
+        // is no longer there (spec 87).
+        Git::new(&repo).run(&["worktree", "prune"])?;
+        return Ok(RemoveOutcome::AlreadyGone);
+    }
     let path = registered_worker_worktree(&repo, worktree)?;
 
     let paths = Git::new(&path).status_paths()?;
@@ -419,6 +429,21 @@ fn copy_untracked(repo: &Path, worktree: &Path, relative: &str) -> Result<()> {
 
 /// The canonical path of `worktree` if it is a direct child of `repo`'s
 /// `.damaian/worktrees`, reached through no symlink, and registered with git.
+/// True when `worktree` would sit directly under the source's
+/// `.damaian/worktrees/` but nothing is there any more. Any other missing path
+/// stays a refusal in [`registered_worker_worktree`].
+fn worker_worktree_is_gone(repo: &Path, worktree: &Path) -> bool {
+    if fs::symlink_metadata(worktree).is_ok() {
+        return false;
+    }
+    let expected = WORKTREES_DIR
+        .iter()
+        .fold(repo.to_path_buf(), |path, component| path.join(component));
+    worktree.parent().is_some_and(|parent| {
+        fs::canonicalize(parent).map_or(parent == expected, |parent| parent == expected)
+    })
+}
+
 fn registered_worker_worktree(repo: &Path, worktree: &Path) -> Result<PathBuf> {
     let refuse = |reason: &str| {
         ClientError::AccessDenied(format!(

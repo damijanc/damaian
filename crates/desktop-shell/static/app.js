@@ -8855,6 +8855,12 @@ function toggleWorkerMenu(row, projectPath, anchorEl, { board }) {
           hint: row.alive ? "Stop the worker first" : "",
           onSelect: runSessionAction(() => removeWorkerWorktree(row, projectPath)),
         },
+        {
+          label: "Delete session",
+          action: "delete",
+          danger: true,
+          onSelect: runSessionAction(() => deleteWorkerSession(row, projectPath)),
+        },
       ],
     ],
   });
@@ -8928,6 +8934,23 @@ async function removeWorkerWorktree(row, projectPath) {
     );
   }
   if (answer.status === "removed") toast(`Removed the worktree of ${row.title}`);
+  if (answer.status === "gone") toast(`The worktree of ${row.title} was already removed`);
+  refreshWorkersAfterAction(projectPath);
+}
+
+// Spec 87: a worker session is deleted like any other. `/api/session-delete`
+// shuts a live worker down first, as for a deleted parent's workers (spec 57);
+// its worktree and branch are kept.
+async function deleteWorkerSession(row, projectPath) {
+  const confirmed = await confirmDialog(
+    "Delete worker session?",
+    `Delete ${row.title}?${row.alive ? " Its worker is stopped first." : ""} Its worktree and branch are kept.`,
+    { danger: true, confirmLabel: "Delete" },
+  );
+  if (!confirmed) return;
+  await deleteSessionForProject(projectPath, { id: row.sessionId }, { confirmed: true });
+  dismissedWorkers.delete(row.sessionId);
+  saveDismissedWorkers();
   refreshWorkersAfterAction(projectPath);
 }
 
@@ -11310,8 +11333,8 @@ async function renameSessionForProject(projectPath, session) {
   toast("Session renamed");
 }
 
-async function deleteSessionForProject(projectPath, session) {
-  if (!(await confirmDialog("Delete this session?", ""))) return;
+async function deleteSessionForProject(projectPath, session, { confirmed = false } = {}) {
+  if (!confirmed && !(await confirmDialog("Delete this session?", ""))) return;
   await api("/api/session-delete", form({ session_id: session.id, repo: projectPath }));
   const normalized = normalizeProjectPath(projectPath);
   if (normalized === repo() && currentSessionId === session.id) {

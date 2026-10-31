@@ -868,6 +868,7 @@ pub(crate) fn route(
                 RemoveOutcome::Dirty { paths } => {
                     Ok(json!({"status": "dirty", "paths": paths}).to_string())
                 }
+                RemoveOutcome::AlreadyGone => Ok(json!({"status": "gone"}).to_string()),
             }
         }
         _ => Err(Refusal::new(404, "not found")),
