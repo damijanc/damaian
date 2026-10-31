@@ -12308,6 +12308,15 @@ function checkLabel(check) {
   return `${check.command} (${check.workingDirectory || "repository root"})`;
 }
 
+// The check card's button names what it will do with the boxes as they stand
+// (spec 82). "Submit checks" over unticked boxes declined every check without
+// saying so; the boxes stay unticked because each check is an approval.
+function checkSubmitLabel(runCount, total) {
+  if (runCount === 0) return total === 1 ? "Skip the check" : "Skip all checks";
+  if (runCount === total) return `Run ${total} check${total === 1 ? "" : "s"}`;
+  return `Run ${runCount}, skip ${total - runCount}`;
+}
+
 // One card for every check that needs approval (spec 23 §5.3). Unchecked
 // checks are declined and reported as skipped; the batch still resolves, so
 // declining everything is a valid answer rather than a stall.
@@ -12334,8 +12343,8 @@ function createCheckBatchCard(
   const note = document.createElement("p");
   note.className = "check-batch-note";
   note.textContent =
-    "Verification is waiting for these checks. Unchecked checks are skipped and reported as " +
-    "declined; the report follows once this card is submitted.";
+    "Verification is waiting for these checks. Tick the ones to run; unticked checks are " +
+    "skipped and reported as declined. The report follows once you answer.";
 
   const list = document.createElement("div");
   list.className = "check-batch-list";
@@ -12383,14 +12392,37 @@ function createCheckBatchCard(
 
   const actions = document.createElement("div");
   actions.className = "check-batch-actions";
+  // Run all is the one-click approval of every listed check; it is left out
+  // where it would say the same as the button beside it.
+  const runAll = document.createElement("button");
+  runAll.type = "button";
+  runAll.className = "btn-sm";
+  runAll.textContent = "Run all";
   const submit = document.createElement("button");
   submit.type = "button";
   submit.className = "btn-sm btn-primary";
-  submit.textContent = "Submit checks";
-  actions.append(submit);
+  actions.append(runAll, submit);
 
-  submit.addEventListener("click", async () => {
+  const syncSubmit = () => {
+    const ticked = rows.filter(({ run }) => run.checked).length;
+    submit.textContent = checkSubmitLabel(ticked, rows.length);
+    runAll.hidden = rows.length < 2 || ticked === rows.length;
+  };
+  for (const { run } of rows) run.addEventListener("change", syncSubmit);
+  syncSubmit();
+
+  runAll.addEventListener("click", () => {
+    for (const { run } of rows) {
+      run.checked = true;
+      run.dispatchEvent(new Event("change"));
+    }
+    void submitChecks();
+  });
+  submit.addEventListener("click", () => void submitChecks());
+
+  async function submitChecks() {
     submit.disabled = true;
+    runAll.disabled = true;
     const decisions = rows.map(({ check, run }) => ({
       proposalId: check.proposalId,
       approved: run.checked,
@@ -12421,10 +12453,11 @@ function createCheckBatchCard(
       );
     } catch (error) {
       submit.disabled = false;
+      runAll.disabled = false;
       card.classList.remove("submitted");
       toast(error.message);
     }
-  });
+  }
 
   card.append(header, note, list, actions);
   return card;

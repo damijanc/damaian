@@ -247,7 +247,9 @@ Each check is a `CommandProposal` and goes through the existing gate
   run, not one per check. A loop that produces five sequential prompts is a loop
   users click through blindly, which is the problem
   [spec 10](../10_persistent_command_approval.md) was written to address. The
-  user approves or declines each check on that one card.
+  user approves or declines each check on that one card. Its boxes start
+  unticked, and its button names the outcome (**Run 2 checks**, **Run 1,
+  skip 1**, **Skip all checks**), per [spec 82](../82_check_card_says_what_submit_does.md).
 - **Blocked** — by `command_blocklist` or a hard block. Recorded as skipped with
   the policy reason. Never retried, never worked around.
 

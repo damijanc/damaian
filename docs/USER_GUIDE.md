@@ -973,7 +973,10 @@ says so. A Cargo root currently detects one check, `cargo test`; detection finds
 no separate clippy or build command, so the report cannot claim one ran.
 
 **Approval.** Checks that would need approval arrive on **one card**, not one
-prompt each. Unchecked checks are declined and reported as skipped; a blocked
+prompt each. The boxes start unticked: tick the checks you want to run. The
+button says what it will do with the boxes as they are (**Run 2 checks**,
+**Run 1, skip 1** or **Skip all checks**), and **Run all** runs every check in
+one click. Unticked checks are declined and reported as skipped; a blocked
 check never reaches the card and is reported with the policy's reason.
 **Allow Always** stays per check, exact-command, and is qualified with the root
 when the check runs in a sub-root. A session with

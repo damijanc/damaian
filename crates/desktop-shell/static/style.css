@@ -5786,6 +5786,7 @@ body.worker-view #chat-model-menu {
 .check-batch-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
 }
 
 .check-batch.submitted {

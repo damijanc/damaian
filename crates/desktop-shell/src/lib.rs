@@ -8230,6 +8230,44 @@ mod tests {
         fs::remove_dir_all(&repo).ok();
     }
 
+    /// Spec 82: the declined-everything answer above is what a "Submit checks"
+    /// button over unticked boxes sent without saying so. The card now names
+    /// the outcome on its button, and its boxes still start unticked. This
+    /// checks the source shape, as the other JS-only assertions here do.
+    #[test]
+    fn the_check_card_button_says_what_it_will_do() {
+        let app = include_str!("../static/app.js");
+        let label = app
+            .split("function checkSubmitLabel(runCount, total) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the submit label helper");
+        for wording in [
+            "\"Skip the check\"",
+            "\"Skip all checks\"",
+            "`Run ${total} check${total === 1 ? \"\" : \"s\"}`",
+            "`Run ${runCount}, skip ${total - runCount}`",
+        ] {
+            assert!(label.contains(wording), "{wording} in {label}");
+        }
+        let card = app
+            .split("function createCheckBatchCard(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfunction ").next())
+            .expect("the check card");
+        assert!(!card.contains("Submit checks"), "{card}");
+        assert!(card.contains("run.checked = reattached;"), "{card}");
+        assert!(
+            card.contains("checkSubmitLabel(ticked, rows.length)"),
+            "{card}"
+        );
+        assert!(
+            card.contains("run.addEventListener(\"change\", syncSubmit)"),
+            "{card}"
+        );
+        assert!(card.contains("\"Run all\""), "{card}");
+    }
+
     /// Spec 32 Task 6: a `before_patch_apply` hook's denial is the error text
     /// the UI already shows, so its reason reaches the user, and a warning is
     /// returned beside the applied files.

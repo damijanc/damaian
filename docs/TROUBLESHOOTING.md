@@ -1353,6 +1353,12 @@ normal command policy, so the fix is the same as for any command: choose
 add the command to `command_allowlist` for the repository. A repository with
 `require_approval_for_all_commands` keeps asking by design.
 
+**Every check was declined and the report says nothing verified.** The check
+card's boxes start unticked, so answering without ticking any skips every check
+(`declined_by_user`). The button reads **Skip all checks** in that state. Before
+2026-10-31 it read *Submit checks*, which did not say so. A skipped check is not
+run again by itself. Ask the agent to verify again, or run the checks yourself.
+
 **A browser check was skipped.** `no running target` means no stored diagnostic
 target existed, or the page could not be reached. Start the app and inspect the
 page once, then run verification again. Without a session grant for browser
