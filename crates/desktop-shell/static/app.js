@@ -7292,11 +7292,13 @@ async function renderRecoveryPrompts(sessionId) {
       .filter((due) => due.sessionId === sessionId)
       .map(createVerificationOfferCard),
   ];
-  // Prepended in reverse so the cards end up above the conversation in the
-  // order they were built.
-  cards.reverse().forEach((card) => {
-    $("chat-log").prepend(card);
+  // Below the conversation, where the next thing to do is (spec 93). Above it,
+  // a few patch cards with their diffs filled several screens and pushed the
+  // session's first prompt out of sight.
+  cards.forEach((card) => {
+    $("chat-log").append(card);
   });
+  cards[0]?.scrollIntoView({ block: "nearest" });
 }
 
 // Spec 29 §5.7: the pending-proposal stack. It is rendered after the turn's
@@ -14175,7 +14177,7 @@ async function loadSession(sessionId) {
   if (!$("context-panel").hidden) renderContextPanel();
   await refreshFindings();
   // After the conversation, because `renderMessages` clears the log and the
-  // cards sit above what it renders.
+  // cards follow what it renders.
   await renderRecoveryPrompts(currentSessionId);
   // The memory stack sits below the conversation and above nothing else, so it
   // is drawn after the messages it follows.

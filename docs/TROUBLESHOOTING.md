@@ -1840,6 +1840,13 @@ guess, so it is failed with that stated reason rather than shown as an approval
 card rebuilt from partial data. **No stored proposal is deleted** — the patches
 and commands themselves remain on disk and stay usable.
 
+A task can also stay `waiting_for_approval` after its patch was applied or
+rejected, for example when the process stopped before the turn moved on. Since
+[spec 93](specs/93_recovery_cards_follow_the_conversation.md), a patch whose
+every file has a `patch_file_decided` event is not offered again, even when a
+reset has made it apply cleanly once more. Recovery cards are drawn below the
+conversation, not above it.
+
 ### A commit was refused, or an interrupted commit's outcome is unknown
 
 A commit refusal is a value, not a guess. The dialog shows the sentence and the

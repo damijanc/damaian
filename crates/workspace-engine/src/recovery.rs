@@ -424,6 +424,26 @@ pub enum ReattachedApproval {
 /// A task whose proposal cannot be loaded is marked [`TaskStatus::Failed`] with
 /// the reason, rather than being left waiting on something that no longer
 /// exists.
+/// Whether the log already holds a decision for every file of `patch_id`.
+fn patch_already_decided(
+    store: &SessionStore,
+    patches: &PatchStore,
+    session_id: &str,
+    task_id: &str,
+    patch_id: &str,
+) -> Result<bool> {
+    let Ok(patch) = patches.load(patch_id) else {
+        return Ok(false);
+    };
+    let decided: std::collections::BTreeSet<String> = store
+        .read_patch_file_decisions(session_id, task_id)?
+        .into_iter()
+        .filter(|decision| decision.patch_id == patch_id)
+        .flat_map(|decision| decision.paths)
+        .collect();
+    Ok(!patch.files.is_empty() && patch.files.iter().all(|file| decided.contains(&file.path)))
+}
+
 pub fn reattach_pending_approvals(
     store: &SessionStore,
     audit: &AuditLog,
@@ -444,6 +464,16 @@ pub fn reattach_pending_approvals(
         }
 
         let pending = store.pending_decision_for(session_id, &task_id)?;
+        if let Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id })) = &pending
+            && kind == "patch"
+            && patch_already_decided(store, patches, session_id, &task_id, proposal_id)?
+        {
+            // Applied or rejected file by file before the process stopped. The
+            // task's status still says it waits, but there is nothing to
+            // review, and a card would offer a patch whose files may now match
+            // its base again, after a reset (spec 93).
+            continue;
+        }
         let outcome = match &pending {
             // Written by a version that recorded the status but not the link.
             // There is nothing to reattach and nothing to guess from.

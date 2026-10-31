@@ -556,6 +556,75 @@ fn a_pending_approval_survives_restart_with_its_proposal() {
     }
 }
 
+/// Spec 93: a patch whose every file the log already decided is not offered
+/// again. Its task still says it waits, but there is nothing to review, and a
+/// reset can make the patch look applicable once more.
+#[test]
+fn a_patch_the_log_already_decided_is_not_reattached() {
+    let fixture = fixture("reattach-decided");
+    let commands = workspace_engine::CommandStore::new(&fixture.data_dir);
+    let patches = workspace_engine::PatchStore::new(&fixture.data_dir);
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "edit", "mock", "m")
+        .unwrap();
+    let patch = workspace_engine::ProposedPatch {
+        id: "patch_decided".to_string(),
+        session_id: fixture.session_id.clone(),
+        origin_session_id: String::new(),
+        task_id: Some(task.id.clone()),
+        summary: "already applied".to_string(),
+        status: "pending".to_string(),
+        created_at_ms: 1,
+        files: vec![workspace_engine::ProposedFilePatch {
+            path: "a.txt".to_string(),
+            status: "modified".to_string(),
+            base_hash: None,
+            new_hash: String::new(),
+            diff: String::new(),
+            hunks: Vec::new(),
+            new_content: "new\n".to_string(),
+        }],
+    };
+    patches.save(&patch).unwrap();
+    fixture
+        .store
+        .await_approval(
+            &task,
+            &workspace_engine::PendingApprovalRef {
+                kind: "patch".to_string(),
+                proposal_id: patch.id.clone(),
+            },
+        )
+        .unwrap();
+    fixture
+        .store
+        .append_patch_file_decision(
+            &fixture.session_id,
+            &workspace_engine::PatchFileDecision {
+                task_id: task.id.clone(),
+                patch_id: patch.id.clone(),
+                paths: vec!["a.txt".to_string()],
+                applied: true,
+                applied_hashes: Default::default(),
+                accepted_hunks: Default::default(),
+            },
+        )
+        .unwrap();
+
+    let reattached = workspace_engine::reattach_pending_approvals(
+        &SessionStore::new(&fixture.data_dir),
+        &fixture.audit,
+        &commands,
+        &patches,
+        &workspace_engine::PausedTurns::new(&fixture.data_dir),
+        &fixture.session_id,
+    )
+    .unwrap();
+
+    assert!(reattached.is_empty(), "{reattached:?}");
+}
+
 /// §5.5: never an approval card reconstructed from partial data — the user
 /// would be approving a command Damaian is guessing at. The task fails instead.
 #[test]
