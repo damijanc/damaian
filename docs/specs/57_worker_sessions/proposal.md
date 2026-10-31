@@ -558,7 +558,9 @@ worktree path: a worker session's own repository is its worktree, so the
 session list for a project adds the sessions whose `worker_spawned` event names
 that project's repository as the source.
 
-**Workers board** (one per project), a table:
+**Workers board** (one per project), a table. [#95](../95_one_workers_panel.md)
+made it one board for every project, opened from the header ⋮, and removed
+the sidebar's Workers entry:
 
 - Columns: status dot, worker (session title), planner (parent title, or —),
   rounds bar with `round/maxRounds`, *Doing* (current phase or tool label, or

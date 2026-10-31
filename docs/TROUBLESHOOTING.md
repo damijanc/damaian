@@ -2019,8 +2019,9 @@ to a separate worker log.
 | Control socket | `workers/<first 16 hex of sha256(session id)>.sock` |
 | Its process | a `processes/*.json` entry with `kind` `worker`, owned by the shell. The worker's own commands and model calls are entries owned by the worker's pid |
 
-The board reads `GET /api/workers?repo=<source repo>`, which the running app
-does not serve to curl (see
+The board reads `GET /api/workers`, every project's workers, each row naming
+its `sourceRepository`. The sidebar reads `GET /api/workers?repo=<source repo>`
+for one project. The running app does not serve either to curl (see
 [The API token blocks curl](#the-api-token-blocks-curl)). In the app, read the
 board itself, or call the route from the webview console. On the
 manual-inspection server, against its own seeded repository and data

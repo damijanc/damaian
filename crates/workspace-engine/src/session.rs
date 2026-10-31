@@ -1540,6 +1540,17 @@ impl SessionStore {
     /// repository ids: each worktree is its own repository id, so the source
     /// is the only thing a project's workers share. Compared as given, so
     /// callers pass the same canonical form they recorded.
+    /// Every session that has a worker record, whatever its source.
+    pub fn worker_sessions(&self) -> Result<Vec<Session>> {
+        let mut workers = Vec::new();
+        for session in self.list_sessions(None)? {
+            if self.worker_record(&session.id)?.is_some() {
+                workers.push(session);
+            }
+        }
+        Ok(workers)
+    }
+
     pub fn worker_sessions_for_source(&self, source_repository: &Path) -> Result<Vec<Session>> {
         let mut workers = Vec::new();
         for session in self.list_sessions(None)? {

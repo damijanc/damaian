@@ -131,7 +131,9 @@ decision, command policy, API route or setting.
    worker row that is not in `dismissedWorkers`. With such rows, the entry shows the most urgent state's dot (needs you
    › running › paused › failed › finished), the existing needs-you badge, and
    `N running` in muted text when any are running.
-8. The project ⋮ menu gains *Workers board* beside *New worker*. It is hidden
+8. ([#95](../95_one_workers_panel.md) later removed the sidebar's Workers
+   entry and moved the board to the header ⋮.) The project ⋮ menu gains
+   *Workers board* beside *New worker*. It is hidden
    when the setting is off, so the board stays reachable with no rows.
 9. The sidebar footer is shown only while an update is available, installing, or
    waiting for a restart. Settings → General gains *Check for updates*, which

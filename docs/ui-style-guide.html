@@ -1346,9 +1346,6 @@ The cause enum is fed by the classifier in validation.rs.</pre>
 
         <span class="sg-rowlabel">Sidebar</span>
         <div style="width: 280px; padding: 8px; background: var(--sidebar); border-radius: 8px">
-          <button type="button" class="project-workers-entry" aria-label="Workers, 1 need you">
-            <span class="worker-dot" data-state="needs-you" role="img" aria-label="Needs you" title="Needs you"></span><span>Workers &middot; 2 running</span><span class="workers-badge">1</span>
-          </button>
           <div class="session-item project-session-item project-worker-item nested">
             <button type="button" class="project-session-open project-worker-open">
               <span class="worker-dot" data-state="needs-you" role="img" aria-label="Needs you" title="Needs you"></span>
@@ -1406,6 +1403,7 @@ The cause enum is fed by the classifier in validation.rs.</pre>
             <tr>
               <th scope="col"><span class="visually-hidden">Status</span></th>
               <th scope="col">Worker</th>
+              <th scope="col">Project</th>
               <th scope="col">Planner</th>
               <th scope="col">Rounds</th>
               <th scope="col">Doing</th>
@@ -1414,10 +1412,11 @@ The cause enum is fed by the classifier in validation.rs.</pre>
             </tr>
           </thead>
           <tbody class="workers-group" data-group="needs_you">
-            <tr><th scope="rowgroup" colspan="7">Needs you · 1</th></tr>
+            <tr><th scope="rowgroup" colspan="8">Needs you · 1</th></tr>
             <tr class="workers-row" data-state="needs-you">
               <td class="workers-cell-dot"><span class="worker-dot" data-state="needs-you" role="img" aria-label="Needs you" title="Needs you"></span></td>
               <td class="workers-cell-worker"><span class="workers-title">Add retry to the fetch client</span><span class="workers-branch">damaian/add-retry</span></td>
+              <td class="workers-cell-project">damaian-client</td>
               <td class="workers-cell-planner">Plan the networking work</td>
               <td class="workers-cell-rounds"><span class="workers-rounds-bar" aria-hidden="true"><span style="width: 50%"></span></span><span>4/8</span></td>
               <td class="workers-cell-doing"><span class="workers-doing">Waiting for approval: cargo test -p net</span></td>
@@ -1428,10 +1427,11 @@ The cause enum is fed by the classifier in validation.rs.</pre>
             </tr>
           </tbody>
           <tbody class="workers-group" data-group="running">
-            <tr><th scope="rowgroup" colspan="7">Running · 1</th></tr>
+            <tr><th scope="rowgroup" colspan="8">Running · 1</th></tr>
             <tr class="workers-row" data-state="running">
               <td class="workers-cell-dot"><span class="worker-dot" data-state="running" role="img" aria-label="Running" title="Running"></span></td>
               <td class="workers-cell-worker"><span class="workers-title">Document the config keys</span><span class="workers-branch">damaian/config-docs</span></td>
+              <td class="workers-cell-project">damaian-client</td>
               <td class="workers-cell-planner">Plan the networking work</td>
               <td class="workers-cell-rounds"><span class="workers-rounds-bar" aria-hidden="true"><span style="width: 25%"></span></span><span>2/8</span></td>
               <td class="workers-cell-doing"><span class="workers-doing">Reading docs/USER_GUIDE.md</span></td>
@@ -1442,10 +1442,11 @@ The cause enum is fed by the classifier in validation.rs.</pre>
             </tr>
           </tbody>
           <tbody class="workers-group" data-group="finished">
-            <tr><th scope="rowgroup" colspan="7">Finished · 2</th></tr>
+            <tr><th scope="rowgroup" colspan="8">Finished · 2</th></tr>
             <tr class="workers-row" data-state="finished">
               <td class="workers-cell-dot"><span class="worker-dot" data-state="finished" role="img" aria-label="Finished" title="Finished"></span></td>
               <td class="workers-cell-worker"><span class="workers-title">Rename the session store</span><span class="workers-branch">damaian/rename-store</span></td>
+              <td class="workers-cell-project">notes-app</td>
               <td class="workers-cell-planner is-empty">—</td>
               <td class="workers-cell-rounds"><span class="workers-rounds-bar" aria-hidden="true"><span style="width: 75%"></span></span><span>6/8</span></td>
               <td class="workers-cell-doing"><span class="workers-doing">Done</span><span class="workers-meta">4 files changed · 1 commit ahead</span></td>
@@ -1457,6 +1458,7 @@ The cause enum is fed by the classifier in validation.rs.</pre>
             <tr class="workers-row" data-state="failed">
               <td class="workers-cell-dot"><span class="worker-dot" data-state="failed" role="img" aria-label="Failed" title="Failed"></span></td>
               <td class="workers-cell-worker"><span class="workers-title">Upgrade the HTTP client</span><span class="workers-branch">damaian/http-upgrade</span></td>
+              <td class="workers-cell-project">damaian-client</td>
               <td class="workers-cell-planner is-empty">—</td>
               <td class="workers-cell-rounds is-empty">—</td>
               <td class="workers-cell-doing"><span class="workers-doing">Interrupted: its process ended mid-turn</span></td>

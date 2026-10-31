@@ -394,15 +394,16 @@ function renderThreadHeader() {
   renderRepoBar();
   renderWorkerHeaderMeta();
 
-  if (!repoPath) {
-    sessionLine.textContent = "";
+  // One board for every project (spec 95), so it names none.
+  if (workersBoardOpen) {
+    sessionLine.textContent = "Workers";
     sessionLine.removeAttribute("title");
     return;
   }
 
-  if (workersBoardProject) {
-    sessionLine.textContent = `Workers · ${projectName(workersBoardProject)}`;
-    sessionLine.title = workersBoardProject;
+  if (!repoPath) {
+    sessionLine.textContent = "";
+    sessionLine.removeAttribute("title");
     return;
   }
 
@@ -1173,11 +1174,9 @@ function toggleProjectMenu(projectPath, anchorEl) {
         { label: "Rename", action: "rename" },
         { label: "Delete", action: "delete", danger: true },
       ],
-      // §5.1 Entry points: from the sidebar, empty and without a parent.
-      [
-        { label: "New worker", action: "new-worker", hidden: !workersEnabled },
-        { label: "Workers board", action: "workers-board", hidden: !workersEnabled },
-      ],
+      // §5.1 Entry points: from the sidebar, empty and without a parent. The
+      // board is the header ⋮'s Workers, for every project (spec 95).
+      [{ label: "New worker", action: "new-worker", hidden: !workersEnabled }],
     ],
   });
 }
@@ -1205,10 +1204,6 @@ async function handleProjectMenuAction(action, projectPath) {
     } catch (error) {
       toast(error.message);
     }
-    return;
-  }
-  if (action === "workers-board") {
-    void openWorkersBoard(projectPath).catch((error) => toast(error.message));
     return;
   }
   if (action === "open-vscode") {
@@ -8748,52 +8743,13 @@ function sidebarEntries(sessions, rows) {
   return entries;
 }
 
-// Most urgent first: a project's entry wears the dot of the worker that most
-// needs a look.
-const WORKER_DOT_URGENCY = ["needs-you", "running", "paused", "failed", "finished"];
-
-// Null when there is nothing to say: no workers, or only dismissed finished
-// ones. The board stays reachable from the project menu.
-function renderWorkersEntry(projectPath, rows) {
-  const shown = (rows || []).filter(
-    (row) => !(row.group === "finished" && dismissedWorkers.has(row.sessionId)),
-  );
-  if (!shown.length) return null;
-  const entry = document.createElement("button");
-  entry.type = "button";
-  entry.className = "project-workers-entry";
-  entry.classList.toggle("active", workersBoardProject === projectPath);
-  const states = shown.map(workerDotState);
-  const state = WORKER_DOT_URGENCY.find((candidate) => states.includes(candidate));
-  const dot = createWorkerDot({ ...shown[states.indexOf(state)] });
-  const label = document.createElement("span");
-  const running = shown.filter((row) => row.group === "running").length;
-  label.textContent = running ? `Workers \u00b7 ${running} running` : "Workers";
-  entry.append(dot, label);
-  const needYou = shown.filter((row) => row.group === "needs_you").length;
-  if (needYou) {
-    const badge = document.createElement("span");
-    badge.className = "workers-badge";
-    badge.textContent = String(needYou);
-    entry.append(badge);
-  }
-  const parts = [];
-  if (needYou) parts.push(`${needYou} need you`);
-  if (running) parts.push(`${running} running`);
-  entry.setAttribute("aria-label", parts.length ? `Workers, ${parts.join(", ")}` : "Workers");
-  entry.addEventListener("click", () => {
-    void openWorkersBoard(projectPath).catch((error) => toast(error.message));
-  });
-  return entry;
-}
-
 function renderProjectWorker(projectPath, row, { nested }) {
   const item = document.createElement("div");
   item.className = "session-item project-session-item project-worker-item";
   item.classList.toggle("nested", nested);
   item.dataset.sessionId = row.sessionId;
   item.dataset.projectPath = projectPath;
-  if (projectPath === repo() && row.sessionId === currentSessionId && !workersBoardProject) {
+  if (projectPath === repo() && row.sessionId === currentSessionId && !workersBoardOpen) {
     item.classList.add("active");
   }
   const button = document.createElement("button");
@@ -8881,9 +8837,10 @@ function toggleWorkerMenu(row, projectPath, anchorEl, { board }) {
 }
 
 // The rows changed because the user acted: the board polls now, or the
-// sidebar reads the project again.
+// sidebar reads the project again. The board covers every project, so it
+// refreshes the sidebar too.
 function refreshWorkersAfterAction(projectPath) {
-  if (workersBoardProject === normalizeProjectPath(projectPath)) {
+  if (workersBoardOpen) {
     void pollWorkersBoard();
   } else {
     void loadProjectWorkers(projectPath);
@@ -9003,8 +8960,8 @@ function undismissUnfinished(rows) {
   if (changed) saveDismissedWorkers();
 }
 
-// The project whose board is showing, or "" while it is hidden.
-let workersBoardProject = "";
+// Whether the board is showing. It lists every project's workers (spec 95).
+let workersBoardOpen = false;
 let workersBoardRows = null; // null until the board's first answer
 let workersBoardError = "";
 let workersBoardSignature = "";
@@ -9022,18 +8979,12 @@ const WORKER_GROUPS = [
   ["finished", "Finished"],
 ];
 
-async function openWorkersBoard(projectPath) {
-  const path = normalizeProjectPath(projectPath);
-  if (!workersEnabled || !path) return;
-  if (path !== repo()) {
-    expandedProjectPaths.add(path);
-    saveProjectState();
-    await switchProject(path, { reloadSelected: false });
-    if (!currentSessionId) clearChat();
-  }
+// The open project stays open: the board belongs to none of them.
+function openWorkersBoard() {
+  if (!workersEnabled) return;
   workersBoardGeneration += 1;
-  workersBoardProject = path;
-  workersBoardRows = workerRowsByProject.get(path) || null;
+  workersBoardOpen = true;
+  workersBoardRows = null;
   workersBoardError = "";
   workersBoardSignature = "";
   workersBoardAnsweredAt = 0;
@@ -9048,8 +8999,8 @@ async function openWorkersBoard(projectPath) {
 }
 
 function hideWorkersBoard() {
-  if (!workersBoardProject) return;
-  workersBoardProject = "";
+  if (!workersBoardOpen) return;
+  workersBoardOpen = false;
   workersBoardGeneration += 1;
   clearTimeout(workersBoardPollTimer);
   workersBoardPollTimer = null;
@@ -9072,28 +9023,29 @@ function hideWorkersBoard() {
 async function pollWorkersBoard() {
   clearTimeout(workersBoardPollTimer);
   workersBoardPollTimer = null;
-  const project = workersBoardProject;
-  if (!project || !workersEnabled || workersBoardInFlight) return;
+  if (!workersBoardOpen || !workersEnabled || workersBoardInFlight) return;
   // A hidden window does not poll; `visibilitychange` starts it again.
   if (document.hidden) return;
   const generation = workersBoardGeneration;
   workersBoardInFlight = true;
   workersBoardRequestStartedAt = Date.now();
   try {
-    const answer = await api(`/api/workers?repo=${encodeURIComponent(project)}`);
+    // No `repo`: every project's workers (spec 95).
+    const answer = await api("/api/workers");
+    const rows = answer.workers || [];
     if (generation === workersBoardGeneration) {
-      workersBoardRows = answer.workers || [];
+      workersBoardRows = rows;
       workersBoardError = "";
       workersBoardAnsweredAt = Date.now();
     }
-    setProjectWorkerRows(project, answer.workers || []);
+    setWorkerRowsFromBoard(rows);
   } catch (error) {
     if (generation === workersBoardGeneration) workersBoardError = error.message;
   } finally {
     workersBoardInFlight = false;
     workersBoardRequestStartedAt = 0;
   }
-  if (!workersBoardProject) return;
+  if (!workersBoardOpen) return;
   if (generation === workersBoardGeneration) renderWorkersBoard();
   // A board opened again while this request was out polls at once.
   workersBoardPollTimer = setTimeout(
@@ -9102,8 +9054,23 @@ async function pollWorkersBoard() {
   );
 }
 
+// The board's answer, split by project for the sidebar. A project that had
+// workers and has none now gets an empty list, so its rows go too.
+function setWorkerRowsFromBoard(rows) {
+  const byProject = new Map([...workerRowsByProject.keys()].map((path) => [path, []]));
+  rows.forEach((row) => {
+    const path = normalizeProjectPath(row.sourceRepository);
+    if (!path) return;
+    if (!byProject.has(path)) byProject.set(path, []);
+    byProject.get(path).push(row);
+  });
+  byProject.forEach((projectRows, path) => {
+    setProjectWorkerRows(path, projectRows);
+  });
+}
+
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden || !workersBoardProject) return;
+  if (document.hidden || !workersBoardOpen) return;
   if (!workersBoardInFlight && !workersBoardPollTimer) void pollWorkersBoard();
 });
 
@@ -9176,6 +9143,10 @@ function renderWorkerBoardRow(row, projectPath) {
   branch.textContent = row.branch;
   worker.append(title, branch);
 
+  const project = cell("workers-cell-project");
+  project.textContent = projectName(projectPath);
+  project.title = projectPath;
+
   const planner = cell("workers-cell-planner");
   planner.textContent = row.parentTitle || "—";
   planner.classList.toggle("is-empty", !row.parentTitle);
@@ -9235,8 +9206,7 @@ function renderWorkerBoardRow(row, projectPath) {
 
 function renderWorkersBoard() {
   const board = $("workers-board");
-  const project = workersBoardProject;
-  if (!project) return;
+  if (!workersBoardOpen) return;
   const rows = (workersBoardRows || []).filter(
     (row) => !(row.group === "finished" && dismissedWorkers.has(row.sessionId)),
   );
@@ -9267,9 +9237,12 @@ function renderWorkersBoard() {
   newWorker.type = "button";
   newWorker.className = "btn-sm";
   newWorker.textContent = "New worker";
+  // The dialog starts a worker in the open project, so it needs one.
+  newWorker.disabled = !repo();
+  newWorker.title = repo() ? `New worker in ${projectName(repo())}` : "Open a project first";
   newWorker.addEventListener("click", async () => {
     const started = await showNewWorkerDialog({});
-    if (started) refreshWorkersAfterAction(project);
+    if (started) refreshWorkersAfterAction(repo());
   });
   head.append(summary, status, newWorker);
   board.replaceChildren(head);
@@ -9278,28 +9251,30 @@ function renderWorkersBoard() {
     const empty = document.createElement("p");
     empty.className = "workers-board-empty";
     empty.textContent =
-      "No workers in this project. Start one with New worker, or from a worker-prompt block in a conversation.";
+      "No workers. Start one with New worker, or from a worker-prompt block in a conversation.";
     board.append(empty);
   } else if (rows.length) {
     const table = document.createElement("table");
     table.className = "workers-table";
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
-    ["Status", "Worker", "Planner", "Rounds", "Doing", "Elapsed", "Actions"].forEach((label) => {
-      const th = document.createElement("th");
-      th.scope = "col";
-      // The dot and action columns keep their header for screen readers only;
-      // the cell stays in the table so the columns line up.
-      if (label === "Status" || label === "Actions") {
-        const hidden = document.createElement("span");
-        hidden.className = "visually-hidden";
-        hidden.textContent = label;
-        th.append(hidden);
-      } else {
-        th.textContent = label;
-      }
-      headRow.append(th);
-    });
+    ["Status", "Worker", "Project", "Planner", "Rounds", "Doing", "Elapsed", "Actions"].forEach(
+      (label) => {
+        const th = document.createElement("th");
+        th.scope = "col";
+        // The dot and action columns keep their header for screen readers only;
+        // the cell stays in the table so the columns line up.
+        if (label === "Status" || label === "Actions") {
+          const hidden = document.createElement("span");
+          hidden.className = "visually-hidden";
+          hidden.textContent = label;
+          th.append(hidden);
+        } else {
+          th.textContent = label;
+        }
+        headRow.append(th);
+      },
+    );
     thead.append(headRow);
     table.append(thead);
     WORKER_GROUPS.forEach(([group, label]) => {
@@ -9313,12 +9288,13 @@ function renderWorkersBoard() {
       const groupHead = document.createElement("tr");
       const groupLabel = document.createElement("th");
       groupLabel.scope = "rowgroup";
-      groupLabel.colSpan = 7;
+      groupLabel.colSpan = 8;
       groupLabel.textContent = `${label} · ${groupRows.length}`;
       groupHead.append(groupLabel);
       body.append(groupHead);
       groupRows.forEach((row) => {
-        body.append(renderWorkerBoardRow(row, project));
+        // Each row acts on its own project (spec 95).
+        body.append(renderWorkerBoardRow(row, normalizeProjectPath(row.sourceRepository)));
       });
       table.append(body);
     });
@@ -9390,7 +9366,7 @@ function workerViewActive(view) {
     view &&
       view === workerView &&
       workersEnabled &&
-      !workersBoardProject &&
+      !workersBoardOpen &&
       view.sessionId === currentSessionId,
   );
 }
@@ -9399,7 +9375,7 @@ function workerViewActive(view) {
 // now open. Reloading the same worker keeps its place in the progress file.
 function syncWorkerView() {
   const sessionId = currentSessionId;
-  if (!workersEnabled || !sessionId || workersBoardProject || !isWorkerSession(sessionId)) {
+  if (!workersEnabled || !sessionId || workersBoardOpen || !isWorkerSession(sessionId)) {
     stopWorkerView();
     return;
   }
@@ -9693,7 +9669,7 @@ function renderWorkerHeaderMeta() {
   let meta = identity.querySelector(".thread-worker-meta");
   const view = workerView;
   const row =
-    view && !workersBoardProject && view.sessionId === currentSessionId
+    view && !workersBoardOpen && view.sessionId === currentSessionId
       ? workerRowFor(view.sessionId)
       : null;
   if (!row) {
@@ -11128,12 +11104,10 @@ function renderProjectList() {
       sessionsList.className = "project-sessions";
       // Workers come by source repository, never from `/api/sessions`
       // (§5.7 Sidebar), and nothing of them is drawn while the setting is off.
+      // There is no Workers entry here: each worker is listed under its parent,
+      // and the header ⋮ opens the one board for every project (spec 95).
       const workers = workersEnabled ? workerRowsByProject.get(projectPath) : null;
-      if (workersEnabled) {
-        if (!workers) void loadProjectWorkers(projectPath);
-        const workersEntry = renderWorkersEntry(projectPath, workers || []);
-        if (workersEntry) sessionsList.append(workersEntry);
-      }
+      if (workersEnabled && !workers) void loadProjectWorkers(projectPath);
       if (!sessions && projectSessionsLoading.has(projectPath)) {
         const loading = document.createElement("p");
         loading.className = "project-session-empty";
@@ -11179,7 +11153,7 @@ function renderProjectSession(projectPath, session) {
   row.className = "session-item project-session-item";
   row.dataset.sessionId = session.id;
   row.dataset.projectPath = projectPath;
-  if (projectPath === repo() && session.id === currentSessionId && !workersBoardProject) {
+  if (projectPath === repo() && session.id === currentSessionId && !workersBoardOpen) {
     row.classList.add("active");
   }
   const button = document.createElement("button");
@@ -11374,7 +11348,7 @@ function syncSessionListActive() {
       "active",
       button.dataset.projectPath === repo() &&
         button.dataset.sessionId === currentSessionId &&
-        !workersBoardProject,
+        !workersBoardOpen,
     );
   });
 }
@@ -14548,6 +14522,15 @@ function toggleThreadMenu(anchorEl) {
               },
             ],
           ],
+        },
+      ],
+      // One board for every project's workers (spec 95).
+      [
+        {
+          label: "Workers",
+          action: "workers-board",
+          hidden: !workersEnabled,
+          onSelect: () => openWorkersBoard(),
         },
       ],
       [

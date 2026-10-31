@@ -980,19 +980,23 @@ impl Group {
 }
 
 /// `GET /api/workers?repo=`: every worker whose source is `repo`, from its
-/// record, its progress file and whether this shell still holds it.
+/// record, its progress file and whether this shell still holds it. Without
+/// `repo`, every worker of every project: the one Workers panel (spec 95).
 fn list_workers(
     supervisor: &Supervisor,
     config: &Config,
     query: &HashMap<String, String>,
 ) -> Result<String, Refusal> {
-    let repo = required(query, "repo")?;
-    let source = std::fs::canonicalize(&repo)
-        .map_err(|error| Refusal::new(400, format!("{repo}: {error}")))?;
     let store = SessionStore::new(&config.data_dir);
-    let sessions = store
-        .worker_sessions_for_source(&source)
-        .map_err(|error| Refusal::new(500, error.to_string()))?;
+    let sessions = match query.get("repo").filter(|repo| !repo.is_empty()) {
+        Some(repo) => {
+            let source = std::fs::canonicalize(repo)
+                .map_err(|error| Refusal::new(400, format!("{repo}: {error}")))?;
+            store.worker_sessions_for_source(&source)
+        }
+        None => store.worker_sessions(),
+    }
+    .map_err(|error| Refusal::new(500, error.to_string()))?;
     let mut rows = Vec::new();
     for session in &sessions {
         let Some(record) = store
@@ -1095,6 +1099,8 @@ fn worker_row(
         "parentTitle": parent_title,
         "branch": record.branch,
         "worktree": record.worktree_path.display().to_string(),
+        // The project the row belongs to, for the all-projects panel (spec 95).
+        "sourceRepository": record.source_repository.display().to_string(),
         "alive": alive,
         "state": state,
         "taskStatus": task_status,

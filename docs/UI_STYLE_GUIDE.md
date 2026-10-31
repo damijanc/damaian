@@ -302,12 +302,8 @@ look. State colours only (§2):
   `aria-hidden`. Keep it that way: the finished dot is about 1.5:1 against
   `--sidebar`, too faint to be the only signal.
 
-**Sidebar.** The `.project-workers-entry` ("Workers") is conditional: a project
-with no workers, or only dismissed finished ones, has none, and the project
-menu's *Workers board* row still opens the board. When shown it carries the
-`.worker-dot` of its most urgent worker (needs-you, running, paused, failed,
-finished), a `· N running` label, and a `.workers-badge` counting the workers
-that need you — white on `--warn`, 5.2:1. A worker's session is listed under the
+**Sidebar.** There is no Workers entry (spec 95): the header ⋮'s *Workers*
+opens the one board for every project. A worker's session is listed under the
 session that started it as `.project-worker-item.nested`, indented one 14px
 step, with its dot where a child's bullet would be.
 
@@ -317,7 +313,7 @@ are hidden, and the board uses the conversation gutters (§6). Its
 `.workers-table` is grouped into one `tbody.workers-group` per state — *Needs
 you*, *Running*, *Finished* — each headed by an uppercase eyebrow row with its
 count. Columns: dot, worker (title, then its branch in muted monospace),
-planner, rounds (`.workers-rounds-bar`, 48×4px, `--accent` on `--line`, then
+project (muted, truncated like the planner), planner, rounds (`.workers-rounds-bar`, 48×4px, `--accent` on `--line`, then
 `n/m`), what it is doing, elapsed time, and actions.
 
 - **One `.btn-sm` per row, unfilled** — *Review* when it needs you, *Pause*

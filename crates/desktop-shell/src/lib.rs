@@ -8277,6 +8277,34 @@ mod tests {
         fs::remove_dir_all(&repo).ok();
     }
 
+    /// Spec 95: one Workers board for every project, opened from the header
+    /// ⋮, and no Workers entry in the sidebar. Checks the source shape.
+    #[test]
+    fn the_workers_board_is_one_panel_in_the_header_menu() {
+        assert!(
+            !super::APP_JS.contains("renderWorkersEntry"),
+            "the sidebar entry is gone"
+        );
+        assert!(!super::APP_JS.contains("workersBoardProject"));
+        let menu = &super::APP_JS[super::APP_JS.find("function toggleThreadMenu").unwrap()..];
+        let menu = &menu[..menu.find("\n}\n").unwrap()];
+        assert!(menu.contains("label: \"Workers\""), "{menu}");
+        assert!(
+            menu.contains("onSelect: () => openWorkersBoard()"),
+            "{menu}"
+        );
+        assert!(
+            super::APP_JS.contains("await api(\"/api/workers\");"),
+            "the board polls every project"
+        );
+        assert!(
+            super::APP_JS.contains("\"Project\""),
+            "the board names each row's project"
+        );
+        assert!(super::APP_JS.contains("normalizeProjectPath(row.sourceRepository)"));
+        assert!(!include_str!("../static/style.css").contains(".project-workers-entry"));
+    }
+
     /// Spec 82: the declined-everything answer above is what a "Submit checks"
     /// button over unticked boxes sent without saying so. The card now names
     /// the outcome on its button, and its boxes still start unticked. This
@@ -14193,6 +14221,41 @@ exec /bin/cat > /dev/null
             assert_eq!(
                 gone_row["filesChanged"], 2,
                 "committed and staged, against the base"
+            );
+
+            fixture.supervisor.shutdown_all();
+        }
+
+        /// Spec 95: without `repo`, the list is the one Workers panel's, with
+        /// every project's workers, each naming the project it belongs to.
+        #[test]
+        fn the_workers_list_covers_every_project_without_a_repo() {
+            let fixture = Fixture::new();
+            let other_repo = repository(&fixture.root, "o");
+            let here = fixture.spawn("Here", None);
+            let elsewhere = fixture.spawn_from(&other_repo, "Elsewhere", None);
+
+            let rows = fixture.route("GET", "/api/workers", &[], &[]).unwrap()["workers"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let source_of = |session: &str| {
+                rows.iter()
+                    .find(|row| row["sessionId"] == session)
+                    .map(|row| row["sourceRepository"].as_str().unwrap().to_string())
+                    .unwrap_or_else(|| panic!("{session} is not listed: {rows:?}"))
+            };
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert_eq!(
+                source_of(&here.session_id),
+                fs::canonicalize(&fixture.repo)
+                    .unwrap()
+                    .display()
+                    .to_string()
+            );
+            assert_eq!(
+                source_of(&elsewhere.session_id),
+                fs::canonicalize(&other_repo).unwrap().display().to_string()
             );
 
             fixture.supervisor.shutdown_all();
