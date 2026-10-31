@@ -298,6 +298,11 @@ A plan panel showing steps with status, the derived phase, and per-step evidence
 where present. The current step is distinguished, and requirement 2 is visible: a
 plan with two `in_progress` steps would be a bug the panel makes obvious.
 
+[#97](../97_reuse_planned_verification_steps.md) closes one such production
+path: automatic verification defers a matching planned whole-suite check until
+the worker reaches that final plan step, and treats any other check as a
+secondary validation substep while a primary step is active.
+
 The completion report distinguishes four outcomes per step — verified complete,
 completed unverified, blocked, skipped — and the summary line never says
 "complete" for a task with a blocked step.

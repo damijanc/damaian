@@ -1546,6 +1546,132 @@ fn an_auto_runnable_check_runs_and_the_report_says_passed() {
     let _ = fs::remove_dir_all(&data_dir);
 }
 
+/// Spec 97: a whole-suite `cargo test` at the end of a carried plan must not
+/// run after every patch. It stays pending for the worker's final plan step,
+/// so post-patch verification neither spends the suite nor opens a competing
+/// `verify_*` step beside the implementation work. Replay every durable log
+/// prefix: the finished plan alone would miss the transient state shown in the
+/// UI.
+#[test]
+fn verification_defers_a_planned_final_check_without_two_steps_in_progress() {
+    let root = temp_dir("planned-check-invariant");
+    let data_dir = temp_dir("planned-check-invariant-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, task_id) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let task = engine
+        .session_store
+        .read_tasks(&session)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .expect("the patch task");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.extend([
+        PlanStep {
+            id: "implement".to_string(),
+            title: "Implement the change".to_string(),
+            detail: None,
+            status: StepStatus::InProgress,
+            depends_on: Vec::new(),
+            started_at_ms: Some(1),
+            completed_at_ms: None,
+            evidence: Vec::new(),
+        },
+        PlanStep {
+            id: "test".to_string(),
+            title: "Run `cargo test`".to_string(),
+            detail: None,
+            status: StepStatus::Pending,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+        },
+    ]);
+    engine.session_store.create_plan(&task, &plan).unwrap();
+
+    let mut adapter = MockModelAdapter::new("");
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+    let carried = engine
+        .session_store
+        .read_task_plan(&session, &result.task.id)
+        .unwrap()
+        .expect("the verification carries the plan");
+    assert_eq!(
+        carried
+            .steps
+            .iter()
+            .find(|step| step.id == "test")
+            .unwrap()
+            .status,
+        StepStatus::Pending,
+        "the final validation waits for the worker to reach its planned step"
+    );
+    assert!(
+        carried
+            .steps
+            .iter()
+            .all(|step| !step.id.starts_with("verify_")),
+        "the planned command is deferred instead of duplicated: {carried:?}"
+    );
+    let report = result
+        .verification_report
+        .as_ref()
+        .expect("the deferred run still reports that no check ran");
+    assert_eq!(report.outcome, Some(VerificationOutcome::NothingVerified));
+    assert!(
+        report.passed.is_empty(),
+        "cargo test was deferred instead of run: {report:?}"
+    );
+    assert!(
+        outcome_events(&engine, &session)
+            .iter()
+            .all(|event| !matches!(
+                event,
+                VerificationEvent::Check { check, .. } if check.command == "cargo test"
+            )),
+        "the deferred suite must not have a check-run event"
+    );
+
+    let log =
+        fs::read_to_string(data_dir.join("sessions").join(format!("{session}.jsonl"))).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    let replay_session = "replay";
+    let replay_path = data_dir
+        .join("sessions")
+        .join(format!("{replay_session}.jsonl"));
+    let store = SessionStore::new(&data_dir);
+    let mut checked = 0;
+    for end in 1..=lines.len() {
+        fs::write(&replay_path, lines[..end].join("\n")).unwrap();
+        let Some(prefix) = store
+            .read_task_plan(replay_session, &result.task.id)
+            .unwrap()
+        else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            !prefix.violates_single_in_progress(),
+            "two steps are in progress after event {end}: {:?}",
+            prefix
+                .steps
+                .iter()
+                .map(|step| (&step.id, step.status))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(checked > 1, "the replay saw the carried plan evolve");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
 #[test]
 fn two_checks_needing_approval_produce_one_batch_and_one_resume() {
     let root = temp_dir("verify-batch");

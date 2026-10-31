@@ -2506,6 +2506,20 @@ impl ChatOrchestrator {
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
+        let mut plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)?
+            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        // A whole-suite validation which the plan explicitly puts at its end
+        // belongs to that final plan step. Running it after every applied
+        // patch is both expensive and makes the test's evidence describe the
+        // wrong point in the task. The worker will run it once when it reaches
+        // the planned step through its ordinary command and approval flow.
+        // Checks the plan did not schedule remain immediate repair feedback.
+        let checks: Vec<_> = checks
+            .into_iter()
+            .filter(|(check, _)| !plan_has_open_check_command(&plan, &check.command))
+            .collect();
         let mut selected: Vec<CheckId> = checks.iter().map(|(check, _)| check.clone()).collect();
         if let Some(browser) = &browser {
             selected.push(browser.check().clone());
@@ -2518,10 +2532,6 @@ impl ChatOrchestrator {
                 checks: selected,
             },
         )?;
-        let mut plan = self
-            .session_store
-            .read_task_plan(&session.id, &task.id)?
-            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
         // A rerun (proposal §5.5) reuses the step of a check an earlier attempt
         // already has and adds one only for a check new in this attempt: the
         // step is closed by id, so a second `verify_1` would take the old
@@ -2529,30 +2539,30 @@ impl ChatOrchestrator {
         let mut step_ids = Vec::new();
         for (check, _) in &checks {
             let detail = format!("Verification check: {}", check.label());
-            let step_id = match plan.steps.iter().find(|step| {
+            let step_id = if let Some(step) = plan.steps.iter().find(|step| {
                 step.id.starts_with("verify_") && step.detail.as_deref() == Some(detail.as_str())
             }) {
-                Some(step) => step.id.clone(),
-                None => {
-                    let step_id = next_verify_step_id(&plan);
-                    plan.steps.push(PlanStep {
-                        id: step_id.clone(),
-                        title: format!(
-                            "Run `{}` in `{}`",
-                            check.command,
-                            root_label(&check.working_directory)
-                        ),
-                        detail: Some(detail),
-                        status: StepStatus::Pending,
-                        depends_on: Vec::new(),
-                        started_at_ms: None,
-                        completed_at_ms: None,
-                        evidence: Vec::new(),
-                    });
-                    step_id
-                }
+                let id = step.id.clone();
+                reset_verify_step(&mut plan, &id);
+                id
+            } else {
+                let step_id = next_verify_step_id(&plan);
+                plan.steps.push(PlanStep {
+                    id: step_id.clone(),
+                    title: format!(
+                        "Run `{}` in `{}`",
+                        check.command,
+                        root_label(&check.working_directory)
+                    ),
+                    detail: Some(detail),
+                    status: StepStatus::Pending,
+                    depends_on: Vec::new(),
+                    started_at_ms: None,
+                    completed_at_ms: None,
+                    evidence: Vec::new(),
+                });
+                step_id
             };
-            reset_verify_step(&mut plan, &step_id);
             step_ids.push(step_id);
         }
         let browser_step = browser.as_ref().map(|browser| {
@@ -2699,13 +2709,7 @@ impl ChatOrchestrator {
         _file_hashes: &BTreeMap<String, String>,
         sink: &mut TurnSink<'_>,
     ) -> Result<CheckOutcome> {
-        let started = now_millis();
-        if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
-            step.status = StepStatus::InProgress;
-            step.started_at_ms = Some(started);
-            self.session_store.update_plan_step(task, step)?;
-            sink.progress(TurnProgress::Plan(plan.clone()));
-        }
+        self.start_verification_step(task, plan, step_id, sink)?;
         let cancel = sink.cancel;
         let on_progress = &mut *sink.on_progress;
         let mut on_output = |line: &str| {
@@ -2774,13 +2778,7 @@ impl ChatOrchestrator {
         _file_hashes: &BTreeMap<String, String>,
         sink: &mut TurnSink<'_>,
     ) -> Result<CheckOutcome> {
-        let started = now_millis();
-        if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
-            step.status = StepStatus::InProgress;
-            step.started_at_ms = Some(started);
-            self.session_store.update_plan_step(task, step)?;
-            sink.progress(TurnProgress::Plan(plan.clone()));
-        }
+        self.start_verification_step(task, plan, step_id, sink)?;
         let BrowserCheck::Ready { call, .. } = browser else {
             let BrowserCheck::Skipped { reason, .. } = browser else {
                 unreachable!("all browser checks are ready or skipped")
@@ -2859,6 +2857,37 @@ impl ChatOrchestrator {
             }
             step.completed_at_ms = Some(now_millis());
             self.session_store.update_plan_step(task, step)?;
+        }
+        Ok(())
+    }
+
+    /// Starts a verification substep without claiming two primary plan steps.
+    ///
+    /// A patch is applied after the proposing turn ended, so its original plan
+    /// step can correctly still be open when the automatic verification turn
+    /// starts. A newly added `verify_*` step is secondary to that work. It
+    /// records its result below, but stays `Pending` while the primary step is
+    /// active rather than producing an impossible two-`InProgress` log state.
+    fn start_verification_step(
+        &self,
+        task: &Task,
+        plan: &mut TaskPlan,
+        step_id: &str,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<()> {
+        let another_primary_is_open = plan
+            .steps
+            .iter()
+            .any(|step| step.id != step_id && step.status == StepStatus::InProgress);
+        if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
+            if !another_primary_is_open {
+                step.status = StepStatus::InProgress;
+            }
+            if step.started_at_ms.is_none() {
+                step.started_at_ms = Some(now_millis());
+            }
+            self.session_store.update_plan_step(task, step)?;
+            sink.progress(TurnProgress::Plan(plan.clone()));
         }
         Ok(())
     }
@@ -11482,6 +11511,33 @@ fn reset_verify_step(plan: &mut TaskPlan, step_id: &str) {
         step.completed_at_ms = None;
         step.evidence.clear();
     }
+}
+
+/// Whether an open user-visible plan step owns this exact check command.
+///
+/// Plans intentionally store human-readable titles rather than model-supplied
+/// command metadata. Match only an exact command phrase (optionally fenced in
+/// backticks) so post-patch verification defers a planned `cargo test` without
+/// treating a vague mention of testing as the same work.
+fn plan_has_open_check_command(plan: &TaskPlan, command: &str) -> bool {
+    plan.steps
+        .iter()
+        .any(|step| plan_step_names_command(step, command))
+}
+
+fn plan_step_names_command(step: &PlanStep, command: &str) -> bool {
+    if step.id.starts_with("verify_") || step.status.is_terminal() {
+        return false;
+    }
+    let named = |text: &str| {
+        text.split('`').any(|segment| segment.trim() == command)
+            || text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(command.split_whitespace().count())
+                .any(|words| words.join(" ") == command)
+    };
+    named(&step.title) || step.detail.as_deref().is_some_and(named)
 }
 
 fn root_label(working_directory: &str) -> &str {

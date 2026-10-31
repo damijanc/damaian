@@ -97,7 +97,7 @@ and worktree delivery finished on 2026-10-28 and were merged into `main` that
 day; the full seven-check gate passed in CI on 2026-10-29 for the `main` push
 that contains both (Quality run 40902516310).
 
-#60–#85 and #87–#96 are also Done (see their rows below). Several were evidence-driven or
+#60–#85 and #87–#97 are also Done (see their rows below). Several were evidence-driven or
 usability specs added outside the roadmap order; being finished, none of them
 changes what may be built next.
 
@@ -115,14 +115,17 @@ changes what may be built next.
   ready set.
 - **Ready:** #33 MCP management. It was serialised behind #30 on `chat.rs`;
   with #30 Done it is free to start, from a `main` that contains #30's turn
-  path so it does not rebase over it.
+  path so it does not rebase over it. [#98](98_task_scoped_protected_patch_paths.md)
+  is also ready: it makes direct user no-touch paths an engine-enforced,
+  task-scoped patch fence across worker and repair continuations.
 - **Blocked:** #37 on #33; #52 on #33; #39 on #38; #40 on #38 and #39; #54 on
   Phase 1 WP3 (provider capability validation), which is unspecified.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
 - **Pairing:** two specs may run together only if at most one of them edits
   `chat.rs`, and #49's reuse slice is a solo `chat.rs` track while it rewrites
   the request around `build_model_prompt`. #33 edits `chat.rs` through the MCP
-  tool list and per-tool dispatch, so it owns that file while it is in flight.
+  tool list and per-tool dispatch, and #98 edits it through patch dispatch and
+  continuation state; either owns that file while it is in flight.
   Every Done spec no longer constrains anything. See
   [Parallel work](#parallel-work).
 - **Open decision:** the priority table below predates #59–#80 and does not
@@ -854,6 +857,8 @@ is ready.
 | 94 | [94_run_a_plan_in_a_worker.md](94_run_a_plan_in_a_worker.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A gap reported in use: the offer to run work in a worker came only from the model's `worker-prompt` block, which it wrote once and then stopped writing, so a spec-sized task ran in the main checkout. With Worker sessions on, a plan review card now offers **Run in a worker**. It opens the New worker dialog with the request and the plan as the card has it, and once the worker starts it ends the paused turn without a model call, its steps skipped and the hand-over audited. |
 | 95 | [95_one_workers_panel.md](95_one_workers_panel.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A usability gap reported in use: the sidebar's per-project **Workers** entry repeated the workers already listed under their parent sessions, and each board covered one project. The entry is gone; **Workers** on the header ⋮ opens one board for every project, with a Project column, and `GET /api/workers` without `repo` lists them all. |
 | 96 | [96_continue_repair_at_the_limit.md](96_continue_repair_at_the_limit.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: the repair limit defaulted to 2 and a worker had no way to continue after it, so an interrupted draft let only workers repair past the limit. The default is now 16, every session still stops at the limit, and a **Continue repair** action starts exactly one more attempt on the user's explicit decision, for ordinary and worker sessions. The failed plan and evidence carry into that attempt, every approval still applies, a second activation is refused, and the offer is redrawn from the durable log after a reload. |
+| 97 | [97_reuse_planned_verification_steps.md](97_reuse_planned_verification_steps.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A task plan can name `cargo test` as its final step, but automatic verification selected the same command after every patch and activated a second `verify_` step beside the carried primary work. Verification now defers an exact planned whole-suite check until the worker reaches its final plan step, and leaves a secondary check pending while another primary step is active, so every durable log prefix preserves the one-in-progress invariant. |
+| 98 | [98_task_scoped_protected_patch_paths.md](98_task_scoped_protected_patch_paths.md) | **Not started.** A worker ignored a direct no-touch instruction and proposed deleting an unrelated file after a failed check. Direct user path exclusions will become durable, task-scoped patch fences enforced before proposal and again before apply, across verification, repairs, worker restart, and reload. A rejected file alone remains a review decision, not an implicit permanent ban. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:

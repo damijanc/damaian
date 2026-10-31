@@ -201,6 +201,12 @@ restart and what makes the plan's completion status honest. What the plan
 cannot hold (the attempt count, a skip's reason, the file hashes a run saw) is
 kept in session-log events beside it (`context.md` §4).
 
+Since [#97](../97_reuse_planned_verification_steps.md), a check that an open
+plan step already names (for example, `cargo test`) is deferred until the
+worker reaches that plan step, rather than run after every patch or adding a
+competing `verify_` step. A secondary check never claims a second `in_progress`
+step while a carried primary step remains open.
+
 ### 5.2 Selecting checks
 
 `propose_detected_validations(repository_root, &RepositoryMap)` returns every
