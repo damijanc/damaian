@@ -2010,3 +2010,37 @@ fn a_chmod_after_preparation_is_refused_as_content_changed() {
     assert_eq!(fixture.head(), before);
     fixture.cleanup();
 }
+
+/// Spec 89: the draft message names the latest request the user typed. A plan
+/// approval appends its continuation note in the user's role, and a bare
+/// "continue" names nothing, so neither becomes the subject.
+#[test]
+fn the_draft_message_names_the_users_request_not_damaians_notes() {
+    let fixture = Fixture::new("draft-message");
+    fixture.write("a.txt", "original\n");
+    fixture.commit_all("initial");
+    let (session, task) = fixture.session();
+    fixture.write("a.txt", "changed\n");
+    fixture.apply(&session, &task, &[("a.txt", "changed\n")], None, None);
+    fixture
+        .engine
+        .session_store
+        .append_message(
+            &session.id,
+            Some(&task.id),
+            "user",
+            "The user reviewed the plan and approved it. Continue with the current step.",
+        )
+        .unwrap();
+    fixture
+        .engine
+        .session_store
+        .create_task(&session.id, "continue", "test", "test")
+        .unwrap();
+
+    let preparation = fixture.prepare(&session);
+
+    assert_eq!(preparation.message, "chore: a.txt Add a feature");
+
+    fixture.cleanup();
+}

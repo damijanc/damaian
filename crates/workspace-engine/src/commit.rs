@@ -1676,15 +1676,22 @@ impl CommitEngine {
         }]
     }
 
+    /// The draft names the latest request the user typed, read from the
+    /// session's tasks rather than its messages (spec 89). Damaian appends some
+    /// notes in the user's role, such as a plan approval's continuation, and
+    /// the draft once read "chore: <file> The user reviewed the plan…".
     fn suggest_message(&self, session_id: &str, selected_paths: &[String]) -> String {
         let summary = self
             .session_store
-            .read_messages(session_id)
+            .read_tasks(session_id)
             .unwrap_or_default()
             .into_iter()
             .rev()
-            .find(|message| message.role == "user" && message.kind.is_none())
-            .map(|message| message.content)
+            .map(|task| task.user_prompt)
+            .find(|prompt| {
+                !crate::chat::is_damaian_task_prompt(prompt) && !is_bare_continuation(prompt)
+            })
+            .map(|prompt| commit_summary(&prompt))
             .unwrap_or_default();
         self.git.suggest_commit_message(&summary, selected_paths)
     }
@@ -2637,6 +2644,37 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// A prompt that only says to go on names nothing a commit did (spec 89).
+fn is_bare_continuation(prompt: &str) -> bool {
+    let words = prompt
+        .trim()
+        .trim_end_matches(['.', '!'])
+        .to_ascii_lowercase();
+    matches!(
+        words.as_str(),
+        "continue" | "go on" | "go ahead" | "proceed" | "next" | "yes" | "ok" | "okay" | "do it"
+    )
+}
+
+/// The first line of a prompt, cut at a word to at most 72 characters, so a
+/// long request does not become the whole subject line (spec 89).
+fn commit_summary(prompt: &str) -> String {
+    const LIMIT: usize = 72;
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    if line.chars().count() <= LIMIT {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(LIMIT).collect();
+    match cut.rfind(' ') {
+        Some(space) if space > 0 => cut[..space].to_string(),
+        _ => cut,
+    }
+}
+
 /// Kept so a test can prove the private index is a file under the data
 /// directory rather than the repository's own, without duplicating the layout.
 #[cfg(test)]
@@ -2647,6 +2685,27 @@ fn private_index_path(data_dir: &Path, prepare_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_commit_summary_is_the_prompts_first_line_cut_at_a_word() {
+        assert_eq!(commit_summary("Add a commit flow"), "Add a commit flow");
+        assert_eq!(
+            commit_summary("\nImplement a new spec end to end.\nMore detail."),
+            "Implement a new spec end to end."
+        );
+        let long = "word ".repeat(30);
+        let summary = commit_summary(&long);
+        assert!(summary.chars().count() <= 72, "{summary}");
+        assert!(!summary.ends_with(' '));
+    }
+
+    #[test]
+    fn a_bare_continuation_names_nothing() {
+        for prompt in ["continue", "Continue.", " go on ", "OK"] {
+            assert!(is_bare_continuation(prompt), "{prompt}");
+        }
+        assert!(!is_bare_continuation("continue the refactor of the parser"));
+    }
 
     #[test]
     fn a_hook_path_is_quoted_as_one_shell_word() {

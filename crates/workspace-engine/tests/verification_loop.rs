@@ -612,15 +612,39 @@ fn a_member_change_selects_its_own_root_and_every_enclosing_root() {
         .iter()
         .map(|(check, _)| check.working_directory.as_str())
         .collect();
+    // Both roots are selected, but the member's `cargo test` is dropped: the
+    // virtual workspace root's `cargo test` runs it already (spec 90).
     assert!(directories.contains(&""));
-    assert!(directories.contains(&"crates/engine"));
+    assert!(!directories.contains(&"crates/engine"), "{directories:?}");
     assert!(!directories.contains(&"crates/cli"));
     assert!(!directories.contains(&"packages/web"));
-    for (check, proposal) in &checks {
-        if check.working_directory == "crates/engine" {
-            assert!(proposal.working_directory.ends_with("crates/engine"));
-        }
-    }
+}
+
+/// Spec 90: a root that is a package as well as a workspace runs only its own
+/// package's tests, so a member's `cargo test` is kept beside it.
+#[test]
+fn a_member_check_is_kept_when_the_root_does_not_run_it() {
+    let repo = Monorepo::new("member-kept");
+    fs::write(
+        repo.root.join("Cargo.toml"),
+        "[package]\nname = \"root\"\n\n[workspace]\nmembers = [\"crates/*\"]\n",
+    )
+    .unwrap();
+    let engine = repo.engine();
+    let map = repo.map(&engine);
+    let changed = vec!["crates/engine/src/lib.rs".to_string()];
+
+    let selection =
+        propose_checks(&engine.validation_orchestrator, &repo.root, &map, &changed).unwrap();
+    let Selection::Proposed(checks) = selection else {
+        panic!("expected proposed checks, got {selection:?}");
+    };
+    let directories: Vec<&str> = checks
+        .iter()
+        .map(|(check, _)| check.working_directory.as_str())
+        .collect();
+    assert!(directories.contains(&""), "{directories:?}");
+    assert!(directories.contains(&"crates/engine"), "{directories:?}");
 }
 
 #[test]
@@ -723,14 +747,12 @@ fn only_the_selected_roots_proposals_are_stored() {
     let Selection::Proposed(checks) = selection else {
         panic!("expected proposed checks, got {selection:?}");
     };
-    assert_eq!(
-        checks.len(),
-        2,
-        "the repository root and crates/engine each propose cargo test"
-    );
+    // The member's `cargo test` is covered by the workspace root's (spec 90),
+    // so it is neither proposed nor stored.
+    assert_eq!(checks.len(), 1, "only the repository root's cargo test");
     assert_eq!(
         repo.pending_proposals() - before,
-        2,
+        1,
         "every proposed check is stored once and nothing else is"
     );
 }

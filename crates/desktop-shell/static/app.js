@@ -1482,18 +1482,24 @@ const repoActionProviders = [
 // What the repo bar's Commit… entry shows, per spec 35 §5.1. It is offered
 // whenever the session has a candidate, because a file changed by an approved
 // command is still worth committing even though it starts unselected.
+// Spec 91: offered only where it can act. A commit belongs to a session, so with
+// none open (a new session, the Workers board) the button would do nothing.
 function commitAction() {
   const status = repoBarCommitStatus;
-  if (!status || !Number(status.candidateCount)) return null;
+  if (!currentSessionId || !status || !Number(status.candidateCount)) return null;
   return {
     key: "commit",
-    label: "Commit…",
+    label: commitPreparing ? "Preparing…" : "Commit…",
     tone: "",
     run: () => void openCommitDialog(),
   };
 }
 
 let repoActionCurrent = null;
+// Spec 91: preparing a commit can take seconds. Without this a click looked
+// like nothing, and a second click opened a second dialog that went stale as
+// soon as the first one committed.
+let commitPreparing = false;
 // Covers the `/api/findings-repair` request before `sendChatPrompt` sets
 // `chatSubmitting`, so a double click cannot start two repairs.
 let findingsRepairPending = false;
@@ -1542,7 +1548,7 @@ function renderRepoAction() {
   slot.dataset.tone = action.tone || "";
   const main = $("repo-action-main");
   main.textContent = action.label;
-  main.disabled = chatSubmitting || findingsRepairPending;
+  main.disabled = chatSubmitting || findingsRepairPending || commitPreparing;
   const more = $("repo-action-more");
   more.hidden = !action.more;
   if (action.more) {
@@ -1561,7 +1567,10 @@ function renderRepoAction() {
 async function openCommitDialog() {
   const repoPath = repo();
   const sessionId = currentSessionId;
-  if (!repoPath || !sessionId) return;
+  if (!repoPath || !sessionId || commitPreparing) return;
+  if (document.querySelector(".app-dialog-commit")) return;
+  commitPreparing = true;
+  renderRepoAction();
   let preparation;
   try {
     preparation = await api(
@@ -1571,6 +1580,9 @@ async function openCommitDialog() {
   } catch (error) {
     toast(error.message);
     return;
+  } finally {
+    commitPreparing = false;
+    renderRepoAction();
   }
   showCommitDialog(preparation, repoPath, sessionId);
 }
@@ -12379,11 +12391,20 @@ function createCheckBatchCard(
     run.type = "checkbox";
     run.className = "check-batch-run";
     run.checked = reattached;
-    run.setAttribute("aria-label", `Run ${check.command}`);
+    run.setAttribute(
+      "aria-label",
+      `Run ${check.command} in ${check.directory || "the repository root"}`,
+    );
 
     const command = document.createElement("code");
     command.className = "check-batch-command";
     command.textContent = check.command;
+    // Two checks can share a command and differ only in where they run
+    // (spec 90), so the card names the directory, as the report does.
+    const where = document.createElement("span");
+    where.className = "check-batch-where";
+    where.textContent = `in ${check.directory || "repository root"}`;
+    command.append(document.createElement("br"), where);
 
     const risk = document.createElement("span");
     risk.className = "check-batch-risk";

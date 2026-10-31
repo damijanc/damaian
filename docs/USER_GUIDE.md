@@ -716,7 +716,7 @@ A strip directly above the prompt shows where the next turn will work:
 - **The folder button** names the working folder. It opens a menu: **Show in Finder**, **Open repository on GitHub**, **Copy path**, **Change folder…** (the same folder picker as the **+** beside **Projects**) and **Open in terminal**. **Open repository on GitHub** appears only when the folder's `origin` remote is on github.com. Damaian rebuilds the address as `https://github.com/<owner>/<repo>` from the remote rather than opening the remote's text as it stands, because a cloned repository controls that text.
 - **The branch** follows it in grey. On a detached HEAD it shows the short commit hash instead.
 - **The change count**, `+N −M` on the right, is the working tree's lines added and removed against the last commit, with new untracked text files counted as added lines. It is hidden when there is nothing to count. It is information only; clicking it does nothing yet.
-- **A contextual action** may appear at the far right. Today that is **Commit…** when the session has changes ([Commits](#commits)), or **Fix N errors** / **Fix N warnings** ([Findings](#fix-n-errors-and-the-findings-list)); errors and warnings take priority.
+- **A contextual action** may appear at the far right. Today that is **Commit…** when an open session has changes (it reads **Preparing…** while the commit is prepared) ([Commits](#commits)), or **Fix N errors** / **Fix N warnings** ([Findings](#fix-n-errors-and-the-findings-list)); errors and warnings take priority.
 
 In a folder that is not a Git repository, the bar shows the folder button alone, and its menu still works. The bar refreshes when you open a session, after every turn, after you apply or roll back a patch, after a rewind, and when you return to the window (at most once every five seconds). It never polls on a timer.
 
@@ -951,7 +951,7 @@ Damaian checks file hashes before applying a stored patch. If a target file chan
 
 Damaian scans generated content for credentials before writing it. If a selected file is flagged, nothing is written: the preview shows which file tripped the check and what was detected, and you choose.
 
-Detection is not perfect. Setup instructions and placeholder values can resemble credentials, so review the diff before deciding. Select **Apply Anyway** to accept the change as written, or **Cancel** to leave the workspace untouched. The decision applies to that one apply and is not remembered; each apply asks again, and the override is recorded in the audit log.
+Only what the change adds is flagged: a key or token that the file already contains, such as a fake token in a test, does not trigger the warning again. Detection is not perfect. Setup instructions and placeholder values can resemble credentials, so review the diff before deciding. Select **Apply Anyway** to accept the change as written, or **Cancel** to leave the workspace untouched. The decision applies to that one apply and is not remembered; each apply asks again, and the override is recorded in the audit log.
 
 From the CLI, `damaian apply-patch` prints the same findings and re-runs with `--allow-generated-secrets` to accept them.
 
@@ -974,8 +974,12 @@ starts no verification.
 
 **Which checks run.** Detection is per project root. A change selects the root
 that owns each changed file plus every root that encloses it, because a member
-change is a workspace change. On this repository, changing `crates/engine`
-selects `cargo test` in `crates/engine` and at the repository root. A
+change is a workspace change. When the enclosing root is a Cargo workspace
+whose own `cargo test` already runs the member's tests (a workspace manifest
+with no `[package]`, `default-members` or `exclude`, listing the member), the
+member's `cargo test` is left out: on this repository, changing
+`crates/workspace-engine` runs `cargo test` once, at the repository root. In
+any other case both run. Each row of the check card says where its check runs. A
 documentation-only change (`.md`, `.txt`, `.rst`, `.adoc`) selects nothing and
 says so. A Cargo root currently detects one check, `cargo test`; detection finds
 no separate clippy or build command, so the report cannot claim one ran.
@@ -1050,7 +1054,7 @@ change is correct, and the report is written to avoid implying that.
 - **One approval per commit.** There is no “always allow”. Committing is available in **Code** mode only, and only under a permission profile whose `allow_git_commits` is on; **Read-only** turns it off. A repository may turn it off and never on.
 - **The result is reported.** The dialog shows the short commit SHA and the message, and the audit log records the SHA, the file and hunk counts, the message length, the hooks and whether the secret override was used.
 
-The commit message starts as a template from your request. **Draft with model** asks the configured model for a subject and body using the redacted diff and the plan; if there is no model, the call fails or the answer is unusable, the template stays. You can always edit the message, and your text is what is committed.
+The commit message starts as a template from the latest request you typed: its first line, at most 72 characters. Damaian's own notes and a bare "continue" are skipped. **Draft with model** asks the configured model for a subject and body using the redacted diff and the plan; if there is no model, the call fails or the answer is unusable, the template stays. You can always edit the message, and your text is what is committed.
 
 If Damaian is interrupted while committing, the recovery card offers **Inspect**: it shows the prepared commit, the `HEAD` it was prepared on, and where `HEAD` is now. It does not resolve the commit for you.
 

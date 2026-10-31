@@ -5752,6 +5752,12 @@ body.worker-view #chat-model-menu {
   font-size: 12px;
 }
 
+.check-batch-where {
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+}
+
 .check-batch-risk {
   border: 1px solid #e3cba8;
   border-radius: 999px;

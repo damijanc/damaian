@@ -434,6 +434,10 @@ pub struct AgentCommandProposal {
     /// This is intentionally separate from command allowlisting: it writes a
     /// session event, not repository or user config.
     pub allow_browser_diagnostics_for_session: bool,
+    /// Where the command runs, relative to the repository root; empty at the
+    /// root and for a call that is not a local command. A check card shows it,
+    /// since two checks can share a command and differ only here (spec 90).
+    pub directory: String,
 }
 
 /// Every check the verification loop wants to run that needs approval, as one
@@ -11185,6 +11189,13 @@ fn system_prompt_for_session(
 /// (spec 23 `context.md` §13).
 const VERIFICATION_TURN_PROMPT: &str = "Verify the patch that was just applied.";
 
+/// A task prompt Damaian wrote for a turn it started itself (a verification or
+/// a repair), not one the user typed. Repair prompts start with the
+/// verification prompt.
+pub(crate) fn is_damaian_task_prompt(prompt: &str) -> bool {
+    prompt.starts_with(VERIFICATION_TURN_PROMPT)
+}
+
 /// The opening of a continuation after a verification that left the task's
 /// plan open (spec 77). Damaian's words, like [`VERIFICATION_TURN_PROMPT`].
 const CONTINUE_AFTER_VERIFICATION_PROMPT: &str = "The patch was applied and its verification finished. The task is not finished: continue it from its plan. Work through the open steps in order, propose each change with `edit_file` or `propose_patch`, and call `complete_step` as each step is done. Stop when the plan is done, then answer with what changed and what is left.";
@@ -13378,6 +13389,10 @@ fn agent_command_proposal(config: &Config, proposal: &CommandProposal) -> AgentC
         reason: proposal.reason.clone(),
         allow_always: allow_always_eligible(config, &proposal.command, proposal.blocked),
         allow_browser_diagnostics_for_session: false,
+        directory: Path::new(&proposal.working_directory)
+            .strip_prefix(&proposal.repository_root)
+            .map(|relative| relative.to_string_lossy().to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -13571,6 +13586,7 @@ fn mcp_approval_proposal(
         // config is the knob for making these stop prompting.
         allow_always: false,
         allow_browser_diagnostics_for_session: false,
+        directory: String::new(),
     }
 }
 
@@ -13617,6 +13633,7 @@ fn web_diagnostic_approval_proposal(
         // The session grant covers loopback only, so a remote URL is never
         // offered it: each remote diagnostic is approved on its own.
         allow_browser_diagnostics_for_session: !call.is_low_risk() && call.targets_loopback(),
+        directory: String::new(),
     }
 }
 

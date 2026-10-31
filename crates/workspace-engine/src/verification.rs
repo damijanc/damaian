@@ -769,8 +769,9 @@ pub fn propose_checks(
     if roots.is_empty() {
         return Ok(Selection::OnlyDocumentation);
     }
-    let proposals =
-        orchestrator.propose_detected_validations(repository_root, &map.restricted_to(&roots))?;
+    let mut restricted = map.restricted_to(&roots);
+    drop_covered_member_checks(repository_root, &mut restricted);
+    let proposals = orchestrator.propose_detected_validations(repository_root, &restricted)?;
     if proposals.is_empty() {
         return Ok(Selection::NoChecksAvailable { roots });
     }
@@ -791,4 +792,112 @@ pub fn propose_checks(
             })
             .collect(),
     ))
+}
+
+/// A member's `cargo test` repeats what its workspace root's `cargo test`
+/// already runs (spec 90), so it is removed from the restricted map before
+/// anything is proposed: nothing is stored that will not run (§5.2).
+fn drop_covered_member_checks(repository_root: &Path, map: &mut RepositoryMap) {
+    let runs_cargo_test = |root: &crate::repository_map::ProjectRoot| {
+        root.commands
+            .iter()
+            .any(|item| item.command == "cargo test")
+    };
+    let workspace_roots: Vec<String> = map
+        .roots
+        .iter()
+        .filter(|root| runs_cargo_test(root))
+        .map(|root| root.path.clone())
+        .collect();
+    for root in &mut map.roots {
+        let covered = workspace_roots.iter().any(|workspace| {
+            workspace != &root.path
+                && cargo_workspace_runs_member(repository_root, workspace, &root.path)
+        });
+        if covered {
+            root.commands.retain(|item| item.command != "cargo test");
+        }
+    }
+}
+
+/// Whether `cargo test` in `root` runs the tests of the package in `member`
+/// (both repository-relative). Read conservatively, without a TOML parser:
+/// only a virtual workspace (`[workspace]` and no `[package]`) with no
+/// `default-members` and no `exclude`, whose `members` patterns name the
+/// member, and whose member is not a workspace of its own. Anything else keeps
+/// both checks, which is the old behaviour and never misses a test.
+fn cargo_workspace_runs_member(repository_root: &Path, root: &str, member: &str) -> bool {
+    let relative = if root.is_empty() {
+        member
+    } else {
+        match member
+            .strip_prefix(root)
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            Some(rest) => rest,
+            None => return false,
+        }
+    };
+    let manifest = |directory: &str| {
+        std::fs::read_to_string(repository_root.join(directory).join("Cargo.toml")).ok()
+    };
+    let (Some(root_manifest), Some(member_manifest)) = (manifest(root), manifest(member)) else {
+        return false;
+    };
+    let sections = |text: &str| {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('['))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    if sections(&member_manifest)
+        .iter()
+        .any(|section| section == "[workspace]")
+    {
+        return false;
+    }
+    let root_sections = sections(&root_manifest);
+    if !root_sections.iter().any(|section| section == "[workspace]")
+        || root_sections.iter().any(|section| section == "[package]")
+    {
+        return false;
+    }
+    let workspace: String = root_manifest
+        .lines()
+        .skip_while(|line| line.trim() != "[workspace]")
+        .skip(1)
+        // A multi-line `members = [` array's own lines do not start with `[`,
+        // so the section is read up to the next table header.
+        .take_while(|line| !line.trim().starts_with('['))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let key_lines = |key: &str| {
+        workspace
+            .lines()
+            .any(|line| line.trim_start().starts_with(key))
+    };
+    if key_lines("default-members") || key_lines("exclude") {
+        return false;
+    }
+    let Some(start) = workspace.find("members") else {
+        return false;
+    };
+    let Some(open) = workspace[start..].find('[') else {
+        return false;
+    };
+    let Some(close) = workspace[start + open..].find(']') else {
+        return false;
+    };
+    workspace[start + open + 1..start + open + close]
+        .split(',')
+        .map(|entry| {
+            entry
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim_end_matches('/')
+        })
+        .filter(|pattern| !pattern.is_empty())
+        .any(|pattern| crate::ignore::glob_match(pattern, relative))
 }
