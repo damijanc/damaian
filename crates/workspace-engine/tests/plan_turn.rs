@@ -1895,6 +1895,10 @@ fn a_plan_under_review_is_handed_to_a_worker() {
         prompt.contains("1. Read the retry helper\n2. Add a bounded backoff"),
         "{prompt}"
     );
+    // Handing over is not an approval: the worker's own review is the one
+    // that counts, so the prompt must not claim the user approved the plan.
+    assert!(prompt.contains("has not approved it yet"), "{prompt}");
+    assert!(!prompt.contains("user reviewed this plan"), "{prompt}");
     let revised = engine
         .chat_orchestrator
         .plan_worker_prompt(
@@ -1929,6 +1933,21 @@ fn a_plan_under_review_is_handed_to_a_worker() {
         "{plan:?}"
     );
     assert!(!repo.join("src/retry.rs").exists(), "nothing changed here");
+    let messages = engine
+        .session_store
+        .read_messages(&paused.session.id)
+        .unwrap();
+    let note = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .expect("a hand-over note");
+    assert!(
+        note.content
+            .contains("asks you to approve the plan there before its first change"),
+        "{}",
+        note.content
+    );
     assert!(
         engine
             .chat_orchestrator

@@ -1224,7 +1224,7 @@ You can:
 - **Retitle** a step by typing in its box.
 - **Delete** a step with **×**.
 - **Approve** the plan as it stands, or **Decline** it.
-- **Run in a worker** (with Worker sessions on, outside a worker): opens the New worker dialog with your request and the plan as the card shows it, edits included. Once the worker starts, this turn ends here with nothing changed, its steps are marked skipped, and the card links to the worker. Cancel the dialog and the card is still waiting for an answer.
+- **Run in a worker** (with Worker sessions on, outside a worker): opens the New worker dialog with your request and the plan as the card shows it, edits included. Once the worker starts, this turn ends here with nothing changed, its steps are marked skipped, and the card links to the worker. Handing over is not an approval: the worker puts the plan up for review again before its first change, and that is where you approve it. Cancel the dialog and the card is still waiting for an answer.
 
 A plan whose steps only read things — listing files, searching, reading source
 — is never put up for approval, because there is nothing to undo.

@@ -31,7 +31,8 @@ worker.
      turns;
    - the plan's open steps, as the card has them, edits included;
    - an instruction to propose them as the worker's plan and work through
-     them.
+     them. It says the plan was drafted in another session and that the user
+     has not approved it yet.
 3. The dialog is the user's click (#57 §5.1). Cancelling it leaves the card
    waiting, and nothing is recorded.
 4. Once the worker has started:
@@ -43,7 +44,13 @@ worker.
      session id.
 5. The pause is answered once. A second hand-over, approve or decline is
    refused.
-6. The model's own `worker-prompt` handoff is unchanged.
+6. Handing over is not an approval. A hand-over is a new start: the worker
+   puts its plan up for review before its first change (#21 §5.5), and that
+   review is the one that counts. Counting the click as an approval would
+   let a plan nobody read skip its review; it is pressed to move the work,
+   not to accept the steps. The hand-over note in this session says so, so
+   the worker's review card is not a surprise.
+7. The model's own `worker-prompt` handoff is unchanged.
 
 ## 3. Non-goals
 
@@ -71,11 +78,13 @@ worker.
 ## 5. Acceptance
 
 - `a_plan_under_review_is_handed_to_a_worker` (`tests/plan_turn.rs`):
-  - the prompt starts with the request and lists both steps;
+  - the prompt starts with the request and lists both steps, and says the
+    user has not approved the plan yet (requirement 6);
   - a revision that drops a step and renames the other is what the prompt
     carries;
   - after the hand-over the task is `complete`, every step is skipped,
-    nothing was written, and a second hand-over is refused.
+    nothing was written, the note says the worker asks for approval, and a
+    second hand-over is refused.
 - The button and dialog flow were checked by reading. The web UI has no
   automated tests for it.
 

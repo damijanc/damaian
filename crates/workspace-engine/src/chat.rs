@@ -4125,7 +4125,8 @@ impl ChatOrchestrator {
         let mut prompt = request.trim().to_string();
         if !steps.is_empty() {
             prompt.push_str(
-                "\n\nThis work was handed over from another session, where the user reviewed this plan. \
+                "\n\nThis work was handed over from another session, which drafted this plan. \
+                 The user has not approved it yet: they review it here, before your first change. \
                  Propose it as your plan with propose_plan, these steps in this order, then work through it:\n",
             );
             for (index, step) in steps.iter().enumerate() {
@@ -4177,7 +4178,7 @@ impl ChatOrchestrator {
             &pending.session.id,
             Some(&pending.task.id),
             "assistant",
-            "Handed to a worker. It runs the plan in its own worktree; nothing changed here.",
+            "Handed to a worker. It runs the plan in its own worktree and asks you to approve the plan there before its first change; nothing changed here.",
         )?;
         self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
         self.session_store
