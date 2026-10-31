@@ -40,7 +40,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | A worker won't start | [A worker will not start](#a-worker-will-not-start) |
 | A worker shows *Interrupted* or *Ended* | [A worker shows Interrupted, or Ended](#a-worker-shows-interrupted-or-ended) |
 | The worker board stops updating | [The board or the control strip stops updating](#the-board-or-the-control-strip-stops-updating) |
-| No *Start worker* button on handoff prompts | [An answer has handoff prompts but no Start worker](#an-answer-has-handoff-prompts-but-no-start-worker) |
+| No *Start worker* or *Work here instead* button on handoff prompts | [An answer has handoff prompts but no Start worker](#an-answer-has-handoff-prompts-but-no-start-worker) |
 | Worktrees left over after a crash | [Leftover worktrees after a crash](#leftover-worktrees-after-a-crash) |
 | Rewind did not restore a file, or reports a conflict | [Checkpoints and rewind](#checkpoints-and-rewind) |
 | The assistant replies but never proposes a patch | [The assistant replies but never proposes a patch](#the-assistant-replies-but-never-proposes-a-patch) |
@@ -1170,7 +1170,8 @@ Event types: `session_created`, `session_renamed`, `task_created`,
 `plan_revised`, `plan_resumed`, `plan_step_updated`, `plan_approved`,
 `question_asked`, `question_answered`, `provider_fallback`,
 `session_mode_set`, `web_diagnostic_recorded`, `finding_recorded`,
-`finding_status_changed`, `worker_spawned`.
+`finding_status_changed`, `worker_spawned`, `worker_returned`,
+`worker_return_consumed`.
 
 Every event carries a monotonic `seq`. Events written before that field existed
 are numbered by line order on read, which is their append order, so old
@@ -2072,20 +2073,38 @@ project is drawn, a session loads or the window regains focus.
 
 #### An answer has handoff prompts but no *Start worker*
 
-*Start worker* appears only on a block whose fence's info string is exactly
-`worker-prompt`, in an assistant message that has finished streaming. A block
-that opens with a bare fence and has `worker-prompt` as its first line inside
-is deliberately not matched, so that no button lands on the wrong thing
-(proposal §4). The handoff paragraph shows the model the literal opening fence
-for this reason. If a model still writes it wrongly, ask it to rewrite the
-prompts as `worker-prompt` blocks, or paste the text into **New worker**. If
-the request produced a patch preview instead of an answer, it went to the
-one-shot patch flow, whose prompt has no handoff paragraph. Only a provider
-with **Native tool-calling** off sends requests there: one with an edit verb
-and a code word (`looksLikeEditRequest` in `app.js`), unless Worker sessions is
-on and the request also says *split*, *plan*, *tasks*, *hand off*, *parallel*,
-*worker* or *session*. Reword it with one of those, or use a provider with
-native tool-calling.
+*Start worker* and *Work here instead* appear only on a block whose fence's
+info string is exactly `worker-prompt`, in an assistant message that has
+finished streaming, in a session that is not itself a worker. A block that
+opens with a bare fence and has `worker-prompt` as its first line inside is
+deliberately not matched, so that no button lands on the wrong thing (proposal
+§4). The handoff paragraph shows the model the literal opening fence for this
+reason. If a model still writes it wrongly, ask it to rewrite the prompts as
+`worker-prompt` blocks, or paste the text into **New worker**. If the request
+produced a patch preview instead of an answer, it went to the one-shot patch
+flow, whose prompt has no handoff paragraph. Only a provider with **Native
+tool-calling** off sends requests there: one with an edit verb and a code word
+(`looksLikeEditRequest` in `app.js`), unless Worker sessions is on and the
+request also says *split*, *plan*, *tasks*, *hand off*, *parallel*, *worker* or
+*session*. Reword it with one of those, or use a provider with native
+tool-calling.
+
+#### A completed worker has no result card in its parent
+
+The result card appears on a terminal worker task, so first check the worker's
+own session: a **Needs your decision** outcome is still waiting on an approval,
+and a running or paused task has not finished. A worker started with **New
+worker** has no parent and returns nothing by design. A parent that was open
+before the worker finished shows the card after it reloads. If the worker's own
+progress says the result could not be returned to the parent, the worker task
+still completed: the failure is recorded beside its task status, not as a failed
+task, and **Continue with result** will not appear. If the parent was deleted
+before the worker finished, the worker reports a delivery failure and does not
+recreate the parent session. The return is written to the parent's session log
+(`sessions/<parent-id>.jsonl`) as a `worker_returned` event; consuming it writes
+one `worker_return_consumed` event that carries both the consumed return and the
+complete created parent task, with no separate `task_created` line. Restarting
+the worker does not duplicate either event.
 
 #### A worker shows *Interrupted*, or *Ended*
 

@@ -12,9 +12,9 @@ use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -72,6 +72,69 @@ pub struct WorkerRecord {
     pub base_commit: String,
     pub included_uncommitted: bool,
     pub git_commands: Vec<String>,
+}
+
+/// One worker result returned to its parent session (spec 100).
+///
+/// Built by the worker's turn driver from its own [`WorkerRecord`] and final
+/// [`TaskStatus`], then scanned before it is appended to the parent's log. It
+/// carries only what the parent needs to understand the handoff: identity,
+/// where the work landed, how the task ended, and the worker's final response.
+/// It never carries raw reasoning, tool output, a pending proposal, or a
+/// credential that was not already redacted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerReturn {
+    pub return_id: String,
+    pub parent_session_id: String,
+    pub worker_session_id: String,
+    pub task_id: String,
+    pub branch: String,
+    pub worktree: String,
+    /// [`TaskStatus::as_str`] of the worker task when it finished.
+    pub task_status: String,
+    pub response: String,
+    pub created_at_ms: u128,
+}
+
+impl WorkerReturn {
+    /// A return with a fresh id and timestamp. Fields are stored as given; the
+    /// store redacts them before writing.
+    pub fn new(
+        parent_session_id: impl Into<String>,
+        worker_session_id: impl Into<String>,
+        task_id: impl Into<String>,
+        branch: impl Into<String>,
+        worktree: impl Into<String>,
+        task_status: impl Into<String>,
+        response: impl Into<String>,
+    ) -> Self {
+        Self {
+            return_id: create_id("worker_return"),
+            parent_session_id: parent_session_id.into(),
+            worker_session_id: worker_session_id.into(),
+            task_id: task_id.into(),
+            branch: branch.into(),
+            worktree: worktree.into(),
+            task_status: task_status.into(),
+            response: response.into(),
+            created_at_ms: now_millis(),
+        }
+    }
+}
+
+/// A worker return and the parent task that consumed it (spec 100).
+///
+/// Created by [`SessionStore::consume_worker_return_and_create_task`] in one
+/// locked transaction: the return is consumed and the parent task exists with
+/// its final id before any model call starts. A crash after this point leaves
+/// exactly one consumed return and one task for ordinary recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumedWorkerReturn {
+    pub task: Task,
+    /// The conversation position immediately before the task was created, for
+    /// the turn's rewind checkpoint.
+    pub position: u64,
 }
 
 /// The user's decision about one or more files of a patch.
@@ -461,31 +524,12 @@ pub struct TaskUsage {
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     data_dir: PathBuf,
-    /// The last `seq` handed out per session, so an append does not have to
-    /// re-read the log to find it.
-    ///
-    /// `Arc`, not a plain field: `SessionStore` derives `Clone` and is cloned
-    /// into both the chat and the edit orchestrator
-    /// (`workspace_engine.rs:97`, `:112`). Per-clone caches would each hand out
-    /// the same next `seq`, and the log would carry duplicates — which rewind
-    /// resolves by sequence number, so it would rewind to the wrong place.
-    ///
-    /// A miss falls back to reading the file, which is what keeps two
-    /// independently constructed stores over one directory in agreement.
-    ///
-    /// Measured before this existed: appending re-read and re-scanned the whole
-    /// log every time, so cost per append grew with the log — 2.3ms at 500
-    /// events, 4.4ms at 1000, 8.7ms at 2000 (17.5s for the batch). Spec 17 adds
-    /// two marker events per action across six action types, which is what made
-    /// this worth fixing before those markers land.
-    last_seq: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl SessionStore {
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),
-            last_seq: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -696,6 +740,10 @@ impl SessionStore {
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        // Hold the same per-session lock an append uses, so a worker returning
+        // a result cannot recreate the log between this delete and its own
+        // existence check (spec 100).
+        let _lock = SessionLogLock::acquire(&self.session_lock_path(session_id))?;
         let path = self.session_log_path(session_id);
         if path.exists() {
             fs::remove_file(path)?;
@@ -979,10 +1027,11 @@ impl SessionStore {
 
     /// The latest recorded status of every task in the session, keyed by task id.
     ///
-    /// Tasks are not stored as records but replayed from `task_created` and
-    /// `task_status_updated` events, so a later event simply overwrites an
-    /// earlier one. Lets a reloaded conversation tell a stopped turn from a
-    /// completed one, which the message log alone cannot express.
+    /// Tasks are not stored as records but replayed from `task_created`,
+    /// `task_status_updated` and the task carried by `worker_return_consumed`
+    /// events, so a later event simply overwrites an earlier one. Lets a
+    /// reloaded conversation tell a stopped turn from a completed one, which
+    /// the message log alone cannot express.
     pub fn read_task_statuses(&self, session_id: &str) -> Result<HashMap<String, String>> {
         let path = self.session_log_path(session_id);
         let Ok(content) = fs::read_to_string(path) else {
@@ -990,15 +1039,19 @@ impl SessionStore {
         };
         let mut statuses = HashMap::new();
         for event in active_events(&content) {
-            if event.event_type != "task_created" && event.event_type != "task_status_updated" {
+            if !matches!(
+                event.event_type.as_str(),
+                "task_created" | "task_status_updated" | "worker_return_consumed"
+            ) {
                 continue;
             }
             // `task_status_updated` may wrap the task as `{"task":…,"error":…}`,
-            // so look inside that wrapper when it is there and at the payload
-            // itself when it is not. The old reader found these fields by
-            // substring across the whole line, which reached into the payload
-            // without descending into it — and matched a torn line just as
-            // readily as a complete one.
+            // and a consumed worker return carries the complete task under
+            // `task` beside its return id, so look inside that wrapper when it
+            // is there and at the payload itself when it is not. The old reader
+            // found these fields by substring across the whole line, which
+            // reached into the payload without descending into it — and matched
+            // a torn line just as readily as a complete one.
             let task = event.payload.get("task").unwrap_or(&event.payload);
             if let (Some(id), Some(status)) = (
                 task.get("id").and_then(|value| value.as_str()),
@@ -1036,11 +1089,15 @@ impl SessionStore {
         let mut order: Vec<String> = Vec::new();
         let mut tasks: HashMap<String, Task> = HashMap::new();
         for event in active_events(&content) {
-            if event.event_type != "task_created" && event.event_type != "task_status_updated" {
+            if !matches!(
+                event.event_type.as_str(),
+                "task_created" | "task_status_updated" | "worker_return_consumed"
+            ) {
                 continue;
             }
             // Both shapes of `task_status_updated` — flat, and wrapped as
-            // `{"task":…,"error":…}` by `await_approval`.
+            // `{"task":…,"error":…}` by `await_approval` — plus the task a
+            // `worker_return_consumed` event carries with its consumed return.
             let payload = event.payload.get("task").unwrap_or(&event.payload);
             let Some(task) = parse_task_payload(payload) else {
                 continue;
@@ -1534,6 +1591,168 @@ impl SessionStore {
             }
         }
         Ok(children)
+    }
+
+    /// The worker's result has already been returned once for this task.
+    ///
+    /// Checked against every return event, consumed or not: a consumed result
+    /// must not be re-appended and then appear as a new pending one (§2). The
+    /// caller holds the session's append lock, so the check and the append it
+    /// guards are one atomic step even against another process.
+    fn worker_return_exists_locked(
+        &self,
+        parent_session_id: &str,
+        worker_session_id: &str,
+        task_id: &str,
+    ) -> Result<bool> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(parent_session_id)) else {
+            return Ok(false);
+        };
+        Ok(parsed_events(&content).0.iter().any(|event| {
+            event.event_type == "worker_returned"
+                && event.text("workerSessionId").as_deref() == Some(worker_session_id)
+                && event.text("taskId").as_deref() == Some(task_id)
+        }))
+    }
+
+    /// Appends one redacted worker return to `return_record.parent_session_id`.
+    ///
+    /// Returns `true` when the event was written and `false` when this worker
+    /// task already has a return. The method is idempotent per worker task, so
+    /// restarting a worker or re-reading its progress file cannot duplicate it.
+    /// `scanner` redacts the branch, worktree and response before persistence;
+    /// the caller never gets a second chance to send them anywhere. The parent
+    /// must still exist: a return after deletion is an error, never a recreated
+    /// log or ghost session.
+    pub fn record_worker_return(
+        &self,
+        return_record: &WorkerReturn,
+        scanner: &SecretScanner,
+    ) -> Result<bool> {
+        let parent_session_id = &return_record.parent_session_id;
+        let mut lock = SessionLogLock::acquire(&self.session_lock_path(parent_session_id))?;
+        // A deleted parent must not be recreated by a worker that finishes
+        // afterwards. Checking under the same lock closes the window where a
+        // delete lands between this check and the append.
+        if self.read_session(parent_session_id)?.is_none() {
+            return Err(crate::error::ClientError::InvalidInput(format!(
+                "Unknown session: {parent_session_id}"
+            )));
+        }
+        if self.worker_return_exists_locked(
+            parent_session_id,
+            &return_record.worker_session_id,
+            &return_record.task_id,
+        )? {
+            return Ok(false);
+        }
+        let mut payload = serde_json::to_value(return_record)
+            .map_err(|error| crate::error::ClientError::InvalidInput(error.to_string()))?;
+        payload["branch"] = serde_json::Value::String(scanner.redact(&return_record.branch).text);
+        payload["worktree"] =
+            serde_json::Value::String(scanner.redact(&return_record.worktree).text);
+        payload["response"] =
+            serde_json::Value::String(scanner.redact(&return_record.response).text);
+        self.append_session_event_locked(
+            parent_session_id,
+            "worker_returned",
+            &payload.to_string(),
+            &mut lock,
+        )?;
+        Ok(true)
+    }
+
+    /// Every return for this parent that has not been consumed, in log order.
+    ///
+    /// Read from `parsed_events`, not `active_events`: a return is control
+    /// communication from the worker process, so rewinding the parent's
+    /// conversation must not resurrect a consumed result or hide a pending
+    /// one.
+    pub fn pending_worker_returns(&self, parent_session_id: &str) -> Result<Vec<WorkerReturn>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(parent_session_id)) else {
+            return Ok(Vec::new());
+        };
+        let events = parsed_events(&content).0;
+        let consumed: HashSet<String> = events
+            .iter()
+            .filter(|event| event.event_type == "worker_return_consumed")
+            .filter_map(|event| event.text("returnId"))
+            .collect();
+        Ok(events
+            .iter()
+            .filter(|event| event.event_type == "worker_returned")
+            .filter_map(|event| serde_json::from_value::<WorkerReturn>(event.payload.clone()).ok())
+            .filter(|record| !consumed.contains(&record.return_id))
+            .collect())
+    }
+
+    /// Consumes one pending return and creates its parent task atomically.
+    ///
+    /// Under the parent session's cross-process append lock this verifies the
+    /// return is still pending, creates the parent task with its final id and
+    /// the canonical continuation prompt, and appends the `consumed` marker
+    /// bound to that task id. A crash after this returns leaves one consumed
+    /// return and one ordinary `Created` task for recovery; a failure before
+    /// it leaves the return pending and safe to retry. `Ok(None)` means the
+    /// return was already consumed, so no task was created and no model call
+    /// should happen.
+    pub fn consume_worker_return_and_create_task(
+        &self,
+        parent_session_id: &str,
+        return_id: &str,
+        prompt: &str,
+        model_provider: &str,
+        model_name: &str,
+    ) -> Result<Option<ConsumedWorkerReturn>> {
+        let mut lock = SessionLogLock::acquire(&self.session_lock_path(parent_session_id))?;
+        let Ok(content) = fs::read_to_string(self.session_log_path(parent_session_id)) else {
+            return Ok(None);
+        };
+        let events = parsed_events(&content).0;
+        let consumed: HashSet<String> = events
+            .iter()
+            .filter(|event| event.event_type == "worker_return_consumed")
+            .filter_map(|event| event.text("returnId"))
+            .collect();
+        let is_pending = events.iter().any(|event| {
+            event.event_type == "worker_returned"
+                && event.text("returnId").as_deref() == Some(return_id)
+                && event.text("parentSessionId").as_deref() == Some(parent_session_id)
+                && !consumed.contains(return_id)
+        });
+        if !is_pending {
+            return Ok(None);
+        }
+        let position = latest_seq(&content);
+        let task = Task {
+            id: create_id("task"),
+            session_id: parent_session_id.to_string(),
+            status: TaskStatus::Created,
+            user_prompt: prompt.to_string(),
+            model_provider: model_provider.to_string(),
+            model_name: model_name.to_string(),
+            created_at_ms: now_millis(),
+            completed_at_ms: None,
+        };
+        let task_value: serde_json::Value = serde_json::from_str(&task_json(&task))
+            .map_err(|error| crate::error::ClientError::InvalidInput(error.to_string()))?;
+        let payload = serde_json::json!({
+            "sessionId": parent_session_id,
+            "returnId": return_id,
+            "taskId": task.id,
+            "consumedAtMs": now_millis() as u64,
+            "task": task_value,
+        })
+        .to_string();
+        // One event is the whole transaction: a single valid JSON line both
+        // consumes the return and contains the complete created task.
+        self.append_session_event_locked(
+            parent_session_id,
+            "worker_return_consumed",
+            &payload,
+            &mut lock,
+        )?;
+        Ok(Some(ConsumedWorkerReturn { task, position }))
     }
 
     /// Every worker session whose record names `source_repository`, across all
@@ -3037,6 +3256,15 @@ impl SessionStore {
                 let (haystack, role) = match event.event_type.as_str() {
                     "message_appended" => (event.text("content"), event.text("role")),
                     "task_created" => (event.text("userPrompt"), Some("task".to_string())),
+                    "worker_return_consumed" => (
+                        event
+                            .payload
+                            .get("task")
+                            .and_then(|task| task.get("userPrompt"))
+                            .and_then(|prompt| prompt.as_str())
+                            .map(str::to_string),
+                        Some("task".to_string()),
+                    ),
                     _ => continue,
                 };
                 let Some(haystack) = haystack else { continue };
@@ -3280,49 +3508,162 @@ impl SessionStore {
         event_type: &str,
         payload: &str,
     ) -> Result<()> {
+        let mut lock = SessionLogLock::acquire(&self.session_lock_path(session_id))?;
+        self.append_session_event_locked(session_id, event_type, payload, &mut lock)
+    }
+
+    /// Appends one event while the caller already holds this session's
+    /// cross-process append lock.
+    ///
+    /// A transaction that consumes a worker return and creates its task needs
+    /// the lock around both facts, so the locked primitives are separate from
+    /// the acquiring one.
+    fn append_session_event_locked(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        payload: &str,
+        lock: &mut SessionLogLock,
+    ) -> Result<()> {
+        self.append_session_events_locked(session_id, &[(event_type, payload)], lock)
+    }
+
+    /// Appends a transaction's events as one prebuilt buffer under the lock the
+    /// caller holds.
+    ///
+    /// Sequence numbers come from the lock sidecar's reserved counter, written
+    /// before the log. A failure after reservation can leave a gap, never a
+    /// duplicate. Ordinary appends are a one-element call.
+    fn append_session_events_locked(
+        &self,
+        session_id: &str,
+        events: &[(&str, &str)],
+        lock: &mut SessionLogLock,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
         let path = self.session_log_path(session_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let seq = self.next_seq(session_id)?;
+        let first_seq = lock.reserve(&path, events.len() as u64)?;
+        let mut buffer = String::new();
+        for (offset, (event_type, payload)) in events.iter().enumerate() {
+            let seq = first_seq + offset as u64;
+            buffer.push_str(&format!(
+                "{{\"eventId\":\"{}\",\"seq\":{},\"timestampMs\":{},\"eventType\":\"{}\",\"payload\":{}}}\n",
+                create_id("evt"),
+                seq,
+                now_millis(),
+                escape_json(event_type),
+                payload
+            ));
+        }
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(
-            file,
-            "{{\"eventId\":\"{}\",\"seq\":{},\"timestampMs\":{},\"eventType\":\"{}\",\"payload\":{}}}",
-            create_id("evt"),
-            seq,
-            now_millis(),
-            escape_json(event_type),
-            payload
-        )?;
+        file.write_all(buffer.as_bytes())?;
         Ok(())
-    }
-
-    /// The `seq` for the next event, taken from the cache when present and read
-    /// back from the log when not.
-    ///
-    /// Holding the lock across the read is deliberate: two appends to one
-    /// session must not both compute the same next value. The lock is per
-    /// store-family rather than per session, which is coarse — but appends are
-    /// short and the alternative is a lock per session id, which buys nothing
-    /// until sessions are appended to concurrently, and nothing does that yet.
-    fn next_seq(&self, session_id: &str) -> Result<u64> {
-        let mut cache = self
-            .last_seq
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let next = match cache.get(session_id) {
-            Some(last) => last + 1,
-            None => self.latest_event_seq(session_id)? + 1,
-        };
-        cache.insert(session_id.to_string(), next);
-        Ok(next)
     }
 
     fn session_log_path(&self, session_id: &str) -> PathBuf {
         self.data_dir
             .join("sessions")
             .join(format!("{session_id}.jsonl"))
+    }
+
+    /// The advisory lock sidecar for one session log. It sits in a directory
+    /// so `list_sessions`, which only reads files, never mistakes it for a
+    /// session.
+    fn session_lock_path(&self, session_id: &str) -> PathBuf {
+        self.data_dir
+            .join("sessions")
+            .join("locks")
+            .join(format!("{session_id}.lock"))
+    }
+}
+
+/// A per-session advisory lock and its authoritative reserved-sequence
+/// counter.
+///
+/// `SessionStore` is constructed independently in different processes — a
+/// worker's driver and the shell both append to the parent session log (spec
+/// 100) — so an in-process `Mutex` alone cannot keep their `seq` values unique.
+/// `flock` on a sidecar file is the cross-process serialisation point. The same
+/// file holds the last sequence number reserved for the session. Writing the
+/// reservation before the log append means a crash can leave a gap, never a
+/// duplicate. Closing the file on drop releases the lock.
+struct SessionLogLock {
+    file: fs::File,
+}
+
+impl SessionLogLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        loop {
+            // SAFETY: `flock` only reads the descriptor; `file` owns it for the
+            // whole call and for as long as the guard lives.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if result == 0 {
+                return Ok(Self { file });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+    }
+
+    /// Reserves `count` sequence numbers and returns the first one.
+    ///
+    /// The counter is the authority. Only a missing or invalid counter — an
+    /// empty sidecar left by an older build, or corruption — reads the JSONL
+    /// once to initialize it. Normal appends never reparse the log.
+    fn reserve(&mut self, log_path: &Path, count: u64) -> Result<u64> {
+        let last = self.reserved_last(log_path)?;
+        let new_last = last + count;
+        self.write_reserved(new_last)?;
+        Ok(last + 1)
+    }
+
+    fn reserved_last(&mut self, log_path: &Path) -> Result<u64> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut text = String::new();
+        self.file.read_to_string(&mut text)?;
+        if let Ok(value) = text.trim().parse::<u64>() {
+            return Ok(value);
+        }
+        // Missing, empty or invalid: initialize once from the existing log.
+        Ok(latest_seq(
+            &fs::read_to_string(log_path).unwrap_or_default(),
+        ))
+    }
+
+    fn write_reserved(&mut self, last: u64) -> Result<()> {
+        let text = last.to_string();
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(text.as_bytes())?;
+        // The previous number may have more digits, and leaving its tail would
+        // make the counter invalid on the next read.
+        self.file.set_len(text.len() as u64)?;
+        Ok(())
+    }
+}
+
+impl Drop for SessionLogLock {
+    fn drop(&mut self) {
+        // SAFETY: as above; unlocking an owned descriptor is always valid.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 }
 
@@ -4341,6 +4682,413 @@ mod tests {
 
         assert_eq!(store.worker_record(&parent.id).unwrap(), None);
         assert_eq!(store.worker_record("ses_missing").unwrap(), None);
+    }
+
+    #[test]
+    fn a_worker_return_is_read_once_redacted_and_idempotent() {
+        let data_dir = temp_data_dir("worker-return");
+        let store = SessionStore::new(&data_dir);
+        let parent = store.create_session("repo_1", "Planner").unwrap();
+        let worker = store.create_session("repo_worktree", "Worker").unwrap();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let record = WorkerReturn::new(
+            &parent.id,
+            &worker.id,
+            "task_worker",
+            "damaian/fix-parser",
+            "/code/app/.damaian/worktrees/fix-parser",
+            "complete",
+            format!("I fixed the parser. Key seen: {secret}"),
+        );
+
+        assert!(
+            store
+                .record_worker_return(&record, &SecretScanner::default())
+                .unwrap()
+        );
+        assert!(
+            !store
+                .record_worker_return(&record, &SecretScanner::default())
+                .unwrap(),
+            "the same worker task must not return twice"
+        );
+
+        let pending = store.pending_worker_returns(&parent.id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].worker_session_id, worker.id);
+        assert_eq!(pending[0].branch, "damaian/fix-parser");
+        assert_eq!(pending[0].task_status, "complete");
+        assert!(pending[0].response.contains("[REDACTED_"));
+        assert!(!pending[0].response.contains(secret));
+
+        let raw = fs::read_to_string(store.session_log_path(&parent.id)).unwrap();
+        assert_eq!(raw.matches("\"eventType\":\"worker_returned\"").count(), 1);
+        assert!(!raw.contains(secret), "the secret reached the parent log");
+        assert!(store.pending_worker_returns(&worker.id).unwrap().is_empty());
+
+        let before = raw.lines().count();
+        let consumed = store
+            .consume_worker_return_and_create_task(
+                &parent.id,
+                &record.return_id,
+                "Continue from the result.",
+                "provider",
+                "model",
+            )
+            .unwrap()
+            .expect("the return is pending");
+        assert_eq!(consumed.task.status, TaskStatus::Created);
+        assert_eq!(consumed.task.user_prompt, "Continue from the result.");
+        assert!(store.pending_worker_returns(&parent.id).unwrap().is_empty());
+        let raw = fs::read_to_string(store.session_log_path(&parent.id)).unwrap();
+        assert_eq!(
+            raw.lines().count(),
+            before + 1,
+            "consumption and task creation must be one event"
+        );
+        assert_eq!(
+            raw.matches("\"eventType\":\"task_created\"").count(),
+            0,
+            "there is no separate task_created line"
+        );
+        assert_eq!(
+            raw.matches("\"eventType\":\"worker_return_consumed\"")
+                .count(),
+            1
+        );
+        // A consumed return is still not written a second time.
+        assert!(
+            !store
+                .record_worker_return(&record, &SecretScanner::default())
+                .unwrap()
+        );
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    /// Spec 100 repair: two independently constructed stores must draw from the
+    /// same sidecar reservation. Neither may hand out a `seq` the other has
+    /// already written.
+    #[test]
+    fn independently_constructed_stores_keep_seq_unique() {
+        use std::sync::{Arc, Barrier};
+
+        let data_dir = temp_data_dir("worker-return-independent-seq");
+        let first = SessionStore::new(&data_dir);
+        let parent = first.create_session("repo_1", "Planner").unwrap();
+        let second = SessionStore::new(&data_dir);
+        // Both stores are now warm in their own way and must still agree.
+        first
+            .append_message(&parent.id, None, "user", "first warm-up")
+            .unwrap();
+        second
+            .append_message(&parent.id, None, "user", "second warm-up")
+            .unwrap();
+
+        // Interleave appends from the two stores.
+        for index in 0..16 {
+            let store = if index % 2 == 0 { &first } else { &second };
+            store
+                .append_message(&parent.id, None, "user", &format!("append {index}"))
+                .unwrap();
+        }
+
+        let content = fs::read_to_string(first.session_log_path(&parent.id)).unwrap();
+        let seqs: Vec<u64> = content
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["seq"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(seqs.len(), 19, "session_created plus every append");
+        assert!(
+            seqs.windows(2).all(|pair| pair[0] < pair[1]),
+            "sequence numbers must strictly increase: {seqs:?}"
+        );
+        let unique: HashSet<u64> = seqs.iter().copied().collect();
+        assert_eq!(unique.len(), seqs.len(), "sequence numbers must be unique");
+
+        // Concurrent independent stores exercise the cross-process lock and
+        // reservation itself, not only sequential interleaving.
+        let store = SessionStore::new(&data_dir);
+        let concurrent_parent = store.create_session("repo_1", "Concurrent").unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let data_dir = data_dir.clone();
+                let session_id = concurrent_parent.id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let store = SessionStore::new(&data_dir);
+                    barrier.wait();
+                    for _ in 0..8 {
+                        store
+                            .append_message(&session_id, None, "user", "concurrent")
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let content = fs::read_to_string(store.session_log_path(&concurrent_parent.id)).unwrap();
+        let seqs: Vec<u64> = content
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["seq"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(seqs.len(), 17);
+        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
+        let unique: HashSet<u64> = seqs.iter().copied().collect();
+        assert_eq!(unique.len(), seqs.len(), "{seqs:?}");
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    /// Spec 100 repair: two independent stores trying to return the same worker
+    /// task must write exactly one `worker_returned` event.
+    #[test]
+    fn concurrent_stores_return_the_same_worker_task_once() {
+        use std::sync::{Arc, Barrier};
+
+        let data_dir = temp_data_dir("worker-return-concurrent");
+        let store = SessionStore::new(&data_dir);
+        let parent = store.create_session("repo_1", "Planner").unwrap();
+        let record = Arc::new(WorkerReturn::new(
+            &parent.id,
+            "ses_worker",
+            "task_worker",
+            "damaian/worker",
+            "/code/app/.damaian/worktrees/worker",
+            "complete",
+            "The worker finished.",
+        ));
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let data_dir = data_dir.clone();
+                let record = record.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let store = SessionStore::new(&data_dir);
+                    barrier.wait();
+                    store
+                        .record_worker_return(&record, &SecretScanner::default())
+                        .unwrap()
+                })
+            })
+            .collect();
+        let written = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|written| *written)
+            .count();
+        assert_eq!(written, 1, "exactly one store may append the return");
+        assert_eq!(store.pending_worker_returns(&parent.id).unwrap().len(), 1);
+        let raw = fs::read_to_string(store.session_log_path(&parent.id)).unwrap();
+        assert_eq!(raw.matches("\"eventType\":\"worker_returned\"").count(), 1);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    /// Spec 100 repair: consuming a return creates its parent task and the
+    /// consumed marker in one transaction, and a fresh store (a restart) sees
+    /// the return gone and refuses a second consume without creating a task.
+    #[test]
+    fn consuming_a_worker_return_survives_a_restart_with_one_task() {
+        let data_dir = temp_data_dir("worker-return-consume");
+        let store = SessionStore::new(&data_dir);
+        let parent = store.create_session("repo_1", "Planner").unwrap();
+        let record = WorkerReturn::new(
+            &parent.id,
+            "ses_worker",
+            "task_worker",
+            "damaian/worker",
+            "/code/app/.damaian/worktrees/worker",
+            "complete",
+            "Finished.",
+        );
+        store
+            .record_worker_return(&record, &SecretScanner::default())
+            .unwrap();
+        let before = fs::read_to_string(store.session_log_path(&parent.id))
+            .unwrap()
+            .lines()
+            .count();
+        let prompt = "Continue from the worker result.";
+        let consumed = store
+            .consume_worker_return_and_create_task(
+                &parent.id,
+                &record.return_id,
+                prompt,
+                "provider",
+                "model",
+            )
+            .unwrap()
+            .expect("the return was pending");
+        assert_eq!(consumed.task.status, TaskStatus::Created);
+        assert_eq!(consumed.task.session_id, parent.id);
+        assert_eq!(consumed.task.user_prompt, prompt);
+        assert!(store.pending_worker_returns(&parent.id).unwrap().is_empty());
+
+        // A new store is the state a restarted process sees: the transaction
+        // is already durable, so the card stays hidden and no second task is
+        // created.
+        let restarted = SessionStore::new(&data_dir);
+        assert!(
+            restarted
+                .pending_worker_returns(&parent.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            restarted
+                .consume_worker_return_and_create_task(
+                    &parent.id,
+                    &record.return_id,
+                    prompt,
+                    "provider",
+                    "model",
+                )
+                .unwrap()
+                .is_none(),
+            "a consumed return must not be consumed twice"
+        );
+        let tasks = restarted.read_tasks(&parent.id).unwrap();
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(tasks[0].id, consumed.task.id);
+
+        let raw = fs::read_to_string(restarted.session_log_path(&parent.id)).unwrap();
+        assert_eq!(
+            raw.lines().count(),
+            before + 1,
+            "consume-and-create must add exactly one log line"
+        );
+        assert_eq!(
+            raw.matches("\"eventType\":\"task_created\"").count(),
+            0,
+            "the continuation must not write a separate task_created event"
+        );
+        assert_eq!(
+            raw.matches("\"eventType\":\"worker_return_consumed\"")
+                .count(),
+            1
+        );
+        assert!(
+            raw.contains(&format!("\"taskId\":\"{}\"", consumed.task.id)),
+            "the consumed marker must name the created task"
+        );
+        assert!(
+            raw.contains(&format!("\"userPrompt\":\"{prompt}\"")),
+            "the same event must carry the complete created task"
+        );
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    /// Spec 100 repair: two tabs are two independent stores. The locked
+    /// consume-and-create transaction lets exactly one of them create a task.
+    #[test]
+    fn concurrent_stores_consume_one_worker_return_once() {
+        use std::sync::{Arc, Barrier};
+
+        let data_dir = temp_data_dir("worker-return-consume-concurrent");
+        let store = SessionStore::new(&data_dir);
+        let parent = store.create_session("repo_1", "Planner").unwrap();
+        let record = WorkerReturn::new(
+            &parent.id,
+            "ses_worker",
+            "task_worker",
+            "damaian/worker",
+            "/code/app/.damaian/worktrees/worker",
+            "complete",
+            "Finished.",
+        );
+        store
+            .record_worker_return(&record, &SecretScanner::default())
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let data_dir = data_dir.clone();
+                let parent_id = parent.id.clone();
+                let return_id = record.return_id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let store = SessionStore::new(&data_dir);
+                    barrier.wait();
+                    store
+                        .consume_worker_return_and_create_task(
+                            &parent_id,
+                            &return_id,
+                            "Continuation prompt.",
+                            "provider",
+                            "model",
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        let consumed: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            consumed.iter().filter(|result| result.is_some()).count(),
+            1,
+            "exactly one store may consume the return"
+        );
+        let tasks = store.read_tasks(&parent.id).unwrap();
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        let raw = fs::read_to_string(store.session_log_path(&parent.id)).unwrap();
+        assert_eq!(raw.matches("\"eventType\":\"task_created\"").count(), 0);
+        assert_eq!(
+            raw.matches("\"eventType\":\"worker_return_consumed\"")
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    /// Spec 100 repair: a worker finishing after its parent was deleted must
+    /// report a delivery failure and must not recreate the parent log.
+    #[test]
+    fn a_return_to_a_deleted_parent_is_refused_without_recreating_it() {
+        let data_dir = temp_data_dir("worker-return-deleted-parent");
+        let store = SessionStore::new(&data_dir);
+        let parent = store.create_session("repo_1", "Planner").unwrap();
+        store.delete_session(&parent.id).unwrap();
+        assert!(!store.session_log_path(&parent.id).exists());
+
+        let record = WorkerReturn::new(
+            &parent.id,
+            "ses_worker",
+            "task_worker",
+            "damaian/worker",
+            "/code/app/.damaian/worktrees/worker",
+            "complete",
+            "Finished after the parent was deleted.",
+        );
+        let error = store
+            .record_worker_return(&record, &SecretScanner::default())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Unknown session"),
+            "the worker must see a delivery failure: {error}"
+        );
+        assert!(
+            !store.session_log_path(&parent.id).exists(),
+            "the return must not recreate the parent JSONL"
+        );
+        assert!(store.read_session(&parent.id).unwrap().is_none());
+        assert!(
+            store.list_sessions(None).unwrap().is_empty(),
+            "no ghost session may appear"
+        );
+        let _ = fs::remove_dir_all(data_dir);
     }
 
     #[test]

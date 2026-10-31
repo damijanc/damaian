@@ -395,13 +395,12 @@ fn recorded_seqs(data_dir: &Path, session_id: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Computing the next `seq` must not require re-reading the whole log, but the
-/// cache must not become a stale per-process guess either. Two independently
-/// constructed stores over the same directory must still agree, which forces a
-/// cache miss to fall back to the file.
+/// Computing the next `seq` must not require re-reading the whole log. Two
+/// independently constructed stores over the same directory must still agree,
+/// which is what the lock sidecar's reserved counter provides.
 #[test]
 fn a_second_store_over_the_same_session_continues_the_sequence() {
-    let data_dir = temp_data_dir("seq-cache-two-stores");
+    let data_dir = temp_data_dir("seq-sidecar-two-stores");
     let first = SessionStore::new(&data_dir);
     let session = first.create_session("repo_1", "Shared").unwrap();
     first
@@ -420,16 +419,110 @@ fn a_second_store_over_the_same_session_continues_the_sequence() {
     );
 }
 
-/// The case that actually happens in production, and the reason the cache has
-/// to be shared rather than per-value: `SessionStore` derives `Clone` and is
-/// cloned into both the chat and the edit orchestrator
-/// (`workspace_engine.rs:97`, `:112`). If each clone carried its own cache, both
-/// would hand out the same next `seq` and the log would contain duplicates —
-/// which rewind resolves by sequence number, so it would rewind to the wrong
-/// place.
+/// Two real processes, not two threads: the per-session lock and its reserved
+/// sequence counter must keep one shared log strictly increasing and return the
+/// same worker task exactly once.
+#[test]
+fn two_processes_append_and_return_one_worker_result() {
+    use std::process::Command;
+
+    let data_dir = temp_data_dir("cross-process");
+    let store = SessionStore::new(&data_dir);
+    let parent = store.create_session("repo_1", "Planner").unwrap().id;
+    let go = data_dir.join("go");
+
+    let spawn = |tag: &str| {
+        Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--ignored",
+                "--exact",
+                "cross_process_append_and_return_helper",
+            ])
+            .env("DAMAIAN_XPROC_DIR", &data_dir)
+            .env("DAMAIAN_XPROC_PARENT", &parent)
+            .env("DAMAIAN_XPROC_TAG", tag)
+            .env("DAMAIAN_XPROC_GO", &go)
+            .spawn()
+            .expect("child test process should spawn")
+    };
+    let mut first = spawn("first");
+    let mut second = spawn("second");
+    fs::write(&go, b"go").unwrap();
+
+    let first_status = first.wait().expect("first child should be reaped");
+    let second_status = second.wait().expect("second child should be reaped");
+    assert!(first_status.success(), "{first_status:?}");
+    assert!(second_status.success(), "{second_status:?}");
+
+    let seqs = recorded_seqs(&data_dir, &parent);
+    let unique: std::collections::HashSet<u64> = seqs.iter().copied().collect();
+    assert_eq!(unique.len(), seqs.len(), "duplicate seq: {seqs:?}");
+    assert!(
+        seqs.windows(2).all(|pair| pair[1] > pair[0]),
+        "sequence numbers must strictly increase: {seqs:?}"
+    );
+    let raw = session_log(&data_dir, &parent);
+    assert_eq!(
+        raw.matches("\"eventType\":\"worker_returned\"").count(),
+        1,
+        "two processes must return the same task exactly once"
+    );
+    assert_eq!(store.pending_worker_returns(&parent).unwrap().len(), 1);
+    let _ = fs::remove_dir_all(data_dir);
+}
+
+/// Not a test on its own: the child half of the cross-process test above,
+/// re-executed with a shared data directory, session and start file.
+///
+/// Run it by hand only through the parent test:
+///
+/// ```text
+/// cargo test -p workspace-engine --test session_rewind -- --exact \
+///   two_processes_append_and_return_one_worker_result
+/// ```
+#[test]
+#[ignore = "the child half of the cross-process append test"]
+fn cross_process_append_and_return_helper() {
+    use workspace_engine::{SecretScanner, WorkerReturn};
+
+    let Ok(data_dir) = std::env::var("DAMAIAN_XPROC_DIR") else {
+        return;
+    };
+    let parent = std::env::var("DAMAIAN_XPROC_PARENT").unwrap();
+    let tag = std::env::var("DAMAIAN_XPROC_TAG").unwrap();
+    let go = PathBuf::from(std::env::var("DAMAIAN_XPROC_GO").unwrap());
+    while !go.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let store = SessionStore::new(data_dir);
+    for index in 0..30 {
+        store
+            .append_message(&parent, None, "user", &format!("{tag} append {index}"))
+            .unwrap();
+    }
+    let returned = WorkerReturn::new(
+        &parent,
+        "ses_worker",
+        "task_worker",
+        "damaian/worker",
+        "/code/app/.damaian/worktrees/worker",
+        "complete",
+        "Finished in a child process.",
+    );
+    store
+        .record_worker_return(&returned, &SecretScanner::default())
+        .unwrap();
+}
+
+/// `SessionStore` derives `Clone` and is cloned into both the chat and the edit
+/// orchestrator (`workspace_engine.rs:97`, `:112`). Each clone must draw from
+/// the same per-session reservation, or both would hand out the same next `seq`
+/// and the log would contain duplicates — which rewind resolves by sequence
+/// number, so it would rewind to the wrong place.
 #[test]
 fn clones_of_one_store_never_hand_out_a_duplicate_sequence_number() {
-    let data_dir = temp_data_dir("seq-cache-clones");
+    let data_dir = temp_data_dir("seq-sidecar-clones");
     let store = SessionStore::new(&data_dir);
     let session = store.create_session("repo_1", "Cloned").unwrap();
 

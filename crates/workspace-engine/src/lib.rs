@@ -217,9 +217,10 @@ pub use repository_trust::{
 };
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
-    ActionMarker, ChatMessage, ContextPin, DanglingAction, ExportFormat, PatchFileDecision,
-    PendingApprovalRef, SearchOptions, Session, SessionSearchHit, SessionSearchResult,
-    SessionStore, Task, TaskStatus, TaskUsage, TurnNotes, WorkerRecord,
+    ActionMarker, ChatMessage, ConsumedWorkerReturn, ContextPin, DanglingAction, ExportFormat,
+    PatchFileDecision, PendingApprovalRef, SearchOptions, Session, SessionSearchHit,
+    SessionSearchResult, SessionStore, Task, TaskStatus, TaskUsage, TurnNotes, WorkerRecord,
+    WorkerReturn,
 };
 pub use steering::TurnSteering;
 pub use symbol_index::{

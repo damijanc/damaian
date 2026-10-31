@@ -3986,6 +3986,68 @@ code.fetch-approval-flag-value {
   color: var(--muted);
 }
 
+/* Spec 100: a completed worker's durable result in its parent conversation. */
+.worker-result-card {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px 14px;
+}
+
+.worker-result-eyebrow {
+  margin: 0;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.worker-result-headline {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.worker-result-where {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.worker-result-response {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 9px 10px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.worker-result-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.worker-result-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 /* Spec 57 §5.7: a worker's status, in the sidebar and on the board. State
    colours only. Finished is neutral, because `--ok` beside `--accent` reads
    as a second "running"; paused is hollow, a needs-you that is not asking. */

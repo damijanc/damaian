@@ -88,8 +88,14 @@ The paragraph, verbatim:
 > Your edits and commands always apply to this session's checkout. The
 > `worktree` argument of the read tools only reads. When the user asks for
 > work on a new branch or in a separate git worktree, do not create a worktree
-> yourself and do not make the change here: hand the task to a worker in a
-> ```worker-prompt block, which runs it in a worktree of its own.
+> yourself: recommend a worker in a ```worker-prompt block, which runs it in a
+> worktree of its own. If the user explicitly chooses to work in this session
+> instead, for example with *Work here instead*, do the work in the current
+> checkout; that choice does not create or select another worktree.
+
+Spec 100 later amended the final sentence from a mandatory handoff to a
+recommendation, so the assistant cannot override an explicit choice to work in
+the current checkout.
 
 ## 5. Acceptance Criteria
 

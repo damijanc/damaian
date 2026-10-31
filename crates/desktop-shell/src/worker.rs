@@ -26,8 +26,8 @@ use serde_json::{Map, Value, json};
 use workspace_engine::worker_progress::{ProgressKind, ProgressWriter};
 use workspace_engine::{
     CancelToken, ChatTurnOptions, ChatTurnResult, Config, ModelAdapter, PhaseKind, ProcessRegistry,
-    RepositoryConfigReport, RoundBudgetDecision, SecretScanner, TaskStatus, TurnProgress, TurnSink,
-    TurnSteering,
+    RepositoryConfigReport, RoundBudgetDecision, SecretScanner, SessionStore, Task, TaskStatus,
+    TurnProgress, TurnSink, TurnSteering, WorkerReturn,
 };
 
 /// The first argument that selects worker mode, in both `main`s.
@@ -840,6 +840,7 @@ pub(crate) struct TurnDriver {
     repository: Option<PathBuf>,
     adapter_for: Box<WorkerAdapterFor>,
     progress: ProgressWriter,
+    scanner: SecretScanner,
 }
 
 impl TurnDriver {
@@ -851,18 +852,16 @@ impl TurnDriver {
         adapter_for: Box<WorkerAdapterFor>,
     ) -> Result<Self, String> {
         let (config, _) = load_worker_config(data_dir, None)?;
-        let progress = ProgressWriter::create(
-            data_dir,
-            session_id,
-            SecretScanner::new(config.secret_patterns.clone()),
-        )
-        .map_err(|error| format!("could not create the progress file: {error}"))?;
+        let scanner = SecretScanner::new(config.secret_patterns.clone());
+        let progress = ProgressWriter::create(data_dir, session_id, scanner.clone())
+            .map_err(|error| format!("could not create the progress file: {error}"))?;
         Ok(Self {
             session_id: session_id.to_string(),
             data_dir: data_dir.to_path_buf(),
             repository: None,
             adapter_for,
             progress,
+            scanner,
         })
     }
 
@@ -885,27 +884,115 @@ impl TurnDriver {
                 if let Some(approval) = approval_payload(&result) {
                     append_progress(&mut self.progress, ProgressKind::Approval, approval);
                 }
+                let returned = self.record_parent_return(&result.task, &result.response);
                 let state = if pending.is_some() {
                     WorkerState::WaitingForApproval
                 } else {
                     WorkerState::Idle
                 };
-                append_progress(
-                    &mut self.progress,
-                    ProgressKind::Status,
-                    json!({"state": state.as_str(), "taskStatus": result.task.status.as_str()}),
-                );
+                let mut status = json!({
+                    "state": state.as_str(),
+                    "taskStatus": result.task.status.as_str()
+                });
+                // The task itself is still complete: failing to tell the
+                // parent is a delivery problem, not a reason to rewrite the
+                // worker's own outcome (spec 100 requirement 1).
+                if let Err(error) = returned {
+                    status["error"] = json!(format!(
+                        "The result could not be returned to the parent session: {error}"
+                    ));
+                }
+                append_progress(&mut self.progress, ProgressKind::Status, status);
                 host.settle(pending);
             }
             Err(error) => {
-                append_progress(
-                    &mut self.progress,
-                    ProgressKind::Status,
-                    json!({"state": WorkerState::Idle.as_str(), "error": error}),
-                );
+                // The engine can persist `Failed` and then return `Err` — a
+                // denied `before_context` hook, a provider refusal, a model
+                // failure. That task is just as terminal as an `Ok` result, so
+                // it returns too (spec 100 requirement 1). The return is
+                // idempotent per task, and a delivery failure stays in the
+                // worker's progress without rewriting the task outcome.
+                let returned = self.record_failed_parent_return(&error);
+                let mut status = json!({
+                    "state": WorkerState::Idle.as_str(),
+                    "error": error
+                });
+                if let Err(delivery) = returned {
+                    status["parentReturnError"] = json!(format!(
+                        "The result could not be returned to the parent session: {delivery}"
+                    ));
+                }
+                append_progress(&mut self.progress, ProgressKind::Status, status);
                 host.settle(None);
             }
         }
+    }
+
+    /// Hand a terminal task to its parent session, if it has one.
+    ///
+    /// Only a terminal task returns (§2). A task waiting on a command, patch,
+    /// plan, check card or fallback stays in the worker conversation until the
+    /// decision produces a terminal outcome. A worker started from the sidebar
+    /// has no parent and returns nothing.
+    fn record_parent_return(&self, task: &Task, response: &str) -> Result<(), String> {
+        if !task.status.is_terminal() {
+            return Ok(());
+        }
+        let store = SessionStore::new(&self.data_dir);
+        let Some(record) = store
+            .worker_record(&self.session_id)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        let Some(parent_session_id) = record.parent_session_id else {
+            return Ok(());
+        };
+        let returned = WorkerReturn::new(
+            parent_session_id,
+            &self.session_id,
+            &task.id,
+            record.branch,
+            record.worktree_path.to_string_lossy().to_string(),
+            task.status.as_str(),
+            response,
+        );
+        store
+            .record_worker_return(&returned, &self.scanner)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// A turn that returned `Err` may still have persisted a terminal task.
+    ///
+    /// Reads the newest task in the worker session and, when it is terminal,
+    /// returns it with the latest durable assistant text, falling back to the
+    /// error the turn surfaced. A task that does not exist, is still running,
+    /// or is waiting for a decision returns nothing, exactly as on the `Ok`
+    /// path.
+    fn record_failed_parent_return(&self, error: &str) -> Result<(), String> {
+        let store = SessionStore::new(&self.data_dir);
+        let mut tasks = store
+            .read_tasks(&self.session_id)
+            .map_err(|read| read.to_string())?;
+        let Some(task) = tasks.pop() else {
+            return Ok(());
+        };
+        if !task.status.is_terminal() {
+            return Ok(());
+        }
+        let response = store
+            .read_messages(&self.session_id)
+            .map_err(|read| read.to_string())?
+            .into_iter()
+            .rev()
+            .find(|message| {
+                message.role == "assistant" && message.task_id.as_deref() == Some(task.id.as_str())
+            })
+            .map(|message| message.content)
+            .filter(|content| !content.trim().is_empty())
+            .unwrap_or_else(|| error.to_string());
+        self.record_parent_return(&task, &response)
     }
 
     /// One turn through the shell's own entry points, engine and adapter.

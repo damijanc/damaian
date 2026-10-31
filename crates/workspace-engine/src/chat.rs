@@ -1223,6 +1223,61 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
         options: ChatTurnOptions,
     ) -> Result<ChatTurnResult> {
+        self.ask_with_session_inner(
+            repository_root,
+            prompt,
+            explicit_paths,
+            session_id,
+            None,
+            model_adapter,
+            sink,
+            options,
+        )
+    }
+
+    /// Runs an already-created task instead of creating one (spec 100).
+    ///
+    /// **Continue with result** creates the parent task under the session
+    /// store's cross-process lock, together with the consumed marker, then
+    /// calls this. A crash after that transaction leaves one ordinary
+    /// `Created` task for recovery rather than a runnable result card.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ask_with_session_using_task(
+        &self,
+        repository_root: impl AsRef<Path>,
+        prompt: &str,
+        explicit_paths: &[String],
+        task: Task,
+        position: u64,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+        options: ChatTurnOptions,
+    ) -> Result<ChatTurnResult> {
+        let session_id = task.session_id.clone();
+        self.ask_with_session_inner(
+            repository_root,
+            prompt,
+            explicit_paths,
+            Some(&session_id),
+            Some((task, position)),
+            model_adapter,
+            sink,
+            options,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ask_with_session_inner(
+        &self,
+        repository_root: impl AsRef<Path>,
+        prompt: &str,
+        explicit_paths: &[String],
+        session_id: Option<&str>,
+        existing_task: Option<(Task, u64)>,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+        options: ChatTurnOptions,
+    ) -> Result<ChatTurnResult> {
         let repository_root = repository_root.as_ref();
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
         // Context a `session_start` or `before_context` hook returned, in the
@@ -1271,14 +1326,50 @@ impl ChatOrchestrator {
         };
         // Captured before the turn's own events, so rewinding this checkpoint
         // takes the user's prompt with it rather than leaving a question the
-        // conversation no longer answers.
-        let position = self.session_store.latest_event_seq(&session.id)?;
-        let mut task = self.session_store.create_task(
-            &session.id,
-            prompt,
-            &self.config.model_provider,
-            &self.config.model_name,
-        )?;
+        // conversation no longer answers. A continuation already has its task
+        // and the position the store recorded just before creating it.
+        let (position, mut task) = match existing_task {
+            Some((task, position)) => {
+                // This is a public entry point, so it must not be usable to
+                // rerun a terminal task or to claim a task this turn did not
+                // create. The caller builds the task and its prompt through the
+                // same store transaction; these checks keep the boundary from
+                // accepting anything else (spec 100).
+                if task.status != TaskStatus::Created {
+                    return Err(ClientError::InvalidInput(
+                        "A pre-created task must still be in the created state".to_string(),
+                    ));
+                }
+                if task.session_id != session.id {
+                    return Err(ClientError::InvalidInput(
+                        "The task belongs to a different session".to_string(),
+                    ));
+                }
+                if task.user_prompt != prompt {
+                    return Err(ClientError::InvalidInput(
+                        "The task prompt does not match this turn".to_string(),
+                    ));
+                }
+                if task.model_provider != self.config.model_provider
+                    || task.model_name != self.config.model_name
+                {
+                    return Err(ClientError::InvalidInput(
+                        "The task model does not match this turn".to_string(),
+                    ));
+                }
+                (position, task)
+            }
+            None => {
+                let position = self.session_store.latest_event_seq(&session.id)?;
+                let task = self.session_store.create_task(
+                    &session.id,
+                    prompt,
+                    &self.config.model_provider,
+                    &self.config.model_name,
+                )?;
+                (position, task)
+            }
+        };
         // Context assembly is the next thing to happen, and it is read-only,
         // so a crash here is resumable. The finer in-flight states are set at
         // the action sites when their markers go in.
@@ -11449,7 +11540,7 @@ pub const WORKER_HANDOFF_PARAGRAPH: &str = "When work should continue in a separ
 /// land in its own checkout, so a request to work in a new branch or worktree
 /// is a worker's task. A session that made a worktree itself and then edited
 /// the main checkout is how this was found (spec 76).
-pub const WORKTREE_TASK_PARAGRAPH: &str = "Your edits and commands always apply to this session's checkout. The `worktree` argument of the read tools only reads. When the user asks for work on a new branch or in a separate git worktree, do not create a worktree yourself and do not make the change here: hand the task to a worker in a ```worker-prompt block, which runs it in a worktree of its own.";
+pub const WORKTREE_TASK_PARAGRAPH: &str = "Your edits and commands always apply to this session's checkout. The `worktree` argument of the read tools only reads. When the user asks for work on a new branch or in a separate git worktree, do not create a worktree yourself: recommend a worker in a ```worker-prompt block, which runs it in a worktree of its own. If the user explicitly chooses to work in this session instead, for example with *Work here instead*, do the work in the current checkout; that choice does not create or select another worktree.";
 
 /// [`system_prompt`] plus the handoff paragraph when the session is offered
 /// handoffs. `system_prompt` itself never changes, which is how the setting
@@ -15313,9 +15404,15 @@ mod worker_handoff_tests {
         // constant has to be an edit to the spec too.
         let from_the_spec = "When work should continue in a separate session — because it is a self-contained task, or one of several that can run in parallel — write each task as a prompt in its own fenced block whose opening line is exactly ```worker-prompt, with the tag on the fence line itself and not inside the block. The user can start a worker from that block. A worker starts with a fresh context in its own git worktree and sees only the repository and that prompt, so say what to read, what to change, which checks to run, and when to stop. Do not use the `worker-prompt` tag for anything else.";
         assert_eq!(WORKER_HANDOFF_PARAGRAPH, from_the_spec);
-        // Verbatim from spec 76 §4, for the same reason.
-        let worktree_task = "Your edits and commands always apply to this session's checkout. The `worktree` argument of the read tools only reads. When the user asks for work on a new branch or in a separate git worktree, do not create a worktree yourself and do not make the change here: hand the task to a worker in a ```worker-prompt block, which runs it in a worktree of its own.";
+        // Verbatim from spec 76 §4 as amended by spec 100 §4, for the same
+        // reason.
+        let worktree_task = "Your edits and commands always apply to this session's checkout. The `worktree` argument of the read tools only reads. When the user asks for work on a new branch or in a separate git worktree, do not create a worktree yourself: recommend a worker in a ```worker-prompt block, which runs it in a worktree of its own. If the user explicitly chooses to work in this session instead, for example with *Work here instead*, do the work in the current checkout; that choice does not create or select another worktree.";
         assert_eq!(WORKTREE_TASK_PARAGRAPH, worktree_task);
+        // Spec 100: the paragraph recommends isolation but must keep the
+        // explicit inline choice and the rule against silently creating a
+        // worktree.
+        assert!(WORKTREE_TASK_PARAGRAPH.contains("Work here instead"));
+        assert!(WORKTREE_TASK_PARAGRAPH.contains("do not create a worktree yourself"));
 
         for mode in ALL_MODES {
             for user_present in [true, false] {
@@ -15716,6 +15813,110 @@ mod mode_refusal_tests {
 
     fn engine_with(repo: &Path) -> WorkspaceEngine {
         WorkspaceEngine::new(test_config(repo))
+    }
+
+    /// Spec 100 repair: the public pre-created-task entry must not be able to
+    /// rerun a terminal task or run one whose prompt, session or model does not
+    /// match this turn.
+    #[test]
+    fn a_precreated_task_must_match_the_turn_it_claims() {
+        let repo = temp_repo("precreated-task");
+        let engine = engine_with(&repo);
+        let repository_id = crate::hash::repository_id_for_root(&repo);
+        let session = engine
+            .session_store
+            .create_session(&repository_id, "Continuation")
+            .unwrap();
+        let prompt = "Continue from the worker result.";
+        let make = |prompt: &str, provider: &str, model: &str| {
+            engine
+                .session_store
+                .create_task(&session.id, prompt, provider, model)
+                .unwrap()
+        };
+
+        let created = make(
+            prompt,
+            &engine.config.model_provider,
+            &engine.config.model_name,
+        );
+        let terminal = engine
+            .session_store
+            .update_task_status(&created, TaskStatus::Complete, None)
+            .unwrap();
+        let wrong_prompt = make(
+            "A different prompt",
+            &engine.config.model_provider,
+            &engine.config.model_name,
+        );
+        let wrong_model = make(prompt, "other-provider", "other-model");
+
+        for (task, expected) in [
+            (terminal, "created state"),
+            (wrong_prompt, "prompt does not match"),
+            (wrong_model, "model does not match"),
+        ] {
+            let mut adapter = MockModelAdapter::new("This must not run.");
+            let mut on_token = |_token: &str| {};
+            let cancel = CancelToken::new();
+            let mut on_progress = |_event: TurnProgress| {};
+            let mut sink = TurnSink {
+                on_token: &mut on_token,
+                on_progress: &mut on_progress,
+                cancel: &cancel,
+                steering: None,
+            };
+            let error = engine
+                .chat_orchestrator
+                .ask_with_session_using_task(
+                    &repo,
+                    prompt,
+                    &[],
+                    task,
+                    0,
+                    &mut adapter,
+                    &mut sink,
+                    ChatTurnOptions::default(),
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected a {expected:?} rejection, got {error}"
+            );
+        }
+
+        // A matching task still runs, so the boundary rejects only mismatches.
+        let position = engine.session_store.latest_event_seq(&session.id).unwrap();
+        let matching = make(
+            prompt,
+            &engine.config.model_provider,
+            &engine.config.model_name,
+        );
+        let mut adapter = MockModelAdapter::new("Matched.");
+        let mut on_token = |_token: &str| {};
+        let cancel = CancelToken::new();
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        let result = engine
+            .chat_orchestrator
+            .ask_with_session_using_task(
+                &repo,
+                prompt,
+                &[],
+                matching,
+                position,
+                &mut adapter,
+                &mut sink,
+                ChatTurnOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(result.task.status, TaskStatus::Complete);
+        fs::remove_dir_all(repo).unwrap();
     }
 
     /// Counts every diagnostic it is asked to run, so a test can assert the

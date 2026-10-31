@@ -1,6 +1,7 @@
 # Feature Spec: Worker Return and Inline Choice
 
-Status: Not started.
+Status: Done 2026-10-31 (specified and built the same day; local checks in §6,
+the full gate is left to CI).
 Order: 100 of 100
 Plan: none. A workflow defect reported in use, following #99.
 Depends on: [#57](57_worker_sessions/proposal.md) (worker lifecycle),
@@ -69,16 +70,29 @@ session to do the work here.
 
 - `SessionStore` gains a typed, append-only worker-return event and a query
   that returns only the unconsumed return records for a parent. Its payload is
-  built from the worker record and final `ChatTurnResult`, then scanned before
+  built from the worker record and final task outcome, then scanned before
   persistence. A consumed marker records the parent task that handled it.
+  Session-log appends take a per-session `flock` sidecar lock, because the
+  worker process and the shell can append to one parent log. The sidecar also
+  holds the authoritative last reserved sequence; an append advances and writes
+  that reservation before appending the log, so it never reparses the JSONL.
+  Only a missing or invalid counter initializes from the log once. The return's
+  existence check and append happen under the same lock.
 - The worker turn driver writes the event after it has persisted its own task
-  outcome and only for a terminal task with a parent. Failure to write the
-  parent notification is visible as a worker progress/error outcome and does
-  not change the completed worker task into a failed one.
+  outcome and only for a terminal task with a parent. That includes the error
+  path: when the engine persists `Failed` and returns `Err`, the driver reads
+  the newest task, and if it is terminal returns it with the latest durable
+  assistant text or the error. Failure to write the parent notification is
+  visible as a worker progress/error outcome and does not change the worker
+  task's own outcome.
 - The shell exposes pending parent returns with the normal session payload and
   an endpoint that consumes exactly one return and streams an ordinary parent
-  turn. It re-reads the return under the session lock, so two browser tabs
-  cannot consume it twice.
+  turn. It resolves config and the model adapter first, then one locked event
+  both consumes the return and carries the complete parent task with its final
+  id and canonical prompt. That single `worker_return_consumed` line is the
+  durable record; task replay treats it as the task creation fact. The turn runs
+  that already-created task. A second browser tab or a restarted process sees
+  the return consumed and starts nothing.
 - `app.js` draws the card beside the parent conversation and provides
   **Continue with result** plus a worker link. The worker-prompt footer grows a
   secondary **Work here instead** action. That action reuses the ordinary
@@ -92,7 +106,7 @@ session to do the work here.
 
 - A worker with a parent and a completed task records exactly one redacted
   return. Its parent reads the worker identity, branch, worktree, status and
-  final response; an unparented worker records none.
+  final response; a parentless worker records none.
 - A waiting approval records no return; resolving it to completion records one.
   Replaying, restarting and a second consume do not duplicate or re-run it.
 - Consuming a return starts one ordinary parent task with a delimited result;
@@ -106,7 +120,44 @@ session to do the work here.
 
 ## 6. Verification
 
-Before hand-back, run the fast checks, scoped `workspace-engine` and
-`desktop-shell` clippy, focused session/worker/parent-return tests, and web
-syntax/lint checks under `AGENTS.md`. The workspace-wide clippy and test suite
-remain CI-only.
+Local checks passed on 2026-10-31:
+
+- `scripts/quality-gate.sh fmt node lint typos` and `cargo deny check`;
+- `cargo clippy -p workspace-engine -p desktop-shell --all-targets --locked -- -D warnings`;
+- focused `workspace-engine` tests for the return event, the redaction and
+  idempotency, and the amended worktree paragraph;
+- focused `desktop-shell` tests for the worker driver's return, the waiting
+  decision, the consume route and its refusal, and the source-level UI actions;
+- `npm run specs:check -- --strict`.
+
+The workspace-wide clippy and test suite remain CI-only under `AGENTS.md`.
+
+### 6.1 What landed
+
+- `SessionStore` gained `WorkerReturn`, `record_worker_return` (idempotent per
+  worker task and scanned before persistence),
+  `pending_worker_returns` (only unconsumed records, read with `parsed_events`
+  so a parent rewind cannot resurrect one), and
+  `consume_worker_return_and_create_task`, whose one `worker_return_consumed`
+  event carries the complete created task. There is no standalone consume
+  method that could write the event without that task. Session appends use a
+  per-session `flock` sidecar that reserves sequence numbers and holds the
+  authoritative counter, so a normal append does not scan the log; the readers
+  of task state accept the consumed event as a task-creation fact.
+- The worker `TurnDriver` writes the return after a terminal turn when its
+  record names a parent, and also when a turn returns `Err` after the engine
+  persisted a terminal task. A failure to write it is recorded beside the
+  terminal worker status and does not change the task's own outcome.
+- `/api/session` includes `workerReturns`, and
+  `/api/continue-worker-result-stream` validates the parent session and
+  repository, resolves the model, then consumes one return and creates its
+  parent task in the same event; the bounded delimited user message is the
+  task's prompt, and the already-created task runs the ordinary parent turn. A
+  model or policy failure leaves the return consumed and that one task failed.
+  A second consume and a restart are refused without another model call or
+  task.
+- `app.js` renders a **Worker result** card with **Continue with result** and a
+  worker link, and adds **Work here instead** beside **Start worker**. Both
+  keep the existing exact-tag, assistant-only, non-worker gating.
+- `WORKTREE_TASK_PARAGRAPH` now recommends a worker and preserves an explicit
+  choice to work in the current checkout. Spec 76 §4 records the amendment.
