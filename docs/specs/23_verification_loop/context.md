@@ -305,11 +305,13 @@ A repair is a patch, and a patch ends the turn (§1). So one repair attempt is:
 - **The attempt count is in the log**, in `verification_started`, not in
   memory. It survives the turn boundary and a restart.
 - **Attempt 0 is the first verification.** Repairs are attempts 1 to
-  `agent_tool_retry_limit` (default 2). When the verification after the last
-  repair still fails, the task's status is `TaskStatus::Failed`
+  `agent_tool_retry_limit` (default 16 since
+  [spec 96](../96_continue_repair_at_the_limit.md)). When the verification
+  after the last repair still fails, the task's status is `TaskStatus::Failed`
   (`session.rs:71`), `verification_finished` records
   `outcome: "repair_limit_exhausted"`, and the report leads with what still
-  fails.
+  fails. Spec 96's explicit **Continue repair** action can start exactly one
+  more attempt; it does not raise the limit or run on its own.
 - **No changed file, no further attempt.** If a repair turn ends without
   proposing a patch, that turn records `outcome: "no_repair_applied"` and
   stops with status `Failed`. It does not ask again. If it proposes a patch
@@ -337,7 +339,7 @@ A repair is a patch, and a patch ends the turn (§1). So one repair attempt is:
   across continuations, *Continue* is refused and only *Answer now* remains,
   which is the old stop and leaves the plan intact.
 - `agent_tool_retry_limit` is a Preference (`config.rs:2838`, field at `:329`,
-  default 2 at `:2629`), so a repository may raise it. The token ceiling is a
+  default 16 since spec 96), so a repository may raise it. The token ceiling is a
   lower-wins Capability (`config.rs:2842`), as is the exploration allowance
   (`config.rs:2846`), so a repository cannot raise what the repairs may spend.
   `agent_max_tool_rounds` is a Preference (`config.rs:2836`). Nothing here

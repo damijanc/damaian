@@ -98,7 +98,8 @@ Checked against the code on 2026-10-09; references re-checked on 2026-10-24.
   Option<i32>` (`command_runner.rs:26`), `stdout`, `stderr`. Full output is
   persisted by `CommandStore::save_execution` (`validation.rs:113`) as
   `stdout.log`, `stderr.log`, and a summary.
-- **Repair bounds already exist.** `agent_tool_retry_limit` (default 2,
+- **Repair bounds already exist.** `agent_tool_retry_limit` (default 16 since
+  [#96](../96_continue_repair_at_the_limit.md);
   `crates/workspace-engine/src/config.rs:329`), `agent_max_tool_rounds`
   (`config.rs:317`), and `agent_web_debug_max_tool_rounds` (`config.rs:326`).
   All three are Preference keys a repository may set (`config.rs:2836-2838`).
@@ -316,6 +317,10 @@ its latest outcome is the step's.
 
 On exhausting the limit, the task does **not** succeed. Status is `failed` with
 the still-failing findings attached, and the report leads with what still fails.
+Since [#96](../96_continue_repair_at_the_limit.md), that report also offers
+**Continue repair**: an explicit user decision that starts exactly one more
+repair attempt, for an ordinary session and a worker alike. It does not raise
+the limit; reaching the limit again offers the action again.
 
 The token ceiling from [spec 21](../21_task_plan_progress_and_budget/proposal.md) applies to
 repair as to any other work: reaching it stops the loop at a step boundary with

@@ -54,8 +54,12 @@ time.
 
 ## 3. Non-goals
 
-- Continuing after a failed verification. The repair loop already asks for a
-  fix, and continuing past a failure would build on a broken change.
+- Continuing after a failed verification automatically. The repair loop
+  already asks for a fix, and continuing past a failure would build on a
+  broken change. Since
+  [#96](96_continue_repair_at_the_limit.md), the repair limit's report offers a
+  **Continue repair** action; that is the user's explicit decision to start
+  exactly one more repair attempt, not an automatic continuation.
 - Treating a verification with every check skipped as anything other than
   what #23 calls it. That a skipped-only run was recorded `passed` was a
   separate defect, fixed by [#78](78_skipped_checks_are_not_passed.md). The continuation's instruction says only that verification

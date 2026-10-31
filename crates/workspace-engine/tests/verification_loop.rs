@@ -22,7 +22,7 @@ use workspace_engine::{
     SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink, VerificationEvent,
     VerificationOutcome, VerificationReport, VerificationState, WebDiagnosticCall,
     WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkspaceEngine, fold_verification, is_documentation,
+    WebDiagnosticsRunnerHandle, WorkerRecord, WorkspaceEngine, fold_verification, is_documentation,
     pending_verifications, propose_checks, reattach_pending_approvals, select_roots,
 };
 
@@ -1359,6 +1359,36 @@ fn run_verification(
         .expect("the verification turn should run")
 }
 
+fn try_continue_repair(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    session_id: &str,
+    adapter: &mut dyn workspace_engine::ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .continue_repair(root, session_id, "tester", adapter, &mut sink)
+}
+
+fn continue_repair(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    session_id: &str,
+    adapter: &mut dyn workspace_engine::ModelAdapter,
+) -> ChatTurnResult {
+    try_continue_repair(engine, root, session_id, adapter)
+        .expect("the explicit repair continuation should run")
+}
+
 fn resume_context_review(
     engine: &WorkspaceEngine,
     proposal_id: &str,
@@ -1422,6 +1452,25 @@ fn applied_change(
         .apply_stored_patch(root, &proposal.patch.id, None, None, "tester", false)
         .expect("the patch should apply");
     (proposal.session.id, proposal.task.id)
+}
+
+/// Marks the session as spec 57's worker, whose worktree is the fixture root.
+fn mark_worker(engine: &WorkspaceEngine, session_id: &str, root: &std::path::Path) {
+    engine
+        .session_store
+        .record_worker_spawned(
+            session_id,
+            &WorkerRecord {
+                parent_session_id: None,
+                source_repository: root.to_path_buf(),
+                worktree_path: root.to_path_buf(),
+                branch: "damaian/fixture".to_string(),
+                base_commit: "HEAD".to_string(),
+                included_uncommitted: false,
+                git_commands: Vec::new(),
+            },
+        )
+        .expect("the worker record is written");
 }
 
 fn outcome_events(engine: &WorkspaceEngine, session_id: &str) -> Vec<VerificationEvent> {
@@ -2239,6 +2288,299 @@ fn exhausting_the_repair_limit_reports_what_still_fails() {
     assert_eq!(
         started_attempts(&outcome_events(&engine, &session)),
         vec![0, 1, 2]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// Spec 96: at the limit every session stops, and the user's explicit
+/// continuation starts exactly one repair turn. Its plan carries the failing
+/// exit and findings, its patch is only a proposal, and applying it leads to
+/// the next verification attempt.
+#[test]
+fn an_explicit_continue_runs_one_more_repair_after_the_limit() {
+    let root = temp_dir("limited-continue");
+    let data_dir = temp_dir("limited-continue-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 0);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+    let limited = run_verification(&engine, &root, &session, &mut adapter);
+    assert_eq!(
+        limited.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::RepairLimitExhausted)
+    );
+    assert_eq!(limited.task.status, TaskStatus::Failed);
+    assert!(
+        adapter.requests.is_empty(),
+        "the limit itself starts no repair turn"
+    );
+    let limited_task = limited.task.id.clone();
+
+    // A fresh orchestrator over the same log proves the action reads durable
+    // state, not a turn left in memory.
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 0);
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+    let continued = continue_repair(&engine, &root, &session, &mut repair);
+
+    assert_eq!(repair.requests.len(), 1, "one explicit action, one attempt");
+    let patch = continued
+        .patch_proposal
+        .as_ref()
+        .expect("the repair turn asks for a patch");
+    assert_ne!(
+        continued.task.id, limited_task,
+        "the explicit attempt is a new task carrying the plan"
+    );
+    assert!(
+        continued.verification_report.is_none(),
+        "the report waits for the repaired check to rerun"
+    );
+    assert_ne!(
+        continued.task.status,
+        TaskStatus::Failed,
+        "the repair task stays alive for the patch review"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/a.rs")).unwrap(),
+        "let a = 2;\n",
+        "a proposed repair patch changes nothing until it is approved"
+    );
+
+    // The failed check's evidence is still in the plan the repair turn carried.
+    let plan = engine
+        .session_store
+        .read_task_plan(&session, &continued.task.id)
+        .unwrap()
+        .expect("the continuation carries the plan");
+    let verify = plan
+        .steps
+        .iter()
+        .find(|step| step.id == "verify_1")
+        .expect("the failing check has its step");
+    assert!(
+        verify.evidence.iter().any(|evidence| matches!(
+            evidence,
+            Evidence::CommandExit {
+                exit_code: Some(code),
+                purpose: CommandPurpose::Check,
+                ..
+            } if *code != 0
+        )),
+        "the failing exit is preserved: {verify:?}"
+    );
+    assert!(
+        verify
+            .evidence
+            .iter()
+            .any(|evidence| matches!(evidence, Evidence::Findings { .. })),
+        "the findings are preserved: {verify:?}"
+    );
+    // The request is the findings, not raw check output.
+    let prompt = first_user_message(&repair);
+    assert!(
+        prompt.contains("verification check failed"),
+        "the repair request names the failure: {prompt}"
+    );
+    assert!(
+        prompt.contains("Fix the") && prompt.contains("finding"),
+        "the repair request carries the finding: {prompt}"
+    );
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+        .expect("the repair patch applies");
+    assert_eq!(
+        fs::read_to_string(root.join("src/a.rs")).unwrap(),
+        "let a = 3;\n"
+    );
+
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[], 0);
+    let mut adapter = MockModelAdapter::new("");
+    let rerun = run_verification(&engine, &root, &session, &mut adapter);
+    assert_eq!(
+        rerun.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::Passed)
+    );
+    assert_eq!(rerun.task.status, TaskStatus::Complete);
+    assert_eq!(
+        started_attempts(&outcome_events(&engine, &session)),
+        vec![0, 1],
+        "the continuation became the next verification attempt"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// A worker gets the same stop and the same explicit action: no repair turn
+/// until the user asks for one, and then exactly one.
+#[test]
+fn a_worker_at_the_limit_waits_for_an_explicit_continue() {
+    let root = temp_dir("worker-limit-continue");
+    let data_dir = temp_dir("worker-limit-continue-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 0);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    mark_worker(&engine, &session, &root);
+    let mut adapter = MockModelAdapter::new("");
+    let limited = run_verification(&engine, &root, &session, &mut adapter);
+    assert_eq!(
+        limited.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::RepairLimitExhausted)
+    );
+    assert_eq!(limited.task.status, TaskStatus::Failed);
+    assert!(
+        adapter.requests.is_empty(),
+        "a worker does not repair past the limit by itself"
+    );
+
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+    let continued = continue_repair(&engine, &root, &session, &mut repair);
+    assert_eq!(repair.requests.len(), 1);
+    assert!(
+        continued.patch_proposal.is_some(),
+        "the explicit action starts the worker's repair turn"
+    );
+    assert_ne!(continued.task.status, TaskStatus::Failed);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// Each explicit continuation is one attempt. A second click while that repair
+/// is pending is refused, and after the next verification hits the limit again
+/// the action is available once more.
+#[test]
+fn repeated_limit_exhaustion_needs_one_explicit_decision_each_time() {
+    let root = temp_dir("limited-repeat");
+    let data_dir = temp_dir("limited-repeat-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 0);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+    let first = run_verification(&engine, &root, &session, &mut adapter);
+    assert_eq!(
+        first.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::RepairLimitExhausted)
+    );
+    let first_limited_task = first.task.id.clone();
+
+    let mut first_repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+    let continued = continue_repair(&engine, &root, &session, &mut first_repair);
+    let patch = continued.patch_proposal.as_ref().expect("a repair patch");
+    assert_eq!(first_repair.requests.len(), 1);
+
+    let mut second_click = MockModelAdapter::new("");
+    let refused = try_continue_repair(&engine, &root, &session, &mut second_click)
+        .expect_err("another explicit action while the repair is pending is refused");
+    assert!(
+        refused.to_string().contains("already in progress"),
+        "{refused}"
+    );
+    assert!(
+        second_click.requests.is_empty(),
+        "a refused continuation spends no model call"
+    );
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+        .expect("the repair patch applies");
+    let mut adapter = MockModelAdapter::new("");
+    let second = run_verification(&engine, &root, &session, &mut adapter);
+    assert_eq!(
+        second.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::RepairLimitExhausted)
+    );
+    assert_ne!(second.task.id, first_limited_task);
+    assert_eq!(
+        started_attempts(&outcome_events(&engine, &session)),
+        vec![0, 1]
+    );
+
+    let mut second_repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 4;\n")]],
+    );
+    let continued = continue_repair(&engine, &root, &session, &mut second_repair);
+    assert!(
+        continued.patch_proposal.is_some(),
+        "the exhausted limit offers the action again"
+    );
+    assert_eq!(second_repair.requests.len(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// The explicit continuation must not widen approvals: a command the repair
+/// turn asks for still pauses on its card and does not run.
+#[test]
+fn an_explicit_repair_turn_still_waits_for_command_approval() {
+    let root = temp_dir("limited-approval");
+    let data_dir = temp_dir("limited-approval-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 0);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+    run_verification(&engine, &root, &session, &mut adapter);
+    let command = workspace_engine::ToolCall {
+        id: "repair_command".to_string(),
+        name: "run_command".to_string(),
+        arguments_json: json!({
+            "command": "touch approved.txt",
+            "reason": "Write a marker as part of the repair",
+        })
+        .to_string(),
+    };
+    let mut repair =
+        MockModelAdapter::new_sequence_with_tool_calls(vec![String::new()], vec![vec![command]]);
+
+    let result = continue_repair(&engine, &root, &session, &mut repair);
+
+    assert_eq!(repair.requests.len(), 1, "the repair turn ran");
+    assert!(
+        result.command_proposal.is_some(),
+        "the command waits on its card"
+    );
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+    assert!(
+        !root.join("approved.txt").exists(),
+        "an unapproved command did not run"
     );
 
     let _ = fs::remove_dir_all(&root);

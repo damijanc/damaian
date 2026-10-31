@@ -373,6 +373,9 @@ pub(crate) enum ControlCommand {
     /// Runs the verification a settled patch made due, and the spec 77
     /// continuation after it, in this process (spec 80).
     Verify,
+    /// Starts exactly one more repair attempt after the verification repair
+    /// limit, as the user's explicit decision (spec 96).
+    ContinueRepair,
     /// Answers a verification's check card: `decisions` is the same JSON list
     /// the shell's check route takes (spec 80).
     Checks {
@@ -442,6 +445,7 @@ fn parse_command(
             proposal_id: required(take("proposalId", MAX_PROPOSAL_ID_BYTES)?)?,
         },
         "verify" => ControlCommand::Verify,
+        "continue-repair" => ControlCommand::ContinueRepair,
         "checks" => ControlCommand::Checks {
             proposal_id: required(take("proposalId", MAX_PROPOSAL_ID_BYTES)?)?,
             decisions: required(take("decisions", MAX_REQUEST_BYTES as usize)?)?,
@@ -559,6 +563,9 @@ enum TurnJob {
     },
     /// The verification a settled patch made due (spec 80).
     Verify,
+    /// One more repair attempt after the repair limit, on the user's explicit
+    /// decision (spec 96).
+    ContinueRepair,
     /// A check card's decisions, resuming the verification that paused.
     Checks {
         proposal_id: String,
@@ -655,6 +662,7 @@ impl WorkerHost {
             ControlCommand::Approve { proposal_id } => (self.decide(proposal_id, true), false),
             ControlCommand::Reject { proposal_id } => (self.decide(proposal_id, false), false),
             ControlCommand::Verify => (self.start(TurnJob::Verify), false),
+            ControlCommand::ContinueRepair => (self.start(TurnJob::ContinueRepair), false),
             ControlCommand::Checks {
                 proposal_id,
                 decisions,
@@ -781,7 +789,7 @@ impl WorkerHost {
         };
         let carried = match job {
             TurnJob::Decide { .. } | TurnJob::Checks { .. } => slot.steering.drain_notes(),
-            TurnJob::Message(_) | TurnJob::Verify => Vec::new(),
+            TurnJob::Message(_) | TurnJob::Verify | TurnJob::ContinueRepair => Vec::new(),
         };
         slot.cancel = CancelToken::new();
         slot.steering = Arc::new(TurnSteering::new());
@@ -983,6 +991,13 @@ impl TurnDriver {
             TurnJob::Verify => {
                 chat.verify_due(&repository, &self.session_id, adapter.as_mut(), &mut sink)
             }
+            TurnJob::ContinueRepair => chat.continue_repair(
+                &repository,
+                &self.session_id,
+                "desktop_user",
+                adapter.as_mut(),
+                &mut sink,
+            ),
             TurnJob::Checks {
                 proposal_id,
                 decisions,
@@ -1472,6 +1487,10 @@ mod tests {
             ParsedRequest::Command(ControlCommand::Verify)
         );
         assert_eq!(
+            with_token(r#""command":"continue-repair""#),
+            ParsedRequest::Command(ControlCommand::ContinueRepair)
+        );
+        assert_eq!(
             with_token(r#""command":"checks","proposalId":"b1","decisions":"[]""#),
             ParsedRequest::Command(ControlCommand::Checks {
                 proposal_id: "b1".to_string(),
@@ -1480,6 +1499,7 @@ mod tests {
         );
         for invalid in [
             r#""command":"verify","text":"x""#,
+            r#""command":"continue-repair","text":"x""#,
             r#""command":"checks","proposalId":"b1""#,
             r#""command":"status","text":"x""#,
             r#""command":"note""#,

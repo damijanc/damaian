@@ -2195,7 +2195,7 @@ impl ChatOrchestrator {
                 .session_store
                 .update_task_status(&task, TaskStatus::Validating, None)?;
             self.session_store.resume_plan(&task, &due.task_id)?;
-            let changed = self.verification_changed_files(session_id, &task.id, &due)?;
+            let changed = self.verification_changed_files(session_id, &task.id, Some(&due))?;
             let file_hashes = hash_existing_files(repository_root, &changed);
             return self.finish_verification_with_outcome(
                 session,
@@ -2247,7 +2247,7 @@ impl ChatOrchestrator {
             .update_task_status(&task, TaskStatus::Validating, None)?;
         sink.session(&session.id);
 
-        let changed = self.verification_changed_files(session_id, &task.id, &due)?;
+        let changed = self.verification_changed_files(session_id, &task.id, Some(&due))?;
         let file_hashes = hash_existing_files(repository_root, &changed);
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
         let (map, _) = RepositoryMapStore::new(&self.config.data_dir, self.audit_log.clone())
@@ -3022,6 +3022,11 @@ impl ChatOrchestrator {
             );
         }
         if attempt >= self.config.agent_tool_retry_limit {
+            // The limit is a stop, for every session kind. A worker has no
+            // user typing "continue", so spec 96 gives both kinds the same
+            // explicit *Continue repair* action instead of one of them
+            // silently bypassing the bound. Nothing here starts another
+            // attempt on its own.
             return self.finish_verification_with_outcome(
                 session,
                 task,
@@ -3035,6 +3040,126 @@ impl ChatOrchestrator {
             session,
             task,
             &preliminary,
+            &plan,
+            changed,
+            file_hashes,
+            model_adapter,
+            sink,
+        )
+    }
+
+    /// Starts exactly one more repair attempt after the repair limit, as an
+    /// explicit user decision (spec 96).
+    ///
+    /// The verification that reached the limit is the latest task, and its
+    /// `repair_limit_exhausted` report is still in the log. This creates a new
+    /// task carrying that plan and its failure evidence, then runs the ordinary
+    /// repair turn once. It never loops: a repair that proposes no patch closes
+    /// as `no_repair_applied`, and a repair that is patch-applied leads to the
+    /// next verification, which stops at the limit again if it still fails.
+    ///
+    /// A second call while that repair is pending is refused: the limit's
+    /// task is no longer the latest one. So is a call when the last
+    /// verification did not reach the limit.
+    pub fn continue_repair(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let repository_root = repository_root.as_ref();
+        let Some(session) = self.session_store.read_session(session_id)? else {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown session: {session_id}"
+            )));
+        };
+        if self.session_store.session_mode(session_id) != SessionMode::Code {
+            return Err(ClientError::AccessDenied(
+                "Repair continuation runs only in Code mode".to_string(),
+            ));
+        }
+        let events = self
+            .session_store
+            .read_verification_events(session_id, &[])?;
+        let state = fold_verification(events.iter());
+        if state.finished != Some(VerificationOutcome::RepairLimitExhausted) || state.due.is_some()
+        {
+            return Err(ClientError::InvalidInput(
+                "The last verification did not reach the repair limit, or another verification is due"
+                    .to_string(),
+            ));
+        }
+        let Some(limited_task_id) = events.iter().rev().find_map(|event| match event {
+            VerificationEvent::Finished { task_id, .. } => Some(task_id.clone()),
+            _ => None,
+        }) else {
+            return Err(ClientError::InvalidInput(
+                "The last verification did not reach the repair limit".to_string(),
+            ));
+        };
+        // One explicit action, one attempt. Once the new task exists it is the
+        // latest task, so another click is refused until a verification closes
+        // this one. This is the guard that keeps the action from becoming an
+        // unbounded retry loop.
+        let latest = self
+            .session_store
+            .read_tasks(session_id)?
+            .into_iter()
+            .last();
+        if !latest
+            .is_some_and(|task| task.id == limited_task_id && task.status == TaskStatus::Failed)
+        {
+            return Err(ClientError::InvalidInput(
+                "The repair limit's verification is not the latest task; a repair is already in progress".to_string(),
+            ));
+        }
+        let Some(limited_plan) = self
+            .session_store
+            .read_task_plan(session_id, &limited_task_id)?
+        else {
+            return Err(ClientError::InvalidInput(
+                "The verification that reached the repair limit carries no plan".to_string(),
+            ));
+        };
+        let changed = self.verification_changed_files(session_id, &limited_task_id, None)?;
+        let file_hashes = hash_existing_files(repository_root, &changed);
+        let report = VerificationReport::build(&state, &limited_plan, &changed, &file_hashes);
+
+        let mut task = self.session_store.create_task(
+            session_id,
+            VERIFICATION_TURN_PROMPT,
+            &self.config.model_provider,
+            &self.config.model_name,
+        )?;
+        task = self
+            .session_store
+            .update_task_status(&task, TaskStatus::PreparingContext, None)?;
+        // Step state and evidence come across verbatim, so the repair request
+        // is built from the checks that actually failed.
+        self.session_store.resume_plan(&task, &limited_task_id)?;
+        task = self
+            .session_store
+            .update_task_status(&task, TaskStatus::Validating, None)?;
+        let plan = self
+            .session_store
+            .read_task_plan(session_id, &task.id)?
+            .unwrap_or(limited_plan);
+        self.audit_log.record(
+            "verification_repair_continued",
+            &[
+                ("actor", approved_by.to_string()),
+                ("sessionId", session.id.clone()),
+                ("fromTaskId", limited_task_id.clone()),
+                ("taskId", task.id.clone()),
+            ],
+        )?;
+        self.run_repair_turn(
+            repository_root,
+            session,
+            task,
+            &report,
             &plan,
             changed,
             file_hashes,
@@ -3463,7 +3588,8 @@ impl ChatOrchestrator {
         if state.selected.is_empty() || state.finished.is_some() {
             return Ok(result);
         }
-        let changed = self.verification_changed_files(&result.session.id, &result.task.id, &due)?;
+        let changed =
+            self.verification_changed_files(&result.session.id, &result.task.id, Some(&due))?;
         let file_hashes = hash_existing_files(repository_root, &changed);
         self.finish_verification_with_outcome(
             result.session,
@@ -3480,7 +3606,7 @@ impl ChatOrchestrator {
         &self,
         session_id: &str,
         task_id: &str,
-        due: &crate::verification::VerificationDue,
+        due: Option<&crate::verification::VerificationDue>,
     ) -> Result<Vec<String>> {
         let mut changed = BTreeSet::new();
         if let Some(plan) = self.session_store.read_task_plan(session_id, task_id)? {
@@ -3521,6 +3647,7 @@ impl ChatOrchestrator {
             }
         }
         if changed.is_empty()
+            && let Some(due) = due
             && let Ok(patch) = self.patch_store.load(&due.patch_id)
         {
             for file in patch.files {
@@ -15521,6 +15648,10 @@ mod mode_refusal_tests {
         let mut config = Config {
             data_dir: repo.join(".damaian"),
             enable_index_watcher: false,
+            // The browser-diagnostic tests pin the old two-call limit so four
+            // inspections still exercise the note; spec 96 raised the product
+            // default, which `Config::default` is tested for separately.
+            agent_tool_retry_limit: 2,
             ..Config::default()
         };
         config.model_providers.push(native_provider());

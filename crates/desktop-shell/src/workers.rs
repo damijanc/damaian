@@ -906,7 +906,7 @@ fn control_route(
             forward("proposal_id", "proposalId", true)?;
             forward("decisions", "decisions", true)?;
         }
-        "pause" | "status" | "verify" => {}
+        "pause" | "status" | "verify" | "continue-repair" => {}
         "stop" => {
             let answer = supervisor
                 .stop(&session)

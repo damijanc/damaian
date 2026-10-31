@@ -48,6 +48,7 @@ fn usage() -> &'static str {
   damaian reject-command <proposal-id>
   damaian ask <repo> <prompt>
   damaian verify <repo> <session> [--decline-checks]
+  damaian continue-repair <repo> <session>
   damaian propose-edit <repo> <prompt>
   damaian show-patch <repo> <patch-id>
   damaian apply-patch <repo> <patch-id> [file...] [--hunk-selection <json>]
@@ -543,6 +544,41 @@ fn run() -> workspace_engine::Result<()> {
                     &mut sink,
                 )?;
             }
+            if use_color(no_color_flag) {
+                print!("{}", render_markdown_to_ansi(&result.response));
+            } else {
+                print!("{}", result.response);
+            }
+            if !result.response.ends_with('\n') {
+                println!();
+            }
+            if let Some(patch) = &result.patch_proposal {
+                eprintln!("repair_patch={}", escape(&patch.patch_id));
+            }
+        }
+        "continue-repair" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let session_id = require_arg(&args, 2, "<session>")?;
+            let engine = engine_for_repo(repo)?;
+            let mut adapter = cli_model_adapter(&engine)?;
+            let cancel = CancelToken::new();
+            let mut on_token = |_token: &str| {};
+            let mut on_progress = |_progress: TurnProgress| {};
+            let mut sink = TurnSink {
+                on_token: &mut on_token,
+                on_progress: &mut on_progress,
+                cancel: &cancel,
+                steering: None,
+            };
+            // Spec 96: the explicit decision to start exactly one more repair
+            // attempt after the verification repair limit.
+            let result = engine.chat_orchestrator.continue_repair(
+                repo,
+                session_id,
+                "local_user",
+                adapter.as_mut(),
+                &mut sink,
+            )?;
             if use_color(no_color_flag) {
                 print!("{}", render_markdown_to_ansi(&result.response));
             } else {

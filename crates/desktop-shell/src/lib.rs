@@ -23,14 +23,15 @@ use workspace_engine::{
     PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId, ProjectIdentity, ProposedFilePatch,
     QuestionState, RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision,
     SearchOptions, Session, SessionMode, StepStatus, SymbolRef, TaskPlan, TaskUsage, TokenUsage,
-    TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationReport,
-    WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
-    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
-    builtin_context_window, builtin_token_defaults, command_approval_prompt, custom_profile_ids,
-    ensure_data_dir_schema, export_profile, import_profile, normalize_mcp_server_id,
-    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
-    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
-    review_profile_import, review_profile_rejections, select_profile,
+    TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationEvent,
+    VerificationOutcome, VerificationReport, WebDiagnosticCall, WebDiagnosticKind,
+    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
+    WorkspaceEngine, allow_always_eligible, builtin_context_window, builtin_token_defaults,
+    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
+    fold_verification, import_profile, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
+    select_profile,
 };
 
 mod keychain;
@@ -384,6 +385,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/resume-fetch-stream") => handle_resume_fetch_stream(stream, &request),
         ("POST", "/api/fetch-decision") => handle_fetch_decision(stream, &request),
         ("POST", "/api/verify-stream") => handle_verify_stream(stream, &request),
+        ("POST", "/api/continue-repair-stream") => handle_continue_repair_stream(stream, &request),
         ("POST", "/api/resume-checks-stream") => handle_resume_checks_stream(stream, &request),
         ("POST", "/api/resume-plan-stream") => handle_resume_plan_stream(stream, &request),
         ("POST", "/api/plan-worker-prompt") => handle_plan_worker_prompt(stream, &request),
@@ -711,13 +713,17 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         .session_store
         .context_restriction(&session_id)
         .map_err(|error| error.to_string())?;
+    // The last verification's outcome survives a reload only as its text; this
+    // is what lets the report's explicit *Continue repair* action (spec 96)
+    // be offered again.
+    let verification = session_verification_json(&engine, &session_id);
     write_response(
         stream,
         request,
         200,
         "application/json",
         &format!(
-            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}],\"conversationView\":{},\"contextState\":{{\"pins\":{},\"restrictedPaths\":{}}}}}",
+            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}],\"conversationView\":{},\"contextState\":{{\"pins\":{},\"restrictedPaths\":{}}},\"verification\":{}}}",
             session_json(&session, engine.session_store.session_mode(&session.id)),
             messages_json(&messages, &question_states),
             task_states_json(
@@ -732,7 +738,8 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
             ),
             conversation_json(&engine, &session_id),
             serde_json::to_string(&context_pins).unwrap_or_else(|_| "[]".to_string()),
-            serde_json::to_string(&context_restriction).unwrap_or_else(|_| "null".to_string())
+            serde_json::to_string(&context_restriction).unwrap_or_else(|_| "null".to_string()),
+            verification
         ),
     )
 }
@@ -3168,6 +3175,16 @@ fn handle_verify_stream(stream: &mut TcpStream, request: &Request) -> Result<(),
     })
 }
 
+/// Spec 96: the user's explicit decision to start one more repair attempt
+/// after the verification repair limit.
+fn handle_continue_repair_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    write_event_stream_headers(stream, request)?;
+    stream_turn(stream, move |cancel, events| {
+        run_continue_repair_request(&form, cancel, events)
+    })
+}
+
 fn handle_resume_checks_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     write_event_stream_headers(stream, request)?;
@@ -3444,6 +3461,48 @@ fn run_verify_request(
     engine
         .chat_orchestrator
         .verify_due(&repo, &session_id, adapter.as_mut(), &mut sink)
+        .map_err(|error| error.to_string())
+}
+
+/// Starts one more repair attempt after the repair limit (spec 96).
+///
+/// This is the explicit user decision the report card offers. The engine
+/// refuses unless the limit's verification is the latest task, so a stale card
+/// or a second click cannot start an unbounded sequence.
+fn run_continue_repair_request(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+) -> Result<ChatTurnResult, String> {
+    let repo = required_form(form, "repo")?;
+    let session_id = required_form(form, "session_id")?;
+    let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
+    let mut adapter = chat_model_adapter(&engine.config, || {
+        resolve_shell_model_api_key(&engine.config)
+    })?;
+    let mut on_token = |token: &str| {
+        let _ = events.send(TurnEvent::Token(token.to_string()));
+    };
+    let mut on_progress = |progress: TurnProgress| {
+        if let Some(event) = turn_progress_event(progress) {
+            let _ = events.send(event);
+        }
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .continue_repair(
+            &repo,
+            &session_id,
+            "desktop_user",
+            adapter.as_mut(),
+            &mut sink,
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -6124,6 +6183,49 @@ fn verification_report_json(report: Option<&VerificationReport>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+/// The last verification's durable outcome, and whether spec 96's explicit
+/// *Continue repair* action applies.
+///
+/// A reloaded report is text only, so this is what lets the shell offer the
+/// action again without keeping in-memory turn state. The engine repeats the
+/// same check when the action is used: the limit's verification must still be
+/// the latest task, and that task must still be `failed`.
+fn session_verification_json(engine: &WorkspaceEngine, session_id: &str) -> String {
+    let Ok(events) = engine
+        .session_store
+        .read_verification_events(session_id, &[])
+    else {
+        return "null".to_string();
+    };
+    let state = fold_verification(events.iter());
+    let Some(outcome) = state.finished else {
+        return "null".to_string();
+    };
+    let Some(task_id) = events.iter().rev().find_map(|event| match event {
+        VerificationEvent::Finished { task_id, .. } => Some(task_id.clone()),
+        _ => None,
+    }) else {
+        return "null".to_string();
+    };
+    let latest_is_limited_task = engine
+        .session_store
+        .read_tasks(session_id)
+        .ok()
+        .and_then(|tasks| tasks.into_iter().last())
+        .is_some_and(|task| {
+            task.id == task_id && task.status == workspace_engine::TaskStatus::Failed
+        });
+    let can_continue = outcome == VerificationOutcome::RepairLimitExhausted
+        && state.due.is_none()
+        && latest_is_limited_task;
+    format!(
+        "{{\"taskId\":\"{}\",\"outcome\":\"{}\",\"canContinueRepair\":{}}}",
+        escape_json(&task_id),
+        outcome.as_str(),
+        can_continue
+    )
+}
+
 /// Shaped identically to `/api/propose-edit`'s response (`patchId` +
 /// `summary` + `files`) so the frontend can render both with the exact same
 /// `createPatchPreview` component regardless of whether the patch came from
@@ -6907,11 +7009,11 @@ mod tests {
         render_markdown_with_optional_file_links, repository_config_review_json,
         repository_config_write_target, require_api_token, resolve_shell_model_api_key,
         run_answer_question_request, run_fetch_decision_request_with, run_server,
-        run_terminal_command, save_config_file, spawn_with_shell_stack, sweep_orphaned_processes,
-        symbol_repository, task_states_json, task_usage_json, terminal_cwd_for_repo,
-        turn_progress_event, validate_context_files, validate_working_folder,
-        validate_workspace_path, verify_data_dir_schema_at, web_diagnostic_json,
-        web_diagnostic_reveal_target, write_basic_response, write_sse_event,
+        run_terminal_command, save_config_file, session_verification_json, spawn_with_shell_stack,
+        sweep_orphaned_processes, symbol_repository, task_states_json, task_usage_json,
+        terminal_cwd_for_repo, turn_progress_event, validate_context_files,
+        validate_working_folder, validate_workspace_path, verify_data_dir_schema_at,
+        web_diagnostic_json, web_diagnostic_reveal_target, write_basic_response, write_sse_event,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
@@ -6927,8 +7029,8 @@ mod tests {
         GeneratedSecretWarning, LanguageServerHub, LanguageServerLaunch, LanguageServerState,
         LanguageServerStatus, MockModelAdapter, PendingQuestionRef, PhaseKind, PlanStep,
         SecretScanner, SessionMode, StepStatus, TaskPlan, TaskStatus, TaskUsage, ToolCall,
-        TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource, WebDiagnosticRecord,
-        WebDiagnosticReport, WorkspaceEngine,
+        TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource, VerificationEvent,
+        VerificationOutcome, WebDiagnosticRecord, WebDiagnosticReport, WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
     };
 
@@ -8191,6 +8293,65 @@ mod tests {
                 .contains("No checks were available"),
             "{done}"
         );
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Spec 96: a reload offers the explicit action from the durable log, and
+    /// stops offering it once a newer repair task exists.
+    #[test]
+    fn session_payload_offers_continue_repair_only_at_the_latest_limit() {
+        let repo = temp_shell_repo("continue-repair-offer");
+        let repo_arg = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
+        let session = engine
+            .session_store
+            .create_session("shell-test", "limited")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "verify", "provider", "model")
+            .unwrap();
+        engine
+            .session_store
+            .update_task_status(&task, workspace_engine::TaskStatus::Failed, None)
+            .unwrap();
+        engine
+            .session_store
+            .append_verification_event(
+                &session.id,
+                &VerificationEvent::Started {
+                    task_id: task.id.clone(),
+                    attempt: 0,
+                    checks: Vec::new(),
+                },
+            )
+            .unwrap();
+        engine
+            .session_store
+            .append_verification_event(
+                &session.id,
+                &VerificationEvent::Finished {
+                    task_id: task.id.clone(),
+                    outcome: VerificationOutcome::RepairLimitExhausted,
+                },
+            )
+            .unwrap();
+
+        let offered = session_verification_json(&engine, &session.id);
+        assert!(offered.contains(&task.id), "{offered}");
+        assert!(offered.contains("\"canContinueRepair\":true"), "{offered}");
+
+        let newer = engine
+            .session_store
+            .create_task(&session.id, "repair", "provider", "model")
+            .unwrap();
+        let not_offered = session_verification_json(&engine, &session.id);
+        assert!(
+            not_offered.contains("\"canContinueRepair\":false"),
+            "a newer repair task is in progress: {not_offered}"
+        );
+        assert_ne!(task.id, newer.id);
 
         fs::remove_dir_all(&repo).ok();
     }
@@ -12466,7 +12627,11 @@ mod tests {
         /// A session for `repo`; with `worker`, one whose worker record names
         /// `repo` as its worktree, as Task 7's spawn will write it.
         fn session_for(repo: &Path, worker: bool) -> String {
-            let store = store();
+            session_for_in(repo, worker, isolated_data_dir())
+        }
+
+        fn session_for_in(repo: &Path, worker: bool, data_dir: &Path) -> String {
+            let store = SessionStore::new(data_dir);
             let session = store
                 .create_session(
                     &workspace_engine::hash::repository_id_for_root(repo),
@@ -13178,6 +13343,33 @@ mod tests {
                     .count(),
                 3,
                 "each job, verify included, is a new running job: {statuses:?}"
+            );
+        }
+
+        /// Spec 96: a worker accepts the explicit continuation, and its engine
+        /// refuses when the last verification did not reach the limit. The
+        /// refusal is recorded as the job's error and the worker stays idle.
+        #[test]
+        fn a_worker_accepts_continue_repair_and_the_engine_gates_it() {
+            let (host, session) = hosted(&fixture("cont"), calls_then("x", "{}", "Done."));
+            assert_eq!(
+                send(&host, ControlCommand::ContinueRepair)["ok"],
+                true,
+                "an idle worker accepts continue-repair"
+            );
+            assert_eq!(settle(&host)["state"], "idle");
+            let statuses = payloads(&progress(&session), "status");
+            assert!(
+                statuses
+                    .first()
+                    .is_some_and(|status| status["state"] == "running"),
+                "the job starts as running: {statuses:?}"
+            );
+            assert!(
+                statuses.iter().any(|status| status["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("did not reach the repair limit"))),
+                "the engine's own refusal is recorded: {statuses:?}"
             );
         }
 
@@ -14027,6 +14219,7 @@ exec /bin/cat > /dev/null
             control(&[("command", "resume"), ("note", "carry on")]).unwrap();
             control(&[("command", "resume")]).unwrap();
             control(&[("command", "pause")]).unwrap();
+            control(&[("command", "continue-repair")]).unwrap();
 
             let seen = requests.lock().unwrap().clone();
             let token = seen[0]["token"].as_str().unwrap().to_string();
@@ -14049,6 +14242,7 @@ exec /bin/cat > /dev/null
                     json!({"command": "resume", "note": "carry on"}),
                     json!({"command": "resume"}),
                     json!({"command": "pause"}),
+                    json!({"command": "continue-repair"}),
                 ]
             );
 

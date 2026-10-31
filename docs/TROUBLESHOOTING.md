@@ -1335,6 +1335,12 @@ root and in `crates/engine` are two checks. Each appears in exactly one of
 passed, failed, skipped or stale in the report; **an unrun check is never
 passed**.
 
+Choosing **Continue repair** at the limit starts one new task that carries the
+plan, and writes the audit event `verification_repair_continued` with the
+session, the limited task and the new task's id. The new task's plan holds the
+failed check's evidence, so the repair request is the same one an automatic
+repair below the limit would have sent.
+
 **Where the full output lives.** A `verification_check` event is a summary. The
 findings carry an `originRef`, and the command's complete `stdout.log`,
 `stderr.log` and summary are under `commands/` in the data directory (see
@@ -1367,8 +1373,11 @@ unasked.
 
 **The task failed with the repair limit exhausted.** The report lists what still
 fails; the agent's repairs did not fix it within `agent_tool_retry_limit`
-(default 2). Raise the limit if the work genuinely needs more, or fix the
-finding and apply a patch — verification runs again when that patch settles.
+(default 16). Choose **Continue repair** on the report to start exactly one more
+attempt with the failing evidence, or raise the limit if the work genuinely
+needs more. The action does not raise the limit and does not retry on its own; a
+second click while that repair is pending is refused. It is offered again if the
+next verification reaches the limit, and it works for worker sessions too.
 
 ### The plan says a step is still open after the turn ended
 

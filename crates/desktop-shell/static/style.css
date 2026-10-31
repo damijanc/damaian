@@ -5859,8 +5859,13 @@ body.worker-view #chat-model-menu {
   color: #7a4b12;
 }
 
-.verification-offer {
+.verification-offer,
+.continue-repair-offer {
   border-color: #d8b985;
+}
+
+.verification-report-actions {
+  margin-top: 8px;
 }
 
 @media (max-width: 720px) {

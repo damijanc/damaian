@@ -12315,6 +12315,19 @@ async function startVerification(repoName) {
   );
 }
 
+// Spec 96: the user's explicit decision to run one more repair attempt after
+// the limit. The engine refuses when the limit's verification is no longer the
+// latest task, so this can start one attempt and no more.
+async function continueRepair(repoName) {
+  if (!currentSessionId) return;
+  if ((currentSessionMode?.mode || "code") !== "code") return;
+  await runVerificationStream(
+    (handlers) =>
+      streamContinueRepairRequest({ repo: repoName, session_id: currentSessionId }, handlers),
+    repoName,
+  );
+}
+
 function checkLabel(check) {
   return `${check.command} (${check.workingDirectory || "repository root"})`;
 }
@@ -12491,7 +12504,7 @@ function createCheckBatchCard(
 // The structured half of proposal §5.7. The text copy is the assistant
 // message; this card is what makes the sections scannable and the changed
 // paths clickable.
-function createVerificationReportCard(report, reportRepo) {
+function createVerificationReportCard(report, reportRepo, { onContinueRepair = null } = {}) {
   const card = document.createElement("section");
   card.className = "verification-report";
 
@@ -12587,8 +12600,117 @@ function createVerificationReportCard(report, reportRepo) {
     ),
   ]);
 
+  // Spec 96: at the repair limit, the explicit decision starts exactly one
+  // more repair attempt. It does not raise the limit and nothing retries on
+  // its own; every patch and command still goes through its own approval.
+  if (report.outcome === "repair_limit_exhausted" && onContinueRepair) {
+    const note = document.createElement("p");
+    note.className = "check-batch-note";
+    note.textContent =
+      "The repair limit was reached. Continue repair starts one more repair attempt with the " +
+      "failing evidence; every patch and command still needs your approval.";
+    const actions = document.createElement("div");
+    actions.className = "verification-report-actions";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn-sm btn-primary";
+    button.textContent = "Continue repair";
+    let running = false;
+    button.addEventListener("click", async () => {
+      if (running) return;
+      running = true;
+      button.disabled = true;
+      button.textContent = "Continuing…";
+      try {
+        await onContinueRepair();
+      } catch (error) {
+        running = false;
+        button.disabled = false;
+        button.textContent = "Continue repair";
+        toast(error.message);
+      }
+    });
+    actions.append(button);
+    card.append(note, actions);
+  }
+
   wireFileReferences(card, reportRepo);
   return card;
+}
+
+// A reloaded verification report is text, so the explicit continuation is
+// offered from the durable outcome in `/api/session` (spec 96). It sits after
+// the turn's last message, like the plan panel, so markdown finalization cannot
+// remove it.
+function createContinueRepairOffer(sessionId, isWorker) {
+  const card = document.createElement("section");
+  card.className = "recovery-card continue-repair-offer";
+
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "recovery-card-eyebrow";
+  eyebrow.textContent = "Verification stopped";
+  const headline = document.createElement("p");
+  headline.className = "recovery-card-headline";
+  headline.textContent = "The repair limit was reached";
+  const note = document.createElement("p");
+  note.className = "recovery-card-note";
+  note.textContent =
+    "Continue repair starts one more repair attempt with the failing evidence. Every patch and " +
+    "command still needs your approval, and the limit is not raised.";
+
+  const actions = document.createElement("div");
+  actions.className = "command-approval-actions";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "btn-sm btn-primary";
+  button.textContent = "Continue repair";
+  let running = false;
+  button.addEventListener("click", async () => {
+    if (running) return;
+    running = true;
+    button.disabled = true;
+    button.textContent = "Continuing…";
+    try {
+      if (isWorker) {
+        await api(
+          "/api/worker-control",
+          form({ session_id: sessionId, command: "continue-repair" }),
+        );
+        const view = workerView;
+        if (view && view.sessionId === sessionId) {
+          Object.assign(view, { state: "running", liveText: "", plan: null, approval: null });
+          renderWorkerView(view);
+          showWorkerLive(view);
+          pollWorkerProgressNow(view);
+        }
+      } else {
+        await continueRepair(repo());
+      }
+      card.remove();
+    } catch (error) {
+      running = false;
+      button.disabled = false;
+      button.textContent = "Continue repair";
+      toast(error.message);
+    }
+  });
+  actions.append(button);
+  card.append(eyebrow, headline, note, actions);
+  return card;
+}
+
+function renderContinueRepairOffer(rendered, verification, sessionId) {
+  if (!verification?.canContinueRepair) return;
+  const row = workerRowFor(sessionId);
+  // A worker runs its own turn, so the action needs its process. An ended
+  // worker has no process to hand it to; *Restart worker* is the way back.
+  if (row && !(row.alive && row.state === "idle")) return;
+  const entry = [...rendered]
+    .reverse()
+    .find(({ message }) => message.taskId === verification.taskId && message.role === "assistant");
+  const card = createContinueRepairOffer(sessionId, Boolean(row));
+  if (entry) entry.bubble.body.after(card);
+  else $("chat-log").append(card);
 }
 
 // A due verification from the recovery sweep. Nothing has run: the button is
@@ -12655,7 +12777,11 @@ function appendProposals(message, payload, repo) {
     message.body.append(createCheckBatchCard(payload.checkBatch, repo));
   }
   if (payload.verificationReport) {
-    message.body.append(createVerificationReportCard(payload.verificationReport, repo));
+    message.body.append(
+      createVerificationReportCard(payload.verificationReport, repo, {
+        onContinueRepair: () => continueRepair(repo),
+      }),
+    );
   }
   if (payload.planProposal) {
     message.body.append(createPlanReview(payload.planProposal, repo));
@@ -14189,6 +14315,9 @@ async function loadSession(sessionId) {
     payload.conversationView?.conversation || null,
   );
   renderSpawnedWorkerEntries(rendered, currentSessionId);
+  // Spec 96: a reloaded report is text, so the explicit continuation comes
+  // from the durable outcome. It follows the verification turn's last message.
+  renderContinueRepairOffer(rendered, payload.verification, currentSessionId);
   contextPins = payload.contextState?.pins || [];
   contextRestrictionDirty = false;
   contextRestriction = payload.contextState?.restrictedPaths ?? null;
@@ -14275,6 +14404,12 @@ async function streamResumeContextRequest(data, handlers) {
 // there is no one-shot endpoint behind it.
 async function streamVerifyRequest(data, handlers) {
   return streamRequest("/api/verify-stream", null, withChatModel(data), handlers);
+}
+
+// Like verification, the continuation starts a turn the engine owns, so there
+// is no one-shot endpoint behind it.
+async function streamContinueRepairRequest(data, handlers) {
+  return streamRequest("/api/continue-repair-stream", null, withChatModel(data), handlers);
 }
 
 async function streamResumeChecksRequest(data, handlers) {

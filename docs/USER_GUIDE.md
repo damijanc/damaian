@@ -996,11 +996,18 @@ when the check runs in a sub-root. A session with
 otherwise run without asking.
 
 **Repair.** A failing check becomes findings, and the agent may propose a repair
-patch within `agent_tool_retry_limit` (default 2). The patch still goes through
+patch within `agent_tool_retry_limit` (default 16). The patch still goes through
 the normal preview and approval path, and the check reruns once it is applied.
 A repair that breaks a previously passing check is reported as a regression. If
 a repair turn produces no patch, the loop stops rather than spending the
 remaining attempts; at the limit the task is marked failed.
+
+At that limit the report offers **Continue repair**. It is an explicit decision
+that starts exactly one more repair attempt with the failing evidence; it does
+not raise the limit. Every patch and command in that attempt still needs its
+own approval, a second click while it is pending is refused, and reaching the
+limit again offers the action again. Worker sessions offer the same action, and
+it runs in the worker's own process.
 
 **The report** lists:
 
@@ -1038,8 +1045,10 @@ check is skipped with `no running target`; it is never inferred as verified.
 Verification runs only in Code mode. Ask, Plan and Review have nothing applied
 to verify. From the command line, `damaian verify <repo> <session>` runs it and
 prints the report; `--decline-checks` answers an approval card with every check
-declined. This checks that the project's own tests pass — it does not prove the
-change is correct, and the report is written to avoid implying that.
+declined. At the repair limit, `damaian continue-repair <repo> <session>` is the
+same one-attempt explicit decision the report card offers. This checks that the
+project's own tests pass — it does not prove the change is correct, and the
+report is written to avoid implying that.
 
 ## Commits
 

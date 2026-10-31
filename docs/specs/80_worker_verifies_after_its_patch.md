@@ -47,6 +47,10 @@ This spec connects the worker to it.
    command card (#57).
 6. `verify` with nothing due is answered with the engine's own refusal, which
    is recorded as the job's error. The worker stays idle.
+7. Since [#96](96_continue_repair_at_the_limit.md), the worker also accepts
+   `continue-repair`. It starts exactly one more repair attempt after the
+   verification repair limit, on the user's explicit decision; it changes
+   neither what verification runs nor the limit itself.
 
 ## 3. Non-goals
 

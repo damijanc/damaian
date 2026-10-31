@@ -3204,7 +3204,11 @@ impl Default for Config {
             // implementation task paused about five times (spec 59 context §5).
             agent_max_tool_rounds: 16,
             agent_web_debug_max_tool_rounds: 16,
-            agent_tool_retry_limit: 2,
+            // Spec 96: a real repair sequence often needs more than two tries
+            // before a check passes, and the limit no longer strands a worker
+            // that cannot type "continue". The explicit *Continue repair*
+            // action remains available at the limit, one attempt per click.
+            agent_tool_retry_limit: 16,
             agent_max_questions_per_turn: 2,
             // Spec 51 D12: a model that fetches twelve pages has lost the
             // thread, and the cap turns that into a refusal it can read.
@@ -5806,13 +5810,18 @@ fn parse_task_token_ceiling(key: &str, value: &str) -> Result<u64> {
     }
 }
 
+/// The repair loop's own default is 16 (spec 96), so the old ceiling of 8
+/// would make the product default unrepresentable in a saved config and stop
+/// anyone raising it. 32 keeps a real bound without defeating that preference.
+const TOOL_RETRY_LIMIT_CEILING: u32 = 32;
+
 fn parse_retry_limit(key: &str, value: &str) -> Result<u32> {
     let parsed = parse_u64(key, value)?;
-    if (1..=8).contains(&parsed) {
+    if (1..=u64::from(TOOL_RETRY_LIMIT_CEILING)).contains(&parsed) {
         Ok(parsed as u32)
     } else {
         Err(ClientError::InvalidInput(format!(
-            "{key} must be between 1 and 8"
+            "{key} must be between 1 and {TOOL_RETRY_LIMIT_CEILING}"
         )))
     }
 }
@@ -5903,6 +5912,15 @@ mod tests {
                 .to_policy_text()
                 .contains("enable_worker_sessions=true")
         );
+    }
+
+    /// Spec 96: the repair loop needs more room than the old two attempts, and
+    /// the explicit continuation at the limit is one click per extra attempt.
+    #[test]
+    fn the_default_repair_limit_is_sixteen() {
+        assert_eq!(Config::default().agent_tool_retry_limit, 16);
+        assert!(ConfigOverlay::parse("agent_tool_retry_limit=32\n").is_ok());
+        assert!(ConfigOverlay::parse("agent_tool_retry_limit=33\n").is_err());
     }
 
     /// Spec 69: on for the product, off for a config built from `default()`,
