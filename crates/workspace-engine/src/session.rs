@@ -2760,13 +2760,78 @@ impl SessionStore {
     /// Absence is `false`, never "unknown": the gate reads this to decide
     /// whether to pause, and anything that fell through to `true` would let a
     /// mutating step run unreviewed.
+    ///
+    /// A carried plan keeps its approval (spec 83 §5.3): the user reviewed
+    /// *that plan*, and [`Self::resume_plan`] only moves it onto the next
+    /// task. So a task whose plan arrived by `plan_resumed` is approved when
+    /// the task it came from was, through any number of carries. A plan the
+    /// task then proposed for itself is a different plan, and drops whatever
+    /// approval the task held before it.
     pub fn read_plan_approved(&self, session_id: &str, task_id: &str) -> Result<bool> {
         let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
             return Ok(false);
         };
-        Ok(active_events(&content).iter().any(|event| {
-            event.event_type == "plan_approved" && event.text("taskId").as_deref() == Some(task_id)
-        }))
+        let mut approved: HashSet<String> = HashSet::new();
+        let mut carried_from: HashMap<String, String> = HashMap::new();
+        for event in active_events(&content) {
+            let Some(event_task) = event.text("taskId") else {
+                continue;
+            };
+            match event.event_type.as_str() {
+                "plan_approved" => {
+                    approved.insert(event_task);
+                }
+                "plan_resumed" => {
+                    if let Some(from) = event.text("resumedFrom") {
+                        carried_from.insert(event_task, from);
+                    }
+                }
+                "plan_created" => {
+                    approved.remove(&event_task);
+                    carried_from.remove(&event_task);
+                }
+                _ => {}
+            }
+        }
+        let mut current = task_id.to_string();
+        let mut visited = HashSet::new();
+        while visited.insert(current.clone()) {
+            if approved.contains(&current) {
+                return Ok(true);
+            }
+            let Some(from) = carried_from.get(&current) else {
+                break;
+            };
+            current = from.clone();
+        }
+        Ok(false)
+    }
+
+    /// Whether `task_id`'s plan was carried in by [`Self::resume_plan`] and
+    /// nothing has changed it since: no step closed or started, no evidence
+    /// appended, and no plan of the task's own proposed or revised.
+    ///
+    /// Spec 83 reads this twice. A carried plan in this state may still be
+    /// replaced by the turn that carried it, because nothing yet ties evidence
+    /// to it; and a plan its carrying turn left in this state is not carried
+    /// again, so an unrelated question costs one turn with the plan on it
+    /// rather than every turn after.
+    pub fn carried_plan_untouched(&self, session_id: &str, task_id: &str) -> Result<bool> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(false);
+        };
+        let mut untouched = false;
+        for event in active_events(&content) {
+            if event.text("taskId").as_deref() != Some(task_id) {
+                continue;
+            }
+            match event.event_type.as_str() {
+                "plan_resumed" => untouched = true,
+                "plan_created" | "plan_revised" | "plan_step_updated" => untouched = false,
+                _ => {}
+            }
+        }
+        Ok(untouched)
     }
 
     /// Tasks carrying a usage entry for a model call lost to a crash, written

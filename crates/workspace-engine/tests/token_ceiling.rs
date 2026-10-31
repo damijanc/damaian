@@ -286,19 +286,31 @@ fn raising_the_ceiling_and_asking_again_resumes_the_plan() {
 
 #[test]
 fn a_turn_after_a_completed_task_starts_with_no_plan() {
-    // The complement. Carrying a plan into an unrelated next question would put
-    // steps on the panel the user never asked for, so the carry is narrow: only
-    // a ceiling stop, only with work outstanding.
+    // The complement: a plan with no work outstanding has nothing to resume.
+    // A typed turn after a task that left steps *open* does pick them up
+    // (spec 83, `plan_carry_over.rs`); one whose plan finished does not.
     let repo = temp_repo("no-carry");
     let engine = engine_with_ceiling(&repo, None);
+    let complete_step = || workspace_engine::ToolCall {
+        id: "c2".to_string(),
+        name: "complete_step".to_string(),
+        arguments_json: "{}".to_string(),
+    };
     let mut planner = MockModelAdapter::new_sequence_with_tool_calls(
-        vec![String::new(), "Done.".to_string()],
+        vec![
+            String::new(),
+            String::new(),
+            String::new(),
+            "Done.".to_string(),
+        ],
         vec![
             vec![workspace_engine::ToolCall {
                 id: "c1".to_string(),
                 name: "propose_plan".to_string(),
                 arguments_json: r#"{"steps":[{"title":"One"},{"title":"Two"}]}"#.to_string(),
             }],
+            vec![complete_step()],
+            vec![complete_step()],
             Vec::new(),
         ],
     );
@@ -500,11 +512,12 @@ fn continuing_after_a_crash_resumes_the_plan() {
     assert_eq!(carried.steps[0].title, planned.steps[0].title);
 }
 
-/// The carry stays narrow. A turn following one that merely *failed* — nothing
-/// superseded it, no ceiling stop — starts clean, so an unrelated next question
-/// does not inherit somebody else's steps.
+/// The carry stays bounded. A turn following one that left its plan open with
+/// nothing superseding it picks the plan up under spec 83's rule, not the
+/// hand-over rule above; an unrelated question that leaves the plan untouched
+/// ends that carry, so the turn after it starts clean.
 #[test]
-fn a_turn_after_an_unsuperseded_task_starts_with_no_plan() {
+fn a_turn_after_an_untouched_carry_starts_with_no_plan() {
     let repo = temp_repo("crash-no-carry");
     let engine = engine_with_ceiling(&repo, None);
     let mut planner = MockModelAdapter::new_sequence_with_tool_calls(
@@ -546,8 +559,36 @@ fn a_turn_after_an_unsuperseded_task_starts_with_no_plan() {
             .session_store
             .read_task_plan(&second.session.id, &second.task.id)
             .unwrap()
+            .is_some(),
+        "the open plan is picked up once"
+    );
+
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let third = engine
+        .chat_orchestrator
+        .ask_with_session(
+            &repo,
+            "Another unrelated question",
+            &[],
+            Some(&first.session.id),
+            &mut MockModelAdapter::new("Another answer."),
+            &mut sink,
+        )
+        .expect("the third turn should run");
+    assert!(
+        engine
+            .session_store
+            .read_task_plan(&third.session.id, &third.task.id)
+            .unwrap()
             .is_none(),
-        "nothing handed work over, so nothing should carry"
+        "the turn before left the plan untouched, so nothing should carry"
     );
 }
 

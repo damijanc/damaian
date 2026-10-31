@@ -1184,6 +1184,21 @@ A plan you declined at the review gate is different: its steps are shown as
 **skipped**, because your decision settled them. Damaian will not ask the model
 to complete work you refused.
 
+### Picking an open plan up again
+
+When a turn ends with steps still open, the next message you type in Code mode
+picks the plan up: "continue" carries on from the step that was running, and
+the panel shows the same plan under the new reply. If you approved the plan,
+you are not asked again; if you never had to, it is reviewed before its first
+change, like any plan. The verification after a patch and the work after it
+then follow the same plan, so a long task keeps going one step at a time.
+
+If you have moved on to something else, the assistant proposes a new plan in
+its place, and the old one stays recorded under the turn that made it. If it
+answers without touching the old plan, that plan is not carried into the turn
+after: one unrelated question does not keep it on the panel for the rest of the
+session. Ask, Plan and Review mode never pick a plan up.
+
 The panel survives a reload, so you can reopen an old session and still see
 what a turn came to.
 

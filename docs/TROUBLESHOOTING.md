@@ -1260,7 +1260,7 @@ showed:
 |-------|--------------|
 | `plan_created` | the model proposed the plan |
 | `plan_revised` | the user edited it at the review gate |
-| `plan_resumed` | a plan was carried onto a new task after a token stop, a tool-budget stop, or a crash-recovery `Continue` |
+| `plan_resumed` | a plan was carried onto a new task: after a token stop, a tool-budget stop, or a crash-recovery `Continue`; onto a typed Code-mode turn while the session's latest plan has open steps (spec 83); or onto a verification turn |
 | `plan_step_updated` | one step changed status or gained evidence |
 | `plan_approved` | the user cleared the review gate |
 
@@ -1682,6 +1682,15 @@ jq -r 'select(.eventType=="plan_resumed") | "\(.payload.taskId) resumed from \(.
 
 If no `plan_resumed` appears, the previous task either had no plan or had
 nothing outstanding — a plan whose steps all finished has nothing to resume.
+
+A turn you type in Code mode also picks up the session's latest plan while it
+has open steps other than verification steps, even when the turn before ended
+normally. It does not when the turn that last carried the plan left it
+untouched (a `plan_resumed` for that task with no `plan_step_updated` after
+it), when the session is in another mode, or when the plan's task ended
+interrupted. A `plan_created` for a task that also has a `plan_resumed` means
+the assistant replaced the carried plan with its own, which then needs its own
+review.
 
 ### The assistant seems to have forgotten something you said earlier
 

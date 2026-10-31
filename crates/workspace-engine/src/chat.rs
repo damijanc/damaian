@@ -5345,7 +5345,7 @@ impl ChatOrchestrator {
                 .superseded_task_ids(session_id)?
                 .contains(&previous.id);
         if !handed_over {
-            return Ok(());
+            return self.carry_the_open_plan(session_id, &tasks, task);
         }
         let Some(plan) = self
             .session_store
@@ -5357,6 +5357,55 @@ impl ChatOrchestrator {
             return Ok(());
         }
         self.session_store.resume_plan(task, &previous.id)
+    }
+
+    /// Picks up the session's latest plan for a turn the user typed
+    /// (`docs/specs/83_typed_turns_pick_up_the_open_plan.md`).
+    ///
+    /// A turn that ends with steps open — an answer after spec 66's reminder,
+    /// a patch the user still has to review — hands nothing over by the rule
+    /// above, and the user's "continue" then started with no plan. The
+    /// verification after its patch carried that empty plan, and spec 77
+    /// found nothing of the task's own to continue.
+    ///
+    /// The latest plan, not the previous task's: a turn that carried none (in
+    /// Ask mode, say) does not end the work. It is not picked up when its only
+    /// open steps are the verification loop's own `verify_` steps, when its
+    /// task ended in a crash (recovery decides that), outside Code mode, or
+    /// when the turn that last carried it left it untouched — so an unrelated
+    /// question costs one turn with the plan on it. The model may also replace
+    /// a carried plan it has not started on (`ProposePlan` below).
+    fn carry_the_open_plan(&self, session_id: &str, tasks: &[Task], task: &Task) -> Result<()> {
+        if self.session_store.session_mode(session_id) != SessionMode::Code {
+            return Ok(());
+        }
+        let plans = self.session_store.read_session_plans(session_id)?;
+        let Some((source, plan)) = tasks
+            .iter()
+            .rev()
+            .filter(|candidate| candidate.id != task.id)
+            .find_map(|candidate| plans.get(&candidate.id).map(|plan| (candidate, plan)))
+        else {
+            return Ok(());
+        };
+        if matches!(
+            source.status,
+            TaskStatus::Interrupted | TaskStatus::UnknownExternalOutcome
+        ) {
+            return Ok(());
+        }
+        let work_left = plan
+            .open_steps()
+            .iter()
+            .any(|step| !step.id.starts_with("verify_"));
+        if !work_left
+            || self
+                .session_store
+                .carried_plan_untouched(session_id, &source.id)?
+        {
+            return Ok(());
+        }
+        self.session_store.resume_plan(task, &source.id)
     }
 
     /// Seeds a new turn with the previous turn's final notes (spec 65 §5.5).
@@ -6267,7 +6316,7 @@ impl ChatOrchestrator {
         // decision the user took, and a turn resumed after a restart must not
         // ask for it again. It is only ever read here — the gate below is the
         // single place it decides anything.
-        let plan_approved = self
+        let mut plan_approved = self
             .session_store
             .read_plan_approved(&session.id, &task.id)
             .unwrap_or(false);
@@ -7683,7 +7732,17 @@ impl ChatOrchestrator {
                             }
                         }
                         ToolAction::ProposePlan(steps) => {
-                            if plan.is_some() {
+                            // A plan an earlier turn made, carried in and not yet
+                            // started on, is the one exception (spec 83 §5.4): the
+                            // user may have moved on to other work, and nothing
+                            // this turn observed is tied to it yet. It stays
+                            // recorded under the task that made it.
+                            let replaceable = plan.is_some()
+                                && self
+                                    .session_store
+                                    .carried_plan_untouched(&session.id, &task.id)
+                                    .unwrap_or(false);
+                            if plan.is_some() && !replaceable {
                                 // Refused rather than replaced. Steps already carry
                                 // evidence tied to a state of the repository, and
                                 // rewriting the plan underneath that evidence produces
@@ -7722,6 +7781,8 @@ impl ChatOrchestrator {
                                     });
                                 }
                                 self.session_store.create_plan(&task, &proposed)?;
+                                // A replaced plan's approval was for the old steps.
+                                plan_approved = false;
                                 sink.plan(&proposed);
                                 let summary = format!("Planned {} steps.", proposed.steps.len());
                                 let first = proposed.steps[0].title.clone();
@@ -12462,7 +12523,7 @@ fn propose_patch_tool_definition() -> ToolDefinition {
 fn propose_plan_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "propose_plan".to_string(),
-        description: "Propose an ordered plan for non-trivial work, before starting it. Use this when the task needs more than one step — a single question or a single file read needs no plan. Do not report a step's outcome here; call complete_step when a step's work is done and Damaian will record how it ended from what it observed.".to_string(),
+        description: "Propose an ordered plan for non-trivial work, before starting it. Use this when the task needs more than one step — a single question or a single file read needs no plan. Do not report a step's outcome here; call complete_step when a step's work is done and Damaian will record how it ended from what it observed. If the context shows a plan carried forward from an earlier turn and the user has moved on to different work, propose a new plan before starting on the old one; the earlier plan stays recorded.".to_string(),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"steps\":{\"type\":\"array\",\"minItems\":2,\"items\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"Short imperative title for the step\"},\"detail\":{\"type\":\"string\",\"description\":\"Optional longer description\"}},\"required\":[\"title\"]}}},\"required\":[\"steps\"]}".to_string(),
     }
 }
