@@ -29,7 +29,7 @@ harness, and **Release** covers packaging, signing and distribution.
 
 | | |
 |---|---|
-| **Next** | - Per-tool MCP management, where nothing installed can widen what you allowed.<br>- Keep direct user no-touch paths out of a task's patches, including worker repairs and resumed work. |
+| **Next** | - Per-tool MCP management, where nothing installed can widen what you allowed.<br>- Keep direct user no-touch paths out of a task's patches, including worker repairs and resumed work.<br>- Call a worker task complete only when its approved plan and required verification are actually closed; otherwise keep a resumable incomplete outcome.<br>- Baseline checks before a patch, repair only introduced regressions, and stop repairs that repeat or oscillate.<br>- Let a worker ask a material clarification and continue across bounded internal segments without losing its safety decisions or overflowing the model context.<br>- Prove the complete one-worker workflow with a specification-sized deterministic fixture and three consecutive fresh live runs. |
 | **After that** | - Order each request so the provider's prompt cache can serve more of it, cutting cost and waiting time.<br>- Accept a pasted screenshot, and let the agent look at the screenshots its own browser diagnostics already capture. |
 | **Later** | - Open a pull request from the commits Damaian prepares, as its own explicit approval.<br>- Let another tool read your repository through Damaian, read-only, with the same redaction and path rules.<br>- Run several agents in parallel, only if measurement shows it beats a single agent. Abandoning it is a legitimate outcome. |
 

@@ -101,7 +101,10 @@ that contains both (Quality run 40902516310).
 #100 finished on 2026-10-31; their local checks passed, and the full gate is left
 to CI. Several were evidence-driven or
 usability specs added outside the roadmap order; being finished, none of them
-changes what may be built next.
+changes what may be built next. #101–#106 are the not-yet-built single-worker
+reliability sequence added after the failed spec 86 attempt: truthful
+completion, safe repair, bounded continuation, worker questions, structured
+checks, and the acceptance gate that proves the sequence works as one system.
 
 - **Done:** #30 memory retrieval and lifecycle finished on
   2026-10-30, built on branch `spec-30-memory-recall` (Tasks 1–6 on
@@ -120,14 +123,23 @@ changes what may be built next.
   path so it does not rebase over it. [#98](98_task_scoped_protected_patch_paths.md)
   is also ready: it makes direct user no-touch paths an engine-enforced,
   task-scoped patch fence across worker and repair continuations.
+  [#101](101_closed_task_completion.md) and [#104](104_worker_questions.md)
+  are dependency-ready too, but both share the agent loop with #33 and #98 and
+  must not be implemented concurrently with either.
 - **Blocked:** #37 on #33; #52 on #33; #39 on #38; #40 on #38 and #39; #54 on
-  Phase 1 WP3 (provider capability validation), which is unspecified.
+  Phase 1 WP3 (provider capability validation), which is unspecified. In the
+  single-worker sequence, [#102](102_repair_provenance_and_stagnation.md) is
+  blocked on #98; [#103](103_bounded_worker_continuation.md) on #101 and #102;
+  [#105](105_structured_plan_checks.md) on #101; and
+  [#106](106_single_worker_spec_acceptance.md) on #98 and #101–#105.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
 - **Pairing:** two specs may run together only if at most one of them edits
   `chat.rs`, and #49's reuse slice is a solo `chat.rs` track while it rewrites
   the request around `build_model_prompt`. #33 edits `chat.rs` through the MCP
   tool list and per-tool dispatch, and #98 edits it through patch dispatch and
-  continuation state; either owns that file while it is in flight.
+  continuation state; either owns that file while it is in flight. #101–#105
+  also touch the task/agent loop and form one serial implementation track.
+  #106 follows that track and primarily owns the eval harness.
   Every Done spec no longer constrains anything. See
   [Parallel work](#parallel-work).
 - **Open decision:** the priority table below predates #59–#80 and does not
@@ -863,6 +875,12 @@ is ready.
 | 98 | [98_task_scoped_protected_patch_paths.md](98_task_scoped_protected_patch_paths.md) | **Not started.** A worker ignored a direct no-touch instruction and proposed deleting an unrelated file after a failed check. Direct user path exclusions will become durable, task-scoped patch fences enforced before proposal and again before apply, across verification, repairs, worker restart, and reload. A rejected file alone remains a review decision, not an implicit permanent ban. |
 | 99 | [99_worker_task_outcomes.md](99_worker_task_outcomes.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A worker's `idle` process state hid whether its task had completed, needed a decision, or had stopped short. The worker session now derives an explicit outcome and next action from durable task status, approvals, errors and progress timestamps; the board also treats an idle pending decision as **Needs you**. |
 | 100 | [100_worker_return_and_inline_choice.md](100_worker_return_and_inline_choice.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A completed worker now returns one redacted, durable terminal outcome to its parent; the parent shows a result card whose **Continue with result** starts an ordinary turn rather than approving or merging anything, and a suggested worker prompt offers **Work here instead** beside **Start worker**. |
+| 101 | [101_closed_task_completion.md](101_closed_task_completion.md) | **Not started.** A model answer can currently become `complete` while approved plan work or verification remains. Completion will become an engine-owned gate; an answer with open work becomes a durable, resumable `incomplete` outcome instead of worker success. |
+| 102 | [102_repair_provenance_and_stagnation.md](102_repair_provenance_and_stagnation.md) | **Not started; blocked on #98.** Checks will be baselined before the patch that first selects them, repair will target only introduced regressions, environment failures will not trigger source edits, and repeated or oscillating repairs will stop before the numeric limit. |
+| 103 | [103_bounded_worker_continuation.md](103_bounded_worker_continuation.md) | **Not started; blocked on #101 and #102.** A user-approved task budget will span internal worker segments, while deterministic within-turn tool-history compaction keeps requests inside the provider window and no-progress or budget exhaustion remains a truthful stop. |
+| 104 | [104_worker_questions.md](104_worker_questions.md) | **Not started.** An app-managed worker will be able to persist a real clarification, show **Needs your answer**, and resume through its control socket without treating an answer as an approval or guessing a material product decision. |
+| 105 | [105_structured_plan_checks.md](105_structured_plan_checks.md) | **Not started; blocked on #101.** Approved plan steps will carry structured required checks with command, directory and current evidence, replacing #97's prose match and giving the completion gate an engine-owned verification obligation. |
+| 106 | [106_single_worker_spec_acceptance.md](106_single_worker_spec_acceptance.md) | **Not started; blocked on #98 and #101–#105.** A deterministic fixture and three consecutive fresh live runs will prove that one real worker can finish one specification-sized task without generic rescue prompts, while all existing safety decisions remain explicit. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:
