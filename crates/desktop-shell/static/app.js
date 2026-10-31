@@ -9107,7 +9107,10 @@ function plural(count, one, many) {
 
 // The one visible action of a row (§5.7).
 function workerRowAction(row, projectPath) {
-  if (row.group === "needs_you" && row.state === "waiting_for_approval") {
+  if (
+    row.group === "needs_you" &&
+    (row.state === "waiting_for_approval" || row.taskStatus === "waiting_for_approval")
+  ) {
     return {
       label: "Review",
       run: () => openWorkerSession(row.sessionId, { source: projectPath, review: true }),
@@ -9350,6 +9353,145 @@ const WORKER_VIEW_LABELS = {
   shutting_down: ["finished", "Stopping"],
 };
 
+const WORKER_TASK_OUTCOMES = {
+  complete: [
+    "finished",
+    "Task complete",
+    "The worker finished this task. Send a follow-up to start another one.",
+  ],
+  cancelled: [
+    "failed",
+    "Task stopped",
+    "The task stopped before completion. Send a message with how to continue.",
+  ],
+  failed: [
+    "failed",
+    "Task failed",
+    "The task did not complete. Send a message to repair or retry it.",
+  ],
+  interrupted: [
+    "failed",
+    "Task interrupted",
+    "The worker stopped before the task completed. Restart it to continue.",
+  ],
+  unknown_external_outcome: [
+    "failed",
+    "Outcome needs review",
+    "The worker stopped during an external action, so its outcome is unknown. Inspect the worktree before continuing.",
+  ],
+  tool_budget_exhausted: [
+    "failed",
+    "Task needs continuation",
+    "The worker reached its tool-round limit before completion. Send a message to continue it.",
+  ],
+  token_budget_exhausted: [
+    "failed",
+    "Task needs continuation",
+    "The worker reached its token limit before completion. Send a message to continue it.",
+  ],
+};
+
+const WORKER_STALE_PROGRESS_AFTER_MS = 30_000;
+
+function workerActivityDetail(view) {
+  if (!Number.isFinite(view.lastActivityAtMs)) return "Waiting for the worker to report progress.";
+  const elapsed = Math.max(0, Date.now() - view.lastActivityAtMs);
+  if (elapsed < WORKER_STALE_PROGRESS_AFTER_MS) return "Worker progress is up to date.";
+  return `No worker progress for ${formatElapsed(elapsed)}. It may still be waiting for the model.`;
+}
+
+// A worker process is intentionally idle between jobs. That lifecycle state is
+// not an outcome users can act on, so derive the task-level result from the
+// durable progress record before drawing any worker control.
+function workerViewOutcome(view) {
+  if (!view.alive) {
+    const taskOutcome = WORKER_TASK_OUTCOMES[view.taskStatus];
+    if (taskOutcome) {
+      const [dot, label, detail] = taskOutcome;
+      return {
+        dot,
+        label,
+        detail: `${detail} Restart the worker to send another message.`,
+        ended: true,
+      };
+    }
+    const interrupted = view.taskStatus === "interrupted" || WORKER_TURN_STATES.has(view.state);
+    return interrupted
+      ? {
+          dot: "failed",
+          label: "Task interrupted",
+          detail: "The worker process ended before completion.",
+          ended: true,
+        }
+      : {
+          dot: "finished",
+          label: "Worker ended",
+          detail: "Restart the worker to send another task.",
+          ended: true,
+        };
+  }
+  if (view.state === "running") {
+    return { dot: "running", label: "Working", detail: workerActivityDetail(view), ended: false };
+  }
+  if (view.state === "paused") {
+    return {
+      dot: "paused",
+      label: "Paused",
+      detail: "Resume it with a note when you are ready.",
+      ended: false,
+    };
+  }
+  if (workerApprovalToShow(view)) {
+    return {
+      dot: "needs-you",
+      label: "Needs your decision",
+      detail: "Review the proposal below before the task can continue.",
+      needsDecision: true,
+      ended: false,
+    };
+  }
+  if (view.state === "waiting_for_approval") {
+    return {
+      dot: "needs-you",
+      label: "Needs your decision",
+      detail: "The worker is waiting for an approval to continue.",
+      needsDecision: true,
+      ended: false,
+    };
+  }
+  if (view.state === "shutting_down") {
+    return {
+      dot: "finished",
+      label: "Stopping",
+      detail: "The worker is shutting down.",
+      ended: false,
+    };
+  }
+  if (view.turnError) {
+    return { dot: "failed", label: "Task failed", detail: view.turnError, ended: false };
+  }
+  const taskOutcome = WORKER_TASK_OUTCOMES[view.taskStatus];
+  if (taskOutcome) {
+    const [dot, label, detail] = taskOutcome;
+    return { dot, label, detail, ended: false };
+  }
+  if (view.hasRun) {
+    return {
+      dot: "failed",
+      label: "Stopped without an outcome",
+      detail:
+        "The worker ended its turn without recording whether the task completed. Send a message to continue or inspect the worktree.",
+      ended: false,
+    };
+  }
+  return {
+    dot: "running",
+    label: "Starting worker",
+    detail: "Waiting for the worker to begin its first task.",
+    ended: false,
+  };
+}
+
 // What the composer's button sends in each state (§5.7), with its label and
 // the field's placeholder.
 const WORKER_COMPOSER_MODES = {
@@ -9396,6 +9538,9 @@ function syncWorkerView() {
       state: row.alive ? row.state : "exited",
       round: row.round ?? null,
       maxRounds: row.maxRounds ?? null,
+      taskStatus: row.taskStatus || "",
+      lastActivityAtMs: null,
+      hasRun: false,
       lastPhase: null,
       plan: null,
       approval: null,
@@ -9502,14 +9647,16 @@ async function applyWorkerProgress(view, answer) {
   let jobEnded = false;
   for (const event of Array.isArray(answer.events) ? answer.events : []) {
     view.after = Math.max(view.after, Number(event.seq) || 0);
+    if (Number.isFinite(event.timestampMs)) view.lastActivityAtMs = event.timestampMs;
     const payload = event.payload || {};
     if (event.kind === "status") {
       const before = view.state;
       view.state = payload.state || view.state;
+      if (payload.taskStatus) view.taskStatus = payload.taskStatus;
       if (view.state === "running" && before !== "paused" && before !== "running") {
         // A new job: a turn, or the rest of one after an approval.
         Object.assign(view, { liveText: "", plan: null, approval: null, lastPhase: null });
-        view.turnError = "";
+        Object.assign(view, { turnError: "", taskStatus: "", hasRun: true });
         if (live) {
           finishWorkerLive(view);
           showWorkerLive(view);
@@ -9577,6 +9724,9 @@ function resetWorkerViewForRestart(view) {
     state: "idle",
     round: null,
     maxRounds: null,
+    taskStatus: "",
+    lastActivityAtMs: null,
+    hasRun: false,
     lastPhase: null,
     plan: null,
     approval: null,
@@ -9628,16 +9778,7 @@ async function showWorkerNote(view, messageId) {
 }
 
 function workerViewStatus(view) {
-  if (!view.alive) {
-    const unfinished =
-      workerRowFor(view.sessionId)?.taskStatus === "interrupted" ||
-      WORKER_TURN_STATES.has(view.state);
-    return unfinished
-      ? { dot: "failed", label: "Interrupted", ended: true }
-      : { dot: "finished", label: "Ended", ended: true };
-  }
-  const [dot, label] = WORKER_VIEW_LABELS[view.state] || ["finished", "Idle"];
-  return { dot, label, ended: false };
+  return workerViewOutcome(view);
 }
 
 function workerViewRow(view) {
@@ -9719,11 +9860,7 @@ function renderWorkerStrip(view) {
     top.querySelector(".thread-header").after(strip);
   }
   const status = workerViewStatus(view);
-  const note = view.pollError
-    ? `Could not refresh: ${view.pollError}`
-    : view.turnError
-      ? `Last turn failed: ${view.turnError}`
-      : "";
+  const note = view.pollError ? `Could not refresh: ${view.pollError}` : status.detail;
   const signature = JSON.stringify([status, view.state, view.round, view.maxRounds, note]);
   // Redrawn only when it changed, so a focused button is not replaced each second.
   if (strip.dataset.signature === signature) return;
@@ -9738,22 +9875,24 @@ function renderWorkerStrip(view) {
   dot.setAttribute("aria-hidden", "true");
   pill.append(dot, document.createTextNode(status.label));
 
-  const round = document.createElement("span");
-  round.className = "worker-round";
-  const bar = document.createElement("span");
-  bar.className = "workers-rounds-bar";
-  bar.setAttribute("aria-hidden", "true");
-  const fill = document.createElement("span");
-  const known =
-    Number.isFinite(view.round) && Number.isFinite(view.maxRounds) && view.maxRounds > 0;
-  fill.style.width = known ? `${Math.min(100, (view.round / view.maxRounds) * 100)}%` : "0%";
-  bar.append(fill);
-  round.append(
-    bar,
-    document.createTextNode(known ? `Round ${view.round}/${view.maxRounds}` : "Round —"),
-  );
-
-  const parts = [pill, round];
+  const parts = [pill];
+  if (view.state === "running" || view.state === "paused") {
+    const round = document.createElement("span");
+    round.className = "worker-round";
+    const bar = document.createElement("span");
+    bar.className = "workers-rounds-bar";
+    bar.setAttribute("aria-hidden", "true");
+    const fill = document.createElement("span");
+    const known =
+      Number.isFinite(view.round) && Number.isFinite(view.maxRounds) && view.maxRounds > 0;
+    fill.style.width = known ? `${Math.min(100, (view.round / view.maxRounds) * 100)}%` : "0%";
+    bar.append(fill);
+    round.append(
+      bar,
+      document.createTextNode(known ? `Round ${view.round}/${view.maxRounds}` : "Round —"),
+    );
+    parts.push(round);
+  }
   if (note) {
     const text = document.createElement("span");
     text.className = "worker-strip-note";
@@ -9819,6 +9958,17 @@ async function restartWorkerFromView(view) {
 
 function workerComposerMode(view) {
   if (!view.alive || view.sending) return null;
+  if (workerViewOutcome(view).needsDecision) return null;
+  if (view.state === "idle" && view.taskStatus === "complete") {
+    return [
+      "message",
+      "Send follow-up",
+      "The task is complete. Send a follow-up to start another task",
+    ];
+  }
+  if (view.state === "idle" && view.hasRun) {
+    return ["message", "Continue task", "Tell the worker how to continue this unfinished task"];
+  }
   return WORKER_COMPOSER_MODES[view.state] || null;
 }
 
@@ -9834,9 +9984,10 @@ function renderWorkerComposer(view) {
   const mode = workerComposerMode(view);
   let placeholder = mode?.[2];
   if (!mode && !view.sending) {
-    if (workerViewStatus(view).ended) {
+    const outcome = workerViewOutcome(view);
+    if (outcome.ended) {
       placeholder = "This worker's process has ended. Restart it to continue.";
-    } else if (view.state === "waiting_for_approval") {
+    } else if (outcome.needsDecision) {
       placeholder = "Approve or reject the proposal above first. A waiting worker takes no notes.";
     } else {
       placeholder = "The worker is stopping.";

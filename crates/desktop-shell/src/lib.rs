@@ -8486,6 +8486,7 @@ mod tests {
         ] {
             assert!(label.contains(wording), "{wording} in {label}");
         }
+
         let card = app
             .split("function createCheckBatchCard(")
             .nth(1)
@@ -8518,6 +8519,19 @@ mod tests {
             style.contains(".check-batch-run,"),
             "the checkbox keeps its size"
         );
+    }
+
+    /// A worker's process can be idle while a patch or fallback card still
+    /// needs a user decision. The session view must retain the durable task
+    /// result rather than presenting that state as unexplained idle.
+    #[test]
+    fn worker_session_explains_task_outcomes_and_stale_progress() {
+        assert!(super::APP_JS.contains("const WORKER_TASK_OUTCOMES"));
+        assert!(super::APP_JS.contains("function workerViewOutcome(view)"));
+        assert!(super::APP_JS.contains("Needs your decision"));
+        assert!(super::APP_JS.contains("Stopped without an outcome"));
+        assert!(super::APP_JS.contains("No worker progress for"));
+        assert!(super::APP_JS.contains("Send follow-up"));
     }
 
     /// Spec 32 Task 6: a `before_patch_apply` hook's denial is the error text
@@ -14283,6 +14297,7 @@ exec /bin/cat > /dev/null
             let other_repo = repository(&fixture.root, "o");
             let parent = fixture.parent("Planner");
             let waiting = fixture.spawn("Waiting one", Some(&parent));
+            let patch_waiting = fixture.spawn("Patch waiting", None);
             let running = fixture.spawn("Running one", None);
             let done = fixture.spawn("Done one", None);
             let gone = fixture.spawn("Gone one", None);
@@ -14303,6 +14318,13 @@ exec /bin/cat > /dev/null
                 &[(
                     ProgressKind::Status,
                     json!({"state": "waiting_for_approval"}),
+                )],
+            );
+            progress(
+                &patch_waiting.session_id,
+                &[(
+                    ProgressKind::Status,
+                    json!({"state": "idle", "taskStatus": "waiting_for_approval"}),
                 )],
             );
             progress(
@@ -14366,6 +14388,7 @@ exec /bin/cat > /dev/null
             assert_eq!(
                 summary,
                 vec![
+                    row("Patch waiting", "needs_you", "idle"),
                     row("Waiting one", "needs_you", "waiting_for_approval"),
                     row("Running one", "running", "running"),
                     row("Gone one", "finished", "exited"),
@@ -14389,6 +14412,8 @@ exec /bin/cat > /dev/null
             assert_eq!(waiting_row["parentTitle"], "Planner");
             assert_eq!(waiting_row["alive"], true);
             assert_eq!(waiting_row["filesChanged"], Value::Null);
+            let patch_waiting_row = by_title(&rows, "Patch waiting");
+            assert_eq!(patch_waiting_row["doing"], "Needs your decision");
             let running_row = by_title(&rows, "Running one");
             assert_eq!(running_row["parentTitle"], Value::Null);
             assert_eq!(running_row["round"], 2);

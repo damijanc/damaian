@@ -97,7 +97,7 @@ and worktree delivery finished on 2026-10-28 and were merged into `main` that
 day; the full seven-check gate passed in CI on 2026-10-29 for the `main` push
 that contains both (Quality run 40902516310).
 
-#60–#85 and #87–#97 are also Done (see their rows below). Several were evidence-driven or
+#60–#85, #87–#97, and #99 are also Done (see their rows below). Several were evidence-driven or
 usability specs added outside the roadmap order; being finished, none of them
 changes what may be built next.
 
@@ -859,6 +859,7 @@ is ready.
 | 96 | [96_continue_repair_at_the_limit.md](96_continue_repair_at_the_limit.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: the repair limit defaulted to 2 and a worker had no way to continue after it, so an interrupted draft let only workers repair past the limit. The default is now 16, every session still stops at the limit, and a **Continue repair** action starts exactly one more attempt on the user's explicit decision, for ordinary and worker sessions. The failed plan and evidence carry into that attempt, every approval still applies, a second activation is refused, and the offer is redrawn from the durable log after a reload. |
 | 97 | [97_reuse_planned_verification_steps.md](97_reuse_planned_verification_steps.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A task plan can name `cargo test` as its final step, but automatic verification selected the same command after every patch and activated a second `verify_` step beside the carried primary work. Verification now defers an exact planned whole-suite check until the worker reaches its final plan step, and leaves a secondary check pending while another primary step is active, so every durable log prefix preserves the one-in-progress invariant. |
 | 98 | [98_task_scoped_protected_patch_paths.md](98_task_scoped_protected_patch_paths.md) | **Not started.** A worker ignored a direct no-touch instruction and proposed deleting an unrelated file after a failed check. Direct user path exclusions will become durable, task-scoped patch fences enforced before proposal and again before apply, across verification, repairs, worker restart, and reload. A rejected file alone remains a review decision, not an implicit permanent ban. |
+| 99 | [99_worker_task_outcomes.md](99_worker_task_outcomes.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A worker's `idle` process state hid whether its task had completed, needed a decision, or had stopped short. The worker session now derives an explicit outcome and next action from durable task status, approvals, errors and progress timestamps; the board also treats an idle pending decision as **Needs you**. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:

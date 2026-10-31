@@ -1043,19 +1043,22 @@ fn worker_row(
                 .ok()
                 .and_then(|tasks| tasks.last().map(|task| task.status.as_str().to_string()))
         });
-    let finished_task = task_status
-        .as_deref()
-        .and_then(TaskStatus::parse)
-        .is_some_and(|status| status.is_terminal());
-    let group = match (alive, reported.as_str()) {
-        (true, "waiting_for_approval" | "paused") => Group::NeedsYou,
-        (true, "running") => Group::Running,
-        // Idle before its first turn has finished: starting, not done.
-        (true, "idle") if !finished_task => Group::Running,
+    let parsed_task_status = task_status.as_deref().and_then(TaskStatus::parse);
+    let group = match (alive, reported.as_str(), parsed_task_status.as_ref()) {
+        (true, "waiting_for_approval" | "paused", _) => Group::NeedsYou,
+        // Patch and fallback cards end their turn, so their process is idle
+        // while the user still has a decision to make.
+        (true, _, Some(TaskStatus::WaitingForApproval)) => Group::NeedsYou,
+        (true, "running", _) => Group::Running,
+        // An idle worker before its first task is starting. An active task
+        // without a running state is likewise still in progress, but a
+        // recovery-only status such as Interrupted is neither.
+        (true, "idle", None) => Group::Running,
+        (true, "idle", Some(status)) if status.is_active() => Group::Running,
         _ => Group::Finished,
     };
     // A process that ended part way through a turn left it unfinished (§5.3).
-    if !alive && task_status.is_some() && !finished_task {
+    if !alive && parsed_task_status.is_some_and(|status| !status.is_terminal()) {
         task_status = Some(TaskStatus::Interrupted.as_str().to_string());
     }
     let state = if alive { reported.as_str() } else { "exited" };
@@ -1066,6 +1069,9 @@ fn worker_row(
             "waiting_for_approval" => Some("Waiting for approval".to_string()),
             "paused" => Some("Paused".to_string()),
             "running" => phase["label"].as_str().map(str::to_string),
+            "idle" if task_status.as_deref() == Some(TaskStatus::WaitingForApproval.as_str()) => {
+                Some("Needs your decision".to_string())
+            }
             _ => None,
         }
     };

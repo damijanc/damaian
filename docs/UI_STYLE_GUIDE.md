@@ -325,16 +325,23 @@ project (muted, truncated like the planner), planner, rounds (`.workers-rounds-b
 
 **The worker strip.** `.worker-strip` sits under the header of a worker's own
 session: one row at least 40px tall, on `--surface-soft`. Left to right: the
-`.worker-pill` (dot and state), `.worker-round` (the rounds bar and
-*Round n/m*), an optional `.worker-strip-note` that truncates, and
-`.worker-strip-actions` pushed right. The actions follow §4: *Pause* is a
-`.btn-sm`, *Resume* is the one `.btn-primary`, *Stop* is `.btn-danger`; an
-ended worker shows only *Restart worker*.
+`.worker-pill` names the task outcome, not bare process state — *Working*,
+*Needs your decision*, *Task complete*, or the specific stopped outcome. While
+working or paused it is followed by `.worker-round` (the rounds bar and *Round
+n/m*); `.worker-strip-note` gives the durable next action or the time since the
+last worker update, and may wrap rather than hiding that outcome.
+`.worker-strip-actions` are pushed right.
+The actions follow §4: *Pause* is a `.btn-sm`, *Resume* is the one
+`.btn-primary`, *Stop* is `.btn-danger`; an ended worker shows only *Restart
+worker*.
 
 **The worker's composer.** The round send button becomes
 `.send-button.is-worker-command`, a labelled pill that says what it sends —
 *Send note* while running, *Resume with note* while paused, *Send message*
-when idle — and stays the row's one filled control. `body.worker-view` hides
+when idle — except *Send follow-up* after completion and *Continue task* after
+an unfinished settled turn — and stays the row's one filled control. A pending
+decision disables it so the review card remains the only route forward.
+`body.worker-view` hides
 the attach and model menus, because neither reaches a worker.
 
 **In the parent conversation.** A `worker-prompt` code block gets a

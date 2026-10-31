@@ -4233,11 +4233,9 @@ body.workers-board-open .worker-strip {
 }
 
 .worker-strip-note {
-  min-width: 0;
-  overflow: hidden;
+  flex: 1 1 240px;
   color: var(--muted);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.35;
 }
 
 .worker-strip-actions {
