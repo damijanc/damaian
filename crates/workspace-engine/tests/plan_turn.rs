@@ -1856,3 +1856,84 @@ fn a_provider_failure_keeps_its_step_open() {
     assert_eq!(left_open.len(), 1);
     assert_eq!(left_open[0]["stopReason"].as_str(), Some("failed"));
 }
+
+/// Spec 94: a plan put up for review can be handed to a worker. The prompt
+/// carries the request and the plan as the card has it, and reading it leaves
+/// the pause alone; handing over ends the turn with nothing changed here.
+#[test]
+fn a_plan_under_review_is_handed_to_a_worker() {
+    let repo = temp_repo("hand-over");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Read the retry helper"},{"title":"Add a bounded backoff"}]}"#,
+        )],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(
+        &engine,
+        &repo,
+        "Add retry handling to the upload client",
+        &mut adapter,
+    );
+    let proposal = paused
+        .plan_proposal
+        .clone()
+        .expect("the plan should be put up");
+    let plan = plan_of(&engine, &paused).expect("a plan");
+
+    let prompt = engine
+        .chat_orchestrator
+        .plan_worker_prompt(&proposal.id, None)
+        .unwrap();
+    assert!(
+        prompt.starts_with("Add retry handling to the upload client"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("1. Read the retry helper\n2. Add a bounded backoff"),
+        "{prompt}"
+    );
+    let revised = engine
+        .chat_orchestrator
+        .plan_worker_prompt(
+            &proposal.id,
+            Some(vec![PlanRevisionStep {
+                id: plan.steps[1].id.clone(),
+                title: "Add a capped backoff".to_string(),
+            }]),
+        )
+        .unwrap();
+    assert!(revised.contains("1. Add a capped backoff\n"), "{revised}");
+    assert!(!revised.contains("Read the retry helper"), "{revised}");
+
+    engine
+        .chat_orchestrator
+        .hand_plan_to_worker(&proposal.id, "session_worker", "tester")
+        .unwrap();
+
+    let task = engine
+        .session_store
+        .read_tasks(&paused.session.id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == paused.task.id)
+        .unwrap();
+    assert_eq!(task.status, TaskStatus::Complete);
+    let plan = plan_of(&engine, &paused).unwrap();
+    assert!(
+        plan.steps
+            .iter()
+            .all(|step| step.status == StepStatus::Skipped),
+        "{plan:?}"
+    );
+    assert!(!repo.join("src/retry.rs").exists(), "nothing changed here");
+    assert!(
+        engine
+            .chat_orchestrator
+            .hand_plan_to_worker(&proposal.id, "session_worker", "tester")
+            .is_err(),
+        "the pause is answered once"
+    );
+}

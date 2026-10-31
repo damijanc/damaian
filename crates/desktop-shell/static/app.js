@@ -13271,6 +13271,17 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
   declineButton.className = "btn-sm btn-quiet";
   declineButton.textContent = "Decline";
   actions.append(approveButton, declineButton);
+  // Spec 94: a plan is the moment a task shows its size, so the card offers to
+  // run it in its own worktree instead of this checkout. Damaian offers it, not
+  // the model. Not in a worker, whose card is answered in its own process.
+  let workerButton = null;
+  if (!decideInWorker && workersEnabled && currentSessionId && !isWorkerSession(currentSessionId)) {
+    workerButton = document.createElement("button");
+    workerButton.type = "button";
+    workerButton.className = "btn-sm";
+    workerButton.textContent = "Run in a worker";
+    actions.insertBefore(workerButton, declineButton);
+  }
 
   const output = document.createElement("pre");
   output.className = "command-approval-output";
@@ -13392,6 +13403,44 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
   declineButton.addEventListener("click", async () => {
     try {
       await decide(false);
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  // The pause stays until a worker has started: a dialog the user cancels
+  // leaves the card answerable, and the turn ends here only once the work has
+  // somewhere to go.
+  workerButton?.addEventListener("click", async () => {
+    const sessionId = currentSessionId;
+    const revision = revisionOrNull();
+    try {
+      const { prompt } = await api(
+        "/api/plan-worker-prompt",
+        form({
+          repo: proposalRepo,
+          proposal_id: proposal.proposalId,
+          steps: revision ? JSON.stringify(revision) : "",
+        }),
+      );
+      const started = await showNewWorkerDialog({ prompt, parentSessionId: sessionId });
+      if (!started) return;
+      await api(
+        "/api/plan-to-worker",
+        form({
+          repo: proposalRepo,
+          proposal_id: proposal.proposalId,
+          worker_session_id: started.sessionId,
+        }),
+      );
+      [approveButton, declineButton, workerButton].forEach((button) => {
+        button.disabled = true;
+      });
+      list.querySelectorAll("input, button").forEach((control) => {
+        control.disabled = true;
+      });
+      output.hidden = false;
+      output.replaceChildren(createWorkerLink(started, "Handed to"));
+      await loadSessions(sessionId, false);
     } catch (error) {
       toast(error.message);
     }

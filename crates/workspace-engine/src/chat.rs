@@ -4077,6 +4077,114 @@ impl ChatOrchestrator {
     /// model as a message, and the model asks again for whatever it still
     /// needs. Replaying the deferred call instead would run the step the user
     /// may have just deleted.
+    /// The prompt a worker gets for a turn paused on its plan review (spec 94):
+    /// the request that started the turn and the plan as the user left it on
+    /// the card. Read-only, so the pause survives a worker dialog the user
+    /// cancels.
+    pub fn plan_worker_prompt(
+        &self,
+        proposal_id: &str,
+        revised: Option<Vec<PlanRevisionStep>>,
+    ) -> Result<String> {
+        let pending = self.pending_commands.load(proposal_id)?;
+        if pending.plan_review.is_none() {
+            return Err(ClientError::InvalidInput(format!(
+                "{proposal_id} is not waiting for a plan review"
+            )));
+        }
+        let plan = self
+            .session_store
+            .read_task_plan(&pending.session.id, &pending.task.id)?;
+        let steps: Vec<String> = match (revised, plan) {
+            (Some(revision), Some(current)) => apply_plan_revision(&current, &revision)
+                .steps
+                .into_iter()
+                .filter(|step| !step.status.is_terminal())
+                .map(|step| step.title)
+                .collect(),
+            (_, Some(current)) => current
+                .steps
+                .into_iter()
+                .filter(|step| !step.status.is_terminal())
+                .map(|step| step.title)
+                .collect(),
+            (_, None) => Vec::new(),
+        };
+        // The request that set the work out, not a typed "continue": the
+        // latest prompt the user typed that says something.
+        let request = self
+            .session_store
+            .read_tasks(&pending.session.id)?
+            .into_iter()
+            .rev()
+            .map(|task| task.user_prompt)
+            .find(|prompt| {
+                !is_damaian_task_prompt(prompt) && prompt.split_whitespace().count() >= 4
+            })
+            .unwrap_or_else(|| pending.task.user_prompt.clone());
+        let mut prompt = request.trim().to_string();
+        if !steps.is_empty() {
+            prompt.push_str(
+                "\n\nThis work was handed over from another session, where the user reviewed this plan. \
+                 Propose it as your plan with propose_plan, these steps in this order, then work through it:\n",
+            );
+            for (index, step) in steps.iter().enumerate() {
+                prompt.push_str(&format!("{}. {step}\n", index + 1));
+            }
+        }
+        Ok(prompt)
+    }
+
+    /// Ends a turn paused on its plan review because the user started a
+    /// worker for it (spec 94). Nothing has changed in this checkout, and
+    /// nothing will: the open steps are skipped here, as for a declined plan,
+    /// and the turn finishes with a note naming the worker. The model is not
+    /// called.
+    pub fn hand_plan_to_worker(
+        &self,
+        proposal_id: &str,
+        worker_session_id: &str,
+        handed_by: &str,
+    ) -> Result<()> {
+        let pending = self.pending_commands.take(proposal_id)?;
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::PlanReview)?;
+        if let Some(mut plan) = self
+            .session_store
+            .read_task_plan(&pending.session.id, &pending.task.id)?
+        {
+            let now = now_millis();
+            for step in plan
+                .steps
+                .iter_mut()
+                .filter(|step| !step.status.is_terminal())
+            {
+                step.status = crate::plan::StepStatus::Skipped;
+                step.completed_at_ms = Some(now);
+                self.session_store.update_plan_step(&pending.task, step)?;
+            }
+        }
+        self.audit_log.record(
+            "plan_handed_to_worker",
+            &[
+                ("actor", handed_by.to_string()),
+                ("sessionId", pending.session.id.clone()),
+                ("taskId", pending.task.id.clone()),
+                ("proposalId", proposal_id.to_string()),
+                ("workerSessionId", worker_session_id.to_string()),
+            ],
+        )?;
+        self.session_store.append_message(
+            &pending.session.id,
+            Some(&pending.task.id),
+            "assistant",
+            "Handed to a worker. It runs the plan in its own worktree; nothing changed here.",
+        )?;
+        self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+        self.session_store
+            .update_task_status(&pending.task, TaskStatus::Complete, None)?;
+        Ok(())
+    }
+
     pub fn resume_after_plan_decision(
         &self,
         proposal_id: &str,

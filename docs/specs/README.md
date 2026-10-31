@@ -97,7 +97,7 @@ and worktree delivery finished on 2026-10-28 and were merged into `main` that
 day; the full seven-check gate passed in CI on 2026-10-29 for the `main` push
 that contains both (Quality run 40902516310).
 
-#60–#85 and #87–#93 are also Done (see their rows below). Several were evidence-driven or
+#60–#85 and #87–#94 are also Done (see their rows below). Several were evidence-driven or
 usability specs added outside the roadmap order; being finished, none of them
 changes what may be built next.
 
@@ -851,6 +851,7 @@ is ready.
 | 91 | [91_commit_button_only_when_it_can_act.md](91_commit_button_only_when_it_can_act.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: **Commit…** seemed to do nothing. With no session open it returned silently, and while a commit was being prepared it gave no sign, so a second press opened a second dialog that went stale. The button is now shown only with a session open, reads **Preparing…** while it works, and opens one dialog at a time. |
 | 92 | [92_rerun_reuses_its_plan_steps.md](92_rerun_reuses_its_plan_steps.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: a verification rerun appended a new `verify_` step for every check, numbered from `verify_1` again, beside the earlier attempt's. The pass closed the old step by id and left the new one open, so a passed run read "Stopped before finishing". A rerun now reuses the step of a check it already has, reset for the attempt, and adds a step only for a new check. |
 | 93 | [93_recovery_cards_follow_the_conversation.md](93_recovery_cards_follow_the_conversation.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: after Damaian was stopped and `main` reset, a session's first prompt sat below six recovery cards about 3,450 px tall. Three of the cards offered patches the log had already applied, which now looked unapplied again. Recovery no longer offers a patch whose every file has a decision, and its cards are drawn below the conversation instead of above it. |
+| 94 | [94_run_a_plan_in_a_worker.md](94_run_a_plan_in_a_worker.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A gap reported in use: the offer to run work in a worker came only from the model's `worker-prompt` block, which it wrote once and then stopped writing, so a spec-sized task ran in the main checkout. With Worker sessions on, a plan review card now offers **Run in a worker**. It opens the New worker dialog with the request and the plan as the card has it, and once the worker starts it ends the paused turn without a model call, its steps skipped and the hand-over audited. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:

@@ -386,6 +386,8 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/verify-stream") => handle_verify_stream(stream, &request),
         ("POST", "/api/resume-checks-stream") => handle_resume_checks_stream(stream, &request),
         ("POST", "/api/resume-plan-stream") => handle_resume_plan_stream(stream, &request),
+        ("POST", "/api/plan-worker-prompt") => handle_plan_worker_prompt(stream, &request),
+        ("POST", "/api/plan-to-worker") => handle_plan_to_worker(stream, &request),
         ("POST", "/api/answer-question-stream") => handle_answer_question_stream(stream, &request),
         ("POST", "/api/resume-fallback-stream") => handle_resume_fallback_stream(stream, &request),
         ("POST", "/api/resume-round-budget-stream") => {
@@ -3180,6 +3182,50 @@ fn handle_resume_plan_stream(stream: &mut TcpStream, request: &Request) -> Resul
     stream_turn(stream, move |cancel, events| {
         run_resume_plan_request(&form, cancel, events)
     })
+}
+
+/// Spec 94: the worker prompt for a turn paused on its plan review, built
+/// from the plan as the card has it. Read-only; the pause is untouched.
+fn handle_plan_worker_prompt(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let proposal_id = required_form(&form, "proposal_id")?;
+    let revised = match form.get("steps").filter(|value| !value.is_empty()) {
+        Some(raw) => Some(parse_plan_revision(raw)?),
+        None => None,
+    };
+    let engine = engine_for_repo(&repo)?;
+    let prompt = engine
+        .chat_orchestrator
+        .plan_worker_prompt(&proposal_id, revised)
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::json!({ "prompt": prompt }).to_string(),
+    )
+}
+
+/// Spec 94: ends the paused turn once the worker it was handed to started.
+fn handle_plan_to_worker(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let proposal_id = required_form(&form, "proposal_id")?;
+    let worker_session_id = required_form(&form, "worker_session_id")?;
+    let engine = engine_for_repo(&repo)?;
+    engine
+        .chat_orchestrator
+        .hand_plan_to_worker(&proposal_id, &worker_session_id, "desktop_user")
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::json!({ "status": "handed" }).to_string(),
+    )
 }
 
 fn handle_resume_context_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {

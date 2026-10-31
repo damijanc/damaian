@@ -1224,6 +1224,7 @@ You can:
 - **Retitle** a step by typing in its box.
 - **Delete** a step with **×**.
 - **Approve** the plan as it stands, or **Decline** it.
+- **Run in a worker** (with Worker sessions on, outside a worker): opens the New worker dialog with your request and the plan as the card shows it, edits included. Once the worker starts, this turn ends here with nothing changed, its steps are marked skipped, and the card links to the worker. Cancel the dialog and the card is still waiting for an answer.
 
 A plan whose steps only read things — listing files, searching, reading source
 — is never put up for approval, because there is nothing to undo.
@@ -1767,7 +1768,7 @@ A **worker** is a session that runs on its own: it gets a prompt, works in a new
 
 **Working in another branch or worktree.** A session's edits and commands always apply to its own checkout. It can read another worktree of the repository, but it cannot change one: an edit to a path inside a worktree is refused. With Worker sessions on, asking for work "on a new branch" or "in a separate worktree" makes the assistant write a `worker-prompt` handoff instead of creating a worktree itself, and the worker does the work in a worktree of its own. With them off, the assistant tells you the setting is needed or asks whether to make the change in your checkout.
 
-**Starting a worker.** A `worker-prompt` block in an assistant's answer gets a **Start worker** button once the answer has finished. No other block gets one. Clicking it opens the New worker dialog with the block's text, which you can still edit. Confirm with **Start worker**. The session holding the block becomes the worker's parent: the block then shows "Started *‹title›* →", and the conversation gets a one-line "Spawned worker" link. **New worker** on a project's ⋮ menu or on the Workers board opens the same dialog empty, for a worker with no parent. A worker cannot start workers of its own.
+**Starting a worker.** A `worker-prompt` block in an assistant's answer gets a **Start worker** button once the answer has finished. No other block gets one. Clicking it opens the New worker dialog with the block's text, which you can still edit. Confirm with **Start worker**. The session holding the block becomes the worker's parent: the block then shows "Started *‹title›* →", and the conversation gets a one-line "Spawned worker" link. A plan put up for review also offers **Run in a worker**, so you do not depend on the assistant writing a block (see [Reviewing a plan before it runs](#reviewing-a-plan-before-it-runs)). **New worker** on a project's ⋮ menu or on the Workers board opens the same dialog empty, for a worker with no parent. A worker cannot start workers of its own.
 
 **Uncommitted changes.** A worker starts from your last commit, so it cannot see work you have not committed — often the very task file you planned it from. If your tree has uncommitted changes, the dialog says how many and names the files the prompt mentions first. Choose **Include uncommitted changes** (selected by default), which copies your tracked edits and untracked files into the worker's tree, or **Start from last commit**. Your own tree is not changed either way.
 
