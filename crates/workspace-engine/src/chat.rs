@@ -28,8 +28,8 @@ use crate::external_reference::{
 use crate::fetch::CurlFetchTransport;
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
 use crate::finding::{
-    Finding, FindingDraft, FindingSource, Severity, default_parsers, findings_from_execution,
-    findings_from_web_record, resolve_finding_path,
+    Finding, FindingDraft, FindingSource, FindingStatus, Severity, default_parsers,
+    findings_from_execution, findings_from_web_record, resolve_finding_path,
 };
 use crate::git_service::{DiffOptions, GitService, GitStatus, WorktreeListing};
 use crate::hash::{create_id, file_hash, now_millis, repository_id_for_root};
@@ -56,6 +56,7 @@ use crate::protected_paths::{
     ProtectedPathAction, ProtectedPathSource, TaskProtectedPaths, ensure_patch_paths_allowed,
     protected_paths_reminder, record_task_protected_paths_from_prompt,
 };
+use crate::provenance::{PostPatchResult, classify};
 use crate::repository_map::RepositoryMapStore;
 use crate::secret_scanner::SecretScanner;
 use crate::session::{
@@ -69,8 +70,9 @@ use crate::validation::{
 };
 use crate::vector_index::VectorIndexCache;
 use crate::verification::{
-    CheckId, CheckOutcome, Selection, SkipReason, VerificationEvent, VerificationOutcome,
-    VerificationReport, fold_verification, propose_checks,
+    CheckId, CheckOutcome, CheckTermination, FindingEvidence, Selection, SkipReason,
+    VerificationEvent, VerificationOutcome, VerificationReport, environment_termination,
+    fold_verification, propose_checks,
 };
 use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
@@ -2994,7 +2996,7 @@ impl ChatOrchestrator {
         repository_root: &Path,
         session: &Session,
         task: &Task,
-        _check: &CheckId,
+        check: &CheckId,
         proposal: &CommandProposal,
         step_id: &str,
         plan: &mut TaskPlan,
@@ -3017,14 +3019,40 @@ impl ChatOrchestrator {
                 0,
             )));
         };
-        let record = self.validation_orchestrator.run_proposal(
+        let record = match self.validation_orchestrator.run_proposal(
             &proposal.id,
             approved,
             approved_by,
             Some(&task.id),
             cancel,
             &mut on_output,
-        )?;
+        ) {
+            Ok(record) => record,
+            Err(error) => {
+                // Requirement 5: the command never reached a code result. Only
+                // a policy refusal or the process spawn itself is an
+                // environment fact for the report. A proposal-store,
+                // execution-store, audit, cancellation or other internal
+                // failure is not evidence about the environment, so it
+                // propagates instead of becoming provenance.
+                let Some(termination) = environment_termination(&error) else {
+                    return Err(error);
+                };
+                self.audit_log.record(
+                    "verification_check_unavailable",
+                    &[
+                        ("actor", "system".to_string()),
+                        ("sessionId", session.id.clone()),
+                        ("taskId", task.id.clone()),
+                        ("check", check.label()),
+                        ("termination", termination.as_str().to_string()),
+                    ],
+                )?;
+                self.close_verification_step(task, plan, step_id, StepStatus::Blocked)?;
+                sink.progress(TurnProgress::Plan(plan.clone()));
+                return Ok(CheckOutcome::Environment { termination });
+            }
+        };
         // Findings and `after_check` both come from here, exactly as they do
         // for a check the model ran. Writing findings through another path
         // would make this the one check no hook sees (proposal §5.3).
@@ -3032,6 +3060,7 @@ impl ChatOrchestrator {
             self.record_command_findings(repository_root, session, task, &record.execution)?;
         let exit_code = record.execution.exit_code;
         let marker_id = record.execution.id.clone();
+        let termination = CheckTermination::from_command(record.execution.termination, exit_code);
         let mut evidence = vec![Evidence::CommandExit {
             marker_id: marker_id.clone(),
             exit_code,
@@ -3051,6 +3080,7 @@ impl ChatOrchestrator {
         Ok(CheckOutcome::Ran {
             exit_code,
             marker_id,
+            termination: Some(termination),
         })
     }
 
@@ -3134,6 +3164,7 @@ impl ChatOrchestrator {
         Ok(CheckOutcome::Ran {
             exit_code: Some(exit_code),
             marker_id: record.id,
+            termination: Some(CheckTermination::Exited { exit_code }),
         })
     }
 
@@ -3312,6 +3343,66 @@ impl ChatOrchestrator {
         )
     }
 
+    /// Fingerprint every live post-patch result and record its classification
+    /// against the task-local baseline (spec 102 Task 3).
+    ///
+    /// The classification is durable, so a reload, a worker restart or the
+    /// explicit repair continuation reads the same provenance instead of
+    /// recomputing it from a baseline it might no longer find. Findings are
+    /// taken only by the run's marker id and only while open; the environment
+    /// and unknown classes deliberately carry no repair evidence.
+    fn record_post_patch_provenance(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        state: &crate::verification::VerificationState,
+    ) -> Result<()> {
+        let baselines = self
+            .session_store
+            .task_verification_baselines(&session.id, &task.id)?;
+        let previous = self
+            .session_store
+            .task_verification_provenance(&session.id, &task.id)?;
+        let findings = self
+            .session_store
+            .read_findings(&session.id, repository_root)?;
+        for check in &state.selected {
+            let Some(run) = state.checks.get(check) else {
+                continue;
+            };
+            if run.outcome.is_passed() {
+                continue;
+            }
+            let Some(termination) = run.outcome.termination() else {
+                // A declined check or a missing browser target is not a
+                // failure with a provenance.
+                continue;
+            };
+            let evidence = match &run.outcome {
+                CheckOutcome::Ran { marker_id, .. } => findings
+                    .iter()
+                    .filter(|finding| {
+                        finding.origin_ref() == Some(marker_id.as_str())
+                            && finding.status() == FindingStatus::Open
+                    })
+                    .map(FindingEvidence::from_finding)
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            let result = PostPatchResult::new(check.clone(), termination, evidence);
+            let classification = classify(&result, baselines.get(check), previous.get(check));
+            self.session_store.append_verification_event(
+                &session.id,
+                &VerificationEvent::Provenance {
+                    task_id: task.id.clone(),
+                    record: classification.record(),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     /// Decides whether the verification is done, may be repaired, or has hit
     /// the repair limit (spec 23 proposal §5.5).
     ///
@@ -3340,6 +3431,13 @@ impl ChatOrchestrator {
             .session_store
             .read_task_plan(&session.id, &task.id)?
             .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        // Spec 102 Task 3: fingerprint and classify every live result against
+        // the task-local baseline before anything decides whether to repair.
+        self.record_post_patch_provenance(repository_root, &session, &task, &state)?;
+        let events = self
+            .session_store
+            .read_verification_events(&session.id, &[])?;
+        let state = fold_verification(events.iter());
         let preliminary = VerificationReport::build(&state, &plan, &changed, &file_hashes);
         if preliminary.failed.is_empty() && preliminary.stale.is_empty() {
             return self.finish_verification_with_outcome(
@@ -3352,6 +3450,19 @@ impl ChatOrchestrator {
                 } else {
                     VerificationOutcome::Passed
                 },
+                changed,
+                file_hashes,
+            );
+        }
+        if preliminary.repair_targets.is_empty() {
+            // Pre-existing, unchanged, environment and unknown failures are
+            // reported and may fail completion, but no code-repair turn is
+            // started from evidence the patch did not introduce.
+            return self.finish_verification_with_outcome(
+                repository_root,
+                session,
+                task,
+                VerificationOutcome::Failed,
                 changed,
                 file_hashes,
             );
@@ -3576,6 +3687,11 @@ impl ChatOrchestrator {
         let changed = self.verification_changed_files(session_id, &limited_task_id, None)?;
         let file_hashes = hash_existing_files(repository_root, &changed);
         let report = VerificationReport::build(&state, &limited_plan, &changed, &file_hashes);
+        if report.repair_targets.is_empty() {
+            return Err(ClientError::InvalidInput(
+                "The verification has no introduced failure evidence to repair".to_string(),
+            ));
+        }
 
         let mut task = self.session_store.create_task(
             session_id,
@@ -3618,13 +3734,13 @@ impl ChatOrchestrator {
         )
     }
 
-    /// Asks the model to fix the failing checks, and either returns its patch
-    /// proposal or closes the attempt as `no_repair_applied`.
+    /// Asks the model to fix only the introduced failures, and either returns
+    /// its patch proposal or closes the attempt as `no_repair_applied`.
     ///
-    /// The request is the rendered [`RepairRequest`](crate::finding::RepairRequest),
-    /// findings rather than raw log output, and it enters as the turn's user
-    /// request through context assembly so `bounded_messages` can never elide
-    /// it (spec 23 `context.md` §13).
+    /// The request is [`VerificationReport::repair_request`]: normalized
+    /// introduced evidence, never the full report and never raw log output. It
+    /// enters as the turn's user request through context assembly so
+    /// `bounded_messages` can never elide it (spec 23 `context.md` §13).
     #[allow(clippy::too_many_arguments)]
     fn run_repair_turn(
         &self,
@@ -3638,47 +3754,29 @@ impl ChatOrchestrator {
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
-        let mut refs = Vec::new();
-        for step in plan
-            .steps
-            .iter()
-            .filter(|step| step.id.starts_with("verify_"))
-        {
-            for evidence in &step.evidence {
-                if let Evidence::Findings { refs: ids, .. } = evidence {
-                    refs.extend(ids.clone());
-                }
-            }
-        }
-        let findings = self
-            .session_store
-            .read_findings(&session.id, repository_root)?;
-        let rendered = crate::finding::RepairRequest::select(&findings, &refs)
-            .render()
-            .unwrap_or_else(|| {
-                // A check that failed without a parsed finding still has to be
-                // stated: the labels and exit reasons, never the raw log.
-                let lines = report
-                    .failed
-                    .iter()
-                    .map(|item| format!("- {} — {}", item.check.label(), item.reason))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!("Fix the failing checks below.\n\n{lines}")
-            });
+        // Spec 102 Task 3: the repair request is the engine's normalized
+        // introduced evidence, never the whole report and never raw output.
+        // Pre-existing, environment and unknown failures stay visible in the
+        // user's report but cannot reach the model here.
+        let rendered = report.repair_request().unwrap_or_else(|| {
+            let lines = report
+                .repair_targets
+                .iter()
+                .map(|target| format!("- {} — {}", target.label, target.reason))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("Repair only the failures this patch introduced.\n\n{lines}")
+        });
+        let target_count = report.repair_targets.len();
         let prompt = format!(
-            "{VERIFICATION_TURN_PROMPT} {} verification {} failed. Fix {} and propose a patch with `propose_patch`.\n\n{rendered}",
-            report.failed.len(),
-            if report.failed.len() == 1 {
-                "check"
+            "{VERIFICATION_TURN_PROMPT} {} introduced {} to repair. Fix only {} and propose a patch with `propose_patch`.\n\n{rendered}",
+            target_count,
+            if target_count == 1 {
+                "failure"
             } else {
-                "checks"
+                "failures"
             },
-            if report.failed.len() == 1 {
-                "it"
-            } else {
-                "them"
-            },
+            if target_count == 1 { "it" } else { "them" },
         );
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
         // The repair continuation sees the same conversation the turn does,
@@ -14753,6 +14851,39 @@ fn session_title(prompt: &str) -> String {
         format!("Chat {}", create_id("session_title"))
     } else {
         title
+    }
+}
+
+#[cfg(test)]
+mod environment_classification_tests {
+    use crate::error::ClientError;
+    use crate::verification::{CheckTermination, environment_termination};
+
+    #[test]
+    fn only_policy_and_a_real_spawn_failure_are_environment_facts() {
+        assert_eq!(
+            environment_termination(&ClientError::PolicyBlocked("blocked".to_string())),
+            Some(CheckTermination::PolicyRefused)
+        );
+        assert_eq!(
+            environment_termination(&ClientError::ApprovalRequired("approval".to_string())),
+            Some(CheckTermination::PolicyRefused)
+        );
+        assert_eq!(
+            environment_termination(&ClientError::CommandSpawnFailed("no shell".to_string())),
+            Some(CheckTermination::SpawnFailed)
+        );
+        // Every unrelated failure must propagate. `Io` is the important one:
+        // the previous mapping turned any I/O error into a spawn failure.
+        for error in [
+            ClientError::Io("execution store is read-only".to_string()),
+            ClientError::Cancelled,
+            ClientError::InvalidInput("bad proposal".to_string()),
+            ClientError::AccessDenied("no".to_string()),
+            ClientError::Git("git failed".to_string()),
+        ] {
+            assert_eq!(environment_termination(&error), None, "{error:?}");
+        }
     }
 }
 

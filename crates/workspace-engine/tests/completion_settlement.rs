@@ -489,6 +489,7 @@ fn a_crashed_failed_verification_settles_failed_with_its_report() {
             outcome: CheckOutcome::Ran {
                 exit_code: Some(1),
                 marker_id: "marker".to_string(),
+                termination: None,
             },
             file_hashes: BTreeMap::new(),
         },

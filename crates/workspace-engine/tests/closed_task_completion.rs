@@ -87,6 +87,7 @@ fn ran(
         outcome: CheckOutcome::Ran {
             exit_code,
             marker_id: "marker".to_string(),
+            termination: None,
         },
         file_hashes: hashes
             .iter()

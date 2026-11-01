@@ -17,12 +17,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::command_policy::relative_location;
-use crate::error::Result;
+use crate::error::{ClientError, Result};
+use crate::finding::{Finding, FindingSource, Severity};
 use crate::plan::{PlanReport, TaskPlan};
+use crate::provenance::{ProvenanceCheck, build_partitions, provenance_reason, repair_targets};
 use crate::repository_map::RepositoryMap;
 use crate::validation::{CommandProposal, ValidationOrchestrator};
 
@@ -115,9 +119,382 @@ pub enum CheckOutcome {
         /// `None` when the command was killed or signalled. Not a zero.
         exit_code: Option<i32>,
         marker_id: String,
+        /// The run's exact termination. Absent from events written before spec
+        /// 102 Task 3. [`Self::termination`] then derives only an ordinary
+        /// `Exited` (or `Signalled` without a code) from what the old event
+        /// recorded; it deliberately does not infer an environment reason such
+        /// as `MissingExecutable` that the log never stored. A historical exit
+        /// 127 therefore stays an ordinary failed exit of unknown provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        termination: Option<CheckTermination>,
     },
     Skipped(SkipReason),
+    /// The check could not run for an environment reason: the process did not
+    /// start, the executable is missing, policy refused it, or its test
+    /// infrastructure was unavailable (spec 102 requirement 5). It is a
+    /// failure for completion, but never a code-repair target.
+    #[serde(rename_all = "camelCase")]
+    Environment {
+        termination: CheckTermination,
+    },
 }
+
+impl CheckOutcome {
+    /// The failure termination, or `None` when the check did not fail in a way
+    /// that has a termination (a user decline or a missing browser target).
+    pub fn termination(&self) -> Option<CheckTermination> {
+        match self {
+            Self::Ran {
+                exit_code,
+                termination,
+                ..
+            } => Some(termination.clone().unwrap_or(match exit_code {
+                Some(code) => CheckTermination::Exited { exit_code: *code },
+                None => CheckTermination::Signalled,
+            })),
+            Self::Skipped(SkipReason::Blocked { .. }) => Some(CheckTermination::PolicyRefused),
+            Self::Skipped(SkipReason::DeclinedByUser | SkipReason::NoRunningTarget) => None,
+            Self::Environment { termination } => Some(termination.clone()),
+        }
+    }
+
+    /// `Some(0)` and nothing else.
+    pub fn is_passed(&self) -> bool {
+        matches!(
+            self,
+            Self::Ran {
+                exit_code: Some(0),
+                ..
+            }
+        )
+    }
+}
+
+/// Why a check stopped, in a form that survives reload (spec 102).
+///
+/// Distinct from [`crate::command_runner::CommandTermination`]: a check can
+/// also fail before a process starts, and that is an environment fact rather
+/// than a code failure. `Exited` keeps the exit code because a different code
+/// is a materially different termination for the fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckTermination {
+    #[serde(rename_all = "camelCase")]
+    Exited {
+        exit_code: i32,
+    },
+    /// The command was killed or signalled; its exit code is unknown.
+    Signalled,
+    TimedOut,
+    Cancelled,
+    /// The process could not be started at all.
+    SpawnFailed,
+    /// The command names an executable that is not installed.
+    MissingExecutable,
+    /// The command policy refused to run it.
+    PolicyRefused,
+    /// Test infrastructure the check needs was unavailable.
+    UnavailableInfrastructure,
+}
+
+impl CheckTermination {
+    /// The wire and report name. `Exited` is the only variant with detail;
+    /// callers that need the code read it from the variant.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Exited { .. } => "exited",
+            Self::Signalled => "signalled",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::SpawnFailed => "spawn_failed",
+            Self::MissingExecutable => "missing_executable",
+            Self::PolicyRefused => "policy_refused",
+            Self::UnavailableInfrastructure => "unavailable_infrastructure",
+        }
+    }
+
+    /// Requirement 5: these never start a code repair turn. The helper states
+    /// the rule once in the engine rather than letting every consumer re-derive
+    /// it from the variant list.
+    pub fn is_environment_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::SpawnFailed
+                | Self::MissingExecutable
+                | Self::PolicyRefused
+                | Self::UnavailableInfrastructure
+        )
+    }
+
+    /// The engine's wording for this termination.
+    pub fn description(&self) -> String {
+        match self {
+            Self::Exited { exit_code } => format!("exit code {exit_code}"),
+            Self::Signalled => "killed or signalled".to_string(),
+            Self::TimedOut => "timed out".to_string(),
+            Self::Cancelled => "cancelled".to_string(),
+            Self::SpawnFailed => "the command could not be started".to_string(),
+            Self::MissingExecutable => "the executable is not installed".to_string(),
+            Self::PolicyRefused => "the command policy refused it".to_string(),
+            Self::UnavailableInfrastructure => {
+                "the test infrastructure was unavailable".to_string()
+            }
+        }
+    }
+
+    /// The one canonical mapping from a command result to check termination.
+    /// Baseline construction and live verification both use it, so a
+    /// fingerprint cannot disagree about what a run was.
+    pub fn from_command(
+        termination: crate::command_runner::CommandTermination,
+        exit_code: Option<i32>,
+    ) -> Self {
+        match termination {
+            crate::command_runner::CommandTermination::Exited => match exit_code {
+                Some(127) => Self::MissingExecutable,
+                Some(exit_code) => Self::Exited { exit_code },
+                None => Self::Signalled,
+            },
+            crate::command_runner::CommandTermination::TimedOut => Self::TimedOut,
+            crate::command_runner::CommandTermination::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// The environment termination a proposal execution error justifies.
+///
+/// Only two errors say something about the command's environment: the policy
+/// refused it, or [`crate::command_runner::CommandRunner`] could not start its
+/// process. Everything else — an unreadable proposal, an execution record that
+/// could not be written, an audit failure, a cancelled turn — is an internal
+/// failure. Returning `None` makes the caller propagate it rather than
+/// disguising it as an environment report (spec 102 Task 3).
+pub(crate) fn environment_termination(error: &ClientError) -> Option<CheckTermination> {
+    match error {
+        ClientError::PolicyBlocked(_) | ClientError::ApprovalRequired(_) => {
+            Some(CheckTermination::PolicyRefused)
+        }
+        ClientError::CommandSpawnFailed(_) => Some(CheckTermination::SpawnFailed),
+        _ => None,
+    }
+}
+
+/// A redacted, canonical finding for fingerprinting (spec 102 requirement 3).
+///
+/// Fields are private so [`FindingEvidence::from_finding`] is the normal
+/// constructor. It copies only the stable, already-redacted parts of a
+/// [`Finding`]: the transient id, creation time, origin reference, status and
+/// details are deliberately absent, so a log reload cannot change a
+/// fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindingEvidence {
+    source: FindingSource,
+    severity: Severity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_column: Option<u32>,
+    summary: String,
+}
+
+impl FindingEvidence {
+    /// Normalise a redacted finding into the form the fingerprint hashes.
+    ///
+    /// Whitespace is collapsed and a machine-local absolute range path is
+    /// reduced to its final component, so moving the checkout does not change
+    /// a fingerprint. Repository-relative paths are kept in full.
+    pub fn from_finding(finding: &Finding) -> Self {
+        let range = finding.range();
+        Self {
+            source: finding.source(),
+            severity: finding.severity(),
+            code: finding.code().map(normalized_text),
+            path: range.map(|range| normalized_repository_path(&range.path)),
+            start_line: range.map(|range| range.start_line),
+            start_column: range.and_then(|range| range.start_column),
+            summary: normalized_text(finding.summary()),
+        }
+    }
+
+    pub fn source(&self) -> FindingSource {
+        self.source
+    }
+
+    pub fn severity(&self) -> Severity {
+        self.severity
+    }
+
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    pub fn start_line(&self) -> Option<u32> {
+        self.start_line
+    }
+
+    pub fn start_column(&self) -> Option<u32> {
+        self.start_column
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    /// Used only to sort and de-duplicate evidence before hashing, and by the
+    /// provenance classifier to compute a stable introduced delta. JSON is an
+    /// unambiguous encoding of every field, and the same evidence always
+    /// produces the same key.
+    pub(crate) fn canonical_key(&self) -> String {
+        serde_json::to_string(self).expect("finding evidence is serializable")
+    }
+}
+
+/// A stable digest of a failed check result (spec 102 requirement 3).
+///
+/// It is derived only from [`CheckId`], normalised [`FindingEvidence`] and
+/// [`CheckTermination`]. Raw output, secrets, marker ids, timestamps and
+/// machine-local paths are not inputs, so an equivalent result produces the
+/// same value regardless of the order the findings arrived in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FailureFingerprint(String);
+
+impl FailureFingerprint {
+    /// The canonical fingerprint of one failed check result.
+    pub fn compute(
+        check: &CheckId,
+        findings: &[FindingEvidence],
+        termination: &CheckTermination,
+    ) -> Self {
+        let mut canonical_findings = findings.to_vec();
+        canonical_findings.sort_by_key(FindingEvidence::canonical_key);
+        canonical_findings.dedup_by(|a, b| a.canonical_key() == b.canonical_key());
+        let canonical = serde_json::json!({
+            "version": 1,
+            "check": {
+                "workingDirectory": normalized_repository_path(&check.working_directory),
+                "command": check.command,
+            },
+            "termination": termination,
+            "findings": canonical_findings,
+        });
+        let bytes = serde_json::to_vec(&canonical).expect("fingerprint input is serializable");
+        Self(crate::hash::sha256(bytes))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The task-local result recorded for a check before the patch that first
+/// selected it was applied (spec 102 requirements 1–2, 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum CheckBaseline {
+    Passed,
+    #[serde(rename_all = "camelCase")]
+    Failed {
+        termination: CheckTermination,
+        fingerprint: FailureFingerprint,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        findings: Vec<FindingEvidence>,
+    },
+    /// The user declined the baseline. A later failure is unknown provenance,
+    /// never assumed to be caused by the task.
+    Declined,
+    /// The baseline could not run. Also unknown provenance, with the
+    /// environment fact recorded for the user.
+    #[serde(rename_all = "camelCase")]
+    Unavailable {
+        termination: CheckTermination,
+        fingerprint: FailureFingerprint,
+    },
+}
+
+impl CheckBaseline {
+    /// The failure evidence, when the baseline ran and failed.
+    pub fn failure_fingerprint(&self) -> Option<&FailureFingerprint> {
+        match self {
+            Self::Passed | Self::Declined => None,
+            Self::Failed { fingerprint, .. } | Self::Unavailable { fingerprint, .. } => {
+                Some(fingerprint)
+            }
+        }
+    }
+}
+
+/// The six post-patch classifications (spec 102 requirement 4). Only
+/// `new_regression` and the new portion of `worsened` may enter automatic
+/// repair; this type only names the classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureProvenance {
+    NewRegression,
+    PreExisting,
+    Worsened,
+    UnchangedFailure,
+    EnvironmentFailure,
+    UnknownProvenance,
+}
+
+impl FailureProvenance {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NewRegression => "new_regression",
+            Self::PreExisting => "pre_existing",
+            Self::Worsened => "worsened",
+            Self::UnchangedFailure => "unchanged_failure",
+            Self::EnvironmentFailure => "environment_failure",
+            Self::UnknownProvenance => "unknown_provenance",
+        }
+    }
+}
+
+/// One post-patch classification, with the evidence it was derived from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckProvenanceRecord {
+    pub check: CheckId,
+    pub provenance: FailureProvenance,
+    pub termination: CheckTermination,
+    pub fingerprint: FailureFingerprint,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<FindingEvidence>,
+    /// The part of `findings` the patch introduced: all of it for a new
+    /// regression, or the delta for a worsened result. Empty for every other
+    /// classification, so a repair turn cannot accidentally receive a
+    /// pre-existing failure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub introduced: Vec<FindingEvidence>,
+}
+
+/// One repair attempt's comparable state (spec 102 requirement 7).
+///
+/// The digests are canonical, content-safe values supplied by the repair
+/// controller in later tasks. Keeping the history bounded is the engine's rule,
+/// not a controller convention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairStateEntry {
+    pub failure_fingerprint: FailureFingerprint,
+    pub patch_digest: String,
+    pub task_diff_digest: String,
+}
+
+/// The bounded window of repair states kept in [`VerificationState`]. Eight
+/// entries cover the A→B→A oscillation plus the identical-consecutive cases
+/// without retaining the whole session's history.
+pub const MAX_REPAIR_STATE_ENTRIES: usize = 8;
 
 /// A check's latest recorded run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +504,44 @@ pub struct CheckRun {
     /// The hash of every file the task had changed when the check ran, so a
     /// later edit, rollback or patch can make the result stale (proposal §5.6).
     pub file_hashes: BTreeMap<String, String>,
+}
+
+fn normalized_text(text: &str) -> String {
+    // An absolute POSIX path is machine-local: the same result under another
+    // checkout must fingerprint identically. Keep the final component (which
+    // is repository content) and any `:line:column` suffix that follows it.
+    static ABSOLUTE_PATH: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(^|[\s(\[{<'"=])(/[^\s:()\[\]{}<>,'"]+)"#)
+            .expect("the absolute-path normaliser is valid")
+    });
+    let text = ABSOLUTE_PATH.replace_all(text, |captures: &regex::Captures<'_>| {
+        let path = &captures[2];
+        let basename = path
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .unwrap_or(path);
+        format!("{}{basename}", &captures[1])
+    });
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalized_repository_path(path: &str) -> String {
+    let mut path = path.trim().replace('\\', "/");
+    while path.len() > 1 && path.ends_with('/') {
+        path.pop();
+    }
+    let path = path.trim_start_matches("./");
+    if path.starts_with('/') {
+        // A machine-local absolute path must not make the fingerprint depend
+        // on where the checkout lives. The final component is the only part
+        // that is repository content.
+        path.rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        path.to_string()
+    }
 }
 
 /// What the whole verification came to.
@@ -197,6 +612,27 @@ pub enum VerificationEvent {
         task_id: String,
         outcome: VerificationOutcome,
     },
+    /// A check's task-local baseline, recorded before the patch that first
+    /// selected it was applied (spec 102 Task 2). Absent from every historical
+    /// log, so replay must not invent one.
+    #[serde(rename = "verification_baseline", rename_all = "camelCase")]
+    Baseline {
+        task_id: String,
+        check: CheckId,
+        baseline: CheckBaseline,
+    },
+    /// One post-patch provenance classification (spec 102 Task 3).
+    #[serde(rename = "verification_provenance", rename_all = "camelCase")]
+    Provenance {
+        task_id: String,
+        record: CheckProvenanceRecord,
+    },
+    /// One repair attempt's comparable state (spec 102 Task 4).
+    #[serde(rename = "verification_repair_state", rename_all = "camelCase")]
+    RepairState {
+        task_id: String,
+        entry: RepairStateEntry,
+    },
 }
 
 impl VerificationEvent {
@@ -208,7 +644,10 @@ impl VerificationEvent {
             Self::Due { task_id, .. }
             | Self::Started { task_id, .. }
             | Self::Check { task_id, .. }
-            | Self::Finished { task_id, .. } => task_id,
+            | Self::Finished { task_id, .. }
+            | Self::Baseline { task_id, .. }
+            | Self::Provenance { task_id, .. }
+            | Self::RepairState { task_id, .. } => task_id,
         }
     }
 }
@@ -249,6 +688,14 @@ pub struct VerificationState {
     pub regressions: Vec<CheckId>,
     /// The last `Finished` outcome, cleared by a new `Started`.
     pub finished: Option<VerificationOutcome>,
+    /// The task-local baseline per check (spec 102). Empty for every log
+    /// written before this spec, and replay leaves it empty rather than
+    /// guessing a provenance.
+    pub baselines: BTreeMap<CheckId, CheckBaseline>,
+    /// The latest post-patch classification per check (spec 102).
+    pub provenance: BTreeMap<CheckId, CheckProvenanceRecord>,
+    /// The bounded repair-state window, oldest first (spec 102 requirement 7).
+    pub repair_history: Vec<RepairStateEntry>,
     /// A `Started` with no later `Finished`. Distinct from `due`, which stays
     /// set until a `Finished` too: a run can be both due and in progress, and
     /// the completion gate reports each fact it can see.
@@ -308,11 +755,33 @@ impl VerificationState {
                 self.finished = Some(*outcome);
                 self.in_progress = false;
             }
+            VerificationEvent::Baseline {
+                check, baseline, ..
+            } => {
+                self.baselines.insert(check.clone(), baseline.clone());
+            }
+            VerificationEvent::Provenance { record, .. } => {
+                self.provenance.insert(record.check.clone(), record.clone());
+            }
+            VerificationEvent::RepairState { entry, .. } => {
+                self.repair_history.push(entry.clone());
+                if self.repair_history.len() > MAX_REPAIR_STATE_ENTRIES {
+                    let excess = self.repair_history.len() - MAX_REPAIR_STATE_ENTRIES;
+                    self.repair_history.drain(0..excess);
+                }
+            }
         }
         self.regressions = self
             .checks
             .iter()
-            .filter(|(check, run)| !passing(&run.outcome) && self.passed_before.contains(*check))
+            .filter(|(check, run)| {
+                !passing(&run.outcome)
+                    && !run
+                        .outcome
+                        .termination()
+                        .is_some_and(|termination| termination.is_environment_failure())
+                    && self.passed_before.contains(*check)
+            })
             .map(|(check, _)| check.clone())
             .collect();
     }
@@ -332,13 +801,7 @@ pub fn fold_verification<'a>(
 /// `Some(0)` and nothing else. The comment is the rule: `None` means killed or
 /// signalled, so it is unknown, and unknown is not passed.
 fn passing(outcome: &CheckOutcome) -> bool {
-    matches!(
-        outcome,
-        CheckOutcome::Ran {
-            exit_code: Some(0),
-            ..
-        }
-    )
+    outcome.is_passed()
 }
 
 fn failure_reason(exit_code: Option<i32>) -> String {
@@ -362,6 +825,10 @@ pub struct FailedCheck {
 pub struct SkippedCheck {
     pub check: CheckId,
     pub reason: SkipReason,
+    /// The engine's wording for `reason`. A renderer prints this and does not
+    /// re-derive a label from the enum.
+    #[serde(default)]
+    pub reason_label: String,
 }
 
 /// Proposal §5.7's report, as data and as text.
@@ -385,6 +852,19 @@ pub struct VerificationReport {
     /// Verification is due and has not run. The summary must never say
     /// "complete" while this holds.
     pub due: bool,
+    /// The engine-owned provenance partitions (spec 102 requirement 9). Every
+    /// failing result and every environment refusal appears in exactly one
+    /// group; only the two eligible groups produce repair targets.
+    #[serde(default)]
+    pub provenance: Vec<crate::provenance::ProvenancePartition>,
+    /// The normalized introduced evidence a repair turn may receive. Empty means
+    /// no automatic repair: pre-existing, environment and unknown failures all
+    /// stay out of this list.
+    #[serde(default)]
+    pub repair_targets: Vec<crate::provenance::RepairTarget>,
+    /// Flattened engine-owned actions for the panel and CLI.
+    #[serde(default)]
+    pub actions: Vec<crate::provenance::VerificationAction>,
 }
 
 impl VerificationReport {
@@ -415,6 +895,9 @@ impl VerificationReport {
             regressions: state.regressions.clone(),
             outcome: state.finished,
             due: state.due.is_some(),
+            provenance: Vec::new(),
+            repair_targets: Vec::new(),
+            actions: Vec::new(),
         };
         for check in &state.selected {
             let Some(run) = state.checks.get(check) else {
@@ -430,7 +913,18 @@ impl VerificationReport {
                 CheckOutcome::Skipped(reason) => report.skipped.push(SkippedCheck {
                     check: check.clone(),
                     reason: reason.clone(),
+                    reason_label: reason.description(),
                 }),
+                CheckOutcome::Environment { termination } => {
+                    if is_stale(run, current_hashes) {
+                        report.stale.push(check.clone());
+                        continue;
+                    }
+                    report.failed.push(FailedCheck {
+                        check: check.clone(),
+                        reason: termination.description(),
+                    });
+                }
                 CheckOutcome::Ran { exit_code, .. } => {
                     if is_stale(run, current_hashes) {
                         report.stale.push(check.clone());
@@ -458,6 +952,61 @@ impl VerificationReport {
                 }
             }
         }
+        // The provenance view is built from durable classifications. A failing
+        // check with no record is a historical log or an interrupted write: it
+        // is reported as unknown (or environment, when its stored termination
+        // says so) rather than guessed from a baseline that replay cannot read.
+        let mut entries = Vec::new();
+        for check in &state.selected {
+            let Some(run) = state.checks.get(check) else {
+                continue;
+            };
+            if passing(&run.outcome) || is_stale(run, current_hashes) {
+                continue;
+            }
+            let Some(termination) = run.outcome.termination() else {
+                // Declined by the user, or no running browser target: not a
+                // failure with a provenance.
+                continue;
+            };
+            if let Some(record) = state.provenance.get(check) {
+                entries.push((
+                    record.provenance,
+                    ProvenanceCheck::new(
+                        check.clone(),
+                        provenance_reason(&record.termination, record.findings.len()),
+                        record.termination.clone(),
+                        Some(record.fingerprint.clone()),
+                        record.findings.clone(),
+                        record.introduced.clone(),
+                    ),
+                ));
+            } else {
+                let provenance = if termination.is_environment_failure() {
+                    FailureProvenance::EnvironmentFailure
+                } else {
+                    FailureProvenance::UnknownProvenance
+                };
+                entries.push((
+                    provenance,
+                    ProvenanceCheck::new(
+                        check.clone(),
+                        provenance_reason(&termination, 0),
+                        termination,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                ));
+            }
+        }
+        report.repair_targets = repair_targets(&entries);
+        report.provenance = build_partitions(entries);
+        report.actions = report
+            .provenance
+            .iter()
+            .filter_map(|partition| partition.action.clone())
+            .collect();
         report
     }
 
@@ -485,36 +1034,20 @@ impl VerificationReport {
         }
         if let Some(VerificationOutcome::RepairLimitExhausted) = self.outcome {
             return format!(
-                "Verification failed: the repair limit was exhausted and {} still {}. {plan_note}",
-                count(self.failed.len(), "check"),
-                if self.failed.len() == 1 {
-                    "fails"
-                } else {
-                    "fail"
-                }
+                "Verification failed: the repair limit was exhausted and {}. {plan_note}",
+                self.failure_phrase()
             );
         }
         if let Some(VerificationOutcome::NoRepairApplied) = self.outcome {
             return format!(
-                "Verification stopped because no repair patch was applied and {} still {}. \
-                 {plan_note}",
-                count(self.failed.len(), "check"),
-                if self.failed.len() == 1 {
-                    "fails"
-                } else {
-                    "fail"
-                }
+                "Verification stopped because no repair patch was applied and {}. {plan_note}",
+                self.failure_phrase()
             );
         }
         if !self.failed.is_empty() || matches!(self.outcome, Some(VerificationOutcome::Failed)) {
             return format!(
-                "Verification failed: {} still {}. {plan_note}",
-                count(self.failed.len(), "check"),
-                if self.failed.len() == 1 {
-                    "fails"
-                } else {
-                    "fail"
-                }
+                "Verification failed: {}. {plan_note}",
+                self.failure_phrase()
             );
         }
         if !self.stale.is_empty() {
@@ -529,6 +1062,9 @@ impl VerificationReport {
             );
         }
         if self.passed.is_empty() {
+            if !self.provenance.is_empty() {
+                return format!("No check passed: {}. {plan_note}", self.failure_phrase());
+            }
             if !self.skipped.is_empty() {
                 return format!(
                     "No check ran: {} skipped, so nothing was verified. {plan_note}",
@@ -548,6 +1084,37 @@ impl VerificationReport {
                 count(self.passed.len(), "check")
             )
         }
+    }
+
+    /// The engine-owned breakdown for the failed summary. It names introduced
+    /// regressions separately from pre-existing, environment and unknown
+    /// failures instead of collapsing every failure into one noun.
+    fn failure_phrase(&self) -> String {
+        if self.provenance.is_empty() {
+            return format!(
+                "{} still {}",
+                count(self.failed.len(), "check"),
+                if self.failed.len() == 1 {
+                    "fails"
+                } else {
+                    "fail"
+                }
+            );
+        }
+        self.provenance
+            .iter()
+            .map(|partition| {
+                crate::provenance::provenance_count(partition.provenance, partition.checks.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The normalized repair request for the eligible partitions. `None` means
+    /// automatic repair must not start, and is the only representation a
+    /// caller needs to check.
+    pub fn repair_request(&self) -> Option<String> {
+        crate::provenance::render_repair_request(&self.repair_targets)
     }
 
     /// Proposal §5.7's layout. Paths are plain repository-relative text; the
@@ -625,6 +1192,29 @@ impl VerificationReport {
         };
         lines.push(section("Regressions", &regressions));
 
+        // Spec 102 requirement 9: each provenance group is its own typed
+        // section. The labels, reasons and actions are engine-owned; a
+        // renderer prints them without deciding what a check's outcome means.
+        for partition in &self.provenance {
+            let value = partition
+                .checks
+                .iter()
+                .map(ProvenanceCheck::render)
+                .collect::<Vec<_>>()
+                .join("\n                     ");
+            lines.push(section(&partition.label, &value));
+        }
+        let actions = if self.actions.is_empty() {
+            "none".to_string()
+        } else {
+            self.actions
+                .iter()
+                .map(|action| format!("{}: {}", action.label, action.detail))
+                .collect::<Vec<_>>()
+                .join("\n                     ")
+        };
+        lines.push(section("What you can do", &actions));
+
         lines.push(section("Remaining", &self.remaining_note()));
         lines.push(section("User action needed", &self.user_action_note()));
         lines.join("\n")
@@ -672,6 +1262,14 @@ impl VerificationReport {
                 declined.join(", "),
                 if declined.len() == 1 { "it" } else { "them" }
             );
+        }
+        if !self.actions.is_empty() {
+            return self
+                .actions
+                .iter()
+                .map(|action| format!("{}: {}", action.label, action.detail))
+                .collect::<Vec<_>>()
+                .join("; ");
         }
         "none".to_string()
     }

@@ -431,6 +431,7 @@ fn seed_facts(engine: &WorkspaceEngine, session: &Session, task: &Task) {
                 outcome: CheckOutcome::Ran {
                     exit_code: Some(0),
                     marker_id: "marker_1".to_string(),
+                    termination: None,
                 },
                 file_hashes: std::collections::BTreeMap::new(),
             },

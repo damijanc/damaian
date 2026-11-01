@@ -725,7 +725,7 @@ fn run() -> workspace_engine::Result<()> {
                     );
                 }
             }
-            let result = engine.edit_orchestrator.apply_stored_patch(
+            let mut result = engine.edit_orchestrator.apply_stored_patch_with_baseline(
                 repo,
                 patch_id,
                 approved_paths.as_deref(),
@@ -733,6 +733,41 @@ fn run() -> workspace_engine::Result<()> {
                 "local_user",
                 allow_generated_secrets,
             )?;
+            // Spec 102 Task 2: a baseline is its own ordinary approval. The
+            // engine's labels are printed verbatim; declining one never
+            // declines the patch, so the apply is retried either way.
+            while let workspace_engine::PatchApplyOutcome::BaselineRequired(batch) = result {
+                eprintln!("{}", batch.note);
+                let mut decisions = Vec::new();
+                for check in &batch.checks {
+                    decisions.push((check.proposal_id.clone(), confirm_baseline(check)?));
+                }
+                match engine.edit_orchestrator.resume_stored_patch_baseline(
+                    repo,
+                    &batch.id,
+                    &decisions,
+                    &[],
+                    "local_user",
+                )? {
+                    workspace_engine::BaselinePreparation::Complete { .. } => {}
+                    workspace_engine::BaselinePreparation::Awaiting(next) => {
+                        // Another card is still required; answer it in turn.
+                        result = workspace_engine::PatchApplyOutcome::BaselineRequired(next);
+                        continue;
+                    }
+                }
+                result = engine.edit_orchestrator.apply_stored_patch_with_baseline(
+                    repo,
+                    patch_id,
+                    approved_paths.as_deref(),
+                    hunk_selection.as_ref(),
+                    "local_user",
+                    allow_generated_secrets,
+                )?;
+            }
+            let workspace_engine::PatchApplyOutcome::Applied(result) = result else {
+                unreachable!("the baseline loop only exits with an applied patch")
+            };
             println!(
                 "{{\"patchId\":\"{}\",\"appliedFiles\":[{}],\"warningCount\":{}}}",
                 escape(&result.patch_id),
@@ -856,6 +891,28 @@ fn confirm_check(check: &workspace_engine::AgentCommandProposal) -> workspace_en
         return Ok(false);
     }
     eprint!("Run `{}` (risk: {})? [y/N] ", check.command, check.risk);
+    std::io::Write::flush(&mut std::io::stderr()).ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|error| workspace_engine::ClientError::Io(error.to_string()))?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// The same question for a pre-apply baseline. The question, location and
+/// risk label are the engine's; declining is still the default and the safe
+/// answer.
+fn confirm_baseline(check: &workspace_engine::BaselineCheck) -> workspace_engine::Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprint!(
+        "{} `{}` in `{}` (risk: {})? [y/N] ",
+        check.prompt, check.command, check.location_label, check.risk_label
+    );
     std::io::Write::flush(&mut std::io::stderr()).ok();
     let mut line = String::new();
     std::io::stdin()

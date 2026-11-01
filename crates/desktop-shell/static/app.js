@@ -12065,7 +12065,7 @@ function hunkLineClass(tag) {
   return "context";
 }
 
-function renderHunks(file, onToggle) {
+function renderHunks(file, onToggle, controlsDisabled = false) {
   const view = document.createElement("div");
   view.className = "diff-view";
   if (!file.hunks.length) {
@@ -12081,7 +12081,7 @@ function renderHunks(file, onToggle) {
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.checked = hunk.selected;
-    checkbox.disabled = file.state !== "pending";
+    checkbox.disabled = controlsDisabled || file.state !== "pending";
     checkbox.addEventListener("change", () => {
       hunk.selected = checkbox.checked;
       onToggle?.();
@@ -12821,16 +12821,9 @@ function createVerificationReportCard(report, reportRepo, { onContinueRepair = n
   );
   section(
     "Checks skipped",
-    (report.skipped || []).map((item) => {
-      const reason = item.reason || {};
-      const detail =
-        reason.reason === "declined_by_user"
-          ? "declined by you"
-          : reason.reason === "no_running_target"
-            ? "no running target"
-            : reason.policyReason || "blocked";
-      return document.createTextNode(`${checkLabel(item.check)} — ${detail}`);
-    }),
+    (report.skipped || []).map((item) =>
+      document.createTextNode(`${checkLabel(item.check)} — ${item.reasonLabel || ""}`),
+    ),
   );
   const stale = section(
     "Checks stale",
@@ -12853,6 +12846,41 @@ function createVerificationReportCard(report, reportRepo, { onContinueRepair = n
   section(
     "Regressions",
     (report.regressions || []).map((check) => document.createTextNode(checkLabel(check))),
+  );
+  // Spec 102 Task 3: provenance groups, their explanations, each check's
+  // label and redacted evidence, and their actions are engine data. This file
+  // prints those strings verbatim and makes no classification, evidence
+  // formatting or repair-eligibility decision of its own.
+  for (const group of report.provenance || []) {
+    const groupBody = document.createElement("div");
+    groupBody.className = "verification-report-group";
+    if (group.summary) {
+      const summary = document.createElement("p");
+      summary.className = "verification-report-group-summary";
+      summary.textContent = group.summary;
+      groupBody.append(summary);
+    }
+    for (const item of group.checks || []) {
+      const row = document.createElement("div");
+      row.className = "verification-report-check";
+      const heading = document.createElement("span");
+      heading.textContent = `${item.label} — ${item.reason}`;
+      row.append(heading);
+      for (const line of item.evidenceLines || []) {
+        const evidence = document.createElement("div");
+        evidence.className = "verification-report-evidence";
+        evidence.textContent = line;
+        row.append(evidence);
+      }
+      groupBody.append(row);
+    }
+    section(group.label, [groupBody]);
+  }
+  section(
+    "What you can do",
+    (report.actions || []).map((action) =>
+      document.createTextNode(`${action.label} — ${action.detail}`),
+    ),
   );
   section("Outcome", [
     document.createTextNode(
@@ -13822,6 +13850,124 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
   return wrapper;
 }
 
+// The engine-owned card for checks that need a pre-apply baseline (spec 102
+// Task 2). The label, note, buttons and per-check risk/cause all arrive from
+// the engine: this renders them and sends the decisions back unchanged.
+function createBaselineBatchCard(batch, onDecide) {
+  const card = document.createElement("section");
+  card.className = "check-batch baseline-batch";
+
+  const header = document.createElement("div");
+  header.className = "check-batch-header";
+  const title = document.createElement("strong");
+  title.textContent = batch.title;
+  const count = document.createElement("span");
+  count.className = "check-batch-count";
+  count.textContent = `${batch.checks.length} check${batch.checks.length === 1 ? "" : "s"}`;
+  header.append(title, count);
+
+  const note = document.createElement("p");
+  note.className = "check-batch-note";
+  note.textContent = batch.note;
+
+  const list = document.createElement("div");
+  list.className = "check-batch-list";
+  const rows = batch.checks.map((check) => {
+    const row = document.createElement("div");
+    row.className = "check-batch-item";
+
+    const run = document.createElement("input");
+    run.type = "checkbox";
+    run.className = "check-batch-run";
+    run.checked = false;
+    run.setAttribute("aria-label", `${check.prompt} ${check.command} in ${check.locationLabel}`);
+
+    const command = document.createElement("code");
+    command.className = "check-batch-command";
+    command.textContent = check.command;
+    const where = document.createElement("span");
+    where.className = "check-batch-where";
+    where.textContent = `in ${check.locationLabel}`;
+    command.append(document.createElement("br"), where);
+
+    const risk = document.createElement("span");
+    risk.className = "check-batch-risk";
+    risk.dataset.blocked = check.blocked ? "true" : "false";
+    risk.textContent = check.riskLabel;
+
+    const cause = document.createElement("span");
+    cause.className = "check-batch-cause";
+    cause.textContent = check.cause;
+
+    row.append(run, command, risk, cause);
+
+    let always = null;
+    if (check.allowAlways) {
+      const grant = document.createElement("label");
+      grant.className = "check-batch-allow";
+      always = document.createElement("input");
+      always.type = "checkbox";
+      always.disabled = true;
+      run.addEventListener("change", () => {
+        always.disabled = !run.checked;
+      });
+      grant.append(always, document.createTextNode(" Always allow"));
+      row.append(grant);
+    }
+    list.append(row);
+    return { check, run, always };
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "check-batch-actions";
+  const runAll = document.createElement("button");
+  runAll.type = "button";
+  runAll.className = "btn-sm";
+  runAll.textContent = batch.runAllLabel;
+  const submit = document.createElement("button");
+  submit.type = "button";
+  submit.className = "btn-sm";
+  actions.append(runAll, submit);
+
+  const syncSubmit = () => {
+    const ticked = rows.filter(({ run }) => run.checked).length;
+    submit.textContent = ticked > 0 ? batch.runLabel : batch.skipLabel;
+    submit.classList.toggle("btn-primary", ticked > 0);
+    runAll.hidden = ticked === rows.length;
+  };
+  for (const { run } of rows) run.addEventListener("change", syncSubmit);
+  syncSubmit();
+
+  runAll.addEventListener("click", () => {
+    for (const { run } of rows) {
+      run.checked = true;
+      run.dispatchEvent(new Event("change"));
+    }
+  });
+  submit.addEventListener("click", async () => {
+    submit.disabled = true;
+    runAll.disabled = true;
+    const decisions = rows.map(({ check, run }) => ({
+      proposalId: check.proposalId,
+      approved: run.checked,
+    }));
+    const always = rows
+      .filter(({ run, always }) => run.checked && always?.checked)
+      .map(({ check }) => check.proposalId)
+      .join("\n");
+    try {
+      await onDecide(decisions, always);
+    } catch (error) {
+      submit.disabled = false;
+      runAll.disabled = false;
+      toast(error.message);
+    }
+  });
+
+  card.append(header, note, list, actions);
+  return card;
+}
+
 // `onResolved` is called once no file is left pending, for a patch reattached
 // after a crash: the task it belonged to has to be closed out, or the next
 // launch offers the same patch again. See
@@ -13833,6 +13979,10 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
     // Warnings a hook returned on an apply (spec 32 Task 9). They are not a
     // reason to roll back, so they stay beside the applied files.
     hookWarnings: [],
+    // A pre-apply baseline batch the engine is waiting on (spec 102 Task 2).
+    // The card carries the engine's own labels and decisions; this object only
+    // remembers the exact apply snapshot to retry once the user answers.
+    baseline: null,
     files: (payload.files || []).map((file) => {
       const stats = diffStats(file.diff);
       return {
@@ -13881,7 +14031,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
     const additions = selected.reduce((sum, file) => sum + file.additions, 0);
     const deletions = selected.reduce((sum, file) => sum + file.deletions, 0);
     applyButton.textContent = `Apply ${selected.length}`;
-    applyButton.disabled = selected.length === 0;
+    applyButton.disabled = selected.length === 0 || Boolean(state.baseline);
     meta.textContent =
       selected.length === 1
         ? `1 file · +${additions} −${deletions}`
@@ -13905,7 +14055,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
     secretNotice.innerHTML = "";
   }
 
-  function showSecretNotice(warnings, paths) {
+  function showSecretNotice(warnings, selection) {
     secretNotice.innerHTML = "";
 
     const title = document.createElement("strong");
@@ -13947,7 +14097,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       clearSecretNotice();
       // Re-apply exactly the same selection, now carrying the user's explicit
       // consent. The override is per-apply and is not remembered.
-      runApply(paths, true);
+      runApply({ ...selection, allowSecrets: true });
     });
     cancelButton.addEventListener("click", () => {
       clearSecretNotice();
@@ -13962,6 +14112,21 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
     return state.files
       .filter((file) => file.state === "pending" && file.selected)
       .map((file) => file.path);
+  }
+
+  // The apply click's exact diff selection, including per-hunk choices and
+  // the per-apply secret override. A baseline pause retries this snapshot
+  // rather than recomputing it from controls the user can still move.
+  function snapshotSelection(paths, allowSecrets = false) {
+    const hunkSelection = {};
+    state.files.forEach((file) => {
+      if (paths.includes(file.path) && file.hunks.length) {
+        hunkSelection[file.path] = file.hunks
+          .filter((hunk) => hunk.selected)
+          .map((hunk) => hunk.id);
+      }
+    });
+    return { paths, hunkSelection, allowSecrets };
   }
 
   // Every file answered, one way or the other.
@@ -14012,7 +14177,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.checked = file.selected;
-      checkbox.disabled = file.state !== "pending";
+      checkbox.disabled = file.state !== "pending" || Boolean(state.baseline);
       checkbox.addEventListener("change", () => {
         file.selected = checkbox.checked;
         // Not `render()`: this handler deliberately does not rebuild the list,
@@ -14082,7 +14247,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       }
 
       cardHeader.append(label, meta);
-      card.append(cardHeader, renderHunks(file));
+      card.append(cardHeader, renderHunks(file, null, Boolean(state.baseline)));
       list.append(card);
     });
 
@@ -14103,35 +14268,82 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       });
       list.append(notice);
     }
-    applyButton.disabled = !hasPending;
-    rejectButton.disabled = !hasPending;
+    if (state.baseline) {
+      list.append(
+        createBaselineBatchCard(state.baseline.batch, async (decisions, always) => {
+          const pending = state.baseline;
+          if (!pending) return;
+          let result;
+          try {
+            result = await api(
+              "/api/resume-baseline",
+              form({
+                repo: patchRepo,
+                batch_id: pending.batch.id,
+                decisions: JSON.stringify(decisions),
+                always,
+              }),
+            );
+          } catch (error) {
+            // A stale card (for example after a reload rebuilt the batch) is
+            // safe to re-offer: the next apply asks the engine again.
+            state.baseline = null;
+            render();
+            throw error;
+          }
+          // Incomplete or still-awaiting responses never retry the apply: the
+          // only response that means every check has a terminal baseline is
+          // the engine's explicit `completed: true`.
+          if (result.completed !== true) {
+            if (!result.baselineBatch) {
+              throw new Error("The baseline response was incomplete");
+            }
+            state.baseline = {
+              batch: result.baselineBatch,
+              selection: pending.selection,
+            };
+            render();
+            return;
+          }
+          state.baseline = null;
+          render();
+          await runApply(pending.selection);
+        }),
+      );
+    }
+    applyButton.disabled = !hasPending || Boolean(state.baseline);
+    rejectButton.disabled = !hasPending || Boolean(state.baseline);
     $("chat-log").scrollTop = $("chat-log").scrollHeight;
   }
 
-  async function runApply(paths, allowSecrets) {
+  async function runApply(selection) {
     try {
       applyButton.disabled = true;
-      const hunkSelection = {};
-      state.files.forEach((file) => {
-        if (paths.includes(file.path) && file.hunks.length) {
-          hunkSelection[file.path] = file.hunks
-            .filter((hunk) => hunk.selected)
-            .map((hunk) => hunk.id);
-        }
-      });
       const fields = {
         repo: patchRepo,
         patch_id: state.patchId,
-        paths: paths.join("\n"),
-        hunk_selection: JSON.stringify(hunkSelection),
+        paths: selection.paths.join("\n"),
+        hunk_selection: JSON.stringify(selection.hunkSelection),
       };
-      if (allowSecrets) fields.allow_secrets = "1";
+      if (selection.allowSecrets) fields.allow_secrets = "1";
       const result = await api("/api/apply-patch", form(fields));
+
+      // Nothing was written; the engine needs the pre-apply baselines decided
+      // first. The batch already carries its own labels and decisions. Keep
+      // this exact snapshot so the retry cannot pick up later control changes.
+      if (result.baselineBatch) {
+        state.baseline = {
+          batch: result.baselineBatch,
+          selection,
+        };
+        render();
+        return;
+      }
 
       // Nothing was written; the server is asking whether to go ahead.
       const blocked = result.blockedBySecrets || [];
       if (blocked.length) {
-        showSecretNotice(blocked, paths);
+        showSecretNotice(blocked, selection);
         applyButton.disabled = false;
         return;
       }
@@ -14141,7 +14353,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       markFiles(applied, "applied");
       await reportResolvedIfSettled();
       toast(
-        allowSecrets
+        selection.allowSecrets
           ? `Applied ${applied.length} file(s) despite secret warning`
           : `Applied ${applied.length} file(s)`,
       );
@@ -14163,7 +14375,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       toast("No pending patch files selected");
       return;
     }
-    runApply(paths, false);
+    runApply(snapshotSelection(paths));
   });
 
   rejectButton.addEventListener("click", async () => {

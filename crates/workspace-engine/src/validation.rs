@@ -525,6 +525,12 @@ impl ValidationOrchestrator {
         &self.command_policy
     }
 
+    /// The store the baseline path reads a proposal back from before running
+    /// it, so a resumed batch executes exactly the command the user saw.
+    pub(crate) fn command_store(&self) -> &CommandStore {
+        &self.command_store
+    }
+
     pub fn reject_proposal(&self, proposal_id: &str, rejected_by: &str) -> Result<PathBuf> {
         let path = self.command_store.mark_rejected(proposal_id, rejected_by)?;
         self.audit_log.record(

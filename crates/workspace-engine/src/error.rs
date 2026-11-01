@@ -79,6 +79,13 @@ pub enum ClientError {
     ApprovalRequired(String),
     PatchConflict(String),
     PolicyBlocked(String),
+    /// The command's process could not be started at all (spec 102 Task 3).
+    /// Narrower than [`Self::Io`] on purpose: only this error is evidence that
+    /// the environment lacks a runnable command. An unrelated I/O failure in
+    /// the same execution path — reading a proposal, writing the execution
+    /// record, auditing — is an internal failure and must propagate instead of
+    /// being reported as an environment fact.
+    CommandSpawnFailed(String),
     Io(String),
     Git(String),
     InvalidInput(String),
@@ -99,6 +106,7 @@ impl ClientError {
             Self::ApprovalRequired(_) => "approval_required",
             Self::PatchConflict(_) => "patch_conflict",
             Self::PolicyBlocked(_) => "policy_blocked",
+            Self::CommandSpawnFailed(_) => "command_spawn_failed",
             Self::Io(_) => "io_error",
             Self::Git(_) => "git_error",
             Self::InvalidInput(_) => "invalid_input",
@@ -143,6 +151,7 @@ impl Display for ClientError {
             | Self::ApprovalRequired(message)
             | Self::PatchConflict(message)
             | Self::PolicyBlocked(message)
+            | Self::CommandSpawnFailed(message)
             | Self::Io(message)
             | Self::Git(message)
             | Self::InvalidInput(message)

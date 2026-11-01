@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod baseline;
 pub mod branch;
 pub mod cancel;
 pub mod chat;
@@ -41,6 +42,7 @@ pub mod plan;
 pub mod process_registry;
 pub mod profile;
 pub mod protected_paths;
+pub mod provenance;
 pub mod recovery;
 mod render;
 pub mod repository_map;
@@ -62,6 +64,9 @@ pub mod worktree;
 pub mod worktree_access;
 
 pub use audit::AuditLog;
+pub use baseline::{
+    BaselineBatch, BaselineCheck, BaselineCoordinator, BaselinePreparation, TaskBaselines,
+};
 pub use branch::{
     BRANCH_SLUG_MAX_CHARS, BranchEngine, BranchError, BranchInspection, BranchOutcome,
     BranchPreparation, BranchRecord, BranchSuggestion, GitMutation, MergePreparation,
@@ -128,8 +133,8 @@ pub use data_schema::{
 };
 pub use diff::{DiffLine, Hunk, create_unified_diff, diff_file, reconstruct_content};
 pub use edit::{
-    EditOrchestrator, EditProposalResult, GeneratedEdit, PatchStore, parse_generated_edit,
-    patch_diff_text, patch_hunk_summary,
+    EditOrchestrator, EditProposalResult, GeneratedEdit, PatchApplyOutcome, PatchStore,
+    parse_generated_edit, patch_diff_text, patch_hunk_summary,
 };
 pub use effective_policy::{
     EffectivePolicy, PolicyEntry, PolicyRule, PolicySource, RefusedBy, RefusedRequest, SourceKind,
@@ -214,6 +219,12 @@ pub use protected_paths::{
     TaskProtectedPathsControl, TaskProtectedPathsEvent, canonicalize_protected_path,
     parse_protected_path_prompt, protected_path_update_outcome, resolve_active_protected_path,
 };
+pub use provenance::{
+    PostPatchResult, ProvenanceCheck, ProvenanceClassification, ProvenancePartition, RepairTarget,
+    VerificationAction, VerificationActionKind, build_partitions, classify, provenance_action,
+    provenance_count, provenance_label, provenance_reason, provenance_summary,
+    render_repair_request, repair_targets,
+};
 pub use recovery::{
     PendingVerification, QUESTION_WAITING_HEADLINE, ReattachedApproval, RecoveredTask, abandon,
     classify_all, classify_session, headline, mark_failed, pending_verifications,
@@ -257,9 +268,11 @@ pub use validation::{
     command_approval_prompt, resolve_command_directory,
 };
 pub use verification::{
-    BROWSER_CHECK_PREFIX, CheckId, CheckOutcome, CheckRun, FailedCheck, Selection, SkipReason,
-    SkippedCheck, VerificationDue, VerificationEvent, VerificationOutcome, VerificationReport,
-    VerificationState, fold_verification, is_documentation, propose_checks, select_roots,
+    BROWSER_CHECK_PREFIX, CheckBaseline, CheckId, CheckOutcome, CheckProvenanceRecord, CheckRun,
+    CheckTermination, FailedCheck, FailureFingerprint, FailureProvenance, FindingEvidence,
+    MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, Selection, SkipReason, SkippedCheck,
+    VerificationDue, VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
+    fold_verification, is_documentation, propose_checks, select_roots,
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,

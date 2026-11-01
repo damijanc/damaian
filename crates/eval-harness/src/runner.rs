@@ -6,10 +6,11 @@ use workspace_engine::{
     AgentCommandProposal, AgentPatchProposal, CancelToken, ChatTurnOptions, ClientError, Config,
     ContextCategory, ContextDecision, CurlModelTransport, MemoryProposal, MemoryScope, MemoryState,
     MemoryStore, MemoryStoreConfig, MemoryTarget, MockModelAdapter, ModelAdapter,
-    ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, ProcessRegistry, ProjectIdentity,
-    ProjectKeySource, ProposalOrigin, Result, RoundBudgetDecision, SecretScanner, SessionStore,
-    Task, TaskStatus, ToolCall, TurnProgress, TurnSink, UsageSource, UserConfirmation,
-    VerificationReport, WorkspaceEngine, classify_session, evidence_ref_for, resume,
+    ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, PatchApplyOutcome, ProcessRegistry,
+    ProjectIdentity, ProjectKeySource, ProposalOrigin, Result, RoundBudgetDecision, SecretScanner,
+    SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink, UsageSource,
+    UserConfirmation, VerificationReport, WorkspaceEngine, classify_session, evidence_ref_for,
+    resume,
 };
 
 use crate::fixture::{self, Materialized};
@@ -119,6 +120,48 @@ pub fn mock_provider() -> ModelProviderConfig {
 
 /// The deterministic tier: a scripted `MockModelAdapter`, no credentials and no
 /// network.
+/// Apply a stored patch the way a headless harness must: spec 102's pre-apply
+/// baseline is a decision the harness has no user for, so it declines each
+/// offered baseline explicitly and retries the same apply. Declining a
+/// baseline never declines the patch, and the recorded `declined` state is
+/// what Task 3 reads as unknown provenance.
+fn apply_eval_patch(engine: &WorkspaceEngine, root: &Path, patch_id: &str) -> Result<()> {
+    let mut outcome = engine.edit_orchestrator.apply_stored_patch_with_baseline(
+        root,
+        patch_id,
+        None,
+        None,
+        "eval-harness",
+        false,
+    )?;
+    while let PatchApplyOutcome::BaselineRequired(batch) = outcome {
+        let decisions = batch
+            .checks
+            .iter()
+            .map(|check| (check.proposal_id.clone(), false))
+            .collect::<Vec<_>>();
+        engine.edit_orchestrator.resume_stored_patch_baseline(
+            root,
+            &batch.id,
+            &decisions,
+            &[],
+            "eval-harness",
+        )?;
+        outcome = engine.edit_orchestrator.apply_stored_patch_with_baseline(
+            root,
+            patch_id,
+            None,
+            None,
+            "eval-harness",
+            false,
+        )?;
+    }
+    let PatchApplyOutcome::Applied(_) = outcome else {
+        unreachable!("the baseline loop only exits with an applied patch")
+    };
+    Ok(())
+}
+
 pub fn run(scenario: &Scenario) -> Result<Run> {
     if scenario.tier != Tier::Deterministic {
         return Err(ClientError::InvalidInput(format!(
@@ -1199,14 +1242,7 @@ fn drive(
         // is the same path the desktop app's apply route uses. No approved_paths
         // and no hunk selection means the whole proposal, which is what a user
         // clicking apply without touching the checkboxes does.
-        if let Err(error) = engine.edit_orchestrator.apply_stored_patch(
-            &materialized.root,
-            &proposal.patch_id,
-            None,
-            None,
-            "eval-harness",
-            false,
-        ) {
+        if let Err(error) = apply_eval_patch(engine, &materialized.root, &proposal.patch_id) {
             apply_error = Some(format!("{error:?}"));
         }
     }
@@ -1227,14 +1263,7 @@ fn drive(
         && result.patch_proposal.is_some()
     {
         if let Some(patch) = result.patch_proposal.clone() {
-            engine.edit_orchestrator.apply_stored_patch(
-                &materialized.root,
-                &patch.patch_id,
-                None,
-                None,
-                "eval-harness",
-                false,
-            )?;
+            apply_eval_patch(engine, &materialized.root, &patch.patch_id)?;
         }
         let session_id = result.session.id.clone();
         let mut current = None;
@@ -1291,14 +1320,7 @@ fn drive(
                 continue;
             }
             if let Some(patch) = turn.patch_proposal.clone() {
-                engine.edit_orchestrator.apply_stored_patch(
-                    &materialized.root,
-                    &patch.patch_id,
-                    None,
-                    None,
-                    "eval-harness",
-                    false,
-                )?;
+                apply_eval_patch(engine, &materialized.root, &patch.patch_id)?;
                 continue;
             }
             verification = turn.verification_report.clone();

@@ -3016,6 +3016,9 @@ impl SessionStore {
             VerificationEvent::Started { .. } => "verification_started",
             VerificationEvent::Check { .. } => "verification_check",
             VerificationEvent::Finished { .. } => "verification_finished",
+            VerificationEvent::Baseline { .. } => "verification_baseline",
+            VerificationEvent::Provenance { .. } => "verification_provenance",
+            VerificationEvent::RepairState { .. } => "verification_repair_state",
         };
         let payload = serde_json::to_string(event).map_err(|error| {
             crate::error::ClientError::Io(format!("verification event serialization: {error}"))
@@ -3242,6 +3245,9 @@ impl SessionStore {
                     | "verification_started"
                     | "verification_check"
                     | "verification_finished"
+                    | "verification_baseline"
+                    | "verification_provenance"
+                    | "verification_repair_state"
             ) {
                 continue;
             }
@@ -3254,6 +3260,60 @@ impl SessionStore {
             }
         }
         Ok(events)
+    }
+
+    /// The current task-local baselines for `task_id`, keyed by check.
+    ///
+    /// A baseline is recorded under the task that owned the patch, never under
+    /// the later verification turn that reads the result. Lookup walks the
+    /// task's continuation chain so a repair turn or a worker continuation
+    /// reuses the source task's baseline instead of taking a new one after the
+    /// failure it is meant to explain (spec 102 Task 2).
+    pub fn task_verification_baselines(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<BTreeMap<crate::verification::CheckId, crate::verification::CheckBaseline>> {
+        use crate::verification::VerificationEvent;
+        let chain = self.task_continuation_chain(session_id, task_id)?;
+        let ids = chain.iter().map(String::as_str).collect::<Vec<_>>();
+        let events = self.read_verification_events(session_id, &ids)?;
+        let mut baselines = BTreeMap::new();
+        for event in events {
+            if let VerificationEvent::Baseline {
+                check, baseline, ..
+            } = event
+            {
+                baselines.insert(check, baseline);
+            }
+        }
+        Ok(baselines)
+    }
+
+    /// The task-local post-patch classifications for `task_id`, keyed by check.
+    ///
+    /// Like [`Self::task_verification_baselines`], lookup walks the task's
+    /// continuation chain so a repair or worker continuation sees its own
+    /// earlier result and a new user task inherits nothing. A missing record
+    /// means the caller must treat the result as unknown, never as a
+    /// regression it invented.
+    pub fn task_verification_provenance(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<BTreeMap<crate::verification::CheckId, crate::verification::CheckProvenanceRecord>>
+    {
+        use crate::verification::VerificationEvent;
+        let chain = self.task_continuation_chain(session_id, task_id)?;
+        let ids = chain.iter().map(String::as_str).collect::<Vec<_>>();
+        let events = self.read_verification_events(session_id, &ids)?;
+        let mut provenance = BTreeMap::new();
+        for event in events {
+            if let VerificationEvent::Provenance { record, .. } = event {
+                provenance.insert(record.check.clone(), record);
+            }
+        }
+        Ok(provenance)
     }
 
     /// Appends one finding (spec 22 §5.7). A `Finding` is redacted by

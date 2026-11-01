@@ -125,6 +125,10 @@ gate that proves the sequence works as one system.
   ordinary and worker sessions; its §7 records the acceptance evidence, the
   deterministic evaluation and the scoped local checks. The full gate is left
   to CI.
+- **In progress:** [#102](102_repair_provenance_and_stagnation.md) started on
+  2026-11-01. Its six-task plan first establishes durable, backward-compatible
+  verification provenance, then adds pre-apply baselines, provenance-gated
+  repair, stagnation stops and engine-owned repair scope before integration.
 - **In progress:** [#49](49_prompt_cache_accounting_and_reuse/proposal.md) prompt
   cache's accounting slice is done and the reuse slice (requirement 4) is still
   unbuilt; #26's ordering exists, and #55 replaced the eight-message sliding
@@ -134,9 +138,8 @@ gate that proves the sequence works as one system.
 - **Ready:** #33 MCP management. It was serialised behind #30 on `chat.rs`;
   with #30 Done it is free to start, from a `main` that contains #30's turn
   path so it does not rebase over it.
-  [#102](102_repair_provenance_and_stagnation.md) and
-  [#104](104_worker_questions.md) are dependency-ready too — #102's last unmet
-  dependency was #98 — and [#105](105_structured_plan_checks.md) becomes
+  [#104](104_worker_questions.md) is dependency-ready too, and
+  [#105](105_structured_plan_checks.md) becomes
   dependency-ready now that #101 is Done. All of them share the agent loop with
   #33 and must not be implemented concurrently with it or with each other.
 - **Blocked:** #37 on #33; #52 on #33; #39 on #38; #40 on #38 and #39; #54 on
@@ -898,7 +901,7 @@ is ready.
 | 99 | [99_worker_task_outcomes.md](99_worker_task_outcomes.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A worker's `idle` process state hid whether its task had completed, needed a decision, or had stopped short. The worker session now derives an explicit outcome and next action from durable task status, approvals, errors and progress timestamps; the board also treats an idle pending decision as **Needs you**. |
 | 100 | [100_worker_return_and_inline_choice.md](100_worker_return_and_inline_choice.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A worker now reaches one redacted, durable terminal outcome — `incomplete` included — for its parent; the parent shows a result card whose **Continue with result** starts an ordinary turn rather than approving or merging anything, and a suggested worker prompt offers **Work here instead** beside **Start worker**. |
 | 101 | [101_closed_task_completion.md](101_closed_task_completion.md) | **Done 2026-11-01.** A model answer can no longer become `complete` while approved plan work or verification remains. The engine-owned completion gate settles an answered turn or a verification, records its typed reasons and declined-check waivers, and otherwise writes a durable, resumable `incomplete`. The shell, worker host and browser transport the engine's task control; **Continue task** re-reads the exact task and report under the session-log lock and grants no approval. Recovery recomputes the gate from durable state, and the deterministic evaluation now asserts the truthful `incomplete` outcome. Its §7 records the acceptance evidence. |
-| 102 | [102_repair_provenance_and_stagnation.md](102_repair_provenance_and_stagnation.md) | **Not started; ready now that #98 is Done.** Checks will be baselined before the patch that first selects them, repair will target only introduced regressions, environment failures will not trigger source edits, and repeated or oscillating repairs will stop before the numeric limit. |
+| 102 | [102_repair_provenance_and_stagnation.md](102_repair_provenance_and_stagnation.md) | **In progress since 2026-11-01.** Six tasks: durable evidence and provenance; pre-apply baseline decisions; provenance-gated repair; stagnation and oscillation stops; engine-owned repair scope and thin presentation; integration and close-out. Checks will be baselined before the patch that first selects them, repair will target only introduced regressions, environment failures will not trigger source edits, and repeated or oscillating repairs will stop before the numeric limit. |
 | 103 | [103_bounded_worker_continuation.md](103_bounded_worker_continuation.md) | **Not started; blocked on #102.** #101 is built. A user-approved task budget will span internal worker segments, while deterministic within-turn tool-history compaction keeps requests inside the provider window and no-progress or budget exhaustion remains a truthful stop. |
 | 104 | [104_worker_questions.md](104_worker_questions.md) | **Not started.** An app-managed worker will be able to persist a real clarification, show **Needs your answer**, and resume through its control socket without treating an answer as an approval or guessing a material product decision. |
 | 105 | [105_structured_plan_checks.md](105_structured_plan_checks.md) | **Not started; ready now that #101 is Done.** Approved plan steps will carry structured required checks with command, directory and current evidence, replacing #97's prose match and giving the completion gate an engine-owned verification obligation. |

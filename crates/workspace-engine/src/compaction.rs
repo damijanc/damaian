@@ -730,6 +730,9 @@ pub fn facts_for_span(inputs: FactInputs<'_>, through_seq: u64) -> Option<Summar
             crate::verification::CheckOutcome::Skipped(reason) => {
                 format!("skipped: {}", reason.description())
             }
+            crate::verification::CheckOutcome::Environment { termination } => {
+                format!("could not run: {}", termination.description())
+            }
         };
         validation.push(ValidationDigest {
             label: check.label(),
@@ -1094,6 +1097,7 @@ mod tests {
             outcome: CheckOutcome::Ran {
                 exit_code: Some(0),
                 marker_id: "marker_1".to_string(),
+                termination: None,
             },
             file_hashes: BTreeMap::new(),
         }];

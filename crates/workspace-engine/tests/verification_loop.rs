@@ -16,14 +16,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
-    CancelToken, ChatTurnResult, CheckId, CheckOutcome, CommandPurpose, CompletionReasonCode,
-    Config, ContextDecision, Evidence, HookConfig, HookEvent, HookMode, HookSource,
-    MockModelAdapter, PausedTurns, PlanReport, PlanStep, ReattachedApproval, RoundBudgetDecision,
-    Selection, SessionStore, SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink,
-    VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
-    WebDiagnosticCall, WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport,
-    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerRecord, WorkspaceEngine,
-    fold_verification, is_documentation, pending_verifications, propose_checks,
+    CancelToken, ChatTurnResult, CheckBaseline, CheckId, CheckOutcome, CommandPurpose,
+    CompletionReasonCode, Config, ContextDecision, Evidence, FailureProvenance, HookConfig,
+    HookEvent, HookMode, HookSource, MockModelAdapter, PausedTurns, PlanReport, PlanStep,
+    ReattachedApproval, RoundBudgetDecision, Selection, SessionStore, SkipReason, TaskPlan,
+    TaskStatus, TurnProgress, TurnSink, VerificationEvent, VerificationOutcome, VerificationReport,
+    VerificationState, WebDiagnosticCall, WebDiagnosticDetails, WebDiagnosticRecord,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerRecord,
+    WorkspaceEngine, fold_verification, is_documentation, pending_verifications, propose_checks,
     reattach_pending_approvals, select_roots,
 };
 
@@ -46,6 +46,7 @@ fn ran(check: CheckId, exit_code: Option<i32>) -> VerificationEvent {
         outcome: CheckOutcome::Ran {
             exit_code,
             marker_id: "marker".to_string(),
+            termination: None,
         },
         file_hashes: BTreeMap::new(),
     }
@@ -62,6 +63,7 @@ fn ran_with_hashes(
         outcome: CheckOutcome::Ran {
             exit_code,
             marker_id: "marker".to_string(),
+            termination: None,
         },
         file_hashes: hashes
             .iter()
@@ -1339,12 +1341,12 @@ fn cargofile(root: &std::path::Path) {
     write(root, "Cargo.toml", "[workspace]\nmembers = []\n");
 }
 
-fn run_verification(
+fn try_run_verification(
     engine: &WorkspaceEngine,
     root: &std::path::Path,
     session_id: &str,
     adapter: &mut dyn workspace_engine::ModelAdapter,
-) -> workspace_engine::ChatTurnResult {
+) -> workspace_engine::Result<ChatTurnResult> {
     let cancel = CancelToken::new();
     let mut on_token = |_token: &str| {};
     let mut on_progress = |_event: TurnProgress| {};
@@ -1357,6 +1359,15 @@ fn run_verification(
     engine
         .chat_orchestrator
         .verify_due(root, session_id, adapter, &mut sink)
+}
+
+fn run_verification(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    session_id: &str,
+    adapter: &mut dyn workspace_engine::ModelAdapter,
+) -> workspace_engine::ChatTurnResult {
+    try_run_verification(engine, root, session_id, adapter)
         .expect("the verification turn should run")
 }
 
@@ -1440,6 +1451,27 @@ fn applied_change(
     root: &std::path::Path,
     files: &[(&str, &str, &str)],
 ) -> (String, String) {
+    applied_change_with_baselines(engine, root, files, true)
+}
+
+/// The same fixture with a declined baseline for every check. The approval
+/// path records the same `Declined` baseline when the user skips the baseline
+/// card; this writes it directly so the test stays about Task 3's
+/// classification rather than Task 2's card transport.
+fn applied_change_with_declined_baseline(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    files: &[(&str, &str, &str)],
+) -> (String, String) {
+    applied_change_with_baselines(engine, root, files, false)
+}
+
+fn applied_change_with_baselines(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    files: &[(&str, &str, &str)],
+    pass_baselines: bool,
+) -> (String, String) {
     for (path, before, _) in files {
         write(root, path, before);
     }
@@ -1448,11 +1480,99 @@ fn applied_change(
         .map(|(path, _, after)| (*path, *after))
         .collect();
     let proposal = propose(engine, root, &edit_response(&changes));
-    engine
+    // Spec 102 Task 2: these fixtures force check approval to exercise the
+    // verification card. Decline the pre-apply baselines here so the patch
+    // applies and the later verification pause is the one under test.
+    let mut outcome = engine
         .edit_orchestrator
-        .apply_stored_patch(root, &proposal.patch.id, None, None, "tester", false)
+        .apply_stored_patch_with_baseline(root, &proposal.patch.id, None, None, "tester", false)
         .expect("the patch should apply");
+    while let workspace_engine::PatchApplyOutcome::BaselineRequired(batch) = outcome {
+        let decisions = batch
+            .checks
+            .iter()
+            .map(|check| (check.proposal_id.clone(), false))
+            .collect::<Vec<_>>();
+        engine
+            .edit_orchestrator
+            .resume_stored_patch_baseline(root, &batch.id, &decisions, &[], "tester")
+            .expect("the baseline decisions should record");
+        outcome = engine
+            .edit_orchestrator
+            .apply_stored_patch_with_baseline(root, &proposal.patch.id, None, None, "tester", false)
+            .expect("the patch should apply");
+    }
+    assert!(matches!(
+        outcome,
+        workspace_engine::PatchApplyOutcome::Applied(_)
+    ));
+    // Spec 102 Task 3: these fixtures exercise the repair loop, so the check
+    // must have passed before the patch. Task 2's coordinator establishes the
+    // baseline through the ordinary policy path; the declined/failed baseline
+    // cases have their own tests.
+    if pass_baselines {
+        mark_baselines_passed(engine, &proposal.session.id, &proposal.task.id);
+    } else {
+        mark_baselines_declined(engine, &proposal.session.id, &proposal.task.id);
+    }
     (proposal.session.id, proposal.task.id)
+}
+
+/// Make the patch task's recorded baselines passing for a fixture that is
+/// about post-patch repair rather than baseline acquisition. The latest event
+/// for a check wins in the fold, so this is deterministic and still replays as
+/// durable evidence.
+fn mark_baselines_passed(engine: &WorkspaceEngine, session_id: &str, task_id: &str) {
+    for check in recorded_checks(engine, session_id, task_id) {
+        engine
+            .session_store
+            .append_verification_event(
+                session_id,
+                &VerificationEvent::Baseline {
+                    task_id: task_id.to_string(),
+                    check,
+                    baseline: workspace_engine::CheckBaseline::Passed,
+                },
+            )
+            .expect("the passing baseline should record");
+    }
+}
+
+/// Record a declined baseline for every check the patch task selected. The
+/// ordinary approval path writes the same event when the user skips the card;
+/// this fixture writes it directly so the test is about Task 3.
+fn mark_baselines_declined(engine: &WorkspaceEngine, session_id: &str, task_id: &str) {
+    for check in recorded_checks(engine, session_id, task_id) {
+        engine
+            .session_store
+            .append_verification_event(
+                session_id,
+                &VerificationEvent::Baseline {
+                    task_id: task_id.to_string(),
+                    check,
+                    baseline: workspace_engine::CheckBaseline::Declined,
+                },
+            )
+            .expect("the declined baseline should record");
+    }
+}
+
+fn recorded_checks(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    task_id: &str,
+) -> std::collections::BTreeSet<CheckId> {
+    let events = engine
+        .session_store
+        .read_verification_events(session_id, &[task_id])
+        .expect("the verification log should read");
+    let mut checks = std::collections::BTreeSet::new();
+    for event in events {
+        if let VerificationEvent::Baseline { check, .. } = event {
+            checks.insert(check);
+        }
+    }
+    checks
 }
 
 /// Marks the session as spec 57's worker, whose worktree is the fixture root.
@@ -2529,15 +2649,19 @@ fn an_explicit_continue_runs_one_more_repair_after_the_limit() {
             .any(|evidence| matches!(evidence, Evidence::Findings { .. })),
         "the findings are preserved: {verify:?}"
     );
-    // The request is the findings, not raw check output.
+    // The request is the normalized introduced evidence, not raw check output.
     let prompt = first_user_message(&repair);
     assert!(
-        prompt.contains("verification check failed"),
-        "the repair request names the failure: {prompt}"
+        prompt.contains("Repair only the failures this patch introduced"),
+        "the repair request names only introduced failures: {prompt}"
     );
     assert!(
-        prompt.contains("Fix the") && prompt.contains("finding"),
-        "the repair request carries the finding: {prompt}"
+        prompt.contains("cargo test (repository root)"),
+        "the repair request names the check: {prompt}"
+    );
+    assert!(
+        prompt.contains("cargo test exited with code 1"),
+        "the repair request carries the normalized finding: {prompt}"
     );
 
     engine
@@ -2871,7 +2995,7 @@ fn a_repair_that_breaks_a_previously_passing_check_is_a_regression() {
 }
 
 #[test]
-fn the_repair_request_names_the_finding_ids_not_the_raw_log() {
+fn the_repair_request_carries_normalized_evidence_not_the_raw_log() {
     let root = temp_dir("repair-request");
     let data_dir = temp_dir("repair-request-data");
     cargofile(&root);
@@ -2905,8 +3029,19 @@ fn the_repair_request_names_the_finding_ids_not_the_raw_log() {
         .find(|message| message.role == "user")
         .expect("a user message carries the request");
     assert!(
-        user.content.contains(finding.id()),
-        "the repair request names the finding id: {}",
+        user.content.contains(finding.summary()),
+        "the repair request carries the normalized finding: {}",
+        user.content
+    );
+    assert!(
+        user.content.contains("src/a.rs:1:1"),
+        "the repair request names the normalized location: {}",
+        user.content
+    );
+    assert!(
+        user.content
+            .contains("Repair only the failures this patch introduced"),
+        "the repair request states its scope: {}",
         user.content
     );
 
@@ -3898,4 +4033,370 @@ fn an_approved_command_that_changes_nothing_is_not_verified() {
 fn an_unavailable_census_reports_no_changed_paths() {
     let census = workspace_engine::CommandCensus::unavailable();
     assert_eq!(census.changed_paths(&census), None);
+}
+
+// --- Spec 102 Task 3: provenance gates repair -------------------------------
+
+fn shell_returning(root: &std::path::Path, code: i32) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join(format!("exit-{code}.sh"));
+    fs::write(&path, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path.to_string_lossy().to_string()
+}
+
+fn provenance_group(
+    report: &VerificationReport,
+    provenance: FailureProvenance,
+) -> Option<&workspace_engine::ProvenancePartition> {
+    report
+        .provenance
+        .iter()
+        .find(|group| group.provenance == provenance)
+}
+
+#[test]
+fn a_declined_baseline_makes_the_failure_unknown_and_starts_no_repair() {
+    let root = temp_dir("declined-baseline");
+    let data_dir = temp_dir("declined-baseline-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let (session, _task) = applied_change_with_declined_baseline(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("unused");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+    let report = result
+        .verification_report
+        .as_ref()
+        .expect("a no-repair verification still reports");
+
+    assert_eq!(report.outcome, Some(VerificationOutcome::Failed));
+    assert!(
+        adapter.requests.is_empty(),
+        "a declined baseline must never start a code repair"
+    );
+    assert!(result.patch_proposal.is_none());
+    assert!(report.repair_targets.is_empty());
+    let group = provenance_group(report, FailureProvenance::UnknownProvenance)
+        .expect("the failure is unknown provenance");
+    assert_eq!(group.checks.len(), 1);
+    assert!(group.action.is_some());
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_matching_failed_baseline_is_pre_existing_and_starts_no_repair() {
+    let root = temp_dir("pre-existing-baseline");
+    let data_dir = temp_dir("pre-existing-baseline-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let (session, _task) = applied_change_with_declined_baseline(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    // The first run has no usable baseline: it is unknown, and records the
+    // exact post-patch fingerprint and evidence a failed baseline would have.
+    let mut first = MockModelAdapter::new("unused");
+    let first_result = run_verification(&engine, &root, &session, &mut first);
+    assert!(first_result.patch_proposal.is_none());
+    assert!(first.requests.is_empty());
+
+    let events = outcome_events(&engine, &session);
+    let state = fold_verification(events.iter());
+    let record = state
+        .provenance
+        .values()
+        .next()
+        .expect("the first run recorded its fingerprint")
+        .clone();
+    let (patch_task, patch_id) = events
+        .iter()
+        .find_map(|event| match event {
+            VerificationEvent::Due {
+                task_id, patch_id, ..
+            } => Some((task_id.clone(), patch_id.clone())),
+            _ => None,
+        })
+        .expect("the patch made verification due");
+    engine
+        .session_store
+        .append_verification_event(
+            &session,
+            &VerificationEvent::Baseline {
+                task_id: patch_task.clone(),
+                check: record.check.clone(),
+                baseline: CheckBaseline::Failed {
+                    termination: record.termination.clone(),
+                    fingerprint: record.fingerprint.clone(),
+                    findings: record.findings.clone(),
+                },
+            },
+        )
+        .unwrap();
+    engine
+        .session_store
+        .append_verification_event(
+            &session,
+            &VerificationEvent::Due {
+                task_id: patch_task,
+                patch_id,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let mut second = MockModelAdapter::new("unused");
+    let result = run_verification(&engine, &root, &session, &mut second);
+    let report = result
+        .verification_report
+        .as_ref()
+        .expect("a pre-existing failure still reports");
+
+    assert_eq!(report.outcome, Some(VerificationOutcome::Failed));
+    assert!(result.patch_proposal.is_none());
+    assert!(
+        second.requests.is_empty(),
+        "a pre-existing failure must never start a code repair"
+    );
+    assert!(report.repair_targets.is_empty());
+    let group = provenance_group(report, FailureProvenance::PreExisting)
+        .expect("the matching failed baseline is pre-existing");
+    assert_eq!(group.checks.len(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_spawn_failure_is_an_environment_failure_and_starts_no_repair() {
+    let root = temp_dir("spawn-failure");
+    let data_dir = temp_dir("spawn-failure-data");
+    cargofile(&root);
+    let missing_shell = root.join("no-such-shell").to_string_lossy().to_string();
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, &missing_shell, &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("unused");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+    let report = result
+        .verification_report
+        .as_ref()
+        .expect("an environment failure still reports");
+
+    assert!(result.patch_proposal.is_none());
+    assert!(
+        adapter.requests.is_empty(),
+        "a spawn failure must never start a code repair"
+    );
+    assert!(report.repair_targets.is_empty());
+    let group = provenance_group(report, FailureProvenance::EnvironmentFailure)
+        .expect("a spawn failure is an environment failure");
+    assert_eq!(group.checks.len(), 1);
+    assert!(group.action.as_ref().unwrap().label.contains("environment"));
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// Spec 102 Task 3 review: an I/O failure while saving the run's execution
+/// record says nothing about the environment. It must propagate as the error
+/// it is, rather than being disguised as a spawn failure.
+#[test]
+fn an_execution_store_failure_propagates_instead_of_becoming_environment() {
+    let root = temp_dir("execution-store-failure");
+    let data_dir = temp_dir("execution-store-failure-data");
+    cargofile(&root);
+    let shell = shell_returning(&root, 1);
+    let engine = verify_engine_with_retry(&root, &data_dir, &shell, &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    // `commands/output` is where the execution record is written. Replace it
+    // with a file after the patch settles, so the check itself runs but saving
+    // its record fails.
+    let output = data_dir.join("commands").join("output");
+    let _ = fs::remove_dir_all(&output);
+    fs::create_dir_all(data_dir.join("commands")).unwrap();
+    fs::write(&output, "not a directory").unwrap();
+    let mut adapter = MockModelAdapter::new("unused");
+
+    let error = try_run_verification(&engine, &root, &session, &mut adapter)
+        .expect_err("an internal store failure must not become provenance");
+
+    assert!(
+        matches!(error, workspace_engine::ClientError::Io(_)),
+        "{error:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_missing_executable_is_an_environment_failure_and_starts_no_repair() {
+    let root = temp_dir("missing-executable");
+    let data_dir = temp_dir("missing-executable-data");
+    cargofile(&root);
+    let shell = shell_returning(&root, 127);
+    let engine = verify_engine_with_retry(&root, &data_dir, &shell, &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("unused");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+    let report = result
+        .verification_report
+        .as_ref()
+        .expect("an environment failure still reports");
+
+    assert!(result.patch_proposal.is_none());
+    assert!(
+        adapter.requests.is_empty(),
+        "a missing executable must never start a code repair"
+    );
+    assert!(report.repair_targets.is_empty());
+    let group = provenance_group(report, FailureProvenance::EnvironmentFailure)
+        .expect("exit 127 is a missing executable");
+    assert!(
+        group.checks[0]
+            .reason
+            .contains("executable is not installed"),
+        "{:?}",
+        group.checks[0].reason
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_policy_refused_check_is_reported_as_environment_and_starts_no_repair() {
+    let root = temp_dir("policy-refused");
+    let data_dir = temp_dir("policy-refused-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &[], &["cargo test"], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("unused");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+    let report = result
+        .verification_report
+        .as_ref()
+        .expect("a policy refusal still reports");
+
+    assert!(result.patch_proposal.is_none());
+    assert!(
+        adapter.requests.is_empty(),
+        "a policy refusal must never start a code repair"
+    );
+    assert!(report.repair_targets.is_empty());
+    let group = provenance_group(report, FailureProvenance::EnvironmentFailure)
+        .expect("a policy refusal is an environment failure");
+    assert_eq!(group.checks.len(), 1);
+    assert!(group.action.as_ref().unwrap().label.contains("environment"));
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_worker_session_does_not_repair_an_unknown_failure() {
+    let root = temp_dir("worker-unknown");
+    let data_dir = temp_dir("worker-unknown-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let (session, _task) = applied_change_with_declined_baseline(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    mark_worker(&engine, &session, &root);
+    let mut adapter = MockModelAdapter::new("unused");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+    let report = result
+        .verification_report
+        .as_ref()
+        .expect("a worker's no-repair verification reports");
+
+    assert!(result.patch_proposal.is_none());
+    assert!(
+        adapter.requests.is_empty(),
+        "a worker must not repair an unknown failure"
+    );
+    assert!(report.repair_targets.is_empty());
+    assert!(
+        provenance_group(report, FailureProvenance::UnknownProvenance).is_some(),
+        "{report:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn provenance_and_repair_targets_survive_a_fresh_store() {
+    let root = temp_dir("provenance-reload");
+    let data_dir = temp_dir("provenance-reload-data");
+    cargofile(&root);
+    let shell = repaired_shell(&root).to_string_lossy().to_string();
+    fs::write(root.join("cargo-fail"), "fail\n").unwrap();
+    let engine = verify_engine_with_retry(&root, &data_dir, &shell, &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut repair = MockModelAdapter::new("I cannot fix this.");
+    let first = run_verification(&engine, &root, &session, &mut repair);
+    assert!(
+        first.patch_proposal.is_none(),
+        "the repair answer proposed no patch"
+    );
+
+    // A new store over the same data dir is the worker/desktop reload path.
+    let reopened = SessionStore::new(&data_dir);
+    let events = reopened.read_verification_events(&session, &[]).unwrap();
+    let state = fold_verification(events.iter());
+    let mut hashes = BTreeMap::new();
+    for run in state.checks.values() {
+        hashes.extend(run.file_hashes.clone());
+    }
+    let report = VerificationReport::build(&state, &TaskPlan::new("task", 0), &[], &hashes);
+    let group = provenance_group(&report, FailureProvenance::NewRegression)
+        .expect("the durable classification survives the reload");
+    assert_eq!(group.checks.len(), 1);
+    assert!(!report.repair_targets.is_empty());
+    assert!(!report.repair_targets[0].evidence.is_empty());
+    assert!(report.render().contains("Introduced regressions"));
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
 }

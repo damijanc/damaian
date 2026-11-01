@@ -176,6 +176,14 @@ impl WorkspaceEngine {
             validation_orchestrator.clone(),
             session_store.clone(),
         );
+        let baselines = crate::baseline::BaselineCoordinator::new(
+            config.clone(),
+            scanner.clone(),
+            audit_log.clone(),
+            indexer.clone(),
+            session_store.clone(),
+            validation_orchestrator.clone(),
+        );
         let chat_orchestrator = ChatOrchestrator::new(
             config.clone(),
             scanner.clone(),
@@ -224,6 +232,7 @@ impl WorkspaceEngine {
             patch_store.clone(),
             checkpoint_store.clone(),
             hooks.clone(),
+            baselines,
         );
         Self {
             config,

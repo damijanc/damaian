@@ -319,7 +319,13 @@ impl CommandRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
-            .spawn()?;
+            .spawn()
+            // Only the process spawn itself is typed this way. Everything else
+            // in this path that can fail with an I/O error (the process
+            // registry, waits, reads) stays `ClientError::Io`: it says nothing
+            // about whether the command's environment is usable, and a
+            // verification consumer must not turn it into an environment fact.
+            .map_err(|error| ClientError::CommandSpawnFailed(error.to_string()))?;
         let mut guard = CommandGuard {
             pid: child.id(),
             armed: true,
@@ -579,6 +585,7 @@ mod tests {
     use crate::command_policy::CommandPolicy;
     use crate::command_purpose::CommandPurpose;
     use crate::config::Config;
+    use crate::error::ClientError;
     use crate::process_registry::ProcessRegistry;
     use crate::secret_scanner::SecretScanner;
     use std::path::PathBuf;
@@ -618,6 +625,34 @@ mod tests {
         let policy = CommandPolicy::new(config.clone());
         let audit = AuditLog::new(&data_dir, false, scanner.clone());
         (CommandRunner::new(config, policy, audit, scanner), data_dir)
+    }
+
+    /// A shell that cannot start is a typed spawn failure, not a generic I/O
+    /// error. Only this error may become an environment fact downstream; an
+    /// unrelated I/O failure in the same path must propagate (spec 102 Task 3
+    /// review).
+    #[test]
+    fn a_missing_shell_is_a_typed_spawn_failure() {
+        let (mut runner, data_dir) = runner_with_scratch_data_dir();
+        runner.config.shell = data_dir.join("no-such-shell").to_string_lossy().to_string();
+        runner.config.command_path_from_interactive_shell = false;
+
+        let cancel = CancelToken::new();
+        let mut on_output = |_line: &str| {};
+        let error = runner
+            .run(
+                "echo hello",
+                &data_dir,
+                "test",
+                granted_options(&cancel, &mut on_output),
+            )
+            .expect_err("a missing shell cannot start");
+
+        assert!(
+            matches!(error, ClientError::CommandSpawnFailed(_)),
+            "{error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// A command that runs to completion must leave nothing behind, and the

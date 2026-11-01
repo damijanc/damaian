@@ -297,6 +297,16 @@ impl CompletionGateReport {
                     });
                 }
                 CheckOutcome::Ran { .. } if passing(run) => {}
+                CheckOutcome::Environment { termination } => {
+                    reasons.push(CompletionReason {
+                        code: CompletionReasonCode::RequiredCheckFailed,
+                        explanation: format!(
+                            "Required check {} could not run: {}.",
+                            check.label(),
+                            termination.description()
+                        ),
+                    });
+                }
                 CheckOutcome::Ran { .. } => {
                     let reason = verification
                         .failed
@@ -333,13 +343,7 @@ impl CompletionGateReport {
 /// Whether a check's latest recorded run passed. `Some(0)` and nothing else;
 /// `None` means killed or signalled, which is unknown, not zero.
 fn passing(run: &CheckRun) -> bool {
-    matches!(
-        run.outcome,
-        CheckOutcome::Ran {
-            exit_code: Some(0),
-            ..
-        }
-    )
+    run.outcome.is_passed()
 }
 
 fn open_steps_explanation(open: &[&PlanStep]) -> String {

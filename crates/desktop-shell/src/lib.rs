@@ -13,26 +13,26 @@ use workspace_engine::hooks::{
 };
 use workspace_engine::{
     AgentCheckBatch, AgentContextReview, AgentFallbackProposal, AgentFetchProposal,
-    AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal, BranchError,
+    AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal, BaselineBatch, BranchError,
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult,
     ClientError, CommitError, Config, ContextDecision, ContextManifest, CostEstimate,
     CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExportFormat, FetchDecision,
     GeneratedSecretWarning, GitMutation, HookActivation, HookEvent, LanguageServerStatus,
     LineRange, McpClient, McpServerConfig, McpTokenResolver, McpTransport, MemoryRecallRef,
     MemoryScope, ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter,
-    PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId, ProjectIdentity, ProposedFilePatch,
-    ProtectedPathAction, QuestionState, RepositoryConfigReport, ResumeDecisionOptions,
-    RoundBudgetDecision, SearchOptions, Session, SessionMode, SessionStore, StepStatus, SymbolRef,
-    Task, TaskPlan, TaskProtectedPathsControl, TaskUsage, TokenUsage, TurnNotes, TurnPhase,
-    TurnProgress, TurnSink, UserConfirmation, VerificationEvent, VerificationOutcome,
-    VerificationReport, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerReturn,
-    WorkspaceEngine, allow_always_eligible, builtin_context_window, builtin_token_defaults,
-    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
-    fold_verification, import_profile, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
-    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
-    select_profile,
+    PatchApplyOutcome, PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId, ProjectIdentity,
+    ProposedFilePatch, ProtectedPathAction, QuestionState, RepositoryConfigReport,
+    ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, SessionStore,
+    StepStatus, SymbolRef, Task, TaskPlan, TaskProtectedPathsControl, TaskUsage, TokenUsage,
+    TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationEvent,
+    VerificationOutcome, VerificationReport, WebDiagnosticCall, WebDiagnosticKind,
+    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
+    WorkerReturn, WorkspaceEngine, allow_always_eligible, builtin_context_window,
+    builtin_token_defaults, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
+    export_profile, fold_verification, import_profile, normalize_mcp_server_id,
+    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
+    review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -409,6 +409,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/ask") => handle_ask(stream, &request),
         ("POST", "/api/propose-edit") => handle_propose_edit(stream, &request),
         ("POST", "/api/apply-patch") => handle_apply_patch(stream, &request),
+        ("POST", "/api/resume-baseline") => handle_resume_baseline(stream, &request),
         ("POST", "/api/rollback-patch") => handle_rollback_patch(stream, &request),
         ("POST", "/api/reject-patch-files") => handle_reject_patch_files(stream, &request),
         ("POST", "/api/reject-patch") => handle_reject_patch(stream, &request),
@@ -3017,7 +3018,7 @@ fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> Result<(), S
     }
     let result = engine
         .edit_orchestrator
-        .apply_stored_patch(
+        .apply_stored_patch_with_baseline(
             &repo,
             &patch_id,
             approved_paths.as_deref(),
@@ -3026,6 +3027,22 @@ fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> Result<(), S
             allow_generated_secrets,
         )
         .map_err(|error| error.to_string())?;
+    let PatchApplyOutcome::Applied(result) = result else {
+        let PatchApplyOutcome::BaselineRequired(batch) = result else {
+            unreachable!("an apply outcome is applied or needs a baseline")
+        };
+        return write_response(
+            stream,
+            request,
+            200,
+            "application/json",
+            &format!(
+                "{{\"patchId\":\"{}\",\"appliedFiles\":[],\"baselineBatch\":{}}}",
+                escape_json(&patch_id),
+                baseline_batch_json(&batch)
+            ),
+        );
+    };
     write_response(
         stream,
         request,
@@ -3039,6 +3056,52 @@ fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> Result<(), S
             json_string_array(&result.hook_warnings)
         ),
     )
+}
+
+fn handle_resume_baseline(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let batch_id = required_form(&form, "batch_id")?;
+    let decisions = parse_check_decisions(&required_form(&form, "decisions")?)?;
+    let always = parse_baseline_always(form.get("always").map(String::as_str));
+    let engine = engine_for_repo(&repo)?;
+    // The engine validates the whole retry against the pending batch before it
+    // writes any *Allow Always* grant or runs any baseline command. The shell
+    // only transports the ids the card rendered; it never decides eligibility.
+    let outcome = engine
+        .edit_orchestrator
+        .resume_stored_patch_baseline(&repo, &batch_id, &decisions, &always, "desktop_user")
+        .map_err(|error| error.to_string())?;
+    match outcome {
+        workspace_engine::BaselinePreparation::Complete { recorded } => write_response(
+            stream,
+            request,
+            200,
+            "application/json",
+            &format!(
+                "{{\"completed\":true,\"recorded\":[{}]}}",
+                recorded
+                    .iter()
+                    .map(|check| format!("\"{}\"", escape_json(&check.label())))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        ),
+        workspace_engine::BaselinePreparation::Awaiting(batch) => write_response(
+            stream,
+            request,
+            200,
+            "application/json",
+            &format!(
+                "{{\"completed\":false,\"baselineBatch\":{}}}",
+                baseline_batch_json(&batch)
+            ),
+        ),
+    }
+}
+
+fn baseline_batch_json(batch: &BaselineBatch) -> String {
+    serde_json::to_string(batch).unwrap_or_else(|_| "null".to_string())
 }
 
 fn handle_rollback_patch(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
@@ -3814,6 +3877,19 @@ fn run_resume_checks_request(
             &mut sink,
         )
         .map_err(|error| error.to_string())
+}
+
+/// The ids a baseline card marked *Allow Always*. They are only transport
+/// values: the engine checks each one against the pending batch, the user's
+/// approval and its own eligibility before writing a grant.
+fn parse_baseline_always(raw: Option<&str>) -> Vec<String> {
+    raw.map(|raw| raw.split(['\n', ',']))
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn parse_check_decisions(raw: &str) -> Result<Vec<(String, bool)>, String> {
@@ -7464,8 +7540,8 @@ mod tests {
         session_verification_json, spawn_with_shell_stack, sweep_orphaned_processes,
         symbol_repository, task_states_json, task_usage_json, terminal_cwd_for_repo,
         turn_progress_event, validate_context_files, validate_working_folder,
-        validate_workspace_path, verify_data_dir_schema_at, web_diagnostic_json,
-        web_diagnostic_reveal_target, write_basic_response, write_sse_event,
+        validate_workspace_path, verification_report_json, verify_data_dir_schema_at,
+        web_diagnostic_json, web_diagnostic_reveal_target, write_basic_response, write_sse_event,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
@@ -7477,14 +7553,17 @@ mod tests {
     use workspace_engine::CheckpointRestoreResult;
     use workspace_engine::{
         AgentFetchProposal, AgentPlanProposal, AgentQuestionProposal, AskUserInput, CancelToken,
-        ChatMessage, ChatTurnOptions, ChatTurnResult, CompletionGateReport, CompletionReason,
-        CompletionReasonCode, Config, Evidence, FetchComponentFlag, GeneratedSecretWarning,
-        LanguageServerHub, LanguageServerLaunch, LanguageServerState, LanguageServerStatus,
-        MockModelAdapter, PendingQuestionRef, PhaseKind, PlanStep, SecretScanner, SessionMode,
-        StepStatus, TaskPlan, TaskStatus, TaskUsage, ToolCall, TurnNotes, TurnPhase, TurnProgress,
-        TurnSink, UsageSource, VerificationEvent, VerificationOutcome, WebDiagnosticRecord,
-        WebDiagnosticReport, WorkspaceEngine,
+        ChatMessage, ChatTurnOptions, ChatTurnResult, CheckId, CheckOutcome, CheckProvenanceRecord,
+        CheckTermination, CompletionGateReport, CompletionReason, CompletionReasonCode, Config,
+        Evidence, FailureFingerprint, FailureProvenance, FetchComponentFlag, FindingEvidence,
+        GeneratedSecretWarning, LanguageServerHub, LanguageServerLaunch, LanguageServerState,
+        LanguageServerStatus, MockModelAdapter, PendingQuestionRef, PhaseKind, PlanStep,
+        SecretScanner, SessionMode, StepStatus, TaskPlan, TaskStatus, TaskUsage, ToolCall,
+        TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource, VerificationEvent,
+        VerificationOutcome, VerificationReport, WebDiagnosticRecord, WebDiagnosticReport,
+        WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
+        fold_verification,
     };
 
     /// Points every engine built in this test binary at a throwaway data
@@ -8650,6 +8729,242 @@ mod tests {
         fs::remove_dir_all(&repo).ok();
     }
 
+    /// Spec 102 Task 2 transport: an approved patch whose selected check needs
+    /// its own approval writes nothing and returns the engine's card. Resuming
+    /// the decisions then lets the same apply write the reviewed bytes.
+    #[test]
+    fn apply_patch_endpoint_returns_a_baseline_batch_and_resume_then_applies() {
+        let repo = temp_path("apply-baseline");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join(".damaian")).unwrap();
+        isolated_data_dir();
+        fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        // A repository may tighten approval, so this test does not depend on
+        // whatever a concurrent test left in the shared user config.
+        fs::write(
+            repo.join(".damaian").join("config.conf"),
+            "require_approval_for_risky_commands=true\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/a.rs"), "let a = 1;\n").unwrap();
+
+        let repo_arg = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
+        let edit_response = "DAMAIAN_EDIT_V1\nSUMMARY: change\n\
+                             FILE: src/a.rs\nSTATUS: modified\nCONTENT:\n\
+                             let a = 2;\nEND_FILE\nEND_PATCH\n";
+        let proposal = engine
+            .edit_orchestrator
+            .propose_edit(
+                &repo,
+                "change it",
+                &[],
+                None,
+                &mut MockModelAdapter::new(edit_response),
+            )
+            .expect("the edit should be proposed");
+        let patch_id = proposal.patch.id;
+        let (port, token) = serve_for_test();
+
+        let applied = post_fields_for_test(
+            port,
+            &token,
+            "/api/apply-patch",
+            &[("repo", &repo_arg), ("patch_id", &patch_id)],
+        );
+        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
+        let applied = response_json(&applied);
+        assert_eq!(applied["appliedFiles"], serde_json::json!([]));
+        assert_eq!(
+            fs::read_to_string(repo.join("src/a.rs")).unwrap(),
+            "let a = 1;\n",
+            "a baseline offer must not write the patch"
+        );
+
+        let batch = &applied["baselineBatch"];
+        assert_eq!(batch["patchId"], patch_id.as_str());
+        assert!(batch["title"].is_string(), "{batch}");
+        assert!(batch["note"].is_string(), "{batch}");
+        assert!(batch["runLabel"].is_string(), "{batch}");
+        assert!(batch["skipLabel"].is_string(), "{batch}");
+        assert!(batch["runAllLabel"].is_string(), "{batch}");
+        let check = &batch["checks"][0];
+        assert!(check["prompt"].is_string(), "{check}");
+        assert!(check["riskLabel"].is_string(), "{check}");
+        assert!(check["locationLabel"].is_string(), "{check}");
+        let batch_id = batch["id"].as_str().expect("batch id");
+        let proposal_id = check["proposalId"].as_str().expect("proposal id");
+
+        let decisions = serde_json::json!([{
+            "proposalId": proposal_id,
+            "approved": false
+        }])
+        .to_string();
+        let resumed = post_fields_for_test(
+            port,
+            &token,
+            "/api/resume-baseline",
+            &[
+                ("repo", &repo_arg),
+                ("batch_id", batch_id),
+                ("decisions", &decisions),
+            ],
+        );
+        assert!(resumed.starts_with("HTTP/1.1 200"), "{resumed}");
+        assert!(resumed.contains("\"completed\":true"), "{resumed}");
+        assert_eq!(
+            fs::read_to_string(repo.join("src/a.rs")).unwrap(),
+            "let a = 1;\n",
+            "resuming a baseline is not an apply"
+        );
+
+        let applied = post_fields_for_test(
+            port,
+            &token,
+            "/api/apply-patch",
+            &[("repo", &repo_arg), ("patch_id", &patch_id)],
+        );
+        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
+        assert!(
+            applied.contains("\"appliedFiles\":[\"src/a.rs\"]"),
+            "{applied}"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("src/a.rs")).unwrap(),
+            "let a = 2;\n"
+        );
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Spec 102 Task 2 security: *Allow Always* on a baseline card is still a
+    /// separate, exact-command grant. The engine refuses an id that is not on
+    /// this pending batch, a check the user did not approve, and a duplicate,
+    /// before writing any grant or running any command.
+    #[test]
+    fn baseline_resume_refuses_unrelated_unapproved_and_duplicate_always_ids() {
+        let repo = temp_path("baseline-always");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join(".damaian")).unwrap();
+        isolated_data_dir();
+        fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        fs::write(
+            repo.join(".damaian").join("config.conf"),
+            "require_approval_for_risky_commands=true\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/a.rs"), "let a = 1;\n").unwrap();
+
+        let repo_arg = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
+        let edit_response = "DAMAIAN_EDIT_V1\nSUMMARY: change\n\
+                             FILE: src/a.rs\nSTATUS: modified\nCONTENT:\n\
+                             let a = 2;\nEND_FILE\nEND_PATCH\n";
+        let proposal = engine
+            .edit_orchestrator
+            .propose_edit(
+                &repo,
+                "change it",
+                &[],
+                None,
+                &mut MockModelAdapter::new(edit_response),
+            )
+            .expect("the edit should be proposed");
+        let patch_id = proposal.patch.id;
+        let (port, token) = serve_for_test();
+
+        let applied = post_fields_for_test(
+            port,
+            &token,
+            "/api/apply-patch",
+            &[("repo", &repo_arg), ("patch_id", &patch_id)],
+        );
+        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
+        let batch = response_json(&applied)["baselineBatch"].clone();
+        let batch_id = batch["id"].as_str().expect("batch id").to_string();
+        let proposal_id = batch["checks"][0]["proposalId"]
+            .as_str()
+            .expect("proposal id")
+            .to_string();
+        assert_eq!(
+            batch["checks"][0]["allowAlways"], true,
+            "the engine must offer the ordinary always control: {batch}"
+        );
+        let config_path = engine.config.user_config_path();
+
+        let refused = [
+            (
+                serde_json::json!([{"proposalId": proposal_id.clone(), "approved": true}])
+                    .to_string(),
+                "cmd_unrelated".to_string(),
+                "Unknown baseline proposal",
+            ),
+            (
+                serde_json::json!([{"proposalId": proposal_id.clone(), "approved": false}])
+                    .to_string(),
+                proposal_id.clone(),
+                "without approval",
+            ),
+            (
+                serde_json::json!([{"proposalId": proposal_id.clone(), "approved": true}])
+                    .to_string(),
+                format!("{proposal_id}\n{proposal_id}"),
+                "Duplicate always decision",
+            ),
+        ];
+        for (decisions, always, message) in refused {
+            let response = post_fields_for_test(
+                port,
+                &token,
+                "/api/resume-baseline",
+                &[
+                    ("repo", &repo_arg),
+                    ("batch_id", &batch_id),
+                    ("decisions", decisions.as_str()),
+                    ("always", always.as_str()),
+                ],
+            );
+            assert!(
+                !response.starts_with("HTTP/1.1 200"),
+                "an invalid always id was accepted: {response}"
+            );
+            assert!(response.contains(message), "{response}");
+            assert!(
+                !fs::read_to_string(&config_path)
+                    .unwrap_or_default()
+                    .contains("cargo test"),
+                "an invalid always id wrote an allowlist grant"
+            );
+            assert_eq!(
+                fs::read_to_string(repo.join("src/a.rs")).unwrap(),
+                "let a = 1;\n"
+            );
+        }
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// must not retry an incomplete resume response, and must not offer a
+    /// second conflicting patch action while the baseline is pending.
+    #[test]
+    fn app_js_retries_the_exact_snapshot_after_a_baseline() {
+        assert!(super::APP_JS.contains("function snapshotSelection"));
+        assert!(super::APP_JS.contains("hunkSelection"));
+        assert!(super::APP_JS.contains("selection,"));
+        assert!(super::APP_JS.contains("result.completed !== true"));
+        assert!(super::APP_JS.contains("The baseline response was incomplete"));
+        assert!(super::APP_JS.contains("state.baseline = null"));
+        assert!(super::APP_JS.contains("runApply(pending.selection)"));
+        assert!(super::APP_JS.contains("Boolean(state.baseline)"));
+        assert!(super::APP_JS.contains("check.riskLabel"));
+        assert!(super::APP_JS.contains("check.locationLabel"));
+        assert!(super::APP_JS.contains("batch.runAllLabel"));
+        assert!(super::APP_JS.contains("check.allowAlways"));
+        assert!(super::APP_JS.contains("Always allow"));
+        assert!(super::APP_JS.contains("always,"));
+        assert!(!super::APP_JS.contains("Checks need a baseline"));
+    }
+
     /// The done event of an SSE turn, whichever `data:` line carries it.
     fn sse_done(response: &str) -> serde_json::Value {
         for line in response.lines() {
@@ -8702,10 +9017,32 @@ mod tests {
             .unwrap();
         patch.session_id = session.id.clone();
         engine.patch_store.save(&patch).unwrap();
-        engine
+        // Spec 102 Task 2: a patch whose paths select checks must settle their
+        // baselines first. This fixture is about the later verification card,
+        // so it declines each offered baseline and continues.
+        let mut outcome = engine
             .edit_orchestrator
-            .apply_stored_patch(repo, &patch.id, None, None, "tester", false)
+            .apply_stored_patch_with_baseline(repo, &patch.id, None, None, "tester", false)
             .unwrap();
+        while let workspace_engine::PatchApplyOutcome::BaselineRequired(batch) = outcome {
+            let decisions = batch
+                .checks
+                .iter()
+                .map(|check| (check.proposal_id.clone(), false))
+                .collect::<Vec<_>>();
+            engine
+                .edit_orchestrator
+                .resume_stored_patch_baseline(repo, &batch.id, &decisions, &[], "tester")
+                .unwrap();
+            outcome = engine
+                .edit_orchestrator
+                .apply_stored_patch_with_baseline(repo, &patch.id, None, None, "tester", false)
+                .unwrap();
+        }
+        assert!(matches!(
+            outcome,
+            workspace_engine::PatchApplyOutcome::Applied(_)
+        ));
         session.id
     }
 
@@ -8751,6 +9088,163 @@ mod tests {
         );
 
         fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Spec 102 Task 3: the report's provenance partitions, repair targets,
+    /// labels and actions are engine data. The shell serialises them and the
+    /// card prints them; neither derives a classification from a check outcome.
+    #[test]
+    fn verification_provenance_and_actions_survive_json() {
+        let check = CheckId::new("", "cargo test");
+        let finding = Finding::new(
+            FindingDraft {
+                source: FindingSource::Compiler,
+                severity: Severity::Error,
+                summary: "mismatched types".to_string(),
+                details: None,
+                range: Some(SourceRange {
+                    path: "src/a.rs".to_string(),
+                    start_line: 4,
+                    start_column: Some(1),
+                    end_line: None,
+                    end_column: None,
+                }),
+                code: Some("E0308".to_string()),
+            },
+            &SecretScanner::new(Vec::new()),
+        );
+        let evidence = FindingEvidence::from_finding(&finding);
+        let fingerprint = FailureFingerprint::compute(
+            &check,
+            std::slice::from_ref(&evidence),
+            &CheckTermination::Exited { exit_code: 1 },
+        );
+        let events = [
+            VerificationEvent::Started {
+                task_id: "task".to_string(),
+                attempt: 0,
+                checks: vec![check.clone()],
+            },
+            VerificationEvent::Check {
+                task_id: "task".to_string(),
+                check: check.clone(),
+                outcome: CheckOutcome::Ran {
+                    exit_code: Some(1),
+                    marker_id: "marker".to_string(),
+                    termination: Some(CheckTermination::Exited { exit_code: 1 }),
+                },
+                file_hashes: BTreeMap::new(),
+            },
+            VerificationEvent::Provenance {
+                task_id: "task".to_string(),
+                record: CheckProvenanceRecord {
+                    check: check.clone(),
+                    provenance: FailureProvenance::NewRegression,
+                    termination: CheckTermination::Exited { exit_code: 1 },
+                    fingerprint,
+                    findings: vec![evidence.clone()],
+                    introduced: vec![evidence],
+                },
+            },
+            VerificationEvent::Finished {
+                task_id: "task".to_string(),
+                outcome: VerificationOutcome::Failed,
+            },
+        ];
+        let report = VerificationReport::build(
+            &fold_verification(events.iter()),
+            &TaskPlan::new("task", 0),
+            &[],
+            &BTreeMap::new(),
+        );
+        let json = verification_report_json(Some(&report));
+
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid report JSON");
+        assert_eq!(value["provenance"][0]["provenance"], "new_regression");
+        assert_eq!(
+            value["provenance"][0]["checks"][0]["label"],
+            "cargo test (repository root)"
+        );
+        assert_eq!(
+            value["provenance"][0]["checks"][0]["reason"],
+            "exit code 1; 1 finding"
+        );
+        assert_eq!(
+            value["provenance"][0]["summary"],
+            "These checks passed before the patch and fail now. Automatic repair receives only these findings."
+        );
+        assert_eq!(
+            value["provenance"][0]["checks"][0]["evidenceLines"][0],
+            "error: [E0308] mismatched types at src/a.rs:4:1"
+        );
+        assert_eq!(
+            value["provenance"][0]["checks"][0]["evidence"][0]["summary"],
+            "mismatched types"
+        );
+        assert_eq!(
+            value["repairTargets"][0]["evidence"][0]["summary"],
+            "mismatched types"
+        );
+        assert_eq!(value["actions"][0]["kind"], "review_introduced_failure");
+        assert!(
+            value["actions"][0]["label"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Review the repair"),
+            "{json}"
+        );
+        assert!(json.contains("Introduced regressions"), "{json}");
+        assert!(!json.contains("raw output"), "{json}");
+    }
+
+    #[test]
+    fn an_environment_failure_serialises_with_an_action_and_no_repair_target() {
+        let check = CheckId::new("", "cargo test");
+        let fingerprint =
+            FailureFingerprint::compute(&check, &[], &CheckTermination::MissingExecutable);
+        let events = [
+            VerificationEvent::Started {
+                task_id: "task".to_string(),
+                attempt: 0,
+                checks: vec![check.clone()],
+            },
+            VerificationEvent::Check {
+                task_id: "task".to_string(),
+                check: check.clone(),
+                outcome: CheckOutcome::Environment {
+                    termination: CheckTermination::MissingExecutable,
+                },
+                file_hashes: BTreeMap::new(),
+            },
+            VerificationEvent::Provenance {
+                task_id: "task".to_string(),
+                record: CheckProvenanceRecord {
+                    check: check.clone(),
+                    provenance: FailureProvenance::EnvironmentFailure,
+                    termination: CheckTermination::MissingExecutable,
+                    fingerprint,
+                    findings: Vec::new(),
+                    introduced: Vec::new(),
+                },
+            },
+            VerificationEvent::Finished {
+                task_id: "task".to_string(),
+                outcome: VerificationOutcome::Failed,
+            },
+        ];
+        let report = VerificationReport::build(
+            &fold_verification(events.iter()),
+            &TaskPlan::new("task", 0),
+            &[],
+            &BTreeMap::new(),
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&verification_report_json(Some(&report))).unwrap();
+
+        assert_eq!(value["provenance"][0]["provenance"], "environment_failure");
+        assert_eq!(value["repairTargets"], serde_json::json!([]));
+        assert_eq!(value["actions"][0]["kind"], "fix_environment");
+        assert_eq!(value["actions"][0]["label"], "Fix the environment");
     }
 
     /// Spec 96: a reload offers the explicit action from the durable log, and
@@ -19592,5 +20086,65 @@ mod branch_route_tests {
         assert_eq!(git(&repo, &["rev-parse", "HEAD"]), before_head);
         assert_eq!(status_text(&repo), "");
         assert!(!repo.join(".git/MERGE_HEAD").exists());
+    }
+}
+
+#[test]
+fn the_verification_card_renders_engine_provenance_without_classifying() {
+    let app = include_str!("../static/app.js");
+    let card = app
+        .split("function createVerificationReportCard(")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfunction ").next())
+        .expect("the verification report card");
+    for engine_field in [
+        "report.provenance",
+        "group.label",
+        "group.summary",
+        "group.checks",
+        "item.label",
+        "item.reason",
+        "item.evidenceLines",
+        "report.actions",
+        "action.label",
+        "action.detail",
+        "item.reasonLabel",
+    ] {
+        assert!(
+            card.contains(engine_field),
+            "{engine_field} missing from {card}"
+        );
+    }
+    // The provenance section renders the engine's own check label and
+    // fully-formatted redacted evidence. Deriving either in JavaScript — from
+    // a CheckId or from FindingEvidence fields — would put report business
+    // logic back in the shell.
+    let provenance = card
+        .split("for (const group of report.provenance")
+        .nth(1)
+        .and_then(|rest| rest.split("What you can do").next())
+        .expect("the provenance group renderer");
+    assert!(
+        !provenance.contains("checkLabel("),
+        "the provenance section must use the engine's ProvenanceCheck.label: {provenance}"
+    );
+    assert!(
+        !provenance.contains("finding.summary"),
+        "the provenance section must render engine-formatted evidenceLines: {provenance}"
+    );
+    for forbidden in [
+        "new_regression",
+        "pre_existing",
+        "unchanged_failure",
+        "environment_failure",
+        "unknown_provenance",
+        "repairTargets",
+        "repair_eligible",
+        "reason.reason ===",
+    ] {
+        assert!(
+            !card.contains(forbidden),
+            "the card must render engine facts, not classify them: {forbidden}"
+        );
     }
 }
