@@ -98,6 +98,12 @@ session to do the work here.
   secondary **Work here instead** action. That action reuses the ordinary
   streaming-chat path with a fixed, user-visible instruction rather than a
   second execution path.
+- **Amended by spec 101 Task 3.** The returned status stays literal in the
+  durable return, and the card's headline and detail come from
+  `workspace-engine::returned_task_control`; `app.js` no longer maps
+  `taskStatus` to a label. An `incomplete` return is labelled incomplete and is
+  never presented as successful. **Continue with result** remains this spec's
+  separate action, not the completion gate's **Continue task**.
 - `WORKTREE_TASK_PARAGRAPH` becomes a recommendation and preserves an explicit
   user choice to work in the current checkout. The code prompt remains clear
   that it must not silently make another worktree itself.
@@ -158,6 +164,8 @@ The workspace-wide clippy and test suite remain CI-only under `AGENTS.md`.
   task.
 - `app.js` renders a **Worker result** card with **Continue with result** and a
   worker link, and adds **Work here instead** beside **Start worker**. Both
-  keep the existing exact-tag, assistant-only, non-worker gating.
+  keep the existing exact-tag, assistant-only, non-worker gating. The card's
+  headline and detail are the engine's returned-task control (spec 101 Task 3),
+  so an `incomplete` result is never shown as complete.
 - `WORKTREE_TASK_PARAGRAPH` now recommends a worker and preserves an explicit
   choice to work in the current checkout. Spec 76 §4 records the amendment.

@@ -9,6 +9,7 @@ pub mod command_purpose;
 pub mod command_runner;
 pub mod commit;
 pub mod compaction;
+pub mod completion;
 pub mod config;
 pub mod context_manager;
 pub mod data_schema;
@@ -49,6 +50,7 @@ pub mod session;
 pub mod shell_path;
 pub mod steering;
 pub mod symbol_index;
+pub mod task_control;
 pub mod tree_walk;
 pub mod validation;
 pub mod vector_index;
@@ -98,6 +100,11 @@ pub use commit::{
 pub use compaction::{
     ApprovalDigest, ConversationSummary, ConversationView, Narrative, PlanStepDigest,
     ValidationDigest, bound_objective, narrative_prompt, parse_narrative, transcript_for_summary,
+};
+pub use completion::{
+    COMPLETION_SETTLEMENT_ACTION, CompletionFacts, CompletionGateReport, CompletionGateService,
+    CompletionReason, CompletionReasonCode, CompletionSettlement, CompletionSettlementMarker,
+    CompletionWaiver, SettledCompletion,
 };
 pub use config::{
     AppliedKey, CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, CostEstimate,
@@ -226,8 +233,8 @@ pub use repository_trust::{
 };
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
-    ActionMarker, ChatMessage, ConsumedWorkerReturn, ContextPin, DanglingAction, ExportFormat,
-    PatchFileDecision, PendingApprovalRef, SearchOptions, Session, SessionSearchHit,
+    ActionMarker, ChatMessage, ConsumedWorkerReturn, ContextPin, ContinuedTask, DanglingAction,
+    ExportFormat, PatchFileDecision, PendingApprovalRef, SearchOptions, Session, SessionSearchHit,
     SessionSearchResult, SessionStore, Task, TaskStatus, TaskUsage, TurnNotes, WorkerRecord,
     WorkerReturn,
 };
@@ -237,6 +244,12 @@ pub use symbol_index::{
     RelationKind, RelationTarget, RenderedSymbols, SYMBOL_INDEX_SCHEMA_VERSION, Symbol, SymbolFile,
     SymbolIndex, SymbolIndexStore, SymbolLoad, SymbolMatch, SymbolRef, SymbolReferences, merge,
     symbol_matches_json, symbol_references_json,
+};
+pub use task_control::{
+    TaskAction, TaskActionInput, TaskActionTransport, TaskCommand, TaskComposer, TaskControl,
+    TaskControlService, TaskOutcomeKind, TurnIndicatorState, TurnPresentation, TurnStopNotice,
+    WORKER_STALE_PROGRESS_AFTER_MS, WorkerBoardGroup, WorkerDot, WorkerProcessState,
+    WorkerTaskFacts, continuation_prompt, returned_task_control, turn_presentation,
 };
 pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{

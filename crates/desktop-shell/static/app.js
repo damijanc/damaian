@@ -6447,7 +6447,7 @@ function startTurnIndicator(target, onStop = null) {
       streaming = true;
       label.textContent = "Streaming";
     },
-    // "stopped" | "complete" | "incomplete" | "failed"
+    // "stopped" | "pending" | "complete" | "incomplete" | "failed"
     finish(state) {
       if (done) return;
       done = true;
@@ -6833,10 +6833,11 @@ function renderActivityGroup(pairs) {
 // Tasks that stopped for the user (spec 68 §5.3): they hold a question, an
 // approval request absorbed into its step, or a request that matched every
 // absorption condition but the parse (declined). A request still pending at
-// reload has no "Ran" step yet; its task's status says it is waiting instead.
+// reload has no "Ran" step yet; the engine marks that task's presentation as
+// paused instead of this file reading its status.
 function pausedTasksOf(messages, endsTheTurn, tasks = []) {
   const paused = new Set(
-    tasks.filter((task) => task.status === "waiting_for_approval").map((task) => task.id),
+    tasks.filter((task) => task.turnPresentation?.paused).map((task) => task.id),
   );
   messages.forEach((message, index) => {
     if (!message.taskId) return;
@@ -6909,14 +6910,10 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
       boundaryDrawn = true;
     }
   };
-  const cancelledTasks = new Set(
-    tasks.filter((task) => task.status === "cancelled").map((task) => task.id),
-  );
-  const toolBudgetExhaustedTasks = new Set(
-    tasks.filter((task) => task.status === "tool_budget_exhausted").map((task) => task.id),
-  );
-  const tokenBudgetExhaustedTasks = new Set(
-    tasks.filter((task) => task.status === "token_budget_exhausted").map((task) => task.id),
+  // Spec 101 Task 3: a reloaded turn's stop row and any action come from the
+  // engine's presentation. This file does not compare task statuses.
+  const turnPresentationByTask = new Map(
+    tasks.filter((task) => task.turnPresentation).map((task) => [task.id, task.turnPresentation]),
   );
   // A task with no plan carries no `plan` field at all, which is how a trivial
   // turn stays panel-free rather than showing an empty plan.
@@ -7057,13 +7054,11 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
         // `finalizeChatMessage` replaces the body's children.
         const finalized = finalizeChatMessage(bubble, message.content);
         if (message.taskId && endsTheTurn(message)) {
-          if (cancelledTasks.has(message.taskId)) {
-            markMessageStopped(bubble);
-          } else if (toolBudgetExhaustedTasks.has(message.taskId)) {
-            markMessageToolBudgetExhausted(bubble, message.sessionId, message.taskId);
-          } else if (tokenBudgetExhaustedTasks.has(message.taskId)) {
-            markMessageTokenBudgetExhausted(bubble);
-          }
+          markMessageTurnStop(
+            bubble,
+            { turnPresentation: turnPresentationByTask.get(message.taskId) },
+            message.sessionId,
+          );
           if (planByTask.has(message.taskId)) {
             renderPlanPanel(bubble, planByTask.get(message.taskId));
           }
@@ -8628,7 +8623,7 @@ function renderWorkerResultCards(workerReturns) {
     eyebrow.textContent = "Worker result";
     const headline = document.createElement("p");
     headline.className = "worker-result-headline";
-    headline.textContent = WORKER_TASK_OUTCOMES[workerReturn.taskStatus]?.[1] || "Worker finished";
+    headline.textContent = workerReturn.control?.headline || "Worker finished";
     const where = document.createElement("p");
     where.className = "worker-result-where";
     const branch = document.createElement("code");
@@ -8636,6 +8631,9 @@ function renderWorkerResultCards(workerReturns) {
     const worktree = document.createElement("code");
     worktree.textContent = workerReturn.worktree;
     where.append("Branch ", branch, " in ", worktree, ".");
+    const detail = document.createElement("p");
+    detail.className = "worker-result-detail";
+    detail.textContent = workerReturn.control?.detail || "";
     const response = document.createElement("pre");
     response.className = "worker-result-response";
     response.textContent = workerReturn.response || "The worker returned no final response.";
@@ -8671,9 +8669,111 @@ function renderWorkerResultCards(workerReturns) {
     note.textContent =
       "This is a result, not an approval. Continuing starts a new turn here; it does not " +
       "merge, apply, or approve anything.";
-    card.append(eyebrow, headline, where, response, footer, note);
+    card.append(eyebrow, headline, where, detail, response, footer, note);
     $("chat-log").append(card);
   });
+}
+
+// Spec 101 Task 3: an ordinary session's engine-provided outcome and action.
+// The card draws `control`; it does not decide whether the task is complete or
+// which command to run.
+function renderTaskControlInto(target, control, sessionId) {
+  const action = control?.primaryAction;
+  if (!target || !action) return null;
+  const card = document.createElement("section");
+  card.className = "recovery-card task-control-card";
+  card.dataset.taskId = control.taskId || "";
+  card.dataset.outcome = control.outcome;
+
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "recovery-card-eyebrow";
+  eyebrow.textContent = "Task outcome";
+  const headline = document.createElement("p");
+  headline.className = "recovery-card-headline";
+  headline.textContent = control.headline;
+  const detail = document.createElement("p");
+  detail.className = "recovery-card-note";
+  detail.textContent = control.detail;
+  card.append(eyebrow, headline, detail);
+
+  const facts = [...(control.reasons || []), ...(control.waivers || [])];
+  if (facts.length) {
+    const list = document.createElement("ul");
+    list.className = "task-control-reasons";
+    facts.forEach((fact) => {
+      const item = document.createElement("li");
+      item.textContent = fact.explanation;
+      list.append(item);
+    });
+    card.append(list);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "command-approval-actions";
+  const note = document.createElement("textarea");
+  note.className = "task-control-note";
+  note.rows = 2;
+  note.placeholder = action.placeholder || "Add a note (optional)";
+  if (action.input === "optional_note" || action.input === "message") {
+    card.append(note);
+  }
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "btn-sm btn-primary";
+  button.textContent = action.label;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      const succeeded = await runStreamTaskAction(action, {
+        sessionId,
+        taskId: control.taskId,
+        note: note.value.trim(),
+      });
+      // A streamed failure has already written its error and kept the session
+      // on disk. Leave the card in place so the user can retry it rather than
+      // treating a swallowed error as a successful continuation.
+      if (!succeeded) {
+        button.disabled = false;
+        return;
+      }
+      card.remove();
+      if (currentSessionId) await loadSession(currentSessionId);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  });
+  actions.append(button);
+  card.append(actions);
+  target.append(card);
+  return card;
+}
+
+// Transport for an engine-selected ordinary-session action. The command and
+// target are returned data; this switch only says where the command goes.
+async function runStreamTaskAction(action, { sessionId, taskId, note = "" } = {}) {
+  switch (action.command) {
+    case "continue_task":
+      return sendChatPrompt({
+        prompt: action.label,
+        restorePrompt: false,
+        agentic: true,
+        endpoint: "/api/continue-task-stream",
+        fallbackEndpoint: null,
+        data: {
+          session_id: sessionId,
+          task_id: action.taskId || taskId,
+          note,
+        },
+      });
+    case "ask_again":
+      if (!action.taskId) throw new Error("This action has no task to re-ask.");
+      await askAgainFromExhausted(sessionId || currentSessionId, action.taskId);
+      return true;
+    default:
+      toast("This action is not available here.");
+      return false;
+  }
 }
 
 function describeUncommittedFiles(status) {
@@ -8843,14 +8943,6 @@ function showNewWorkerDialog({ prompt = "", parentSessionId = "", parentTaskId =
 const workerRowsByProject = new Map();
 const workerRowsLoading = new Set();
 
-const WORKER_FAILED_STATUSES = new Set([
-  "failed",
-  "interrupted",
-  "unknown_external_outcome",
-  "tool_budget_exhausted",
-  "token_budget_exhausted",
-]);
-
 const WORKER_DOT_LABELS = {
   running: "Running",
   "needs-you": "Needs you",
@@ -8859,24 +8951,10 @@ const WORKER_DOT_LABELS = {
   failed: "Failed",
 };
 
-// Why a finished worker stopped, for the board's Doing column.
-const WORKER_END_LABELS = {
-  complete: "Done",
-  cancelled: "Stopped",
-  failed: "Failed",
-  interrupted: "Interrupted: its process ended mid-turn",
-  tool_budget_exhausted: "Tool budget used up",
-  token_budget_exhausted: "Token budget used up",
-  unknown_external_outcome: "Outcome unknown",
-};
-
-// The five dots of §5.7. A finished row that carries an error, or ended in a
-// status that is not a clean end, is failed. A worker whose process died while
-// paused or waiting (C5) is reported `interrupted` and lands here too.
+// The dot is the engine's outcome, not a decision this file makes. A row
+// written before spec 101 has no control, and reads as finished.
 function workerDotState(row) {
-  if (row.group === "needs_you") return row.state === "paused" ? "paused" : "needs-you";
-  if (row.group === "running") return "running";
-  return WORKER_FAILED_STATUSES.has(row.taskStatus) || row.doing ? "failed" : "finished";
+  return row.control?.dot || "finished";
 }
 
 function createWorkerDot(row) {
@@ -9318,33 +9396,32 @@ function workerElapsedText(row) {
 }
 
 function workerDoingText(row) {
-  if (row.doing) return row.doing;
-  if (row.group === "running") return row.state === "idle" ? "Starting" : "Working";
-  if (row.group === "finished") {
-    return WORKER_END_LABELS[row.taskStatus] || (row.alive ? "Idle" : "Ended");
-  }
-  return "";
+  return row.doing || row.control?.headline || "";
 }
 
 function plural(count, one, many) {
   return `${count} ${count === 1 ? one : many}`;
 }
 
-// The one visible action of a row (§5.7).
+// The one visible action of a row, chosen by the engine.
 function workerRowAction(row, projectPath) {
-  if (
-    row.group === "needs_you" &&
-    (row.state === "waiting_for_approval" || row.taskStatus === "waiting_for_approval")
-  ) {
-    return {
-      label: "Review",
-      run: () => openWorkerSession(row.sessionId, { source: projectPath, review: true }),
-    };
+  const open = () => openWorkerSession(row.sessionId, { source: projectPath });
+  const action = row.control?.boardAction;
+  if (!action) return { label: "Open", run: open };
+  switch (action.command) {
+    case "review_decision":
+      return {
+        label: action.label,
+        run: () => openWorkerSession(row.sessionId, { source: projectPath, review: true }),
+      };
+    case "pause_worker":
+      return {
+        label: action.label,
+        run: runSessionAction(() => pauseWorker(row, projectPath)),
+      };
+    default:
+      return { label: action.label, run: open };
   }
-  if (row.group === "running" && row.state === "running") {
-    return { label: "Pause", run: runSessionAction(() => pauseWorker(row, projectPath)) };
-  }
-  return { label: "Open", run: () => openWorkerSession(row.sessionId, { source: projectPath }) };
 }
 
 function renderWorkerBoardRow(row, projectPath) {
@@ -9568,162 +9645,25 @@ function tickWorkersBoard() {
 
 // `status` states that end a job: the turn finished, or it waits for approval.
 const WORKER_JOB_END_STATES = new Set(["idle", "waiting_for_approval"]);
-const WORKER_TURN_STATES = new Set(["running", "paused", "waiting_for_approval"]);
 
-const WORKER_VIEW_LABELS = {
-  running: ["running", "Running"],
-  paused: ["paused", "Paused"],
-  waiting_for_approval: ["needs-you", "Waiting for approval"],
-  idle: ["finished", "Idle"],
-  shutting_down: ["finished", "Stopping"],
-};
-
-const WORKER_TASK_OUTCOMES = {
-  complete: [
-    "finished",
-    "Task complete",
-    "The worker finished this task. Send a follow-up to start another one.",
-  ],
-  cancelled: [
-    "failed",
-    "Task stopped",
-    "The task stopped before completion. Send a message with how to continue.",
-  ],
-  failed: [
-    "failed",
-    "Task failed",
-    "The task did not complete. Send a message to repair or retry it.",
-  ],
-  interrupted: [
-    "failed",
-    "Task interrupted",
-    "The worker stopped before the task completed. Restart it to continue.",
-  ],
-  unknown_external_outcome: [
-    "failed",
-    "Outcome needs review",
-    "The worker stopped during an external action, so its outcome is unknown. Inspect the worktree before continuing.",
-  ],
-  tool_budget_exhausted: [
-    "failed",
-    "Task needs continuation",
-    "The worker reached its tool-round limit before completion. Send a message to continue it.",
-  ],
-  token_budget_exhausted: [
-    "failed",
-    "Task needs continuation",
-    "The worker reached its token limit before completion. Send a message to continue it.",
-  ],
-};
-
-const WORKER_STALE_PROGRESS_AFTER_MS = 30_000;
-
-function workerActivityDetail(view) {
-  if (!Number.isFinite(view.lastActivityAtMs)) return "Waiting for the worker to report progress.";
-  const elapsed = Math.max(0, Date.now() - view.lastActivityAtMs);
-  if (elapsed < WORKER_STALE_PROGRESS_AFTER_MS) return "Worker progress is up to date.";
-  return `No worker progress for ${formatElapsed(elapsed)}. It may still be waiting for the model.`;
-}
-
-// A worker process is intentionally idle between jobs. That lifecycle state is
-// not an outcome users can act on, so derive the task-level result from the
-// durable progress record before drawing any worker control.
-function workerViewOutcome(view) {
-  if (!view.alive) {
-    const taskOutcome = WORKER_TASK_OUTCOMES[view.taskStatus];
-    if (taskOutcome) {
-      const [dot, label, detail] = taskOutcome;
-      return {
-        dot,
-        label,
-        detail: `${detail} Restart the worker to send another message.`,
-        ended: true,
-      };
+// Spec 101 Task 3: every label, dot, detail, group and action below comes from
+// the engine's `control` on the progress answer (or on a worker row). Nothing
+// in this file maps a task status to an outcome or picks the next command from
+// a lifecycle string.
+function workerControl(view) {
+  return (
+    view.control || {
+      outcome: "starting",
+      dot: "running",
+      headline: "Starting worker",
+      detail: "Waiting for the worker to report progress.",
+      needsDecision: false,
+      ended: false,
+      actions: [],
+      composer: null,
     }
-    const interrupted = view.taskStatus === "interrupted" || WORKER_TURN_STATES.has(view.state);
-    return interrupted
-      ? {
-          dot: "failed",
-          label: "Task interrupted",
-          detail: "The worker process ended before completion.",
-          ended: true,
-        }
-      : {
-          dot: "finished",
-          label: "Worker ended",
-          detail: "Restart the worker to send another task.",
-          ended: true,
-        };
-  }
-  if (view.state === "running") {
-    return { dot: "running", label: "Working", detail: workerActivityDetail(view), ended: false };
-  }
-  if (view.state === "paused") {
-    return {
-      dot: "paused",
-      label: "Paused",
-      detail: "Resume it with a note when you are ready.",
-      ended: false,
-    };
-  }
-  if (workerApprovalToShow(view)) {
-    return {
-      dot: "needs-you",
-      label: "Needs your decision",
-      detail: "Review the proposal below before the task can continue.",
-      needsDecision: true,
-      ended: false,
-    };
-  }
-  if (view.state === "waiting_for_approval") {
-    return {
-      dot: "needs-you",
-      label: "Needs your decision",
-      detail: "The worker is waiting for an approval to continue.",
-      needsDecision: true,
-      ended: false,
-    };
-  }
-  if (view.state === "shutting_down") {
-    return {
-      dot: "finished",
-      label: "Stopping",
-      detail: "The worker is shutting down.",
-      ended: false,
-    };
-  }
-  if (view.turnError) {
-    return { dot: "failed", label: "Task failed", detail: view.turnError, ended: false };
-  }
-  const taskOutcome = WORKER_TASK_OUTCOMES[view.taskStatus];
-  if (taskOutcome) {
-    const [dot, label, detail] = taskOutcome;
-    return { dot, label, detail, ended: false };
-  }
-  if (view.hasRun) {
-    return {
-      dot: "failed",
-      label: "Stopped without an outcome",
-      detail:
-        "The worker ended its turn without recording whether the task completed. Send a message to continue or inspect the worktree.",
-      ended: false,
-    };
-  }
-  return {
-    dot: "running",
-    label: "Starting worker",
-    detail: "Waiting for the worker to begin its first task.",
-    ended: false,
-  };
+  );
 }
-
-// What the composer's button sends in each state (§5.7), with its label and
-// the field's placeholder.
-const WORKER_COMPOSER_MODES = {
-  running: ["note", "Send note", "Steer the worker: a note reaches it before its next round"],
-  paused: ["resume", "Resume with note", "Add a note: the worker reads it as it resumes"],
-  idle: ["message", "Send message", "Message the worker"],
-};
 
 // The composer as the page drew it, kept while a worker view borrows it.
 let composerDefaults = null;
@@ -9763,7 +9703,7 @@ function syncWorkerView() {
       state: row.alive ? row.state : "exited",
       round: row.round ?? null,
       maxRounds: row.maxRounds ?? null,
-      taskStatus: row.taskStatus || "",
+      control: row.control || null,
       lastActivityAtMs: null,
       hasRun: false,
       lastPhase: null,
@@ -9877,11 +9817,10 @@ async function applyWorkerProgress(view, answer) {
     if (event.kind === "status") {
       const before = view.state;
       view.state = payload.state || view.state;
-      if (payload.taskStatus) view.taskStatus = payload.taskStatus;
       if (view.state === "running" && before !== "paused" && before !== "running") {
         // A new job: a turn, or the rest of one after an approval.
         Object.assign(view, { liveText: "", plan: null, approval: null, lastPhase: null });
-        Object.assign(view, { turnError: "", taskStatus: "", hasRun: true });
+        Object.assign(view, { turnError: "", hasRun: true });
         if (live) {
           finishWorkerLive(view);
           showWorkerLive(view);
@@ -9889,7 +9828,7 @@ async function applyWorkerProgress(view, answer) {
       } else if (live && view.live && view.state !== before) {
         view.live.indicator.phase({
           phase: view.state,
-          label: WORKER_VIEW_LABELS[view.state]?.[1],
+          label: view.control?.headline,
         });
       }
       if (WORKER_JOB_END_STATES.has(view.state)) {
@@ -9922,6 +9861,7 @@ async function applyWorkerProgress(view, answer) {
       await showWorkerNote(view, payload.messageId);
     }
   }
+  if (answer.control) view.control = answer.control;
   const wasAlive = view.alive;
   view.alive = Boolean(answer.alive);
   if (!view.caughtUp) {
@@ -9949,7 +9889,6 @@ function resetWorkerViewForRestart(view) {
     state: "idle",
     round: null,
     maxRounds: null,
-    taskStatus: "",
     lastActivityAtMs: null,
     hasRun: false,
     lastPhase: null,
@@ -10003,7 +9942,7 @@ async function showWorkerNote(view, messageId) {
 }
 
 function workerViewStatus(view) {
-  return workerViewOutcome(view);
+  return workerControl(view);
 }
 
 function workerViewRow(view) {
@@ -10098,10 +10037,10 @@ function renderWorkerStrip(view) {
   dot.className = "worker-dot";
   dot.dataset.state = status.dot;
   dot.setAttribute("aria-hidden", "true");
-  pill.append(dot, document.createTextNode(status.label));
+  pill.append(dot, document.createTextNode(status.headline));
 
   const parts = [pill];
-  if (view.state === "running" || view.state === "paused") {
+  if (status.showRound) {
     const round = document.createElement("span");
     round.className = "worker-round";
     const bar = document.createElement("span");
@@ -10128,47 +10067,50 @@ function renderWorkerStrip(view) {
 
   const actions = document.createElement("div");
   actions.className = "inline-actions worker-strip-actions";
-  const row = () => workerViewRow(view);
   const after = () => pollWorkerProgressNow(view);
-  if (status.ended) {
+  for (const action of status.actions || []) {
+    const className =
+      action.command === "stop_worker"
+        ? "btn-sm btn-danger"
+        : action.command === "resume_worker"
+          ? "btn-sm btn-primary"
+          : "btn-sm";
     actions.append(
-      workerStripButton("Restart worker", "btn-sm", () => restartWorkerFromView(view)),
+      workerStripButton(action.label, className, () => runWorkerAction(action, view, after)),
     );
-  } else {
-    if (view.state === "running") {
-      actions.append(
-        workerStripButton("Pause", "btn-sm", async () => {
-          await pauseWorker(row(), workerViewSource(view));
-          after();
-        }),
-      );
-    }
-    if (view.state === "paused") {
-      actions.append(
-        workerStripButton("Resume", "btn-sm btn-primary", async () => {
-          await api("/api/worker-control", form({ session_id: view.sessionId, command: "resume" }));
-          after();
-        }),
-      );
-    }
-    if (view.state !== "shutting_down") {
-      actions.append(
-        workerStripButton("Stop", "btn-sm btn-danger", async () => {
-          await stopWorker(row(), workerViewSource(view));
-          after();
-        }),
-      );
-    }
   }
   parts.push(actions);
   strip.replaceChildren(...parts);
+}
+
+// Transport for an engine-selected action. The command ids are engine data;
+// this switch only says where each one goes, never what it means.
+async function runWorkerAction(action, view, after = () => {}) {
+  const row = workerViewRow(view);
+  switch (action.command) {
+    case "restart_worker":
+      return restartWorkerFromView(view);
+    case "pause_worker":
+      await pauseWorker(row, workerViewSource(view));
+      return after();
+    case "stop_worker":
+      await stopWorker(row, workerViewSource(view));
+      return after();
+    case "resume_worker":
+      await api("/api/worker-control", form({ session_id: view.sessionId, command: "resume" }));
+      return after();
+    case "review_decision":
+      return openWorkerSession(view.sessionId, { source: workerViewSource(view), review: true });
+    default:
+      return openWorkerSession(view.sessionId, { source: workerViewSource(view) });
+  }
 }
 
 // *Restart worker* (§5.7): a new, idle process for the same session and
 // worktree. A pending approval belonged to the old process and is not handed
 // to the new one (Task 7), so the command it asked about did not run.
 async function restartWorkerFromView(view) {
-  const wasWaiting = view.state === "waiting_for_approval";
+  const wasWaiting = workerViewStatus(view).needsDecision;
   await api("/api/worker-restart", form({ session_id: view.sessionId }));
   resetWorkerViewForRestart(view);
   toast(
@@ -10181,50 +10123,32 @@ async function restartWorkerFromView(view) {
   pollWorkerProgressNow(view);
 }
 
-function workerComposerMode(view) {
+function workerComposer(view) {
   if (!view.alive || view.sending) return null;
-  if (workerViewOutcome(view).needsDecision) return null;
-  if (view.state === "idle" && view.taskStatus === "complete") {
-    return [
-      "message",
-      "Send follow-up",
-      "The task is complete. Send a follow-up to start another task",
-    ];
-  }
-  if (view.state === "idle" && view.hasRun) {
-    return ["message", "Continue task", "Tell the worker how to continue this unfinished task"];
-  }
-  return WORKER_COMPOSER_MODES[view.state] || null;
+  return view.control?.composer || null;
 }
 
-// The composer sends a note while running, a resume with a note while paused
-// and a message when idle, and says which on its button. It is disabled while
-// the worker waits for approval (notes are refused then) and once it ended.
+// The composer's command, label and input requirement are engine data. This
+// function only places them on the page; it does not choose them.
 function renderWorkerComposer(view) {
   const button = $("ask-btn");
   const field = $("chat-prompt");
   if (!composerDefaults) {
     composerDefaults = { placeholder: field.placeholder, content: [...button.childNodes] };
   }
-  const mode = workerComposerMode(view);
-  let placeholder = mode?.[2];
-  if (!mode && !view.sending) {
-    const outcome = workerViewOutcome(view);
-    if (outcome.ended) {
-      placeholder = "This worker's process has ended. Restart it to continue.";
-    } else if (outcome.needsDecision) {
-      placeholder = "Approve or reject the proposal above first. A waiting worker takes no notes.";
-    } else {
-      placeholder = "The worker is stopping.";
-    }
-  }
-  const label = mode?.[1] || "Send";
+  const composer = workerComposer(view);
+  const control = workerControl(view);
   button.classList.add("is-worker-command");
+  const label = composer?.action.label || "Send";
   if (button.textContent !== label) button.textContent = label;
   button.setAttribute("aria-label", label);
-  button.disabled = !mode;
-  field.disabled = !mode && !view.sending;
-  if (placeholder) field.placeholder = placeholder;
+  button.disabled = !composer;
+  field.disabled = !composer && !view.sending;
+  field.placeholder =
+    composer?.placeholder ||
+    (control.needsDecision
+      ? "Approve or reject the proposal above first. A waiting worker takes no notes."
+      : control.detail);
 }
 
 function restoreComposerFromWorker() {
@@ -10241,19 +10165,35 @@ function restoreComposerFromWorker() {
 }
 
 // Requirement 4: every word to a worker goes through `/api/worker-control`.
+// The wire command and target task are returned with the engine action, so
+// this file keeps no semantic-action-to-wire map of its own.
 async function sendWorkerComposer(override = "") {
   const view = workerView;
-  const mode = view && workerComposerMode(view);
-  if (!mode) return;
+  const composer = view && workerComposer(view);
+  if (!composer) return false;
+  if (!composer.action.wireCommand) {
+    toast("This action is not available here.");
+    return false;
+  }
   const field = $("chat-prompt");
   const text = (override || field.value).trim();
-  if (!text) {
-    toast(mode[0] === "message" ? "Write a message first" : "Write a note first");
-    return;
+  if (composer.action.input === "message" && !text) {
+    toast("Write a message first");
+    return false;
   }
-  const fields = { session_id: view.sessionId, command: mode[0] };
-  if (mode[0] === "resume") fields.note = text;
-  else fields.text = text;
+  const command = composer.action.command;
+  const fields = {
+    session_id: view.sessionId,
+    command: composer.action.wireCommand,
+  };
+  if (command === "continue_task") {
+    fields.task_id = composer.action.taskId;
+    fields.note = text;
+  } else if (command === "resume_worker") {
+    fields.note = text;
+  } else {
+    fields.text = text;
+  }
   view.sending = true;
   renderWorkerComposer(view);
   try {
@@ -10262,10 +10202,10 @@ async function sendWorkerComposer(override = "") {
       field.value = "";
       autoGrowPrompt();
     }
-    if (mode[0] === "message") {
+    if (command === "send_message" || command === "send_follow_up" || command === "continue_task") {
       // The worker writes it to the log as its turn starts; drawn now so it
       // does not wait for the next read.
-      appendChatMessage("user", text);
+      appendChatMessage("user", text || composer.action.label);
       Object.assign(view, { state: "running", liveText: "", plan: null, approval: null });
       Object.assign(view, { lastPhase: null, turnError: "" });
       renderWorkerApproval(view);
@@ -10273,13 +10213,15 @@ async function sendWorkerComposer(override = "") {
     } else {
       view.pendingNotes.push(text);
       toast(
-        mode[0] === "note"
+        command === "send_note"
           ? "Note queued. The worker reads it before its next round."
           : "Resuming. The worker reads your note before its next round.",
       );
     }
+    return true;
   } catch (error) {
     toast(error.message);
+    return false;
   } finally {
     view.sending = false;
     if (view === workerView) {
@@ -10474,108 +10416,49 @@ function markMessageUsage(target, usage, durationMs = null) {
   target.body.after(row);
 }
 
-function markMessageStopped(target) {
-  const row = document.createElement("p");
-  row.className = "turn-indicator";
-  row.dataset.state = "stopped";
-  const label = document.createElement("span");
-  label.className = "turn-indicator-label";
-  label.textContent = "Stopped by you";
-  row.append(label);
-  target.body.after(row);
-}
-
-function markMessageToolBudgetExhausted(target, sessionId = currentSessionId, taskId = null) {
-  if (target.body.nextElementSibling?.dataset?.state === "incomplete") return;
-  const row = document.createElement("div");
-  row.className = "turn-indicator";
-  row.dataset.state = "incomplete";
-  const label = document.createElement("span");
-  label.className = "turn-indicator-label";
-  label.textContent = "Tool budget exhausted";
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "turn-indicator-action";
-  // *Ask again* (spec 61 §5.7): starts a new turn whose prompt the engine
-  // builds from the stopped task's own request, not a fixed "continue
-  // debugging" string. Without a task id there is nothing to re-ask, so the
-  // button is only offered when one is known.
-  button.textContent = "Ask again";
-  button.addEventListener("click", async () => {
-    try {
-      button.disabled = true;
-      await askAgainFromExhausted(sessionId, taskId);
-    } catch (error) {
-      button.disabled = false;
-      toast(error.message);
-    }
-  });
-  if (taskId) row.append(label, button);
-  else row.append(label);
-  target.body.after(row);
-}
-
-// A turn stopped at its token ceiling (spec 21 §5.4). Deliberately not folded
-// into the tool-budget row: one means the work needed more rounds, the other
-// that it needed more money, and the remedies are different. There is no
-// "continue" button here on purpose — continuing means raising
-// `agent_max_task_tokens` first, and a one-click button beside the number that
-// stopped the spending would be the wrong shape of control.
-function markMessageTokenBudgetExhausted(target) {
-  if (target.body.nextElementSibling?.dataset?.state === "incomplete") return;
-  const row = document.createElement("div");
-  row.className = "turn-indicator";
-  row.dataset.state = "incomplete";
-  const label = document.createElement("span");
-  label.className = "turn-indicator-label";
-  label.textContent = "Token budget exhausted";
-  const hint = document.createElement("span");
-  hint.className = "turn-indicator-hint";
-  hint.textContent = "Raise agent_max_task_tokens to go further.";
-  row.append(label, hint);
-  target.body.after(row);
-}
-
-// The one place that turns a stopped turn's status into a row under the
-// answer. Both stops used to be handled at each call site, which is how a
-// token stop rendered as an ordinary completed turn everywhere except the one
-// site that knew about it.
+// Spec 101 Task 3: a stopped turn's row, its hint and any action are engine
+// presentation. This file draws them and dispatches the returned command; it
+// does not compare task statuses to choose a meaning.
 function markMessageTurnStop(target, payload, sessionId = currentSessionId) {
-  if (payload.taskStatus === "tool_budget_exhausted") {
-    markMessageToolBudgetExhausted(target, payload.sessionId || sessionId, payload.taskId || null);
-  } else if (payload.taskStatus === "token_budget_exhausted") {
-    markMessageTokenBudgetExhausted(target);
-  } else if (payload.incomplete) {
-    markMessageIncomplete(target);
+  const turn = payload.turnPresentation;
+  if (!turn) return;
+  const resolved = payload.sessionId || sessionId;
+  if (turn.showTaskControl && payload.taskControl) {
+    renderTaskControlInto(target.body, payload.taskControl, resolved);
   }
-}
-
-// A turn whose model run ended early for a reason no budget names (spec 58
-// §3.2). Quiet on purpose: there is nothing to press, only something to know.
-//
-// Live-only. The run's `incomplete` flag is not stored on the task, so a reload
-// cannot tell this turn from a complete one; and the engine sets it only on
-// cancellation, whose task is stored as `cancelled` and reloads as "Stopped by
-// you" instead.
-function markMessageIncomplete(target) {
-  if (target.body.nextElementSibling?.dataset?.state === "incomplete") return;
-  const row = document.createElement("p");
+  const notice = turn.stopNotice;
+  if (!notice) return;
+  if (target.body.nextElementSibling?.dataset?.state === notice.state) return;
+  const row = document.createElement("div");
   row.className = "turn-indicator";
-  row.dataset.state = "incomplete";
+  row.dataset.state = notice.state;
   const label = document.createElement("span");
   label.className = "turn-indicator-label";
-  label.textContent = "Stopped before finishing";
+  label.textContent = notice.label;
   row.append(label);
+  if (notice.hint) {
+    const hint = document.createElement("span");
+    hint.className = "turn-indicator-hint";
+    hint.textContent = notice.hint;
+    row.append(hint);
+  }
+  if (notice.action) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "turn-indicator-action";
+    button.textContent = notice.action.label;
+    button.addEventListener("click", async () => {
+      try {
+        button.disabled = true;
+        await runStreamTaskAction(notice.action, { sessionId: resolved });
+      } catch (error) {
+        button.disabled = false;
+        toast(error.message);
+      }
+    });
+    row.append(button);
+  }
   target.body.after(row);
-}
-
-// How a finished turn's indicator ends: "incomplete" for every end that
-// `markMessageTurnStop` marks, "complete" otherwise.
-function chatCompletionState(payload) {
-  const exhausted =
-    payload.taskStatus === "tool_budget_exhausted" ||
-    payload.taskStatus === "token_budget_exhausted";
-  return exhausted || payload.incomplete ? "incomplete" : "complete";
 }
 
 // The files a turn read, folded into that turn rather than a strip docked above
@@ -12407,7 +12290,7 @@ function createQuestionCard(question, questionRepo, { answered = null } = {}) {
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
-            indicator.finish(chatCompletionState(payload));
+            indicator.finish(payload.turnPresentation?.indicatorState || "pending");
             markMessageTurnStop(assistantMessage, payload);
           },
           error(payload) {
@@ -12598,7 +12481,7 @@ function createFetchApproval(proposal, proposalRepo) {
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
-            indicator.finish(chatCompletionState(payload));
+            indicator.finish(payload.turnPresentation?.indicatorState || "pending");
             markMessageTurnStop(assistantMessage, payload);
           },
           error(payload) {
@@ -12661,7 +12544,7 @@ async function runVerificationStream(streamCall, targetRepo) {
         appendContextDisclosure(target.body, payload.contextFiles || []);
         markMessageUsage(target, payload.usage, liveTurnDurationMs(payload, indicator));
         markMessageTurnStop(target, payload);
-        indicator.finish(chatCompletionState(payload));
+        indicator.finish(payload.turnPresentation?.indicatorState || "pending");
       },
       error(payload) {
         streamError = new Error(payload.error || "Verification failed");
@@ -13302,7 +13185,7 @@ function createFallbackOffer(proposal, proposalRepo) {
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
-            if (indicator) indicator.finish(chatCompletionState(payload));
+            if (indicator) indicator.finish(payload.turnPresentation?.indicatorState || "pending");
             markMessageTurnStop(assistantMessage, payload);
           },
           error(payload) {
@@ -13470,7 +13353,7 @@ function createContextReview(review, reviewRepo) {
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
-            indicator.finish(chatCompletionState(payload));
+            indicator.finish(payload.turnPresentation?.indicatorState || "pending");
             markMessageTurnStop(assistantMessage, payload);
           },
           error(payload) {
@@ -13594,7 +13477,7 @@ function createRoundBudgetOffer(proposal, proposalRepo) {
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
-            indicator.finish(chatCompletionState(payload));
+            indicator.finish(payload.turnPresentation?.indicatorState || "pending");
             markMessageTurnStop(assistantMessage, payload);
           },
           error(payload) {
@@ -13850,7 +13733,7 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
-            indicator.finish(chatCompletionState(payload));
+            indicator.finish(payload.turnPresentation?.indicatorState || "pending");
             markMessageTurnStop(assistantMessage, payload);
           },
           error(payload) {
@@ -14552,7 +14435,7 @@ function createCommandApprovalPreview(
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
-            indicator.finish(chatCompletionState(payload));
+            indicator.finish(payload.turnPresentation?.indicatorState || "pending");
             markMessageTurnStop(assistantMessage, payload);
           },
           error(payload) {
@@ -14705,6 +14588,11 @@ async function loadSession(sessionId) {
   // Spec 100: a completed worker's durable result follows the conversation it
   // belongs to, with its own explicit continuation.
   renderWorkerResultCards(payload.workerReturns);
+  // Spec 101 Task 3: an incomplete task's card and its continue action are
+  // engine data in this payload, like any other reloaded outcome.
+  if (!isWorkerSession(currentSessionId)) {
+    renderTaskControlInto($("chat-log"), payload.taskControl, currentSessionId);
+  }
   // Spec 98 Task 4: the explicit protected-path control is server-computed in
   // this same payload, so a reload needs no second decision-making fetch.
   renderProtectedPathsControl(payload.protectedPathsControl);
@@ -15353,9 +15241,9 @@ async function sendChatPrompt(options = {}) {
   // talks to the worker, never to the shell's turn routes.
   if (workerView) {
     await sendWorkerComposer(promptOverride);
-    return;
+    return true;
   }
-  if (chatSubmitting) return;
+  if (chatSubmitting) return false;
   try {
     prompt = promptOverride || $("chat-prompt").value.trim();
     if (!prompt) throw new Error("Prompt is required");
@@ -15377,7 +15265,7 @@ async function sendChatPrompt(options = {}) {
     if (!options.agentic && changeRequestsUseOneShotPatch() && looksLikeEditRequest(prompt)) {
       await proposePatchFromChat(prompt, assistantMessage);
       dismissContextChips();
-      return;
+      return true;
     }
 
     const controller = new AbortController();
@@ -15439,7 +15327,7 @@ async function sendChatPrompt(options = {}) {
             if (indicator) indicator.finish("stopped");
             return;
           }
-          if (indicator) indicator.finish(chatCompletionState(payload));
+          if (indicator) indicator.finish(payload.turnPresentation?.indicatorState || "pending");
           markMessageTurnStop(assistantMessage, payload);
         },
         error(payload) {
@@ -15459,6 +15347,7 @@ async function sendChatPrompt(options = {}) {
     if (checkpoint) markMessageRewindable(userMessage, checkpoint);
     await loadSessions(currentSessionId, false);
     await refreshFindings();
+    return true;
   } catch (error) {
     // A stop is not a failure. Without this every Stop would toast "Failed"
     // and write an error into the bubble the user just chose to keep.
@@ -15473,6 +15362,7 @@ async function sendChatPrompt(options = {}) {
       renderChatMessageError(assistantMessage, error);
       if (restoreSubmittedPrompt) restorePrompt(prompt);
     }
+    return false;
   } finally {
     chatSubmitting = false;
     currentTurn = null;
@@ -15544,7 +15434,7 @@ async function askAgainFromExhausted(sessionId, taskId) {
             indicator.finish("stopped");
             return;
           }
-          indicator.finish(chatCompletionState(payload));
+          indicator.finish(payload.turnPresentation?.indicatorState || "pending");
           markMessageTurnStop(assistantMessage, payload);
         },
         error(payload) {

@@ -28,7 +28,8 @@ use workspace_engine::worktree::{
 };
 use workspace_engine::{
     AuditLog, Config, ProcessIdentity, ProcessKind, ProcessRegistry, RegistrationHandle,
-    SecretScanner, Session, SessionMode, SessionStore, TaskStatus, WorkerRecord,
+    SecretScanner, Session, SessionMode, SessionStore, TaskControl, TaskControlService, TaskStatus,
+    WorkerBoardGroup, WorkerProcessState, WorkerRecord, WorkerTaskFacts,
 };
 
 /// How long the supervisor waits at each step. Only tests change these.
@@ -868,7 +869,19 @@ pub(crate) fn route(
             };
             let events = read_progress_after(&config.data_dir, &session, after)
                 .map_err(|error| Refusal::new(500, error.to_string()))?;
-            Ok(json!({"events": events, "alive": supervisor.is_alive(&session)}).to_string())
+            let alive = supervisor.is_alive(&session);
+            // Spec 101 Task 3: the worker's outcome, labels and actions are
+            // engine data. The browser renders `control`; it does not rebuild
+            // them from `taskStatus` or the lifecycle state.
+            let all_events = read_progress_after(&config.data_dir, &session, 0)
+                .map_err(|error| Refusal::new(500, error.to_string()))?;
+            let control = progress_control(
+                &SessionStore::new(&config.data_dir),
+                &session,
+                alive,
+                &all_events,
+            )?;
+            Ok(json!({"events": events, "alive": alive, "control": control}).to_string())
         }
         ("POST", "/api/worker-control") => control_route(supervisor, request.form),
         ("POST", "/api/worker-restart") => {
@@ -955,6 +968,10 @@ fn control_route(
             forward("decisions", "decisions", true)?;
         }
         "pause" | "status" | "verify" | "continue-repair" => {}
+        "continue-task" => {
+            forward("task_id", "taskId", true)?;
+            forward("note", "note", false)?;
+        }
         "stop" => {
             let answer = supervisor
                 .stop(&session)
@@ -1009,22 +1026,58 @@ fn worker_record_of(config: &Config, session: &str) -> Result<WorkerRecord, Refu
         .ok_or_else(|| Refusal::new(400, "This session is not a worker."))
 }
 
-/// The board's groups, in the order §5.7 shows them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Group {
-    NeedsYou,
-    Running,
-    Finished,
-}
-
-impl Group {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::NeedsYou => "needs_you",
-            Self::Running => "running",
-            Self::Finished => "finished",
-        }
-    }
+/// The engine's control model for a worker session, from its progress record.
+///
+/// Lifecycle facts are read here and passed as typed inputs; the engine chooses
+/// the labels, dot, group and actions. Both the progress route and the board
+/// row use this, so they cannot disagree about what a status means.
+fn progress_control(
+    store: &SessionStore,
+    session_id: &str,
+    alive: bool,
+    events: &[Value],
+) -> Result<TaskControl, Refusal> {
+    let last = |kind: &str| {
+        events
+            .iter()
+            .rev()
+            .find(|event| event["kind"] == kind)
+            .map(|event| event["payload"].clone())
+    };
+    let status = last("status").unwrap_or(Value::Null);
+    let reported = status["state"].as_str().unwrap_or("idle");
+    let stored_status = store
+        .read_tasks(session_id)
+        .map_err(|error| Refusal::new(500, error.to_string()))?
+        .last()
+        .map(|task| task.status.clone());
+    let task_status = status["taskStatus"]
+        .as_str()
+        .and_then(TaskStatus::parse)
+        .or(stored_status);
+    let has_run = events.iter().any(|event| {
+        event["kind"] == "status" && event["payload"]["state"].as_str() == Some("running")
+    });
+    let last_progress_at_ms = events
+        .iter()
+        .rev()
+        .find_map(|event| event["timestampMs"].as_u64().map(u128::from));
+    TaskControlService::new(store, None)
+        .worker_control(
+            session_id,
+            WorkerTaskFacts {
+                task: None,
+                reported_task_status: task_status.clone(),
+                report: None,
+                alive,
+                state: WorkerProcessState::parse(if alive { reported } else { "exited" }),
+                has_run,
+                turn_error: status["error"].as_str(),
+                last_progress_at_ms,
+                now_ms: workspace_engine::hash::now_millis(),
+            },
+        )
+        .map_err(|error| Refusal::new(500, error.to_string()))
 }
 
 /// `GET /api/workers?repo=`: every worker whose source is `repo`, from its
@@ -1053,7 +1106,7 @@ fn list_workers(
         else {
             continue;
         };
-        rows.push(worker_row(supervisor, config, &store, session, &record));
+        rows.push(worker_row(supervisor, config, &store, session, &record)?);
     }
     // Newest first within each group.
     rows.sort_by(|(group_a, created_a, _), (group_b, created_b, _)| {
@@ -1069,7 +1122,7 @@ fn worker_row(
     store: &SessionStore,
     session: &Session,
     record: &WorkerRecord,
-) -> (Group, u128, Value) {
+) -> Result<(WorkerBoardGroup, u128, Value), Refusal> {
     let alive = supervisor.is_alive(&session.id);
     let events = read_progress_after(&config.data_dir, &session.id, 0).unwrap_or_default();
     let last = |kind: &str| {
@@ -1081,8 +1134,8 @@ fn worker_row(
     };
     let status = last("status").unwrap_or(Value::Null);
     let phase = last("phase").unwrap_or(Value::Null);
-    let reported = status["state"].as_str().unwrap_or("idle").to_string();
-    let mut task_status = status["taskStatus"]
+    let reported = status["state"].as_str().unwrap_or("idle");
+    let task_status = status["taskStatus"]
         .as_str()
         .map(str::to_string)
         .or_else(|| {
@@ -1092,43 +1145,44 @@ fn worker_row(
                 .and_then(|tasks| tasks.last().map(|task| task.status.as_str().to_string()))
         });
     let parsed_task_status = task_status.as_deref().and_then(TaskStatus::parse);
-    let group = match (alive, reported.as_str(), parsed_task_status.as_ref()) {
-        (true, "waiting_for_approval" | "paused", _) => Group::NeedsYou,
-        // Patch and fallback cards end their turn, so their process is idle
-        // while the user still has a decision to make.
-        (true, _, Some(TaskStatus::WaitingForApproval)) => Group::NeedsYou,
-        (true, "running", _) => Group::Running,
-        // An idle worker before its first task is starting. An active task
-        // without a running state is likewise still in progress, but a
-        // recovery-only status such as Interrupted is neither.
-        (true, "idle", None) => Group::Running,
-        (true, "idle", Some(status)) if status.is_active() => Group::Running,
-        _ => Group::Finished,
-    };
-    // A process that ended part way through a turn left it unfinished (§5.3).
-    if !alive && parsed_task_status.is_some_and(|status| !status.is_terminal()) {
-        task_status = Some(TaskStatus::Interrupted.as_str().to_string());
-    }
-    let state = if alive { reported.as_str() } else { "exited" };
-    let doing = if let Some(error) = status["error"].as_str() {
-        Some(error.to_string())
+    let state = if alive { reported } else { "exited" };
+    let last_progress_at_ms = events
+        .iter()
+        .rev()
+        .find_map(|event| event["timestampMs"].as_u64().map(u128::from));
+    let control = TaskControlService::new(store, None)
+        .worker_control(
+            &session.id,
+            WorkerTaskFacts {
+                task: None,
+                reported_task_status: parsed_task_status.clone(),
+                report: None,
+                alive,
+                state: WorkerProcessState::parse(state),
+                has_run: parsed_task_status.is_some(),
+                turn_error: status["error"].as_str(),
+                last_progress_at_ms,
+                now_ms: workspace_engine::hash::now_millis(),
+            },
+        )
+        .map_err(|error| Refusal::new(500, error.to_string()))?;
+    let group = control.group;
+    // The phase label is a progress detail, not an outcome: the engine still
+    // owns the group, dot and action. Without a phase, show its headline.
+    let doing = if reported == "running" {
+        phase["label"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| Some(control.headline.clone()))
     } else {
-        match state {
-            "waiting_for_approval" => Some("Waiting for approval".to_string()),
-            "paused" => Some("Paused".to_string()),
-            "running" => phase["label"].as_str().map(str::to_string),
-            "idle" if task_status.as_deref() == Some(TaskStatus::WaitingForApproval.as_str()) => {
-                Some("Needs your decision".to_string())
-            }
-            _ => None,
-        }
+        Some(control.headline.clone())
     };
     let parent_title = record
         .parent_session_id
         .as_deref()
         .and_then(|parent| store.read_session(parent).ok().flatten())
         .map(|parent| parent.title);
-    let (files_changed, commits_ahead) = if group == Group::Finished {
+    let (files_changed, commits_ahead) = if group == WorkerBoardGroup::Finished {
         (
             git_count(
                 &record.worktree_path,
@@ -1159,6 +1213,7 @@ fn worker_row(
         "state": state,
         "taskStatus": task_status,
         "group": group.as_str(),
+        "control": control,
         "round": phase["round"],
         "maxRounds": phase["maxRounds"],
         // Additive for spec 59 §5.5: a row written before the exploration
@@ -1174,7 +1229,7 @@ fn worker_row(
         "filesChanged": files_changed,
         "commitsAhead": commits_ahead,
     });
-    (group, session.created_at_ms, row)
+    Ok((group, session.created_at_ms, row))
 }
 
 /// One `git -C <worktree>` call, read as a count: `rev-list --count` prints

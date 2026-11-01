@@ -6,7 +6,8 @@ prompt = "Work out what the upload client does, then write the report."
 # Spec 66 §5.5's second scenario: the model answers, receives the one
 # reminder, and answers again without closing anything. The turn ends with the
 # first answer as its response, the steps still open, and the command the turn
-# ran attached to the open step.
+# ran attached to the open step. Spec 101 makes that outcome `incomplete`: the
+# model answered, but the engine-owned completion gate still sees open work.
 [[turn]]
 content = ""
 tool_calls = [
@@ -39,7 +40,7 @@ plan_left_open = true
 # ended. On a pause it would instead be carried in the pending turn.
 plan_open_evidence = 1
 last_assistant_message_contains = ["Still not done."]
-final_task_status = "complete"
+final_task_status = "incomplete"
 deterministic_only = [
   "plan_reminders",
   "plan_outstanding",

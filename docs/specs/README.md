@@ -97,14 +97,14 @@ and worktree delivery finished on 2026-10-28 and were merged into `main` that
 day; the full seven-check gate passed in CI on 2026-10-29 for the `main` push
 that contains both (Quality run 40902516310).
 
-#60–#85, #87–#100 are also Done (see their rows below). #99 and #100 finished
-on 2026-10-31, and #98 finished on 2026-11-01; their scoped local checks passed,
+#60–#85, #87–#101 are also Done (see their rows below). #99 and #100 finished
+on 2026-10-31, #98 and #101 on 2026-11-01; their scoped local checks passed,
 and the full gate is left to CI. Several were evidence-driven or
 usability specs added outside the roadmap order; being finished, none of them
-changes what may be built next. #101–#106 are the not-yet-built single-worker
-reliability sequence added after the failed spec 86 attempt: truthful
-completion, safe repair, bounded continuation, worker questions, structured
-checks, and the acceptance gate that proves the sequence works as one system.
+changes what may be built next. #102–#106 are the remaining single-worker
+reliability sequence added after the failed spec 86 attempt: safe repair,
+bounded continuation, worker questions, structured checks, and the acceptance
+gate that proves the sequence works as one system.
 
 - **Done:** #30 memory retrieval and lifecycle finished on
   2026-10-30, built on branch `spec-30-memory-recall` (Tasks 1–6 on
@@ -119,6 +119,12 @@ checks, and the acceptance gate that proves the sequence works as one system.
   reattachment, the engine-owned desktop and CLI controls, and the final
   integration pass. Its §7 records the scoped local checks; the full gate is
   left to CI.
+- **Done:** [#101](101_closed_task_completion.md) closed task completion
+  finished on 2026-11-01. The engine-owned completion gate, settlement and
+  crash recovery, and the exact-target **Continue task** controls landed for
+  ordinary and worker sessions; its §7 records the acceptance evidence, the
+  deterministic evaluation and the scoped local checks. The full gate is left
+  to CI.
 - **In progress:** [#49](49_prompt_cache_accounting_and_reuse/proposal.md) prompt
   cache's accounting slice is done and the reuse slice (requirement 4) is still
   unbuilt; #26's ordering exists, and #55 replaced the eight-message sliding
@@ -128,25 +134,25 @@ checks, and the acceptance gate that proves the sequence works as one system.
 - **Ready:** #33 MCP management. It was serialised behind #30 on `chat.rs`;
   with #30 Done it is free to start, from a `main` that contains #30's turn
   path so it does not rebase over it.
-  [#101](101_closed_task_completion.md),
   [#102](102_repair_provenance_and_stagnation.md) and
   [#104](104_worker_questions.md) are dependency-ready too — #102's last unmet
-  dependency was #98 — but all of them share the agent loop with #33 and must
-  not be implemented concurrently with it or with each other.
+  dependency was #98 — and [#105](105_structured_plan_checks.md) becomes
+  dependency-ready now that #101 is Done. All of them share the agent loop with
+  #33 and must not be implemented concurrently with it or with each other.
 - **Blocked:** #37 on #33; #52 on #33; #39 on #38; #40 on #38 and #39; #54 on
   Phase 1 WP3 (provider capability validation), which is unspecified. In the
-  single-worker sequence, [#103](103_bounded_worker_continuation.md) is blocked
-  on #101 and #102; [#105](105_structured_plan_checks.md) on #101; and
-  [#106](106_single_worker_spec_acceptance.md) on #101–#105.
+  single-worker sequence, [#103](103_bounded_worker_continuation.md) remains
+  blocked on #102; [#106](106_single_worker_spec_acceptance.md) remains blocked
+  on #102–#105. #101 is built and no longer blocks either.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
 - **Pairing:** two specs may run together only if at most one of them edits
   `chat.rs`, and #49's reuse slice is a solo `chat.rs` track while it rewrites
   the request around `build_model_prompt`. #33 edits `chat.rs` through the MCP
   tool list and per-tool dispatch and owns that file while it is in flight.
-  #101–#105 also touch the task/agent loop and form one serial implementation
-  track. #106 follows that track and primarily owns the eval harness. #98 is
-  Done and no longer constrains `chat.rs`. Every Done spec no longer constrains
-  anything. See [Parallel work](#parallel-work).
+  #102–#105 also touch the task/agent loop and form one serial implementation
+  track. #106 follows that track and primarily owns the eval harness. #98 and
+  #101 are Done and no longer constrain anything. Every Done spec no longer
+  constrains anything. See [Parallel work](#parallel-work).
 - **Open decision:** the priority table below predates #59–#80 and does not
   rank them; the text after it now calls #23 the priority with #65 done.
 
@@ -735,6 +741,17 @@ path, `memory_recalled` audit and stale state it needs to show "last used" and
 invalidated on state change (§5.6); and the phase is not complete until the
 two-week real-session observation in its §7.3 is recorded.
 
+Re-derived on 2026-11-01, when [#101](101_closed_task_completion.md) finished.
+The `Depends on:` lines that named #101 were updated to record it as built:
+[#103](103_bounded_worker_continuation.md) now names only #102 as its remaining
+blocker, [#105](105_structured_plan_checks.md) has no unbuilt dependency and
+joins the ready set, and [#106](106_single_worker_spec_acceptance.md) still
+waits on #102–#105. #101 leaves the ready and in-progress sets, and its
+`chat.rs` pairing constraint ends with it; the remaining #102–#105 tasks still
+form one serial track because they all touch the task/agent loop. The
+deterministic evaluation passes with the new `incomplete` expectation, and the
+scoped local checks are recorded in #101's §7.
+
 ### Parallel work
 
 Two specs may be built at once, which is a **deliberate exception to the
@@ -879,13 +896,13 @@ is ready.
 | 97 | [97_reuse_planned_verification_steps.md](97_reuse_planned_verification_steps.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A task plan can name `cargo test` as its final step, but automatic verification selected the same command after every patch and activated a second `verify_` step beside the carried primary work. Verification now defers an exact planned whole-suite check until the worker reaches its final plan step, and leaves a secondary check pending while another primary step is active, so every durable log prefix preserves the one-in-progress invariant. |
 | 98 | [98_task_scoped_protected_patch_paths.md](98_task_scoped_protected_patch_paths.md) | **Done 2026-11-01.** A worker ignored a direct no-touch instruction and proposed deleting an unrelated file after a failed check. Direct user path exclusions are now durable, task-scoped patch fences enforced before proposal and again before apply, across verification, repairs, worker restart, and reload. The engine owns the narrow direct-user parser, canonicalisation, repository/session checks, deletion-safe explicit removal, `plan_resumed`/verification ancestry replay, the worker handoff, the proposal/apply and recovery fences, the reminder, worker progress, and one typed control model for the desktop and CLI. A rejected file alone remains a review decision, not an implicit permanent ban, and shell commands remain separately approval-gated rather than sandboxed. |
 | 99 | [99_worker_task_outcomes.md](99_worker_task_outcomes.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A worker's `idle` process state hid whether its task had completed, needed a decision, or had stopped short. The worker session now derives an explicit outcome and next action from durable task status, approvals, errors and progress timestamps; the board also treats an idle pending decision as **Needs you**. |
-| 100 | [100_worker_return_and_inline_choice.md](100_worker_return_and_inline_choice.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A completed worker now returns one redacted, durable terminal outcome to its parent; the parent shows a result card whose **Continue with result** starts an ordinary turn rather than approving or merging anything, and a suggested worker prompt offers **Work here instead** beside **Start worker**. |
-| 101 | [101_closed_task_completion.md](101_closed_task_completion.md) | **Not started.** A model answer can currently become `complete` while approved plan work or verification remains. Completion will become an engine-owned gate; an answer with open work becomes a durable, resumable `incomplete` outcome instead of worker success. |
+| 100 | [100_worker_return_and_inline_choice.md](100_worker_return_and_inline_choice.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A worker now reaches one redacted, durable terminal outcome — `incomplete` included — for its parent; the parent shows a result card whose **Continue with result** starts an ordinary turn rather than approving or merging anything, and a suggested worker prompt offers **Work here instead** beside **Start worker**. |
+| 101 | [101_closed_task_completion.md](101_closed_task_completion.md) | **Done 2026-11-01.** A model answer can no longer become `complete` while approved plan work or verification remains. The engine-owned completion gate settles an answered turn or a verification, records its typed reasons and declined-check waivers, and otherwise writes a durable, resumable `incomplete`. The shell, worker host and browser transport the engine's task control; **Continue task** re-reads the exact task and report under the session-log lock and grants no approval. Recovery recomputes the gate from durable state, and the deterministic evaluation now asserts the truthful `incomplete` outcome. Its §7 records the acceptance evidence. |
 | 102 | [102_repair_provenance_and_stagnation.md](102_repair_provenance_and_stagnation.md) | **Not started; ready now that #98 is Done.** Checks will be baselined before the patch that first selects them, repair will target only introduced regressions, environment failures will not trigger source edits, and repeated or oscillating repairs will stop before the numeric limit. |
-| 103 | [103_bounded_worker_continuation.md](103_bounded_worker_continuation.md) | **Not started; blocked on #101 and #102.** A user-approved task budget will span internal worker segments, while deterministic within-turn tool-history compaction keeps requests inside the provider window and no-progress or budget exhaustion remains a truthful stop. |
+| 103 | [103_bounded_worker_continuation.md](103_bounded_worker_continuation.md) | **Not started; blocked on #102.** #101 is built. A user-approved task budget will span internal worker segments, while deterministic within-turn tool-history compaction keeps requests inside the provider window and no-progress or budget exhaustion remains a truthful stop. |
 | 104 | [104_worker_questions.md](104_worker_questions.md) | **Not started.** An app-managed worker will be able to persist a real clarification, show **Needs your answer**, and resume through its control socket without treating an answer as an approval or guessing a material product decision. |
-| 105 | [105_structured_plan_checks.md](105_structured_plan_checks.md) | **Not started; blocked on #101.** Approved plan steps will carry structured required checks with command, directory and current evidence, replacing #97's prose match and giving the completion gate an engine-owned verification obligation. |
-| 106 | [106_single_worker_spec_acceptance.md](106_single_worker_spec_acceptance.md) | **Not started; blocked on #101–#105.** A deterministic fixture and three consecutive fresh live runs will prove that one real worker can finish one specification-sized task without generic rescue prompts, while all existing safety decisions remain explicit. |
+| 105 | [105_structured_plan_checks.md](105_structured_plan_checks.md) | **Not started; ready now that #101 is Done.** Approved plan steps will carry structured required checks with command, directory and current evidence, replacing #97's prose match and giving the completion gate an engine-owned verification obligation. |
+| 106 | [106_single_worker_spec_acceptance.md](106_single_worker_spec_acceptance.md) | **Not started; blocked on #102–#105.** #101 is built. A deterministic fixture and three consecutive fresh live runs will prove that one real worker can finish one specification-sized task without generic rescue prompts, while all existing safety decisions remain explicit. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:

@@ -16,14 +16,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
-    CancelToken, ChatTurnResult, CheckId, CheckOutcome, CommandPurpose, Config, ContextDecision,
-    Evidence, HookConfig, HookEvent, HookMode, HookSource, MockModelAdapter, PausedTurns,
-    PlanReport, PlanStep, ReattachedApproval, RoundBudgetDecision, Selection, SessionStore,
-    SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink, VerificationEvent,
-    VerificationOutcome, VerificationReport, VerificationState, WebDiagnosticCall,
-    WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkerRecord, WorkspaceEngine, fold_verification, is_documentation,
-    pending_verifications, propose_checks, reattach_pending_approvals, select_roots,
+    CancelToken, ChatTurnResult, CheckId, CheckOutcome, CommandPurpose, CompletionReasonCode,
+    Config, ContextDecision, Evidence, HookConfig, HookEvent, HookMode, HookSource,
+    MockModelAdapter, PausedTurns, PlanReport, PlanStep, ReattachedApproval, RoundBudgetDecision,
+    Selection, SessionStore, SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink,
+    VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
+    WebDiagnosticCall, WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerRecord, WorkspaceEngine,
+    fold_verification, is_documentation, pending_verifications, propose_checks,
+    reattach_pending_approvals, select_roots,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -1739,7 +1740,21 @@ fn two_checks_needing_approval_produce_one_batch_and_one_resume() {
         .find(|item| item.check.command == "npm run test")
         .expect("the declined check is reported as skipped");
     assert_eq!(declined.reason, SkipReason::DeclinedByUser);
-    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    // Spec 101: the declined check is a named waiver, but the browser check
+    // that was skipped for want of a running target is not a pass either, so
+    // the task settles incomplete rather than complete.
+    let settled = engine
+        .session_store
+        .read_completion_report(&session, &resumed.task.id)
+        .unwrap()
+        .expect("the settlement carries the gate report");
+    assert_eq!(resumed.task.status, TaskStatus::Incomplete);
+    assert_eq!(
+        settled.reason_codes(),
+        vec![workspace_engine::CompletionReasonCode::RequiredCheckSkipped]
+    );
+    assert_eq!(settled.waivers.len(), 1);
+    assert_eq!(settled.waivers[0].check, declined.check.clone());
 
     let plan = engine
         .session_store
@@ -3586,6 +3601,33 @@ fn a_passed_verification_with_open_steps_continues_the_task() {
         .as_ref()
         .expect("the report stays with the turn");
     assert_eq!(report.outcome, Some(VerificationOutcome::Passed));
+    // Spec 101: the successful verification settles `incomplete` because the
+    // task's own plan work remains, and the continuation's answer leaves it
+    // open again. No transient `complete` is ever written.
+    assert_eq!(result.task.status, TaskStatus::Incomplete);
+    let settled = engine
+        .session_store
+        .read_completion_report(&session, &result.task.id)
+        .unwrap()
+        .expect("the settlement carries the gate report");
+    assert_eq!(
+        settled.reason_codes(),
+        vec![CompletionReasonCode::OpenPlanSteps]
+    );
+    let log = fs::read_to_string(data_dir.join("sessions").join(format!("{session}.jsonl")))
+        .expect("the session log should read");
+    let transient_complete = log
+        .lines()
+        .filter(|line| {
+            line.contains("\"eventType\":\"task_status_updated\"")
+                && line.contains(&result.task.id)
+                && line.contains("\"status\":\"complete\"")
+        })
+        .count();
+    assert_eq!(
+        transient_complete, 0,
+        "open plan work must never pass through a transient complete"
+    );
     // The report was still recorded before the continuation answered.
     let messages = engine.session_store.read_messages(&session).unwrap();
     assert!(
@@ -3642,6 +3684,18 @@ fn a_failed_verification_is_not_continued() {
 
     assert!(adapter.requests.is_empty(), "a failure is not continued");
     assert_eq!(result.task.status, TaskStatus::Failed);
+    let settled = engine
+        .session_store
+        .read_completion_report(&session, &result.task.id)
+        .unwrap()
+        .expect("a failed verification still carries the gate report");
+    assert!(!settled.eligible);
+    assert!(
+        settled
+            .reason_codes()
+            .contains(&CompletionReasonCode::RequiredCheckFailed),
+        "{settled:?}"
+    );
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);

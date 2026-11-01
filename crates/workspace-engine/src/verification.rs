@@ -249,6 +249,10 @@ pub struct VerificationState {
     pub regressions: Vec<CheckId>,
     /// The last `Finished` outcome, cleared by a new `Started`.
     pub finished: Option<VerificationOutcome>,
+    /// A `Started` with no later `Finished`. Distinct from `due`, which stays
+    /// set until a `Finished` too: a run can be both due and in progress, and
+    /// the completion gate reports each fact it can see.
+    pub in_progress: bool,
     /// Private so the state cannot be constructed by hand into a shape the
     /// events do not support; the report's honesty rests on the fold.
     passed_before: BTreeSet<CheckId>,
@@ -275,6 +279,7 @@ impl VerificationState {
             } => {
                 self.attempt = *attempt;
                 self.finished = None;
+                self.in_progress = true;
                 for check in checks {
                     if !self.selected.contains(check) {
                         self.selected.push(check.clone());
@@ -301,6 +306,7 @@ impl VerificationState {
             VerificationEvent::Finished { outcome, .. } => {
                 self.due = None;
                 self.finished = Some(*outcome);
+                self.in_progress = false;
             }
         }
         self.regressions = self

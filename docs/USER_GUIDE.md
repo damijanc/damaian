@@ -1082,8 +1082,9 @@ change made without a plan ends with the report, as before.
 detected checks, or a documentation-only change, says so in its own words. So
 does a verification where you declined every check, or policy blocked them: it
 ends as **nothing verified** ("No check ran: 2 checks skipped, so nothing was
-verified"), never as passed. The task still counts as complete, since declining
-was your choice, and a task with open plan steps still continues.
+verified"), never as passed. Declining is a named waiver, so it does not block
+the task by itself: the task still completes when everything else is closed, and
+a task with open plan steps still continues.
 
 **Browser checks.** When a changed path is a web asset and the session already
 has a diagnostic target, the loop reruns an inspection at that page under the
@@ -1249,18 +1250,36 @@ Damaian knows what it observed; it does not know that the work was left undone,
 which is why the wording is not "failed". The answer is still the answer, and
 everything the step ran is still listed under **What confirms this**.
 
+An answer is not proof that the task is finished. When the turn ends, Damaian
+checks the task itself: every non-verification plan step must be terminal, no
+verification may be due or running, no proposal or question may be waiting, and
+every selected check must have a current result. Only then is the task
+**complete**. If any of those facts is still open, the task ends
+**incomplete**. The answer stays in the conversation, the steps stay as they
+are, and a **Task incomplete** card names the reasons, such as "Verification is
+due and has not run." A check you declined is named as a waiver and never
+counted as a passed check; a check skipped by policy is still a blocker.
+
+**Continue task** on that card starts a new run with the same plan and the same
+completion reasons, without typing "continue". You can add a note, which is
+appended as your message. Continuing is not an approval: every patch, command,
+check, question and provider fallback still asks for its own decision. When the
+remaining steps and checks are closed, the next run settles **complete** instead.
+
 A plan you declined at the review gate is different: its steps are shown as
 **skipped**, because your decision settled them. Damaian will not ask the model
 to complete work you refused.
 
 ### Picking an open plan up again
 
-When a turn ends with steps still open, the next message you type in Code mode
-picks the plan up: "continue" carries on from the step that was running, and
-the panel shows the same plan under the new reply. If you approved the plan,
-you are not asked again; if you never had to, it is reviewed before its first
-change, like any plan. The verification after a patch and the work after it
-then follow the same plan, so a long task keeps going one step at a time.
+When a turn ends with steps still open, **Continue task** on the incomplete
+card carries on from the step that was running; the panel shows the same plan
+under the new reply, and the card also names the completion reasons it carried.
+Typing the next message in Code mode picks the same plan up, so "continue" still
+works. If you approved the plan, you are not asked again; if you never had to,
+it is reviewed before its first change, like any plan. The verification after a
+patch and the work after it then follow the same plan, so a long task keeps
+going one step at a time.
 
 If you have moved on to something else, the assistant proposes a new plan in
 its place, and the old one stays recorded under the turn that made it. If it
@@ -1827,7 +1846,7 @@ A **worker** is a session that runs on its own: it gets a prompt, works in a new
 
 **Starting a worker.** A `worker-prompt` block in an assistant's answer gets a **Start worker** button once the answer has finished, and a secondary **Work here instead** button. No other block gets either. Clicking **Start worker** opens the New worker dialog with the block's text, which you can still edit. Confirm with **Start worker**. **Work here instead** sends the block to the current conversation as an ordinary turn, with an instruction that you chose this checkout rather than a worker; it does not create, switch to, or write in another worktree. The session holding the block becomes the worker's parent: the block then shows "Started *‹title›* →", and the conversation gets a one-line "Spawned worker" link. A plan put up for review also offers **Run in a worker**, so you do not depend on the assistant writing a block (see [Reviewing a plan before it runs](#reviewing-a-plan-before-it-runs)). **New worker** on a project's ⋮ menu or on the Workers board opens the same dialog empty, for a worker with no parent. A worker cannot start workers of its own.
 
-**When a worker finishes.** A worker with a parent leaves one redacted result in that parent when its task reaches a terminal outcome: complete, stopped, failed, or out of budget. The parent shows a **Worker result** card naming the task outcome, branch, worktree and the worker's final response, with a link to the worker. Its next action is **Continue with result**. That starts an ordinary turn in the parent with the result as a delimited user message; it never starts a turn by itself, and it does not merge the branch, apply a patch, or approve anything. A task waiting on a command, patch, plan, check card or provider choice returns only after that decision produces a terminal outcome. A worker started from **New worker**, with no parent, returns nothing.
+**When a worker finishes.** A worker with a parent leaves one redacted result in that parent when its task reaches a terminal outcome: complete, incomplete, stopped, failed, or out of budget. The parent shows a **Worker result** card naming the task outcome, branch, worktree and the worker's final response, with a link to the worker. Its next action is **Continue with result**. That starts an ordinary turn in the parent with the result as a delimited user message; it never starts a turn by itself, and it does not merge the branch, apply a patch, or approve anything. An incomplete result is labelled **Task incomplete** and names the completion reasons; it is never presented as success. A task waiting on a command, patch, plan, check card or provider choice returns only after that decision produces a terminal outcome. A worker started from **New worker**, with no parent, returns nothing.
 
 **Uncommitted changes.** A worker starts from your last commit, so it cannot see work you have not committed — often the very task file you planned it from. If your tree has uncommitted changes, the dialog says how many and names the files the prompt mentions first. Choose **Include uncommitted changes** (selected by default), which copies your tracked edits and untracked files into the worker's tree, or **Start from last commit**. Your own tree is not changed either way.
 
@@ -1838,6 +1857,7 @@ A **worker** is a session that runs on its own: it gets a prompt, works in a new
 **In a worker's session** a control strip under the header shows its state and round, with **Pause** and **Stop** while it runs, **Resume** and **Stop** while it is paused, and **Stop** while it waits or sits idle. The header says which session it came from and which branch it is on.
 
 - **Notes.** While a worker runs, the composer's button reads **Send note**. A note joins the conversation as your message at the worker's next round, before its next model request. While paused it reads **Resume with note**, and when the worker is idle, **Send message** starts a new turn. A note sent during the turn's final round, after which the turn finishes without another model request, does not reach that turn.
+- **Complete and incomplete tasks.** An idle worker whose task closed through the completion gate reads **Task complete** and offers **Send follow-up**. One whose answer left plan work, verification, a pending decision or a required check still open reads **Task incomplete** and offers **Continue task**, which carries the same plan and reasons into a new worker turn. A worker waiting for a decision shows only its review action, with no composer. Continuing grants no approval.
 - **Pause** takes effect at the next round boundary. A running command or model call is never cut short.
 - **Stop** ends the turn at its next safe point. If it has not ended within 10 seconds Damaian asks the worker to shut down, and 5 seconds after that it terminates the process. Stopping a worker that waits for approval or sits idle shuts it down.
 - **Approvals** look exactly as they do in your own sessions and continue in the same worker process without restarting it. A worker's command card has no *Allow Always*, and its plan steps cannot be edited before approval. Patch proposals and provider-switch offers end the turn as usual and are answered from the worker's session. Once you have applied or rejected every file of a worker's patch, the worker verifies it and carries on with its plan, as your own sessions do; a check card it raises is answered in the worker's session too, without Always allow.

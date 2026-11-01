@@ -1,6 +1,6 @@
 # Feature Spec: A Worker Completes Only a Closed Task
 
-Status: Not started
+Status: Done (started 2026-11-01; done 2026-11-01)
 Order: 101 of 106
 Plan: none. This is a failure-driven specification from the 2026-10-31
 attempt to implement the reserved spec 86 with one Damaian worker.
@@ -89,3 +89,240 @@ path as a budget continuation, without granting more approvals.
   continuing it carries the same plan.
 - No historical task already stored as complete is rewritten during migration;
   the stricter rule applies when new status events are settled.
+
+## 6. Implementation Plan
+
+**Started:** 2026-11-01 — **Done:** 2026-11-01
+
+| Task | State | Durable result |
+|---|---|---|
+| 1 · Completion model and engine gate | Done 2026-11-01 | Added terminal-but-unsuccessful `incomplete`, typed engine-owned reason/waiver reports, compatible durable storage, and a repository-bound gate over the active plan, pending decision, explicit continuation chain, and current verification evidence. The full chain is required for completion evidence because a continuation and its verification turn may be sibling descendants of the same plan task; protected paths retain one-way ancestry. Passed locally: `cargo fmt --all`, scoped workspace-engine clippy, the `closed_task_completion`, `session_rewind`, `crash_recovery`, `plan`, and `verification_loop` tests, strict spec-status checking, and typos. |
+| 2 · Settlement and recovery | Done 2026-11-01 | Recomputed and persisted the gate at both new-settlement paths. `run_agentic_turn` settles an answered turn through one engine operation: eligible work writes `complete`, otherwise `incomplete`, while #66's reminder transcript and pending/budget statuses are unchanged. A verification appends `Finished` before the same settlement; a successful outcome becomes `complete` only when the whole task is closed, and intermediate continuation reopens only an `incomplete` whose sole blocker is `open_plan_steps`. A command verification still runs after an `incomplete` answer settlement, so `verification_due` is not stranded. A non-side-effecting `completion_settlement` marker stores a typed JSON reference (repository root plus `gate`/`verification_failed`) and is written before the gate is recomputed, so a crash during report computation is still inside the recognizable answer-to-status window; recovery parses it, validates root/session/task, recomputes currentness, never reads a stored eligible boolean, keeps a crashed failed verification `failed` with its report, and fails safe to `interrupted` when validation fails or the raw status is unknown to this build. A dangling side effect on the same task outranks the marker, so recovery cannot overwrite `unknown_external_outcome`. Recovery closes the original marker through crate-private `finish_recorded_action`; tests prove one start and one finish, with no duplicate marker, and that normal settlement order is `action_started` < `task_status_updated` with the report < `action_finished`. `model_response_completed` records the persisted verdict. Regression tests cover two answers with an open plan (`incomplete`, unchanged plan, both transcript answers, `incomplete` audit), a closed plan (`complete`), successful intermediate verification with no transient `complete`, failed verification staying `failed` with `required_check_failed`, crash markers recomputed to `incomplete`/`complete`/`failed`, an unusable root staying interrupted, an unknown future status not being settled, a dangling side effect outranking a completion marker, and settlement event order. The browser-skip batch test now expects `incomplete` because a policy-skipped check is not a pass and the declined check is only a named waiver. Passed locally: `cargo fmt --all`; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`; nextest `completion_settlement`, `closed_task_completion`, `crash_recovery`, `session_rewind`, `verification_loop` (157 passed, 4 skipped) and workspace-engine lib tests (679 passed, 5 skipped); `npm run specs:check -- --strict`; `scripts/quality-gate.sh typos`. Workspace clippy and tests are left to CI. Task 3 discovery: read the durable report through `read_completion_report`; use `TaskStatus::is_successful` and the report's reason codes and waivers instead of re-deriving completion, and do not assume only `complete` can carry a verification report because `verify_after_command_turn` now accepts an `incomplete` settlement. |
+| 3 · Resume, worker outcome and thin UIs | Done 2026-11-01 | Added `workspace-engine::task_control`: one serializable `TaskControl` per ordinary session or worker with outcome, dot, group, headline, detail, completion reasons/waivers, primary/board/composer actions and the engine-computed stale-progress sentence. `SessionStore::continue_incomplete_task` writes the new task and its `plan_resumed` edge in one locked batch after re-reading the newest task, its `incomplete` status and the exact completion report the prompt was built from; `ChatOrchestrator::continue_incomplete_task` builds the prompt from the durable reasons plus an optional note and runs that task through the ordinary path, granting no approval. Every continuation action carries its exact source `taskId` and the engine's `wireCommand`, so the shell, socket, `TurnJob` and worker host never resolve "the latest task" at execution time; a stale second click is refused instead of continuing a later incomplete task. `ChatTurnResult` now carries the engine-owned `taskControl` (with its durable reasons/waivers, so a live result matches a reload) and a `turnPresentation` with an exhaustive serialized `TurnIndicatorState` (including `pending` for paused and still-running tasks), a typed stop notice/action, and the engine-computed `paused` reload-grouping fact; the same presentation is serialized per task for reloaded sessions, and only `TaskStatus::Complete` yields `complete`. Worker facts carry the typed `WorkerProcessState` and durable/reported `TaskStatus`; the engine decides `needs_decision` itself, so the shell transports facts rather than a pre-decided flag. `app.js` groups paused reloads from `turnPresentation.paused` and compares no task statuses. `/api/continue-task-stream`, the worker `continue-task` command, `/api/session.taskControl`, enriched `workerReturns.control`, `/api/worker-progress.control` and board-row `control` all transport the engine model. `app.js` lost `WORKER_TASK_OUTCOMES`, `WORKER_END_LABELS`, `WORKER_COMPOSER_MODES`, `WORKER_WIRE_COMMANDS`, `workerViewOutcome`, `workerComposerMode`, `chatCompletionState` and the budget/stop status tables; it renders returned labels/actions, including **Task incomplete — Continue task**, and keeps the literal `incomplete` in worker progress and returns. A failed streamed continuation now returns a false result and leaves the ordinary **Continue task** card in place rather than treating a swallowed error as success. Specs 99 and 100 record the amendment. Two stale desktop tests were aligned with Task 2: an answered command task with a due verification is now expected to be `incomplete` with its verification task `complete`, and the verification fixtures create their session under the real repository id so the repository-bound gate can settle them. Regression tests cover the exact worker target, stale-target refusal, report equality under the lock, live result reasons/waivers, engine stop notices, typed indicator and paused facts (including `waiting_for_approval`), decision derivation from typed/reported worker facts, and source-level thin-UI assertions that reject the raw paused-status comparison. Passed locally: `cargo fmt --all`; `node --check crates/desktop-shell/static/app.js`; `npm run lint:web` (one pre-existing descending-specificity warning in `style.css`); scoped clippy for `workspace-engine` and `desktop-shell`; `workspace-engine` `task_control` unit and integration tests (17 passed), `closed_task_completion` and `completion_settlement`; the thin-UI source test and four desktop worker tests (all passed). Workspace-wide clippy and tests remain CI-only. |
+| 4 · Integration, documentation and close-out | Done 2026-11-01 | Audited all eight requirements and six acceptance criteria against the engine, shell, worker and tests. Closed four integration gaps: the deterministic harness counted the non-side-effecting `completion_settlement` marker as a tool round and a tool call, so its trace now excludes it from both and a unit test pins that; `plan_left_open_at_end` asserts the truthful `incomplete` verdict; the plan-review hand-off clears its resolved pending link before settling through the same gate instead of writing `complete` directly; and recovery closes a settlement marker whose status landed before the crash instead of leaving a permanent crash window. Added evidence for a continuation that closes the carried plan (`complete`) and for a verification-only continuation prompt that does not claim a plan. Updated `USER_GUIDE.md`, `TROUBLESHOOTING.md` and `SECURITY.md` for complete versus incomplete, **Continue task**, crash settlement, worker outcomes and unchanged approvals; reconciled #103/#105/#106 dependencies and `README.md`; and removed #101's completed item from `CHANGELOG.md` `Unreleased`. Deterministic evaluation: all 46 scenarios pass. Local checks passed: `scripts/quality-gate.sh fmt node lint typos deny`; scoped clippy for `workspace-engine`, `desktop-shell` and `eval-harness`; nextest 898 passed / 9 skipped across `workspace-engine` lib plus `closed_task_completion`, `completion_settlement`, `task_control`, `crash_recovery`, `verification_loop`, `session_rewind` and `plan_turn`; 67 passed (1 leaky) / 209 skipped desktop-shell worker/continue/incomplete tests; the `eval-harness` trace unit test; `npm run specs:check -- --strict`; and `git diff --check`. Workspace clippy and tests remain CI-only. |
+
+### Task 1: completion model and engine gate
+
+Task 1 establishes the reusable application boundary before any settlement or
+UI wiring:
+
+- `TaskStatus::Incomplete` is terminal for one run, is never successful, and
+  parses/replays without rewriting historical `complete` events.
+- `CompletionReasonCode` and `CompletionGateReport` are typed engine data. The
+  report carries `eligible`, stable reason codes, user-visible explanations,
+  and explicit declined-check waivers; adapters must not reconstruct their
+  meaning.
+- The session log stores the report beside the status event and can read the
+  newest report for a task. Old events have no report and keep their recorded
+  status unchanged.
+- A `workspace-engine` service builds the report from durable task state: the
+  active plan, folded verification events, pending approval/question link, and
+  the latest known disposition of each selected check. Non-verification plan
+  steps must be terminal. Verification due or started-but-unfinished blocks
+  completion. Passed current checks and checks explicitly declined by the user
+  are terminal; failed, stale, missing, or policy-skipped checks are not.
+- Repository/session/task validation and check-currentness decisions remain in
+  the engine. A future CLI and the desktop receive the same report rather than
+  reimplementing the gate.
+
+Task 1 does not yet change `StopReason::Answered`, recovery, worker outcomes or
+the desktop. Its scoped tests pin the pure reason matrix, durable round-trip,
+historical compatibility, explicit-waiver semantics, and repository-bound
+service behavior. It stops after updating this table and recording its actual
+checks and discoveries.
+
+### Task 2: settlement and recovery
+
+Task 2 makes the gate the only engine path from newly settled work to
+`TaskStatus::Complete`:
+
+- Add one engine-owned settlement operation that recomputes a
+  `CompletionGateReport` from durable state and writes the report beside the
+  chosen status. An answered turn may become `complete` only when the report is
+  eligible; otherwise it becomes `incomplete`. A failed verification remains
+  `failed`, but carries the ineligible report rather than bypassing the gate.
+- `run_agentic_turn` keeps #66's transcript behavior: the answer that triggered
+  the reminder and the answer after it remain useful assistant messages. After
+  the final plan evidence is settled, `StopReason::Answered` calls the shared
+  settlement operation. Pending approvals/questions and budget stops retain
+  their existing statuses and do not pass through completion settlement.
+- Verification appends its terminal `Finished` event before invoking the same
+  settlement operation. A successful verification outcome becomes `complete`
+  only when the whole task is closed; otherwise it is `incomplete`. The
+  existing automatic continuation after a successful intermediate
+  verification may reopen only an `incomplete` task whose remaining blocker is
+  its open non-verification plan work. Failed, stale, missing, pending or
+  policy-skipped evidence must not enter that continuation.
+- Record a durable, non-side-effecting completion-settlement marker before the
+  status write. It identifies the repository through an engine-validated root,
+  and is finished only after the report and status are durable. Recovery of a
+  dangling marker calls the same engine settlement operation and recomputes
+  currentness from the checkout; it never trusts a stored `eligible` boolean.
+  If the root/session/task can no longer be validated, recovery fails safe into
+  the ordinary interrupted path rather than writing `complete`.
+- Audit fields and returned task state use the persisted verdict. No adapter,
+  shell or JavaScript decides whether the report is eligible or translates an
+  ineligible report into success.
+
+Scoped tests must cover two answers with an open plan becoming `incomplete`, a
+closed plan becoming `complete`, successful intermediate verification
+continuing without a transient false success, failed verification remaining
+failed with reasons, and a crash-window marker being recomputed into the same
+truthful verdict. Keep historical `complete` events unchanged. Stop after Task
+2; do not add Continue-task controls, worker outcome mapping or UI behavior,
+which belong to Task 3.
+
+### Task 3: resume, worker outcome and thin UIs
+
+Task 3 makes an `incomplete` verdict understandable and directly resumable in
+ordinary and worker sessions without making either desktop layer interpret
+task state:
+
+- Add an engine-owned, serializable task control model. It supplies the
+  outcome's visual kind, headline and detail, the completion reasons and
+  waivers to show, and the permitted primary action with its command, label and
+  input requirements. The engine has separate ordinary-session and worker
+  views of the same task verdict; worker lifecycle facts such as alive,
+  running, paused, waiting for a decision and last progress time are typed
+  inputs, not JavaScript conditions. The stale-progress sentence remains a
+  presentation fact computed by the engine from those inputs. A live
+  `ChatTurnResult` carries the same control (including the durable completion
+  reasons and waivers) plus a `turnPresentation` for the indicator and any
+  stop row/action; a reloaded task carries the same presentation, so the UI
+  never maps `taskStatus` or `outcome` to a stop affordance.
+- Move the status/action decisions introduced by #99 out of `app.js` and the
+  desktop shell. In particular, browser maps and conditionals must not decide
+  that a status means complete, incomplete, failed, needs a decision, follow-up
+  or continuation. Worker-board rows, the open worker strip and worker-return
+  cards consume engine-produced labels and actions. Amend #99 and #100 where
+  their older designs assign those decisions to the browser.
+- Provide an engine-authorized **Continue task** operation for the newest
+  `incomplete` task. The rendered control carries the exact source task id, and
+  the execution boundary re-reads that id under the session-log lock: it must
+  still be the newest task, still be `incomplete`, and still carry the exact
+  completion report the prompt was built from. It refuses an unknown, stale,
+  re-settled, non-incomplete or wrong-repository target, creates a new run
+  through the ordinary turn path, and uses an engine-built prompt containing
+  the durable completion reasons.
+  It must work without requiring the user to type the word "continue"; an
+  optional user note may be appended as data. The new run carries the source
+  task's open plan through the existing durable plan-resume edge. It grants no
+  patch, command, check, question or fallback approval.
+- Expose the same continuation command through the worker host. A reloaded
+  idle incomplete worker offers **Continue task**; a completed worker offers
+  **Send follow-up**; a decision-pending worker offers only its existing
+  decision control. Starting the continuation records a normal new worker task
+  and carries the same plan. The shell and browser transport the engine action
+  rather than selecting the worker command from lifecycle/status strings.
+- Preserve the literal `incomplete` status in worker progress and in #100's
+  durable `WorkerReturn`. A returned incomplete result is labelled as
+  incomplete and is never presented as successful; continuing a parent return
+  remains #100's separate **Continue with result** action.
+- Keep all action authorization at the execution boundary. A stale browser
+  control, a second click, or a manually forged request is refused by the
+  engine after re-reading the newest durable task and its report. UI source
+  tests should prove that it renders returned labels/actions and contains no
+  task-status outcome table or completion decision logic.
+
+Scoped tests must cover ordinary continuation and refusal cases, plan and
+reason carry, worker continuation after reload, complete versus incomplete
+worker actions, decision-pending suppression, stale progress presentation,
+worker progress and return preservation, and source-level thin-UI assertions.
+Stop after Task 3; final documentation, dependency reconciliation,
+deterministic evaluation and spec close-out belong to Task 4.
+
+### Global implementation constraints
+
+- The completion gate is application logic in `workspace-engine`. The desktop
+  shell, CLI, worker host and JavaScript may transport or render its typed
+  result but may not select facts, infer success, translate reason codes, or
+  decide whether a task may complete.
+- A question answer is not an approval or a check waiver. Only the existing
+  explicit declined-check record can produce a waiver.
+- Do not rewrite historical `complete` tasks or infer reports for them during
+  schema migration. The stricter verdict begins with new settlements.
+- Keep #102 and #105 boundaries intact: this spec consumes current verification
+  dispositions but does not assign failure provenance or derive required
+  checks from prose.
+
+## 7. Acceptance and evidence
+
+**Closed 2026-11-01.** All eight requirements and all six acceptance criteria
+above are implemented. Nothing in this section is deferred, and no acceptance
+criterion depends on #102, #103, #104, #105 or #106.
+
+### Requirements
+
+| Requirement | Evidence |
+|---|---|
+| 1 · `complete` only through the engine gate | `completion.rs::CompletionGateService::settle` is the only path from a newly settled planned task to `TaskStatus::Complete`; answered turns, successful verification and the plan-review hand-off all settle through it. `completion_settlement` tests cover the answered and verification paths; `plan_turn` proves the hand-off records an eligible report. Synthetic commit/branch tasks carry no plan and keep their own action outcome. |
+| 2 · every plan step, verification, pending decision and selected check is closed | `CompletionGateReport::evaluate` reads the active plan, folded verification state, newest pending decision and current file hashes. `closed_task_completion` pins the full reason matrix, including due, started-but-unfinished, missing, failed, stale and policy-skipped checks. |
+| 3 · declined checks are named waivers, never passes | `CompletionReasonCode` has no waiver variant; `CompletionWaiver` is produced only for `SkipReason::DeclinedByUser`, and the check still never enters `passed`. A policy-skipped check is `required_check_skipped` and blocks. |
+| 4 · an answer with work left is `incomplete` | `run_agentic_turn` settles `StopReason::Answered` through the gate; `two_answers_with_an_open_plan_settle_incomplete_and_keep_the_plan` proves the single #66 reminder, unchanged plan and two transcript answers. `plan_left_open_at_end` is the deterministic scenario for the same outcome. |
+| 5 · terminal but resumable, in an ordinary session and a worker | `TaskStatus::Incomplete` is terminal and not successful. `TaskControl::for_session` and `TaskControl::for_worker` offer **Continue task** with the exact `taskId`; `SessionStore::continue_incomplete_task` writes the new task and `plan_resumed` edge in one locked batch and compares the whole report. `ChatOrchestrator::continue_incomplete_task` builds the prompt from the durable reasons. Engine, route and worker tests cover carry, refusal, stale click, wrong repository and the next run settling `complete`. |
+| 6 · worker progress and #100 preserve the truthful outcome | The worker progress status carries `TaskStatus::as_str()` and `/api/worker-progress` returns the engine `control`; the board row and result card draw its headline/detail. `returned_task_control` labels an incomplete return **Task incomplete** and never success, while #100's **Continue with result** remains a separate action. Source tests prove `app.js` has no task-status outcome table. |
+| 7 · recovery recomputes the gate | `recovery::settle_crashed_completions` validates the marker's root, session and task, recomputes the report from the checkout and writes the status through the same service; it never reads a stored `eligible` boolean. Tests cover a crash window settling `incomplete`, `complete` and `failed`, an unusable root staying `interrupted`, an unknown future status being left alone, a dangling side effect outranking the marker, and a marker whose status already landed being closed without a rewrite. |
+| 8 · approval boundaries unchanged | Continuing grants no patch, command, check, question or fallback approval. The prompt says so, the route carries only the target id and optional note, and the worker host refuses the command while a turn is running or waiting. A question answer remains neither an approval nor a waiver. |
+
+### Acceptance criteria
+
+| Criterion | Evidence |
+|---|---|
+| Two answers with an open plan get one reminder and end `incomplete`, plan unchanged | `completion_settlement::two_answers_with_an_open_plan_settle_incomplete_and_keep_the_plan`; deterministic `plan_left_open_at_end`. |
+| Completing the remaining steps and checks changes the next run to `complete` | `task_control::completing_the_carried_plan_on_the_next_run_settles_complete`; `completion_settlement::a_closed_plan_settles_complete_with_an_eligible_report`. |
+| A declined required check is a named waiver, never pass evidence | `closed_task_completion::a_declined_check_is_a_named_waiver_and_never_a_pass`; the full reason-matrix test. |
+| Due verification, pending patch/question or open required step prevents `complete` | `closed_task_completion::every_blocking_fact_produces_its_stable_reason_code`; the shell route test where an answered command task with a due verification settles `incomplete`; the worker progress/outcome tests. |
+| Reloading an incomplete worker shows **Incomplete — Continue task** and carries the same plan | `worker_supervisor::worker_outcomes_use_engine_control_and_preserve_incomplete`; `worker_turns::continuing_an_incomplete_task_through_the_route_carries_plan_and_reasons`; `worker_turns::a_worker_continues_only_the_exact_task_its_control_named`; engine `task_control` carry test. |
+| Historical `complete` events are not rewritten | `closed_task_completion::a_historical_status_event_has_no_report_and_stays_valid`; reports are additive siblings and the stricter rule applies only to new settlements. |
+
+### Behaviour and documentation
+
+- **Complete versus incomplete.** Only an eligible report yields `Task complete`.
+  An ineligible answer is shown as **Task incomplete** with the engine's reasons
+  and waivers; the answer stays in the transcript but is not the execution
+  verdict.
+- **Continue task.** The desktop ordinary session and the worker host offer the
+  engine-provided action, including after reload. It requires no typed
+  "continue", accepts an optional note as data, and re-validates the newest
+  task and report under the session-log lock.
+- **Recovery.** The settlement marker is non-side-effecting and is written
+  before the report is recomputed. A crash in that window is settled from
+  current durable state; an unusable repository or unknown status fails safe to
+  the ordinary interrupted path.
+- **Worker outcomes.** Worker progress, the board and #100's parent result
+  preserve the literal status. Complete offers **Send follow-up**, incomplete
+  offers **Continue task**, and a decision-pending worker offers only its review
+  action.
+- **Approvals unchanged.** The gate may stop or continue work; it cannot approve
+  anything. Every patch, command, check card, question and provider fallback
+  still takes its own explicit decision.
+
+### Verification record
+
+Run locally on 2026-11-01:
+
+- `scripts/quality-gate.sh fmt node lint typos deny`: all five steps passed.
+- `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`,
+  `cargo clippy -p desktop-shell --all-targets --locked -- -D warnings`, and
+  `cargo clippy -p eval-harness --all-targets --locked -- -D warnings`: passed.
+- `cargo nextest run -p workspace-engine --lib --test closed_task_completion
+  --test completion_settlement --test task_control --test crash_recovery
+  --test verification_loop --test session_rewind --test plan_turn`: 898 passed,
+  9 skipped.
+- `cargo nextest run -p desktop-shell -E
+  'test(/worker|continue|incomplete|task_control/)'`: 67 passed (1 leaky), 209
+  skipped.
+- `cargo nextest run -p eval-harness --lib`: 1 passed.
+- `cargo run -p eval-harness -- run --tier deterministic`: all 46 scenarios
+  passed, including `plan_left_open_at_end` and `plan_answer_without_complete_step`.
+  With the settlement marker excluded from tool calls as well as rounds, the
+  final metrics record a tool and model error rate of 0.161 and 3.174 model
+  calls and tool rounds per task.
+- `npm run specs:check -- --strict` and `git diff --check`: passed.
+
+Workspace-wide clippy and the full nextest suite were not run locally, per
+`AGENTS.md`; they remain for CI. The deterministic tier is not a live-provider
+run, so it proves the engine paths, not model behaviour against a real provider.
+The live acceptance for this spec is therefore the truthful state machine above,
+not a claim that a worker can finish an arbitrarily large task; #103 and #106
+own that longer-horizon evidence.

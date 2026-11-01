@@ -7,8 +7,8 @@ Plan: none. This closes the verification-scheduling gap exposed by the
 Depends on: [#21](21_task_plan_progress_and_budget/proposal.md) (approved
 plans), [#23](23_verification_loop/proposal.md) (automatic verification),
 [#97](97_reuse_planned_verification_steps.md) (deferring an exact command),
-and [#101](101_closed_task_completion.md) (completion gate) — #21, #23 and #97
-are built; **#101 is not built, so this spec is blocked on it**.
+and [#101](101_closed_task_completion.md) (completion gate) — #21, #23, #97
+and #101 are built; **nothing here is unbuilt, so this spec is ready to start**.
 Everything else named below is a cross-reference, not a prerequisite.
 
 ## 1. Motivation

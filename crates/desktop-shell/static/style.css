@@ -4020,6 +4020,16 @@ code.fetch-approval-flag-value {
   overflow-wrap: anywhere;
 }
 
+.worker-result-detail {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.worker-result-detail:empty {
+  display: none;
+}
+
 .worker-result-response {
   max-height: 260px;
   overflow: auto;

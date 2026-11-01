@@ -1616,6 +1616,47 @@ charged to `agent_max_tool_rounds`.
   time, until the token ceiling stops it or it reaches 16 action rounds. At 16
   rounds it pauses as above.
 
+### A task ended incomplete: what the completion gate saw
+
+`incomplete` is terminal for the run but is not success
+([spec 101](specs/101_closed_task_completion.md)). It means the model answered
+while the engine still saw work: a non-verification plan step was open, a
+verification was due or had started without finishing, a proposal or question
+was waiting, or a selected check was missing, failed, stale, or skipped by
+policy. A check you **declined** is not a blocker; it is a named waiver in the
+report and is never counted as passed. A check skipped for another reason is a
+blocker.
+
+The live result and the reloaded session both show **Task incomplete** with the
+gate's reasons and **Continue task**. The action carries the exact task id:
+
+```bash
+# What the settlement recorded beside the status.
+jq -c 'select(.eventType=="task_status_updated" and .payload.completionReport)
+       | {task: .payload.task.id, status: .payload.task.status,
+          eligible: .payload.completionReport.eligible,
+          reasons: [.payload.completionReport.reasons[].code],
+          waivers: [.payload.completionReport.waivers[].check]}
+      ' "$SESSION_FILE"
+
+# The explicit continuation, when the user pressed Continue task.
+jq -c 'select(.eventType=="task_continued")' "$DATA_DIR/audit/events.jsonl"
+```
+
+`Continue task` does not trust the card. The engine re-reads the newest task,
+requires it to still be `incomplete` and to carry the exact completion report
+the prompt was built from, then creates the next task and its `plan_resumed`
+edge in one locked batch. An unknown, stale, re-settled, non-incomplete or
+wrong-repository target creates nothing. The prompt is built from the durable
+reasons plus any optional note, so the word "continue" is not required.
+Continuing grants no patch, command, check, question or fallback approval.
+
+A successful verification appends `Finished` and then settles through the same
+gate. A failed verification remains `failed` and still carries an ineligible
+report, so "failed" and "incomplete" stay distinct. Declining a required check
+can close a task, but only as a named waiver; it never turns the check into
+evidence that passed.
+
 ### Notes: what the assistant kept, and why a later turn knows something
 
 A turn can write short `turn_notes` during an investigation (spec 65). The
@@ -1814,6 +1855,22 @@ jq -r 'select(.eventType|startswith("task_recover")) | "\(.eventType) \(.taskId)
 (`danglingAction`, `danglingRef`, `danglingSeq`, `autoResumePermitted`);
 `task_recovery_decision` carries what was then done about it and whether it was
 allowed or refused.
+
+**A crash during completion settlement.** The engine writes a non-side-effecting
+`completion_settlement` action marker before it recomputes the completion gate
+and writes the status. If the process dies after the final answer but before
+that status, the next launch's sweep recomputes the gate from the checkout and
+writes the same truthful verdict: `complete` only when the report is eligible,
+otherwise `incomplete`, and `failed` for a verification that had already failed.
+It never trusts a stored `eligible` boolean, and it closes the original marker.
+The audit log records `task_completion_settled_after_crash` with the settled
+status and reasons. If the marker's repository root is unavailable, or the
+status is not one this build understands, nothing is written:
+`task_completion_settlement_unavailable` records the reason and the ordinary
+`interrupted` path owns the task. An unfinished side-effecting action on the
+same task still outranks the settlement marker, so recovery cannot overwrite
+`unknown_external_outcome`. A crash after the status landed but before the
+marker closed only closes the marker; it does not rewrite the verdict.
 
 **The sweep runs once per app start**, on the first `GET /api/recovery` from
 the web UI ([spec 45](specs/45_crash_recovery_prompt.md) §5.3). Once, because
@@ -2095,12 +2152,14 @@ tool-calling.
 
 The result card appears on a terminal worker task, so first check the worker's
 own session: a **Needs your decision** outcome is still waiting on an approval,
-and a running or paused task has not finished. A worker started with **New
-worker** has no parent and returns nothing by design. A parent that was open
-before the worker finished shows the card after it reloads. If the worker's own
-progress says the result could not be returned to the parent, the worker task
-still completed: the failure is recorded beside its task status, not as a failed
-task, and **Continue with result** will not appear. If the parent was deleted
+and a running or paused task has not finished. An **incomplete** task is
+terminal and does return: its card headline is **Task incomplete**, names the
+completion reasons, and does not present the result as success. A worker started
+with **New worker** has no parent and returns nothing by design. A parent that
+was open before the worker finished shows the card after it reloads. If the
+worker's own progress says the result could not be returned to the parent, the
+worker task still completed: the failure is recorded beside its task status, not
+as a failed task, and **Continue with result** will not appear. If the parent was deleted
 before the worker finished, the worker reports a delivery failure and does not
 recreate the parent session. The return is written to the parent's session log
 (`sessions/<parent-id>.jsonl`) as a `worker_returned` event; consuming it writes
@@ -2116,7 +2175,10 @@ recovery ([After a crash: what recovery decided](#after-a-crash-what-recovery-de
 as `interrupted` or, when a command was running, `unknown_external_outcome`.
 *Ended* means it ended between turns. Common causes: the app quit or crashed
 (workers never outlive it), the worker was stopped, or its session's parent was
-deleted.
+deleted. **Task incomplete** is neither: the process is still alive and idle,
+but the completion gate found work open, so the session offers **Continue task**
+rather than a restart. If its process has ended, restart first; the durable task
+stays incomplete and can be continued once an idle worker is running.
 
 **Restart worker** starts a new, idle process for the same session and worktree
 (`worker_restarted`). It does not continue the old turn: a worker session is

@@ -6,10 +6,18 @@
 //! `sideEffecting: true` means the outcome is unknown, and anything else means
 //! the task was merely interrupted.
 //!
-//! The classifier makes one write, and only one: spec 19 §5.5 requires a model
-//! call lost to the crash to be accounted for, and the sweep is the only place
-//! that knows one was lost. It is an append, it is idempotent across launches,
-//! and it changes no classification — see `account_for_lost_model_calls`.
+//! The classifier normally makes one write, and only one: spec 19 §5.5
+//! requires a model call lost to the crash to be accounted for, and the sweep is
+//! the only place that knows one was lost. It is an append, it is idempotent
+//! across launches, and it changes no classification — see
+//! `account_for_lost_model_calls`.
+//!
+//! It also finishes a completion settlement whose marker survived in the
+//! answer-to-status window (spec 101). That path recomputes the completion gate
+//! from the checkout, writes the status and report, and closes the original
+//! marker; the settled task is not reported as interrupted. An unknown status,
+//! an unusable repository, or another dangling side effect leaves the task to
+//! the ordinary unknown/interrupted path.
 //!
 //! The module's reason for existing is requirement 5 — no action whose outcome
 //! is unknown is ever automatically repeated. That decision is made *here*
@@ -19,6 +27,7 @@
 use crate::audit::AuditLog;
 use crate::chat::{PausedTurns, PendingFetchCall};
 use crate::clarification::PendingDecision;
+use crate::completion::COMPLETION_SETTLEMENT_ACTION;
 use crate::context_manager::ContextManifest;
 use crate::edit::PatchStore;
 use crate::error::{ClientError, Result};
@@ -28,6 +37,7 @@ use crate::plan::TaskPlan;
 use crate::session::{DanglingAction, PendingApprovalRef, SessionStore, TaskStatus};
 use crate::validation::{CommandProposal, CommandStore};
 use crate::verification::{VerificationEvent, fold_verification};
+use std::collections::{HashMap, HashSet};
 
 /// A task that was in flight when the process stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +92,10 @@ pub fn classify_session(
     let dangling = store.dangling_actions(session_id)?;
 
     account_for_lost_model_calls(store, audit, session_id, &dangling)?;
+    // Spec 101: a settlement marker left by a crash sits between the final
+    // answer and the status write. Recompute the gate against the checkout and
+    // settle it through the same engine operation a live turn uses.
+    let settled = settle_crashed_completions(store, audit, session_id, &statuses, &dangling)?;
     let is_worker = store.worker_record(session_id)?.is_some();
 
     let mut recovered = Vec::new();
@@ -95,6 +109,10 @@ pub fn classify_session(
         if is_terminal {
             continue;
         }
+        // Settled above from its crash-window marker; it is not interrupted.
+        if settled.contains(&task_id) {
+            continue;
+        }
         // §5.4 rule 3: a task waiting for a human was not interrupted
         // mid-action. It keeps its status and its proposal is reattached
         // (§5.5), so it is not a recovered task.
@@ -102,9 +120,13 @@ pub fn classify_session(
             continue;
         }
 
+        // Prefer a side-effecting dangling action when there is one: it is the
+        // fact that makes the outcome unknown, and the evidence shown must not
+        // be a benign marker that happened to start first.
         let task_dangling = dangling
             .iter()
-            .find(|action| action.task_id == task_id)
+            .filter(|action| action.task_id == task_id)
+            .max_by_key(|action| action.side_effecting)
             .cloned();
 
         // §5.4 rules 1 and 2.
@@ -197,6 +219,98 @@ pub fn classify_session(
 
     recovered.sort_by(|left, right| left.task_id.cmp(&right.task_id));
     Ok(recovered)
+}
+
+/// Settles tasks whose completion marker proves a crash landed in the window
+/// between the final answer and the durable status write (spec 101).
+///
+/// The verdict is recomputed from the checkout, never read from a stored
+/// `eligible` boolean: a plan may have been resumed, a check may have become
+/// stale, or a file may have changed while the process was down. If the marker
+/// does not name a usable repository, or the session/task cannot be validated,
+/// nothing is written and the ordinary interrupted path owns the task.
+fn settle_crashed_completions(
+    store: &SessionStore,
+    audit: &AuditLog,
+    session_id: &str,
+    statuses: &HashMap<String, String>,
+    dangling: &[DanglingAction],
+) -> Result<HashSet<String>> {
+    let mut settled = HashSet::new();
+    for action in dangling
+        .iter()
+        .filter(|action| action.action == COMPLETION_SETTLEMENT_ACTION)
+    {
+        if settled.contains(&action.task_id) {
+            continue;
+        }
+        let Some(raw_status) = statuses.get(&action.task_id) else {
+            continue;
+        };
+        // Only a status this build understands and considers non-terminal may
+        // be settled. An unknown future status is exactly the case where
+        // guessing would be unsafe, so it falls through to the ordinary
+        // unknown/interrupted classification.
+        let Some(status) = TaskStatus::parse(raw_status) else {
+            continue;
+        };
+        if status.is_terminal() {
+            // The crash landed after the report and status were durable but
+            // before the marker was closed. The verdict is already the right
+            // one, so only the marker's lifecycle is incomplete; finish it
+            // rather than reporting a settlement window that no longer exists.
+            store.finish_recorded_action(session_id, action, "already_settled")?;
+            continue;
+        }
+        // An unfinished side effect on the same task is still an unknown
+        // outcome, whatever a later settlement marker says. Nothing may be
+        // written over that.
+        if dangling
+            .iter()
+            .any(|other| other.task_id == action.task_id && other.side_effecting)
+        {
+            continue;
+        }
+        let Ok(task) = store.task(session_id, &action.task_id) else {
+            continue;
+        };
+        match crate::completion::settle_recovered(store, &task, action) {
+            Ok(completion) => {
+                let reasons = completion
+                    .report
+                    .reason_codes()
+                    .iter()
+                    .map(|code| code.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                audit.record(
+                    "task_completion_settled_after_crash",
+                    &[
+                        ("actor", "system".to_string()),
+                        ("sessionId", session_id.to_string()),
+                        ("taskId", action.task_id.clone()),
+                        ("status", completion.task.status.as_str().to_string()),
+                        ("reasons", reasons),
+                    ],
+                )?;
+                settled.insert(action.task_id.clone());
+            }
+            Err(error) => {
+                // Fails safe: the task falls through to the ordinary
+                // interrupted classification rather than being written complete.
+                audit.record(
+                    "task_completion_settlement_unavailable",
+                    &[
+                        ("actor", "system".to_string()),
+                        ("sessionId", session_id.to_string()),
+                        ("taskId", action.task_id.clone()),
+                        ("reason", error.to_string()),
+                    ],
+                )?;
+            }
+        }
+    }
+    Ok(settled)
 }
 
 /// Appends an estimated usage event for every model call that started and

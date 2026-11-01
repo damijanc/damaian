@@ -1414,11 +1414,14 @@ fn expected(status: &TaskStatus, shape: CrashShape) -> Expected {
         // Nothing further happens to a terminal task, whatever the log holds.
         // A dangling marker under a terminal status means the crash landed
         // between the action and the status write, and the status won.
+        // `Incomplete` is terminal too (spec 101): recovery does not invent a
+        // resume for it, because continuation is an explicit user action.
         // `TokenBudgetExhausted` joins them for the same reason and one of its
         // own: the token check runs *before* a model call rather than after one
         // (spec 21 `context.md` §3.3), so the stop lands at a point where
         // nothing was in flight to begin with.
         TaskStatus::Complete
+        | TaskStatus::Incomplete
         | TaskStatus::Failed
         | TaskStatus::Cancelled
         | TaskStatus::ToolBudgetExhausted
@@ -1514,11 +1517,12 @@ fn every_state_and_crash_shape_recovers_the_way_the_matrix_says() {
             cells += 1;
         }
     }
-    // Fifteen states by three crash shapes. If this number moves, a state or
+    // Sixteen states by three crash shapes. If this number moves, a state or
     // a shape was added or removed — check the matrix is still complete before
     // updating it. It moved from 39 when spec 21 added `TokenBudgetExhausted`,
-    // and from 42 when spec 57 added `Paused`.
-    assert_eq!(cells, 45, "the matrix must not shrink");
+    // from 42 when spec 57 added `Paused`, and from 45 when spec 101 added
+    // `Incomplete`.
+    assert_eq!(cells, 48, "the matrix must not shrink");
 }
 
 /// The row `TaskStatus::all()` cannot reach: a status written by a *later*

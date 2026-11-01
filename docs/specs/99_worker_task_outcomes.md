@@ -60,23 +60,33 @@ the user to interpret the process state.
 
 ## 4. Design
 
-- `app.js` keeps `taskStatus`, the most recent progress timestamp, and whether
-  the worker has started a turn in its worker view. `workerViewOutcome` derives
-  the visible label, detail, dot and available action from those durable facts.
-  The strip keeps this result after the live Thinking indicator is removed.
-- The 30-second stale threshold is presentation only. It compares the browser
-  clock with `timestampMs` from the worker progress event and says “No worker
-  progress …”; it never calls the worker dead or stuck.
-- `workerComposerMode` refuses a decision-pending idle worker, names completed
-  work as a follow-up, and names an unfinished settled task as continuation.
-- `workers.rs::worker_row` classifies an idle task with
-  `waiting_for_approval` as **Needs you**. It uses `TaskStatus::is_active()`
-  rather than treating every non-terminal recovery status as running.
+> **Amended by spec 101 Task 3.** The outcome model below moved out of the
+> browser. `workspace-engine::task_control` now owns the label, detail, dot,
+> group, stale-progress sentence, composer and next action for an ordinary
+> session and for a worker. `app.js` renders the `control` the shell returns and
+> keeps no `taskStatus` outcome table of its own.
+
+- The worker host and shell pass typed lifecycle facts — alive, running,
+  paused, waiting for a decision, the last progress timestamp — to the engine.
+  The engine derives the visible label, detail, dot, group and available
+  action. The strip keeps that result after the live Thinking indicator is
+  removed.
+- The 30-second stale threshold is presentation only. The engine compares the
+  typed progress timestamp with the current clock and says “No worker progress
+  …”; it never calls the worker dead or stuck.
+- The engine's composer model refuses a decision-pending idle worker, names
+  completed work as a follow-up, and names an unfinished settled task as
+  continuation. `app.js` only transports the returned command.
+- `workers.rs::worker_row` asks the same engine service for the row's control
+  model. The engine classifies an idle task with `waiting_for_approval` as
+  **Needs you**, using the task status and typed lifecycle facts rather than
+  treating every non-terminal recovery status as running.
 
 ## 5. Acceptance Criteria
 
 - A worker session source-level UI test covers explicit completed, decision,
-  unknown-outcome, stale-progress, and follow-up labels.
+  unknown-outcome, stale-progress, and follow-up labels, and proves the browser
+  renders the engine's `control` instead of keeping a task-status outcome map.
 - A board route test writes an idle `waiting_for_approval` progress status and
   proves that the row is **needs_you**, describes the decision, and can be
   reviewed.

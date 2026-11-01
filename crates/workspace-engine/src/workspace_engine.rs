@@ -725,6 +725,22 @@ impl WorkspaceEngine {
         )
     }
 
+    /// The completion gate's verdict for one task, computed from durable state
+    /// (spec 101).
+    ///
+    /// The same typed report every adapter must consume: a shell, CLI or
+    /// worker transports its reasons and waivers and never decides completion
+    /// itself. Repository membership and check currentness are validated here.
+    pub fn completion_report(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<crate::completion::CompletionGateReport> {
+        crate::completion::CompletionGateService::new(&self.session_store, repository_root.as_ref())
+            .report(session_id, task_id)
+    }
+
     /// The task's active protected paths (spec 98).
     pub fn task_protected_paths(
         &self,

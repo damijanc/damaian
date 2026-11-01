@@ -43,6 +43,7 @@ const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 pub const MAX_NOTE_BYTES: usize = 16 * 1024;
 const MAX_PROPOSAL_ID_BYTES: usize = 256;
 const MAX_SESSION_ID_BYTES: usize = 128;
+const MAX_TASK_ID_BYTES: usize = 256;
 /// macOS's `sockaddr_un.sun_path`, including the terminating NUL.
 const SUN_PATH_CAPACITY: usize = 104;
 /// The control token is 32 random bytes, written as hex.
@@ -382,6 +383,15 @@ pub(crate) enum ControlCommand {
         proposal_id: String,
         decisions: String,
     },
+    /// Spec 101 Task 3: the engine-authorized continuation of the exact task a
+    /// rendered control named. The id is carried, never re-resolved to
+    /// "whatever is newest" when the command runs, so a stale second click
+    /// cannot continue a later incomplete task. The optional note is user data,
+    /// not an instruction that widens the execution boundary.
+    ContinueTask {
+        task_id: String,
+        note: Option<String>,
+    },
     Stop,
     Shutdown,
     Status,
@@ -446,6 +456,10 @@ fn parse_command(
         },
         "verify" => ControlCommand::Verify,
         "continue-repair" => ControlCommand::ContinueRepair,
+        "continue-task" => ControlCommand::ContinueTask {
+            task_id: required(take("taskId", MAX_TASK_ID_BYTES)?)?,
+            note: take("note", MAX_NOTE_BYTES)?,
+        },
         "checks" => ControlCommand::Checks {
             proposal_id: required(take("proposalId", MAX_PROPOSAL_ID_BYTES)?)?,
             decisions: required(take("decisions", MAX_REQUEST_BYTES as usize)?)?,
@@ -571,6 +585,11 @@ enum TurnJob {
         proposal_id: String,
         decisions: Vec<(String, bool)>,
     },
+    /// Spec 101 Task 3: continue the exact task a rendered control named.
+    ContinueTask {
+        task_id: String,
+        note: Option<String>,
+    },
 }
 
 pub(crate) struct WorkerHost {
@@ -663,6 +682,9 @@ impl WorkerHost {
             ControlCommand::Reject { proposal_id } => (self.decide(proposal_id, false), false),
             ControlCommand::Verify => (self.start(TurnJob::Verify), false),
             ControlCommand::ContinueRepair => (self.start(TurnJob::ContinueRepair), false),
+            ControlCommand::ContinueTask { task_id, note } => {
+                (self.start(TurnJob::ContinueTask { task_id, note }), false)
+            }
             ControlCommand::Checks {
                 proposal_id,
                 decisions,
@@ -789,7 +811,10 @@ impl WorkerHost {
         };
         let carried = match job {
             TurnJob::Decide { .. } | TurnJob::Checks { .. } => slot.steering.drain_notes(),
-            TurnJob::Message(_) | TurnJob::Verify | TurnJob::ContinueRepair => Vec::new(),
+            TurnJob::Message(_)
+            | TurnJob::Verify
+            | TurnJob::ContinueRepair
+            | TurnJob::ContinueTask { .. } => Vec::new(),
         };
         slot.cancel = CancelToken::new();
         slot.steering = Arc::new(TurnSteering::new());
@@ -1078,6 +1103,14 @@ impl TurnDriver {
             TurnJob::Verify => {
                 chat.verify_due(&repository, &self.session_id, adapter.as_mut(), &mut sink)
             }
+            TurnJob::ContinueTask { task_id, note } => chat.continue_incomplete_task(
+                &repository,
+                &self.session_id,
+                &task_id,
+                note.as_deref(),
+                adapter.as_mut(),
+                &mut sink,
+            ),
             TurnJob::ContinueRepair => chat.continue_repair(
                 &repository,
                 &self.session_id,
@@ -1632,6 +1665,27 @@ mod tests {
         assert_eq!(
             with_token(r#""command":"continue-repair""#),
             ParsedRequest::Command(ControlCommand::ContinueRepair)
+        );
+        assert_eq!(
+            with_token(r#""command":"continue-task","taskId":"task_1""#),
+            ParsedRequest::Command(ControlCommand::ContinueTask {
+                task_id: "task_1".to_string(),
+                note: None,
+            })
+        );
+        assert_eq!(
+            with_token(r#""command":"continue-task","taskId":"task_1","note":"go""#),
+            ParsedRequest::Command(ControlCommand::ContinueTask {
+                task_id: "task_1".to_string(),
+                note: Some("go".to_string()),
+            })
+        );
+        assert!(
+            matches!(
+                request(&format!(r#""token":"{TOKEN}","command":"continue-task""#)),
+                ParsedRequest::Invalid { .. }
+            ),
+            "continue-task without its exact target is refused"
         );
         assert_eq!(
             with_token(r#""command":"checks","proposalId":"b1","decisions":"[]""#),

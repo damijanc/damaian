@@ -2,6 +2,7 @@ use crate::audit::escape_json;
 use crate::clarification::{
     AskUserInput, PendingDecision, PendingQuestionRef, QuestionState, validate_answer,
 };
+use crate::completion::CompletionGateReport;
 use crate::error::{ClientError, Result};
 use crate::external_reference::ExternalReference;
 use crate::file_access::LineRange;
@@ -154,6 +155,18 @@ pub struct ConsumedWorkerReturn {
     pub position: u64,
 }
 
+/// An incomplete task continued into an ordinary new run (spec 101 Task 3).
+///
+/// Created by [`SessionStore::continue_incomplete_task`] in one locked batch
+/// with its carried plan. A crash after this point leaves one ordinary
+/// `Created` task for recovery; a refusal leaves no task at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuedTask {
+    pub task: Task,
+    /// The conversation position immediately before the task was created.
+    pub position: u64,
+}
+
 /// The user's decision about one or more files of a patch.
 ///
 /// A session event rather than a field on the stored patch: neither the apply
@@ -237,6 +250,11 @@ pub enum TaskStatus {
     ApplyingPatch,
     Validating,
     Complete,
+    /// The turn ended with work still open: the completion gate did not
+    /// consider the task closed (spec 101). Terminal for this run, but not
+    /// successful and explicitly resumable — the open plan and the gate's
+    /// reasons travel with it.
+    Incomplete,
     Failed,
     Cancelled,
     ToolBudgetExhausted,
@@ -266,6 +284,7 @@ impl TaskStatus {
             Self::ApplyingPatch,
             Self::Validating,
             Self::Complete,
+            Self::Incomplete,
             Self::Failed,
             Self::Cancelled,
             Self::ToolBudgetExhausted,
@@ -286,6 +305,7 @@ impl TaskStatus {
             Self::ApplyingPatch => "applying_patch",
             Self::Validating => "validating",
             Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::ToolBudgetExhausted => "tool_budget_exhausted",
@@ -313,11 +333,20 @@ impl TaskStatus {
         matches!(
             self,
             Self::Complete
+                | Self::Incomplete
                 | Self::Failed
                 | Self::Cancelled
                 | Self::ToolBudgetExhausted
                 | Self::TokenBudgetExhausted
         )
+    }
+
+    /// Whether the task finished its work successfully.
+    ///
+    /// Only [`Self::Complete`]. [`Self::Incomplete`] is terminal for the run
+    /// but is not success: distinguishing the two is the point of spec 101.
+    pub fn is_successful(&self) -> bool {
+        matches!(self, Self::Complete)
     }
 
     /// Whether a turn is still going in this state, as the plan panel means it.
@@ -338,6 +367,7 @@ impl TaskStatus {
             | Self::ApplyingPatch
             | Self::Validating => true,
             Self::Complete
+            | Self::Incomplete
             | Self::Failed
             | Self::Cancelled
             | Self::ToolBudgetExhausted
@@ -636,6 +666,76 @@ impl SessionStore {
         };
         self.append_session_event(&task.session_id, "task_status_updated", &payload)?;
         Ok(updated)
+    }
+
+    /// [`Self::update_task_status`] with the completion gate's report beside the
+    /// new status (spec 101).
+    ///
+    /// The report is a sibling of the wrapped task, exactly like `failureKind`,
+    /// so an event written before this spec keeps decoding without one. A
+    /// report that names another task is refused: the durable record must not
+    /// claim one task's verdict for another.
+    pub fn update_task_status_with_completion(
+        &self,
+        task: &Task,
+        status: TaskStatus,
+        report: &CompletionGateReport,
+    ) -> Result<Task> {
+        if report.task_id != task.id {
+            return Err(ClientError::InvalidInput(format!(
+                "Completion report for {} cannot describe task {}",
+                report.task_id, task.id
+            )));
+        }
+        let mut updated = task.clone();
+        updated.status = status;
+        if updated.status.is_terminal() {
+            updated.completed_at_ms = Some(now_millis());
+        }
+        let report = serde_json::to_string(report).map_err(|error| {
+            ClientError::Io(format!("completion report serialization: {error}"))
+        })?;
+        let payload = format!(
+            "{{\"task\":{},\"completionReport\":{}}}",
+            task_json(&updated),
+            report
+        );
+        self.append_session_event(&task.session_id, "task_status_updated", &payload)?;
+        Ok(updated)
+    }
+
+    /// The newest completion report recorded for a task, if any.
+    ///
+    /// Events written before spec 101 carry no report, and a later status
+    /// event that carries none does not erase an earlier verdict; the newest
+    /// *report* wins. An unreadable report is skipped rather than clearing a
+    /// readable earlier one, matching how the other readers in this module
+    /// treat a payload they do not understand.
+    pub fn read_completion_report(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<CompletionGateReport>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        let mut found = None;
+        for event in active_events(&content) {
+            if event.event_type != "task_status_updated" {
+                continue;
+            }
+            let task = event.payload.get("task").unwrap_or(&event.payload);
+            if task.get("id").and_then(|value| value.as_str()) != Some(task_id) {
+                continue;
+            }
+            let Some(report) = event.payload.get("completionReport") else {
+                continue;
+            };
+            if let Ok(report) = serde_json::from_value::<CompletionGateReport>(report.clone()) {
+                found = Some(report);
+            }
+        }
+        Ok(found)
     }
 
     /// The latest `failureKind` of every task in the session, keyed by task id.
@@ -2371,6 +2471,36 @@ impl SessionStore {
         self.write_action_finished(&marker, outcome, None)
     }
 
+    /// Finishes an action from its durable record rather than an in-memory
+    /// marker.
+    ///
+    /// Recovery holds a [`DanglingAction`], not the `ActionMarker` the original
+    /// caller lost to the crash. Spec 101 uses this to close the
+    /// completion-settlement marker after it has recomputed and written the
+    /// status, so the log does not keep reporting a window that is now settled.
+    /// The fields come from the `action_started` event; nothing is re-derived.
+    /// Crate-private because this is recovery's implementation detail, not a
+    /// general way to finish an arbitrary marker.
+    pub(crate) fn finish_recorded_action(
+        &self,
+        session_id: &str,
+        action: &DanglingAction,
+        outcome: &str,
+    ) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "action_finished",
+            &format!(
+                "{{\"markerId\":\"{}\",\"taskId\":\"{}\",\"action\":\"{}\",\"ref\":\"{}\",\"outcome\":\"{}\"}}",
+                escape_json(&action.marker_id),
+                escape_json(&action.task_id),
+                escape_json(&action.action),
+                escape_json(&action.reference),
+                escape_json(outcome)
+            ),
+        )
+    }
+
     /// [`Self::finish_action`] for a command, recording the exit code and
     /// deriving the outcome from it.
     ///
@@ -2475,22 +2605,79 @@ impl SessionStore {
     /// A task with no plan carries nothing rather than an empty plan: `None`
     /// and a zero-step plan are different facts.
     pub fn resume_plan(&self, task: &Task, from_task_id: &str) -> Result<()> {
-        let Some(mut plan) = self.read_task_plan(&task.session_id, from_task_id)? else {
+        let Some(plan) = self.read_task_plan(&task.session_id, from_task_id)? else {
             return Ok(());
         };
-        plan.task_id = task.id.clone();
-        let mut payload = serde_json::to_value(&plan).map_err(|error| {
-            crate::error::ClientError::Io(format!("plan serialization: {error}"))
-        })?;
-        if let Some(object) = payload.as_object_mut() {
-            // Alongside the plan's own fields rather than wrapping it, so the
-            // reader needs no special case: `TaskPlan` ignores the extra key.
-            object.insert(
-                "resumedFrom".to_string(),
-                serde_json::Value::String(from_task_id.to_string()),
-            );
+        let payload = resumed_plan_payload(&plan, task, from_task_id)?;
+        self.append_session_event(&task.session_id, "plan_resumed", &payload)
+    }
+
+    /// Carries an incomplete task's open plan into a new run in one locked
+    /// transaction (spec 101 Task 3).
+    ///
+    /// The latest task must still be the named task, must still be
+    /// `incomplete`, and must carry the exact completion report the prompt was
+    /// built from. Comparing the whole report under the lock is what refuses a
+    /// second click, a stale browser control, or a request whose task was
+    /// re-settled between rendering and clicking. When the plan still has
+    /// non-terminal steps, its `plan_resumed` edge is written in the same event
+    /// batch as `task_created`, so a crash cannot leave a continuation task
+    /// without the work it promised to carry.
+    ///
+    /// `None` means nothing was written: the caller must not start a model
+    /// call. The new task is ordinary `Created`, not approved and not granted
+    /// any command, patch, check, question or fallback permission.
+    pub fn continue_incomplete_task(
+        &self,
+        session_id: &str,
+        source_task_id: &str,
+        expected_report: &CompletionGateReport,
+        prompt: &str,
+        model_provider: &str,
+        model_name: &str,
+    ) -> Result<Option<ContinuedTask>> {
+        let mut lock = SessionLogLock::acquire(&self.session_lock_path(session_id))?;
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        let Some(source) = self.read_tasks(session_id)?.into_iter().last() else {
+            return Ok(None);
+        };
+        if source.id != source_task_id || source.status != TaskStatus::Incomplete {
+            return Ok(None);
         }
-        self.append_session_event(&task.session_id, "plan_resumed", &payload.to_string())
+        let Some(current_report) = self.read_completion_report(session_id, source_task_id)? else {
+            return Ok(None);
+        };
+        if current_report != *expected_report {
+            return Ok(None);
+        }
+        let task = Task {
+            id: create_id("task"),
+            session_id: session_id.to_string(),
+            status: TaskStatus::Created,
+            user_prompt: prompt.to_string(),
+            model_provider: model_provider.to_string(),
+            model_name: model_name.to_string(),
+            created_at_ms: now_millis(),
+            completed_at_ms: None,
+        };
+        let plan_payload = match self.read_task_plan(session_id, source_task_id)? {
+            Some(plan) if plan.steps.iter().any(|step| !step.status.is_terminal()) => {
+                Some(resumed_plan_payload(&plan, &task, source_task_id)?)
+            }
+            _ => None,
+        };
+        let task_payload = task_json(&task);
+        let mut events = vec![("task_created", task_payload.as_str())];
+        if let Some(payload) = plan_payload.as_deref() {
+            events.push(("plan_resumed", payload));
+        }
+        self.append_session_events_locked(session_id, &events, &mut lock)?;
+        Ok(Some(ContinuedTask {
+            task,
+            position: latest_seq(&content),
+        }))
     }
 
     /// Appends one more piece of evidence to whichever step is open.
@@ -2932,7 +3119,7 @@ impl SessionStore {
                 "Unknown task in session {session_id}: {task_id}"
             )));
         }
-        let ancestry = protected_path_ancestry(&events, task_id);
+        let ancestry = continuation_ancestry(&events, task_id);
         let mut paths: Vec<ProtectedPath> = Vec::new();
         for event in &events {
             if event.event_type != TASK_PROTECTED_PATHS_EVENT {
@@ -2976,6 +3163,56 @@ impl SessionStore {
             task_id: task_id.to_string(),
             paths,
         })
+    }
+
+    /// The task and every task it continues, through the explicit
+    /// `plan_resumed` and `verification_due`/`verification_started` edges.
+    ///
+    /// Membership in the same session is deliberately not an edge. Protected
+    /// paths are inherited only in this direction: a task takes what its
+    /// predecessors protected, never what a later continuation added.
+    pub fn task_continuation_ancestry(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<HashSet<String>> {
+        let events = self.task_lineage_events(session_id, task_id)?;
+        Ok(continuation_ancestry(&events, task_id))
+    }
+
+    /// The task and every task connected to it by an explicit continuation
+    /// edge, in either direction.
+    ///
+    /// The completion gate needs this rather than ancestry alone. A verification
+    /// turn names the task whose patch or command made the run due, and a later
+    /// continuation may resume from that same plan task rather than from the
+    /// verification turn; walking both directions keeps the verification's
+    /// check dispositions visible to every task in the same chain. Membership
+    /// in the same session is still not an edge, so a new user-started task
+    /// sees none of another task's results.
+    pub fn task_continuation_chain(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<HashSet<String>> {
+        let events = self.task_lineage_events(session_id, task_id)?;
+        Ok(continuation_chain(&events, task_id))
+    }
+
+    /// The active events of a session, after confirming the task exists in it.
+    fn task_lineage_events(&self, session_id: &str, task_id: &str) -> Result<Vec<SessionEvent>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown task in session {session_id}: {task_id}"
+            )));
+        };
+        let events = active_events(&content);
+        if !task_exists_in_events(&events, task_id) {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown task in session {session_id}: {task_id}"
+            )));
+        }
+        Ok(events)
     }
 
     /// Every verification event in the session belonging to one of
@@ -3758,6 +3995,29 @@ impl SessionStore {
     }
 }
 
+/// Serializes a plan for a `plan_resumed` edge onto `task`.
+///
+/// The plan's own `taskId` is rewritten to the new task, and `resumedFrom`
+/// sits alongside it rather than wrapping it, so the reader needs no special
+/// case: `TaskPlan` ignores the extra key.
+fn resumed_plan_payload(
+    plan: &crate::plan::TaskPlan,
+    task: &Task,
+    from_task_id: &str,
+) -> Result<String> {
+    let mut plan = plan.clone();
+    plan.task_id = task.id.clone();
+    let mut payload = serde_json::to_value(&plan)
+        .map_err(|error| crate::error::ClientError::Io(format!("plan serialization: {error}")))?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "resumedFrom".to_string(),
+            serde_json::Value::String(from_task_id.to_string()),
+        );
+    }
+    Ok(payload.to_string())
+}
+
 /// A per-session advisory lock and its authoritative reserved-sequence
 /// counter.
 ///
@@ -4041,7 +4301,7 @@ fn task_exists_in_events(events: &[SessionEvent], task_id: &str) -> bool {
     })
 }
 
-/// The task ids whose protections a task inherits, including itself.
+/// The task ids whose work a task continues, including itself.
 ///
 /// Two explicit continuation edges exist today. `plan_resumed` is written by a
 /// verification, repair, worker or typed-plan continuation and names the task
@@ -4050,8 +4310,11 @@ fn task_exists_in_events(events: &[SessionEvent], task_id: &str) -> bool {
 /// `verification_due` that names the task whose patch or command made it due.
 ///
 /// Membership in the same session is deliberately not an edge, so a new
-/// user-started task inherits nothing.
-fn protected_path_ancestry(events: &[SessionEvent], task_id: &str) -> HashSet<String> {
+/// user-started task inherits nothing — neither protected paths nor another
+/// task's verification disposition.
+fn continuation_edges(
+    events: &[SessionEvent],
+) -> (HashMap<String, String>, HashMap<String, String>) {
     let mut plan_parent: HashMap<String, String> = HashMap::new();
     let mut verification_parent: HashMap<String, String> = HashMap::new();
     let mut pending_due: Option<String> = None;
@@ -4079,7 +4342,11 @@ fn protected_path_ancestry(events: &[SessionEvent], task_id: &str) -> HashSet<St
             _ => {}
         }
     }
+    (plan_parent, verification_parent)
+}
 
+fn continuation_ancestry(events: &[SessionEvent], task_id: &str) -> HashSet<String> {
+    let (plan_parent, verification_parent) = continuation_edges(events);
     let mut ancestry = HashSet::new();
     let mut pending = vec![task_id.to_string()];
     while let Some(current) = pending.pop() {
@@ -4094,6 +4361,35 @@ fn protected_path_ancestry(events: &[SessionEvent], task_id: &str) -> HashSet<St
         }
     }
     ancestry
+}
+
+fn continuation_chain(events: &[SessionEvent], task_id: &str) -> HashSet<String> {
+    let (plan_parent, verification_parent) = continuation_edges(events);
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for (child, parent) in plan_parent.iter().chain(verification_parent.iter()) {
+        children
+            .entry(parent.clone())
+            .or_default()
+            .push(child.clone());
+    }
+
+    let mut chain = HashSet::new();
+    let mut pending = vec![task_id.to_string()];
+    while let Some(current) = pending.pop() {
+        if !chain.insert(current.clone()) {
+            continue;
+        }
+        if let Some(parent) = plan_parent.get(&current) {
+            pending.push(parent.clone());
+        }
+        if let Some(parent) = verification_parent.get(&current) {
+            pending.push(parent.clone());
+        }
+        if let Some(kids) = children.get(&current) {
+            pending.extend(kids.iter().cloned());
+        }
+    }
+    chain
 }
 
 /// Findings as recorded, with their newest status change applied. Staleness

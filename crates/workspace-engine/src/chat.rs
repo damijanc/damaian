@@ -13,6 +13,7 @@ use crate::command_policy::{
 use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::compaction::ConversationSummary;
+use crate::completion::{CompletionGateService, CompletionReasonCode, CompletionSettlement};
 use crate::config::{Config, ConfigOverlay, CostEstimate, McpTransport};
 use crate::context_manager::{
     ContextManager, ContextManifest, ContextPlan, ContextRequest, MemoryRecallRef, PreparedContext,
@@ -61,6 +62,7 @@ use crate::session::{
     ChatMessage, PendingApprovalRef, Session, SessionStore, Task, TaskStatus, TaskUsage,
 };
 use crate::steering::TurnSteering;
+use crate::task_control::{TaskControl, TurnPresentation, continuation_prompt, turn_presentation};
 use crate::validation::{
     CommandProposal, CommandStore, ValidationOrchestrator, command_approval_prompt,
     resolve_command_directory,
@@ -696,6 +698,13 @@ pub struct ChatTurnResult {
     /// [`ChatOrchestrator::resume_after_context_decision`]. Carries the
     /// manifest only; the prepared items stay on disk.
     pub context_review: Option<AgentContextReview>,
+    /// The engine-owned outcome and action model for this turn's task
+    /// (spec 101 Task 3). It carries the durable completion reasons and
+    /// waivers, so a live result and a reloaded session render the same truth.
+    /// A CLI reads this field directly rather than rebuilding it.
+    pub task_control: TaskControl,
+    /// The engine-owned indicator and stop-row presentation for the live turn.
+    pub turn_presentation: TurnPresentation,
 }
 
 /// A paused pre-send context review (spec 27 §5.1).
@@ -780,6 +789,12 @@ pub struct ChatTurnOptions {
     /// it so a resume keeps the same exemption.
     #[serde(default)]
     pub verification_turn: bool,
+    /// The run's plan was already carried by a durable transaction (spec 101
+    /// Task 3). Set only by the engine's continue-incomplete operation, whose
+    /// session-store transaction wrote `task_created` and `plan_resumed` in one
+    /// batch; the ordinary turn path must not write a second resume edge.
+    #[serde(default)]
+    pub plan_already_carried: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1553,7 +1568,13 @@ impl ChatOrchestrator {
         // and only while its plan still has work outstanding. Carrying a plan
         // into an unrelated next question would put steps on the panel the user
         // never asked for, and a normally-completed task has nothing to resume.
-        self.carry_plan_from_the_previous_turn(&session.id, &task)?;
+        //
+        // A continue-incomplete run already wrote its `plan_resumed` edge in
+        // the same locked transaction as `task_created` (spec 101 Task 3), so
+        // it must not be carried twice.
+        if !options.plan_already_carried {
+            self.carry_plan_from_the_previous_turn(&session.id, &task)?;
+        }
         // Spec 65 §5.5: the model's notes from the previous turn are this
         // turn's starting record, pinned from the first request and marked as
         // carried. Read from the active log, so a rewind carries the notes of
@@ -2040,6 +2061,8 @@ impl ChatOrchestrator {
         let mut model_run =
             ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
         model_run.content = response.clone();
+        let task_control = self.task_control_for(&task);
+        let turn_presentation = turn_presentation(&task.status, false, false, Some(&task.id));
         Ok(ChatTurnResult {
             session,
             task,
@@ -2063,6 +2086,8 @@ impl ChatOrchestrator {
                 id: proposal_id,
                 manifest,
             }),
+            task_control,
+            turn_presentation,
         })
     }
 
@@ -2138,6 +2163,8 @@ impl ChatOrchestrator {
                 &self.config.model_name,
             );
             model_run.content = message.clone();
+            let task_control = self.task_control_for(&task);
+            let turn_presentation = turn_presentation(&task.status, false, true, Some(&task.id));
             return Ok(ChatTurnResult {
                 session: pending.session,
                 task,
@@ -2158,6 +2185,8 @@ impl ChatOrchestrator {
                 usage,
                 estimated_cost,
                 context_review: None,
+                task_control,
+                turn_presentation,
             });
         }
 
@@ -2460,6 +2489,7 @@ impl ChatOrchestrator {
             let changed = self.verification_changed_files(session_id, &task.id, Some(&due))?;
             let file_hashes = hash_existing_files(repository_root, &changed);
             return self.finish_verification_with_outcome(
+                repository_root,
                 session,
                 task,
                 VerificationOutcome::NoRepairApplied,
@@ -2524,6 +2554,7 @@ impl ChatOrchestrator {
         if browser.is_none() {
             return match selection {
                 Selection::OnlyDocumentation => self.finish_verification_without_checks(
+                    repository_root,
                     session,
                     task,
                     attempt,
@@ -2532,6 +2563,7 @@ impl ChatOrchestrator {
                     file_hashes,
                 ),
                 Selection::NoChecksAvailable { .. } => self.finish_verification_without_checks(
+                    repository_root,
                     session,
                     task,
                     attempt,
@@ -3249,8 +3281,12 @@ impl ChatOrchestrator {
         )
     }
 
+    // The signature mirrors the verification turn's durable inputs. Grouping
+    // them into a one-use struct would only move the same fields to every call.
+    #[allow(clippy::too_many_arguments)]
     fn finish_verification_without_checks(
         &self,
+        repository_root: &Path,
         session: Session,
         task: Task,
         attempt: u32,
@@ -3266,7 +3302,14 @@ impl ChatOrchestrator {
                 checks: Vec::new(),
             },
         )?;
-        self.finish_verification_with_outcome(session, task, outcome, changed, file_hashes)
+        self.finish_verification_with_outcome(
+            repository_root,
+            session,
+            task,
+            outcome,
+            changed,
+            file_hashes,
+        )
     }
 
     /// Decides whether the verification is done, may be repaired, or has hit
@@ -3300,6 +3343,7 @@ impl ChatOrchestrator {
         let preliminary = VerificationReport::build(&state, &plan, &changed, &file_hashes);
         if preliminary.failed.is_empty() && preliminary.stale.is_empty() {
             return self.finish_verification_with_outcome(
+                repository_root,
                 session,
                 task,
                 // Every check skipped is not a pass (spec 78).
@@ -3319,6 +3363,7 @@ impl ChatOrchestrator {
             // silently bypassing the bound. Nothing here starts another
             // attempt on its own.
             return self.finish_verification_with_outcome(
+                repository_root,
                 session,
                 task,
                 VerificationOutcome::RepairLimitExhausted,
@@ -3336,6 +3381,120 @@ impl ChatOrchestrator {
             file_hashes,
             model_adapter,
             sink,
+        )
+    }
+
+    /// The engine's control model for a settled task.
+    ///
+    /// Reading the durable report here is what makes a live `ChatTurnResult`
+    /// carry the same reasons and waivers a reloaded session shows. A failure to
+    /// read presentation data must not fail a turn that already settled, so the
+    /// control falls back to the status with no report.
+    fn task_control_for(&self, task: &Task) -> TaskControl {
+        let report = self
+            .session_store
+            .read_completion_report(&task.session_id, &task.id)
+            .ok()
+            .flatten();
+        TaskControl::for_session(Some(task), report.as_ref())
+    }
+
+    /// Continues an incomplete task as an explicit engine-authorized action
+    /// (spec 101 Task 3).
+    ///
+    /// The target must still be the newest task, still be `incomplete`, and
+    /// still carry its completion report; the session must belong to the
+    /// repository. The prompt is built here from the durable reasons and the
+    /// optional user note, so a client never has to type "continue" or
+    /// reconstruct the gate. The session-store transaction writes the new task
+    /// and its carried plan in one locked batch; this method then runs that
+    /// already-created task through the ordinary turn path. Continuing grants
+    /// no patch, command, check, question or fallback approval.
+    #[allow(clippy::too_many_arguments)]
+    pub fn continue_incomplete_task(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+        task_id: &str,
+        note: Option<&str>,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let repository_root = repository_root.as_ref();
+        let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
+        let Some(session) = self.session_store.read_session(session_id)? else {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown session: {session_id}"
+            )));
+        };
+        if session.repository_id != index.repository_id {
+            return Err(ClientError::AccessDenied(
+                "Session belongs to a different repository".to_string(),
+            ));
+        }
+        let latest = self
+            .session_store
+            .read_tasks(session_id)?
+            .into_iter()
+            .last();
+        if !latest
+            .as_ref()
+            .is_some_and(|task| task.id == task_id && task.status == TaskStatus::Incomplete)
+        {
+            return Err(ClientError::InvalidInput(
+                "The task is no longer the newest incomplete task".to_string(),
+            ));
+        }
+        let Some(report) = self
+            .session_store
+            .read_completion_report(session_id, task_id)?
+        else {
+            return Err(ClientError::InvalidInput(
+                "The incomplete task has no recorded completion report".to_string(),
+            ));
+        };
+        let prompt = continuation_prompt(&report, note);
+        let Some(continued) = self.session_store.continue_incomplete_task(
+            session_id,
+            task_id,
+            &report,
+            &prompt,
+            &self.config.model_provider,
+            &self.config.model_name,
+        )?
+        else {
+            return Err(ClientError::InvalidInput(
+                "The task is no longer the newest incomplete task".to_string(),
+            ));
+        };
+        let reasons = report
+            .reason_codes()
+            .into_iter()
+            .map(|code| code.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.audit_log.record(
+            "task_continued",
+            &[
+                ("actor", "user".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("fromTaskId", task_id.to_string()),
+                ("taskId", continued.task.id.clone()),
+                ("reasons", reasons),
+            ],
+        )?;
+        self.ask_with_session_using_task(
+            repository_root,
+            &prompt,
+            &[],
+            continued.task,
+            continued.position,
+            model_adapter,
+            sink,
+            ChatTurnOptions {
+                plan_already_carried: true,
+                ..ChatTurnOptions::default()
+            },
         )
     }
 
@@ -3634,6 +3793,7 @@ impl ChatOrchestrator {
         // question again would spend the remaining attempts for nothing, so the
         // loop stops here (proposal §5.5).
         self.finish_verification_with_outcome(
+            repository_root,
             result.session,
             result.task,
             VerificationOutcome::NoRepairApplied,
@@ -3642,10 +3802,19 @@ impl ChatOrchestrator {
         )
     }
 
-    /// Appends `Finished`, builds the report and closes the task with the
-    /// status that outcome earns.
+    /// Appends `Finished`, builds the report and closes the task through the
+    /// completion gate.
+    ///
+    /// A successful outcome still has to close the whole task; while plan work
+    /// remains the settlement is `incomplete`, never a transient `complete`. A
+    /// failed outcome keeps `failed` but carries the gate's ineligible report
+    /// with it.
+    // The signature mirrors the verification turn's durable inputs. Grouping
+    // them into a one-use struct would only move the same fields to every call.
+    #[allow(clippy::too_many_arguments)]
     fn finish_verification_with_outcome(
         &self,
+        repository_root: &Path,
         session: Session,
         task: Task,
         outcome: VerificationOutcome,
@@ -3669,16 +3838,18 @@ impl ChatOrchestrator {
             .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
         let report = VerificationReport::build(&state, &plan, &changed, &file_hashes);
         let response = format!("{}\n\n{}", report.summary(&plan.report()), report.render());
-        let status = match outcome {
+        let settlement = match outcome {
             VerificationOutcome::Passed
             | VerificationOutcome::NothingVerified
             | VerificationOutcome::NoChecksAvailable
-            | VerificationOutcome::OnlyDocumentationChanged => TaskStatus::Complete,
+            | VerificationOutcome::OnlyDocumentationChanged => CompletionSettlement::Gate,
             VerificationOutcome::Failed
             | VerificationOutcome::RepairLimitExhausted
-            | VerificationOutcome::NoRepairApplied => TaskStatus::Failed,
+            | VerificationOutcome::NoRepairApplied => CompletionSettlement::VerificationFailed,
         };
-        let task = self.session_store.update_task_status(&task, status, None)?;
+        let task = CompletionGateService::new(&self.session_store, repository_root)
+            .settle(&task, settlement)?
+            .task;
         self.verification_turn_result(session, task, response, None, Some(report), changed)
     }
 
@@ -3701,7 +3872,26 @@ impl ChatOrchestrator {
         let Some(report) = result.verification_report.clone() else {
             return Ok(result);
         };
-        if result.task.status != TaskStatus::Complete || result.cancelled {
+        if result.cancelled {
+            return Ok(result);
+        }
+        // A successful verification settles the task, but only a whole closed
+        // task becomes `complete` (spec 101). An `incomplete` settlement may
+        // still be continued when the sole remaining blocker is the task's own
+        // open non-verification plan work. Any failed, stale, missing, pending
+        // or policy-skipped evidence keeps it stopped, which is why the gate's
+        // exact reasons are checked rather than just the status.
+        let may_continue = match result.task.status {
+            TaskStatus::Complete => true,
+            TaskStatus::Incomplete => self
+                .session_store
+                .read_completion_report(&result.session.id, &result.task.id)?
+                .is_some_and(|settled| {
+                    settled.reason_codes() == vec![CompletionReasonCode::OpenPlanSteps]
+                }),
+            _ => false,
+        };
+        if !may_continue {
             return Ok(result);
         }
         let session = result.session.clone();
@@ -3883,6 +4073,7 @@ impl ChatOrchestrator {
             self.verification_changed_files(&result.session.id, &result.task.id, Some(&due))?;
         let file_hashes = hash_existing_files(repository_root, &changed);
         self.finish_verification_with_outcome(
+            repository_root,
             result.session,
             result.task,
             VerificationOutcome::NoRepairApplied,
@@ -3981,6 +4172,8 @@ impl ChatOrchestrator {
         let mut model_run =
             ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
         model_run.content = response.clone();
+        let task_control = self.task_control_for(&task);
+        let turn_presentation = turn_presentation(&task.status, false, false, Some(&task.id));
         Ok(ChatTurnResult {
             session,
             task,
@@ -4001,6 +4194,8 @@ impl ChatOrchestrator {
             usage,
             estimated_cost,
             context_review: None,
+            task_control,
+            turn_presentation,
         })
     }
 
@@ -4450,7 +4645,15 @@ impl ChatOrchestrator {
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
-        let finished = !turn_is_paused(&result) && result.task.status == TaskStatus::Complete;
+        // Spec 101: an answered turn with a due command verification settles
+        // `incomplete` for `verification_due`, not `complete`. The verification
+        // the command made due is still the turn's work, so it runs for either
+        // terminal settlement and its own task records the final verdict.
+        let settled = matches!(
+            result.task.status,
+            TaskStatus::Complete | TaskStatus::Incomplete
+        );
+        let finished = !turn_is_paused(&result) && settled;
         let command_due = finished && {
             let events = self
                 .session_store
@@ -4602,8 +4805,23 @@ impl ChatOrchestrator {
             "Handed to a worker. It runs the plan in its own worktree and asks you to approve the plan there before its first change; nothing changed here.",
         )?;
         self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
-        self.session_store
-            .update_task_status(&pending.task, TaskStatus::Complete, None)?;
+        // The review is resolved by the hand-off, so clear the durable pending
+        // link it left on the status before the completion gate reads it. This
+        // is the same transition every other resume writes; without it the
+        // gate would correctly refuse to close a task that still names an
+        // unanswered proposal.
+        let task = self.session_store.update_task_status(
+            &pending.task,
+            TaskStatus::PreparingContext,
+            None,
+        )?;
+        // Handing the plan to a worker settles this task's planned work here:
+        // its steps are skipped and nothing changed in this checkout. It still
+        // goes through the shared completion gate (spec 101), so this ordinary
+        // turn cannot write `complete` by a path that bypasses the verdict.
+        let repository_root = PathBuf::from(&pending.repository_root);
+        CompletionGateService::new(&self.session_store, &repository_root)
+            .settle(&task, CompletionSettlement::Gate)?;
         Ok(())
     }
 
@@ -9569,13 +9787,26 @@ impl ChatOrchestrator {
             // `await_answer`; never through `await_approval` (spec 50 §5.2).
             (None, Some(question)) => self.session_store.await_answer(&task, question)?,
             (None, None) => {
-                let final_status = match stop_reason {
-                    StopReason::ToolBudget => TaskStatus::ToolBudgetExhausted,
-                    StopReason::TokenBudget => TaskStatus::TokenBudgetExhausted,
-                    StopReason::Answered => TaskStatus::Complete,
-                };
-                self.session_store
-                    .update_task_status(&task, final_status, None)?
+                match stop_reason {
+                    // Spec 101: an answer is settled through the engine gate, so
+                    // `complete` cannot be asserted by the model or reached with
+                    // open plan work, a due verification or pending evidence.
+                    StopReason::Answered => {
+                        CompletionGateService::new(&self.session_store, repository_root)
+                            .settle(&task, CompletionSettlement::Gate)?
+                            .task
+                    }
+                    StopReason::ToolBudget => self.session_store.update_task_status(
+                        &task,
+                        TaskStatus::ToolBudgetExhausted,
+                        None,
+                    )?,
+                    StopReason::TokenBudget => self.session_store.update_task_status(
+                        &task,
+                        TaskStatus::TokenBudgetExhausted,
+                        None,
+                    )?,
+                }
             }
             (Some(_), Some(_)) => {
                 unreachable!("a turn cannot pause for an approval and a question at once")
@@ -9605,6 +9836,10 @@ impl ChatOrchestrator {
                         "tool_budget_exhausted".to_string()
                     } else if stop_reason == StopReason::TokenBudget {
                         "token_budget_exhausted".to_string()
+                    } else if task.status == TaskStatus::Incomplete {
+                        // The persisted verdict, not the fact that the model
+                        // answered, is what the audit records (spec 101).
+                        "incomplete".to_string()
                     } else if action_rounds > 0 {
                         "complete_with_command".to_string()
                     } else {
@@ -9642,6 +9877,9 @@ impl ChatOrchestrator {
                 source: usage.source,
             })
         });
+        let task_control = self.task_control_for(&task);
+        let turn_presentation =
+            turn_presentation(&task.status, final_run.incomplete, false, Some(&task.id));
         Ok(ChatTurnResult {
             session,
             task,
@@ -9662,6 +9900,8 @@ impl ChatOrchestrator {
             cancelled: false,
             usage,
             estimated_cost,
+            task_control,
+            turn_presentation,
         })
     }
 
@@ -9763,6 +10003,8 @@ impl ChatOrchestrator {
         let mut model_run =
             ModelRun::cancelled_before_start(&offer.refused_provider, &offer.refused_model);
         model_run.content = response.clone();
+        let task_control = self.task_control_for(&task);
+        let turn_presentation = turn_presentation(&task.status, false, false, Some(&task.id));
         Ok(ChatTurnResult {
             session,
             task,
@@ -9791,6 +10033,8 @@ impl ChatOrchestrator {
             cancelled: false,
             usage,
             estimated_cost,
+            task_control,
+            turn_presentation,
         })
     }
 
@@ -9908,6 +10152,8 @@ impl ChatOrchestrator {
         let mut model_run =
             ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
         model_run.content = response.clone();
+        let task_control = self.task_control_for(&task);
+        let turn_presentation = turn_presentation(&task.status, false, false, Some(&task.id));
         Ok(ChatTurnResult {
             session,
             task,
@@ -9935,6 +10181,8 @@ impl ChatOrchestrator {
             cancelled: false,
             usage,
             estimated_cost,
+            task_control,
+            turn_presentation,
         })
     }
 
@@ -10013,6 +10261,8 @@ impl ChatOrchestrator {
                 source: usage.source,
             })
         });
+        let task_control = self.task_control_for(&task);
+        let turn_presentation = turn_presentation(&task.status, false, true, Some(&task.id));
         Ok(ChatTurnResult {
             session,
             task,
@@ -10033,6 +10283,8 @@ impl ChatOrchestrator {
             cancelled: true,
             usage,
             estimated_cost,
+            task_control,
+            turn_presentation,
         })
     }
 

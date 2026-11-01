@@ -393,6 +393,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/fetch-decision") => handle_fetch_decision(stream, &request),
         ("POST", "/api/verify-stream") => handle_verify_stream(stream, &request),
         ("POST", "/api/continue-repair-stream") => handle_continue_repair_stream(stream, &request),
+        ("POST", "/api/continue-task-stream") => handle_continue_task_stream(stream, &request),
         ("POST", "/api/continue-worker-result-stream") => {
             handle_continue_worker_result_stream(stream, &request)
         }
@@ -738,13 +739,18 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         .session_store
         .pending_worker_returns(&session_id)
         .map_err(|error| error.to_string())?;
+    // Spec 101 Task 3: the ordinary session's outcome and primary action are
+    // engine data. The UI renders this model and does not infer a status.
+    let task_control = workspace_engine::TaskControlService::new(&engine.session_store, None)
+        .session_control(&session_id)
+        .map_err(|error| error.to_string())?;
     write_response(
         stream,
         request,
         200,
         "application/json",
         &format!(
-            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}],\"conversationView\":{},\"contextState\":{{\"pins\":{},\"restrictedPaths\":{}}},\"verification\":{},\"workerReturns\":{},\"protectedPathsControl\":{}}}",
+            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}],\"conversationView\":{},\"contextState\":{{\"pins\":{},\"restrictedPaths\":{}}},\"verification\":{},\"taskControl\":{},\"workerReturns\":{},\"protectedPathsControl\":{}}}",
             session_json(&session, engine.session_store.session_mode(&session.id)),
             messages_json(&messages, &question_states),
             task_states_json(
@@ -761,10 +767,45 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
             serde_json::to_string(&context_pins).unwrap_or_else(|_| "[]".to_string()),
             serde_json::to_string(&context_restriction).unwrap_or_else(|_| "null".to_string()),
             verification,
-            serde_json::to_string(&worker_returns).unwrap_or_else(|_| "[]".to_string()),
+            serde_json::to_string(&task_control).unwrap_or_else(|_| "null".to_string()),
+            worker_returns_json(&engine, &worker_returns),
             protected_paths_control
         ),
     )
+}
+
+/// Spec 101 Task 3: a parent's pending worker returns plus the engine's own
+/// outcome model for each returned task.
+///
+/// The durable return keeps its literal `taskStatus` (`incomplete` stays
+/// `incomplete`); the added `control` is what the result card draws. Reading
+/// the worker's completion report is transport preparation, not a second
+/// decision: the labels come from `returned_task_control`.
+fn worker_returns_json(engine: &WorkspaceEngine, returns: &[WorkerReturn]) -> String {
+    let views: Vec<serde_json::Value> = returns
+        .iter()
+        .map(|worker_return| {
+            let report = engine
+                .session_store
+                .read_completion_report(&worker_return.worker_session_id, &worker_return.task_id)
+                .ok()
+                .flatten();
+            let control = workspace_engine::returned_task_control(
+                &worker_return.task_status,
+                report.as_ref(),
+            );
+            let mut value = serde_json::to_value(worker_return)
+                .unwrap_or_else(|_| serde_json::json!({"returnId": worker_return.return_id}));
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "control".to_string(),
+                    serde_json::to_value(control).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            value
+        })
+        .collect();
+    serde_json::to_string(&views).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// `GET /api/protected-paths?repo=&session_id=&task_id=`: the active typed
@@ -3305,6 +3346,17 @@ fn handle_verify_stream(stream: &mut TcpStream, request: &Request) -> Result<(),
     })
 }
 
+/// Spec 101 Task 3: continue the newest incomplete task as one explicit,
+/// engine-authorized run. The engine re-reads the task and its report, so a
+/// stale card or a second click creates nothing.
+fn handle_continue_task_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    write_event_stream_headers(stream, request)?;
+    stream_turn(stream, move |cancel, events| {
+        run_continue_task_request(&form, cancel, events)
+    })
+}
+
 /// Spec 96: the user's explicit decision to start one more repair attempt
 /// after the verification repair limit.
 fn handle_continue_repair_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
@@ -3644,6 +3696,63 @@ fn run_continue_repair_request(
             &repo,
             &session_id,
             "desktop_user",
+            adapter.as_mut(),
+            &mut sink,
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// Spec 101 Task 3: one explicit **Continue task** for an incomplete task.
+///
+/// This route builds no prompt and chooses no task: it passes the optional note
+/// and the target id to the engine, which rebuilds the prompt from the durable
+/// completion report and re-validates the newest task before creating a run.
+fn run_continue_task_request(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+) -> Result<ChatTurnResult, String> {
+    run_continue_task_request_with(form, cancel, events, &mut |config| {
+        chat_model_adapter(config, || resolve_shell_model_api_key(config))
+    })
+}
+
+fn run_continue_task_request_with(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+    adapter_for: &mut AdapterFor<'_>,
+) -> Result<ChatTurnResult, String> {
+    let repo = required_form(form, "repo")?;
+    let session_id = required_form(form, "session_id")?;
+    let task_id = required_form(form, "task_id")?;
+    let note = form
+        .get("note")
+        .map(|note| note.trim())
+        .filter(|note| !note.is_empty());
+    let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
+    let mut adapter = adapter_for(&engine.config)?;
+    let mut on_token = |token: &str| {
+        let _ = events.send(TurnEvent::Token(token.to_string()));
+    };
+    let mut on_progress = |progress: TurnProgress| {
+        if let Some(event) = turn_progress_event(progress) {
+            let _ = events.send(event);
+        }
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .continue_incomplete_task(
+            &repo,
+            &session_id,
+            &task_id,
+            note,
             adapter.as_mut(),
             &mut sink,
         )
@@ -6355,12 +6464,14 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         None => "null".to_string(),
     };
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"fetchProposal\":{},\"checkBatch\":{},\"verificationReport\":{},\"turnNotes\":{},\"usage\":{},\"contextReview\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"taskControl\":{},\"turnPresentation\":{},\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"questionProposal\":{},\"fetchProposal\":{},\"checkBatch\":{},\"verificationReport\":{},\"turnNotes\":{},\"usage\":{},\"contextReview\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
         escape_json(&result.task.id),
         result.task.status.as_str(),
+        serde_json::to_string(&result.task_control).unwrap_or_else(|_| "null".to_string()),
+        serde_json::to_string(&result.turn_presentation).unwrap_or_else(|_| "null".to_string()),
         escape_json(&result.model_run.run_id),
         result.model_run.incomplete,
         result.cancelled,
@@ -7100,8 +7211,23 @@ fn task_states_json(
                 ),
                 None => String::new(),
             };
+            // Spec 101 Task 3: a reloaded turn draws its stop row and any
+            // action from the engine's presentation, not from its status.
+            let turn_presentation = statuses
+                .get(*id)
+                .and_then(|status| workspace_engine::TaskStatus::parse(status))
+                .map(|status| {
+                    workspace_engine::turn_presentation(&status, false, false, Some(id.as_str()))
+                });
+            let turn_presentation_field = match turn_presentation {
+                Some(presentation) => format!(
+                    ",\"turnPresentation\":{}",
+                    serde_json::to_string(&presentation).unwrap_or_else(|_| "null".to_string())
+                ),
+                None => String::new(),
+            };
             format!(
-                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}{}{}{}}}",
+                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}{}{}{}{}}}",
                 escape_json(id),
                 escape_json(&statuses[*id]),
                 usage_json,
@@ -7109,6 +7235,7 @@ fn task_states_json(
                 plan_json_field,
                 notes_field,
                 web_diagnostics_field,
+                turn_presentation_field,
                 context_field
             )
         })
@@ -7332,12 +7459,13 @@ mod tests {
         plan_proposal_json, question_proposal_json, relay_turn_events, remember_model_api_key,
         render_markdown_with_optional_file_links, repository_config_review_json,
         repository_config_write_target, require_api_token, resolve_shell_model_api_key,
-        run_answer_question_request, run_fetch_decision_request_with, run_server,
-        run_terminal_command, save_config_file, session_verification_json, spawn_with_shell_stack,
-        sweep_orphaned_processes, symbol_repository, task_states_json, task_usage_json,
-        terminal_cwd_for_repo, turn_progress_event, validate_context_files,
-        validate_working_folder, validate_workspace_path, verify_data_dir_schema_at,
-        web_diagnostic_json, web_diagnostic_reveal_target, write_basic_response, write_sse_event,
+        run_answer_question_request, run_continue_task_request_with,
+        run_fetch_decision_request_with, run_server, run_terminal_command, save_config_file,
+        session_verification_json, spawn_with_shell_stack, sweep_orphaned_processes,
+        symbol_repository, task_states_json, task_usage_json, terminal_cwd_for_repo,
+        turn_progress_event, validate_context_files, validate_working_folder,
+        validate_workspace_path, verify_data_dir_schema_at, web_diagnostic_json,
+        web_diagnostic_reveal_target, write_basic_response, write_sse_event,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
@@ -7349,12 +7477,13 @@ mod tests {
     use workspace_engine::CheckpointRestoreResult;
     use workspace_engine::{
         AgentFetchProposal, AgentPlanProposal, AgentQuestionProposal, AskUserInput, CancelToken,
-        ChatMessage, ChatTurnOptions, ChatTurnResult, Config, Evidence, FetchComponentFlag,
-        GeneratedSecretWarning, LanguageServerHub, LanguageServerLaunch, LanguageServerState,
-        LanguageServerStatus, MockModelAdapter, PendingQuestionRef, PhaseKind, PlanStep,
-        SecretScanner, SessionMode, StepStatus, TaskPlan, TaskStatus, TaskUsage, ToolCall,
-        TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource, VerificationEvent,
-        VerificationOutcome, WebDiagnosticRecord, WebDiagnosticReport, WorkspaceEngine,
+        ChatMessage, ChatTurnOptions, ChatTurnResult, CompletionGateReport, CompletionReason,
+        CompletionReasonCode, Config, Evidence, FetchComponentFlag, GeneratedSecretWarning,
+        LanguageServerHub, LanguageServerLaunch, LanguageServerState, LanguageServerStatus,
+        MockModelAdapter, PendingQuestionRef, PhaseKind, PlanStep, SecretScanner, SessionMode,
+        StepStatus, TaskPlan, TaskStatus, TaskUsage, ToolCall, TurnNotes, TurnPhase, TurnProgress,
+        TurnSink, UsageSource, VerificationEvent, VerificationOutcome, WebDiagnosticRecord,
+        WebDiagnosticReport, WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
     };
 
@@ -8549,7 +8678,10 @@ mod tests {
         }
         let session = engine
             .session_store
-            .create_session("shell-test", "verification")
+            .create_session(
+                &workspace_engine::hash::repository_id_for_root(repo),
+                "verification",
+            )
             .unwrap();
         let task = engine
             .session_store
@@ -8630,7 +8762,10 @@ mod tests {
         let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
         let session = engine
             .session_store
-            .create_session("shell-test", "limited")
+            .create_session(
+                &workspace_engine::hash::repository_id_for_root(&repo),
+                "limited",
+            )
             .unwrap();
         let task = engine
             .session_store
@@ -8850,12 +8985,66 @@ mod tests {
     /// result rather than presenting that state as unexplained idle.
     #[test]
     fn worker_session_explains_task_outcomes_and_stale_progress() {
-        assert!(super::APP_JS.contains("const WORKER_TASK_OUTCOMES"));
-        assert!(super::APP_JS.contains("function workerViewOutcome(view)"));
-        assert!(super::APP_JS.contains("Needs your decision"));
-        assert!(super::APP_JS.contains("Stopped without an outcome"));
-        assert!(super::APP_JS.contains("No worker progress for"));
-        assert!(super::APP_JS.contains("Send follow-up"));
+        // Spec 101 Task 3: labels, dots, groups, stale-progress sentences and
+        // the next command are engine data. The browser renders the returned
+        // model and keeps no status-to-outcome table of its own.
+        for removed in [
+            "const WORKER_TASK_OUTCOMES",
+            "const WORKER_END_LABELS",
+            "const WORKER_COMPOSER_MODES",
+            "const WORKER_WIRE_COMMANDS",
+            "function workerViewOutcome",
+            "function workerComposerMode",
+            "function workerActivityDetail",
+            "function chatCompletionState",
+            "function markMessageToolBudgetExhausted",
+            "function markMessageTokenBudgetExhausted",
+            "function markMessageIncomplete",
+        ] {
+            assert!(!super::APP_JS.contains(removed), "{removed}");
+        }
+        for forbidden in [
+            "taskStatus ===",
+            "taskStatus ==",
+            "taskControl.outcome ===",
+            "taskControl.outcome ==",
+            ".outcome === \"complete\"",
+            ".outcome === \"incomplete\"",
+            // A reload groups paused turns from the engine's presentation fact,
+            // not by comparing the durable task status.
+            "task.status === \"waiting_for_approval\"",
+            "task.status == \"waiting_for_approval\"",
+        ] {
+            assert!(!super::APP_JS.contains(forbidden), "{forbidden}");
+        }
+        assert!(super::APP_JS.contains("task.turnPresentation?.paused"));
+        assert!(super::APP_JS.contains("view.control"));
+        assert!(super::APP_JS.contains("answer.control"));
+        assert!(super::APP_JS.contains("status.headline"));
+        assert!(super::APP_JS.contains("status.detail"));
+        assert!(super::APP_JS.contains("status.actions"));
+        assert!(super::APP_JS.contains("view.control?.composer"));
+        assert!(super::APP_JS.contains("row.control?.boardAction"));
+        assert!(super::APP_JS.contains("function renderTaskControlInto"));
+        assert!(super::APP_JS.contains("/api/continue-task-stream"));
+        assert!(super::APP_JS.contains("taskControl"));
+        assert!(super::APP_JS.contains("turnPresentation"));
+        assert!(super::APP_JS.contains("indicatorState"));
+        assert!(super::APP_JS.contains("stopNotice"));
+        assert!(super::APP_JS.contains("action.wireCommand"));
+        assert!(super::APP_JS.contains("action.taskId"));
+        // A failed stream is not a successful continuation: the card stays
+        // and the button is restored instead of being removed as if it ran.
+        assert!(super::APP_JS.contains("const succeeded = await runStreamTaskAction"));
+        assert!(super::APP_JS.contains("if (!succeeded)"));
+        let send = super::APP_JS
+            .split("async function sendChatPrompt")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfunction ").next())
+            .expect("sendChatPrompt");
+        assert!(send.contains("if (chatSubmitting) return false;"), "{send}");
+        assert!(send.contains("return true;"), "{send}");
+        assert!(send.contains("return false;"), "{send}");
     }
 
     /// Spec 100: the two worker-prompt actions and the result card are source
@@ -8892,6 +9081,7 @@ mod tests {
         assert!(super::APP_JS.contains("Open worker"));
         assert!(super::APP_JS.contains("\"This is a result, not an approval."));
         assert!(super::APP_JS.contains("payload.workerReturns"));
+        assert!(super::APP_JS.contains("workerReturn.control?.headline"));
         assert!(
             super::APP_JS.contains("/api/continue-worker-result-stream"),
             "the action must consume the return through its own route"
@@ -14302,7 +14492,19 @@ mod tests {
             let tasks = store().read_tasks(&session).unwrap();
             assert_eq!(tasks.len(), 2, "{tasks:?}");
             assert_eq!(tasks[0].user_prompt, "Mark it.");
-            assert_eq!(tasks[0].status, TaskStatus::Complete);
+            // Spec 101: the command's new file made a verification due, so the
+            // answered task is incomplete until the verification that follows
+            // closes the chain.
+            assert_eq!(tasks[0].status, TaskStatus::Incomplete);
+            assert_eq!(
+                store()
+                    .read_completion_report(&session, &tasks[0].id)
+                    .unwrap()
+                    .expect("the settlement carries its report")
+                    .reason_codes(),
+                vec![workspace_engine::CompletionReasonCode::VerificationDue]
+            );
+            assert_eq!(tasks[1].status, TaskStatus::Complete);
             assert!(
                 store()
                     .read_verification_events(&session, &[])
@@ -14505,6 +14707,85 @@ mod tests {
                     .as_str()
                     .is_some_and(|error| error.contains("did not reach the repair limit"))),
                 "the engine's own refusal is recorded: {statuses:?}"
+            );
+        }
+
+        /// Spec 101 Task 3: the worker host carries the exact task id from the
+        /// rendered control. A stale click for an older incomplete task is
+        /// refused and must not continue the newer incomplete task that
+        /// happens to be latest when the command runs.
+        #[test]
+        fn a_worker_continues_only_the_exact_task_its_control_named() {
+            let (host, session) = hosted(&fixture("ctask"), calls_then("x", "{}", "Done."));
+            let store = store();
+            let incomplete = |prompt: &str| {
+                let task = store.create_task(&session, prompt, "mock", "mock").unwrap();
+                store
+                    .update_task_status_with_completion(
+                        &task,
+                        TaskStatus::Incomplete,
+                        &CompletionGateReport {
+                            task_id: task.id.clone(),
+                            eligible: false,
+                            reasons: vec![CompletionReason {
+                                code: CompletionReasonCode::OpenPlanSteps,
+                                explanation: "1 planned step is still open.".to_string(),
+                            }],
+                            waivers: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+                task
+            };
+            let older = incomplete("Older incomplete task");
+            let newer = incomplete("Newer incomplete task");
+
+            assert_eq!(
+                send(
+                    &host,
+                    ControlCommand::ContinueTask {
+                        task_id: older.id.clone(),
+                        note: Some("keep going".to_string()),
+                    }
+                )["ok"],
+                true,
+                "an idle worker accepts continue-task"
+            );
+            assert_eq!(settle(&host)["state"], "idle");
+            let statuses = payloads(&progress(&session), "status");
+            assert!(
+                statuses.iter().any(|status| status["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("newest incomplete task"))),
+                "the stale target is refused: {statuses:?}"
+            );
+            assert_eq!(
+                store.read_tasks(&session).unwrap().len(),
+                2,
+                "the stale click creates no task for the newer one"
+            );
+
+            assert_eq!(
+                send(
+                    &host,
+                    ControlCommand::ContinueTask {
+                        task_id: newer.id.clone(),
+                        note: Some("finish it".to_string()),
+                    }
+                )["ok"],
+                true
+            );
+            assert_eq!(settle(&host)["state"], "idle");
+            let tasks = store.read_tasks(&session).unwrap();
+            assert_eq!(tasks.len(), 3, "{tasks:?}");
+            assert_ne!(tasks[2].id, older.id);
+            assert_ne!(tasks[2].id, newer.id);
+            assert!(
+                tasks[2]
+                    .user_prompt
+                    .contains("1 planned step is still open"),
+                "the continuation prompt came from the named task's report: {}",
+                tasks[2].user_prompt
             );
         }
 
@@ -14752,6 +15033,96 @@ mod tests {
             )
             .unwrap_err();
             assert!(refused.contains("already have been used"), "{refused}");
+        }
+
+        /// Spec 101 Task 3: the ordinary route passes the target and optional
+        /// note to the engine, which builds the prompt and refuses a second
+        /// click.
+        #[test]
+        fn continuing_an_incomplete_task_through_the_route_carries_plan_and_reasons() {
+            isolated_data_dir();
+            let repo = fixture("continue-task-route");
+            let session = store()
+                .create_session(
+                    &workspace_engine::hash::repository_id_for_root(&repo),
+                    "Planner",
+                )
+                .unwrap()
+                .id;
+            let task = store()
+                .create_task(&session, "Finish the parser", "mock", "mock")
+                .unwrap();
+            let mut plan = TaskPlan::new(task.id.clone(), 0);
+            plan.steps.push(PlanStep {
+                id: "finish".to_string(),
+                title: "Finish the parser".to_string(),
+                detail: None,
+                status: StepStatus::InProgress,
+                depends_on: Vec::new(),
+                started_at_ms: None,
+                completed_at_ms: None,
+                evidence: Vec::new(),
+            });
+            store().create_plan(&task, &plan).unwrap();
+            store()
+                .update_task_status_with_completion(
+                    &task,
+                    TaskStatus::Incomplete,
+                    &CompletionGateReport {
+                        task_id: task.id.clone(),
+                        eligible: false,
+                        reasons: vec![CompletionReason {
+                            code: CompletionReasonCode::OpenPlanSteps,
+                            explanation: "1 planned step is still open: \"Finish the parser\"."
+                                .to_string(),
+                        }],
+                        waivers: Vec::new(),
+                    },
+                )
+                .unwrap();
+
+            let form = HashMap::from([
+                ("repo".to_string(), repo.to_string_lossy().to_string()),
+                ("session_id".to_string(), session.clone()),
+                ("task_id".to_string(), task.id.clone()),
+                ("note".to_string(), "Keep the tokenizer".to_string()),
+            ]);
+            let (events, _discard) = std::sync::mpsc::channel();
+            let adapter = MockModelAdapter::new("I will continue.");
+            let result =
+                run_continue_task_request_with(&form, &CancelToken::new(), &events, &mut |_| {
+                    Ok(Box::new(adapter.clone()))
+                })
+                .unwrap();
+            assert_ne!(result.task.id, task.id);
+            assert!(
+                result.task.user_prompt.contains("Finish the parser"),
+                "{}",
+                result.task.user_prompt
+            );
+            assert!(
+                result.task.user_prompt.contains("Keep the tokenizer"),
+                "{}",
+                result.task.user_prompt
+            );
+            assert_eq!(
+                store().read_tasks(&session).unwrap().len(),
+                2,
+                "the continuation is one new task"
+            );
+
+            let (events, _discard) = std::sync::mpsc::channel();
+            let refused =
+                run_continue_task_request_with(&form, &CancelToken::new(), &events, &mut |_| {
+                    Ok(Box::new(MockModelAdapter::new("unused")))
+                })
+                .unwrap_err();
+            assert!(refused.contains("newest incomplete task"), "{refused}");
+            assert_eq!(
+                store().read_tasks(&session).unwrap().len(),
+                2,
+                "a stale click creates no task"
+            );
         }
 
         /// Spec 100 repair: the route must reject a parent session from another
@@ -15889,6 +16260,16 @@ exec /bin/cat > /dev/null
             let done = fixture.spawn("Done one", None);
             let gone = fixture.spawn("Gone one", None);
             let elsewhere = fixture.spawn_from(&other_repo, "Elsewhere", None);
+            // A progress status is a report about a durable task; the board's
+            // engine control reads the task itself.
+            let done_task = fixture
+                .store()
+                .create_task(&done.session_id, "Done one", "mock", "mock")
+                .unwrap();
+            fixture
+                .store()
+                .update_task_status(&done_task, TaskStatus::Complete, None)
+                .unwrap();
             let progress = |session: &str, lines: &[(ProgressKind, Value)]| {
                 let mut writer = ProgressWriter::create(
                     &fixture.config.data_dir,
@@ -16001,6 +16382,11 @@ exec /bin/cat > /dev/null
             assert_eq!(waiting_row["filesChanged"], Value::Null);
             let patch_waiting_row = by_title(&rows, "Patch waiting");
             assert_eq!(patch_waiting_row["doing"], "Needs your decision");
+            assert_eq!(patch_waiting_row["control"]["needsDecision"], true);
+            assert_eq!(
+                patch_waiting_row["control"]["primaryAction"]["command"],
+                "review_decision"
+            );
             let running_row = by_title(&rows, "Running one");
             assert_eq!(running_row["parentTitle"], Value::Null);
             assert_eq!(running_row["round"], 2);
@@ -16016,7 +16402,13 @@ exec /bin/cat > /dev/null
             assert_eq!(gone_row["alive"], false);
             assert_eq!(gone_row["filesChanged"], 0);
             assert_eq!(gone_row["commitsAhead"], 0);
-            assert_eq!(by_title(&rows, "Done one")["taskStatus"], "complete");
+            let done_row = by_title(&rows, "Done one");
+            assert_eq!(done_row["taskStatus"], "complete");
+            assert_eq!(done_row["control"]["outcome"], "complete");
+            assert_eq!(
+                done_row["control"]["primaryAction"]["command"],
+                "send_follow_up"
+            );
 
             fs::write(gone.worktree.join("README.md"), "# Changed\n").unwrap();
             git(&gone.worktree, &["commit", "-qam", "one ahead"]);
@@ -16067,6 +16459,118 @@ exec /bin/cat > /dev/null
             fixture.supervisor.shutdown_all();
         }
 
+        /// Spec 101 Task 3: an incomplete worker's row and progress answer use
+        /// the engine's outcome and action, preserve the literal status, and
+        /// suppress the composer when a decision is pending.
+        #[test]
+        fn worker_outcomes_use_engine_control_and_preserve_incomplete() {
+            let fixture = Fixture::new();
+            let spawned = fixture.spawn("Incomplete task", None);
+            let store = fixture.store();
+            let task = store
+                .create_task(&spawned.session_id, "Finish it", "mock", "mock")
+                .unwrap();
+            let mut plan = TaskPlan::new(task.id.clone(), 0);
+            plan.steps.push(PlanStep {
+                id: "finish".to_string(),
+                title: "Finish the work".to_string(),
+                detail: None,
+                status: StepStatus::InProgress,
+                depends_on: Vec::new(),
+                started_at_ms: None,
+                completed_at_ms: None,
+                evidence: Vec::new(),
+            });
+            store.create_plan(&task, &plan).unwrap();
+            let report = workspace_engine::CompletionGateReport {
+                task_id: task.id.clone(),
+                eligible: false,
+                reasons: vec![workspace_engine::CompletionReason {
+                    code: workspace_engine::CompletionReasonCode::OpenPlanSteps,
+                    explanation: "1 planned step is still open: \"Finish the work\".".to_string(),
+                }],
+                waivers: Vec::new(),
+            };
+            store
+                .update_task_status_with_completion(&task, TaskStatus::Incomplete, &report)
+                .unwrap();
+            let mut writer = ProgressWriter::create(
+                &fixture.config.data_dir,
+                &spawned.session_id,
+                SecretScanner::new(Vec::new()),
+            )
+            .unwrap();
+            writer
+                .append(
+                    ProgressKind::Status,
+                    json!({"state": "idle", "taskStatus": "incomplete"}),
+                )
+                .unwrap();
+
+            let rows = fixture
+                .route(
+                    "GET",
+                    "/api/workers",
+                    &[("repo", fixture.repo.to_str().unwrap())],
+                    &[],
+                )
+                .unwrap()["workers"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let row = rows
+                .iter()
+                .find(|row| row["sessionId"] == spawned.session_id.as_str())
+                .unwrap();
+            assert_eq!(row["taskStatus"], "incomplete");
+            assert_eq!(row["control"]["status"], "incomplete");
+            assert_eq!(row["control"]["outcome"], "incomplete");
+            assert_eq!(row["control"]["headline"], "Task incomplete");
+            assert_eq!(row["control"]["primaryAction"]["command"], "continue_task");
+            assert_eq!(row["control"]["primaryAction"]["input"], "optional_note");
+            assert!(
+                row["control"]["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Finish the work"),
+                "{row}"
+            );
+
+            let page = fixture
+                .route(
+                    "GET",
+                    "/api/worker-progress",
+                    &[("session", spawned.session_id.as_str()), ("after", "0")],
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(page["control"]["status"], "incomplete");
+            assert_eq!(page["control"]["outcome"], "incomplete");
+
+            writer
+                .append(
+                    ProgressKind::Status,
+                    json!({"state": "waiting_for_approval", "taskStatus": "incomplete"}),
+                )
+                .unwrap();
+            let page = fixture
+                .route(
+                    "GET",
+                    "/api/worker-progress",
+                    &[("session", spawned.session_id.as_str()), ("after", "0")],
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(page["control"]["needsDecision"], true);
+            assert_eq!(page["control"]["composer"], Value::Null);
+            assert_eq!(
+                page["control"]["primaryAction"]["command"],
+                "review_decision"
+            );
+
+            fixture.supervisor.shutdown_all();
+        }
+
         /// `after=` pages exactly, `alive` says whether this shell still holds
         /// the worker, and a session id that is not one is refused before any
         /// path is built from it.
@@ -16104,6 +16608,7 @@ exec /bin/cat > /dev/null
             assert_eq!(seqs, vec![2, 3]);
             assert_eq!(answer["events"][1]["payload"]["text"], "three");
             assert_eq!(answer["alive"], true);
+            assert_eq!(answer["control"]["headline"], "Starting worker");
             assert_eq!(page("3").unwrap()["events"], json!([]));
             assert_eq!(page("0").unwrap()["events"].as_array().unwrap().len(), 3);
 

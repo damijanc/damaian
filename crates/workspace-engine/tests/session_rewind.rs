@@ -552,10 +552,10 @@ fn clones_of_one_store_never_hand_out_a_duplicate_sequence_number() {
     );
 }
 
-/// §5.1's twelve states. Enumerated via `all()` rather than listed, so a
-/// variant added later fails these tests until it is given a string form, a
-/// terminality, and a side-effect answer — which is the mechanism that stops
-/// the state machine drifting away from the spec's table.
+/// Every state. Enumerated via `all()` rather than listed, so a variant added
+/// later fails these tests until it is given a string form, a terminality, and
+/// a side-effect answer — which is the mechanism that stops the state machine
+/// drifting away from the spec's table.
 #[test]
 fn every_state_round_trips_through_its_string_form() {
     for status in TaskStatus::all() {
@@ -594,6 +594,9 @@ fn terminal_states_are_exactly_these() {
         terminal,
         vec![
             "complete",
+            // Spec 101. Terminal for this run, but not successful: the work
+            // is still open, so a later Continue task resumes it.
+            "incomplete",
             "failed",
             "cancelled",
             "tool_budget_exhausted",

@@ -1931,6 +1931,14 @@ fn a_plan_under_review_is_handed_to_a_worker() {
         .find(|task| task.id == paused.task.id)
         .unwrap();
     assert_eq!(task.status, TaskStatus::Complete);
+    // Spec 101: handing the plan off still settles through the shared gate,
+    // so the completion has a durable report rather than a bypass.
+    let report = engine
+        .session_store
+        .read_completion_report(&paused.session.id, &paused.task.id)
+        .unwrap()
+        .expect("the hand-off settlement carries its report");
+    assert!(report.eligible, "{report:?}");
     let plan = plan_of(&engine, &paused).unwrap();
     assert!(
         plan.steps

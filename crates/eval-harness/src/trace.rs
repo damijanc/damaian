@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use workspace_engine::{ClientError, CommandPurpose, Result};
+use workspace_engine::{COMPLETION_SETTLEMENT_ACTION, ClientError, CommandPurpose, Result};
 
 use crate::record::{FindingsByPurpose, PurposeTally, RecordedToolCall};
 
@@ -162,7 +162,11 @@ pub fn tool_actions(data_dir: &Path) -> Result<Vec<RecordedToolCall>> {
             match event_type {
                 Some("action_started") => {
                     let action = text_field("action");
-                    if action == "model_call" {
+                    // `model_call` markers are model calls, not tools, and
+                    // `completion_settlement` is durable bookkeeping rather
+                    // than a dispatched tool (spec 101). Counting either here
+                    // would distort tool-call and error metrics.
+                    if action == "model_call" || action == COMPLETION_SETTLEMENT_ACTION {
                         continue;
                     }
                     started.push((text_field("markerId"), action, text_field("ref")));
@@ -263,6 +267,14 @@ fn rounds(data_dir: &Path) -> Result<Vec<Round>> {
                 }
                 continue;
             }
+            // A completion settlement is durable bookkeeping, not a dispatched
+            // tool (spec 101). It runs after the turn's last model call, so
+            // counting it would add a phantom tool round to every completed
+            // task and make round-budget assertions wrong in exactly the
+            // direction that hides their own subject.
+            if action == COMPLETION_SETTLEMENT_ACTION {
+                continue;
+            }
             let round = current.get_or_insert(Round { read_only: true });
             if !READ_ONLY_ACTION_MARKERS.contains(&action) && action != NOTES_ACTION_MARKER {
                 round.read_only = false;
@@ -336,6 +348,12 @@ fn action_markers(data_dir: &Path) -> Result<Vec<(String, String, String)>> {
                     .unwrap_or_default()
                     .to_string()
             };
+            // The settlement marker is bookkeeping, not an action, so every
+            // consumer of this generic marker reader agrees with
+            // [`tool_actions`] about what counts (spec 101).
+            if text("action") == COMPLETION_SETTLEMENT_ACTION {
+                continue;
+            }
             markers.push((text("taskId"), text("action"), text("ref")));
         }
     }
@@ -511,4 +529,53 @@ fn session_log_paths(data_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     }
     paths.sort();
     Ok(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_data_dir(name: &str) -> std::path::PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "damaian-trace-{name}-{now}-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join("sessions")).expect("sessions directory");
+        dir
+    }
+
+    /// Spec 101 writes a durable settlement marker after the last model call.
+    /// It is bookkeeping, not a dispatched tool, so it must not become a
+    /// phantom tool round or a recorded tool call in the scenario report.
+    #[test]
+    fn a_completion_settlement_marker_is_not_a_tool_round_or_call() {
+        let dir = temp_data_dir("settlement-round");
+        let log = dir.join("sessions/ses_1.jsonl");
+        let lines = [
+            r#"{"eventType":"action_started","payload":{"action":"model_call","taskId":"task_1","ref":"run"}}"#,
+            r#"{"eventType":"action_started","payload":{"action":"read_file","taskId":"task_1","ref":"src/a.rs","sideEffecting":false}}"#,
+            r#"{"eventType":"action_started","payload":{"action":"completion_settlement","taskId":"task_1","ref":"{}","sideEffecting":false}}"#,
+        ];
+        std::fs::write(&log, lines.join("\n")).unwrap();
+
+        assert_eq!(tool_rounds(&dir).unwrap(), 1);
+        assert_eq!(exploration_rounds(&dir).unwrap(), 1);
+
+        let calls = tool_actions(&dir).unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].name, "read_file");
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.name == COMPLETION_SETTLEMENT_ACTION)
+        );
+    }
 }
