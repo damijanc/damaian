@@ -1640,6 +1640,8 @@ mod tests {
                 &session.id,
                 &workspace_engine::WorkerRecord {
                     parent_session_id: None,
+                    parent_task_id: None,
+                    inherited_protected_paths: Vec::new(),
                     source_repository: PathBuf::from("/code/app"),
                     worktree_path: PathBuf::from("/code/app/.damaian/worktrees/w"),
                     branch: "damaian/w".to_string(),
@@ -1676,6 +1678,76 @@ mod tests {
         let error = apply_decision(&engine, &decision(&session.id, &task.id, "mark_failed"))
             .expect_err("a live worker's task is not a recovered task");
         assert!(error.contains("is not a recovered task"), "got {error}");
+    }
+
+    /// Spec 98: a reloaded session must not offer a patch card whose remaining
+    /// file became protected after the preview. The engine refuses the stale
+    /// card; the shell renders the ordinary unavailable outcome, never a patch
+    /// card the user could approve.
+    #[test]
+    fn a_reloaded_patch_card_with_a_newly_protected_file_is_unavailable() {
+        let (engine, data_dir) = engine("protected-reload");
+        let repo = data_dir.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        let session = engine
+            .session_store
+            .create_session(&workspace_engine::repository_id_for_root(&repo), "Reload")
+            .unwrap();
+        let task = task_left_in(
+            &engine,
+            &session.id,
+            "edit a.rs",
+            TaskStatus::WaitingForApproval,
+            None,
+        );
+        let patch = workspace_engine::ProposedPatch {
+            id: "patch_protected_reload".to_string(),
+            session_id: session.id.clone(),
+            origin_session_id: String::new(),
+            task_id: Some(task.id.clone()),
+            summary: "Waiting for review".to_string(),
+            status: "pending".to_string(),
+            created_at_ms: 1,
+            files: vec![workspace_engine::ProposedFilePatch {
+                path: "src/a.rs".to_string(),
+                status: "modified".to_string(),
+                base_hash: None,
+                new_hash: String::new(),
+                diff: String::new(),
+                hunks: Vec::new(),
+                new_content: "pub fn a() { let changed = true; }\n".to_string(),
+            }],
+        };
+        engine.patch_store.save(&patch).unwrap();
+        engine
+            .session_store
+            .await_approval(
+                &task,
+                &workspace_engine::PendingApprovalRef {
+                    kind: "patch".to_string(),
+                    proposal_id: patch.id.clone(),
+                },
+            )
+            .unwrap();
+        engine
+            .add_task_protected_paths(&repo, &session.id, &task.id, &["src/a.rs".to_string()])
+            .unwrap();
+
+        let (_swept, payload) = sweep(&engine);
+
+        assert!(
+            !payload.contains("\"kind\":\"patch\""),
+            "a pending patch with a newly protected file must not be offered: {payload}"
+        );
+        assert!(
+            payload.contains("\"kind\":\"unavailable\""),
+            "the stale card must become the ordinary unavailable outcome: {payload}"
+        );
+        assert!(payload.contains("protected task path"), "{payload}");
+        assert!(payload.contains("src/a.rs"), "{payload}");
+
+        let _ = fs::remove_dir_all(&data_dir);
     }
 
     /// §5.5 of spec 17: a task awaiting an approval nothing recorded is failed

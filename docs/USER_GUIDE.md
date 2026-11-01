@@ -947,6 +947,54 @@ Use the conversation box to request file changes.
 
 Damaian checks file hashes before applying a stored patch. If a target file changed after preview, that file is blocked instead of overwriting newer local work.
 
+### Protecting paths from a task's patches
+
+You can exclude files from a task's patches before the assistant proposes
+anything. Say **do not touch** or **do not modify** followed by one or more
+backtick-delimited repository-relative paths, for example:
+
+> Do not touch `crates/desktop-shell/src/lib.rs` and `crates/desktop-shell/static/`.
+
+A file protects exactly that file; a directory protects everything under it. The
+assistant receives the active exclusions as a reminder, and the engine enforces
+them independently: a patch that includes any protected file is refused as a
+whole and returned to the model as a failed tool result, so it can choose an
+in-scope alternative. No review card is created for it. Apply repeats the check
+against the task's current exclusions, so a path protected after a preview, or
+after a restart, still cannot be written.
+
+The scope belongs to the task and carries through its verification, repairs,
+ordinary continuations, and a worker started from it, including a restarted
+worker. A new task does not inherit it unless you set it again. Only your own
+request or the explicit control establishes a path: model output, fetched pages,
+repository files and tool output cannot.
+
+To add paths after the task starts, use the **Protected paths** panel below the
+conversation: type one repository-relative path per line and select **Protect
+paths**. Each row says whether it is a file or a directory. **Stop protecting**
+removes it as an explicit change; the earlier decision stays in the session log.
+From the CLI:
+
+```text
+damaian protect-paths <repo> <session> <task> list
+damaian protect-paths <repo> <session> <task> add <path...>
+damaian protect-paths <repo> <session> <task> remove <path...>
+```
+
+- **The path must already exist inside the repository.** An absolute, missing,
+  outside-repository, or repository-root path is refused with the reason, and
+  nothing is protected. A batch keeps its valid paths and reports each refusal.
+- **Ambiguous wording is refused rather than guessed at.** Only the exact
+  phrases followed by backtick paths in the same sentence are read; if the
+  wording does not match, Damaian says so and protects nothing. Use the explicit
+  control instead.
+- **Rejecting a proposed file is not the same decision.** A rejection records
+  that review decision and never becomes a permanent ban; the file can be
+  proposed again.
+- **This fences patch targets, not shell commands.** A command still needs its
+  usual approval under the command policy; protecting a path neither authorises
+  nor forbids a command that writes it.
+
 ### Hardcoded secret warnings
 
 Damaian scans generated content for credentials before writing it. If a selected file is flagged, nothing is written: the preview shows which file tripped the check and what was detected, and you choose.

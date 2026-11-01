@@ -23,6 +23,12 @@ use crate::memory::{MemoryStore, MemoryStoreConfig};
 use crate::navigation::NavigationController;
 use crate::patch_engine::PatchEngine;
 use crate::path_policy::PathPolicy;
+use crate::protected_paths::{
+    ProtectedPathAction, ProtectedPathPromptResult, ProtectedPathRefusal, ProtectedPathSource,
+    TaskProtectedPathUpdate, TaskProtectedPaths, TaskProtectedPathsControl,
+    canonicalize_protected_path_requests, protected_path_update_outcome,
+    record_task_protected_paths_from_prompt, resolve_active_protected_path,
+};
 use crate::repository_map::{MapLoad, RepositoryMap, RepositoryMapStore};
 use crate::repository_trust::RepositoryTrustStore;
 use crate::secret_scanner::SecretScanner;
@@ -717,6 +723,306 @@ impl WorkspaceEngine {
             language,
             session_id,
         )
+    }
+
+    /// The task's active protected paths (spec 98).
+    pub fn task_protected_paths(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<TaskProtectedPaths> {
+        self.session_store.task_protected_paths(session_id, task_id)
+    }
+
+    /// [`Self::task_protected_paths`] bound to the repository the caller is
+    /// looking at.
+    ///
+    /// The desktop and CLI controls take a repository root, a session id and a
+    /// task id from the request. Reading accepts only a session in that
+    /// repository, and an unknown task is refused by the store before anything
+    /// is returned; without this check a list request could reveal repository
+    /// A's protections while the user is looking at repository B.
+    pub fn task_protected_paths_in_repository(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<TaskProtectedPaths> {
+        self.ensure_protected_paths_repository(repository_root.as_ref(), session_id)?;
+        self.session_store.task_protected_paths(session_id, task_id)
+    }
+
+    /// The complete protected-path control for a repository and session.
+    ///
+    /// The target task is the newest one in durable creation order, never a
+    /// sorted id or a message scan. A session with no task returns an explicit
+    /// unavailable control, and the repository is checked before the task log
+    /// is read. Both the desktop session payload and the CLI list consume this
+    /// one selection and availability decision.
+    pub fn task_protected_paths_control(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+    ) -> Result<TaskProtectedPathsControl> {
+        self.ensure_protected_paths_repository(repository_root.as_ref(), session_id)?;
+        let tasks = self.session_store.read_tasks(session_id)?;
+        let Some(task) = tasks.last() else {
+            return Ok(TaskProtectedPathsControl::unavailable(
+                "No task is available to protect paths for in this session.",
+            ));
+        };
+        let active = self
+            .session_store
+            .task_protected_paths(session_id, &task.id)?;
+        Ok(TaskProtectedPathsControl::for_task(&task.id, &active))
+    }
+
+    /// The same shared control model for a named task, repository-bound.
+    ///
+    /// The CLI takes an explicit task and must keep operating on it even when
+    /// later tasks exist, so this is a view of that task rather than the
+    /// newest-task selection [`Self::task_protected_paths_control`] performs.
+    pub fn task_protected_paths_control_for_task(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<TaskProtectedPathsControl> {
+        let active =
+            self.task_protected_paths_in_repository(repository_root, session_id, task_id)?;
+        Ok(TaskProtectedPathsControl::for_task(task_id, &active))
+    }
+
+    /// Adds paths the user selected in the explicit control.
+    ///
+    /// Every path is canonicalised against this task's repository before any
+    /// event is written. Valid paths are recorded together; a missing,
+    /// absolute, outside-repository or non-file path is returned in `refused`
+    /// with the reason the user needs to see.
+    pub fn add_task_protected_paths(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+        task_id: &str,
+        requested: &[String],
+    ) -> Result<TaskProtectedPathUpdate> {
+        self.change_task_protected_paths(
+            repository_root.as_ref(),
+            session_id,
+            task_id,
+            requested,
+            ProtectedPathAction::Add,
+            false,
+        )
+    }
+
+    /// Adds paths for the desktop control's current task.
+    ///
+    /// This is the control-specific mutation: the engine re-selects the target
+    /// from durable creation order and refuses the supplied task if the user's
+    /// stale view named an older one, before canonicalisation or any event.
+    /// The generic [`Self::add_task_protected_paths`] deliberately has no such
+    /// restriction, so the CLI can edit a named older task.
+    pub fn add_current_task_protected_paths(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+        task_id: &str,
+        requested: &[String],
+    ) -> Result<TaskProtectedPathUpdate> {
+        self.change_task_protected_paths(
+            repository_root.as_ref(),
+            session_id,
+            task_id,
+            requested,
+            ProtectedPathAction::Add,
+            true,
+        )
+    }
+
+    /// Removes paths from the task's protected set as an explicit user action.
+    ///
+    /// Removal is an event, never a rewrite: the earlier add stays in the log.
+    /// A path that is not currently protected is refused rather than recorded
+    /// as a no-op, so the user sees that the control did nothing.
+    pub fn remove_task_protected_paths(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+        task_id: &str,
+        requested: &[String],
+    ) -> Result<TaskProtectedPathUpdate> {
+        self.change_task_protected_paths(
+            repository_root.as_ref(),
+            session_id,
+            task_id,
+            requested,
+            ProtectedPathAction::Remove,
+            false,
+        )
+    }
+
+    /// Removes paths for the desktop control's current task. See
+    /// [`Self::add_current_task_protected_paths`] for the stale-target rule.
+    pub fn remove_current_task_protected_paths(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+        task_id: &str,
+        requested: &[String],
+    ) -> Result<TaskProtectedPathUpdate> {
+        self.change_task_protected_paths(
+            repository_root.as_ref(),
+            session_id,
+            task_id,
+            requested,
+            ProtectedPathAction::Remove,
+            true,
+        )
+    }
+
+    /// Applies the narrow direct-user grammar to the prompt the user typed.
+    ///
+    /// This is the only text-reading entry point for protections. It must not
+    /// be called with model output, fetched content, a repository file or tool
+    /// output; those are data, not a user's scope decision.
+    pub fn record_task_protected_paths_from_prompt(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+        task_id: &str,
+        prompt: &str,
+    ) -> Result<ProtectedPathPromptResult> {
+        record_task_protected_paths_from_prompt(
+            &self.session_store,
+            &self.path_policy,
+            repository_root.as_ref(),
+            session_id,
+            task_id,
+            prompt,
+        )
+    }
+
+    fn change_task_protected_paths(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        task_id: &str,
+        requested: &[String],
+        action: ProtectedPathAction,
+        require_current_control: bool,
+    ) -> Result<TaskProtectedPathUpdate> {
+        self.ensure_protected_paths_repository(repository_root, session_id)?;
+        self.session_store.task(session_id, task_id)?;
+        if require_current_control {
+            self.ensure_current_control_task(repository_root, session_id, task_id)?;
+        }
+        // Blank lines from a textarea are transport noise, not path requests.
+        // Trimming and dropping them here keeps both front ends from having to
+        // reproduce the engine's empty-input semantics.
+        let requested = requested
+            .iter()
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        let (accepted, refused) = if action == ProtectedPathAction::Remove {
+            // Removal is a match against the durable canonical set, never a
+            // filesystem lookup: the file or directory may already be deleted
+            // or renamed, and it was protected before that happened.
+            let active = self
+                .session_store
+                .task_protected_paths(session_id, task_id)?;
+            let mut accepted = Vec::new();
+            let mut refused = Vec::new();
+            for requested in requested {
+                match resolve_active_protected_path(&active, &requested) {
+                    Ok(protected) => {
+                        if !accepted.contains(&protected) {
+                            accepted.push(protected);
+                        }
+                    }
+                    Err(error) => refused.push(ProtectedPathRefusal {
+                        requested: requested.trim().to_string(),
+                        error,
+                    }),
+                }
+            }
+            (accepted, refused)
+        } else {
+            canonicalize_protected_path_requests(&self.path_policy, repository_root, &requested)
+        };
+        if !accepted.is_empty() {
+            self.session_store.record_task_protected_paths(
+                session_id,
+                task_id,
+                action,
+                &accepted,
+                ProtectedPathSource::ExplicitControl,
+            )?;
+        }
+        let active = self
+            .session_store
+            .task_protected_paths(session_id, task_id)?;
+        let control = TaskProtectedPathsControl::for_task(task_id, &active);
+        let outcome = protected_path_update_outcome(action, &accepted, &refused);
+        Ok(TaskProtectedPathUpdate {
+            task_id: task_id.to_string(),
+            action,
+            source: ProtectedPathSource::ExplicitControl,
+            accepted,
+            refused,
+            active: active.paths,
+            control,
+            outcome,
+        })
+    }
+
+    /// Refuses a desktop-control mutation whose supplied task is no longer the
+    /// engine-selected target. Generic explicit mutations do not call this.
+    fn ensure_current_control_task(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<()> {
+        let control = self.task_protected_paths_control(repository_root, session_id)?;
+        if control.available && control.task_id == task_id {
+            return Ok(());
+        }
+        let target = if control.available {
+            control.task_id.as_str()
+        } else {
+            "no task"
+        };
+        Err(ClientError::InvalidInput(format!(
+            "The protected-path control now targets {target}."
+        )))
+    }
+
+    /// Refuses a protected-path operation when the supplied root is not the
+    /// repository the session belongs to.
+    ///
+    /// Without this check, a path from repository A could be canonicalised and
+    /// written onto a task in repository B. It runs before canonicalisation and
+    /// before any event is appended.
+    fn ensure_protected_paths_repository(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+    ) -> Result<()> {
+        let Some(session) = self.session_store.read_session(session_id)? else {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown session: {session_id}"
+            )));
+        };
+        let repository_id = repository_id_for_root(repository_root);
+        if repository_id != session.repository_id {
+            return Err(ClientError::AccessDenied(format!(
+                "Session {session_id} does not belong to repository {}",
+                repository_root.display()
+            )));
+        }
+        Ok(())
     }
 }
 

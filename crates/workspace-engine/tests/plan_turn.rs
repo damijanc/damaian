@@ -1883,10 +1883,15 @@ fn a_plan_under_review_is_handed_to_a_worker() {
         .expect("the plan should be put up");
     let plan = plan_of(&engine, &paused).expect("a plan");
 
-    let prompt = engine
+    let handoff = engine
         .chat_orchestrator
         .plan_worker_prompt(&proposal.id, None)
         .unwrap();
+    assert_eq!(
+        handoff.task_id, paused.task.id,
+        "the spawn request must carry the paused plan task, not the plan proposal id"
+    );
+    let prompt = handoff.prompt;
     assert!(
         prompt.starts_with("Add retry handling to the upload client"),
         "{prompt}"
@@ -1908,7 +1913,8 @@ fn a_plan_under_review_is_handed_to_a_worker() {
                 title: "Add a capped backoff".to_string(),
             }]),
         )
-        .unwrap();
+        .unwrap()
+        .prompt;
     assert!(revised.contains("1. Add a capped backoff\n"), "{revised}");
     assert!(!revised.contains("Read the retry helper"), "{revised}");
 

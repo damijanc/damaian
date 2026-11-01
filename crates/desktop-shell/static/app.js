@@ -6099,6 +6099,9 @@ function clearSessionList() {
 function clearChat() {
   stopWorkerView();
   $("chat-log").innerHTML = "";
+  protectedPathsControl = null;
+  $("protected-paths-panel").hidden = true;
+  showProtectedPathOutcome("");
   sessionHasRecordedDiagnostics = false;
   // Every caller means "no conversation": a new, deleted or unselected
   // session. The findings belong to the conversation that just left.
@@ -6999,6 +7002,7 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
         drawBoundaryBefore(message);
         const bubble = renderActivityGroup(activity);
         if (message.seq) bubble.message.dataset.seq = message.seq;
+        if (message.taskId) bubble.message.dataset.taskId = message.taskId;
         return { message, bubble };
       }
       if (groupedMessageIds.has(message.id)) return null;
@@ -7043,6 +7047,7 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
       }
       const bubble = appendChatMessage(message.role, message.content);
       if (message.seq) bubble.message.dataset.seq = message.seq;
+      if (message.taskId) bubble.message.dataset.taskId = message.taskId;
       if (message.role === "user") {
         const checkpoint = sessionCheckpoints.find((entry) => entry.userMessageId === message.id);
         if (checkpoint) markMessageRewindable(bubble, checkpoint);
@@ -7294,6 +7299,118 @@ async function renderRecoveryPrompts(sessionId) {
     $("chat-log").append(card);
   });
   cards[0]?.scrollIntoView({ block: "nearest" });
+}
+
+// Spec 98 Task 4: this view is render-and-submit only. The shell chooses the
+// target task from durable creation order, validates every request and returns
+// all labels, notes, rows and outcome text. JavaScript never selects a task,
+// decides availability, parses the textarea, or interprets accepted/refused.
+let protectedPathsControl = null;
+
+function setProtectedPathsEnabled(enabled) {
+  $("protected-paths-input").disabled = !enabled;
+  $("protected-paths-add").disabled = !enabled;
+}
+
+function showProtectedPathOutcome(message = "") {
+  const outcome = $("protected-paths-outcome");
+  outcome.textContent = message;
+  outcome.hidden = message === "";
+}
+
+function renderProtectedPathsControl(control) {
+  $("protected-paths-panel").hidden = false;
+  protectedPathsControl = control || {
+    available: false,
+    taskId: "",
+    taskLabel: "",
+    note: "",
+    rows: [],
+  };
+  $("protected-paths-task").textContent = protectedPathsControl.taskLabel || "";
+  const note = $("protected-paths-note");
+  note.textContent = protectedPathsControl.note || "";
+  note.hidden = !protectedPathsControl.note;
+  setProtectedPathsEnabled(protectedPathsControl.available === true);
+  const list = $("protected-paths-list");
+  list.replaceChildren();
+  (protectedPathsControl.rows || []).forEach((row) => {
+    const item = document.createElement("li");
+    item.className = "protected-path-row";
+    item.dataset.kind = row.kind;
+    const name = document.createElement("code");
+    name.textContent = row.path;
+    const kind = document.createElement("span");
+    kind.className = "protected-path-kind";
+    kind.textContent = row.kindLabel;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "btn-sm btn-quiet protected-path-remove";
+    remove.textContent = "Stop protecting";
+    remove.setAttribute("aria-label", row.removeLabel);
+    remove.addEventListener("click", () => void removeProtectedPath(row.path));
+    item.append(name, kind, remove);
+    list.append(item);
+  });
+}
+
+function protectedPathRequestIsCurrent(repoPath, sessionId, taskId) {
+  return (
+    repo() === repoPath &&
+    currentSessionId === sessionId &&
+    protectedPathsControl?.taskId === taskId
+  );
+}
+
+async function addProtectedPaths() {
+  const control = protectedPathsControl;
+  const repoPath = repo();
+  const sessionId = currentSessionId;
+  if (!control?.taskId || !repoPath || !sessionId) return;
+  const taskId = control.taskId;
+  try {
+    const payload = await api(
+      "/api/protected-paths-add",
+      form({
+        repo: repoPath,
+        session_id: sessionId,
+        task_id: taskId,
+        paths: $("protected-paths-input").value,
+      }),
+    );
+    if (!protectedPathRequestIsCurrent(repoPath, sessionId, taskId)) return;
+    $("protected-paths-input").value = "";
+    renderProtectedPathsControl(payload.protectedPathsControl);
+    showProtectedPathOutcome(payload.outcome);
+  } catch (error) {
+    if (!protectedPathRequestIsCurrent(repoPath, sessionId, taskId)) return;
+    showProtectedPathOutcome(errorMessage(error));
+  }
+}
+
+async function removeProtectedPath(path) {
+  const control = protectedPathsControl;
+  const repoPath = repo();
+  const sessionId = currentSessionId;
+  if (!control?.taskId || !repoPath || !sessionId) return;
+  const taskId = control.taskId;
+  try {
+    const payload = await api(
+      "/api/protected-paths-remove",
+      form({
+        repo: repoPath,
+        session_id: sessionId,
+        task_id: taskId,
+        paths: path,
+      }),
+    );
+    if (!protectedPathRequestIsCurrent(repoPath, sessionId, taskId)) return;
+    renderProtectedPathsControl(payload.protectedPathsControl);
+    showProtectedPathOutcome(payload.outcome);
+  } catch (error) {
+    if (!protectedPathRequestIsCurrent(repoPath, sessionId, taskId)) return;
+    showProtectedPathOutcome(errorMessage(error));
+  }
 }
 
 // Spec 29 §5.7: the pending-proposal stack. It is rendered after the turn's
@@ -8374,6 +8491,9 @@ function attachWorkerPromptActions(target, sessionId) {
     const pre = code.parentElement;
     if (pre.nextElementSibling?.classList.contains("worker-prompt-footer")) return;
     const prompt = workerPromptText(code);
+    // The task that produced this assistant message owns the paths the worker
+    // should inherit. Set when the message rendered or its turn finished.
+    const parentTaskId = target.message.dataset.taskId || "";
     const footer = document.createElement("div");
     footer.className = "worker-prompt-footer";
     const start = document.createElement("button");
@@ -8381,7 +8501,11 @@ function attachWorkerPromptActions(target, sessionId) {
     start.className = "btn-sm";
     start.textContent = "Start worker";
     start.addEventListener("click", async () => {
-      const started = await showNewWorkerDialog({ prompt, parentSessionId: sessionId });
+      const started = await showNewWorkerDialog({
+        prompt,
+        parentSessionId: sessionId,
+        parentTaskId,
+      });
       if (!started) return;
       footer.append(createWorkerLink(started, "Started"));
       appendSpawnedWorkerEntry(target.message, started);
@@ -8576,7 +8700,7 @@ function describeUncommittedFiles(status) {
 
 // "New worker" (§5.1 Dialog), built the way `showRewindDialog` is. Resolves
 // to the spawned worker's row, or null when cancelled.
-function showNewWorkerDialog({ prompt = "", parentSessionId = "" } = {}) {
+function showNewWorkerDialog({ prompt = "", parentSessionId = "", parentTaskId = "" } = {}) {
   const repoPath = repo();
   return new Promise((resolve) => {
     const backdrop = document.createElement("div");
@@ -8678,6 +8802,7 @@ function showNewWorkerDialog({ prompt = "", parentSessionId = "" } = {}) {
             prompt: text,
             include_uncommitted: include ? "true" : "false",
             parent_session_id: parentSessionId,
+            parent_task_id: parentTaskId,
           }),
         );
         const row = {
@@ -12469,6 +12594,7 @@ function createFetchApproval(proposal, proposalRepo) {
               currentSessionId = payload.sessionId;
               localStorage.setItem(lastSessionStorageKey(), currentSessionId);
             }
+            if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
@@ -13172,6 +13298,7 @@ function createFallbackOffer(proposal, proposalRepo) {
               currentSessionId = payload.sessionId;
               localStorage.setItem(lastSessionStorageKey(), currentSessionId);
             }
+            if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
@@ -13463,6 +13590,7 @@ function createRoundBudgetOffer(proposal, proposalRepo) {
               currentSessionId = payload.sessionId;
               localStorage.setItem(lastSessionStorageKey(), currentSessionId);
             }
+            if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
@@ -13718,6 +13846,7 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
               currentSessionId = payload.sessionId;
               localStorage.setItem(lastSessionStorageKey(), currentSessionId);
             }
+            if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
@@ -13770,7 +13899,7 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
     const sessionId = currentSessionId;
     const revision = revisionOrNull();
     try {
-      const { prompt } = await api(
+      const { prompt, taskId } = await api(
         "/api/plan-worker-prompt",
         form({
           repo: proposalRepo,
@@ -13778,7 +13907,11 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
           steps: revision ? JSON.stringify(revision) : "",
         }),
       );
-      const started = await showNewWorkerDialog({ prompt, parentSessionId: sessionId });
+      const started = await showNewWorkerDialog({
+        prompt,
+        parentSessionId: sessionId,
+        parentTaskId: taskId || proposal.plan?.taskId || "",
+      });
       if (!started) return;
       await api(
         "/api/plan-to-worker",
@@ -14415,6 +14548,7 @@ function createCommandApprovalPreview(
               currentSessionId = payload.sessionId;
               localStorage.setItem(lastSessionStorageKey(), currentSessionId);
             }
+            if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
@@ -14548,7 +14682,9 @@ async function loadSession(sessionId) {
   }
   // A rewind reloads the session through here, so it refreshes the bar too.
   void refreshRepoBar();
-  const payload = await api(`/api/session?session_id=${encodeURIComponent(sessionId)}`);
+  const payload = await api(
+    `/api/session?repo=${encodeURIComponent(repo())}&session_id=${encodeURIComponent(sessionId)}`,
+  );
   currentSessionId = payload.session.id;
   currentSessionMode = { sessionId: payload.session.id, mode: payload.session.mode || "code" };
   localStorage.setItem(lastSessionStorageKey(), currentSessionId);
@@ -14569,6 +14705,10 @@ async function loadSession(sessionId) {
   // Spec 100: a completed worker's durable result follows the conversation it
   // belongs to, with its own explicit continuation.
   renderWorkerResultCards(payload.workerReturns);
+  // Spec 98 Task 4: the explicit protected-path control is server-computed in
+  // this same payload, so a reload needs no second decision-making fetch.
+  renderProtectedPathsControl(payload.protectedPathsControl);
+  showProtectedPathOutcome("");
   // Spec 96: a reloaded report is text, so the explicit continuation comes
   // from the durable outcome. It follows the verification turn's last message.
   renderContinueRepairOffer(rendered, payload.verification, currentSessionId);
@@ -14803,6 +14943,11 @@ $("context-pin-btn").addEventListener("click", async () => {
   } catch (error) {
     toast(error.message);
   }
+});
+
+$("protected-paths-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  addProtectedPaths().catch((error) => toast(error.message));
 });
 
 $("context-pins-clear").addEventListener("click", () => {
@@ -15278,6 +15423,7 @@ async function sendChatPrompt(options = {}) {
           currentSessionId = payload.sessionId;
           localStorage.setItem(lastSessionStorageKey(), currentSessionId);
           persistPinnedContextForSession(currentSessionId);
+          if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
           if (payload.response && payload.response !== assistantText) {
             assistantText = payload.response;
           }

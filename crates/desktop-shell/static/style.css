@@ -6267,6 +6267,81 @@ body.worker-view #chat-model-menu {
   text-decoration: underline;
 }
 
+/* Spec 98 Task 4: the explicit protected-path control below the conversation.
+   The server owns the durable set; this panel only shows the newest task's
+   active paths and offers add and per-path removal. */
+.protected-paths-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 16px;
+}
+
+.protected-paths-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.protected-paths-task {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.protected-paths-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.protected-paths-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+}
+
+.protected-path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+}
+
+.protected-path-row code {
+  font-size: 12px;
+}
+
+.protected-path-kind {
+  color: var(--muted);
+  font-size: 11px;
+  flex: 1;
+}
+
+.protected-paths-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.protected-paths-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.protected-paths-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 /* Spec 29: pending memory proposals. A separate stack below the conversation,
    never a transcript message, so a suggestion cannot become model context. */
 .memory-proposal-stack {

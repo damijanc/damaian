@@ -51,6 +51,10 @@ use crate::patch_engine::{PatchEngine, ProposedChange, ProposedFilePatch, Propos
 use crate::path_policy::PathPolicy;
 use crate::plan::{Evidence, PlanStep, StepStatus, TaskPlan, status_from_evidence};
 use crate::process_registry::ProcessRegistry;
+use crate::protected_paths::{
+    ProtectedPathAction, ProtectedPathSource, TaskProtectedPaths, ensure_patch_paths_allowed,
+    protected_paths_reminder, record_task_protected_paths_from_prompt,
+};
 use crate::repository_map::RepositoryMapStore;
 use crate::secret_scanner::SecretScanner;
 use crate::session::{
@@ -316,6 +320,14 @@ pub enum TurnProgress {
     NoteAdded {
         message_id: String,
     },
+    /// The task's active protected paths at the start of this turn (spec 98).
+    ///
+    /// This is the resolved durable record, not a re-parse of any prompt, and
+    /// it carries the task id so a viewer can join it to the turn. A worker's
+    /// progress sink writes it as its own line. The desktop panel reads the same
+    /// record from the session payload, so the shell's SSE relay does not need a
+    /// second rendering route.
+    ProtectedPaths(TaskProtectedPaths),
 }
 
 /// The per-turn side channel: where answer tokens go, where progress goes, and
@@ -484,6 +496,17 @@ pub struct AgentPlanProposal {
     /// progress line uses — so the card can say what the approval unblocks
     /// rather than asking the user to approve in the abstract.
     pub deferred_action: String,
+}
+
+/// A prompt for a worker started from a paused plan, and the task whose
+/// protections the worker inherits (spec 94, spec 98).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanWorkerPrompt {
+    pub prompt: String,
+    /// The paused plan task's id. The shell passes it with the spawn request so
+    /// the worker snapshots that task's durable protected paths rather than
+    /// re-parsing this constructed prompt.
+    pub task_id: String,
 }
 
 /// A question the model asked mid-turn, waiting for the user's answer
@@ -990,6 +1013,136 @@ impl ChatOrchestrator {
         Ok(())
     }
 
+    /// Applies the narrow protected-path grammar to a prompt the user typed.
+    ///
+    /// Only the original direct-user task boundary calls this. A continuation's
+    /// prompt is constructed by Damaian, so it inherits through task ancestry
+    /// and is never re-parsed. A refusal is shown as an engine line and writes
+    /// no protection event.
+    fn record_direct_prompt_protected_paths(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        task_id: &str,
+        prompt: &str,
+    ) -> Result<()> {
+        let result = record_task_protected_paths_from_prompt(
+            &self.session_store,
+            &self.path_policy,
+            repository_root,
+            session_id,
+            task_id,
+            prompt,
+        )?;
+        match result {
+            crate::protected_paths::ProtectedPathPromptResult::NoRequest => Ok(()),
+            crate::protected_paths::ProtectedPathPromptResult::Refused(error) => self
+                .announce_protected_path_refusal(
+                    session_id,
+                    task_id,
+                    &format!("Protected paths were not recorded: {error}"),
+                ),
+            crate::protected_paths::ProtectedPathPromptResult::Recorded(update) => {
+                for refusal in &update.refused {
+                    self.announce_protected_path_refusal(
+                        session_id,
+                        task_id,
+                        &format!("Protected path was not recorded: {}", refusal.message()),
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Copies a worker's spawn-time snapshot onto its first task.
+    ///
+    /// The parent and its worker are separate sessions, so `plan_resumed`
+    /// ancestry cannot carry protected paths across the handoff. The snapshot
+    /// was resolved from the parent task's durable record at spawn and stored
+    /// in the worker's own `WorkerRecord`; this writes one
+    /// `inherited_worker_handoff` event on the first task, before its first
+    /// model request. It never inspects the prompt, which may be model text.
+    ///
+    /// Only the first task is seeded. A later user-started task in the same
+    /// worker session starts empty, exactly as a new task in any other session
+    /// does. The source check makes a restart idempotent: a task that already
+    /// has its handoff event gets no second one.
+    fn seed_worker_inherited_protected_paths(&self, session_id: &str, task: &Task) -> Result<()> {
+        let Some(record) = self.session_store.worker_record(session_id)? else {
+            return Ok(());
+        };
+        if record.inherited_protected_paths.is_empty() {
+            return Ok(());
+        }
+        let is_first_task = self
+            .session_store
+            .read_tasks(session_id)?
+            .first()
+            .is_some_and(|first| first.id == task.id);
+        if !is_first_task {
+            return Ok(());
+        }
+        let already_seeded = self
+            .session_store
+            .read_task_protected_path_events(session_id)?
+            .iter()
+            .any(|event| {
+                event.task_id == task.id
+                    && event.source == ProtectedPathSource::InheritedWorkerHandoff
+            });
+        if already_seeded {
+            return Ok(());
+        }
+        self.session_store.record_task_protected_paths(
+            session_id,
+            &task.id,
+            ProtectedPathAction::Add,
+            &record.inherited_protected_paths,
+            ProtectedPathSource::InheritedWorkerHandoff,
+        )?;
+        Ok(())
+    }
+
+    fn announce_protected_path_refusal(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        message: &str,
+    ) -> Result<()> {
+        self.session_store.append_message_with_kind(
+            session_id,
+            Some(task_id),
+            "assistant",
+            message,
+            Some("protected_path_refusal"),
+        )?;
+        self.audit_log.record(
+            "task_protected_path_refusal",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("taskId", task_id.to_string()),
+                ("message", message.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Resolves the task's durable exclusions and refuses a whole proposal if
+    /// any file it would change is covered.
+    fn ensure_patch_not_protected(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        patch: &ProposedPatch,
+    ) -> Result<()> {
+        let active = self
+            .session_store
+            .task_protected_paths(session_id, task_id)?;
+        ensure_patch_paths_allowed(&active, patch.files.iter().map(|file| file.path.as_str()))
+    }
+
     fn default_tool_round_limit(&self) -> u32 {
         self.config
             .agent_max_tool_rounds
@@ -1328,6 +1481,12 @@ impl ChatOrchestrator {
         // takes the user's prompt with it rather than leaving a question the
         // conversation no longer answers. A continuation already has its task
         // and the position the store recorded just before creating it.
+        //
+        // A pre-created task or a worker's own session is constructed text, not
+        // a direct user request, so only this ordinary path reads the prompt
+        // for protected paths (spec 98 §2.1).
+        let is_direct_user_task =
+            existing_task.is_none() && self.session_store.worker_record(&session.id)?.is_none();
         let (position, mut task) = match existing_task {
             Some((task, position)) => {
                 // This is a public entry point, so it must not be usable to
@@ -1370,6 +1529,10 @@ impl ChatOrchestrator {
                 (position, task)
             }
         };
+        // A worker's first task receives the parent task's spawn-time snapshot
+        // before anything can reach the model. This is the cross-session
+        // handoff edge; later continuations inherit through ordinary ancestry.
+        self.seed_worker_inherited_protected_paths(&session.id, &task)?;
         // Context assembly is the next thing to happen, and it is read-only,
         // so a crash here is resumable. The finer in-flight states are set at
         // the action sites when their markers go in.
@@ -1431,6 +1594,14 @@ impl ChatOrchestrator {
         let user_message =
             self.session_store
                 .append_message(&session.id, Some(&task.id), "user", prompt)?;
+        if is_direct_user_task {
+            self.record_direct_prompt_protected_paths(
+                repository_root,
+                &session.id,
+                &task.id,
+                prompt,
+            )?;
+        }
         // Spec 29 §5.2: an explicit request is still a proposal. The user's own
         // sentence is the statement, so no model paraphrase or extra round trip
         // sits between what they asked and what the card will show.
@@ -4332,7 +4503,7 @@ impl ChatOrchestrator {
         &self,
         proposal_id: &str,
         revised: Option<Vec<PlanRevisionStep>>,
-    ) -> Result<String> {
+    ) -> Result<PlanWorkerPrompt> {
         let pending = self.pending_commands.load(proposal_id)?;
         if pending.plan_review.is_none() {
             return Err(ClientError::InvalidInput(format!(
@@ -4380,7 +4551,10 @@ impl ChatOrchestrator {
                 prompt.push_str(&format!("{}. {step}\n", index + 1));
             }
         }
-        Ok(prompt)
+        Ok(PlanWorkerPrompt {
+            prompt,
+            task_id: pending.task.id,
+        })
     }
 
     /// Ends a turn paused on its plan review because the user started a
@@ -6534,6 +6708,21 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
         turn_options: ChatTurnOptions,
     ) -> Result<ChatTurnResult> {
+        // Every turn and inherited continuation gets the durable exclusions as
+        // a reminder. This is never the enforcement boundary: proposal and
+        // apply resolve the same record themselves (spec 98 §2.7). A resumed
+        // turn may carry a reminder from its paused messages, so this replaces
+        // that block rather than appending a second one. A read failure fails
+        // closed: running without the reminder would silently drop a
+        // user-owned constraint.
+        let active_protected = self
+            .session_store
+            .task_protected_paths(&session.id, &task.id)?;
+        // The worker writes this as its own progress line: the resolved typed
+        // record, with the task id, so a board can show the active exclusions
+        // without re-deriving them from a prompt or message text.
+        sink.progress(TurnProgress::ProtectedPaths(active_protected.clone()));
+        apply_protected_paths_reminder(&mut messages, &active_protected, &self.scanner);
         // Per-turn MCP runtime: connects lazily, caches tool lists and
         // connections for this turn, and tears everything down on drop.
         let mut mcp = self.build_mcp_runtime(&session.id);
@@ -8154,6 +8343,10 @@ impl ChatOrchestrator {
                                         Some(&task.id),
                                         &generated_edit.summary,
                                     )
+                                })
+                                .and_then(|patch| {
+                                    self.ensure_patch_not_protected(&session.id, &task.id, &patch)
+                                        .map(|()| patch)
                                 }) {
                                 Ok(patch) => {
                                     // See `ProposedPatch::session_id`: the engine does
@@ -8432,6 +8625,10 @@ impl ChatOrchestrator {
                                         Some(&task.id),
                                         &summary,
                                     )
+                                })
+                                .and_then(|patch| {
+                                    self.ensure_patch_not_protected(&session.id, &task.id, &patch)
+                                        .map(|()| patch)
                                 }) {
                                 Ok(patch) => {
                                     // See `ProposedPatch::session_id`: the engine does
@@ -11541,6 +11738,37 @@ pub const WORKER_HANDOFF_PARAGRAPH: &str = "When work should continue in a separ
 /// is a worker's task. A session that made a worktree itself and then edited
 /// the main checkout is how this was found (spec 76).
 pub const WORKTREE_TASK_PARAGRAPH: &str = "Your edits and commands always apply to this session's checkout. The `worktree` argument of the read tools only reads. When the user asks for work on a new branch or in a separate git worktree, do not create a worktree yourself: recommend a worker in a ```worker-prompt block, which runs it in a worktree of its own. If the user explicitly chooses to work in this session instead, for example with *Work here instead*, do the work in the current checkout; that choice does not create or select another worktree.";
+
+/// Marks the protected-path reminder inside the system message so a resumed
+/// turn can replace it instead of stacking copies.
+const PROTECTED_PATHS_REMINDER_MARKER: &str = "\n\n[protected task paths]";
+
+/// Appends or replaces the task's protected-path reminder in the system
+/// message. The reminder is derived from the durable resolved set every turn;
+/// it never re-parses a prompt.
+///
+/// The reminder reaches the model, so it passes the secret scanner like every
+/// other inserted model-facing text. A repository can have a credential-shaped
+/// file name, and the path is still a detected credential once it leaves the
+/// machine.
+pub(crate) fn apply_protected_paths_reminder(
+    messages: &mut [ModelMessage],
+    active: &TaskProtectedPaths,
+    scanner: &SecretScanner,
+) {
+    let Some(system) = messages.iter_mut().find(|message| message.role == "system") else {
+        return;
+    };
+    if let Some(start) = system.content.find(PROTECTED_PATHS_REMINDER_MARKER) {
+        system.content.truncate(start);
+    }
+    if let Some(reminder) = protected_paths_reminder(active) {
+        let reminder = scanner.redact(&reminder).text;
+        system.content.push_str(PROTECTED_PATHS_REMINDER_MARKER);
+        system.content.push('\n');
+        system.content.push_str(&reminder);
+    }
+}
 
 /// [`system_prompt`] plus the handoff paragraph when the session is offered
 /// handoffs. `system_prompt` itself never changes, which is how the setting
@@ -15520,6 +15748,8 @@ mod worker_handoff_tests {
                 &session_id,
                 &WorkerRecord {
                     parent_session_id: None,
+                    parent_task_id: None,
+                    inherited_protected_paths: Vec::new(),
                     source_repository: repo.clone(),
                     worktree_path: repo.join(".damaian/worktrees/worker"),
                     branch: "damaian/worker".to_string(),
@@ -15757,6 +15987,7 @@ mod mode_refusal_tests {
     use crate::config::{McpServerConfig, ModelProviderConfig};
     use crate::mode::SessionMode;
     use crate::model::MockModelAdapter;
+    use crate::protected_paths::ProtectedPathSource;
     use crate::web_diagnostics::{WebDiagnosticReport, WebDiagnosticsRunner};
     use crate::workspace_engine::WorkspaceEngine;
     use std::sync::Arc;
@@ -17132,6 +17363,197 @@ done
         assert!(
             result.patch_proposal.is_some(),
             "the turn's captured Code mode must still govern its own round"
+        );
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    /// Spec 98: a continuation inherits the durable reminder and never parses
+    /// its own constructed prompt for new protections.
+    #[test]
+    fn a_continuation_gets_the_inherited_reminder_without_reparsing_its_prompt() {
+        let repo = temp_repo("protected-reminder");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        fs::write(repo.join("src/other.rs"), "pub fn other() {}\n").unwrap();
+        let engine = engine_with(&repo);
+        let repository_id = crate::hash::repository_id_for_root(&repo);
+        let session = engine
+            .session_store
+            .create_session(&repository_id, "Continuation")
+            .unwrap();
+        engine
+            .session_store
+            .set_session_mode(&session.id, SessionMode::Code, "user")
+            .unwrap();
+        let patch_task = engine
+            .session_store
+            .create_task(&session.id, "Do the work.", "mock", "mock")
+            .unwrap();
+        engine
+            .record_task_protected_paths_from_prompt(
+                &repo,
+                &session.id,
+                &patch_task.id,
+                "Do not touch `src/a.rs`.",
+            )
+            .unwrap();
+        let plan = TaskPlan::new(&patch_task.id, now_millis());
+        engine
+            .session_store
+            .create_plan(&patch_task, &plan)
+            .unwrap();
+        let verification_task = engine
+            .session_store
+            .create_task(&session.id, "Verify.", "mock", "mock")
+            .unwrap();
+        engine
+            .session_store
+            .resume_plan(&verification_task, &patch_task.id)
+            .unwrap();
+        let verification_task = engine
+            .session_store
+            .update_task_status(&verification_task, TaskStatus::PreparingContext, None)
+            .unwrap();
+
+        let messages = vec![
+            ModelMessage::system("Base system prompt."),
+            ModelMessage::user(
+                "Verify the patch. Do not touch `src/other.rs` in this constructed prompt.",
+            ),
+        ];
+        let mut adapter = MockModelAdapter::new("Done.");
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        engine
+            .chat_orchestrator
+            .run_agentic_turn(
+                &repo,
+                session.clone(),
+                verification_task.clone(),
+                Vec::new(),
+                messages,
+                0,
+                0,
+                TurnNotesState::default(),
+                Vec::new(),
+                false,
+                &mut adapter,
+                &mut sink,
+                ChatTurnOptions::default(),
+            )
+            .unwrap();
+
+        let system = &adapter.requests[0].messages[0].content;
+        assert!(
+            system.contains("The user excluded these task paths") && system.contains("src/a.rs"),
+            "{system}"
+        );
+        assert!(!system.contains("src/other.rs"), "{system}");
+        let inherited = engine
+            .session_store
+            .task_protected_paths(&session.id, &verification_task.id)
+            .unwrap();
+        assert_eq!(inherited.path_list(), vec!["src/a.rs".to_string()]);
+        let events = engine
+            .session_store
+            .read_task_protected_path_events(&session.id)
+            .unwrap();
+        assert_eq!(events.len(), 1, "the continuation must add no event");
+        assert_eq!(events[0].source, ProtectedPathSource::Prompt);
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    /// Spec 98: the reminder is inserted into the system message, which leaves
+    /// the machine, so a credential-shaped protected path is redacted there
+    /// exactly as it is in the worker progress file.
+    #[test]
+    fn a_protected_path_reminder_is_redacted_before_the_model() {
+        const SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let active = TaskProtectedPaths {
+            task_id: "task_1".to_string(),
+            paths: vec![crate::protected_paths::ProtectedPath {
+                path: format!("notes/{SECRET}"),
+                kind: crate::protected_paths::ProtectedPathKind::Directory,
+            }],
+        };
+        let mut messages = vec![ModelMessage::system("Base system prompt.")];
+
+        apply_protected_paths_reminder(&mut messages, &active, &SecretScanner::default());
+
+        let system = &messages[0].content;
+        assert!(system.contains("[protected task paths]"), "{system}");
+        assert!(
+            !system.contains(SECRET),
+            "a protected path carried a secret to the model: {system}"
+        );
+        assert!(system.contains("[REDACTED_"), "{system}");
+    }
+
+    /// Spec 98: a failed durable read must fail the turn before the model is
+    /// called, not silently run without the user's exclusions.
+    #[test]
+    fn a_protected_path_read_failure_stops_the_turn_before_the_model() {
+        let repo = temp_repo("protected-read-failure");
+        let engine = engine_with(&repo);
+        let session = session_in(&engine, &repo, SessionMode::Code);
+        let missing_task = Task {
+            id: "missing-task".to_string(),
+            session_id: session.clone(),
+            status: TaskStatus::PreparingContext,
+            user_prompt: "Constructed continuation prompt.".to_string(),
+            model_provider: "mock".to_string(),
+            model_name: "mock".to_string(),
+            created_at_ms: 0,
+            completed_at_ms: None,
+        };
+        let messages = vec![
+            ModelMessage::system("Base system prompt."),
+            ModelMessage::user("Continue."),
+        ];
+        let mut adapter = MockModelAdapter::new("Done.");
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+
+        let result = engine.chat_orchestrator.run_agentic_turn(
+            &repo,
+            engine
+                .session_store
+                .read_session(&session)
+                .unwrap()
+                .unwrap(),
+            missing_task,
+            Vec::new(),
+            messages,
+            0,
+            0,
+            TurnNotesState::default(),
+            Vec::new(),
+            false,
+            &mut adapter,
+            &mut sink,
+            ChatTurnOptions::default(),
+        );
+
+        assert!(result.is_err(), "the read failure must end the turn");
+        assert!(
+            adapter.requests.is_empty(),
+            "the model must not be called without the reminder"
         );
 
         fs::remove_dir_all(repo).unwrap();

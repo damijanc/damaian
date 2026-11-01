@@ -1237,6 +1237,13 @@ impl ProgressSink<'_> {
                     json!({ "messageId": message_id }),
                 );
             }
+            TurnProgress::ProtectedPaths(active) => {
+                append_progress(
+                    self.writer,
+                    ProgressKind::ProtectedPaths,
+                    json!({ "taskId": active.task_id, "paths": active.paths }),
+                );
+            }
             // The session is the worker's own, and diagnostics are in the
             // session log; neither is a board column.
             TurnProgress::Session(_)
@@ -1537,6 +1544,55 @@ mod tests {
         let elsewhere = scratch("link-to");
         std::os::unix::fs::symlink(&elsewhere, data_dir.join("workers")).unwrap();
         assert!(bind_control_socket(&data_dir, SESSION).is_err());
+    }
+
+    #[test]
+    fn protected_path_progress_is_typed_canonical_and_redacted() {
+        const SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let data_dir = scratch("paths-progress");
+        let mut writer =
+            ProgressWriter::create(&data_dir, SESSION, SecretScanner::default()).unwrap();
+        let host = WorkerHost::new(SESSION.to_string(), Arc::new(ShutdownSignal::default()));
+        let active = workspace_engine::TaskProtectedPaths {
+            task_id: "task_1".to_string(),
+            paths: vec![
+                workspace_engine::ProtectedPath {
+                    path: "src/a.rs".to_string(),
+                    kind: workspace_engine::ProtectedPathKind::File,
+                },
+                workspace_engine::ProtectedPath {
+                    path: format!("notes/{SECRET}"),
+                    kind: workspace_engine::ProtectedPathKind::Directory,
+                },
+            ],
+        };
+        {
+            let mut sink = ProgressSink {
+                writer: &mut writer,
+                text: String::new(),
+                last_flush: Instant::now(),
+            };
+            sink.event(&host, TurnProgress::ProtectedPaths(active));
+        }
+
+        let events =
+            workspace_engine::worker_progress::read_progress_after(&data_dir, SESSION, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "protected_paths");
+        assert_eq!(events[0]["payload"]["taskId"], "task_1");
+        assert_eq!(
+            events[0]["payload"]["paths"][0],
+            json!({"path": "src/a.rs", "kind": "file"})
+        );
+        let raw = fs::read_to_string(workspace_engine::worker_progress::progress_path(
+            &data_dir, SESSION,
+        ))
+        .unwrap();
+        assert!(
+            !raw.contains(SECRET),
+            "a secret reached the progress file: {raw}"
+        );
+        assert!(raw.contains("[REDACTED_"), "{raw}");
     }
 
     #[test]

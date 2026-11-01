@@ -21,6 +21,10 @@ pub enum ProgressKind {
     Tool,
     Approval,
     Note,
+    /// The task's active typed protected paths at the start of a turn
+    /// (spec 98). The payload carries `taskId` and `paths`, each
+    /// `{"path": …, "kind": "file" | "directory"}`.
+    ProtectedPaths,
 }
 
 impl ProgressKind {
@@ -33,6 +37,7 @@ impl ProgressKind {
             Self::Tool => "tool",
             Self::Approval => "approval",
             Self::Note => "note",
+            Self::ProtectedPaths => "protected_paths",
         }
     }
 }

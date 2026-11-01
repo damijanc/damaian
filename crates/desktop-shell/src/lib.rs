@@ -21,17 +21,18 @@ use workspace_engine::{
     LineRange, McpClient, McpServerConfig, McpTokenResolver, McpTransport, MemoryRecallRef,
     MemoryScope, ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter,
     PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId, ProjectIdentity, ProposedFilePatch,
-    QuestionState, RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision,
-    SearchOptions, Session, SessionMode, SessionStore, StepStatus, SymbolRef, Task, TaskPlan,
-    TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation,
-    VerificationEvent, VerificationOutcome, VerificationReport, WebDiagnosticCall,
-    WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkerReturn, WorkspaceEngine, allow_always_eligible,
-    builtin_context_window, builtin_token_defaults, command_approval_prompt, custom_profile_ids,
-    ensure_data_dir_schema, export_profile, fold_verification, import_profile,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    parse_hunk_selection, parse_mcp_transport, patch_diff_text, profile_import_base,
-    repository_id_for_root, review_profile_import, review_profile_rejections, select_profile,
+    ProtectedPathAction, QuestionState, RepositoryConfigReport, ResumeDecisionOptions,
+    RoundBudgetDecision, SearchOptions, Session, SessionMode, SessionStore, StepStatus, SymbolRef,
+    Task, TaskPlan, TaskProtectedPathsControl, TaskUsage, TokenUsage, TurnNotes, TurnPhase,
+    TurnProgress, TurnSink, UserConfirmation, VerificationEvent, VerificationOutcome,
+    VerificationReport, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerReturn,
+    WorkspaceEngine, allow_always_eligible, builtin_context_window, builtin_token_defaults,
+    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
+    fold_verification, import_profile, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
+    select_profile,
 };
 
 mod keychain;
@@ -347,6 +348,12 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/session-create") => handle_session_create(stream, &request),
         ("POST", "/api/session-rename") => handle_session_rename(stream, &request),
         ("POST", "/api/session-mode") => handle_session_mode(stream, &request),
+        // Spec 98 Task 4: the user's explicit protected-path control. Every
+        // route is repository-bound, and writes go through the engine's
+        // canonicalising API rather than appending session events here.
+        ("GET", "/api/protected-paths") => handle_protected_paths(stream, &request),
+        ("POST", "/api/protected-paths-add") => handle_protected_paths_add(stream, &request),
+        ("POST", "/api/protected-paths-remove") => handle_protected_paths_remove(stream, &request),
         ("POST", "/api/context-pin") => handle_context_pin(stream, &request),
         ("POST", "/api/context-restriction") => handle_context_restriction(stream, &request),
         ("POST", "/api/context-remove") => handle_context_remove(stream, &request),
@@ -634,6 +641,7 @@ fn handle_recovery_approval_resolved(
 
 fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let session_id = required_param(request, "session_id")?;
+    let repo = request.param("repo");
     let engine = default_engine()?;
     let Some(session) = engine
         .session_store
@@ -642,6 +650,10 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
     else {
         return Err(format!("Unknown session: {session_id}"));
     };
+    // The engine chooses the protected-path control target from durable task
+    // creation order; the shell does not read or sort the task list itself.
+    let protected_paths_control =
+        protected_paths_control_json(&engine, repo.as_deref(), &session_id)?;
     let messages = engine
         .session_store
         .read_messages_with_seq(&session_id)
@@ -732,7 +744,7 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         200,
         "application/json",
         &format!(
-            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}],\"conversationView\":{},\"contextState\":{{\"pins\":{},\"restrictedPaths\":{}}},\"verification\":{},\"workerReturns\":{}}}",
+            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}],\"conversationView\":{},\"contextState\":{{\"pins\":{},\"restrictedPaths\":{}}},\"verification\":{},\"workerReturns\":{},\"protectedPathsControl\":{}}}",
             session_json(&session, engine.session_store.session_mode(&session.id)),
             messages_json(&messages, &question_states),
             task_states_json(
@@ -749,9 +761,117 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
             serde_json::to_string(&context_pins).unwrap_or_else(|_| "[]".to_string()),
             serde_json::to_string(&context_restriction).unwrap_or_else(|_| "null".to_string()),
             verification,
-            serde_json::to_string(&worker_returns).unwrap_or_else(|_| "[]".to_string())
+            serde_json::to_string(&worker_returns).unwrap_or_else(|_| "[]".to_string()),
+            protected_paths_control
         ),
     )
+}
+
+/// `GET /api/protected-paths?repo=&session_id=&task_id=`: the active typed
+/// protections for one named task, read through the engine's repository-bound
+/// API. The desktop UI renders the control from `/api/session`; this route
+/// remains for API coverage and diagnostics.
+fn handle_protected_paths(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let session_id = required_param(request, "session_id")?;
+    let task_id = required_param(request, "task_id")?;
+    let engine = engine_for_repo(&repo)?;
+    let active = engine
+        .task_protected_paths_in_repository(&repo, &session_id, &task_id)
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::to_string(&active).map_err(|error| error.to_string())?,
+    )
+}
+
+/// `POST /api/protected-paths-add`: the textarea value arrives unchanged in
+/// `paths`. Splitting, trimming, empty validation, canonicalisation and
+/// partial acceptance all happen here and in the engine, never in the UI.
+fn handle_protected_paths_add(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    handle_protected_path_change(stream, request, ProtectedPathAction::Add)
+}
+
+/// `POST /api/protected-paths-remove`: active canonical paths, one per line in
+/// `paths`. Removal is an explicit user action recorded as a new event; it
+/// never edits or deletes the earlier add.
+fn handle_protected_paths_remove(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    handle_protected_path_change(stream, request, ProtectedPathAction::Remove)
+}
+
+fn handle_protected_path_change(
+    stream: &mut TcpStream,
+    request: &Request,
+    action: ProtectedPathAction,
+) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let task_id = required_form(&form, "task_id")?;
+    let engine = engine_for_repo(&repo)?;
+    // The engine validates repository, session and task, and refuses a stale
+    // task that is no longer the control's durable target. Splitting and
+    // trimming the textarea is also server-side; an empty list becomes an
+    // outcome sentence with no event.
+    // Transport only: split the textarea on its line/alternative separators.
+    // Trimming, dropping blanks, validation and canonicalisation belong to the
+    // engine, so both front ends share those semantics.
+    let requested = parse_protected_path_lines(&form.get("paths").cloned().unwrap_or_default());
+    let update = match action {
+        ProtectedPathAction::Add => {
+            engine.add_current_task_protected_paths(&repo, &session_id, &task_id, &requested)
+        }
+        ProtectedPathAction::Remove => {
+            engine.remove_current_task_protected_paths(&repo, &session_id, &task_id, &requested)
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let refused = update
+        .refused
+        .iter()
+        .map(|refusal| {
+            serde_json::json!({
+                "requested": refusal.requested,
+                "error": refusal.error,
+                "reason": refusal.message(),
+            })
+        })
+        .collect::<Vec<_>>();
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::to_string(&serde_json::json!({
+            "protectedPathsControl": update.control,
+            "outcome": update.outcome,
+            "accepted": update.accepted,
+            "refused": refused,
+        }))
+        .map_err(|error| error.to_string())?,
+    )
+}
+
+/// The session payload's control comes from the engine's repository-bound
+/// service. The shell chooses neither the task nor availability; when no
+/// repository was supplied it returns the engine's explicit unavailable shape.
+fn protected_paths_control_json(
+    engine: &WorkspaceEngine,
+    repo: Option<&str>,
+    session_id: &str,
+) -> Result<String, String> {
+    let control = match repo.filter(|value| !value.trim().is_empty()) {
+        None => TaskProtectedPathsControl::unavailable(
+            "The repository was not supplied, so protected paths cannot be read.",
+        ),
+        Some(repo) => engine
+            .task_protected_paths_control(repo, session_id)
+            .map_err(|error| error.to_string())?,
+    };
+    serde_json::to_string(&control).map_err(|error| error.to_string())
 }
 
 /// `GET /api/memory-proposals`: what is still waiting for a decision in this
@@ -3236,7 +3356,7 @@ fn handle_plan_worker_prompt(stream: &mut TcpStream, request: &Request) -> Resul
         None => None,
     };
     let engine = engine_for_repo(&repo)?;
-    let prompt = engine
+    let handoff = engine
         .chat_orchestrator
         .plan_worker_prompt(&proposal_id, revised)
         .map_err(|error| error.to_string())?;
@@ -3245,7 +3365,7 @@ fn handle_plan_worker_prompt(stream: &mut TcpStream, request: &Request) -> Resul
         request,
         200,
         "application/json",
-        &serde_json::json!({ "prompt": prompt }).to_string(),
+        &serde_json::json!({ "prompt": handoff.prompt, "taskId": handoff.task_id }).to_string(),
     )
 }
 
@@ -4029,7 +4149,13 @@ fn turn_progress_event(progress: TurnProgress) -> Option<TurnEvent> {
         }),
         TurnProgress::WebDiagnostic(record) => Some(TurnEvent::WebDiagnostic(record)),
         TurnProgress::Context(manifest) => Some(TurnEvent::Context(manifest)),
-        TurnProgress::Paused | TurnProgress::Resumed | TurnProgress::NoteAdded { .. } => None,
+        // The desktop's protected-path panel reads the engine's control model
+        // from `/api/session`, so the stream has no separate card to draw. A
+        // worker's own progress sink still records the typed event.
+        TurnProgress::Paused
+        | TurnProgress::Resumed
+        | TurnProgress::NoteAdded { .. }
+        | TurnProgress::ProtectedPaths(_) => None,
     }
 }
 
@@ -5702,6 +5828,12 @@ fn parse_optional_path_list(value: &str) -> Vec<String> {
         .filter(|path| !path.is_empty())
         .map(|path| path.to_string())
         .collect()
+}
+
+/// The protected-path textarea's transport split. Deliberately does not trim
+/// or drop blank entries: the engine owns those semantics for both front ends.
+fn parse_protected_path_lines(value: &str) -> Vec<String> {
+    value.split(['\n', '|']).map(str::to_string).collect()
 }
 
 fn parse_form(body: &str) -> HashMap<String, String> {
@@ -9819,6 +9951,558 @@ mod tests {
         (port, token)
     }
 
+    /// Spec 98 Task 4: the repository-bound explicit controls list, add and
+    /// remove canonical paths, and the same state comes back from a fresh
+    /// engine, which is what a reload reads.
+    #[test]
+    fn protected_paths_routes_list_add_remove_and_reload_durable_state() {
+        let (repo, repo_arg, session, task) = protected_paths_fixture("paths-routes");
+        let (port, token) = serve_for_test();
+
+        let listed = response_json(&protected_paths_get(
+            port, &token, &repo_arg, &session, &task,
+        ));
+        assert_eq!(listed["taskId"], task);
+        assert_eq!(listed["paths"].as_array().unwrap().len(), 0);
+
+        let added_response = post_fields_for_test(
+            port,
+            &token,
+            "/api/protected-paths-add",
+            &[
+                ("repo", &repo_arg),
+                ("session_id", &session),
+                ("task_id", &task),
+                ("paths", "src/a.rs\nsrc/nested"),
+            ],
+        );
+        assert!(
+            added_response.starts_with("HTTP/1.1 200"),
+            "{added_response}"
+        );
+        let added = response_json(&added_response);
+        let added_control = &added["protectedPathsControl"];
+        assert_eq!(added_control["available"], true);
+        assert_eq!(added_control["taskId"], task);
+        assert_eq!(added_control["taskLabel"], format!("Task {task}"));
+        assert_eq!(added_control["note"], "");
+        assert_eq!(added_control["rows"][0]["path"], "src/a.rs");
+        assert_eq!(added_control["rows"][0]["kind"], "file");
+        assert_eq!(added_control["rows"][0]["kindLabel"], "file");
+        assert_eq!(
+            added_control["rows"][0]["removeLabel"],
+            "Stop protecting src/a.rs"
+        );
+        assert_eq!(added_control["rows"][1]["path"], "src/nested");
+        assert_eq!(added_control["rows"][1]["kind"], "directory");
+        assert_eq!(
+            added_control["rows"][1]["kindLabel"],
+            "directory (and everything under it)"
+        );
+        assert!(
+            added["outcome"].as_str().unwrap_or_default().contains(
+                "Protected src/a.rs (file), src/nested (directory (and everything under it))."
+            ),
+            "{added}"
+        );
+        assert!(added["refused"].as_array().unwrap().is_empty(), "{added}");
+        assert_eq!(added_control["rows"].as_array().unwrap().len(), 2);
+
+        let listed = response_json(&protected_paths_get(
+            port, &token, &repo_arg, &session, &task,
+        ));
+        assert_eq!(listed["paths"][0]["path"], "src/a.rs");
+        assert_eq!(listed["paths"][1]["kind"], "directory");
+
+        let reloaded = engine_for_repo(&repo_arg)
+            .unwrap()
+            .task_protected_paths(&session, &task)
+            .unwrap();
+        assert_eq!(
+            reloaded.path_list(),
+            vec!["src/a.rs".to_string(), "src/nested".to_string()]
+        );
+
+        let session_payload =
+            response_json(&session_payload_get(port, &token, &repo_arg, &session));
+        assert_eq!(session_payload["protectedPathsControl"], *added_control);
+
+        let removed_response = post_fields_for_test(
+            port,
+            &token,
+            "/api/protected-paths-remove",
+            &[
+                ("repo", &repo_arg),
+                ("session_id", &session),
+                ("task_id", &task),
+                ("paths", "src/a.rs"),
+            ],
+        );
+        assert!(
+            removed_response.starts_with("HTTP/1.1 200"),
+            "{removed_response}"
+        );
+        let removed = response_json(&removed_response);
+        let removed_control = &removed["protectedPathsControl"];
+        assert_eq!(removed_control["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(removed_control["rows"][0]["path"], "src/nested");
+        assert!(
+            removed["outcome"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Removed protection for src/a.rs (file)."),
+            "{removed}"
+        );
+
+        let reloaded = engine_for_repo(&repo_arg)
+            .unwrap()
+            .task_protected_paths(&session, &task)
+            .unwrap();
+        assert_eq!(reloaded.path_list(), vec!["src/nested".to_string()]);
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A batch with one bad path keeps its accepted half and reports each
+    /// refusal with the wording the user needs, rather than dropping the whole
+    /// change or silently ignoring the bad entry.
+    #[test]
+    fn protected_paths_routes_keep_partial_acceptance_and_name_refusals() {
+        let (repo, repo_arg, session, task) = protected_paths_fixture("paths-partial");
+        let (port, token) = serve_for_test();
+
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/protected-paths-add",
+            &[
+                ("repo", &repo_arg),
+                ("session_id", &session),
+                ("task_id", &task),
+                ("paths", "src/a.rs\nsrc/missing.rs\n../outside.rs"),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = response_json(&response);
+        assert_eq!(body["accepted"].as_array().unwrap().len(), 1, "{body}");
+        assert_eq!(body["accepted"][0]["path"], "src/a.rs");
+        let refused = body["refused"].as_array().unwrap();
+        assert_eq!(refused.len(), 2, "{body}");
+        assert!(
+            refused
+                .iter()
+                .any(|entry| entry["requested"] == "src/missing.rs"
+                    && entry["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("does not exist")),
+            "{body}"
+        );
+        assert!(
+            refused.iter().any(|entry| {
+                entry["requested"] == "../outside.rs"
+                    && entry["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("outside")
+            }),
+            "{body}"
+        );
+        let control = &body["protectedPathsControl"];
+        assert_eq!(control["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(control["rows"][0]["path"], "src/a.rs");
+        let outcome = body["outcome"].as_str().unwrap_or_default();
+        assert!(outcome.contains("Protected src/a.rs (file)."), "{body}");
+        assert!(
+            outcome.contains("src/missing.rs") && outcome.contains("does not exist"),
+            "the refused path and reason are server-written: {body}"
+        );
+        assert!(outcome.contains("../outside.rs"), "{body}");
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Repository and task identity are checked before an event is appended:
+    /// a request carrying another repository's root or another session's task
+    /// changes nothing durable.
+    #[test]
+    fn protected_paths_routes_refuse_cross_repository_and_wrong_task_before_events() {
+        let (repo, repo_arg, session, task) = protected_paths_fixture("paths-refuse");
+        let other_repo = temp_shell_repo("paths-refuse-other");
+        fs::write(other_repo.join("other.txt"), "other\n").unwrap();
+        let other_repo_arg = other_repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).unwrap();
+        let other_session = engine
+            .session_store
+            .create_session(
+                &workspace_engine::repository_id_for_root(&repo),
+                "another session",
+            )
+            .unwrap();
+        let other_task = engine
+            .session_store
+            .create_task(&other_session.id, "Other work.", "provider", "model")
+            .unwrap();
+        let (port, token) = serve_for_test();
+
+        let cross_repository = post_fields_for_test(
+            port,
+            &token,
+            "/api/protected-paths-add",
+            &[
+                ("repo", &other_repo_arg),
+                ("session_id", &session),
+                ("task_id", &task),
+                ("paths", "src/a.rs"),
+            ],
+        );
+        assert!(
+            cross_repository.starts_with("HTTP/1.1 500"),
+            "{cross_repository}"
+        );
+        assert!(
+            cross_repository.contains("does not belong to repository"),
+            "{cross_repository}"
+        );
+
+        let cross_list = protected_paths_get(port, &token, &other_repo_arg, &session, &task);
+        assert!(cross_list.starts_with("HTTP/1.1 500"), "{cross_list}");
+
+        let cross_session = session_payload_get(port, &token, &other_repo_arg, &session);
+        assert!(cross_session.starts_with("HTTP/1.1 500"), "{cross_session}");
+        assert!(
+            cross_session.contains("does not belong to repository"),
+            "{cross_session}"
+        );
+
+        let wrong_task = post_fields_for_test(
+            port,
+            &token,
+            "/api/protected-paths-add",
+            &[
+                ("repo", &repo_arg),
+                ("session_id", &session),
+                ("task_id", &other_task.id),
+                ("paths", "src/a.rs"),
+            ],
+        );
+        assert!(wrong_task.starts_with("HTTP/1.1 500"), "{wrong_task}");
+        assert!(
+            wrong_task.contains("Unknown task in session"),
+            "{wrong_task}"
+        );
+
+        let fresh = engine_for_repo(&repo_arg).unwrap();
+        assert!(
+            fresh
+                .session_store
+                .read_task_protected_path_events(&session)
+                .unwrap()
+                .is_empty(),
+            "a refused request must not append a protection event"
+        );
+        assert!(
+            fresh
+                .session_store
+                .read_task_protected_path_events(&other_session.id)
+                .unwrap()
+                .is_empty()
+        );
+
+        fs::remove_dir_all(&repo).ok();
+        fs::remove_dir_all(&other_repo).ok();
+    }
+
+    fn protected_paths_fixture(name: &str) -> (PathBuf, String, String, String) {
+        let repo = temp_shell_repo(name);
+        fs::create_dir_all(repo.join("src/nested")).unwrap();
+        fs::write(repo.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        fs::write(repo.join("src/nested/b.rs"), "pub fn b() {}\n").unwrap();
+        let repo_arg = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).unwrap();
+        let session = engine
+            .session_store
+            .create_session(
+                &workspace_engine::repository_id_for_root(&repo),
+                "protected paths",
+            )
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "Do the work.", "provider", "model")
+            .unwrap();
+        (repo, repo_arg, session.id, task.id)
+    }
+
+    fn protected_paths_get(
+        port: u16,
+        token: &str,
+        repo: &str,
+        session: &str,
+        task: &str,
+    ) -> String {
+        send_for_test(
+            port,
+            format!(
+                "GET /api/protected-paths?repo={}&session_id={}&task_id={} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n",
+                percent_encode_for_test(repo),
+                percent_encode_for_test(session),
+                percent_encode_for_test(task)
+            ),
+        )
+    }
+
+    fn session_payload_get(port: u16, token: &str, repo: &str, session: &str) -> String {
+        send_for_test(
+            port,
+            format!(
+                "GET /api/session?repo={}&session_id={} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n",
+                percent_encode_for_test(repo),
+                percent_encode_for_test(session)
+            ),
+        )
+    }
+
+    /// The session payload's control is an engine decision: it targets the
+    /// newest task in durable creation order, carries the engine's labels and
+    /// notes, and a session with no task is explicitly unavailable.
+    #[test]
+    fn session_payload_control_targets_the_newest_task_and_explains_no_task() {
+        let (repo, repo_arg, session, first) = protected_paths_fixture("control-target");
+        let engine = engine_for_repo(&repo_arg).unwrap();
+        let second = engine
+            .session_store
+            .create_task(&session, "Second work.", "provider", "model")
+            .unwrap();
+        let (port, token) = serve_for_test();
+
+        let initial = response_json(&session_payload_get(port, &token, &repo_arg, &session));
+        let control = &initial["protectedPathsControl"];
+        assert_eq!(control["available"], true);
+        assert_eq!(control["taskId"], second.id);
+        assert_eq!(control["taskLabel"], format!("Task {}", second.id));
+        assert_eq!(control["note"], "No protected paths for this task.");
+        assert!(control["rows"].as_array().unwrap().is_empty());
+        assert_ne!(first, second.id);
+
+        let stale = post_fields_for_test(
+            port,
+            &token,
+            "/api/protected-paths-add",
+            &[
+                ("repo", &repo_arg),
+                ("session_id", &session),
+                ("task_id", &first),
+                ("paths", "docs.md"),
+            ],
+        );
+        assert!(stale.starts_with("HTTP/1.1 500"), "{stale}");
+        assert!(stale.contains("now targets"), "{stale}");
+        assert!(
+            engine
+                .session_store
+                .read_task_protected_path_events(&session)
+                .unwrap()
+                .is_empty(),
+            "a stale desktop action appends no event"
+        );
+
+        let added = post_fields_for_test(
+            port,
+            &token,
+            "/api/protected-paths-add",
+            &[
+                ("repo", &repo_arg),
+                ("session_id", &session),
+                ("task_id", &second.id),
+                ("paths", "src/a.rs\nsrc/nested"),
+            ],
+        );
+        assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+        let reloaded = response_json(&session_payload_get(port, &token, &repo_arg, &session));
+        assert_eq!(
+            reloaded["protectedPathsControl"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            reloaded["protectedPathsControl"]["rows"][1]["kindLabel"],
+            "directory (and everything under it)"
+        );
+
+        let empty_session = engine
+            .session_store
+            .create_session(&workspace_engine::repository_id_for_root(&repo), "Empty")
+            .unwrap();
+        let empty = response_json(&session_payload_get(
+            port,
+            &token,
+            &repo_arg,
+            &empty_session.id,
+        ));
+        let control = &empty["protectedPathsControl"];
+        assert_eq!(control["available"], false);
+        assert_eq!(control["taskId"], "");
+        assert_eq!(control["taskLabel"], "");
+        assert!(control["rows"].as_array().unwrap().is_empty());
+        assert!(
+            control["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("No task is available to protect paths"),
+            "{empty}"
+        );
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The textarea value reaches Rust unchanged: blank input is a server
+    /// outcome, not a client-side error, and writes no event.
+    #[test]
+    fn protected_paths_route_answers_an_empty_textarea_from_the_server() {
+        let (repo, repo_arg, session, task) = protected_paths_fixture("empty-paths");
+        let (port, token) = serve_for_test();
+
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/protected-paths-add",
+            &[
+                ("repo", &repo_arg),
+                ("session_id", &session),
+                ("task_id", &task),
+                ("paths", "  \n  "),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = response_json(&response);
+        assert_eq!(
+            body["outcome"],
+            "Enter at least one repository-relative path."
+        );
+        assert_eq!(body["protectedPathsControl"]["available"], true);
+        assert_eq!(body["protectedPathsControl"]["taskId"], task);
+        assert!(body["refused"].as_array().unwrap().is_empty());
+        assert!(
+            engine_for_repo(&repo_arg)
+                .unwrap()
+                .session_store
+                .read_task_protected_path_events(&session)
+                .unwrap()
+                .is_empty()
+        );
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Spec 98 Task 4: the UI is render-and-submit only. The shell supplies
+    /// the target, availability, labels and outcome; the client must not pick a
+    /// task, sort ids, parse paths or compose business messages. This checks
+    /// the source shapes because the suite has no browser DOM.
+    #[test]
+    fn the_protected_paths_panel_renders_the_server_model_and_ignores_stale_responses() {
+        let html = include_str!("../static/index.html");
+        for marker in [
+            "id=\"protected-paths-panel\"",
+            "id=\"protected-paths-list\"",
+            "id=\"protected-paths-input\"",
+            "id=\"protected-paths-outcome\"",
+            "Protect paths",
+        ] {
+            assert!(html.contains(marker), "{marker} missing from index.html");
+        }
+        let app = include_str!("../static/app.js");
+        for removed in [
+            "relevantTaskForProtectedPaths",
+            "protectedPathOutcome",
+            "protectedPathKindLabel",
+            "refreshProtectedPaths",
+            "messages[index].taskId",
+            "ids.sort()",
+        ] {
+            assert!(
+                !app.contains(removed),
+                "client inference remains: {removed}"
+            );
+        }
+        assert!(
+            !app.contains("/api/protected-paths?"),
+            "the UI renders the control from /api/session, not a second decision fetch"
+        );
+        let render = app
+            .split("function renderProtectedPathsControl")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfunction ").next())
+            .expect("the protected-path control renderer");
+        assert!(
+            render.contains("protectedPathsControl.taskLabel"),
+            "{render}"
+        );
+        assert!(render.contains("protectedPathsControl.note"), "{render}");
+        assert!(render.contains("row.kindLabel"), "{render}");
+        assert!(render.contains("row.removeLabel"), "{render}");
+        assert!(render.contains("Stop protecting"), "{render}");
+        assert!(render.contains("removeProtectedPath(row.path)"), "{render}");
+        assert!(!render.contains("=== \"directory\""), "{render}");
+        let add = app
+            .split("async function addProtectedPaths")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfunction ").next())
+            .expect("the protected-path add action");
+        assert!(
+            add.contains("paths: $(\"protected-paths-input\").value"),
+            "the textarea must be sent unchanged: {add}"
+        );
+        assert!(add.contains("const taskId = control.taskId"), "{add}");
+        assert!(add.contains("protectedPathRequestIsCurrent("), "{add}");
+        assert!(
+            add.contains("renderProtectedPathsControl(payload.protectedPathsControl)"),
+            "{add}"
+        );
+        assert!(
+            add.contains("showProtectedPathOutcome(payload.outcome)"),
+            "{add}"
+        );
+        assert!(
+            !add.contains("accepted") && !add.contains("refused"),
+            "the client must not read accepted/refused fields: {add}"
+        );
+        assert!(
+            app.contains("renderProtectedPathsControl(payload.protectedPathsControl)"),
+            "{app}"
+        );
+        assert!(
+            app.contains("$(\"protected-paths-form\").addEventListener(\"submit\""),
+            "{app}"
+        );
+        let shell = include_str!("lib.rs");
+        let control = shell
+            .split("fn protected_paths_control_json")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("the shell control helper");
+        assert!(
+            control.contains("task_protected_paths_control"),
+            "the shell must delegate control selection: {control}"
+        );
+        assert!(!control.contains("read_tasks"), "{control}");
+        let change = shell
+            .split("fn handle_protected_path_change")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("the shell change handler");
+        assert!(
+            change.contains("add_current_task_protected_paths")
+                && change.contains("remove_current_task_protected_paths"),
+            "the shell must use the engine's current-control mutations: {change}"
+        );
+        assert!(!change.contains("read_tasks"), "{change}");
+        assert!(!change.contains("kind_label"), "{change}");
+        assert!(!change.contains("Protected "), "{change}");
+    }
+
     /// The provider editor's placeholders show these numbers, so the endpoint
     /// must answer per model with what a blank field resolves to, including
     /// "no ceiling" for the output of a provider that sets none.
@@ -12892,6 +13576,8 @@ mod tests {
                         &session.id,
                         &WorkerRecord {
                             parent_session_id: None,
+                            parent_task_id: None,
+                            inherited_protected_paths: Vec::new(),
                             source_repository: repo.to_path_buf(),
                             worktree_path: repo.to_path_buf(),
                             branch: "damaian/fixture".to_string(),
@@ -13077,6 +13763,8 @@ mod tests {
                     &session,
                     &WorkerRecord {
                         parent_session_id: Some(parent.clone()),
+                        parent_task_id: None,
+                        inherited_protected_paths: Vec::new(),
                         source_repository: repo.to_path_buf(),
                         worktree_path: repo.to_path_buf(),
                         branch: "damaian/fixture".to_string(),
@@ -13399,6 +14087,8 @@ mod tests {
                     &session.id,
                     &WorkerRecord {
                         parent_session_id: None,
+                        parent_task_id: None,
+                        inherited_protected_paths: Vec::new(),
                         source_repository: repo.clone(),
                         worktree_path: repo.clone(),
                         branch: "damaian/fixture".to_string(),
@@ -14405,6 +15095,7 @@ exec /bin/cat > /dev/null
                             prompt: prompt.to_string(),
                             include_uncommitted: false,
                             parent_session_id: parent.map(str::to_string),
+                            parent_task_id: None,
                         },
                         KEY,
                     )
@@ -14615,6 +15306,186 @@ exec /bin/cat > /dev/null
             fixture.supervisor.shutdown_all();
         }
 
+        /// Spec 98: a worker snapshots its parent task's durable protected
+        /// paths at spawn, and the prompt — which may be model-generated — is
+        /// never parsed for them. A sidebar worker has no parent task and gets
+        /// nothing, and a task from a different session is refused.
+        #[test]
+        fn a_parent_task_snapshot_crosses_the_handoff_and_prompt_text_cannot_broaden_it() {
+            let fixture = Fixture::new();
+            let store = fixture.store();
+            let parent = fixture.parent("Parent");
+            let task = store
+                .create_task(&parent, "Change the docs.", "provider", "model")
+                .unwrap();
+            let engine = workspace_engine::WorkspaceEngine::new(fixture.config.clone());
+            engine
+                .add_task_protected_paths(
+                    &fixture.repo,
+                    &parent,
+                    &task.id,
+                    &["README.md".to_string()],
+                )
+                .unwrap();
+
+            let spawned = fixture
+                .supervisor
+                .spawn(
+                    &fixture.config,
+                    SpawnRequest {
+                        repo: fixture.repo.clone(),
+                        prompt: "Do not touch `src/other.rs`. Do the work.".to_string(),
+                        include_uncommitted: false,
+                        parent_session_id: Some(parent.clone()),
+                        parent_task_id: Some(task.id.clone()),
+                    },
+                    KEY,
+                )
+                .expect("the worker should spawn");
+            let record = store.worker_record(&spawned.session_id).unwrap().unwrap();
+            assert_eq!(record.parent_task_id.as_deref(), Some(task.id.as_str()));
+            assert_eq!(
+                record.inherited_protected_paths,
+                vec![workspace_engine::ProtectedPath {
+                    path: "README.md".to_string(),
+                    kind: workspace_engine::ProtectedPathKind::File,
+                }],
+                "only the parent's resolved record is copied"
+            );
+            assert!(
+                !record
+                    .inherited_protected_paths
+                    .iter()
+                    .any(|path| path.path == "src/other.rs"),
+                "prompt text must not add a protection"
+            );
+
+            let manual = fixture.spawn("A sidebar worker", None);
+            assert!(
+                store
+                    .worker_record(&manual.session_id)
+                    .unwrap()
+                    .unwrap()
+                    .inherited_protected_paths
+                    .is_empty(),
+                "a worker with no parent task inherits nothing"
+            );
+
+            let other_parent = fixture.parent("Other");
+            let refused = fixture
+                .supervisor
+                .spawn(
+                    &fixture.config,
+                    SpawnRequest {
+                        repo: fixture.repo.clone(),
+                        prompt: "Do the work.".to_string(),
+                        include_uncommitted: false,
+                        parent_session_id: Some(other_parent),
+                        parent_task_id: Some(task.id),
+                    },
+                    KEY,
+                )
+                .unwrap_err();
+            assert!(refused.contains("Unknown task"), "{refused}");
+
+            fixture.supervisor.shutdown_all();
+        }
+
+        /// A crafted handoff cannot move repository-relative protections from
+        /// one repository into a worker for another. The check runs before the
+        /// worktree, branch, session and audit records exist, and applies even
+        /// when the caller supplies no parent task.
+        #[test]
+        fn a_parent_session_from_another_repository_is_refused_before_any_worker_state() {
+            let fixture = Fixture::new();
+            let store = fixture.store();
+            let other_repo = repository(&fixture.root, "o");
+            let parent = fixture.parent("Parent");
+            let task = store
+                .create_task(&parent, "Change the docs.", "provider", "model")
+                .unwrap();
+            let engine = workspace_engine::WorkspaceEngine::new(fixture.config.clone());
+            engine
+                .add_task_protected_paths(
+                    &fixture.repo,
+                    &parent,
+                    &task.id,
+                    &["README.md".to_string()],
+                )
+                .unwrap();
+
+            let sessions_before = store.list_sessions(None).unwrap().len();
+            let spawn_cross_repo = |parent_task_id: Option<String>| {
+                fixture
+                    .supervisor
+                    .spawn(
+                        &fixture.config,
+                        SpawnRequest {
+                            repo: other_repo.clone(),
+                            prompt: "Do the work.".to_string(),
+                            include_uncommitted: false,
+                            parent_session_id: Some(parent.clone()),
+                            parent_task_id,
+                        },
+                        KEY,
+                    )
+                    .unwrap_err()
+            };
+            for parent_task_id in [Some(task.id.clone()), None] {
+                let refused = spawn_cross_repo(parent_task_id);
+                assert!(
+                    refused.contains("different repository"),
+                    "a cross-repository handoff must be refused: {refused}"
+                );
+            }
+
+            assert_eq!(
+                store.list_sessions(None).unwrap().len(),
+                sessions_before,
+                "no worker session may be created"
+            );
+            assert!(
+                store.worker_children(&parent).unwrap().is_empty(),
+                "no child may be recorded"
+            );
+            assert!(
+                !other_repo.join(".damaian").exists(),
+                "no worktree or branch metadata may be created"
+            );
+            assert!(
+                audit_events(&fixture.config.data_dir, "worker_spawned").is_empty()
+                    && audit_events(&fixture.config.data_dir, "worker_spawn_failed").is_empty(),
+                "the refusal must precede every audit side effect"
+            );
+
+            // The same handoff within the source repository still works.
+            let spawned = fixture
+                .supervisor
+                .spawn(
+                    &fixture.config,
+                    SpawnRequest {
+                        repo: fixture.repo.clone(),
+                        prompt: "Do the work.".to_string(),
+                        include_uncommitted: false,
+                        parent_session_id: Some(parent.clone()),
+                        parent_task_id: Some(task.id.clone()),
+                    },
+                    KEY,
+                )
+                .expect("the same-repository worker should spawn");
+            let record = store.worker_record(&spawned.session_id).unwrap().unwrap();
+            assert_eq!(record.parent_task_id.as_deref(), Some(task.id.as_str()));
+            assert_eq!(
+                record.inherited_protected_paths,
+                vec![workspace_engine::ProtectedPath {
+                    path: "README.md".to_string(),
+                    kind: workspace_engine::ProtectedPathKind::File,
+                }]
+            );
+
+            fixture.supervisor.shutdown_all();
+        }
+
         /// A data directory whose worker socket path cannot fit `sun_path` is
         /// refused before anything is created: no worktree, no branch, no
         /// session. Before this check it was refused only when the process
@@ -14630,6 +15501,7 @@ exec /bin/cat > /dev/null
                     prompt: "Fix the parser".to_string(),
                     include_uncommitted: false,
                     parent_session_id: None,
+                    parent_task_id: None,
                 },
                 KEY,
             );

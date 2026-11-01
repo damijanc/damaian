@@ -1,6 +1,6 @@
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
-use crate::chat::ToolAction;
+use crate::chat::{ToolAction, apply_protected_paths_reminder};
 use crate::checkpoint::{
     CheckpointConversation, CheckpointManifest, CheckpointOrigin, CheckpointPath,
     CheckpointRequest, CheckpointStore,
@@ -17,6 +17,8 @@ use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsag
 use crate::patch_engine::{
     GeneratedSecretWarning, PatchApplyResult, PatchEngine, ProposedChange, ProposedPatch,
 };
+use crate::path_policy::PathPolicy;
+use crate::protected_paths::{ensure_patch_paths_allowed, record_task_protected_paths_from_prompt};
 use crate::secret_scanner::SecretScanner;
 use crate::session::{PatchFileDecision, Session, SessionStore, Task, TaskStatus};
 use crate::verification::{VerificationEvent, fold_verification};
@@ -403,6 +405,110 @@ impl EditOrchestrator {
         (outcome, warnings)
     }
 
+    /// Applies the narrow direct-user grammar to this flow's prompt and shows a
+    /// refusal as an engine line. The edit flow starts its own task from the
+    /// user's request, so this is an original direct-user boundary too.
+    fn record_direct_prompt_protected_paths(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        task_id: &str,
+        prompt: &str,
+    ) -> Result<()> {
+        let result = record_task_protected_paths_from_prompt(
+            &self.session_store,
+            &PathPolicy::new(&self.config),
+            repository_root,
+            session_id,
+            task_id,
+            prompt,
+        )?;
+        match result {
+            crate::protected_paths::ProtectedPathPromptResult::NoRequest => Ok(()),
+            crate::protected_paths::ProtectedPathPromptResult::Refused(error) => self
+                .announce_protected_path_refusal(
+                    session_id,
+                    task_id,
+                    &format!("Protected paths were not recorded: {error}"),
+                ),
+            crate::protected_paths::ProtectedPathPromptResult::Recorded(update) => {
+                for refusal in &update.refused {
+                    self.announce_protected_path_refusal(
+                        session_id,
+                        task_id,
+                        &format!("Protected path was not recorded: {}", refusal.message()),
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn announce_protected_path_refusal(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        message: &str,
+    ) -> Result<()> {
+        self.session_store.append_message_with_kind(
+            session_id,
+            Some(task_id),
+            "assistant",
+            message,
+            Some("protected_path_refusal"),
+        )?;
+        self.audit_log.record(
+            "task_protected_path_refusal",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("taskId", task_id.to_string()),
+                ("message", message.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_patch_not_protected(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        patch: &ProposedPatch,
+    ) -> Result<()> {
+        let active = self
+            .session_store
+            .task_protected_paths(session_id, task_id)?;
+        ensure_patch_paths_allowed(&active, patch.files.iter().map(|file| file.path.as_str()))
+    }
+
+    /// Repeats the fence against the task's current protections at apply time.
+    ///
+    /// Only the selected files matter: a partial review may apply unrelated
+    /// selected files and must still refuse a selected protected one. This runs
+    /// before the apply marker, checkpoint and any write, so a refusal leaves
+    /// no action, decision or `verification_due`.
+    fn ensure_selected_patch_files_not_protected(
+        &self,
+        patch: &ProposedPatch,
+        approved_paths: Option<&[String]>,
+    ) -> Result<()> {
+        if patch.session_id.is_empty() {
+            return Ok(());
+        }
+        let Some(task_id) = patch.task_id.as_deref() else {
+            return Ok(());
+        };
+        let active = self
+            .session_store
+            .task_protected_paths(&patch.session_id, task_id)?;
+        let selected = patch
+            .files
+            .iter()
+            .filter(|file| approved_paths.is_none_or(|paths| paths.contains(&file.path)))
+            .map(|file| file.path.as_str());
+        ensure_patch_paths_allowed(&active, selected)
+    }
+
     /// Proposes a patch from one prompt, in a session of its own.
     ///
     /// `origin_session_id` is the chat session the user asked from, if any.
@@ -452,6 +558,12 @@ impl EditOrchestrator {
         let user_message =
             self.session_store
                 .append_message(&session.id, Some(&task.id), "user", prompt)?;
+        self.record_direct_prompt_protected_paths(
+            repository_root.as_ref(),
+            &session.id,
+            &task.id,
+            prompt,
+        )?;
         // Best-effort, as in the chat flow: an edit proposal that cannot be
         // checkpointed is still worth showing the user.
         if let Err(error) = self.checkpoint_store.create_checkpoint(
@@ -549,13 +661,18 @@ impl EditOrchestrator {
                 return Err(self.record_edit_failure(&session.id, &task, error));
             }
         };
+        let active_protected = self
+            .session_store
+            .task_protected_paths(&session.id, &task.id)?;
+        let mut messages = vec![
+            ModelMessage::system(edit_system_prompt()),
+            ModelMessage::user(build_edit_prompt(&context)),
+        ];
+        apply_protected_paths_reminder(&mut messages, &active_protected, &self.scanner);
         let request = ModelRequest {
             provider: self.config.model_provider.clone(),
             model: self.config.model_name.clone(),
-            messages: vec![
-                ModelMessage::system(edit_system_prompt()),
-                ModelMessage::user(build_edit_prompt(&context)),
-            ],
+            messages,
             temperature: Some("0".to_string()),
             reasoning_level: Some(self.config.model_reasoning_level.clone()),
             stream: true,
@@ -641,6 +758,8 @@ impl EditOrchestrator {
         let mut patch = patch;
         patch.session_id = session.id.clone();
         patch.origin_session_id = origin_session_id.to_string();
+        self.ensure_patch_not_protected(&session.id, &task.id, &patch)
+            .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
         self.patch_store
             .save(&patch)
             .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
@@ -718,6 +837,23 @@ impl EditOrchestrator {
         allow_generated_secrets: bool,
     ) -> Result<PatchApplyResult> {
         let patch = self.patch_store.load(patch_id)?;
+        // Spec 98 §2.5: resolve the patch task's current protections again.
+        // The proposal-time fence cannot cover a path protected after the
+        // preview, a recovered card, or a protection added while the review was
+        // open. This runs before the mode and hook refusals, the action marker,
+        // the checkpoint and every write, so a refusal leaves no ambiguous
+        // outcome and no `verification_due`. The refusal is still durable: the
+        // patch task's session log gets an engine line and the audit log its
+        // matching event. It is not a patch-file rejection decision.
+        if let Err(error) = self.ensure_selected_patch_files_not_protected(&patch, approved_paths) {
+            if let ClientError::AccessDenied(message) = &error
+                && !patch.session_id.is_empty()
+                && let Some(task_id) = patch.task_id.as_deref()
+            {
+                self.announce_protected_path_refusal(&patch.session_id, task_id, message)?;
+            }
+            return Err(error);
+        }
         // Layer 3 of spec 20's working modes: applying is its own decision,
         // made after the turn that proposed the patch has ended, so it answers
         // to the session's mode now — a patch proposed under Code is refused

@@ -6,8 +6,8 @@ Plan: none. This is a failure-driven specification from the 2026-10-31
 single-worker attempt.
 Depends on: [#23](23_verification_loop/proposal.md) (verification and repair),
 [#92](92_rerun_reuses_its_plan_steps.md) (stable check steps), and
-[#98](98_task_scoped_protected_patch_paths.md) (durable no-touch paths) — #23
-and #92 are built; **#98 is not built, so this spec is blocked on it**.
+[#98](98_task_scoped_protected_patch_paths.md) (durable no-touch paths) — #23,
+#92 and #98 are built.
 Everything else named below is a cross-reference, not a prerequisite.
 
 ## 1. Motivation

@@ -350,6 +350,8 @@ fn worker_session(root: &Path, data_dir: &Path) -> (PathBuf, String) {
             &session.id,
             &WorkerRecord {
                 parent_session_id: None,
+                parent_task_id: None,
+                inherited_protected_paths: Vec::new(),
                 source_repository: repo.clone(),
                 worktree_path: repo.clone(),
                 branch: "damaian/fixture".to_string(),

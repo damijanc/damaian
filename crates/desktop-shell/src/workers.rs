@@ -65,6 +65,10 @@ pub struct SpawnRequest {
     pub prompt: String,
     pub include_uncommitted: bool,
     pub parent_session_id: Option<String>,
+    /// The task whose message carried the handoff. Its already-durable
+    /// protected paths are snapshotted for the worker; the prompt itself is
+    /// never parsed (spec 98).
+    pub parent_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,12 +143,23 @@ impl Supervisor {
         }
         let store = SessionStore::new(&config.data_dir);
         if let Some(parent) = &request.parent_session_id {
-            if store
+            let Some(parent_session) = store
                 .read_session(parent)
                 .map_err(|error| error.to_string())?
-                .is_none()
-            {
+            else {
                 return Err(format!("Unknown session: {parent}"));
+            };
+            // A handoff is only meaningful inside one repository: canonical
+            // relative paths from repository A must never become protections
+            // on a worker running repository B. This runs before any worktree,
+            // branch, session or audit side effect, and applies even when the
+            // caller supplies no parent task.
+            let source_repository_id =
+                workspace_engine::hash::repository_id_for_root(&request.repo);
+            if parent_session.repository_id != source_repository_id {
+                return Err(
+                    "A worker's parent session belongs to a different repository.".to_string(),
+                );
             }
             // §5.1: workers do not spawn workers.
             if store
@@ -154,7 +169,24 @@ impl Supervisor {
             {
                 return Err("A worker cannot start workers.".to_string());
             }
+        } else if request.parent_task_id.is_some() {
+            return Err("A worker's parent task needs a parent session.".to_string());
         }
+        // Snapshot only the parent task's already-durable resolved paths. The
+        // worker prompt may be model-generated, so it is never read for this.
+        let inherited_protected_paths = match (&request.parent_session_id, &request.parent_task_id)
+        {
+            (Some(parent), Some(parent_task_id)) => {
+                store
+                    .task(parent, parent_task_id)
+                    .map_err(|error| error.to_string())?;
+                store
+                    .task_protected_paths(parent, parent_task_id)
+                    .map_err(|error| error.to_string())?
+                    .paths
+            }
+            _ => Vec::new(),
+        };
         // The socket path's length depends only on the data directory, so a
         // directory too long for `sun_path` is refused here, before the
         // worktree, its branch and the records exist rather than after.
@@ -197,6 +229,8 @@ impl Supervisor {
             .map_err(|error| error.to_string())?;
         let record = WorkerRecord {
             parent_session_id: request.parent_session_id.clone(),
+            parent_task_id: request.parent_task_id.clone(),
+            inherited_protected_paths,
             source_repository: source,
             worktree_path: created.path.clone(),
             branch: created.branch.clone(),
@@ -223,6 +257,15 @@ impl Supervisor {
                     (
                         "parentSessionId",
                         record.parent_session_id.clone().unwrap_or_default(),
+                    ),
+                    (
+                        "parentTaskId",
+                        record.parent_task_id.clone().unwrap_or_default(),
+                    ),
+                    (
+                        "inheritedProtectedPaths",
+                        serde_json::to_string(&record.inherited_protected_paths)
+                            .map_err(|error| error.to_string())?,
                     ),
                     (
                         "sourceRepository",
@@ -795,6 +838,11 @@ pub(crate) fn route(
                 parent_session_id: request
                     .form
                     .get("parent_session_id")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                parent_task_id: request
+                    .form
+                    .get("parent_task_id")
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty()),
             };

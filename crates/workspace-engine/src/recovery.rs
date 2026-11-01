@@ -494,13 +494,7 @@ pub fn reattach_pending_approvals(
             Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
                 if kind == "patch" =>
             {
-                patches
-                    .load(proposal_id)
-                    .map(|patch| ReattachedApproval::Patch {
-                        task_id: task_id.clone(),
-                        patch,
-                    })
-                    .map_err(|error| format!("patch {proposal_id} is unreadable: {error:?}"))
+                reattach_patch(store, audit, patches, session_id, &task_id, proposal_id)
             }
             Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
                 if kind == "plan" =>
@@ -619,6 +613,59 @@ pub fn reattach_pending_approvals(
     Ok(reattached)
 }
 
+/// Reattaches one pending patch, refusing it when a remaining file became
+/// protected after the card was written (spec 98).
+///
+/// Only files without a decision are still actionable, so an already-decided
+/// protected file must not turn a harmless remaining review into a refusal.
+fn reattach_patch(
+    store: &SessionStore,
+    audit: &AuditLog,
+    patches: &PatchStore,
+    session_id: &str,
+    task_id: &str,
+    proposal_id: &str,
+) -> std::result::Result<ReattachedApproval, String> {
+    let patch = patches
+        .load(proposal_id)
+        .map_err(|error| format!("patch {proposal_id} is unreadable: {error:?}"))?;
+    let decided: std::collections::BTreeSet<String> = store
+        .read_patch_file_decisions(session_id, task_id)
+        .map_err(|error| format!("patch decisions for {proposal_id} are unreadable: {error:?}"))?
+        .into_iter()
+        .filter(|decision| decision.patch_id == proposal_id)
+        .flat_map(|decision| decision.paths)
+        .collect();
+    let active = store
+        .task_protected_paths(session_id, task_id)
+        .map_err(|error| format!("protected paths for {task_id} are unreadable: {error:?}"))?;
+    let mut protected: Vec<String> = Vec::new();
+    for file in patch
+        .files
+        .iter()
+        .filter(|file| !decided.contains(&file.path))
+    {
+        if let Some(cover) = active.covering_path(&file.path)
+            && !protected.contains(&cover.path)
+        {
+            protected.push(cover.path.clone());
+        }
+    }
+    if protected.is_empty() {
+        return Ok(ReattachedApproval::Patch {
+            task_id: task_id.to_string(),
+            patch,
+        });
+    }
+    let reason = format!(
+        "Patch would modify protected task path: {}",
+        protected.join(", ")
+    );
+    record_protected_path_recovery_refusal(store, audit, session_id, task_id, &reason)
+        .map_err(|error| format!("could not record the protected-path refusal: {error:?}"))?;
+    Err(reason)
+}
+
 /// The plan a task paused to have reviewed, and the action that review is
 /// holding back.
 ///
@@ -681,6 +728,39 @@ fn fail_task(
         ],
     )?;
     Ok(())
+}
+
+/// Records a recovery refusal caused by a newly protected path on the task and
+/// in the audit log, in the same shape an apply-time refusal uses.
+///
+/// This is deliberately not a `patch_file_decided` event: the user did not
+/// reject a file, and the path-specific refusal must not become review
+/// evidence or a decision that lets the card be skipped in a later replay.
+fn record_protected_path_recovery_refusal(
+    store: &SessionStore,
+    audit: &AuditLog,
+    session_id: &str,
+    task_id: &str,
+    reason: &str,
+) -> Result<()> {
+    store.append_message_with_kind(
+        session_id,
+        Some(task_id),
+        "assistant",
+        reason,
+        Some("protected_path_refusal"),
+    )?;
+    audit
+        .record(
+            "task_protected_path_refusal",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("taskId", task_id.to_string()),
+                ("message", reason.to_string()),
+            ],
+        )
+        .map(|_| ())
 }
 
 /// The sentence naming what was in flight, for

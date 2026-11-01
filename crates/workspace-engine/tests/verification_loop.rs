@@ -1462,6 +1462,8 @@ fn mark_worker(engine: &WorkspaceEngine, session_id: &str, root: &std::path::Pat
             session_id,
             &WorkerRecord {
                 parent_session_id: None,
+                parent_task_id: None,
+                inherited_protected_paths: Vec::new(),
                 source_repository: root.to_path_buf(),
                 worktree_path: root.to_path_buf(),
                 branch: "damaian/fixture".to_string(),

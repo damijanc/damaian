@@ -45,6 +45,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | Rewind did not restore a file, or reports a conflict | [Checkpoints and rewind](#checkpoints-and-rewind) |
 | The assistant replies but never proposes a patch | [The assistant replies but never proposes a patch](#the-assistant-replies-but-never-proposes-a-patch) |
 | Applying a patch fails with a conflict | [Patch apply fails with a conflict](#patch-apply-fails-with-a-conflict) |
+| A patch is refused as modifying a protected task path | [A patch was refused because a task path is protected](#a-patch-was-refused-because-a-task-path-is-protected) |
 | An `edit_file` proposal is refused | [An `edit_file` proposal is refused](#an-edit_file-proposal-is-refused) |
 | `Refused: …` from a mode, a profile or the command policy | [The assistant was refused](#the-assistant-was-refused-the-session-mode-the-permission-profile-or-the-command-policy) |
 | `Refused by hook …`, or a hook blocked, warned, timed out or did not run | [A hook refused, blocked, or did not run](#a-hook-refused-blocked-or-did-not-run) |
@@ -1165,7 +1166,8 @@ events. This is where **message content** lives.
 
 Event types: `session_created`, `session_renamed`, `task_created`,
 `task_status_updated`, `task_superseded`, `task_usage_recorded`,
-`message_appended`, `steering_note_added`, `action_started`, `action_finished`,
+`message_appended`, `task_protected_paths`, `steering_note_added`,
+`action_started`, `action_finished`,
 `browser_diagnostics_approval_updated`, `conversation_rewound`, `plan_created`,
 `plan_revised`, `plan_resumed`, `plan_step_updated`, `plan_approved`,
 `question_asked`, `question_answered`, `provider_fallback`,
@@ -2023,7 +2025,7 @@ to a separate worker log.
 | What | Where |
 |---|---|
 | Worktree and branch | `<source repo>/.damaian/worktrees/<slug>` on `damaian/<slug>`; `.damaian/worktrees/` is a line in the source's `.git/info/exclude` |
-| What created them | the worker's own session log, first event `worker_spawned` (`gitCommands`, `baseCommit`, `includedUncommitted`, `parentSessionId`), and the same event in the audit log |
+| What created them | the worker's own session log, first event `worker_spawned` (`gitCommands`, `baseCommit`, `includedUncommitted`, `parentSessionId`, `parentTaskId`, `inheritedProtectedPaths`), and the same event in the audit log |
 | Its conversation | `sessions/<session-id>.jsonl`, keyed by the **worktree's** repository id, not the source's. The parent's log has a `worker_spawned` event naming it |
 | Live progress | `sessions/<session-id>.progress.jsonl` |
 | Control socket | `workers/<first 16 hex of sha256(session id)>.sock` |
@@ -2570,6 +2572,41 @@ model quotes the reason back. Two refusals are expected, not bugs:
 
 Neither refusal writes anything to disk. A refused edit goes back to the model
 as a tool result, so it can retry within the same turn.
+
+### A patch was refused because a task path is protected
+
+The refusal reads `Patch would modify protected task path: <path>` (or names
+several). The task has a user-established exclusion covering that file, from a
+`do not touch` / `do not modify` prompt, the **Protected paths** panel, or
+`damaian protect-paths`. A protected directory covers everything under it. The
+engine refuses the whole proposal before it is stored, so no review card
+appears, and apply refuses a selected protected file before writing,
+checkpointing or marking a decision.
+
+Read the durable events in the task's session log:
+
+```bash
+jq -r 'select(.eventType=="task_protected_paths") |
+  "\(.seq) \(.payload.action) \(.payload.source) \([.payload.paths[].path] | join(", "))"' "$SESSION_FILE"
+```
+
+`source` is `prompt` for the user's message, `explicit_control` for the panel or
+CLI, and `inherited_worker_handoff` for the first task of a worker started from
+a protected parent task. A verification or repair task does not get its own add
+event: it inherits through `plan_resumed` or the
+`verification_due`/`verification_started` pair, so only the origin task's add
+appears here.
+
+To continue, ask for an in-scope alternative, or remove the protection with
+**Stop protecting** or
+`damaian protect-paths <repo> <session> <task> remove <path>`. Removing is a
+new event and keeps the earlier add in the log. A file you rejected in review is
+*not* a protection; if a path was never named in a prompt or the explicit
+control, the refusal is a defect. Every refusal is audited as
+`task_protected_path_refusal`, and a stale recovered card whose remaining file
+became protected is failed with that reason instead of being offered again.
+This fence covers patch and edit-tool targets only: a shell command still needs
+its ordinary approval under the command policy.
 
 ### A command that used to run unasked now asks
 

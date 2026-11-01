@@ -8,11 +8,11 @@ use workspace_engine::{
     HookEvent, MapLoad, MockModelAdapter, ModelAdapter, OpenAICompatibleAdapter, ProcessRegistry,
     ProfileId, ReadWindow, RebuildReason, RelationTarget, RepositoryMap, RootEvidence,
     RootOverride, RootOverrideEdit, SearchResult, SymbolLoad, SymbolMatch, SymbolRef,
-    SymbolReferences, TurnProgress, TurnSink, WorkspaceEngine, command_approval_prompt,
-    edit_root_overrides, ensure_data_dir_schema, export_profile, hook_definition_hash,
-    import_profile, parse_hunk_selection, patch_diff_text, patch_hunk_summary, profile_import_base,
-    render_markdown_to_ansi, review_profile_import, review_profile_rejections, select_profile,
-    symbol_matches_json, symbol_references_json,
+    SymbolReferences, TaskProtectedPathsControl, TurnProgress, TurnSink, WorkspaceEngine,
+    command_approval_prompt, edit_root_overrides, ensure_data_dir_schema, export_profile,
+    hook_definition_hash, import_profile, parse_hunk_selection, patch_diff_text,
+    patch_hunk_summary, profile_import_base, render_markdown_to_ansi, review_profile_import,
+    review_profile_rejections, select_profile, symbol_matches_json, symbol_references_json,
 };
 
 fn usage() -> &'static str {
@@ -50,6 +50,9 @@ fn usage() -> &'static str {
   damaian verify <repo> <session> [--decline-checks]
   damaian continue-repair <repo> <session>
   damaian propose-edit <repo> <prompt>
+  damaian protect-paths <repo> <session> <task> list
+  damaian protect-paths <repo> <session> <task> add <path...>
+  damaian protect-paths <repo> <session> <task> remove <path...>
   damaian show-patch <repo> <patch-id>
   damaian apply-patch <repo> <patch-id> [file...] [--hunk-selection <json>]
                       [--allow-generated-secrets]
@@ -633,6 +636,49 @@ fn run() -> workspace_engine::Result<()> {
                     .collect::<Vec<_>>()
                     .join(",")
             );
+        }
+        "protect-paths" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let session_id = require_arg(&args, 2, "<session>")?;
+            let task_id = require_arg(&args, 3, "<task>")?;
+            let action = args.get(4).map(String::as_str).ok_or_else(|| {
+                workspace_engine::ClientError::InvalidInput(
+                    "protect-paths needs list, add, or remove".to_string(),
+                )
+            })?;
+            let engine = engine_for_repo(repo)?;
+            match action {
+                "list" => {
+                    if args.len() > 5 {
+                        return Err(workspace_engine::ClientError::InvalidInput(
+                            "protect-paths list takes no paths".to_string(),
+                        ));
+                    }
+                    let control =
+                        engine.task_protected_paths_control_for_task(repo, session_id, task_id)?;
+                    print!("{}", protected_paths_text(&control));
+                }
+                "add" => {
+                    let paths = protect_path_arguments(&args[5..], "add")?;
+                    let update =
+                        engine.add_task_protected_paths(repo, session_id, task_id, &paths)?;
+                    println!("{}", update.outcome);
+                    print!("{}", protected_paths_text(&update.control));
+                }
+                "remove" => {
+                    let paths = protect_path_arguments(&args[5..], "remove")?;
+                    let update =
+                        engine.remove_task_protected_paths(repo, session_id, task_id, &paths)?;
+                    println!("{}", update.outcome);
+                    print!("{}", protected_paths_text(&update.control));
+                }
+                other => {
+                    return Err(workspace_engine::ClientError::InvalidInput(format!(
+                        "Unknown protect-paths action: {other}\n\n{}",
+                        usage()
+                    )));
+                }
+            }
         }
         "show-patch" => {
             let repo = require_arg(&args, 1, "<repo>")?;
@@ -1292,6 +1338,34 @@ fn print_provider_switch_warnings(
         );
     }
     Ok(())
+}
+
+/// `protect-paths` needs at least one path for `add` and `remove`; `list`
+/// takes none. The error names the action so a missing argument is not mistaken
+/// for an empty protected set.
+fn protect_path_arguments(args: &[String], action: &str) -> workspace_engine::Result<Vec<String>> {
+    if args.is_empty() {
+        return Err(workspace_engine::ClientError::InvalidInput(format!(
+            "protect-paths {action} needs at least one path"
+        )));
+    }
+    Ok(args.to_vec())
+}
+
+/// One canonical path and the engine-provided kind label per line, after the
+/// task line. Stable text so the list command can be asserted directly.
+fn protected_paths_text(control: &TaskProtectedPathsControl) -> String {
+    if !control.available {
+        return format!("protected paths unavailable: {}\n", control.note);
+    }
+    let mut output = format!("protected paths for task {}:\n", control.task_id);
+    if control.rows.is_empty() {
+        output.push_str(&format!("  none ({})\n", control.note));
+    }
+    for row in &control.rows {
+        output.push_str(&format!("  {}  {}\n", row.path, row.kind_label));
+    }
+    output
 }
 
 fn search_results_json(results: &[SearchResult]) -> String {

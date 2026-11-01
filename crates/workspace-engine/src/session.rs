@@ -8,6 +8,10 @@ use crate::file_access::LineRange;
 use crate::hash::{create_id, now_millis};
 use crate::mode::SessionMode;
 use crate::model::{TokenUsage, UsageSource};
+use crate::protected_paths::{
+    ProtectedPath, ProtectedPathAction, ProtectedPathSource, TASK_PROTECTED_PATHS_EVENT,
+    TaskProtectedPaths, TaskProtectedPathsEvent,
+};
 use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -66,6 +70,19 @@ pub struct ContextPin {
 pub struct WorkerRecord {
     /// `None` for a worker started from the sidebar rather than from a block.
     pub parent_session_id: Option<String>,
+    /// The task whose message carried the handoff, when the worker was started
+    /// from a `worker-prompt` block or a plan review.
+    ///
+    /// Defaulted so a record written before spec 98 still decodes.
+    #[serde(default)]
+    pub parent_task_id: Option<String>,
+    /// The parent task's already-durable protected paths at spawn time.
+    ///
+    /// This is the snapshot the worker's first task receives. It is copied from
+    /// the resolved task record, never parsed from the worker's prompt, which
+    /// may be model-generated. Defaulted for records written before spec 98.
+    #[serde(default)]
+    pub inherited_protected_paths: Vec<ProtectedPath>,
     pub source_repository: PathBuf,
     pub worktree_path: PathBuf,
     pub branch: String,
@@ -368,11 +385,13 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     /// What wrote this entry, when it was not an ordinary chat turn. The values
-    /// today are `"plan_reminder"` (spec 66 §5.5), the engine's nudge, and
+    /// today are `"plan_reminder"` (spec 66 §5.5), the engine's nudge,
     /// `"memory_refusal"` (spec 29 §5.5), the plain reason an explicit
-    /// "remember that…" became no proposal. Both render as system lines and
-    /// must not seed the next turn as the user's or the assistant's words.
-    /// `None` for every message a person or the model wrote.
+    /// "remember that…" became no proposal, and `"protected_path_refusal"`
+    /// (spec 98), the reason a prompt's protected-path wording was not
+    /// recorded. These render as system lines and must not seed the next turn
+    /// as the user's or the assistant's words. `None` for every message a
+    /// person or the model wrote.
     pub kind: Option<String>,
     pub created_at_ms: u128,
 }
@@ -1131,6 +1150,21 @@ impl SessionStore {
             .into_iter()
             .filter_map(|id| tasks.remove(&id))
             .collect())
+    }
+
+    /// One task in this session, or a clear error naming what was asked for.
+    ///
+    /// Task-scoped controls use this so a typo cannot write an event keyed to a
+    /// task that does not exist.
+    pub fn task(&self, session_id: &str, task_id: &str) -> Result<Task> {
+        self.read_tasks(session_id)?
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| {
+                ClientError::InvalidInput(format!(
+                    "Unknown task in session {session_id}: {task_id}"
+                ))
+            })
     }
 
     pub fn allow_browser_diagnostics_for_session(
@@ -2802,6 +2836,148 @@ impl SessionStore {
         self.append_session_event(session_id, event_type, &payload)
     }
 
+    /// Appends one task-scoped protected-path change (spec 98).
+    ///
+    /// The caller must already have canonicalised every path against the task
+    /// repository. This writer validates only that what it was given is a
+    /// normal repository-relative path, so a malformed event cannot be recorded
+    /// even by a future caller that skipped canonicalisation.
+    ///
+    /// There is deliberately no text-accepting variant. A path is established
+    /// by the prompt parser, the explicit control, or a worker's copy of its
+    /// parent task's already-durable record. Model, repository, fetched and
+    /// tool text have no route here. Crate-private so the desktop and CLI must
+    /// go through `WorkspaceEngine`'s user-action methods, which verify the
+    /// session's repository before reaching this writer.
+    pub(crate) fn record_task_protected_paths(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        action: ProtectedPathAction,
+        paths: &[ProtectedPath],
+        source: ProtectedPathSource,
+    ) -> Result<TaskProtectedPathsEvent> {
+        self.task(session_id, task_id)?;
+        let mut canonical = Vec::new();
+        for path in paths {
+            if !path.is_valid_repository_relative() {
+                return Err(ClientError::InvalidInput(format!(
+                    "Protected path is not repository-relative: {}",
+                    path.path
+                )));
+            }
+            if !canonical.contains(path) {
+                canonical.push(path.clone());
+            }
+        }
+        if canonical.is_empty() {
+            return Err(ClientError::InvalidInput(
+                "A protected-path change needs at least one path".to_string(),
+            ));
+        }
+        let event = TaskProtectedPathsEvent::new(task_id, action, source, canonical);
+        let payload = serde_json::to_string(&event).map_err(|error| {
+            ClientError::Io(format!("protected path event serialization: {error}"))
+        })?;
+        self.append_session_event(session_id, TASK_PROTECTED_PATHS_EVENT, &payload)?;
+        Ok(event)
+    }
+
+    /// Every parseable protected-path event in the session, in log order.
+    ///
+    /// A path that is not a normal repository-relative name is dropped with its
+    /// entry rather than becoming a protection by accident. An event whose
+    /// entries are all malformed is omitted.
+    pub fn read_task_protected_path_events(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TaskProtectedPathsEvent>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        Ok(active_events(&content)
+            .into_iter()
+            .filter(|event| event.event_type == TASK_PROTECTED_PATHS_EVENT)
+            .filter_map(|event| {
+                let mut change =
+                    serde_json::from_value::<TaskProtectedPathsEvent>(event.payload).ok()?;
+                change
+                    .paths
+                    .retain(ProtectedPath::is_valid_repository_relative);
+                (!change.paths.is_empty()).then_some(change)
+            })
+            .collect())
+    }
+
+    /// The task's active protections, replayed through its continuation
+    /// ancestry.
+    ///
+    /// Ancestry is [`Self::resume_plan`]'s `plan_resumed` link plus the
+    /// verification turn a `verification_due`/`verification_started` pair
+    /// creates. Both are explicit continuation edges; a task that merely
+    /// belongs to the same session has none of them and starts empty.
+    pub fn task_protected_paths(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<TaskProtectedPaths> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown task in session {session_id}: {task_id}"
+            )));
+        };
+        let events = active_events(&content);
+        if !task_exists_in_events(&events, task_id) {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown task in session {session_id}: {task_id}"
+            )));
+        }
+        let ancestry = protected_path_ancestry(&events, task_id);
+        let mut paths: Vec<ProtectedPath> = Vec::new();
+        for event in &events {
+            if event.event_type != TASK_PROTECTED_PATHS_EVENT {
+                continue;
+            }
+            let Some(event_task) = event.text("taskId") else {
+                continue;
+            };
+            if !ancestry.contains(&event_task) {
+                continue;
+            }
+            let Ok(change) =
+                serde_json::from_value::<TaskProtectedPathsEvent>(event.payload.clone())
+            else {
+                continue;
+            };
+            if change.task_id != event_task {
+                continue;
+            }
+            match change.action {
+                ProtectedPathAction::Add => {
+                    for path in change.paths {
+                        if path.is_valid_repository_relative() && !paths.contains(&path) {
+                            paths.push(path);
+                        }
+                    }
+                }
+                ProtectedPathAction::Remove => {
+                    // Removed by path, because the file may have become a
+                    // directory (or the reverse) since the protection landed.
+                    paths.retain(|existing| {
+                        !change
+                            .paths
+                            .iter()
+                            .any(|removed| removed.path == existing.path)
+                    });
+                }
+            }
+        }
+        Ok(TaskProtectedPaths {
+            task_id: task_id.to_string(),
+            paths,
+        })
+    }
+
     /// Every verification event in the session belonging to one of
     /// `task_ids`, in log order. An empty `task_ids` means every task, which is
     /// what a verification turn needs to find the due event before it knows
@@ -3848,6 +4024,78 @@ fn active_events(content: &str) -> Vec<SessionEvent> {
         .collect()
 }
 
+/// Whether the active log contains this task's creation or a later status
+/// event that carries the whole task.
+fn task_exists_in_events(events: &[SessionEvent], task_id: &str) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "task_created" | "task_status_updated" | "worker_return_consumed"
+        ) && event
+            .payload
+            .get("task")
+            .unwrap_or(&event.payload)
+            .get("id")
+            .and_then(|value| value.as_str())
+            .is_some_and(|id| id == task_id)
+    })
+}
+
+/// The task ids whose protections a task inherits, including itself.
+///
+/// Two explicit continuation edges exist today. `plan_resumed` is written by a
+/// verification, repair, worker or typed-plan continuation and names the task
+/// the plan came from. A verification can also be created for a due that had
+/// no plan; its `verification_started` event names the new task and follows the
+/// `verification_due` that names the task whose patch or command made it due.
+///
+/// Membership in the same session is deliberately not an edge, so a new
+/// user-started task inherits nothing.
+fn protected_path_ancestry(events: &[SessionEvent], task_id: &str) -> HashSet<String> {
+    let mut plan_parent: HashMap<String, String> = HashMap::new();
+    let mut verification_parent: HashMap<String, String> = HashMap::new();
+    let mut pending_due: Option<String> = None;
+    for event in events {
+        match event.event_type.as_str() {
+            "plan_resumed" => {
+                if let (Some(task), Some(from)) = (event.text("taskId"), event.text("resumedFrom"))
+                    && task != from
+                {
+                    plan_parent.insert(task, from);
+                }
+            }
+            "verification_due" => {
+                pending_due = event.text("taskId");
+            }
+            "verification_started" => {
+                if let Some(task) = event.text("taskId")
+                    && let Some(due) = &pending_due
+                    && due != &task
+                {
+                    verification_parent.insert(task, due.clone());
+                }
+            }
+            "verification_finished" => pending_due = None,
+            _ => {}
+        }
+    }
+
+    let mut ancestry = HashSet::new();
+    let mut pending = vec![task_id.to_string()];
+    while let Some(current) = pending.pop() {
+        if !ancestry.insert(current.clone()) {
+            continue;
+        }
+        if let Some(parent) = plan_parent.get(&current) {
+            pending.push(parent.clone());
+        }
+        if let Some(parent) = verification_parent.get(&current) {
+            pending.push(parent.clone());
+        }
+    }
+    ancestry
+}
+
 /// Findings as recorded, with their newest status change applied. Staleness
 /// is not derived here, so `set_finding_status` can use this to check that
 /// an id exists.
@@ -4617,6 +4865,8 @@ mod tests {
     fn worker_record(parent: Option<&str>, source: &str, worktree: &str) -> WorkerRecord {
         WorkerRecord {
             parent_session_id: parent.map(str::to_string),
+            parent_task_id: None,
+            inherited_protected_paths: Vec::new(),
             source_repository: PathBuf::from(source),
             worktree_path: PathBuf::from(worktree),
             branch: "damaian/split-the-parser".to_string(),
@@ -4647,6 +4897,23 @@ mod tests {
         // A rewind discards conversation, not what the session is.
         store.rewind_conversation(&worker.id, 0).unwrap();
         assert!(store.worker_record(&worker.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_worker_record_written_before_handoff_fields_still_decodes() {
+        let legacy = serde_json::json!({
+            "parentSessionId": "ses_parent",
+            "sourceRepository": "/code/app",
+            "worktreePath": "/code/app/.damaian/worktrees/w",
+            "branch": "damaian/w",
+            "baseCommit": "0123456",
+            "includedUncommitted": false,
+            "gitCommands": []
+        });
+        let record: WorkerRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(record.parent_session_id.as_deref(), Some("ses_parent"));
+        assert_eq!(record.parent_task_id, None);
+        assert!(record.inherited_protected_paths.is_empty());
     }
 
     #[test]

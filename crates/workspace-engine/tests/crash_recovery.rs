@@ -116,6 +116,8 @@ fn a_worker_session_is_never_auto_resumed() {
                 &fixture.session_id,
                 &WorkerRecord {
                     parent_session_id: None,
+                    parent_task_id: None,
+                    inherited_protected_paths: Vec::new(),
                     source_repository: PathBuf::from("/code/app"),
                     worktree_path: PathBuf::from("/code/app/.damaian/worktrees/w"),
                     branch: "damaian/w".to_string(),
@@ -241,6 +243,8 @@ fn record_worker(fixture: &Fixture) {
             &fixture.session_id,
             &WorkerRecord {
                 parent_session_id: None,
+                parent_task_id: None,
+                inherited_protected_paths: Vec::new(),
                 source_repository: PathBuf::from("/code/app"),
                 worktree_path: PathBuf::from("/code/app/.damaian/worktrees/w"),
                 branch: "damaian/w".to_string(),

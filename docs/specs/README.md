@@ -79,7 +79,7 @@ directory was renamed from `ROADMAP` to `PLAN` because it was never a roadmap:
 
 ## What to build next, and what may run in parallel
 
-### Current state (2026-10-31)
+### Current state (2026-11-01)
 
 A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
@@ -97,9 +97,9 @@ and worktree delivery finished on 2026-10-28 and were merged into `main` that
 day; the full seven-check gate passed in CI on 2026-10-29 for the `main` push
 that contains both (Quality run 40902516310).
 
-#60–#85, #87–#97, #99 and #100 are also Done (see their rows below). #99 and
-#100 finished on 2026-10-31; their local checks passed, and the full gate is left
-to CI. Several were evidence-driven or
+#60–#85, #87–#100 are also Done (see their rows below). #99 and #100 finished
+on 2026-10-31, and #98 finished on 2026-11-01; their scoped local checks passed,
+and the full gate is left to CI. Several were evidence-driven or
 usability specs added outside the roadmap order; being finished, none of them
 changes what may be built next. #101–#106 are the not-yet-built single-worker
 reliability sequence added after the failed spec 86 attempt: truthful
@@ -112,36 +112,41 @@ checks, and the acceptance gate that proves the sequence works as one system.
   [`tasks.md`](30_memory_retrieval_and_lifecycle/tasks.md)). Its scoped checks
   passed locally, and the full seven-check gate passed in CI on 2026-10-30 for the `main` push that contains it (Quality run 41063831118). Its §7.3 records the one open item that is not a criterion:
   the phase's two-week real-session observation has not elapsed.
-- **In progress:** none. #49 prompt cache's accounting slice is done and the
-  reuse slice (requirement 4) is still unbuilt; #26's ordering exists, and #55
-  replaced the eight-message sliding window on 2026-10-26, so the reuse slice is
-  no longer blocked by either. #49's own `Depends on:` line still names Phase 1
-  WP3 (provider capability validation) as unspecified, so it is not in the
-  ready set.
+- **Done:** [#98](98_task_scoped_protected_patch_paths.md) task-scoped
+  protected patch paths finished on 2026-11-01. Tasks 1–5 landed: durable
+  protected-path state and continuation ancestry, the proposal/apply fences and
+  model reminder, the parent-to-worker handoff, worker progress and recovery
+  reattachment, the engine-owned desktop and CLI controls, and the final
+  integration pass. Its §7 records the scoped local checks; the full gate is
+  left to CI.
+- **In progress:** [#49](49_prompt_cache_accounting_and_reuse/proposal.md) prompt
+  cache's accounting slice is done and the reuse slice (requirement 4) is still
+  unbuilt; #26's ordering exists, and #55 replaced the eight-message sliding
+  window on 2026-10-26, so the reuse slice is no longer blocked by either.
+  #49's own `Depends on:` line still names Phase 1 WP3 (provider capability
+  validation) as unspecified, so it is not in the ready set.
 - **Ready:** #33 MCP management. It was serialised behind #30 on `chat.rs`;
   with #30 Done it is free to start, from a `main` that contains #30's turn
-  path so it does not rebase over it. [#98](98_task_scoped_protected_patch_paths.md)
-  is also ready: it makes direct user no-touch paths an engine-enforced,
-  task-scoped patch fence across worker and repair continuations.
-  [#101](101_closed_task_completion.md) and [#104](104_worker_questions.md)
-  are dependency-ready too, but both share the agent loop with #33 and #98 and
-  must not be implemented concurrently with either.
+  path so it does not rebase over it.
+  [#101](101_closed_task_completion.md),
+  [#102](102_repair_provenance_and_stagnation.md) and
+  [#104](104_worker_questions.md) are dependency-ready too — #102's last unmet
+  dependency was #98 — but all of them share the agent loop with #33 and must
+  not be implemented concurrently with it or with each other.
 - **Blocked:** #37 on #33; #52 on #33; #39 on #38; #40 on #38 and #39; #54 on
   Phase 1 WP3 (provider capability validation), which is unspecified. In the
-  single-worker sequence, [#102](102_repair_provenance_and_stagnation.md) is
-  blocked on #98; [#103](103_bounded_worker_continuation.md) on #101 and #102;
-  [#105](105_structured_plan_checks.md) on #101; and
-  [#106](106_single_worker_spec_acceptance.md) on #98 and #101–#105.
+  single-worker sequence, [#103](103_bounded_worker_continuation.md) is blocked
+  on #101 and #102; [#105](105_structured_plan_checks.md) on #101; and
+  [#106](106_single_worker_spec_acceptance.md) on #101–#105.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
 - **Pairing:** two specs may run together only if at most one of them edits
   `chat.rs`, and #49's reuse slice is a solo `chat.rs` track while it rewrites
   the request around `build_model_prompt`. #33 edits `chat.rs` through the MCP
-  tool list and per-tool dispatch, and #98 edits it through patch dispatch and
-  continuation state; either owns that file while it is in flight. #101–#105
-  also touch the task/agent loop and form one serial implementation track.
-  #106 follows that track and primarily owns the eval harness.
-  Every Done spec no longer constrains anything. See
-  [Parallel work](#parallel-work).
+  tool list and per-tool dispatch and owns that file while it is in flight.
+  #101–#105 also touch the task/agent loop and form one serial implementation
+  track. #106 follows that track and primarily owns the eval harness. #98 is
+  Done and no longer constrains `chat.rs`. Every Done spec no longer constrains
+  anything. See [Parallel work](#parallel-work).
 - **Open decision:** the priority table below predates #59–#80 and does not
   rank them; the text after it now calls #23 the priority with #65 done.
 
@@ -872,15 +877,15 @@ is ready.
 | 95 | [95_one_workers_panel.md](95_one_workers_panel.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A usability gap reported in use: the sidebar's per-project **Workers** entry repeated the workers already listed under their parent sessions, and each board covered one project. The entry is gone; **Workers** on the header ⋮ opens one board for every project, with a Project column, and `GET /api/workers` without `repo` lists them all. |
 | 96 | [96_continue_repair_at_the_limit.md](96_continue_repair_at_the_limit.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A defect reported in use: the repair limit defaulted to 2 and a worker had no way to continue after it, so an interrupted draft let only workers repair past the limit. The default is now 16, every session still stops at the limit, and a **Continue repair** action starts exactly one more attempt on the user's explicit decision, for ordinary and worker sessions. The failed plan and evidence carry into that attempt, every approval still applies, a second activation is refused, and the offer is redrawn from the durable log after a reload. |
 | 97 | [97_reuse_planned_verification_steps.md](97_reuse_planned_verification_steps.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A task plan can name `cargo test` as its final step, but automatic verification selected the same command after every patch and activated a second `verify_` step beside the carried primary work. Verification now defers an exact planned whole-suite check until the worker reaches its final plan step, and leaves a secondary check pending while another primary step is active, so every durable log prefix preserves the one-in-progress invariant. |
-| 98 | [98_task_scoped_protected_patch_paths.md](98_task_scoped_protected_patch_paths.md) | **Not started.** A worker ignored a direct no-touch instruction and proposed deleting an unrelated file after a failed check. Direct user path exclusions will become durable, task-scoped patch fences enforced before proposal and again before apply, across verification, repairs, worker restart, and reload. A rejected file alone remains a review decision, not an implicit permanent ban. |
+| 98 | [98_task_scoped_protected_patch_paths.md](98_task_scoped_protected_patch_paths.md) | **Done 2026-11-01.** A worker ignored a direct no-touch instruction and proposed deleting an unrelated file after a failed check. Direct user path exclusions are now durable, task-scoped patch fences enforced before proposal and again before apply, across verification, repairs, worker restart, and reload. The engine owns the narrow direct-user parser, canonicalisation, repository/session checks, deletion-safe explicit removal, `plan_resumed`/verification ancestry replay, the worker handoff, the proposal/apply and recovery fences, the reminder, worker progress, and one typed control model for the desktop and CLI. A rejected file alone remains a review decision, not an implicit permanent ban, and shell commands remain separately approval-gated rather than sandboxed. |
 | 99 | [99_worker_task_outcomes.md](99_worker_task_outcomes.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A worker's `idle` process state hid whether its task had completed, needed a decision, or had stopped short. The worker session now derives an explicit outcome and next action from durable task status, approvals, errors and progress timestamps; the board also treats an idle pending decision as **Needs you**. |
 | 100 | [100_worker_return_and_inline_choice.md](100_worker_return_and_inline_choice.md) | **Done 2026-10-31** (specified and built the same day; local checks passed, the full gate is left to CI). A completed worker now returns one redacted, durable terminal outcome to its parent; the parent shows a result card whose **Continue with result** starts an ordinary turn rather than approving or merging anything, and a suggested worker prompt offers **Work here instead** beside **Start worker**. |
 | 101 | [101_closed_task_completion.md](101_closed_task_completion.md) | **Not started.** A model answer can currently become `complete` while approved plan work or verification remains. Completion will become an engine-owned gate; an answer with open work becomes a durable, resumable `incomplete` outcome instead of worker success. |
-| 102 | [102_repair_provenance_and_stagnation.md](102_repair_provenance_and_stagnation.md) | **Not started; blocked on #98.** Checks will be baselined before the patch that first selects them, repair will target only introduced regressions, environment failures will not trigger source edits, and repeated or oscillating repairs will stop before the numeric limit. |
+| 102 | [102_repair_provenance_and_stagnation.md](102_repair_provenance_and_stagnation.md) | **Not started; ready now that #98 is Done.** Checks will be baselined before the patch that first selects them, repair will target only introduced regressions, environment failures will not trigger source edits, and repeated or oscillating repairs will stop before the numeric limit. |
 | 103 | [103_bounded_worker_continuation.md](103_bounded_worker_continuation.md) | **Not started; blocked on #101 and #102.** A user-approved task budget will span internal worker segments, while deterministic within-turn tool-history compaction keeps requests inside the provider window and no-progress or budget exhaustion remains a truthful stop. |
 | 104 | [104_worker_questions.md](104_worker_questions.md) | **Not started.** An app-managed worker will be able to persist a real clarification, show **Needs your answer**, and resume through its control socket without treating an answer as an approval or guessing a material product decision. |
 | 105 | [105_structured_plan_checks.md](105_structured_plan_checks.md) | **Not started; blocked on #101.** Approved plan steps will carry structured required checks with command, directory and current evidence, replacing #97's prose match and giving the completion gate an engine-owned verification obligation. |
-| 106 | [106_single_worker_spec_acceptance.md](106_single_worker_spec_acceptance.md) | **Not started; blocked on #98 and #101–#105.** A deterministic fixture and three consecutive fresh live runs will prove that one real worker can finish one specification-sized task without generic rescue prompts, while all existing safety decisions remain explicit. |
+| 106 | [106_single_worker_spec_acceptance.md](106_single_worker_spec_acceptance.md) | **Not started; blocked on #101–#105.** A deterministic fixture and three consecutive fresh live runs will prove that one real worker can finish one specification-sized task without generic rescue prompts, while all existing safety decisions remain explicit. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:

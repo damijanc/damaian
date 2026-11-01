@@ -39,6 +39,7 @@ pub mod path_policy;
 pub mod plan;
 pub mod process_registry;
 pub mod profile;
+pub mod protected_paths;
 pub mod recovery;
 mod render;
 pub mod repository_map;
@@ -70,8 +71,8 @@ pub use chat::{
     AgentFetchProposal, AgentPatchProposal, AgentPlanProposal, AgentQuestionProposal,
     AgentRoundBudgetProposal, ChatOrchestrator, ChatTurnOptions, ChatTurnResult, ContextDecision,
     FetchComponentFlag, FetchDecision, McpTokenResolver, MemoryDisplayEntry, PausedTurns,
-    PendingFetchCall, PhaseKind, PlanRevisionStep, ResumeDecisionOptions, RoundBudgetDecision,
-    RoundBudgetPause, TurnPhase, TurnProgress, TurnSink,
+    PendingFetchCall, PhaseKind, PlanRevisionStep, PlanWorkerPrompt, ResumeDecisionOptions,
+    RoundBudgetDecision, RoundBudgetPause, TurnPhase, TurnProgress, TurnSink,
 };
 pub use checkpoint::{
     CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,
@@ -197,6 +198,14 @@ pub use profile::{
     ProfileCapabilities, ProfileId, ProfileImport, ProfileImportReview, ProfileSelection,
     custom_profile_ids, export_profile, import_profile, profile_import_base, review_profile_import,
     review_profile_rejections, select_profile, split_profile_keys,
+};
+pub use protected_paths::{
+    PROTECTED_PATH_PROMPT_PHRASES, ProtectedPath, ProtectedPathAction, ProtectedPathError,
+    ProtectedPathKind, ProtectedPathPromptError, ProtectedPathPromptOutcome,
+    ProtectedPathPromptResult, ProtectedPathRefusal, ProtectedPathRow, ProtectedPathSource,
+    TASK_PROTECTED_PATHS_EVENT, TaskProtectedPathUpdate, TaskProtectedPaths,
+    TaskProtectedPathsControl, TaskProtectedPathsEvent, canonicalize_protected_path,
+    parse_protected_path_prompt, protected_path_update_outcome, resolve_active_protected_path,
 };
 pub use recovery::{
     PendingVerification, QUESTION_WAITING_HEADLINE, ReattachedApproval, RecoveredTask, abandon,

@@ -3134,6 +3134,8 @@ fn a_worker_session_is_deleted_from_its_source_project() {
             &session.id,
             &workspace_engine::WorkerRecord {
                 parent_session_id: None,
+                parent_task_id: None,
+                inherited_protected_paths: Vec::new(),
                 source_repository: root.clone(),
                 worktree_path: worktree,
                 branch: "damaian/gone".to_string(),

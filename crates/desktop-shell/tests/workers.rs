@@ -78,6 +78,7 @@ fn spawn(supervisor: &Supervisor, config: &Config, repo: &Path, prompt: &str) ->
                 prompt: prompt.to_string(),
                 include_uncommitted: false,
                 parent_session_id: None,
+                parent_task_id: None,
             },
             KEY,
         )
