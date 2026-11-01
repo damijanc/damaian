@@ -32,6 +32,10 @@ API keys under your control.
   **Skipped**, with the evidence behind it.
 - **Fix what a check found.** Errors from compilers, tests, lint and the browser
   become findings: **Fix N errors** repairs them all, **Fix selected** some.
+- **Repair only what the change broke.** Checks are baselined before a patch
+  applies, so a failure that was already there stays separate and starts no
+  repair. Repair stops when it stalls instead of spending attempts that repeat
+  the same failure.
 
 ### Stay in control
 

@@ -1,0 +1,112 @@
+name = "verification_repair_oscillation"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Add a retry to the upload client"
+
+# Specification 102 requirement 7 and acceptance criterion 5: the applied file
+# state and failure oscillate A -> B -> A, and the next repair proposal repeats
+# the first failure/diff pair. Repair stops as `oscillation` before the limit of
+# sixteen, and the redundant patch is never applied.
+verify_after_apply = true
+check_decisions = [{ command = "cargo test", approved = true }]
+config_overlay = """
+agent_tool_retry_limit=16
+"""
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs" } },
+]
+
+[[turn]]
+content = "I added a retry helper."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Add upload retry", files = [
+    { path = "src/upload.rs", status = "modified", content = """
+pub fn upload(payload: &str) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("payload was empty".to_string());
+    }
+    Ok(())
+}
+
+pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
+    let _value: i32 = "not a number";
+    Ok(())
+}
+""" },
+  ] } },
+]
+
+[[turn]]
+content = "I tried a different type here."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Use a bool instead", files = [
+    { path = "src/upload.rs", status = "modified", content = """
+pub fn upload(payload: &str) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("payload was empty".to_string());
+    }
+    Ok(())
+}
+
+pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
+    let _value: bool = 42;
+    Ok(())
+}
+""" },
+  ] } },
+]
+
+[[turn]]
+content = "I restored the first attempt."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Restore the first attempt", files = [
+    { path = "src/upload.rs", status = "modified", content = """
+pub fn upload(payload: &str) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("payload was empty".to_string());
+    }
+    Ok(())
+}
+
+pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
+    let _value: i32 = "not a number";
+    Ok(())
+}
+""" },
+  ] } },
+]
+
+[[turn]]
+content = "I tried a third shape."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Try a third shape", files = [
+    { path = "src/upload.rs", status = "modified", content = """
+pub fn upload(payload: &str) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("payload was empty".to_string());
+    }
+    Ok(())
+}
+
+pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
+    let _value: i32 = true;
+    Ok(())
+}
+""" },
+  ] } },
+]
+
+[assert]
+verification_outcome = "repair_stalled"
+verification_baselines = [{ command = "cargo test", state = "passed" }]
+verification_provenances = [{ command = "cargo test", provenance = "new_regression" }]
+verification_repair_targets = 0
+verification_action_kinds = ["review_stalled_repair"]
+repair_stall_reason = "oscillation"
+# Read, initial patch, and three repair proposals; the third is stopped before
+# it is applied, so the limit of sixteen is never approached.
+model_calls_at_most = 5
+final_task_status = "failed"

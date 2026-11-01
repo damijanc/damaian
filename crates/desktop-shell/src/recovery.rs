@@ -16,7 +16,7 @@ use workspace_engine::{
     pending_verifications, reattach_pending_approvals, resume_allowed, resume_blocked_reason,
 };
 
-use crate::{escape_json, fetch_proposal_json, patch_files_json, plan_json};
+use crate::{escape_json, fetch_proposal_json, patch_payload_json, plan_json};
 
 /// What an interrupted commit can be inspected against: the expected old
 /// `HEAD`, the commit object that may have been created, and where `HEAD` is
@@ -604,11 +604,13 @@ fn describe_approval(
             session_id: session_id.to_string(),
             task_id,
             kind: "patch",
-            payload: format!(
-                "{{\"patchId\":\"{}\",\"summary\":\"{}\",\"files\":[{}]}}",
-                escape_json(&patch.id),
-                escape_json(&patch.summary),
-                patch_files_json(&patch.files)
+            // The same payload the live turn and a worker produce, including
+            // the engine-owned repair-scope review (spec 102 Task 5).
+            payload: patch_payload_json(
+                &patch.id,
+                &patch.summary,
+                &patch.files,
+                patch.repair_scope.as_ref(),
             ),
             unavailable_reason: None,
         },
@@ -1709,6 +1711,7 @@ mod tests {
             summary: "Waiting for review".to_string(),
             status: "pending".to_string(),
             created_at_ms: 1,
+            repair_scope: None,
             files: vec![workspace_engine::ProposedFilePatch {
                 path: "src/a.rs".to_string(),
                 status: "modified".to_string(),

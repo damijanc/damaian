@@ -1331,18 +1331,65 @@ session events:
 | `verification_due` | a settled Code-mode patch needs verification; names the task and patch |
 | `verification_started` | one attempt, with its number and the selected checks |
 | `verification_check` | one check's outcome, or its skip reason, plus the hash of every changed file when it ran |
+| `verification_baseline` | one check's pre-patch baseline: `passed`, `failed` with a redacted fingerprint, `declined`, or `unavailable` with the environment termination |
+| `verification_provenance` | one post-patch classification (`new_regression`, `pre_existing`, `worsened`, `unchanged_failure`, `environment_failure`, `unknown_provenance`) with the redacted evidence and introduced delta |
+| `verification_repair_state` | one repair attempt's comparable state: failure fingerprint, proposed-patch digest and task-diff digest, all hashes or digests rather than content |
+| `verification_repair_stalled` | the terminal no-progress stop, with the same state and the typed reason (`identical_state`, `repeated_failure`, `equivalent_patch`, `unchanged_task_diff`, `oscillation`); the state folds this to the `repair_stalled` outcome |
 | `verification_finished` | the attempt's outcome (`passed`, `nothing_verified` when every check was skipped (spec 78), `failed`, `repair_limit_exhausted`, `no_repair_applied`, `no_checks_available`, `only_documentation_changed`) |
+
+A stall writes only `verification_repair_stalled`, not a `verification_finished`
+event: the one terminal event carries the state and the stop, so replay cannot
+see half of them. The report's `repair_stalled` outcome therefore comes from the
+folded `verification_repair_stalled` event.
 
 A check is identified by its command and root, so `cargo test` at the repository
 root and in `crates/engine` are two checks. Each appears in exactly one of
 passed, failed, skipped or stale in the report; **an unrun check is never
 passed**.
 
+**A check failed before the patch too.** The report calls it `pre_existing` and
+starts no repair. The pre-apply baseline ran the same check against the reviewed
+bytes and recorded a matching redacted fingerprint. Fix it separately if you
+want it addressed; the task did not cause it.
+
+**A check could not run at all.** A missing executable, a process that could not
+be started, a policy refusal or unavailable test infrastructure is
+`environment_failure`, not a code result. The report names the termination and
+offers **Fix the environment**; no repair turn is sent. The same rule applies to
+a command that exits 127: it is recorded as `missing_executable`.
+
+**The failure is `unknown_provenance`.** No usable baseline exists: you declined
+it, it could not run, or the log predates this feature. The failure can still
+fail completion, but Damaian will not assume the task introduced it and starts no
+repair. A later patch can offer a baseline for that check.
+
+**The baseline card appeared before the patch.** Running a selected check against
+the pre-patch files is its own ordinary command decision. Approving the patch
+does not approve the baseline, and skipping the baseline does not skip the patch.
+If a baseline command changes a tracked file, the reviewed patch is stale and
+must be previewed again. The card is recorded as `verification_baseline_paused`
+and `verification_baseline_resumed` in the audit log.
+
+**Automatic repair stopped and says `repair stalled`.** This is progress
+detection, not the numeric limit. Two consecutive attempts left the same failure,
+repeated an equivalent patch, produced no net change to the task's files, or
+oscillated between two states. The report's outcome is `repair_stalled`, taken
+from the `verification_repair_stalled` event; it carries the typed reason, offers
+one **Review the failure and choose the next step** action, and deliberately
+offers no **Continue repair**. Change the task or fix the failure yourself;
+Damaian will not retry automatically.
+
+**The report calls a repair `worsened`.** The check already failed before the
+patch, and the patch added findings to it. Only the new findings are eligible for
+repair, so the older failure is not re-sent as a target. An unchanged failure
+with no new evidence starts no repair.
+
 Choosing **Continue repair** at the limit starts one new task that carries the
 plan, and writes the audit event `verification_repair_continued` with the
 session, the limited task and the new task's id. The new task's plan holds the
 failed check's evidence, so the repair request is the same one an automatic
-repair below the limit would have sent.
+repair below the limit would have sent. A stalled repair is not the limit, so it
+offers no such action.
 
 **Where the full output lives.** A `verification_check` event is a summary. The
 findings carry an `originRef`, and the command's complete `stdout.log`,
@@ -1380,7 +1427,9 @@ fails; the agent's repairs did not fix it within `agent_tool_retry_limit`
 attempt with the failing evidence, or raise the limit if the work genuinely
 needs more. The action does not raise the limit and does not retry on its own; a
 second click while that repair is pending is refused. It is offered again if the
-next verification reaches the limit, and it works for worker sessions too.
+next verification reaches the limit, and it works for worker sessions too. A
+report that says **repair stalled** is a different stop: repair made no progress
+before the limit, so no **Continue repair** action is offered.
 
 ### The plan says a step is still open after the turn ended
 

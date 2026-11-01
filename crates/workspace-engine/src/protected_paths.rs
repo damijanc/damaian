@@ -1542,6 +1542,7 @@ mod tests {
             summary: "Waiting for review".to_string(),
             status: "pending".to_string(),
             created_at_ms: 1,
+            repair_scope: None,
             files: files
                 .iter()
                 .map(|path| crate::patch_engine::ProposedFilePatch {

@@ -3019,6 +3019,7 @@ impl SessionStore {
             VerificationEvent::Baseline { .. } => "verification_baseline",
             VerificationEvent::Provenance { .. } => "verification_provenance",
             VerificationEvent::RepairState { .. } => "verification_repair_state",
+            VerificationEvent::RepairStalled { .. } => "verification_repair_stalled",
         };
         let payload = serde_json::to_string(event).map_err(|error| {
             crate::error::ClientError::Io(format!("verification event serialization: {error}"))
@@ -3248,6 +3249,7 @@ impl SessionStore {
                     | "verification_baseline"
                     | "verification_provenance"
                     | "verification_repair_state"
+                    | "verification_repair_stalled"
             ) {
                 continue;
             }
@@ -3314,6 +3316,40 @@ impl SessionStore {
             }
         }
         Ok(provenance)
+    }
+
+    /// The bounded repair-state window for `task_id`, oldest first.
+    ///
+    /// Scoped to the task's continuation chain, like baselines and provenance,
+    /// so a repair continuation and a worker restart compare against their own
+    /// earlier attempts and a new user task inherits nothing. A terminal
+    /// `RepairStalled` entry is included: it is the last attempt whose
+    /// redundant proposal was refused, and a later attempt must not pretend it
+    /// never happened.
+    pub fn task_verification_repair_history(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<crate::verification::RepairStateEntry>> {
+        use crate::verification::{MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, VerificationEvent};
+        let chain = self.task_continuation_chain(session_id, task_id)?;
+        let ids = chain.iter().map(String::as_str).collect::<Vec<_>>();
+        let events = self.read_verification_events(session_id, &ids)?;
+        let mut history: Vec<RepairStateEntry> = Vec::new();
+        for event in events {
+            match event {
+                VerificationEvent::RepairState { entry, .. }
+                | VerificationEvent::RepairStalled { entry, .. } => {
+                    history.push(entry);
+                    if history.len() > MAX_REPAIR_STATE_ENTRIES {
+                        let excess = history.len() - MAX_REPAIR_STATE_ENTRIES;
+                        history.drain(0..excess);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(history)
     }
 
     /// Appends one finding (spec 22 §5.7). A `Finding` is redacted by
@@ -4398,7 +4434,7 @@ fn continuation_edges(
                     verification_parent.insert(task, due.clone());
                 }
             }
-            "verification_finished" => pending_due = None,
+            "verification_finished" | "verification_repair_stalled" => pending_due = None,
             _ => {}
         }
     }

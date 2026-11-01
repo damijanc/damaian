@@ -10,8 +10,8 @@ loop), [#55](55_conversation_compaction/proposal.md) (between-turn
 compaction), [#59](59_exploration_rounds/proposal.md) (round classes),
 [#101](101_closed_task_completion.md) (truthful completion), and
 [#102](102_repair_provenance_and_stagnation.md) (progress stops) — #17, #47,
-#55, #59 and #101 are built; **#102 is not built, so this spec remains blocked
-on it**. Everything else named below is a cross-reference, not a prerequisite.
+#55, #59, #101 and #102 are built. Everything else named below is a
+cross-reference, not a prerequisite.
 
 ## 1. Motivation
 

@@ -310,6 +310,41 @@ capabilities from committing (spec 36):
   bodies. Recovery compares the recorded ref with the repository now and never
   retries.
 
+## Verification, Baselines and Repair
+
+A check selected by an approved patch is baselined against the reviewed bytes
+before the patch writes. The baseline command keeps its ordinary policy and
+approval: patch approval does not approve it, and declining the baseline does
+not decline the patch. If the baseline command changes a tracked file, the
+existing patch hash protection makes the reviewed patch stale; it is never
+applied over bytes different from the preview.
+
+Every check result is reduced to a stable fingerprint built from the check's
+identity, its normalized redacted findings and its termination kind. Raw command
+output, timestamps, marker ids, machine-local absolute paths and secret text are
+not inputs. The durable provenance, baseline and repair-state events therefore
+carry redacted evidence and digests, never a second copy of unredacted output.
+
+Post-patch comparison classifies each failing result as `new_regression`,
+`pre_existing`, `worsened`, `unchanged_failure`, `environment_failure` or
+`unknown_provenance`. Only a new regression and the introduced part of a
+worsened result may reach an automatic code-repair turn. A missing executable, a
+spawn failure, a policy refusal and unavailable test infrastructure are
+environment failures: they are reported with a user action and never sent to
+code repair. A declined, unavailable or absent baseline yields unknown
+provenance, so the task is never assumed to have caused that failure.
+
+A repair patch is checked against the task's changed paths and the failure's
+locations. A path protected for the task remains an unconditional refusal. Any
+other new path is a one-shot, visible expansion on the patch card; approving
+that patch covers it once, and plan, check, baseline or earlier patch approvals
+never imply it.
+
+Automatic repair also stops before its numeric limit when two attempts repeat
+the same failure, propose an equivalent patch, leave the task's files unchanged,
+or oscillate. The stop is engine-owned and durable, offers no automatic retry,
+and is not the same action as the explicit **Continue repair** at the limit.
+
 ## Repository Config Trust Boundary
 
 Configuration comes from three files, applied in order: user (`<data_dir>/config/user.conf`), repository (`<repo>/.damaian/config.conf`), and admin (`DAMAIAN_ADMIN_CONFIG` or `<data_dir>/config/admin.conf`). Only the repository file arrives with a clone, so **repository config is untrusted input**: it may add restrictions and never remove one.

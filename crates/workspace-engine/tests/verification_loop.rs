@@ -19,12 +19,12 @@ use workspace_engine::{
     CancelToken, ChatTurnResult, CheckBaseline, CheckId, CheckOutcome, CommandPurpose,
     CompletionReasonCode, Config, ContextDecision, Evidence, FailureProvenance, HookConfig,
     HookEvent, HookMode, HookSource, MockModelAdapter, PausedTurns, PlanReport, PlanStep,
-    ReattachedApproval, RoundBudgetDecision, Selection, SessionStore, SkipReason, TaskPlan,
-    TaskStatus, TurnProgress, TurnSink, VerificationEvent, VerificationOutcome, VerificationReport,
-    VerificationState, WebDiagnosticCall, WebDiagnosticDetails, WebDiagnosticRecord,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerRecord,
-    WorkspaceEngine, fold_verification, is_documentation, pending_verifications, propose_checks,
-    reattach_pending_approvals, select_roots,
+    ReattachedApproval, RepairStallReason, RoundBudgetDecision, Selection, SessionStore,
+    SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink, VerificationEvent,
+    VerificationOutcome, VerificationReport, VerificationState, WebDiagnosticCall,
+    WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
+    WebDiagnosticsRunnerHandle, WorkerRecord, WorkspaceEngine, fold_verification, is_documentation,
+    pending_verifications, propose_checks, reattach_pending_approvals, select_roots,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -2504,10 +2504,13 @@ fn exhausting_the_repair_limit_reports_what_still_fails() {
     let root = temp_dir("repair-limit");
     let data_dir = temp_dir("repair-limit-data");
     cargofile(&root);
+    // The failure fingerprint must progress on each attempt: a repeated
+    // fingerprint is a stall (spec 102 Task 4), and this fixture is about the
+    // numeric limit remaining the fallback while repair makes progress.
+    let shell = progress_shell(&root).to_string_lossy().to_string();
     let mut session = String::new();
     for attempt in 0..2 {
-        let engine =
-            verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+        let engine = verify_engine_with_retry(&root, &data_dir, &shell, &["cargo test"], &[], 2);
         if attempt == 0 {
             let (created, _task) = applied_change(
                 &engine,
@@ -2516,9 +2519,14 @@ fn exhausting_the_repair_limit_reports_what_still_fails() {
             );
             session = created;
         }
+        // Each attempt must make a different change: an equivalent patch is a
+        // stall (spec 102 Task 4), and this fixture is about the numeric limit.
         let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
             vec![String::new()],
-            vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+            vec![vec![patch_call(
+                "src/a.rs",
+                &format!("let a = {};\n", attempt + 3),
+            )]],
         );
         let turn = run_verification(&engine, &root, &session, &mut repair);
         let patch = turn
@@ -2531,8 +2539,7 @@ fn exhausting_the_repair_limit_reports_what_still_fails() {
             .expect("the repair patch applies");
     }
 
-    let engine =
-        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let engine = verify_engine_with_retry(&root, &data_dir, &shell, &["cargo test"], &[], 2);
     let mut adapter = MockModelAdapter::new("");
     let result = run_verification(&engine, &root, &session, &mut adapter);
 
@@ -2540,6 +2547,10 @@ fn exhausting_the_repair_limit_reports_what_still_fails() {
     assert_eq!(
         report.outcome,
         Some(VerificationOutcome::RepairLimitExhausted)
+    );
+    assert!(
+        report.repair_stall.is_none(),
+        "progressing repair is stopped by the count, not a stall"
     );
     assert_eq!(result.task.status, TaskStatus::Failed);
     assert!(!result.response.contains("complete"));
@@ -2555,6 +2566,260 @@ fn exhausting_the_repair_limit_reports_what_still_fails() {
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// Spec 102 Task 4: an ineffective repair stops on the second identical result
+/// even though the configured limit is sixteen. The redundant patch is not
+/// exposed, another attempt is not spent, and the typed stop is durable.
+#[test]
+fn a_repeated_ineffective_repair_stalls_before_the_numeric_limit() {
+    let root = temp_dir("repair-stall-repeat");
+    let data_dir = temp_dir("repair-stall-repeat-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 16);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut first_repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+    let first = run_verification(&engine, &root, &session, &mut first_repair);
+    let patch = first
+        .patch_proposal
+        .as_ref()
+        .expect("the first attempt is progress and asks for a repair");
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+        .expect("the first repair applies");
+
+    // The check still fails the same way, and the model repeats the same
+    // repair. That is a stall, not one of the remaining fourteen attempts.
+    let mut repeated = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+    let stalled = run_verification(&engine, &root, &session, &mut repeated);
+
+    assert!(
+        stalled.patch_proposal.is_none(),
+        "a stalled repair must not expose its redundant patch"
+    );
+    let report = stalled
+        .verification_report
+        .as_ref()
+        .expect("the stall is a terminal report");
+    assert_eq!(report.outcome, Some(VerificationOutcome::RepairStalled));
+    assert_eq!(
+        report.repair_stall.as_ref().map(|stall| stall.reason),
+        Some(RepairStallReason::RepeatedFailure)
+    );
+    assert!(
+        report.repair_targets.is_empty(),
+        "no target may reach a repair turn after a stall"
+    );
+    assert_eq!(report.repair_request(), None);
+    assert_eq!(stalled.task.status, TaskStatus::Failed);
+    assert!(
+        stalled.response.contains("Repair stalled"),
+        "{}",
+        stalled.response
+    );
+    assert!(!stalled.response.contains("complete"));
+    assert_eq!(
+        started_attempts(&outcome_events(&engine, &session)),
+        vec![0, 1],
+        "a stall does not spend another automatic attempt"
+    );
+    assert_eq!(
+        engine
+            .session_store
+            .task_verification_repair_history(&session, &stalled.task.id)
+            .unwrap()
+            .len(),
+        2,
+        "both attempts, including the stalled one, are in the durable window"
+    );
+
+    // The same typed stop survives a new store, and it is not the numeric
+    // limit's explicit continuation.
+    let reopened =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 16);
+    let events = outcome_events(&reopened, &session);
+    let state = fold_verification(events.iter());
+    assert_eq!(state.finished, Some(VerificationOutcome::RepairStalled));
+    assert_eq!(
+        state.repair_stall.as_ref().map(|stall| stall.reason),
+        Some(RepairStallReason::RepeatedFailure)
+    );
+    let mut refused_adapter = MockModelAdapter::new("");
+    let refused = try_continue_repair(&reopened, &root, &session, &mut refused_adapter)
+        .expect_err("a stall does not enable continue repair");
+    assert!(refused.to_string().contains("repair limit"), "{refused}");
+    assert!(refused_adapter.requests.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn a_worker_stops_on_the_same_typed_repair_stall() {
+    let root = temp_dir("repair-stall-worker");
+    let data_dir = temp_dir("repair-stall-worker-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 16);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    mark_worker(&engine, &session, &root);
+    let mut first_repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+    let first = run_verification(&engine, &root, &session, &mut first_repair);
+    let patch = first.patch_proposal.as_ref().expect("a repair patch");
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+        .expect("the repair applies");
+
+    let mut repeated = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+    let stalled = run_verification(&engine, &root, &session, &mut repeated);
+    assert!(stalled.patch_proposal.is_none());
+    assert_eq!(
+        stalled.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::RepairStalled)
+    );
+    assert_eq!(stalled.task.status, TaskStatus::Failed);
+    assert_eq!(
+        started_attempts(&outcome_events(&engine, &session)),
+        vec![0, 1],
+        "a worker does not start another automatic repair after a stall"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// Spec 102 Task 4 and acceptance: an A → B → A fingerprint/diff oscillation
+/// stops with `repair_stalled`, even with a much larger numeric limit.
+#[test]
+fn an_a_to_b_to_a_repair_oscillation_stalls() {
+    let root = temp_dir("repair-stall-oscillation");
+    let data_dir = temp_dir("repair-stall-oscillation-data");
+    cargofile(&root);
+    let shell = content_shell(&root);
+    let engine = verify_engine_with_retry(
+        &root,
+        &data_dir,
+        &shell.to_string_lossy(),
+        &["cargo test"],
+        &[],
+        16,
+    );
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 0;\n", "let a = 2;\n")],
+    );
+
+    // Attempt 0 sees failure B and proposes A.
+    let mut first = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 1;\n")]],
+    );
+    let first = run_verification(&engine, &root, &session, &mut first);
+    let patch = first.patch_proposal.as_ref().expect("a repair patch");
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+        .expect("the repair applies");
+
+    // Attempt 1 sees failure A and proposes B.
+    let mut second = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 2;\n")]],
+    );
+    let second = run_verification(&engine, &root, &session, &mut second);
+    let patch = second.patch_proposal.as_ref().expect("a repair patch");
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+        .expect("the repair applies");
+
+    // Attempt 2 sees failure B again with B's net diff. The patch is new, so
+    // only the window-level fingerprint/diff pair repeat is the stop.
+    let mut third = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+    let stalled = run_verification(&engine, &root, &session, &mut third);
+
+    assert!(stalled.patch_proposal.is_none());
+    let report = stalled.verification_report.as_ref().unwrap();
+    assert_eq!(report.outcome, Some(VerificationOutcome::RepairStalled));
+    assert_eq!(
+        report.repair_stall.as_ref().map(|stall| stall.reason),
+        Some(RepairStallReason::Oscillation)
+    );
+    assert_eq!(
+        started_attempts(&outcome_events(&engine, &session)),
+        vec![0, 1, 2],
+        "the limit was sixteen; the oscillation stopped at three attempts"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/a.rs")).unwrap(),
+        "let a = 2;\n",
+        "the redundant third patch was not applied"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// A shell whose failure summary includes the current content of `src/a.rs`,
+/// so every distinct repair changes the fingerprint. This is the progressing
+/// case: only the numeric limit should stop it.
+fn progress_shell(root: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("bin").join("progress-check.sh");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        "#!/bin/sh\nvalue=$(cat src/a.rs 2>/dev/null | tr -d '\\n')\necho \"error: value $value is wrong\" >&2\necho ' --> src/a.rs:1:1' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+/// A shell whose failure fingerprint depends on the current content of
+/// `src/a.rs`, so the repair loop can produce distinct A and B results.
+fn content_shell(root: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("bin").join("content-check.sh");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        "#!/bin/sh\ncontent=$(cat src/a.rs 2>/dev/null)\ncase \"$content\" in\n  *\"let a = 1;\"*)\n    echo 'error[E0001]: alpha failure' >&2\n    echo ' --> src/a.rs:1:1' >&2\n    ;;\n  *\"let a = 2;\"*)\n    echo 'error[E0002]: beta failure' >&2\n    echo ' --> src/a.rs:1:1' >&2\n    ;;\n  *)\n    echo 'error[E0003]: gamma failure' >&2\n    echo ' --> src/a.rs:1:1' >&2\n    ;;\nesac\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
 }
 
 /// Spec 96: at the limit every session stops, and the user's explicit
@@ -2743,8 +3008,10 @@ fn repeated_limit_exhaustion_needs_one_explicit_decision_each_time() {
     let root = temp_dir("limited-repeat");
     let data_dir = temp_dir("limited-repeat-data");
     cargofile(&root);
-    let engine =
-        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 0);
+    // A changing failure is progress, so each explicit continuation reaches
+    // the limit again instead of stopping as a stall (spec 102 Task 4).
+    let shell = progress_shell(&root).to_string_lossy().to_string();
+    let engine = verify_engine_with_retry(&root, &data_dir, &shell, &["cargo test"], &[], 0);
     let (session, _task) = applied_change(
         &engine,
         &root,
@@ -4396,6 +4663,299 @@ fn provenance_and_repair_targets_survive_a_fresh_store() {
     assert!(!report.repair_targets.is_empty());
     assert!(!report.repair_targets[0].evidence.is_empty());
     assert!(report.render().contains("Introduced regressions"));
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+// --- Repair scope and thin presentation (spec 102 Task 5) ------------------
+
+/// A repair that stays inside the task's changed paths is ordinary: no
+/// expansion fact and nothing for a card to warn about.
+#[test]
+fn a_repair_inside_the_task_scope_has_no_scope_review() {
+    let root = temp_dir("repair-scope-inside");
+    let data_dir = temp_dir("repair-scope-inside-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+
+    let first = run_verification(&engine, &root, &session, &mut repair);
+    let patch = first.patch_proposal.as_ref().expect("a repair patch");
+    assert!(
+        patch.repair_scope.is_none(),
+        "a task-changed path is not an expansion: {:?}",
+        patch.repair_scope
+    );
+    let stored = engine.patch_store.load(&patch.patch_id).expect("stored");
+    assert!(stored.repair_scope.is_none());
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// A repair may touch a path the failing finding names even when the task
+/// changed a different file. That path is in the existing scope, so neither
+/// the live proposal nor the stored patch carries an expansion review.
+#[test]
+fn a_repair_may_touch_a_finding_path_outside_the_task_changed_paths() {
+    let root = temp_dir("repair-scope-finding");
+    let data_dir = temp_dir("repair-scope-finding-data");
+    cargofile(&root);
+    let shell = repaired_shell(&root).to_string_lossy().to_string();
+    fs::write(root.join("cargo-fail"), "fail\n").unwrap();
+    // The finding's location must resolve to an existing file, or the parser
+    // keeps the message but drops the path and this scenario would prove
+    // nothing about finding locations.
+    write(&root, "src/a.rs", "let a = 1;\n");
+    let engine = verify_engine_with_retry(&root, &data_dir, &shell, &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/app.rs", "let app = 1;\n", "let app = 2;\n")],
+    );
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/a.rs", "let a = 3;\n")]],
+    );
+
+    let first = run_verification(&engine, &root, &session, &mut repair);
+    let request = repair
+        .requests
+        .first()
+        .expect("the repair turn called the model");
+    let user = request
+        .messages
+        .iter()
+        .find(|message| message.role == "user")
+        .expect("a user message carries the request");
+    assert!(
+        user.content.contains("src/a.rs:1:1"),
+        "the finding is in a different file from the task change: {}",
+        user.content
+    );
+    let patch = first.patch_proposal.as_ref().expect("a repair patch");
+    assert_eq!(patch.files.len(), 1);
+    assert_eq!(patch.files[0].path, "src/a.rs");
+    assert!(
+        patch.repair_scope.is_none(),
+        "a finding path is already in the repair scope: {:?}",
+        patch.repair_scope
+    );
+    let stored = engine.patch_store.load(&patch.patch_id).expect("stored");
+    assert!(
+        stored.repair_scope.is_none(),
+        "the stored patch carries no expansion either: {:?}",
+        stored.repair_scope
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// A new unprotected path is a typed one-shot expansion, and the stored patch
+/// carries exactly the same review the live proposal returned.
+#[test]
+fn a_new_unprotected_repair_path_is_a_typed_one_shot_expansion() {
+    let root = temp_dir("repair-scope-expand");
+    let data_dir = temp_dir("repair-scope-expand-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/new.rs", "fn new() {}\n")]],
+    );
+
+    let first = run_verification(&engine, &root, &session, &mut repair);
+    let patch = first.patch_proposal.as_ref().expect("a repair patch");
+    let scope = patch
+        .repair_scope
+        .as_ref()
+        .expect("a new path is an expansion");
+    assert!(scope.one_shot);
+    assert_eq!(scope.expansion_paths, vec!["src/new.rs".to_string()]);
+    assert!(!scope.label.is_empty());
+    assert!(!scope.explanation.is_empty());
+    assert!(scope.reason_groups.iter().any(|group| {
+        group.kind == workspace_engine::RepairScopeReasonKind::OutsideExistingScope
+            && group.paths == vec!["src/new.rs".to_string()]
+    }));
+    assert_eq!(scope.actions.len(), 1);
+    assert_eq!(
+        scope.actions[0].kind,
+        workspace_engine::RepairScopeActionKind::ApproveScopeExpansionOnce
+    );
+
+    let stored = engine.patch_store.load(&patch.patch_id).expect("stored");
+    assert_eq!(
+        stored.repair_scope.as_ref(),
+        Some(scope),
+        "a reload must render the same typed fact"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// Spec 98 outranks the scope review: a protected path refuses the whole
+/// proposal, so no expansion card can exist for it.
+#[test]
+fn a_protected_repair_path_is_refused_without_a_patch() {
+    let root = temp_dir("repair-scope-protected");
+    let data_dir = temp_dir("repair-scope-protected-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    // Protection is canonicalised against an existing file or directory.
+    write(&root, "src/new.rs", "fn old() {}\n");
+    engine
+        .add_task_protected_paths(&root, &session, &task, &["src/new.rs".to_string()])
+        .expect("the task can protect a path");
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), String::new()],
+        vec![vec![patch_call("src/new.rs", "fn new() {}\n")], Vec::new()],
+    );
+
+    let result = run_verification(&engine, &root, &session, &mut repair);
+    assert!(
+        result.patch_proposal.is_none(),
+        "a protected path never produces a review card"
+    );
+    let conversation = engine
+        .session_store
+        .read_conversation(&session)
+        .expect("the conversation should read");
+    assert!(
+        conversation.messages.iter().any(|message| message
+            .content
+            .contains("Patch would modify protected task path")),
+        "the refusal is visible in the turn: {:?}",
+        conversation
+            .messages
+            .iter()
+            .map(|message| &message.content)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/new.rs")).unwrap(),
+        "fn old() {}\n",
+        "a refused proposal writes nothing"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// A worker's repair proposal and a reloaded/recovered card read the same
+/// engine-owned expansion from the stored patch.
+#[test]
+fn a_worker_and_a_reload_preserve_the_same_scope_review() {
+    let root = temp_dir("repair-scope-worker");
+    let data_dir = temp_dir("repair-scope-worker-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    mark_worker(&engine, &session, &root);
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/new.rs", "fn new() {}\n")]],
+    );
+
+    let first = run_verification(&engine, &root, &session, &mut repair);
+    let patch = first.patch_proposal.as_ref().expect("a repair patch");
+    let live_scope = patch.repair_scope.clone().expect("an expansion");
+
+    let reopened =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let stored = reopened.patch_store.load(&patch.patch_id).expect("stored");
+    assert_eq!(stored.repair_scope.as_ref(), Some(&live_scope));
+
+    let paused = PausedTurns::new(&data_dir);
+    let reattached = reattach_pending_approvals(
+        &reopened.session_store,
+        &reopened.audit_log,
+        &reopened.command_store,
+        &reopened.patch_store,
+        &paused,
+        &session,
+    )
+    .expect("the pending approval should reattach");
+    let recovered = reattached
+        .iter()
+        .find_map(|approval| match approval {
+            ReattachedApproval::Patch { patch, .. } => Some(patch),
+            _ => None,
+        })
+        .expect("the repair patch is reattached");
+    assert_eq!(recovered.repair_scope.as_ref(), Some(&live_scope));
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// A card whose path became protected after the preview is refused at apply
+/// time, and nothing is written even though the expansion review is stored.
+#[test]
+fn a_stale_expansion_card_newly_protected_is_refused_at_apply() {
+    let root = temp_dir("repair-scope-stale");
+    let data_dir = temp_dir("repair-scope-stale-data");
+    cargofile(&root);
+    let engine =
+        verify_engine_with_retry(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call("src/new.rs", "fn new() {}\n")]],
+    );
+    let first = run_verification(&engine, &root, &session, &mut repair);
+    let patch = first.patch_proposal.as_ref().expect("a repair patch");
+    assert!(patch.repair_scope.is_some());
+
+    // The card was built before this file existed; it becomes protected only
+    // now, so the apply-time recheck is the fence under test.
+    write(&root, "src/new.rs", "fn someone_else() {}\n");
+    engine
+        .add_task_protected_paths(&root, &session, &first.task.id, &["src/new.rs".to_string()])
+        .expect("the repair task can protect a path");
+    let error = engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+        .expect_err("a newly protected path must refuse the stale card");
+    assert!(error.to_string().contains("protected task path"), "{error}");
+    assert_eq!(
+        fs::read_to_string(root.join("src/new.rs")).unwrap(),
+        "fn someone_else() {}\n",
+        "a refused apply writes nothing"
+    );
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);

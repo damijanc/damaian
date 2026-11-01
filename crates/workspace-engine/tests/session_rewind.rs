@@ -774,6 +774,7 @@ fn a_patch_saved_now_round_trips_its_session() {
         status: "pending".to_string(),
         created_at_ms: 7,
         files: Vec::new(),
+        repair_scope: None,
     };
     store.save(&patch).expect("save");
 
@@ -789,8 +790,76 @@ fn a_patch_saved_now_round_trips_its_session() {
     )
     .unwrap();
     assert!(
-        raw.starts_with("DAMAIAN_STORED_PATCH_V3\n"),
-        "new patches are written as V3"
+        raw.starts_with("DAMAIAN_STORED_PATCH_V4\n"),
+        "new patches are written as V4"
+    );
+}
+
+/// V4 added `REPAIR_SCOPE`. A V3 patch already on disk keeps its session and
+/// origin and simply has no repair-scope review, which is what an ordinary
+/// patch has now.
+#[test]
+fn a_v3_stored_patch_still_loads_without_a_repair_scope() {
+    let data_dir = temp_data_dir("patch-v3-legacy");
+    let store = workspace_engine::PatchStore::new(&data_dir);
+    let v3 = concat!(
+        "DAMAIAN_STORED_PATCH_V3\n",
+        "PATCH_ID 8\npatch_v3\n",
+        "SESSION_ID 11\nsession_abc\n",
+        "ORIGIN_SESSION_ID 12\nsession_chat\n",
+        "TASK_ID 0\n\n",
+        "SUMMARY 2\nv3\n",
+        "STATUS 7\npending\n",
+        "CREATED_AT_MS 1\n1\n",
+        "FILE_COUNT 1\n0\n",
+        "END_PATCH\n",
+    );
+    let patches = data_dir.join("patches").join("pending");
+    fs::create_dir_all(&patches).unwrap();
+    fs::write(patches.join("patch_v3.dpatch"), v3).unwrap();
+
+    let loaded = store.load("patch_v3").expect("a V3 patch must still load");
+    assert_eq!(loaded.session_id, "session_abc");
+    assert_eq!(loaded.origin_session_id, "session_chat");
+    assert!(
+        loaded.repair_scope.is_none(),
+        "a V3 patch has no scope review"
+    );
+}
+
+/// The typed repair-scope review survives the stored-patch format, so a
+/// reloaded or reattached card shows the same expansion fact (spec 102 Task 5).
+#[test]
+fn a_v4_patch_round_trips_its_repair_scope() {
+    let data_dir = temp_data_dir("patch-v4-scope");
+    let store = workspace_engine::PatchStore::new(&data_dir);
+    let review = workspace_engine::RepairScopeReview::compute(
+        &["src/a.rs".to_string()],
+        &["src/b.rs".to_string()],
+        &["src/new.rs".to_string()],
+    );
+    let patch = workspace_engine::ProposedPatch {
+        id: "patch_v4".to_string(),
+        session_id: "session_abc".to_string(),
+        origin_session_id: String::new(),
+        task_id: Some("task_abc".to_string()),
+        summary: "repair".to_string(),
+        status: "pending".to_string(),
+        created_at_ms: 7,
+        files: Vec::new(),
+        repair_scope: Some(review),
+    };
+    store.save(&patch).expect("save");
+
+    let loaded = store.load("patch_v4").expect("load");
+    assert_eq!(loaded, patch, "the scope review must round-trip unchanged");
+    assert_eq!(
+        loaded
+            .repair_scope
+            .as_ref()
+            .expect("the review is stored")
+            .expansion_paths,
+        vec!["src/new.rs".to_string()]
     );
 }
 

@@ -1043,19 +1043,61 @@ when the check runs in a sub-root. A session with
 `require_approval_for_all_commands` gets a card even for a check that would
 otherwise run without asking.
 
+**Baseline before the patch.** Once you approve a patch that selects a check,
+Damaian offers to run that check against the current, pre-patch files before
+anything is written. This is an ordinary command decision on its own card:
+approving the patch does not approve it, and skipping the baseline does not skip
+the patch. The baseline is what lets Damaian tell a failure the patch introduced
+from one that was already there. A check first selected by a later patch is
+baselined before that patch applies. If a baseline command itself changes a
+tracked file, the reviewed patch becomes stale and needs a fresh preview rather
+than applying over bytes you did not see.
+
+**What a failure is attributed to.** The report keeps six outcomes apart rather
+than calling everything failed:
+
+- **Introduced regression** — the check passed before the patch and fails now.
+  Only this, or the new part of a worsened result, starts a repair.
+- **Worsened** — the check already failed, and the patch added findings to it.
+  Only the new findings go to repair.
+- **Pre-existing** — the check fails the same way it did before the patch. No
+  repair turn starts, and the report says to fix it separately if you want it
+  addressed.
+- **Unchanged failure** — an earlier attempt already saw this same failure. No
+  further automatic repair.
+- **Environment failure** — the command could not start, its executable is
+  missing, policy refused it, or the test infrastructure is unavailable. The
+  report offers an action to fix the environment and never sends this to code
+  repair.
+- **Unknown provenance** — the baseline was declined, could not run, or is
+  absent. The failure can still prevent completion, but Damaian does not assume
+  the task caused it.
+
 **Repair.** A failing check becomes findings, and the agent may propose a repair
 patch within `agent_tool_retry_limit` (default 16). The patch still goes through
 the normal preview and approval path, and the check reruns once it is applied.
-A repair that breaks a previously passing check is reported as a regression. If
-a repair turn produces no patch, the loop stops rather than spending the
-remaining attempts; at the limit the task is marked failed.
+Only introduced evidence reaches the repair request; pre-existing, environment
+and unknown failures stay visible in your report. A repair patch is checked
+against the task's existing paths and the failure's locations: a path outside
+that scope is marked as a one-shot expansion on the preview and must be approved
+there, which neither plan approval nor check approval implies, and a path
+excluded for this task is refused outright. A repair that breaks a previously
+passing check is reported as a regression.
+
+Repair also stops before the numeric limit when two consecutive attempts leave
+the same failure, repeat an equivalent patch, leave the task's files unchanged,
+or oscillate between two states. That stop is **repair stalled**, with the
+engine's reason and one review action; it offers no automatic retry. If a repair
+turn produces no patch, the loop stops rather than spending the remaining
+attempts; at the limit the task is marked failed.
 
 At that limit the report offers **Continue repair**. It is an explicit decision
 that starts exactly one more repair attempt with the failing evidence; it does
 not raise the limit. Every patch and command in that attempt still needs its
 own approval, a second click while it is pending is refused, and reaching the
 limit again offers the action again. Worker sessions offer the same action, and
-it runs in the worker's own process.
+it runs in the worker's own process. A stalled repair is not a limit stop and
+does not offer this action.
 
 **The report** lists:
 
@@ -1067,6 +1109,10 @@ it runs in the worker's own process.
 - **Checks stale** — the files a check saw changed after it ran (a rollback, a
   later patch, or an edit outside Damaian). A stale check is not rerun silently
   and is not reported as passed.
+- **Failure provenance** — introduced, worsened, pre-existing, unchanged,
+  environment and unknown failures, each in its own group with its own action.
+- **Repair stalled** — when automatic repair stopped for no progress, with the
+  typed reason and no automatic retry.
 - **Behaviour verified** — browser checks that ran and recorded no error.
 - **Unverified steps**, **Regressions**, **Remaining**, and **User action
   needed**.
@@ -1094,9 +1140,12 @@ check is skipped with `no running target`; it is never inferred as verified.
 Verification runs only in Code mode. Ask, Plan and Review have nothing applied
 to verify. From the command line, `damaian verify <repo> <session>` runs it and
 prints the report; `--decline-checks` answers an approval card with every check
-declined. At the repair limit, `damaian continue-repair <repo> <session>` is the
-same one-attempt explicit decision the report card offers. This checks that the
-project's own tests pass — it does not prove the change is correct, and the
+declined. `damaian apply-patch` offers the same pre-apply baseline decisions
+before it writes: at a terminal it confirms each check, and a non-interactive
+run declines them, which leaves a later failure unknown rather than
+task-caused. At the repair limit, `damaian continue-repair <repo> <session>` is
+the same one-attempt explicit decision the report card offers. This checks that
+the project's own tests pass — it does not prove the change is correct, and the
 report is written to avoid implying that.
 
 ## Commits

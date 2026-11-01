@@ -45,11 +45,13 @@ pub mod protected_paths;
 pub mod provenance;
 pub mod recovery;
 mod render;
+pub mod repair_scope;
 pub mod repository_map;
 pub mod repository_trust;
 pub mod secret_scanner;
 pub mod session;
 pub mod shell_path;
+pub mod stagnation;
 pub mod steering;
 pub mod symbol_index;
 pub mod task_control;
@@ -233,6 +235,10 @@ pub use recovery::{
 pub use render::{
     render_markdown_to_ansi, render_markdown_to_html, render_markdown_to_html_with_file_links,
 };
+pub use repair_scope::{
+    RepairScopeAction, RepairScopeActionKind, RepairScopeReasonGroup, RepairScopeReasonKind,
+    RepairScopeReview,
+};
 pub use repository_map::{
     Degradation, DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, MapLoad, ProjectRoot,
     REPOSITORY_MAP_SCHEMA_VERSION, RebuildReason, RenderedMap, RepositoryMap, RepositoryMapStore,
@@ -248,6 +254,10 @@ pub use session::{
     ExportFormat, PatchFileDecision, PendingApprovalRef, SearchOptions, Session, SessionSearchHit,
     SessionSearchResult, SessionStore, Task, TaskStatus, TaskUsage, TurnNotes, WorkerRecord,
     WorkerReturn,
+};
+pub use stagnation::{
+    RepairStall, RepairStallReason, detect_repair_stall, proposed_patch_digest, repair_state_entry,
+    task_diff_digest,
 };
 pub use steering::TurnSteering;
 pub use symbol_index::{

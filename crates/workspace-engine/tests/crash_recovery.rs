@@ -520,6 +520,7 @@ fn a_pending_approval_survives_restart_with_its_proposal() {
         status: "pending".to_string(),
         created_at_ms: 1,
         files: Vec::new(),
+        repair_scope: None,
     };
     patches.save(&patch).unwrap();
 
@@ -580,6 +581,7 @@ fn a_patch_the_log_already_decided_is_not_reattached() {
         summary: "already applied".to_string(),
         status: "pending".to_string(),
         created_at_ms: 1,
+        repair_scope: None,
         files: vec![workspace_engine::ProposedFilePatch {
             path: "a.txt".to_string(),
             status: "modified".to_string(),

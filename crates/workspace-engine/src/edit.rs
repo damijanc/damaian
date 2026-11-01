@@ -1592,7 +1592,7 @@ fn patch_hook_payload(patch: &ProposedPatch, applied: Option<&[String]>) -> serd
 
 fn serialize_patch(patch: &ProposedPatch) -> String {
     let mut output = String::new();
-    output.push_str("DAMAIAN_STORED_PATCH_V3\n");
+    output.push_str("DAMAIAN_STORED_PATCH_V4\n");
     write_field(&mut output, "PATCH_ID", &patch.id);
     write_field(&mut output, "SESSION_ID", &patch.session_id);
     write_field(&mut output, "ORIGIN_SESSION_ID", &patch.origin_session_id);
@@ -1607,6 +1607,13 @@ fn serialize_patch(patch: &ProposedPatch) -> String {
         &mut output,
         "CREATED_AT_MS",
         &patch.created_at_ms.to_string(),
+    );
+    // V4 adds the typed repair-scope review. An ordinary patch writes `null`,
+    // so a reload reads the same absence the live proposal had.
+    write_field(
+        &mut output,
+        "REPAIR_SCOPE",
+        &serde_json::to_string(&patch.repair_scope).unwrap_or_else(|_| "null".to_string()),
     );
     write_field(&mut output, "FILE_COUNT", &patch.files.len().to_string());
     for file in &patch.files {
@@ -1634,16 +1641,18 @@ fn serialize_patch(patch: &ProposedPatch) -> String {
 
 fn deserialize_patch(raw: &str) -> Result<ProposedPatch> {
     let mut cursor = Cursor::new(raw);
-    // Every version is accepted. V1 predates `SESSION_ID` and V2 predates
-    // `ORIGIN_SESSION_ID`; nothing is converted and no file is rewritten, so a
-    // patch already on disk keeps working and simply has no session, or no
-    // origin. `read_field` is name-checked, so a version mismatch fails closed
-    // rather than silently reading the next field's value.
+    // Every version is accepted. V1 predates `SESSION_ID`, V2 predates
+    // `ORIGIN_SESSION_ID` and V3 predates `REPAIR_SCOPE`; nothing is converted
+    // and no file is rewritten, so a patch already on disk keeps working and
+    // simply has no session, no origin, or no repair-scope review.
+    // `read_field` is name-checked, so a version mismatch fails closed rather
+    // than silently reading the next field's value.
     let version = cursor.read_line()?;
-    let (has_session, has_origin) = match version.as_str() {
-        "DAMAIAN_STORED_PATCH_V3" => (true, true),
-        "DAMAIAN_STORED_PATCH_V2" => (true, false),
-        "DAMAIAN_STORED_PATCH_V1" => (false, false),
+    let (has_session, has_origin, has_repair_scope) = match version.as_str() {
+        "DAMAIAN_STORED_PATCH_V4" => (true, true, true),
+        "DAMAIAN_STORED_PATCH_V3" => (true, true, false),
+        "DAMAIAN_STORED_PATCH_V2" => (true, false, false),
+        "DAMAIAN_STORED_PATCH_V1" => (false, false, false),
         other => {
             return Err(ClientError::InvalidInput(format!(
                 "Unknown stored patch format: {other}"
@@ -1668,6 +1677,14 @@ fn deserialize_patch(raw: &str) -> Result<ProposedPatch> {
         .read_field("CREATED_AT_MS")?
         .parse()
         .map_err(|_| ClientError::InvalidInput("Stored patch has invalid timestamp".to_string()))?;
+    let repair_scope = if has_repair_scope {
+        let raw = cursor.read_field("REPAIR_SCOPE")?;
+        serde_json::from_str(&raw).map_err(|error| {
+            ClientError::InvalidInput(format!("Stored patch has an invalid repair scope: {error}"))
+        })?
+    } else {
+        None
+    };
     let file_count: usize = cursor.read_field("FILE_COUNT")?.parse().map_err(|_| {
         ClientError::InvalidInput("Stored patch has invalid file count".to_string())
     })?;
@@ -1702,6 +1719,7 @@ fn deserialize_patch(raw: &str) -> Result<ProposedPatch> {
         status,
         created_at_ms,
         files,
+        repair_scope,
     })
 }
 

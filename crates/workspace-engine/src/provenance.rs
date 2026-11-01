@@ -416,6 +416,23 @@ pub enum VerificationActionKind {
     ReviewUnchangedFailure,
     FixEnvironment,
     ProvideBaseline,
+    ReviewStalledRepair,
+}
+
+impl VerificationActionKind {
+    /// The wire and report name, matching the serde representation. Renderers
+    /// and evaluations name an action from this value rather than re-deriving
+    /// one from its label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReviewIntroducedFailure => "review_introduced_failure",
+            Self::ReviewPreExistingFailure => "review_pre_existing_failure",
+            Self::ReviewUnchangedFailure => "review_unchanged_failure",
+            Self::FixEnvironment => "fix_environment",
+            Self::ProvideBaseline => "provide_baseline",
+            Self::ReviewStalledRepair => "review_stalled_repair",
+        }
+    }
 }
 
 /// The repair request's view of one eligible check.

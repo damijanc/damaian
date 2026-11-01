@@ -412,6 +412,112 @@ pub fn evaluate(
             );
         }
 
+        // Spec 102 Task 6: the provenance groups and the repair targets come
+        // from the durable report, so a scenario measures what the engine
+        // classified rather than what the script expected.
+        if let Some(expected) = &asserts.verification_provenances {
+            let mut wanted: Vec<(String, String)> = expected
+                .iter()
+                .map(|entry| (entry.command.clone(), entry.provenance.clone()))
+                .collect();
+            wanted.sort();
+            let mut actual = Vec::new();
+            if let Some(report) = &run.verification {
+                for partition in &report.provenance {
+                    for check in &partition.checks {
+                        actual.push((
+                            check.check.command.clone(),
+                            partition.provenance.as_str().to_string(),
+                        ));
+                    }
+                }
+            }
+            actual.sort();
+            push(
+                "verification_provenances",
+                wanted == actual,
+                format!("{wanted:?}"),
+                format!("{actual:?}"),
+            );
+        }
+
+        if let Some(expected) = asserts.verification_repair_targets {
+            let actual = run
+                .verification
+                .as_ref()
+                .map(|report| report.repair_targets.len() as u64);
+            push(
+                "verification_repair_targets",
+                actual == Some(expected),
+                expected.to_string(),
+                match actual {
+                    Some(value) => value.to_string(),
+                    None => "no verification report".to_string(),
+                },
+            );
+        }
+
+        if let Some(expected) = &asserts.verification_action_kinds {
+            let mut wanted = expected.clone();
+            wanted.sort();
+            let mut actual = run
+                .verification
+                .as_ref()
+                .map(|report| {
+                    report
+                        .actions
+                        .iter()
+                        .map(|action| action.kind.as_str().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            actual.sort();
+            push(
+                "verification_action_kinds",
+                wanted == actual,
+                format!("{wanted:?}"),
+                format!("{actual:?}"),
+            );
+        }
+
+        if let Some(expected) = &asserts.repair_stall_reason {
+            let actual = run
+                .verification
+                .as_ref()
+                .and_then(|report| report.repair_stall.as_ref())
+                .map(|stall| stall.reason.as_str().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            push(
+                "repair_stall_reason",
+                &actual == expected,
+                expected.clone(),
+                actual,
+            );
+        }
+
+        // Spec 102 Task 6: the baseline is the durable fact the classification
+        // compared against. A scenario that declined it can therefore prove the
+        // log says `declined`, not that the harness intended to decline it.
+        if let Some(expected) = &asserts.verification_baselines {
+            let mut wanted: Vec<(String, String)> = expected
+                .iter()
+                .map(|entry| (entry.command.clone(), entry.state.clone()))
+                .collect();
+            wanted.sort();
+            let mut actual = run
+                .verification_baselines
+                .iter()
+                .map(|(command, state)| (command.clone(), state.clone()))
+                .collect::<Vec<_>>();
+            actual.sort();
+            push(
+                "verification_baselines",
+                wanted == actual,
+                format!("{wanted:?}"),
+                format!("{actual:?}"),
+            );
+        }
+
         // §5.8's replay claim, read from the request the mock adapter recorded
         // rather than from the session log the request was rebuilt from.
         if let Some(wanted) = &asserts.continuation_request_contains {

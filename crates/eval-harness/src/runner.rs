@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,8 +9,8 @@ use workspace_engine::{
     ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, PatchApplyOutcome, ProcessRegistry,
     ProjectIdentity, ProjectKeySource, ProposalOrigin, Result, RoundBudgetDecision, SecretScanner,
     SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink, UsageSource,
-    UserConfirmation, VerificationReport, WorkspaceEngine, classify_session, evidence_ref_for,
-    resume,
+    UserConfirmation, VerificationEvent, VerificationReport, WorkspaceEngine, classify_session,
+    evidence_ref_for, resume,
 };
 
 use crate::fixture::{self, Materialized};
@@ -59,6 +59,11 @@ pub struct Run {
     /// The report the verification continuation produced, when the scenario
     /// asked for one (spec 23 Task 9). `None` for every other scenario.
     pub verification: Option<VerificationReport>,
+    /// Every durable baseline state the run recorded, keyed by check command
+    /// (spec 102 Task 6). Read from the session log, so a declined, unavailable
+    /// or passing baseline is a fact about the run rather than an assumption
+    /// about what the harness asked for.
+    pub verification_baselines: BTreeMap<String, String>,
     /// The task's last assistant message as the session log holds it, which is
     /// not always `response`: after a plan reminder the pre-reminder answer is
     /// the response and the post-reminder reply follows it (spec 66 `context.md`
@@ -178,10 +183,46 @@ fn apply_eval_patch(
 /// own check decisions are the only approval it declares: a baseline for a
 /// check the scenario approves runs, and every other baseline stays declined.
 fn baseline_approved(scenario: &Scenario, command: &str) -> bool {
+    if scenario.decline_baseline {
+        return false;
+    }
     scenario
         .check_decisions
         .iter()
         .any(|decision| decision.command == command && decision.approved)
+}
+
+/// The durable baseline state per check, read from the run's session log.
+///
+/// Only the last record per check is kept, which is the baseline the
+/// post-patch comparison used. A historical log writes none, and the map stays
+/// empty rather than claiming a baseline the engine never recorded. A log that
+/// cannot be read is an error, not an empty map: a broken read must not be
+/// mistaken for a run that recorded no baselines.
+fn durable_baselines(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+) -> Result<BTreeMap<String, String>> {
+    let mut baselines = BTreeMap::new();
+    let events = engine
+        .session_store
+        .read_verification_events(session_id, &[])?;
+    for event in events {
+        let VerificationEvent::Baseline {
+            check, baseline, ..
+        } = event
+        else {
+            continue;
+        };
+        let state = match baseline {
+            workspace_engine::CheckBaseline::Passed => "passed",
+            workspace_engine::CheckBaseline::Failed { .. } => "failed",
+            workspace_engine::CheckBaseline::Declined => "declined",
+            workspace_engine::CheckBaseline::Unavailable { .. } => "unavailable",
+        };
+        baselines.insert(check.command, state.to_string());
+    }
+    Ok(baselines)
 }
 
 /// The deterministic tier: a scripted `MockModelAdapter`, no credentials and no
@@ -557,6 +598,7 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
         continuation_request: None,
         answer_request: None,
         verification: None,
+        verification_baselines: BTreeMap::new(),
         last_assistant_message: None,
         compacted_request: None,
         compacted_system_prompt: None,
@@ -1366,6 +1408,13 @@ fn drive(
     // before the trace is read: classification and the resume decision are both
     // audited, and that trail is what the assertions and §5.6's recovery row
     // read.
+    // Spec 102 Task 6: the baseline is read from the durable log before the
+    // outcome is consumed below, so a declined or unavailable baseline is a
+    // recorded fact rather than an assumption about the harness's decision.
+    let verification_baselines = match outcome.as_ref() {
+        Ok(result) => durable_baselines(engine, &result.session.id)?,
+        Err(_) => BTreeMap::new(),
+    };
     let recovery = match &scenario.crash_mid_action {
         Some(crash) => Some(interrupt_and_recover(engine, materialized, crash)?),
         None => None,
@@ -1687,6 +1736,7 @@ fn drive(
         continuation_request: None,
         answer_request: None,
         verification,
+        verification_baselines,
         last_assistant_message,
         compacted_request: None,
         compacted_system_prompt: None,

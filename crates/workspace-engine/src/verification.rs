@@ -394,6 +394,40 @@ impl FailureFingerprint {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// One fingerprint for a whole repair attempt, from the failures that made
+    /// it due.
+    ///
+    /// A repair can target more than one check; the attempt's identity is the
+    /// canonical set of `(CheckId, fingerprint)` pairs, not the order the shell
+    /// happened to list them in. This is the value the bounded repair history
+    /// compares, so two attempts with the same failing checks produce the same
+    /// value and a materially different result does not.
+    pub fn for_attempt(entries: &[(CheckId, FailureFingerprint)]) -> Self {
+        let mut entries = entries.to_vec();
+        entries.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.as_str().cmp(right.1.as_str()))
+        });
+        entries.dedup();
+        let failures = entries
+            .iter()
+            .map(|(check, fingerprint)| {
+                serde_json::json!({
+                    "workingDirectory": normalized_repository_path(&check.working_directory),
+                    "command": check.command,
+                    "fingerprint": fingerprint,
+                })
+            })
+            .collect::<Vec<_>>();
+        let canonical = serde_json::json!({
+            "version": 1,
+            "failures": failures,
+        });
+        let bytes = serde_json::to_vec(&canonical).expect("fingerprint input is serializable");
+        Self(crate::hash::sha256(bytes))
+    }
 }
 
 /// The task-local result recorded for a check before the patch that first
@@ -525,7 +559,7 @@ fn normalized_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn normalized_repository_path(path: &str) -> String {
+pub(crate) fn normalized_repository_path(path: &str) -> String {
     let mut path = path.trim().replace('\\', "/");
     while path.len() > 1 && path.ends_with('/') {
         path.pop();
@@ -556,6 +590,9 @@ pub enum VerificationOutcome {
     NothingVerified,
     Failed,
     RepairLimitExhausted,
+    /// Automatic repair stopped because progress stalled before the numeric
+    /// limit (spec 102 requirement 7). The report carries the typed reason.
+    RepairStalled,
     NoRepairApplied,
     NoChecksAvailable,
     OnlyDocumentationChanged,
@@ -569,6 +606,7 @@ impl VerificationOutcome {
             Self::NothingVerified => "nothing_verified",
             Self::Failed => "failed",
             Self::RepairLimitExhausted => "repair_limit_exhausted",
+            Self::RepairStalled => "repair_stalled",
             Self::NoRepairApplied => "no_repair_applied",
             Self::NoChecksAvailable => "no_checks_available",
             Self::OnlyDocumentationChanged => "only_documentation_changed",
@@ -633,6 +671,17 @@ pub enum VerificationEvent {
         task_id: String,
         entry: RepairStateEntry,
     },
+    /// The terminal repair-stall transition (spec 102 Task 4). One event
+    /// records the current state and the typed reason, and replays as a
+    /// finished verification with no due or in-progress run. A separate
+    /// state-then-finish pair would leave a crash window in which replay sees
+    /// the state but not the stop and could silently restart repair.
+    #[serde(rename = "verification_repair_stalled", rename_all = "camelCase")]
+    RepairStalled {
+        task_id: String,
+        entry: RepairStateEntry,
+        stall: crate::stagnation::RepairStall,
+    },
 }
 
 impl VerificationEvent {
@@ -647,7 +696,8 @@ impl VerificationEvent {
             | Self::Finished { task_id, .. }
             | Self::Baseline { task_id, .. }
             | Self::Provenance { task_id, .. }
-            | Self::RepairState { task_id, .. } => task_id,
+            | Self::RepairState { task_id, .. }
+            | Self::RepairStalled { task_id, .. } => task_id,
         }
     }
 }
@@ -696,6 +746,9 @@ pub struct VerificationState {
     pub provenance: BTreeMap<CheckId, CheckProvenanceRecord>,
     /// The bounded repair-state window, oldest first (spec 102 requirement 7).
     pub repair_history: Vec<RepairStateEntry>,
+    /// The latest terminal repair stall, cleared by a new `Started`. Only a
+    /// `RepairStalled` event sets it; no reader derives it from a check count.
+    pub repair_stall: Option<crate::stagnation::RepairStall>,
     /// A `Started` with no later `Finished`. Distinct from `due`, which stays
     /// set until a `Finished` too: a run can be both due and in progress, and
     /// the completion gate reports each fact it can see.
@@ -726,6 +779,7 @@ impl VerificationState {
             } => {
                 self.attempt = *attempt;
                 self.finished = None;
+                self.repair_stall = None;
                 self.in_progress = true;
                 for check in checks {
                     if !self.selected.contains(check) {
@@ -753,6 +807,7 @@ impl VerificationState {
             VerificationEvent::Finished { outcome, .. } => {
                 self.due = None;
                 self.finished = Some(*outcome);
+                self.repair_stall = None;
                 self.in_progress = false;
             }
             VerificationEvent::Baseline {
@@ -763,11 +818,21 @@ impl VerificationState {
             VerificationEvent::Provenance { record, .. } => {
                 self.provenance.insert(record.check.clone(), record.clone());
             }
-            VerificationEvent::RepairState { entry, .. } => {
+            VerificationEvent::RepairState { entry, .. }
+            | VerificationEvent::RepairStalled { entry, .. } => {
                 self.repair_history.push(entry.clone());
                 if self.repair_history.len() > MAX_REPAIR_STATE_ENTRIES {
                     let excess = self.repair_history.len() - MAX_REPAIR_STATE_ENTRIES;
                     self.repair_history.drain(0..excess);
+                }
+                if let VerificationEvent::RepairStalled { stall, .. } = event {
+                    // One event: the state, the typed stop, and the cleared
+                    // due/in-progress facts are all durable at the same log
+                    // position, so replay cannot see half of them.
+                    self.repair_stall = Some(stall.clone());
+                    self.finished = Some(VerificationOutcome::RepairStalled);
+                    self.due = None;
+                    self.in_progress = false;
                 }
             }
         }
@@ -865,6 +930,11 @@ pub struct VerificationReport {
     /// Flattened engine-owned actions for the panel and CLI.
     #[serde(default)]
     pub actions: Vec<crate::provenance::VerificationAction>,
+    /// The typed stop when automatic repair stalled (spec 102 requirement 7).
+    /// The reason, label, explanation and action are engine data; a shell
+    /// prints them and never infers a stall kind from a check count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_stall: Option<crate::stagnation::RepairStall>,
 }
 
 impl VerificationReport {
@@ -898,6 +968,7 @@ impl VerificationReport {
             provenance: Vec::new(),
             repair_targets: Vec::new(),
             actions: Vec::new(),
+            repair_stall: state.repair_stall.clone(),
         };
         for check in &state.selected {
             let Some(run) = state.checks.get(check) else {
@@ -1000,13 +1071,31 @@ impl VerificationReport {
                 ));
             }
         }
-        report.repair_targets = repair_targets(&entries);
+        // A stall is terminal for automatic repair: the introduced failures
+        // stay visible in their provenance partition, but no target can reach
+        // a repair turn and the redundant proposal is never offered.
+        report.repair_targets = if report.repair_stall.is_some() {
+            Vec::new()
+        } else {
+            repair_targets(&entries)
+        };
         report.provenance = build_partitions(entries);
         report.actions = report
             .provenance
             .iter()
             .filter_map(|partition| partition.action.clone())
             .collect();
+        if let Some(stall) = &report.repair_stall {
+            // The part of the report that says a repair started is false once
+            // it stalled; the engine's stall action replaces it.
+            report.actions.retain(|action| {
+                !matches!(
+                    action.kind,
+                    crate::provenance::VerificationActionKind::ReviewIntroducedFailure
+                )
+            });
+            report.actions.push(stall.action.clone());
+        }
         report
     }
 
@@ -1037,6 +1126,11 @@ impl VerificationReport {
                 "Verification failed: the repair limit was exhausted and {}. {plan_note}",
                 self.failure_phrase()
             );
+        }
+        if let Some(stall) = &self.repair_stall {
+            // The engine's explanation already ends with a sentence period;
+            // adding another would print double punctuation.
+            return format!("{}: {} {plan_note}", stall.label, stall.explanation);
         }
         if let Some(VerificationOutcome::NoRepairApplied) = self.outcome {
             return format!(
@@ -1114,6 +1208,9 @@ impl VerificationReport {
     /// automatic repair must not start, and is the only representation a
     /// caller needs to check.
     pub fn repair_request(&self) -> Option<String> {
+        if self.repair_stall.is_some() {
+            return None;
+        }
         crate::provenance::render_repair_request(&self.repair_targets)
     }
 
@@ -1204,6 +1301,9 @@ impl VerificationReport {
                 .join("\n                     ");
             lines.push(section(&partition.label, &value));
         }
+        if let Some(stall) = &self.repair_stall {
+            lines.push(section(&stall.label, &stall.explanation));
+        }
         let actions = if self.actions.is_empty() {
             "none".to_string()
         } else {
@@ -1238,6 +1338,9 @@ impl VerificationReport {
                     "match"
                 }
             ));
+        }
+        if self.repair_stall.is_some() {
+            notes.push("automatic repair stopped because it stalled".to_string());
         }
         if notes.is_empty() {
             "none".to_string()

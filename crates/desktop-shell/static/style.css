@@ -1233,6 +1233,47 @@ button:disabled {
   color: var(--warn);
 }
 
+/* Spec 102 Task 5: engine-owned repair-scope review. Like the secret notice,
+   `display` below overrides the UA `[hidden]` rule, so hide it explicitly. */
+.patch-repair-scope[hidden] {
+  display: none;
+}
+
+.patch-repair-scope {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.patch-repair-scope strong {
+  color: var(--warn);
+  font-size: 13px;
+}
+
+.patch-repair-scope p,
+.patch-repair-scope li {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.patch-repair-scope ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.patch-repair-scope code {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.patch-repair-scope .patch-repair-scope-action {
+  color: var(--ink);
+}
+
 .message-body h3,
 .message-body h4,
 .message-body h5,

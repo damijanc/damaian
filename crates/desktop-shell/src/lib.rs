@@ -6713,7 +6713,8 @@ fn session_verification_json(engine: &WorkspaceEngine, session_id: &str) -> Stri
         return "null".to_string();
     };
     let Some(task_id) = events.iter().rev().find_map(|event| match event {
-        VerificationEvent::Finished { task_id, .. } => Some(task_id.clone()),
+        VerificationEvent::Finished { task_id, .. }
+        | VerificationEvent::RepairStalled { task_id, .. } => Some(task_id.clone()),
         _ => None,
     }) else {
         return "null".to_string();
@@ -6729,11 +6730,20 @@ fn session_verification_json(engine: &WorkspaceEngine, session_id: &str) -> Stri
     let can_continue = outcome == VerificationOutcome::RepairLimitExhausted
         && state.due.is_none()
         && latest_is_limited_task;
+    // A stale reload still needs the engine's typed stop, including its label,
+    // explanation and action. The shell prints those strings and never derives
+    // a stall kind from the outcome or from a check count.
+    let repair_stall = state
+        .repair_stall
+        .as_ref()
+        .and_then(|stall| serde_json::to_string(stall).ok())
+        .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"taskId\":\"{}\",\"outcome\":\"{}\",\"canContinueRepair\":{}}}",
+        "{{\"taskId\":\"{}\",\"outcome\":\"{}\",\"canContinueRepair\":{},\"repairStall\":{}}}",
         escape_json(&task_id),
         outcome.as_str(),
-        can_continue
+        can_continue,
+        repair_stall
     )
 }
 
@@ -6745,11 +6755,32 @@ fn patch_proposal_json(result: &ChatTurnResult) -> String {
     let Some(proposal) = &result.patch_proposal else {
         return "null".to_string();
     };
+    patch_payload_json(
+        &proposal.patch_id,
+        &proposal.summary,
+        &proposal.files,
+        proposal.repair_scope.as_ref(),
+    )
+}
+
+/// The one patch-preview payload for a live turn, a worker result and a
+/// reattached card. The engine-owned repair-scope review travels with it, so
+/// every route renders the same fact (spec 102 Task 5).
+fn patch_payload_json(
+    patch_id: &str,
+    summary: &str,
+    files: &[ProposedFilePatch],
+    repair_scope: Option<&workspace_engine::RepairScopeReview>,
+) -> String {
+    let repair_scope = repair_scope
+        .map(|scope| serde_json::to_string(scope).unwrap_or_else(|_| "null".to_string()))
+        .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"patchId\":\"{}\",\"summary\":\"{}\",\"files\":[{}]}}",
-        escape_json(&proposal.patch_id),
-        escape_json(&proposal.summary),
-        patch_files_json(&proposal.files)
+        "{{\"patchId\":\"{}\",\"summary\":\"{}\",\"files\":[{}],\"repairScope\":{}}}",
+        escape_json(patch_id),
+        escape_json(summary),
+        patch_files_json(files),
+        repair_scope
     )
 }
 
@@ -7531,11 +7562,11 @@ mod tests {
         fetch_decision_error_code, fetch_decision_error_json, fetch_proposal_json,
         forget_model_api_key, generated_secret_warnings_json, handle_connection, index_html,
         json_error, json_optional_string, keychain, language_servers_json, mcp_browser_arguments,
-        message_json, parse_form, parse_path_list, percent_decode, phase_json, plan_json,
-        plan_proposal_json, question_proposal_json, relay_turn_events, remember_model_api_key,
-        render_markdown_with_optional_file_links, repository_config_review_json,
-        repository_config_write_target, require_api_token, resolve_shell_model_api_key,
-        run_answer_question_request, run_continue_task_request_with,
+        message_json, parse_form, parse_path_list, patch_payload_json, percent_decode, phase_json,
+        plan_json, plan_proposal_json, question_proposal_json, relay_turn_events,
+        remember_model_api_key, render_markdown_with_optional_file_links,
+        repository_config_review_json, repository_config_write_target, require_api_token,
+        resolve_shell_model_api_key, run_answer_question_request, run_continue_task_request_with,
         run_fetch_decision_request_with, run_server, run_terminal_command, save_config_file,
         session_verification_json, spawn_with_shell_stack, sweep_orphaned_processes,
         symbol_repository, task_states_json, task_usage_json, terminal_cwd_for_repo,
@@ -7558,8 +7589,8 @@ mod tests {
         Evidence, FailureFingerprint, FailureProvenance, FetchComponentFlag, FindingEvidence,
         GeneratedSecretWarning, LanguageServerHub, LanguageServerLaunch, LanguageServerState,
         LanguageServerStatus, MockModelAdapter, PendingQuestionRef, PhaseKind, PlanStep,
-        SecretScanner, SessionMode, StepStatus, TaskPlan, TaskStatus, TaskUsage, ToolCall,
-        TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource, VerificationEvent,
+        RepairScopeReview, SecretScanner, SessionMode, StepStatus, TaskPlan, TaskStatus, TaskUsage,
+        ToolCall, TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource, VerificationEvent,
         VerificationOutcome, VerificationReport, WebDiagnosticRecord, WebDiagnosticReport,
         WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
@@ -9309,6 +9340,83 @@ mod tests {
         fs::remove_dir_all(&repo).ok();
     }
 
+    /// Spec 102 Task 4: the reloaded session payload carries the same typed
+    /// stall, and it never offers Spec 96's explicit repair continuation.
+    #[test]
+    fn session_payload_renders_a_durable_repair_stall_without_offering_continue() {
+        let repo = temp_shell_repo("repair-stall-offer");
+        let repo_arg = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
+        let session = engine
+            .session_store
+            .create_session(
+                &workspace_engine::hash::repository_id_for_root(&repo),
+                "stalled",
+            )
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "verify", "provider", "model")
+            .unwrap();
+        engine
+            .session_store
+            .update_task_status(&task, workspace_engine::TaskStatus::Failed, None)
+            .unwrap();
+        let check = CheckId::new("", "cargo test");
+        let entry = workspace_engine::RepairStateEntry {
+            failure_fingerprint: FailureFingerprint::compute(
+                &check,
+                &[],
+                &CheckTermination::Exited { exit_code: 1 },
+            ),
+            patch_digest: "sha256:patch".to_string(),
+            task_diff_digest: "sha256:diff".to_string(),
+        };
+        let stall = workspace_engine::RepairStall::new(
+            workspace_engine::RepairStallReason::RepeatedFailure,
+        );
+        for event in [
+            VerificationEvent::Started {
+                task_id: task.id.clone(),
+                attempt: 1,
+                checks: vec![check],
+            },
+            VerificationEvent::RepairStalled {
+                task_id: task.id.clone(),
+                entry,
+                stall: stall.clone(),
+            },
+        ] {
+            engine
+                .session_store
+                .append_verification_event(&session.id, &event)
+                .unwrap();
+        }
+
+        let offered = session_verification_json(&engine, &session.id);
+        let value: serde_json::Value = serde_json::from_str(&offered).expect("valid payload");
+        assert_eq!(value["taskId"], task.id);
+        assert_eq!(value["outcome"], "repair_stalled");
+        assert_eq!(
+            value["canContinueRepair"], false,
+            "a stall is not the numeric limit: {offered}"
+        );
+        assert_eq!(value["repairStall"]["label"], stall.label);
+        assert_eq!(value["repairStall"]["explanation"], stall.explanation);
+        assert_eq!(
+            value["repairStall"]["action"]["kind"],
+            "review_stalled_repair"
+        );
+
+        // A fresh store over the same log renders exactly the same stop.
+        drop(engine);
+        let reopened = engine_for_repo(&repo_arg).expect("engine for the same repo");
+        let reloaded = session_verification_json(&reopened, &session.id);
+        assert_eq!(reloaded, offered);
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
     #[test]
     fn resume_checks_endpoint_records_declined_checks() {
         unsafe { std::env::set_var("DAMAIAN_MOCK_MODEL_RESPONSE", "No repair.") };
@@ -9417,6 +9525,105 @@ mod tests {
         );
         assert!(super::APP_JS.contains("normalizeProjectPath(row.sourceRepository)"));
         assert!(!include_str!("../static/style.css").contains(".project-workers-entry"));
+    }
+
+    /// Spec 102 Task 5: the shared patch payload carries the engine's typed
+    /// repair-scope review, so a live turn, a worker and a reattached card use
+    /// one shape.
+    #[test]
+    fn the_shared_patch_payload_carries_the_engine_repair_scope() {
+        let review = RepairScopeReview::compute(
+            &["src/a.rs".to_string()],
+            &["src/report.rs".to_string()],
+            &["src/new.rs".to_string()],
+        );
+        let payload = patch_payload_json("patch_1", "repair", &[], Some(&review));
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["patchId"], "patch_1");
+        assert_eq!(value["repairScope"]["oneShot"], true);
+        assert_eq!(value["repairScope"]["expansionPaths"][0], "src/new.rs");
+        assert_eq!(
+            value["repairScope"]["actions"][0]["kind"],
+            "approve_scope_expansion_once"
+        );
+        assert_eq!(value["repairScope"]["label"], review.label);
+    }
+
+    /// The desktop card prints the engine's repair-scope fields and keeps no
+    /// path classification or permission decision of its own. The engine
+    /// returns `repairScope` only for an expansion, so presence alone decides
+    /// rendering; the card never reads `oneShot`, a reason/action kind or a
+    /// decision field.
+    #[test]
+    fn the_patch_card_renders_only_engine_repair_scope_facts() {
+        let card = super::APP_JS
+            .split("function createPatchPreview(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfunction ").next())
+            .expect("the patch preview");
+        let without_comments = |text: &str| {
+            text.lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for field in [
+            "payload.repairScope",
+            "scope.label",
+            "scope.explanation",
+            "scope.reasonGroups",
+            "group.paths",
+            "scope.actions",
+            "action.label",
+            "action.detail",
+        ] {
+            assert!(card.contains(field), "{field} in {card}");
+        }
+        let renderer = card
+            .split("function renderRepairScope()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  renderRepairScope();").next())
+            .expect("the repair-scope renderer");
+        assert!(
+            renderer.contains("const scope = payload.repairScope;"),
+            "{renderer}"
+        );
+        assert!(renderer.contains("if (!scope)"), "{renderer}");
+        let renderer_code = without_comments(renderer);
+        for forbidden in [
+            "oneShot",
+            "one_shot",
+            "expansionPaths",
+            "taskChangedPaths",
+            "findingPaths",
+            "reasonGroups.kind",
+            "group.kind",
+            "action.kind",
+            "decision",
+            "isProtected",
+            "classify",
+            "permission",
+            "status",
+        ] {
+            assert!(
+                !renderer_code.contains(forbidden),
+                "the card must render on repairScope presence alone, not {forbidden}"
+            );
+        }
+        let card_code = without_comments(card);
+        for forbidden in [
+            "oneShot",
+            "taskChangedPaths",
+            "findingPaths",
+            "expansionPaths.includes",
+            "isProtected",
+            "classify",
+        ] {
+            assert!(
+                !card_code.contains(forbidden),
+                "the card must not classify paths itself: {forbidden}"
+            );
+        }
     }
 
     /// Spec 82: the declined-everything answer above is what a "Submit checks"
@@ -20089,6 +20296,43 @@ mod branch_route_tests {
     }
 }
 
+/// Spec 102 Task 4: a reloaded stall card is the same engine data as the live
+/// report. The shell places it; it does not inspect the reason.
+#[test]
+fn the_reloaded_stall_card_renders_engine_strings_without_classifying() {
+    let app = include_str!("../static/app.js");
+    let card = app
+        .split("function renderRepairStallOffer(")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfunction ").next())
+        .expect("the reloaded stall card");
+    for engine_field in [
+        "verification?.repairStall",
+        "stall.label",
+        "stall.explanation",
+        "stall.action.label",
+        "stall.action.detail",
+    ] {
+        assert!(
+            card.contains(engine_field),
+            "{engine_field} missing from {card}"
+        );
+    }
+    for forbidden in [
+        "identical_state",
+        "repeated_failure",
+        "equivalent_patch",
+        "unchanged_task_diff",
+        "oscillation",
+        "canContinueRepair",
+    ] {
+        assert!(
+            !card.contains(forbidden),
+            "the stall card must not infer or offer {forbidden}: {card}"
+        );
+    }
+}
+
 #[test]
 fn the_verification_card_renders_engine_provenance_without_classifying() {
     let app = include_str!("../static/app.js");
@@ -20109,12 +20353,21 @@ fn the_verification_card_renders_engine_provenance_without_classifying() {
         "action.label",
         "action.detail",
         "item.reasonLabel",
+        "report.repairStall",
+        "report.repairStall.label",
+        "report.repairStall.explanation",
     ] {
         assert!(
             card.contains(engine_field),
             "{engine_field} missing from {card}"
         );
     }
+    // The stall's action is flattened into report.actions, so rendering
+    // report.repairStall.action here would print the same engine action twice.
+    assert!(
+        !card.contains("report.repairStall.action"),
+        "the stall action must render once through report.actions: {card}"
+    );
     // The provenance section renders the engine's own check label and
     // fully-formatted redacted evidence. Deriving either in JavaScript — from
     // a CheckId or from FindingEvidence fields — would put report business
@@ -20141,6 +20394,11 @@ fn the_verification_card_renders_engine_provenance_without_classifying() {
         "repairTargets",
         "repair_eligible",
         "reason.reason ===",
+        "identical_state",
+        "repeated_failure",
+        "equivalent_patch",
+        "unchanged_task_diff",
+        "oscillation",
     ] {
         assert!(
             !card.contains(forbidden),

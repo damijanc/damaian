@@ -556,6 +556,11 @@ fn run() -> workspace_engine::Result<()> {
                 println!();
             }
             if let Some(patch) = &result.patch_proposal {
+                // Engine-owned repair-scope facts, printed verbatim (spec 102
+                // Task 5). The CLI classifies no path.
+                if let Some(scope) = &patch.repair_scope {
+                    eprintln!("{}", scope.render());
+                }
                 eprintln!("repair_patch={}", escape(&patch.patch_id));
             }
         }
@@ -591,6 +596,9 @@ fn run() -> workspace_engine::Result<()> {
                 println!();
             }
             if let Some(patch) = &result.patch_proposal {
+                if let Some(scope) = &patch.repair_scope {
+                    eprintln!("{}", scope.render());
+                }
                 eprintln!("repair_patch={}", escape(&patch.patch_id));
             }
         }
@@ -687,11 +695,19 @@ fn run() -> workspace_engine::Result<()> {
             let patch = engine.patch_store.load(patch_id)?;
             print!("{}", patch_diff_text(&patch));
             print!("{}", patch_hunk_summary(&patch));
+            if let Some(scope) = &patch.repair_scope {
+                print!("{}", scope.render());
+            }
         }
         "apply-patch" => {
             let repo = require_arg(&args, 1, "<repo>")?;
             let engine = engine_for_repo(repo)?;
             let patch_id = require_arg(&args, 2, "<patch-id>")?;
+            // Print the engine's own one-shot scope review before applying, so
+            // an operator sees the same fact the desktop card renders.
+            if let Some(scope) = &engine.patch_store.load(patch_id)?.repair_scope {
+                eprintln!("{}", scope.render());
+            }
             let approved_paths = if args.len() > 3 {
                 Some(args[3..].to_vec())
             } else {
@@ -1668,4 +1684,32 @@ fn escape(value: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+#[cfg(test)]
+mod tests {
+    /// Spec 102 Task 5: the CLI prints the engine's repair-scope rendering
+    /// verbatim. It must not classify paths or decide whether repair may go on.
+    #[test]
+    fn repair_scope_output_is_engine_owned() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the production source");
+        assert!(
+            production.matches("scope.render()").count() >= 3,
+            "the repair, show and apply routes all print the engine rendering"
+        );
+        for forbidden in [
+            "expansion_paths.iter()",
+            "RepairScopeReasonKind::",
+            "ApproveScopeExpansionOnce",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "the CLI must not rebuild repair-scope facts: {forbidden}"
+            );
+        }
+    }
 }

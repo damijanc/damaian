@@ -1334,11 +1334,12 @@ fn a_blocked_scenario_is_still_skipped_and_says_why() {
 }
 
 /// Guards the count in spec 18 §6, now that spec 17 has landed: every scenario
-/// runs and none is blocked. Forty-seven: spec 59 added `long_discovery` and
+/// runs and none is blocked. Fifty-two: spec 59 added `long_discovery` and
 /// `read_loop`, spec 62 added `approval_causes`, spec 50 added
 /// `answered_question`, spec 23 added `verified_repair` and
-/// `repair_limit_exhausted`, spec 66 added `plan_left_open`, and spec 30 added
-/// seven memory-recall scenarios.
+/// `repair_limit_exhausted`, spec 66 added `plan_left_open`, spec 30 added
+/// seven memory-recall scenarios, and spec 102 added five verification
+/// provenance and stagnation scenarios.
 #[test]
 fn every_scenario_runs_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
@@ -1355,10 +1356,10 @@ fn every_scenario_runs_and_none_is_blocked() {
     );
     assert_eq!(
         all.len(),
-        47,
-        "forty-seven scenarios should run: the two compaction scenarios, thirteen memory \
-         scenarios (six consent, seven recall), three external-reference injection scenarios, and \
-         the live injection twin"
+        52,
+        "fifty-two scenarios should run: the two compaction scenarios, thirteen memory \
+         scenarios (six consent, seven recall), three external-reference injection scenarios, \
+         the live injection twin, and five spec 102 verification scenarios"
     );
 }
 
@@ -1668,8 +1669,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        46,
-        "all forty-six deterministic scenario files should be accounted for; the live \
+        51,
+        "all fifty-one deterministic scenario files should be accounted for; the live \
          injection twin is credential-gated"
     );
     assert_eq!(

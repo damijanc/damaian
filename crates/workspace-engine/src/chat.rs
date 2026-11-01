@@ -57,11 +57,13 @@ use crate::protected_paths::{
     protected_paths_reminder, record_task_protected_paths_from_prompt,
 };
 use crate::provenance::{PostPatchResult, classify};
+use crate::repair_scope::RepairScopeReview;
 use crate::repository_map::RepositoryMapStore;
 use crate::secret_scanner::SecretScanner;
 use crate::session::{
     ChatMessage, PendingApprovalRef, Session, SessionStore, Task, TaskStatus, TaskUsage,
 };
+use crate::stagnation::{RepairStall, detect_repair_stall, repair_state_entry};
 use crate::steering::TurnSteering;
 use crate::task_control::{TaskControl, TurnPresentation, continuation_prompt, turn_presentation};
 use crate::validation::{
@@ -481,6 +483,11 @@ pub struct AgentPatchProposal {
     pub patch_id: String,
     pub summary: String,
     pub files: Vec<ProposedFilePatch>,
+    /// The engine's typed one-shot repair-scope review (spec 102 Task 5), when
+    /// this patch expands the repair beyond the task's changed paths and the
+    /// active report's finding locations. `None` for an ordinary patch and for
+    /// a repair that stays in scope.
+    pub repair_scope: Option<crate::repair_scope::RepairScopeReview>,
 }
 
 /// A plan put up for review before the turn takes its first mutating step
@@ -3884,7 +3891,30 @@ impl ChatOrchestrator {
             || result.fallback_proposal.is_some()
             || result.round_budget_proposal.is_some()
             || result.check_batch.is_some();
-        if paused || result.patch_proposal.is_some() {
+        // Spec 102 Task 4: a repair patch proposal is the first point all
+        // three comparable values exist. Record that state; when it proves no
+        // progress, stop here rather than expose the redundant patch or spend
+        // another automatic attempt.
+        if let Some(proposal) = result.patch_proposal.clone() {
+            if self.record_repair_state_or_stall(
+                repository_root,
+                &result.session.id,
+                &result.task.id,
+                report,
+                &changed,
+                &proposal,
+            )? {
+                return self.finish_verification_stalled(
+                    repository_root,
+                    result.session,
+                    result.task,
+                    changed,
+                    file_hashes,
+                );
+            }
+            return Ok(result);
+        }
+        if paused {
             return Ok(result);
         }
         // The model answered without proposing a patch. Asking it the same
@@ -3898,6 +3928,125 @@ impl ChatOrchestrator {
             changed,
             file_hashes,
         )
+    }
+
+    /// The engine's repair-scope review for a patch proposed in this turn.
+    ///
+    /// Only a verification turn is a repair, and its scope comes from the
+    /// durable active verification state rather than a caller-supplied report.
+    /// A direct repair and a resumed repair therefore compute the same fact by
+    /// the same rule, before the patch is first stored. An ordinary turn never
+    /// attaches one.
+    fn repair_scope_review_for_patch(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        turn_options: ChatTurnOptions,
+        patch: &ProposedPatch,
+    ) -> Result<Option<RepairScopeReview>> {
+        if !turn_options.verification_turn {
+            return Ok(None);
+        }
+        let events = self
+            .session_store
+            .read_verification_events(&session.id, &[])?;
+        let state = fold_verification(events.iter());
+        let changed = self.verification_changed_files(&session.id, &task.id, state.due.as_ref())?;
+        let file_hashes = hash_existing_files(repository_root, &changed);
+        let plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)?
+            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        let report = VerificationReport::build(&state, &plan, &changed, &file_hashes);
+        let finding_paths = repair_scope_finding_paths(&report);
+        let proposed = patch
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        Ok(RepairScopeReview::for_patch(
+            &changed,
+            &finding_paths,
+            &proposed,
+        ))
+    }
+
+    /// Record one repair attempt's comparable state, or its terminal stall.
+    ///
+    /// Returns `true` when the state repeats an earlier attempt and the
+    /// caller must settle the verification as stalled. The durable
+    /// `verification_repair_stalled` event records the state and the reason in
+    /// one append; a progressing attempt appends `verification_repair_state`.
+    #[allow(clippy::too_many_arguments)]
+    fn record_repair_state_or_stall(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        task_id: &str,
+        report: &VerificationReport,
+        changed: &[String],
+        proposal: &AgentPatchProposal,
+    ) -> Result<bool> {
+        let entry = repair_state_entry(
+            repository_root,
+            changed,
+            &report.repair_targets,
+            &proposal.files,
+            &self.scanner,
+        );
+        let history = self
+            .session_store
+            .task_verification_repair_history(session_id, task_id)?;
+        let Some(reason) = detect_repair_stall(&history, &entry) else {
+            self.session_store.append_verification_event(
+                session_id,
+                &VerificationEvent::RepairState {
+                    task_id: task_id.to_string(),
+                    entry,
+                },
+            )?;
+            return Ok(false);
+        };
+        self.session_store.append_verification_event(
+            session_id,
+            &VerificationEvent::RepairStalled {
+                task_id: task_id.to_string(),
+                entry,
+                stall: RepairStall::new(reason),
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// Settle a verification whose automatic repair stalled.
+    ///
+    /// The terminal event was appended by [`Self::record_repair_state_or_stall`]
+    /// and already cleared the due/in-progress facts on replay. This rebuilds
+    /// the report from the durable log, so a reload renders exactly what the
+    /// live turn returns, and takes the failed completion settlement.
+    fn finish_verification_stalled(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        changed: Vec<String>,
+        file_hashes: BTreeMap<String, String>,
+    ) -> Result<ChatTurnResult> {
+        let events = self
+            .session_store
+            .read_verification_events(&session.id, &[])?;
+        let state = fold_verification(events.iter());
+        let plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)?
+            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        let report = VerificationReport::build(&state, &plan, &changed, &file_hashes);
+        let response = format!("{}\n\n{}", report.summary(&plan.report()), report.render());
+        let task = CompletionGateService::new(&self.session_store, repository_root)
+            .settle(&task, CompletionSettlement::VerificationFailed)?
+            .task;
+        self.verification_turn_result(session, task, response, None, Some(report), changed)
     }
 
     /// Appends `Finished`, builds the report and closes the task through the
@@ -3943,6 +4092,7 @@ impl ChatOrchestrator {
             | VerificationOutcome::OnlyDocumentationChanged => CompletionSettlement::Gate,
             VerificationOutcome::Failed
             | VerificationOutcome::RepairLimitExhausted
+            | VerificationOutcome::RepairStalled
             | VerificationOutcome::NoRepairApplied => CompletionSettlement::VerificationFailed,
         };
         let task = CompletionGateService::new(&self.session_store, repository_root)
@@ -4154,13 +4304,53 @@ impl ChatOrchestrator {
             || result.round_budget_proposal.is_some()
             || result.check_batch.is_some()
             || result.cancelled;
-        if paused {
-            return Ok(result);
-        }
         let events = self
             .session_store
             .read_verification_events(&result.session.id, &[])?;
         let state = fold_verification(events.iter());
+        // A paused repair turn resumes outside `run_repair_turn`, so its patch
+        // proposal reaches Task 4's progress check here instead. The same
+        // durable decision and the same typed report are required on this path.
+        if result.patch_proposal.is_some() {
+            let changed = self.verification_changed_files(
+                &result.session.id,
+                &result.task.id,
+                state.due.as_ref(),
+            )?;
+            let file_hashes = hash_existing_files(repository_root, &changed);
+            let plan = self
+                .session_store
+                .read_task_plan(&result.session.id, &result.task.id)?
+                .unwrap_or_else(|| TaskPlan::new(&result.task.id, now_millis()));
+            let report = VerificationReport::build(&state, &plan, &changed, &file_hashes);
+            // The paused repair proposal already carries the same engine-owned
+            // scope review that `run_agentic_turn` attached before its first
+            // save; only the progress decision remains for this path.
+            let proposal = result
+                .patch_proposal
+                .clone()
+                .expect("a proposal was checked above");
+            if self.record_repair_state_or_stall(
+                repository_root,
+                &result.session.id,
+                &result.task.id,
+                &report,
+                &changed,
+                &proposal,
+            )? {
+                return self.finish_verification_stalled(
+                    repository_root,
+                    result.session,
+                    result.task,
+                    changed,
+                    file_hashes,
+                );
+            }
+            return Ok(result);
+        }
+        if paused {
+            return Ok(result);
+        }
         let Some(due) = state.due.clone() else {
             return Ok(result);
         };
@@ -8669,6 +8859,17 @@ impl ChatOrchestrator {
                                     // not know the session, this orchestrator does.
                                     let mut patch = patch;
                                     patch.session_id = session.id.clone();
+                                    // Spec 102 Task 5: the scope review is part of
+                                    // the patch before its first save, so a crash
+                                    // can never recover a repair card without it.
+                                    let repair_scope = self.repair_scope_review_for_patch(
+                                        repository_root,
+                                        &session,
+                                        &task,
+                                        turn_options,
+                                        &patch,
+                                    )?;
+                                    patch.repair_scope = repair_scope;
                                     self.patch_store.save(&patch)?;
                                     let response = patch_proposal_response(&patch);
                                     // A patch waiting for review is a clean stop, not
@@ -8951,6 +9152,17 @@ impl ChatOrchestrator {
                                     // not know the session, this orchestrator does.
                                     let mut patch = patch;
                                     patch.session_id = session.id.clone();
+                                    // Spec 102 Task 5: the scope review is part of
+                                    // the patch before its first save, so a crash
+                                    // can never recover a repair card without it.
+                                    let repair_scope = self.repair_scope_review_for_patch(
+                                        repository_root,
+                                        &session,
+                                        &task,
+                                        turn_options,
+                                        &patch,
+                                    )?;
+                                    patch.repair_scope = repair_scope;
                                     self.patch_store.save(&patch)?;
                                     let response = patch_proposal_response(&patch);
                                     // A patch waiting for review is a clean stop, not
@@ -14650,11 +14862,38 @@ fn patch_proposal_response(patch: &ProposedPatch) -> String {
     )
 }
 
+/// Every normalized finding location in the active verification report.
+///
+/// Both the full redacted evidence and a repair target's introduced delta
+/// count: the existing repair scope is where the report says failures are, not
+/// only the subset a repair turn may read.
+fn repair_scope_finding_paths(report: &VerificationReport) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for partition in &report.provenance {
+        for check in &partition.checks {
+            for evidence in check.evidence.iter().chain(check.introduced.iter()) {
+                if let Some(path) = evidence.path() {
+                    paths.insert(path.to_string());
+                }
+            }
+        }
+    }
+    for target in &report.repair_targets {
+        for evidence in &target.evidence {
+            if let Some(path) = evidence.path() {
+                paths.insert(path.to_string());
+            }
+        }
+    }
+    paths.into_iter().collect()
+}
+
 fn agent_patch_proposal(patch: &ProposedPatch) -> AgentPatchProposal {
     AgentPatchProposal {
         patch_id: patch.id.clone(),
         summary: patch.summary.clone(),
         files: patch.files.clone(),
+        repair_scope: patch.repair_scope.clone(),
     }
 }
 
@@ -14883,6 +15122,55 @@ mod environment_classification_tests {
             ClientError::Git("git failed".to_string()),
         ] {
             assert_eq!(environment_termination(&error), None, "{error:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod repair_scope_ordering_tests {
+    /// Spec 102 Task 5: the first persisted patch must already carry its
+    /// repair-scope review. Attaching it after the turn returns would leave a
+    /// crash window where recovery restores a repair card without the scope
+    /// fact the user is supposed to approve.
+    #[test]
+    fn a_repair_patch_is_stored_after_its_scope_review_is_attached() {
+        let source = include_str!("chat.rs");
+        for (name, start, end) in [
+            (
+                "propose_patch",
+                "ToolAction::ProposePatch(generated_edit) => {",
+                "ToolAction::ProposePlan(steps) => {",
+            ),
+            (
+                "edit_file",
+                "ToolAction::EditFile { summary, edits } => {",
+                "ToolAction::FetchUrl { url } => {",
+            ),
+        ] {
+            let branch = source
+                .split(start)
+                .nth(1)
+                .and_then(|rest| rest.split(end).next())
+                .unwrap_or_else(|| panic!("the {name} branch"));
+            let position = |needle: &str| {
+                branch
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle} in the {name} branch"))
+            };
+            let protected = position("ensure_patch_not_protected");
+            let review = position("repair_scope_review_for_patch");
+            let save = position("self.patch_store.save(&patch)?");
+            let response = position("patch_proposal_response(&patch)");
+            let card = position("agent_patch_proposal(&patch)");
+            let finish = position("finish_action(action_marker, \"awaiting_review\")");
+            assert!(
+                protected < review
+                    && review < save
+                    && save < response
+                    && save < card
+                    && save < finish,
+                "the {name} branch must attach scope before its first save and every later step"
+            );
         }
     }
 }

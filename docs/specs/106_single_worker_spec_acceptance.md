@@ -9,8 +9,8 @@ harness), [#98](98_task_scoped_protected_patch_paths.md) (scope fence),
 [#101](101_closed_task_completion.md),
 [#102](102_repair_provenance_and_stagnation.md),
 [#103](103_bounded_worker_continuation.md), [#104](104_worker_questions.md),
-and [#105](105_structured_plan_checks.md) — #18, #98 and #101 are built;
-**#102–#105 are not built, so this spec remains blocked on them**.
+and [#105](105_structured_plan_checks.md) — #18, #98, #101 and #102 are built;
+**#103–#105 are not built, so this spec remains blocked on them**.
 
 ## 1. Motivation
 

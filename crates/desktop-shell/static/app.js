@@ -12876,6 +12876,20 @@ function createVerificationReportCard(report, reportRepo, { onContinueRepair = n
     }
     section(group.label, [groupBody]);
   }
+  // Spec 102 Task 4: a stalled repair is engine data, like the provenance
+  // groups. The heading and explanation are printed verbatim; this file does
+  // not inspect the reason or decide whether repair may continue. The stall's
+  // action is in report.actions, so it is printed once below with every other
+  // engine-owned action rather than again here.
+  if (report.repairStall) {
+    const stallBody = document.createElement("div");
+    stallBody.className = "verification-report-group";
+    const explanation = document.createElement("p");
+    explanation.className = "verification-report-group-summary";
+    explanation.textContent = report.repairStall.explanation;
+    stallBody.append(explanation);
+    section(report.repairStall.label, [stallBody]);
+  }
   section(
     "What you can do",
     (report.actions || []).map((action) =>
@@ -12985,6 +12999,37 @@ function createContinueRepairOffer(sessionId, isWorker) {
   actions.append(button);
   card.append(eyebrow, headline, note, actions);
   return card;
+}
+
+// Spec 102 Task 4: a reloaded stall is the same typed stop the live turn
+// rendered. The engine supplies the heading, explanation and action; this card
+// only places them after the verification turn's last message.
+function renderRepairStallOffer(rendered, verification) {
+  const stall = verification?.repairStall;
+  if (!stall) return;
+  const entry = [...rendered]
+    .reverse()
+    .find(({ message }) => message.taskId === verification.taskId && message.role === "assistant");
+  const card = document.createElement("section");
+  card.className = "recovery-card repair-stall-offer";
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "recovery-card-eyebrow";
+  eyebrow.textContent = "Verification stopped";
+  const headline = document.createElement("p");
+  headline.className = "recovery-card-headline";
+  headline.textContent = stall.label;
+  const note = document.createElement("p");
+  note.className = "recovery-card-note";
+  note.textContent = stall.explanation;
+  card.append(eyebrow, headline, note);
+  if (stall.action) {
+    const action = document.createElement("p");
+    action.className = "recovery-card-note";
+    action.textContent = `${stall.action.label} — ${stall.action.detail}`;
+    card.append(action);
+  }
+  if (entry) entry.bubble.body.after(card);
+  else $("chat-log").append(card);
 }
 
 function renderContinueRepairOffer(rendered, verification, sessionId) {
@@ -14046,9 +14091,59 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
   secretNotice.className = "patch-secret-notice";
   secretNotice.hidden = true;
 
+  // Spec 102 Task 5: the engine owns the repair-scope fact. This card prints
+  // its label, explanation, reason groups, paths and actions verbatim and
+  // decides nothing about which paths are in scope or whether repair may go on.
+  const repairScope = document.createElement("div");
+  repairScope.className = "patch-repair-scope";
+  repairScope.hidden = true;
+
   const list = document.createElement("div");
   list.className = "diff-list";
-  wrapper.append(header, secretNotice, list);
+  wrapper.append(header, secretNotice, repairScope, list);
+
+  function renderRepairScope() {
+    repairScope.innerHTML = "";
+    const scope = payload.repairScope;
+    // The engine returns a review only for an expansion, so presence alone
+    // decides whether anything renders. This card does not inspect oneShot,
+    // path groups, reason kinds or action kinds.
+    if (!scope) {
+      repairScope.hidden = true;
+      return;
+    }
+    repairScope.hidden = false;
+    const title = document.createElement("strong");
+    title.textContent = scope.label;
+    const explanation = document.createElement("p");
+    explanation.textContent = scope.explanation;
+    repairScope.append(title, explanation);
+
+    const groups = document.createElement("ul");
+    (scope.reasonGroups || []).forEach((group) => {
+      const item = document.createElement("li");
+      const label = document.createElement("strong");
+      label.textContent = group.label;
+      const paths = document.createElement("code");
+      paths.textContent = (group.paths || []).join(", ");
+      const detail = document.createElement("span");
+      detail.textContent = ` — ${group.explanation}`;
+      item.append(label, document.createTextNode(" "), paths, detail);
+      groups.append(item);
+    });
+    if (groups.childElementCount) repairScope.append(groups);
+
+    (scope.actions || []).forEach((action) => {
+      const line = document.createElement("p");
+      line.className = "patch-repair-scope-action";
+      const label = document.createElement("strong");
+      label.textContent = action.label;
+      line.append(label, document.createTextNode(` — ${action.detail}`));
+      repairScope.append(line);
+    });
+  }
+
+  renderRepairScope();
 
   function clearSecretNotice() {
     secretNotice.hidden = true;
@@ -14811,6 +14906,7 @@ async function loadSession(sessionId) {
   showProtectedPathOutcome("");
   // Spec 96: a reloaded report is text, so the explicit continuation comes
   // from the durable outcome. It follows the verification turn's last message.
+  renderRepairStallOffer(rendered, payload.verification);
   renderContinueRepairOffer(rendered, payload.verification, currentSessionId);
   contextPins = payload.contextState?.pins || [];
   contextRestrictionDirty = false;

@@ -220,6 +220,22 @@ pub struct Asserts {
     pub exploration_findings: Option<u64>,
     /// The verification outcome the run must report (spec 23 Task 9).
     pub verification_outcome: Option<String>,
+    /// The provenance classification the durable report must record for each
+    /// check (spec 102 Task 6). Compared as an exact set, so a result classified
+    /// into two groups or into the wrong one fails rather than passing a
+    /// substring match.
+    pub verification_provenances: Option<Vec<VerificationProvenance>>,
+    /// The exact number of introduced failures that may reach a repair turn.
+    /// Zero is the answer for pre-existing, environment and unknown results.
+    pub verification_repair_targets: Option<u64>,
+    /// The engine-owned action kinds the report must offer, such as
+    /// `fix_environment` or `review_stalled_repair`.
+    pub verification_action_kinds: Option<Vec<String>>,
+    /// The typed repair-stall reason, or `none` when no stall is expected.
+    pub repair_stall_reason: Option<String>,
+    /// The durable baseline state recorded for each check, read from the
+    /// session log rather than inferred from the result.
+    pub verification_baselines: Option<Vec<VerificationBaseline>>,
     /// A phrase the final report's summary must not contain. The negative
     /// scenario uses `"complete"`, which is the claim an optimistic loop would
     /// make.
@@ -427,6 +443,11 @@ pub struct Scenario {
     /// How each check on a verification card is answered, matched by command.
     /// A check the list omits is declined, which is the card's default.
     pub check_decisions: Vec<CheckDecision>,
+    /// Decline every baseline the pre-apply gate offers, while still approving
+    /// the check itself (spec 102 Task 6). A headless harness has no user, so
+    /// this is how a scenario exercises requirement 6's declined-baseline path
+    /// separately from its post-patch check decision.
+    pub decline_baseline: bool,
     /// When set, the runner leaves the turn's task mid-action — an
     /// `action_started` with no `action_finished` — then reopens the store and
     /// classifies, which is what a restart does. See [`CrashMidAction`].
@@ -501,6 +522,8 @@ struct RawScenario {
     #[serde(default)]
     check_decisions: Vec<CheckDecision>,
     #[serde(default)]
+    decline_baseline: bool,
+    #[serde(default)]
     crash_mid_action: Option<CrashMidAction>,
     #[serde(default, rename = "turn")]
     turns: Vec<RawTurn>,
@@ -544,6 +567,22 @@ pub struct CrashMidAction {
 pub struct CheckDecision {
     pub command: String,
     pub approved: bool,
+}
+
+/// One expected provenance classification for a check (spec 102 Task 6).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct VerificationProvenance {
+    pub command: String,
+    pub provenance: String,
+}
+
+/// One expected durable baseline state for a check (spec 102 Task 6).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct VerificationBaseline {
+    pub command: String,
+    pub state: String,
 }
 
 #[derive(Deserialize)]
@@ -696,6 +735,7 @@ pub fn load(path: &Path) -> Result<Scenario> {
         },
         verify_after_apply: raw.verify_after_apply,
         check_decisions: raw.check_decisions,
+        decline_baseline: raw.decline_baseline,
         crash_mid_action: raw.crash_mid_action,
         turns,
         asserts: raw.asserts,

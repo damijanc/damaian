@@ -53,6 +53,13 @@ pub struct ProposedPatch {
     pub status: String,
     pub created_at_ms: u128,
     pub files: Vec<ProposedFilePatch>,
+    /// The engine's typed repair-scope review (spec 102 Task 5), or `None` for
+    /// an ordinary patch or a repair that stays inside its existing scope.
+    ///
+    /// Stored on the patch rather than rebuilt by a renderer so a live card, a
+    /// reattached card, a worker result and a reloaded session all show the
+    /// same one-shot expansion fact.
+    pub repair_scope: Option<crate::repair_scope::RepairScopeReview>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +240,7 @@ impl PatchEngine {
             status: "pending".to_string(),
             created_at_ms: now_millis(),
             files,
+            repair_scope: None,
         };
 
         self.audit_log.record(
