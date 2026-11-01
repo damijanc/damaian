@@ -118,14 +118,21 @@ pub fn mock_provider() -> ModelProviderConfig {
     }
 }
 
-/// The deterministic tier: a scripted `MockModelAdapter`, no credentials and no
-/// network.
 /// Apply a stored patch the way a headless harness must: spec 102's pre-apply
-/// baseline is a decision the harness has no user for, so it declines each
-/// offered baseline explicitly and retries the same apply. Declining a
-/// baseline never declines the patch, and the recorded `declined` state is
-/// what Task 3 reads as unknown provenance.
-fn apply_eval_patch(engine: &WorkspaceEngine, root: &Path, patch_id: &str) -> Result<()> {
+/// baseline is its own ordinary approval, and the harness has no user to ask.
+/// A baseline for a check the scenario already approves therefore runs, so the
+/// recorded baseline is what makes a later failure attributable to the patch;
+/// a check the scenario declines (or does not name) keeps the harness's
+/// headless default of declining the baseline. Declining a baseline never
+/// declines the patch, so the same apply is retried either way. Always
+/// declining here would record `declined` for every check, and spec 102 Task 3
+/// correctly reads that as unknown provenance, which starts no repair.
+fn apply_eval_patch(
+    engine: &WorkspaceEngine,
+    root: &Path,
+    patch_id: &str,
+    scenario: &Scenario,
+) -> Result<()> {
     let mut outcome = engine.edit_orchestrator.apply_stored_patch_with_baseline(
         root,
         patch_id,
@@ -138,7 +145,12 @@ fn apply_eval_patch(engine: &WorkspaceEngine, root: &Path, patch_id: &str) -> Re
         let decisions = batch
             .checks
             .iter()
-            .map(|check| (check.proposal_id.clone(), false))
+            .map(|check| {
+                (
+                    check.proposal_id.clone(),
+                    baseline_approved(scenario, &check.command),
+                )
+            })
             .collect::<Vec<_>>();
         engine.edit_orchestrator.resume_stored_patch_baseline(
             root,
@@ -162,6 +174,18 @@ fn apply_eval_patch(engine: &WorkspaceEngine, root: &Path, patch_id: &str) -> Re
     Ok(())
 }
 
+/// A headless harness has no user to answer a baseline card, so the scenario's
+/// own check decisions are the only approval it declares: a baseline for a
+/// check the scenario approves runs, and every other baseline stays declined.
+fn baseline_approved(scenario: &Scenario, command: &str) -> bool {
+    scenario
+        .check_decisions
+        .iter()
+        .any(|decision| decision.command == command && decision.approved)
+}
+
+/// The deterministic tier: a scripted `MockModelAdapter`, no credentials and no
+/// network.
 pub fn run(scenario: &Scenario) -> Result<Run> {
     if scenario.tier != Tier::Deterministic {
         return Err(ClientError::InvalidInput(format!(
@@ -1242,7 +1266,9 @@ fn drive(
         // is the same path the desktop app's apply route uses. No approved_paths
         // and no hunk selection means the whole proposal, which is what a user
         // clicking apply without touching the checkboxes does.
-        if let Err(error) = apply_eval_patch(engine, &materialized.root, &proposal.patch_id) {
+        if let Err(error) =
+            apply_eval_patch(engine, &materialized.root, &proposal.patch_id, scenario)
+        {
             apply_error = Some(format!("{error:?}"));
         }
     }
@@ -1263,7 +1289,7 @@ fn drive(
         && result.patch_proposal.is_some()
     {
         if let Some(patch) = result.patch_proposal.clone() {
-            apply_eval_patch(engine, &materialized.root, &patch.patch_id)?;
+            apply_eval_patch(engine, &materialized.root, &patch.patch_id, scenario)?;
         }
         let session_id = result.session.id.clone();
         let mut current = None;
@@ -1320,7 +1346,7 @@ fn drive(
                 continue;
             }
             if let Some(patch) = turn.patch_proposal.clone() {
-                apply_eval_patch(engine, &materialized.root, &patch.patch_id)?;
+                apply_eval_patch(engine, &materialized.root, &patch.patch_id, scenario)?;
                 continue;
             }
             verification = turn.verification_report.clone();
@@ -1823,4 +1849,45 @@ fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::baseline_approved;
+    use crate::scenario::{self, CheckDecision};
+
+    /// A declined baseline is `unknown_provenance` and starts no repair (spec
+    /// 102 Task 3), so the harness must approve the baselines whose checks the
+    /// scenario already approves. Declining every baseline, as the Task 2
+    /// harness did, silently disabled repair for `verified_repair` and
+    /// `repair_limit_exhausted`.
+    #[test]
+    fn a_baseline_follows_the_scenarios_own_check_decision() {
+        let path = scenario::scenarios_dir().join("verified_repair.toml");
+        let mut loaded = scenario::load(&path).expect("the scenario should load");
+
+        assert!(
+            baseline_approved(&loaded, "cargo test"),
+            "the scenario approves cargo test, so its baseline must run"
+        );
+        assert!(
+            !baseline_approved(&loaded, "cargo clippy"),
+            "a check the scenario does not name stays declined"
+        );
+
+        loaded.check_decisions = vec![CheckDecision {
+            command: "cargo test".to_string(),
+            approved: false,
+        }];
+        assert!(
+            !baseline_approved(&loaded, "cargo test"),
+            "declining the check declines its baseline too"
+        );
+
+        loaded.check_decisions.clear();
+        assert!(
+            !baseline_approved(&loaded, "cargo test"),
+            "the headless default stays declined when nothing is approved"
+        );
+    }
 }
