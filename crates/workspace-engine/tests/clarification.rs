@@ -16,12 +16,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    ANSWER_MAX_CHARS, AskUserInput, CancelToken, ChatTurnOptions, ChatTurnResult, Config,
-    ConfigOverlay, MAX_QUESTIONS_PER_TURN_CEILING, MockModelAdapter, ModelAdapter,
-    ModelProviderConfig, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, PendingApprovalRef,
-    PendingDecision, PendingQuestionRef, QUESTION_MAX_CHARS, RepositoryConfigReport,
-    RepositoryKeyClass, RoundBudgetDecision, SessionMode, SessionStore, Task, TaskStatus, ToolCall,
-    TurnProgress, TurnSink, WorkspaceEngine, validate_answer,
+    ANSWER_MAX_CHARS, AskUserInput, CancelToken, ChatTurnOptions, ChatTurnResult,
+    CompletionReasonCode, Config, ConfigOverlay, MAX_QUESTIONS_PER_TURN_CEILING, MockModelAdapter,
+    ModelAdapter, ModelProviderConfig, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN,
+    PendingApprovalRef, PendingDecision, PendingQuestionRef, QUESTION_MAX_CHARS,
+    RepositoryConfigReport, RepositoryKeyClass, RoundBudgetDecision, SessionMode, SessionStore,
+    Task, TaskStatus, ToolCall, TurnProgress, TurnSink, WorkspaceEngine, validate_answer,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1506,7 +1506,21 @@ fn a_command_or_plan_id_cannot_be_answered() {
         &mut MockModelAdapter::new("Approved."),
     )
     .expect("the plan is still resumable");
-    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    // Spec 101: approval only records the decision; it does not close the
+    // plan's open steps, so the answer that follows settles `incomplete`.
+    assert_eq!(resumed.task.status, TaskStatus::Incomplete);
+    let report = plan_engine
+        .session_store
+        .read_completion_report(&resumed.session.id, &resumed.task.id)
+        .expect("the completion report is readable")
+        .expect("the settlement carries its report");
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|reason| reason.code == CompletionReasonCode::OpenPlanSteps),
+        "{report:?}"
+    );
     fs::remove_dir_all(plan_repo).unwrap();
 }
 

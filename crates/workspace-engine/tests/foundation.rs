@@ -4935,11 +4935,25 @@ fn classifies_a_stalled_transfer_as_retryable() {
 
 /// Concatenated session journals for a test repo, so a test can assert on the
 /// task-status transitions the orchestrator recorded.
+///
+/// Only `*.jsonl` files are journals. The `sessions/locks/` sidecar directory
+/// sits beside them, and reading every entry as a file panics on it.
 fn read_session_journals(repo: &Path) -> String {
     let sessions = repo.join(".damaian").join("sessions");
     let mut combined = String::new();
     for entry in fs::read_dir(sessions).unwrap() {
-        combined.push_str(&fs::read_to_string(entry.unwrap().path()).unwrap());
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_file() {
+            continue;
+        }
+        if !entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            continue;
+        }
+        combined.push_str(&fs::read_to_string(entry.path()).unwrap());
     }
     combined
 }
