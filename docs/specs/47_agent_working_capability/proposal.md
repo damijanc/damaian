@@ -128,12 +128,12 @@ because those three cannot be built by an agent that lacks it.
 - Changing hunk selection at review time — that is
   [#04](../04_hunk_level_patch_apply.md), and it is unaffected.
 - Background or long-running processes as a feature (Phase 2 WP5), and
-  subagents ([#38](../38_subagent_model.md),
-  [#39](../39_coordination_and_conflict_handling.md)). Requirement 8 is
+  model-directed subagents. Requirement 8 is
   *within-round* dispatch of read-only calls the model already made in one
   response: no second agent, no second conversation, no second context, and
-  nothing that outlives the round. Multi-agent parallelism and its ownership
-  and conflict rules remain #38 and #39 entirely.
+  nothing that outlives the round. Specs #38–#40, which proposed multi-agent
+  parallelism and its ownership and evaluation rules, were retired and deleted
+  on 2026-11-01. Any future delegation design requires a new specification.
 
 ## 5. Design
 

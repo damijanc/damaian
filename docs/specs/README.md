@@ -55,8 +55,8 @@ its §1.
 actually built — a planner session that owns specs and verification, worker
 sessions that implement one task each, in parallel worktrees — and asking what
 Damaian needs to host that workflow itself. It is user-driven sessions, not
-#38's agent delegation, so it is not subject to #38's readiness gates; its
-`context.md` §2 records why.
+model-directed delegation; its `context.md` §2 records why. The superseded
+model-delegation specs #38–#40 were retired and deleted on 2026-11-01.
 
 #58 is a seventh exception, of the same kind as #41–#44: usability feedback on
 the desktop shell, with a clickable mockup agreed before the spec was written.
@@ -146,11 +146,13 @@ proves the sequence works as one system.
   [#105](105_structured_plan_checks.md) became dependency-ready when #101
   finished. All of them share the agent loop with #33 and must not be
   implemented concurrently with it or with each other.
-- **Blocked:** #37 on #33; #52 on #33; #39 on #38; #40 on #38 and #39; #54 on
-  Phase 1 WP3 (provider capability validation), which is unspecified. In the
+- **Blocked:** #37 on #33; #52 on #33; #54 on Phase 1 WP3 (provider capability
+  validation), which is unspecified. In the
   single-worker sequence, [#106](106_single_worker_spec_acceptance.md) remains
   blocked on #103–#105; #101 and #102 are built and no longer block anything.
-- **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
+- **Retired:** specification numbers #38–#40 were deleted on 2026-11-01. Their
+  in-process, model-directed multi-agent design was superseded by user-started
+  worktree workers and is no longer planned.
 - **Pairing:** two specs may run together only if at most one of them edits
   `chat.rs`, and #49's reuse slice is a solo `chat.rs` track while it rewrites
   the request around `build_model_prompt`. #33 edits `chat.rs` through the MCP
@@ -174,9 +176,9 @@ Re-derived on 2026-09-25, when [#20](20_working_modes/proposal.md) was
 finished. **Five specs now have every dependency built:**
 [#22](22_findings_model_and_panel/proposal.md), [#31](31_permission_profiles/proposal.md),
 [#50](50_model_initiated_clarification/proposal.md) — all three unblocked by #20 —
-plus [#56](56_provider_fallback_consent/proposal.md) and [#38](38_subagent_model.md)
-(which depends on nothing here, but is explicitly speculative — its own §1
-allows abandoning it). #20 also cleared one of the dependencies of
+plus [#56](56_provider_fallback_consent/proposal.md) and the former #38
+(which depended on nothing here, but was explicitly speculative and allowed
+abandonment). #20 also cleared one of the dependencies of
 [#33](33_mcp_management_and_deferred_discovery.md) and
 [#51](51_external_reference_retrieval/proposal.md), but both still wait on #26, and #33
 waits on #31 as well.
@@ -275,7 +277,7 @@ specs inherit:
   and `RepositoryMap::root_for_path` is the function #26's planned
   `ContextItem.root_path` should call.
 
-Re-checked on 2026-10-09, when [#38](38_subagent_model.md) was deferred
+Re-checked on 2026-10-09, when the former #38 was deferred
 rather than planned. It leaves the ready set, which is now #23, #25, #32, #50,
 #56 and #57. Nothing is promoted or demoted, because #38's only dependents,
 #39 and #40, were already blocked on it. Its stage 2 is superseded by #57's
@@ -438,7 +440,7 @@ set was then #30, #33 and #36; #51's completion is recorded below.
 | 3 | #28, #33, #51 | The fan-out #26 unblocked. **#27 is Done (2026-10-26)** and promoted #28; **#51 is Done (2026-10-28; CI green 2026-10-29)**. #28 and #29 are Done; #33 remains and is ready now that #30, which shared `chat.rs` with it, is Done |
 | 4 | #29 → #30 | Memory, strictly serial behind #27. **#29 is Done (2026-10-26)** and promoted #30; **#30 is Done (2026-10-30)**, CI green (Quality run 41063831118) |
 | 5 | #36 (**Done 2026-10-28**, CI green 2026-10-29)/#37; #33 → #52 | Delivery and extensibility clusters. #35 is Done (2026-10-26) and promoted #36, which finished on 2026-10-28. #37 is still blocked on #33, not on #36 |
-| 6 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not". #38 is deferred; #57 is done, so its stage 1 is due for re-evaluation |
+| 6 | Retired | Specs #38–#40 were deleted on 2026-11-01. User-started worktree workers supersede the proposed in-process, model-directed multi-agent path |
 
 #54 stays off this table until Phase 1 WP3's provider capability validation is
 specified; #66 was built ahead of it and is Done 2026-10-25, with the full gate green in CI.
@@ -852,9 +854,6 @@ is ready.
 | 35 | [35_commit_preparation/](35_commit_preparation/proposal.md) | **Done 2026-10-26** (planned 2026-10-26; Tasks 1–9; seven-check gate green in CI, Quality run 40323902715). Roadmap Phase 5 WP1. Damaian's first write to a user's Git repository. Builds the commit through a private index so the user's staging is never touched, runs the repository's real `pre-commit`/`prepare-commit-msg`/`commit-msg`/`post-commit` hooks with the private index in their environment and no `--no-verify`, and closes the trap: `GitService::diff` redacts, so the commit scans the composed bytes, reports categories and counts only, requires a separate per-commit override, and proves each selected path's blob id against the prepared record. The candidate set is the session's uncommitted accepted changes, with hand-edited and command-changed files shown and unselected. Committing is a Code-mode capability (`allow_git_commits`) a profile or a repository may deny, takes its own typed approval, and is bracketed by #17's side-effecting markers with an Inspect view that compares HEAD with the prepared commit. `suggest_commit_message` remains the fallback; the shell may draft with the redacted diff. |
 | 36 | [36_branch_and_worktree_delivery/proposal.md](36_branch_and_worktree_delivery/proposal.md) | **Done 2026-10-28** (planned 2026-10-28; Tasks 1–8 plus the review-fix row after the first Done, before merge, in its [`tasks.md`](36_branch_and_worktree_delivery/tasks.md)). The full seven-check gate passed in CI on 2026-10-29 (Quality run 40902516310); scoped checks passed locally. Roadmap Phase 5 WP2. Branch suggestion, creation, ahead/behind, merge-base, and conflict prediction via `merge-tree --write-tree` so preparation provably cannot execute. Create, switch and delete are separate typed one-shot approvals behind `allow_git_branches` in Code mode; switching carries `--no-overwrite-ignore`; an unmerged delete needs a distinct confirmation naming the count and subjects, including when Git's own `-d` reference disagrees with the default-branch count; merge and rebase are reports only, with no execution route. Written to work with no worktree support, since its stated dependency (Phase 2 WP4) is Should-tier and unspecified; spec 57's worker worktrees and spec 60's listing mean §5.7 stays reporting-only rather than building worktree support. |
 | 37 | [37_pull_request_creation.md](37_pull_request_creation.md) | **Not started.** Roadmap Phase 5 WP4. Push and publication as two typed approvals that cannot substitute for each other, base branch asked for rather than inferred, force push refused rather than gated, and interrupted PR creation resolved by a duplicate search before any retry. Uses MCP rather than a bespoke client. |
-| 38 | [38_subagent_model.md](38_subagent_model.md) | **Not started; deferred 2026-10-09.** Stage 2 (editing subagents) is superseded by #57's worktree workers; stage 1 is re-evaluated once #57 and its result-summary follow-up have shipped, and may then be recorded as abandoned. Its §Deferral says why. Roadmap Phase 6 WP1, and gated on that phase's eight readiness gates being measured first. Subagents as in-process tasks whose capability can only be derived by narrowing a parent's, staged read-only-first. Corrects the roadmap's process-based framing and the flat `CancelToken`. |
-| 39 | [39_coordination_and_conflict_handling.md](39_coordination_and_conflict_handling.md) | **Not started.** Roadmap Phase 6 WP2. Exclusive file-ownership claims checked at spawn *and* before every write, serialized patch integration with `base_hash` revalidation between applies, and a combined-check rerun that catches two individually-passing patches failing together. |
-| 40 | [40_autonomy_evaluations.md](40_autonomy_evaluations.md) | **Not started.** Roadmap Phase 6 WP7. The decision instrument: same scenarios run in both execution modes, cost amplification as a ratio, and an experimental label *derived* from the recorded comparison rather than chosen. Makes abandoning Phase 6 a first-class recorded outcome. |
 | 41 | [41_ui_density_and_action_hierarchy/](41_ui_density_and_action_hierarchy/proposal.md) | **Done.** Collapsed command approval 161px → 104px, patch actions from half the conversation column to their natural width. Usability-driven, not a roadmap graduation: the shell has exactly one button style, so a one-shot `Approve Run` and a persistent `Allow Always` are visually identical, and a stray `min-height: 180px` on base `pre` makes every command approval reserve 180px of empty rationale pane. Introduces the button scale in [`../UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md) and applies it to the approval and patch cards. Presentation only — the approval policy from #10, #12 and #34 is untouched. Also builds `docs/ui-style-guide.html`, a specimen page that loads the shipping stylesheet so the guide has a rendered counterpart that cannot drift. First of three UI specs; the conversation column and the remaining chrome follow. |
 | 42 | [42_conversation_column_density/](42_conversation_column_density/proposal.md) | **Done.** Chat log 459 → 606px at 1280×800; chrome down from 43% to 24% of the column. Second of the three UI specs from the same usability review as #41. 43% of the conversation column measured as chrome at 1280×800: the docked context strip folds into the turn that read the files, the thread header trades a hardcoded caption for the active folder and session, role labels move to screen-reader-only, and the composer grows from two rows instead of reserving four. Depends on #41's button scale and disclosure pattern, which it promotes to a shared class. |
 | 43 | [43_chrome_density_and_hierarchy/](43_chrome_density_and_hierarchy/proposal.md) | **Done.** Third of the UI specs. Applies the scale to the surfaces #41 and #42 did not reach: settings action buttons 456 → 129px with one primary per group and `.btn-danger` on the destructive ones, every font-size brought onto a type scale that now documents its heading steps, and the terminal tab bar slimmed with the working directory folded into it (body 142 → 183px). Supersedes #41 §3.1 on `.inline-actions`. |

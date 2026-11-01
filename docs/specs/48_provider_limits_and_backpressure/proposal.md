@@ -73,9 +73,8 @@ section says what each one has to become.
   This spec reacts to the limit; it does not try to stay under it.
 - **A queue of pending turns.** One session, one turn. Backpressure delays a
   call; it does not build a scheduler.
-  [Spec 39](../39_coordination_and_conflict_handling.md)
-  explicitly rules a general work queue out and this spec does not reintroduce
-  one.
+  The retired coordination design also ruled a general work queue out; this
+  spec does not reintroduce one.
 - **Automatic model downgrade.** Requirement 7 is a consented switch. Silently
   answering with a weaker model because the strong one was busy changes the
   result of the user's task without telling them, and model routing as a

@@ -136,7 +136,8 @@ truthful". **Context:** §1, §2.
 
 **Files:** `docs/specs/35_commit_preparation/`, `docs/specs/README.md`,
 `docs/specs/36_branch_and_worktree_delivery/proposal.md`,
-`docs/specs/37_pull_request_creation.md`, `docs/specs/38_subagent_model.md`,
+`docs/specs/37_pull_request_creation.md`, former spec #38 (retired and deleted
+2026-11-01),
 `docs/specs/52_mcp_server_mode.md`,
 `docs/specs/57_worker_sessions/proposal.md`,
 `docs/specs/58_header_repo_bar_and_menus/proposal.md`.

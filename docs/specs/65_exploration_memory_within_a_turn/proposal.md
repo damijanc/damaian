@@ -255,8 +255,9 @@ corrections are recorded in [`tasks.md`](tasks.md).
   one session's task, not facts about the project, and they end with the
   session.
 - **Delegated exploration** (a sub-agent that explores and returns only a
-  conclusion). That would also keep the main request small, but #38 is deferred
-  and its premise is unmeasured. This spec should be measured first (§6).
+  conclusion). That would also keep the main request small, but the former
+  delegation specs #38–#40 were retired and deleted on 2026-11-01. Any future
+  delegation design requires a new specification.
 - **Telling the model how to explore.** Beyond describing the tool, the cut
   and what is about to leave the window, the system prompt does not prescribe
   a method.

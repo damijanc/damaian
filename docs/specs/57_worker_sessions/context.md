@@ -27,24 +27,24 @@ smallest possible spawn. Planner-drafted handoffs, loop detection, and letting a
 planner read a worker's result are deliberately later specs (§7 of the
 proposal).
 
-## 2. Why this is not spec 38
+## 2. Why this is not model-directed delegation
 
-[#38](../38_subagent_model.md) is delegation *by the agent*: a parent turn hands
-part of itself to a child that runs inside the parent's task, under the parent's
-capability, and returns a result the parent is accountable for. Its readiness
-gates exist because that is a second execution path.
+The retired spec #38 described delegation *by the agent*: a parent turn handed
+part of itself to a child that ran inside the parent's task, under the parent's
+capability, and returned a result the parent was accountable for. Its readiness
+gates existed because that was a second execution path. Specs #38–#40 were
+deleted on 2026-11-01 after worktree workers and durable worker return made that
+in-process design obsolete.
 
 A worker session is none of that. The **user** starts it, it is an ordinary
 session with its own approvals, mode, audit trail and session log, and nothing
 flows from a worker back to the planner — the repository is the only channel,
 exactly as `AGENTS.md` already requires between task sessions. The planner is
 only where the user happened to be standing when they started it. So #38's
-readiness gates do not apply. This spec does not depend on #38. It did,
-however, change #38's case: on 2026-10-09 #38 was deferred until this spec
-has shipped, with its stage 2 superseded by these worktree workers. #38's
-Deferral section says why.
+readiness gates did not apply. This spec never depended on #38; instead, its
+worktree-worker architecture superseded the editing stage that #38 proposed.
 
-What this spec does inherit from #38 is the one rule that matters: **a worker is
+The worker design keeps the one rule that mattered independently: **a worker is
 a different host for the same turn, never a different turn.** §5.2 of the
 proposal makes that a tested requirement.
 

@@ -7,7 +7,8 @@ from describing how this repository is actually built — a planner session that
 owns specs and verification, and task sessions that implement — and asking what
 Damaian needs to host that workflow itself. Settled in a brainstorming session
 on 2026-10-03. It is user-driven and is **not** #38's agent delegation, so #38's
-readiness gates do not apply; [`context.md`](context.md) §2 says why.
+readiness gates did not apply; [`context.md`](context.md) §2 says why. The
+superseded #38–#40 model-delegation specs were retired on 2026-11-01.
 Depends on: [#17](../17_durable_task_state_and_crash_recovery/proposal.md) (task
 state, pending-approval snapshots, recovery) — built;
 [#46](../46_process_registry_and_orphan_sweep/proposal.md) (process registry and
@@ -20,8 +21,7 @@ Related implementation specs:
 (round budget), [`36_branch_and_worktree_delivery/proposal.md`](../36_branch_and_worktree_delivery/proposal.md)
 (git-mutation approval and dirty-worktree removal, which this follows for the
 one mutation it performs), [`34_repository_config_trust_boundary.md`](../34_repository_config_trust_boundary.md)
-(`.damaian/` is repository-controlled), [`38_subagent_model.md`](../38_subagent_model.md)
-(the "no second execution path" rule this inherits),
+(`.damaian/` is repository-controlled),
 [`45_crash_recovery_prompt.md`](../45_crash_recovery_prompt.md). See also
 [`SECURITY.md`](../../../SECURITY.md), [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md).
 
