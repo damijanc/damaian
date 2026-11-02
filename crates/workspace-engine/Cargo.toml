@@ -15,7 +15,7 @@ candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
 libc = "0.2.186"
 notify = "8.2.0"
-pulldown-cmark = "0.13.4"
+pulldown-cmark = "0.13.6"
 # Already in the tree through `tokenizers`; promoting it to a direct dependency
 # adds no download and no new license. Linear-time by construction, so a pattern
 # written by a model cannot hang `search_content`.
