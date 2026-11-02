@@ -1427,7 +1427,10 @@ fn expected(status: &TaskStatus, shape: CrashShape) -> Expected {
         | TaskStatus::Failed
         | TaskStatus::Cancelled
         | TaskStatus::ToolBudgetExhausted
-        | TaskStatus::TokenBudgetExhausted => Expected::NotRecovered,
+        | TaskStatus::TokenBudgetExhausted
+        | TaskStatus::TaskBudgetExhausted
+        | TaskStatus::TaskCompactionCannotFit
+        | TaskStatus::TaskNoProgress => Expected::NotRecovered,
 
         // §5.4 rule 3: a task awaiting a human was not interrupted mid-action.
         // Its proposal is reattached (§5.5) instead.
@@ -1522,9 +1525,10 @@ fn every_state_and_crash_shape_recovers_the_way_the_matrix_says() {
     // Sixteen states by three crash shapes. If this number moves, a state or
     // a shape was added or removed — check the matrix is still complete before
     // updating it. It moved from 39 when spec 21 added `TokenBudgetExhausted`,
-    // from 42 when spec 57 added `Paused`, and from 45 when spec 101 added
-    // `Incomplete`.
-    assert_eq!(cells, 48, "the matrix must not shrink");
+    // from 42 when spec 57 added `Paused`, from 45 when spec 101 added
+    // `Incomplete`, and from 48 when spec 103 Task 6 added the three bounded
+    // task stops.
+    assert_eq!(cells, 57, "the matrix must not shrink");
 }
 
 /// The row `TaskStatus::all()` cannot reach: a status written by a *later*

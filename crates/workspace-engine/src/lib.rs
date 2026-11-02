@@ -57,6 +57,7 @@ pub mod steering;
 pub mod symbol_index;
 pub mod task_budget;
 pub mod task_control;
+pub mod task_outcomes;
 pub mod task_segments;
 pub mod tree_walk;
 pub mod validation;
@@ -261,8 +262,8 @@ pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
     ActionMarker, ChatMessage, ConsumedWorkerReturn, ContextPin, ContinuedTask, DanglingAction,
     ExportFormat, PatchFileDecision, PendingApprovalRef, PlanApproval, SearchOptions, Session,
-    SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskStatus, TaskUsage, TurnNotes,
-    WorkerRecord, WorkerReturn, validate_plan_approval,
+    SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskStatus, TaskTerminalSettlement,
+    TaskUsage, TurnNotes, WorkerRecord, WorkerReturn, validate_plan_approval,
 };
 pub use stagnation::{
     RepairStall, RepairStallReason, detect_repair_stall, proposed_patch_digest, repair_state_entry,
@@ -284,7 +285,13 @@ pub use task_control::{
     TaskAction, TaskActionInput, TaskActionTransport, TaskCommand, TaskComposer, TaskControl,
     TaskControlService, TaskOutcomeKind, TurnIndicatorState, TurnPresentation, TurnStopNotice,
     WORKER_STALE_PROGRESS_AFTER_MS, WorkerBoardGroup, WorkerDot, WorkerProcessState,
-    WorkerTaskFacts, continuation_prompt, returned_task_control, turn_presentation,
+    WorkerTaskFacts, continuation_prompt, returned_task_control,
+    returned_task_control_with_outcome, turn_presentation, turn_presentation_with_outcome,
+};
+pub use task_outcomes::{
+    TASK_TERMINAL_OUTCOME_FORMAT_VERSION, TaskCompactionFacts, TaskOutcomeFigures,
+    TaskSegmentSnapshot, TaskTerminalOutcome, TaskTerminalOutcomeKind, approved_action_round_cap,
+    approved_exploration_round_cap, dimension_label,
 };
 pub use task_segments::{
     SegmentContinuationDecision, SegmentContinuationInput, SegmentDeclineReason,

@@ -742,7 +742,19 @@ fn a_request_that_cannot_fit_sends_nothing() {
         "This prompt is much larger than one token.",
         &mut adapter,
     );
-    assert!(result.is_err(), "the turn must fail closed");
+    let result = result.expect("a cannot-fit request is a typed terminal outcome");
+    assert_eq!(
+        result.task.status,
+        workspace_engine::TaskStatus::TaskCompactionCannotFit
+    );
+    assert_eq!(
+        result
+            .task_control
+            .terminal_outcome
+            .as_ref()
+            .map(|outcome| outcome.kind),
+        Some(workspace_engine::TaskTerminalOutcomeKind::CompactionCannotFit)
+    );
     assert!(
         adapter.requests.is_empty(),
         "no partially reduced request may reach the model"

@@ -596,12 +596,29 @@ fn repeating_the_same_typed_calls_is_not_progress() {
     calls.push(Vec::new());
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(responses, calls);
     let result = decide_with(&engine, &proposal_id, &approved, &mut adapter)
-        .expect("the turn should pause when progress repeats");
+        .expect("the turn should settle the no-progress outcome");
 
-    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+    assert_eq!(result.task.status, TaskStatus::TaskNoProgress);
     assert!(
-        result.round_budget_proposal.is_some(),
-        "no advance keeps the existing stop/pause"
+        result.round_budget_proposal.is_none(),
+        "a bounded stop must not become a generic round pause"
+    );
+    let outcome = result
+        .task_control
+        .terminal_outcome
+        .as_ref()
+        .expect("the no-progress outcome is typed");
+    assert_eq!(
+        outcome.kind,
+        workspace_engine::TaskTerminalOutcomeKind::NoProgress
+    );
+    assert_eq!(
+        result
+            .turn_presentation
+            .terminal_outcome
+            .as_ref()
+            .map(|outcome| outcome.kind),
+        Some(workspace_engine::TaskTerminalOutcomeKind::NoProgress)
     );
     let events = segment_events(&engine, &session.id);
     let declined = audit_events(&engine)
@@ -637,13 +654,23 @@ fn a_smaller_budget_caps_the_allowance_before_the_ordinary_segment() {
     let (proposal_id, session, approved) = plan_review(&engine, &repo, ChatTurnOptions::default());
     let mut adapter = read_sequence(&repo, 6);
     let result = decide_with(&engine, &proposal_id, &approved, &mut adapter)
-        .expect("the turn should pause at the approved total, not the ordinary segment");
+        .expect("the turn should settle at the approved total, not the ordinary segment");
 
-    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
-    let proposal = result
-        .round_budget_proposal
-        .expect("exhausting the approved total keeps the existing pause");
-    assert_eq!(proposal.rounds_used, 1);
+    assert_eq!(result.task.status, TaskStatus::TaskBudgetExhausted);
+    assert!(result.round_budget_proposal.is_none());
+    let outcome = result
+        .task_control
+        .terminal_outcome
+        .as_ref()
+        .expect("the exhausted budget is a typed outcome");
+    assert_eq!(
+        outcome.kind,
+        workspace_engine::TaskTerminalOutcomeKind::ApprovedBudgetExhausted
+    );
+    assert!(
+        outcome.dimension.is_some(),
+        "the exact limiting dimension must be named"
+    );
     let events = segment_events(&engine, &session.id);
     assert_eq!(
         events
@@ -905,7 +932,7 @@ fn a_cannot_fit_boundary_sends_no_request_and_starts_no_segment() {
             steering.queue_note("x".repeat(200_000));
         }
     };
-    let error = decide_with_steering(
+    let result = decide_with_steering(
         &engine,
         &proposal_id,
         &approved,
@@ -913,11 +940,22 @@ fn a_cannot_fit_boundary_sends_no_request_and_starts_no_segment() {
         &steering,
         &mut on_progress,
     )
-    .expect_err("the boundary request cannot fit a pinned note");
-    assert!(
-        matches!(error, ClientError::RequestPreparation(_)),
-        "{error}"
+    .expect("a cannot-fit boundary is a typed terminal outcome");
+    assert_eq!(result.task.status, TaskStatus::TaskCompactionCannotFit);
+    assert!(result.round_budget_proposal.is_none());
+    let outcome = result
+        .task_control
+        .terminal_outcome
+        .as_ref()
+        .expect("the cannot-fit outcome is typed");
+    assert_eq!(
+        outcome.kind,
+        workspace_engine::TaskTerminalOutcomeKind::CompactionCannotFit
     );
+    let compaction = outcome
+        .compaction
+        .expect("the refusal carries the content-safe request facts");
+    assert!(compaction.threshold_tokens > 0);
 
     let events = segment_events(&engine, &session.id);
     assert_eq!(
@@ -1019,7 +1057,20 @@ fn a_boundary_request_that_would_overspend_input_tokens_sends_nothing_and_starts
     )
     .expect("the budget stop is a turn outcome, not a preparation error");
 
-    assert_eq!(result.task.status, TaskStatus::TokenBudgetExhausted);
+    assert_eq!(result.task.status, TaskStatus::TaskBudgetExhausted);
+    let outcome = result
+        .task_control
+        .terminal_outcome
+        .as_ref()
+        .expect("the overspent input total is a typed outcome");
+    assert_eq!(
+        outcome.kind,
+        workspace_engine::TaskTerminalOutcomeKind::ApprovedBudgetExhausted
+    );
+    assert_eq!(
+        outcome.dimension,
+        Some(workspace_engine::TaskBudgetDimension::InputTokens)
+    );
     assert_eq!(
         adapter.requests.len(),
         2,
@@ -1067,7 +1118,16 @@ fn the_first_post_approval_request_is_stopped_when_planning_already_spent_the_in
     let result = decide_with(&engine, &proposal_id, &approved, &mut adapter)
         .expect("the exhausted budget stops before the call");
 
-    assert_eq!(result.task.status, TaskStatus::TokenBudgetExhausted);
+    assert_eq!(result.task.status, TaskStatus::TaskBudgetExhausted);
+    let outcome = result
+        .task_control
+        .terminal_outcome
+        .as_ref()
+        .expect("the spent input total is a typed outcome");
+    assert_eq!(
+        outcome.dimension,
+        Some(workspace_engine::TaskBudgetDimension::InputTokens)
+    );
     assert!(
         adapter.requests.is_empty(),
         "planning spend cannot authorise another model call"

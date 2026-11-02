@@ -603,7 +603,13 @@ fn terminal_states_are_exactly_these() {
             // Spec 21 §5.4. Beside the round budget rather than folded into
             // it: one means the work needed more rounds, the other that it
             // needed more money, and the remedies differ.
-            "token_budget_exhausted"
+            "token_budget_exhausted",
+            // Spec 103 Task 6. Distinct non-success stops at the approved
+            // task bound: one names which dimension ran out, one the request
+            // that could not fit, one repeated progress.
+            "task_budget_exhausted",
+            "task_compaction_cannot_fit",
+            "task_no_progress"
         ]
     );
 }

@@ -40,6 +40,11 @@ pub enum TaskOutcomeKind {
     Interrupted,
     UnknownOutcome,
     BudgetExhausted,
+    /// The next request could not fit the configured window share (spec 103
+    /// Task 6).
+    CannotFit,
+    /// The engine-owned segment progress state repeated (spec 103 Task 6).
+    NoProgress,
     Ended,
 }
 
@@ -57,6 +62,8 @@ impl TaskOutcomeKind {
             Self::Interrupted => "interrupted",
             Self::UnknownOutcome => "unknown_outcome",
             Self::BudgetExhausted => "budget_exhausted",
+            Self::CannotFit => "cannot_fit",
+            Self::NoProgress => "no_progress",
             Self::Ended => "ended",
         }
     }
@@ -266,6 +273,10 @@ pub struct TurnPresentation {
     pub show_task_control: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_notice: Option<TurnStopNotice>,
+    /// The typed terminal outcome for a bounded stop (spec 103 Task 6), so a
+    /// live turn and a reload carry the same engine-owned facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_outcome: Option<crate::task_outcomes::TaskTerminalOutcome>,
 }
 
 /// One engine-labelled row under a stopped turn.
@@ -363,11 +374,26 @@ pub struct TaskControl {
     /// Worker lifecycle controls (pause, resume, stop, restart).
     pub actions: Vec<TaskAction>,
     pub composer: Option<TaskComposer>,
+    /// The typed terminal outcome when this task stopped at an approved-task
+    /// bound (spec 103 Task 6). Carried for desktop/worker/return transports;
+    /// no surface reconstructs it from `status` or a label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_outcome: Option<crate::task_outcomes::TaskTerminalOutcome>,
 }
 
 impl TaskControl {
     /// An ordinary session's view of its newest task.
     pub fn for_session(task: Option<&Task>, report: Option<&CompletionGateReport>) -> Self {
+        Self::for_session_with_outcome(task, report, None)
+    }
+
+    /// An ordinary session's view with the typed terminal outcome, when the
+    /// task stopped at an approved-task bound (spec 103 Task 6).
+    pub fn for_session_with_outcome(
+        task: Option<&Task>,
+        report: Option<&CompletionGateReport>,
+        outcome: Option<&crate::task_outcomes::TaskTerminalOutcome>,
+    ) -> Self {
         let Some(task) = task else {
             return Self::empty();
         };
@@ -379,6 +405,34 @@ impl TaskControl {
             .unwrap_or_default();
         let status = task.status.as_str().to_string();
         match &task.status {
+            TaskStatus::TaskBudgetExhausted
+            | TaskStatus::TaskCompactionCannotFit
+            | TaskStatus::TaskNoProgress => {
+                let (outcome_kind, headline, detail) =
+                    bounded_stop_presentation(&task.status, outcome);
+                Self::terminal(
+                    task,
+                    status,
+                    outcome_kind,
+                    WorkerDot::Failed,
+                    &headline,
+                    detail,
+                    reasons,
+                    waivers,
+                    outcome.cloned(),
+                )
+            }
+            TaskStatus::Failed if outcome.is_some_and(usage_unavailable) => Self::terminal(
+                task,
+                status,
+                TaskOutcomeKind::Failed,
+                WorkerDot::Failed,
+                &outcome.expect("checked above").label(),
+                outcome.expect("checked above").explanation(),
+                reasons,
+                waivers,
+                outcome.cloned(),
+            ),
             TaskStatus::Incomplete => Self {
                 task_id: Some(task.id.clone()),
                 status: Some(status),
@@ -409,6 +463,7 @@ impl TaskControl {
                 board_action: None,
                 actions: Vec::new(),
                 composer: None,
+                terminal_outcome: outcome.cloned(),
             },
             TaskStatus::Complete => Self::terminal(
                 task,
@@ -419,6 +474,7 @@ impl TaskControl {
                 "The task finished its work.".to_string(),
                 reasons,
                 waivers,
+                None,
             ),
             TaskStatus::Cancelled => Self::terminal(
                 task,
@@ -429,6 +485,7 @@ impl TaskControl {
                 "The task stopped before completion.".to_string(),
                 reasons,
                 waivers,
+                None,
             ),
             TaskStatus::Failed => Self::terminal(
                 task,
@@ -439,6 +496,7 @@ impl TaskControl {
                 "The task did not complete.".to_string(),
                 reasons,
                 waivers,
+                None,
             ),
             TaskStatus::ToolBudgetExhausted | TaskStatus::TokenBudgetExhausted => Self::terminal(
                 task,
@@ -449,6 +507,7 @@ impl TaskControl {
                 "The task reached its budget before completion.".to_string(),
                 reasons,
                 waivers,
+                None,
             ),
             TaskStatus::Interrupted => Self::terminal(
                 task,
@@ -459,6 +518,7 @@ impl TaskControl {
                 "The task stopped before it completed.".to_string(),
                 reasons,
                 waivers,
+                None,
             ),
             TaskStatus::UnknownExternalOutcome => Self::terminal(
                 task,
@@ -470,6 +530,7 @@ impl TaskControl {
                     .to_string(),
                 reasons,
                 waivers,
+                None,
             ),
             _ => Self {
                 task_id: Some(task.id.clone()),
@@ -489,17 +550,48 @@ impl TaskControl {
                 board_action: None,
                 actions: Vec::new(),
                 composer: None,
+                terminal_outcome: outcome.cloned(),
             },
         }
     }
 
     /// A worker's view of the same durable verdict plus its lifecycle.
     pub fn for_worker(facts: WorkerTaskFacts<'_>) -> Self {
+        Self::for_worker_with_outcome(facts, None)
+    }
+
+    /// A worker's view with the typed terminal outcome when the task stopped at
+    /// an approved-task bound (spec 103 Task 6).
+    pub fn for_worker_with_outcome(
+        facts: WorkerTaskFacts<'_>,
+        outcome: Option<&crate::task_outcomes::TaskTerminalOutcome>,
+    ) -> Self {
         let task = facts.task;
         let reported_task_status = facts.reported_task_status.clone();
         let effective_status = task
             .map(|task| &task.status)
             .or(reported_task_status.as_ref());
+        // Spec 103 Task 6: a bounded stop keeps the same engine-owned control
+        // whether the worker is still alive, idle after the turn, or restarted.
+        // It never becomes a generic Continue/Send message against the same
+        // approved bound; only the ordinary Open lifecycle action remains.
+        if let Some(status) = effective_status
+            && (matches!(
+                status,
+                TaskStatus::TaskBudgetExhausted
+                    | TaskStatus::TaskCompactionCannotFit
+                    | TaskStatus::TaskNoProgress
+            ) || (matches!(status, TaskStatus::Failed)
+                && outcome.is_some_and(usage_unavailable)))
+        {
+            return Self::bounded_worker(
+                task.map(|task| task.id.as_str()),
+                status.as_str(),
+                status,
+                outcome,
+                facts.report,
+            );
+        }
         // The engine decides "needs a decision" from the typed process state and
         // the durable or reported status. The shell only transports those facts.
         let waiting_for_decision = facts.state == WorkerProcessState::WaitingForApproval
@@ -592,6 +684,7 @@ impl TaskControl {
                 board_action: Some(open_action()),
                 actions: vec![primary],
                 composer: None,
+                terminal_outcome: None,
             };
         }
 
@@ -630,6 +723,7 @@ impl TaskControl {
                     placeholder: "Steer the worker: a note reaches it before its next round"
                         .to_string(),
                 }),
+                terminal_outcome: outcome.cloned(),
             };
         }
 
@@ -664,6 +758,7 @@ impl TaskControl {
                     ),
                     placeholder: "Add a note: the worker reads it as it resumes".to_string(),
                 }),
+                terminal_outcome: outcome.cloned(),
             };
         }
 
@@ -686,6 +781,7 @@ impl TaskControl {
                 board_action: Some(review_action()),
                 actions: Vec::new(),
                 composer: None,
+                terminal_outcome: outcome.cloned(),
             };
         }
 
@@ -708,6 +804,7 @@ impl TaskControl {
                 board_action: Some(open_action()),
                 actions: Vec::new(),
                 composer: None,
+                terminal_outcome: outcome.cloned(),
             };
         }
 
@@ -730,6 +827,7 @@ impl TaskControl {
                 board_action: Some(open_action()),
                 actions: Vec::new(),
                 composer: Some(composer_for(continue_message_action())),
+                terminal_outcome: outcome.cloned(),
             };
         }
 
@@ -765,6 +863,7 @@ impl TaskControl {
                 board_action: Some(open_action()),
                 actions: Vec::new(),
                 composer: Some(composer_for(continue_message_action())),
+                terminal_outcome: outcome.cloned(),
             };
         }
 
@@ -795,6 +894,7 @@ impl TaskControl {
                 ),
                 placeholder: "Message the worker".to_string(),
             }),
+            terminal_outcome: outcome.cloned(),
         }
     }
 
@@ -896,6 +996,7 @@ impl TaskControl {
             board_action: Some(open_action()),
             actions: Vec::new(),
             composer: Some(composer_for(action)),
+            terminal_outcome: None,
         })
     }
 
@@ -909,6 +1010,7 @@ impl TaskControl {
         detail: String,
         reasons: Vec<CompletionReason>,
         waivers: Vec<CompletionWaiver>,
+        terminal_outcome: Option<crate::task_outcomes::TaskTerminalOutcome>,
     ) -> Self {
         Self {
             task_id: Some(task.id.clone()),
@@ -928,6 +1030,7 @@ impl TaskControl {
             board_action: None,
             actions: Vec::new(),
             composer: None,
+            terminal_outcome,
         }
     }
 
@@ -950,6 +1053,7 @@ impl TaskControl {
             board_action: None,
             actions: Vec::new(),
             composer: None,
+            terminal_outcome: None,
         }
     }
 
@@ -971,6 +1075,17 @@ pub fn returned_task_control(
     task_status: &str,
     report: Option<&CompletionGateReport>,
 ) -> TaskControl {
+    returned_task_control_with_outcome(task_status, report, None)
+}
+
+/// [`returned_task_control`] with the typed terminal outcome a bounded task
+/// stopped with (spec 103 Task 6). Historical returns have no outcome and keep
+/// the pre-existing control shape.
+pub fn returned_task_control_with_outcome(
+    task_status: &str,
+    report: Option<&CompletionGateReport>,
+    outcome: Option<&crate::task_outcomes::TaskTerminalOutcome>,
+) -> TaskControl {
     let Some(status) = TaskStatus::parse(task_status) else {
         return TaskControl {
             task_id: None,
@@ -990,6 +1105,7 @@ pub fn returned_task_control(
             board_action: None,
             actions: Vec::new(),
             composer: None,
+            terminal_outcome: outcome.cloned(),
         };
     };
     let task = Task {
@@ -1002,7 +1118,7 @@ pub fn returned_task_control(
         created_at_ms: 0,
         completed_at_ms: None,
     };
-    let mut control = TaskControl::for_session(Some(&task), report);
+    let mut control = TaskControl::for_session_with_outcome(Some(&task), report, outcome);
     control.task_id = None;
     control.primary_action = None;
     control
@@ -1065,6 +1181,19 @@ pub fn turn_presentation(
     cancelled: bool,
     task_id: Option<&str>,
 ) -> TurnPresentation {
+    turn_presentation_with_outcome(status, model_incomplete, cancelled, task_id, None)
+}
+
+/// [`turn_presentation`] with the typed terminal outcome a bounded task stopped
+/// with (spec 103 Task 6).
+pub fn turn_presentation_with_outcome(
+    status: &TaskStatus,
+    model_incomplete: bool,
+    cancelled: bool,
+    task_id: Option<&str>,
+    outcome: Option<&crate::task_outcomes::TaskTerminalOutcome>,
+) -> TurnPresentation {
+    let terminal_outcome = outcome.cloned();
     if cancelled {
         return TurnPresentation {
             indicator_state: TurnIndicatorState::Stopped,
@@ -1076,6 +1205,7 @@ pub fn turn_presentation(
                 hint: None,
                 action: None,
             }),
+            terminal_outcome,
         };
     }
     match status {
@@ -1089,13 +1219,50 @@ pub fn turn_presentation(
                 hint: None,
                 action: None,
             }),
+            terminal_outcome,
         },
         TaskStatus::Incomplete => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
             paused: false,
             show_task_control: true,
             stop_notice: None,
+            terminal_outcome,
         },
+        TaskStatus::TaskBudgetExhausted
+        | TaskStatus::TaskCompactionCannotFit
+        | TaskStatus::TaskNoProgress => {
+            let (_, headline, detail) = bounded_stop_presentation(status, outcome);
+            TurnPresentation {
+                indicator_state: TurnIndicatorState::Incomplete,
+                paused: false,
+                show_task_control: true,
+                stop_notice: Some(TurnStopNotice {
+                    state: TurnIndicatorState::Incomplete,
+                    label: headline,
+                    hint: Some(detail),
+                    // Deliberately no continuation action against the same
+                    // approved bound. A worker's ordinary Open control lives
+                    // on `TaskControl`.
+                    action: None,
+                }),
+                terminal_outcome,
+            }
+        }
+        TaskStatus::Failed if outcome.is_some_and(usage_unavailable) => {
+            let outcome = outcome.expect("checked above");
+            TurnPresentation {
+                indicator_state: TurnIndicatorState::Failed,
+                paused: false,
+                show_task_control: false,
+                stop_notice: Some(TurnStopNotice {
+                    state: TurnIndicatorState::Failed,
+                    label: outcome.label(),
+                    hint: Some(outcome.explanation()),
+                    action: None,
+                }),
+                terminal_outcome,
+            }
+        }
         TaskStatus::ToolBudgetExhausted => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
             paused: false,
@@ -1115,6 +1282,7 @@ pub fn turn_presentation(
                     .for_task(task_id),
                 ),
             }),
+            terminal_outcome,
         },
         TaskStatus::TokenBudgetExhausted => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
@@ -1129,12 +1297,14 @@ pub fn turn_presentation(
                 hint: Some("Raise agent_max_task_tokens to go further.".to_string()),
                 action: None,
             }),
+            terminal_outcome,
         },
         TaskStatus::Failed | TaskStatus::UnknownExternalOutcome => TurnPresentation {
             indicator_state: TurnIndicatorState::Failed,
             paused: false,
             show_task_control: false,
             stop_notice: None,
+            terminal_outcome,
         },
         TaskStatus::Interrupted => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
@@ -1146,6 +1316,7 @@ pub fn turn_presentation(
                 hint: None,
                 action: None,
             }),
+            terminal_outcome,
         },
         TaskStatus::Complete if model_incomplete => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
@@ -1157,12 +1328,14 @@ pub fn turn_presentation(
                 hint: None,
                 action: None,
             }),
+            terminal_outcome,
         },
         TaskStatus::Complete => TurnPresentation {
             indicator_state: TurnIndicatorState::Complete,
             paused: false,
             show_task_control: false,
             stop_notice: None,
+            terminal_outcome,
         },
         // Everything below is still in progress or waiting for the user. It is
         // explicitly not success, including `waiting_for_approval`, whose
@@ -1180,6 +1353,7 @@ pub fn turn_presentation(
             paused: matches!(status, TaskStatus::WaitingForApproval | TaskStatus::Paused),
             show_task_control: false,
             stop_notice: None,
+            terminal_outcome,
         },
     }
 }
@@ -1229,7 +1403,12 @@ impl<'a> TaskControlService<'a> {
         let report = self
             .session_store
             .read_completion_report(session_id, &task.id)?;
-        Ok(Some(TaskControl::for_session(Some(&task), report.as_ref())))
+        let outcome = self.session_store.read_task_outcome(session_id, &task.id)?;
+        Ok(Some(TaskControl::for_session_with_outcome(
+            Some(&task),
+            report.as_ref(),
+            outcome.as_ref(),
+        )))
     }
 
     pub fn worker_control(
@@ -1253,17 +1432,24 @@ impl<'a> TaskControlService<'a> {
                 .read_completion_report(session_id, &task.id)?,
             None => None,
         };
-        Ok(TaskControl::for_worker(WorkerTaskFacts {
-            task: task.as_ref(),
-            reported_task_status: facts.reported_task_status,
-            report: report.as_ref(),
-            alive: facts.alive,
-            state: facts.state,
-            has_run: facts.has_run,
-            turn_error: facts.turn_error,
-            last_progress_at_ms: facts.last_progress_at_ms,
-            now_ms: facts.now_ms,
-        }))
+        let outcome = match &task {
+            Some(task) => self.session_store.read_task_outcome(session_id, &task.id)?,
+            None => None,
+        };
+        Ok(TaskControl::for_worker_with_outcome(
+            WorkerTaskFacts {
+                task: task.as_ref(),
+                reported_task_status: facts.reported_task_status,
+                report: report.as_ref(),
+                alive: facts.alive,
+                state: facts.state,
+                has_run: facts.has_run,
+                turn_error: facts.turn_error,
+                last_progress_at_ms: facts.last_progress_at_ms,
+                now_ms: facts.now_ms,
+            },
+            outcome.as_ref(),
+        ))
     }
 }
 
@@ -1319,6 +1505,89 @@ fn composer_for(action: TaskAction) -> TaskComposer {
     TaskComposer {
         action,
         placeholder,
+    }
+}
+
+/// The engine-owned headline and detail for a bounded task stop.
+fn bounded_stop_presentation(
+    status: &TaskStatus,
+    outcome: Option<&crate::task_outcomes::TaskTerminalOutcome>,
+) -> (TaskOutcomeKind, String, String) {
+    let kind = match status {
+        TaskStatus::TaskBudgetExhausted => TaskOutcomeKind::BudgetExhausted,
+        TaskStatus::TaskCompactionCannotFit => TaskOutcomeKind::CannotFit,
+        TaskStatus::TaskNoProgress => TaskOutcomeKind::NoProgress,
+        _ => TaskOutcomeKind::Failed,
+    };
+    match outcome {
+        Some(outcome) => (kind, outcome.label(), outcome.explanation()),
+        None => match status {
+            TaskStatus::TaskBudgetExhausted => (
+                kind,
+                "Approved task budget exhausted".to_string(),
+                "The worker reached the task budget the user approved before it could finish."
+                    .to_string(),
+            ),
+            TaskStatus::TaskCompactionCannotFit => (
+                kind,
+                "Request cannot fit".to_string(),
+                "The next request could not fit the configured request-window share.".to_string(),
+            ),
+            TaskStatus::TaskNoProgress => (
+                kind,
+                "Task made no progress".to_string(),
+                "The task repeated its recent state without advancing, so the engine stopped it."
+                    .to_string(),
+            ),
+            _ => (
+                kind,
+                "Task stopped".to_string(),
+                "The task stopped before completion.".to_string(),
+            ),
+        },
+    }
+}
+
+fn usage_unavailable(outcome: &crate::task_outcomes::TaskTerminalOutcome) -> bool {
+    outcome.kind == crate::task_outcomes::TaskTerminalOutcomeKind::UsageUnavailable
+}
+
+impl TaskControl {
+    /// The same bounded-stop control for a live, idle, or restarted worker.
+    fn bounded_worker(
+        task_id: Option<&str>,
+        status_text: &str,
+        status: &TaskStatus,
+        outcome: Option<&crate::task_outcomes::TaskTerminalOutcome>,
+        report: Option<&CompletionGateReport>,
+    ) -> Self {
+        let (outcome_kind, headline, detail) = bounded_stop_presentation(status, outcome);
+        Self {
+            task_id: task_id.map(str::to_string),
+            status: Some(status_text.to_string()),
+            outcome: outcome_kind,
+            dot: WorkerDot::Failed,
+            group: WorkerBoardGroup::Finished,
+            headline,
+            detail,
+            needs_decision: false,
+            ended: true,
+            progress_current: true,
+            show_round: false,
+            reasons: report
+                .map(|report| report.reasons.clone())
+                .unwrap_or_default(),
+            waivers: report
+                .map(|report| report.waivers.clone())
+                .unwrap_or_default(),
+            // No continuation against the same approved bound. Opening the
+            // worker is the engine's ordinary navigation lifecycle action.
+            primary_action: None,
+            board_action: Some(open_action()),
+            actions: Vec::new(),
+            composer: None,
+            terminal_outcome: outcome.cloned(),
+        }
     }
 }
 

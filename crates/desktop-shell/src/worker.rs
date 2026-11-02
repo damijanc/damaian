@@ -1098,6 +1098,12 @@ impl TurnDriver {
                     "state": state.as_str(),
                     "taskStatus": result.task.status.as_str()
                 });
+                // Spec 103 Task 6: the progress/status line carries the same
+                // typed outcome the board control and parent return use. The
+                // shell never reconstructs it from a status string.
+                if let Some(outcome) = &result.task_control.terminal_outcome {
+                    status["terminalOutcome"] = json!(outcome);
+                }
                 // The task itself is still complete: failing to tell the
                 // parent is a delivery problem, not a reason to rewrite the
                 // worker's own outcome (spec 100 requirement 1).
@@ -1169,6 +1175,11 @@ impl TurnDriver {
             record.worktree_path.to_string_lossy().to_string(),
             task.status.as_str(),
             response,
+        )
+        .with_terminal_outcome(
+            store
+                .read_task_outcome(&self.session_id, &task.id)
+                .map_err(|error| error.to_string())?,
         );
         store
             .record_worker_return(&returned, &self.scanner)
@@ -2429,6 +2440,110 @@ mod tests {
             "m".repeat(MAX_REQUEST_BYTES as usize)
         );
         assert_eq!(served.connect().exchange(&line), None);
+    }
+
+    /// Spec 103 Task 6: a restart re-reads the durable terminal status and
+    /// typed outcome, reports the same engine-owned control and starts no model
+    /// call. It never re-runs a bounded stop.
+    #[test]
+    fn a_restarted_worker_reports_the_same_bounded_outcome_without_a_model_call() {
+        let data_dir = scratch("outcome-restart");
+        let repo = data_dir.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/a.rs"), "fn main() {}\n").unwrap();
+        let store = SessionStore::new(&data_dir);
+        let session = store
+            .create_session(&workspace_engine::repository_id_for_root(&repo), "Worker")
+            .unwrap()
+            .id;
+        store
+            .record_worker_spawned(
+                &session,
+                &workspace_engine::WorkerRecord {
+                    parent_session_id: None,
+                    parent_task_id: None,
+                    inherited_protected_paths: Vec::new(),
+                    source_repository: repo.clone(),
+                    worktree_path: repo.clone(),
+                    branch: "main".to_string(),
+                    base_commit: "0000000".to_string(),
+                    included_uncommitted: false,
+                    git_commands: Vec::new(),
+                },
+            )
+            .unwrap();
+        let task = store.create_task(&session, "bounded", "mock", "m").unwrap();
+        let outcome = workspace_engine::TaskTerminalOutcome::new(
+            &session,
+            &task.id,
+            workspace_engine::TaskTerminalOutcomeKind::NoProgress,
+        );
+        store
+            .settle_task_terminal_outcome(&task, TaskStatus::TaskNoProgress, &outcome)
+            .unwrap();
+
+        let before = workspace_engine::TaskControlService::new(&store, None)
+            .worker_control(
+                &session,
+                workspace_engine::WorkerTaskFacts {
+                    task: None,
+                    reported_task_status: None,
+                    report: None,
+                    alive: true,
+                    state: workspace_engine::WorkerProcessState::Idle,
+                    has_run: true,
+                    turn_error: None,
+                    last_progress_at_ms: None,
+                    now_ms: workspace_engine::hash::now_millis(),
+                },
+            )
+            .unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&calls);
+        let host = host_in_process(
+            &session,
+            &data_dir,
+            Box::new(move |_config: &Config| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(workspace_engine::MockModelAdapter::new("Done."))
+                    as Box<dyn ModelAdapter>)
+            }),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a restarted worker must not start a model call for a terminal task"
+        );
+        assert_eq!(host.snapshot()["state"], "idle");
+        let after = workspace_engine::TaskControlService::new(&store, None)
+            .worker_control(
+                &session,
+                workspace_engine::WorkerTaskFacts {
+                    task: None,
+                    reported_task_status: None,
+                    report: None,
+                    alive: true,
+                    state: workspace_engine::WorkerProcessState::Idle,
+                    has_run: true,
+                    turn_error: None,
+                    last_progress_at_ms: None,
+                    now_ms: workspace_engine::hash::now_millis(),
+                },
+            )
+            .unwrap();
+        assert_eq!(after, before, "the engine-owned control is unchanged");
+        assert_eq!(
+            after.terminal_outcome.as_ref().map(|outcome| outcome.kind),
+            Some(workspace_engine::TaskTerminalOutcomeKind::NoProgress)
+        );
+        assert_eq!(
+            store.read_tasks(&session).unwrap().last().unwrap().status,
+            TaskStatus::TaskNoProgress
+        );
     }
 
     /// The control server on a thread against a temp data dir.

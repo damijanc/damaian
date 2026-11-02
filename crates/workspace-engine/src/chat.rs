@@ -70,8 +70,17 @@ use crate::session::{
 };
 use crate::stagnation::{RepairStall, detect_repair_stall, repair_state_entry};
 use crate::steering::TurnSteering;
-use crate::task_budget::{TaskBudgetPolicy, TaskBudgetReview, TaskExecutionBudget};
-use crate::task_control::{TaskControl, TurnPresentation, continuation_prompt, turn_presentation};
+use crate::task_budget::{
+    TaskBudgetDimension, TaskBudgetPolicy, TaskBudgetReview, TaskExecutionBudget,
+};
+use crate::task_control::{
+    TaskControl, TurnPresentation, continuation_prompt, turn_presentation,
+    turn_presentation_with_outcome,
+};
+use crate::task_outcomes::{
+    TaskCompactionFacts, TaskOutcomeFigures, TaskSegmentSnapshot, TaskTerminalOutcome,
+    TaskTerminalOutcomeKind, approved_action_round_cap, approved_exploration_round_cap,
+};
 use crate::task_segments::{
     SegmentContinuationDecision, SegmentContinuationInput, SegmentProgressInput,
     SegmentTokenTotals, SegmentTotals, TASK_SEGMENT_FORMAT_VERSION, TaskRequestTokenAuthority,
@@ -202,7 +211,7 @@ fn action_command(action: &ToolAction) -> Option<&str> {
 /// An enum rather than two booleans: two flags admit a state where both are
 /// set, and the audit status string and the task status would then each have to
 /// pick one arbitrarily. The loop can only stop for one reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum StopReason {
     /// The model produced an answer, or the turn is pausing for a human.
     Answered,
@@ -212,6 +221,9 @@ enum StopReason {
     /// detected *before* a model call rather than after one, so no tokens are
     /// spent discovering it (`context.md` §3.3).
     TokenBudget,
+    /// A bounded worker task stopped for one of spec 103 Task 6's typed
+    /// outcomes. The status and the outcome are written together at settlement.
+    TaskTerminal(Box<crate::task_outcomes::TaskTerminalOutcome>),
 }
 
 impl StopReason {
@@ -221,6 +233,7 @@ impl StopReason {
             Self::Answered => "answered",
             Self::ToolBudget => "tool_budget",
             Self::TokenBudget => "token_budget",
+            Self::TaskTerminal(outcome) => outcome.kind.as_str(),
         }
     }
 }
@@ -3546,7 +3559,12 @@ impl ChatOrchestrator {
             .read_completion_report(&task.session_id, &task.id)
             .ok()
             .flatten();
-        TaskControl::for_session(Some(task), report.as_ref())
+        let outcome = self
+            .session_store
+            .read_task_outcome(&task.session_id, &task.id)
+            .ok()
+            .flatten();
+        TaskControl::for_session_with_outcome(Some(task), report.as_ref(), outcome.as_ref())
     }
 
     /// Continues an incomplete task as an explicit engine-authorized action
@@ -3951,6 +3969,12 @@ impl ChatOrchestrator {
         if paused {
             return Ok(result);
         }
+        // Spec 103 Task 6: a bounded task stop is already terminal and typed.
+        // The verification's ordinary "no repair applied" settlement must not
+        // relabel it as a generic failed verification.
+        if result.task_control.terminal_outcome.is_some() {
+            return Ok(result);
+        }
         // The model answered without proposing a patch. Asking it the same
         // question again would spend the remaining attempts for nothing, so the
         // loop stops here (proposal §5.5).
@@ -4059,6 +4083,33 @@ impl ChatOrchestrator {
     /// and already cleared the due/in-progress facts on replay. This rebuilds
     /// the report from the durable log, so a reload renders exactly what the
     /// live turn returns, and takes the failed completion settlement.
+    /// The engine-owned presentation of the repair stall that already stopped
+    /// this task, built from durable verification state (spec 102).
+    ///
+    /// A Task 6 stop that loses the settlement race must show the authoritative
+    /// result, not the rendering it was about to persist. The report summary and
+    /// rendering are the same ones [`Self::finish_verification_stalled`] uses.
+    fn verification_stall_presentation(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+    ) -> Result<(String, crate::verification::VerificationReport)> {
+        let events = self
+            .session_store
+            .read_verification_events(&session.id, &[])?;
+        let state = fold_verification(events.iter());
+        let plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)?
+            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        let changed = self.verification_changed_files(&session.id, &task.id, state.due.as_ref())?;
+        let file_hashes = hash_existing_files(repository_root, &changed);
+        let report = VerificationReport::build(&state, &plan, &changed, &file_hashes);
+        let response = format!("{}\n\n{}", report.summary(&plan.report()), report.render());
+        Ok((response, report))
+    }
+
     fn finish_verification_stalled(
         &self,
         repository_root: &Path,
@@ -4385,6 +4436,12 @@ impl ChatOrchestrator {
             return Ok(result);
         }
         if paused {
+            return Ok(result);
+        }
+        // Spec 103 Task 6: a bounded stop already settled a typed terminal
+        // outcome. It is not a "no repair applied" verification result, and the
+        // later settlement must not overwrite its status or outcome.
+        if result.task_control.terminal_outcome.is_some() {
             return Ok(result);
         }
         let Some(due) = state.due.clone() else {
@@ -7410,7 +7467,7 @@ impl ChatOrchestrator {
         protected: &TaskProtectedPaths,
         tools: Option<Vec<ToolDefinition>>,
         max_tokens: Option<u32>,
-    ) -> Result<PreparedTurnRequest> {
+    ) -> Result<TurnRequestDecision> {
         let notes_window = if self.config.agent_max_turn_notes_chars == 0 {
             // Requirement 3: zero restores today's request exactly.
             NotesWindow::none()
@@ -7433,14 +7490,14 @@ impl ChatOrchestrator {
             max_tokens,
         );
         let Some(context_window) = self.config.context_window() else {
-            return Ok(PreparedTurnRequest::unchanged(legacy_request));
+            return Ok(TurnRequestDecision::prepared(legacy_request));
         };
         let threshold =
             request_threshold_tokens(context_window, self.config.conversation_window_share);
         let request_tokens_before =
             TokenEstimate::Prose.tokens(&model_request_json(&legacy_request));
         if request_tokens_before <= threshold {
-            return Ok(PreparedTurnRequest::unchanged(legacy_request));
+            return Ok(TurnRequestDecision::prepared(legacy_request));
         }
 
         // The threshold is crossed. Safety pinning takes precedence over the
@@ -7497,7 +7554,7 @@ impl ChatOrchestrator {
         });
         match outcome {
             RequestPreparationOutcome::Unchanged => {
-                Ok(PreparedTurnRequest::unchanged(safety_request))
+                Ok(TurnRequestDecision::prepared(safety_request))
             }
             RequestPreparationOutcome::Compacted { request, attempt } => {
                 self.record_within_turn_compaction_attempt(&attempt)?;
@@ -7506,27 +7563,28 @@ impl ChatOrchestrator {
                     .iter()
                     .map(|fact| fact.call_id.clone())
                     .collect();
-                Ok(PreparedTurnRequest {
+                Ok(TurnRequestDecision::Prepared(PreparedTurnRequest {
                     request,
                     compacted_call_ids,
-                })
+                }))
             }
             RequestPreparationOutcome::FailedClosed { attempt } => {
                 self.record_within_turn_compaction_attempt(&attempt)?;
-                let message = match attempt.outcome {
+                match attempt.outcome {
+                    // A request that cannot fit is a typed terminal outcome,
+                    // never a generic client error. It carries no request and
+                    // the caller settles it without sending a model call or
+                    // writing a segment boundary.
                     crate::request_preparation::WithinTurnCompactionAttemptOutcome::CannotFit => {
-                        format!(
-                            "the next request cannot fit the configured window share: {} tokens (\u{2264} {} allowed) after compaction",
-                            attempt
-                                .request_tokens_minimum
-                                .unwrap_or(attempt.request_tokens_before),
-                            attempt.threshold_tokens
-                        )
+                        Ok(TurnRequestDecision::CannotFit(attempt))
                     }
-                    _ => "the completed tool metadata does not match the request messages"
-                        .to_string(),
-                };
-                Err(ClientError::RequestPreparation(message))
+                    // Invalid metadata stays fail-closed: a caller cannot act
+                    // on it as if the window were too small.
+                    _ => Err(ClientError::RequestPreparation(
+                        "the completed tool metadata does not match the request messages"
+                            .to_string(),
+                    )),
+                }
             }
         }
     }
@@ -7675,62 +7733,247 @@ impl ChatOrchestrator {
         Ok(())
     }
 
-    /// Turns a refused task-budget request into the existing pre-call token
-    /// stop, recording the typed dimension and the exact figures.
+    /// Builds one durable terminal outcome with the engine state available now.
     ///
-    /// Task 6 replaces this transitional presentation with a distinct durable
-    /// budget-exhausted outcome. What matters here is that the request is not
-    /// sent and no segment boundary is written.
-    fn task_budget_token_stop(
+    /// `last_segment` is the live snapshot of the segment still open, not the
+    /// durable `segment_started` record: a declined boundary leaves that record
+    /// at its zeros and without a progress digest, and persisting those would
+    /// describe a segment the turn never ran. Token totals come from the
+    /// caller's durable usage entry; missing usage stays absent, so the record
+    /// never invents a zero someone could read as "spent nothing".
+    #[allow(clippy::too_many_arguments)]
+    fn task_terminal_outcome(
+        &self,
+        session: &Session,
+        task: &Task,
+        kind: TaskTerminalOutcomeKind,
+        dimension: Option<TaskBudgetDimension>,
+        figures: Option<TaskOutcomeFigures>,
+        compaction: Option<TaskCompactionFacts>,
+        usage: Option<&TaskUsage>,
+        last_segment: Option<TaskSegmentSnapshot>,
+    ) -> Result<TaskTerminalOutcome> {
+        let mut outcome = TaskTerminalOutcome::new(&session.id, &task.id, kind)
+            .with_dimension_opt(dimension)
+            .with_figures_opt(figures)
+            .with_last_segment(last_segment)
+            .with_usage(usage.map(|usage| SegmentTokenTotals::from_usage(Some(usage))));
+        if let Some(compaction) = compaction {
+            outcome = outcome.with_compaction(compaction);
+        }
+        Ok(outcome)
+    }
+
+    /// Records one terminal outcome and returns the loop's stop value.
+    ///
+    /// The durable status/outcome pair is written later, at the single final
+    /// settlement point; this helper only prepares the response the user sees.
+    /// The audit fact is written there too, because a spec 102 repair stall can
+    /// win the settlement race and then the newer outcome never happened.
+    fn task_terminal_stop(
+        &self,
+        outcome: TaskTerminalOutcome,
+    ) -> Result<(ModelRun, String, StopReason)> {
+        let response = outcome.render();
+        let mut run =
+            ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
+        run.content = response.clone();
+        Ok((run, response, StopReason::TaskTerminal(Box::new(outcome))))
+    }
+
+    /// The terminal outcome for a declined segment continuation.
+    #[allow(clippy::too_many_arguments)]
+    fn segment_decline_outcome(
+        &self,
+        session: &Session,
+        task: &Task,
+        reason: crate::task_segments::SegmentDeclineReason,
+        budget: &TaskExecutionBudget,
+        totals: SegmentTotals,
+        usage: Option<&TaskUsage>,
+        last_segment: Option<TaskSegmentSnapshot>,
+    ) -> Result<TaskTerminalOutcome> {
+        use crate::task_segments::SegmentDeclineReason;
+        match reason {
+            SegmentDeclineReason::ActionRoundsExhausted => {
+                let approved = approved_action_round_cap(budget);
+                let used = u64::from(totals.action_rounds);
+                self.task_terminal_outcome(
+                    session,
+                    task,
+                    TaskTerminalOutcomeKind::ApprovedBudgetExhausted,
+                    Some(TaskBudgetDimension::ActionRounds),
+                    Some(TaskOutcomeFigures {
+                        approved,
+                        used,
+                        required: None,
+                        remaining: Some(approved.saturating_sub(used)),
+                    }),
+                    None,
+                    usage,
+                    last_segment,
+                )
+            }
+            SegmentDeclineReason::ExplorationRoundsExhausted => {
+                let approved = approved_exploration_round_cap(budget);
+                let used = u64::from(totals.exploration_rounds);
+                self.task_terminal_outcome(
+                    session,
+                    task,
+                    TaskTerminalOutcomeKind::ApprovedBudgetExhausted,
+                    Some(TaskBudgetDimension::ExplorationRounds),
+                    Some(TaskOutcomeFigures {
+                        approved,
+                        used,
+                        required: None,
+                        remaining: Some(approved.saturating_sub(used)),
+                    }),
+                    None,
+                    usage,
+                    last_segment,
+                )
+            }
+            SegmentDeclineReason::InputTokensExhausted => {
+                let used = usage.map_or(0, |usage| usage.input_tokens);
+                self.task_terminal_outcome(
+                    session,
+                    task,
+                    TaskTerminalOutcomeKind::ApprovedBudgetExhausted,
+                    Some(TaskBudgetDimension::InputTokens),
+                    Some(TaskOutcomeFigures {
+                        approved: budget.input_tokens,
+                        used,
+                        required: None,
+                        remaining: Some(budget.input_tokens.saturating_sub(used)),
+                    }),
+                    None,
+                    usage,
+                    last_segment,
+                )
+            }
+            SegmentDeclineReason::OutputTokensExhausted => {
+                let used = usage.map_or(0, |usage| usage.output_tokens);
+                self.task_terminal_outcome(
+                    session,
+                    task,
+                    TaskTerminalOutcomeKind::ApprovedBudgetExhausted,
+                    Some(TaskBudgetDimension::OutputTokens),
+                    Some(TaskOutcomeFigures {
+                        approved: budget.output_tokens,
+                        used,
+                        required: None,
+                        remaining: Some(budget.output_tokens.saturating_sub(used)),
+                    }),
+                    None,
+                    usage,
+                    last_segment,
+                )
+            }
+            SegmentDeclineReason::NoProgress => self.task_terminal_outcome(
+                session,
+                task,
+                TaskTerminalOutcomeKind::NoProgress,
+                None,
+                None,
+                None,
+                usage,
+                last_segment,
+            ),
+            // Missing usage is not an exhausted total. It is a named failure
+            // that never offers a continuation against the approved bound.
+            SegmentDeclineReason::UsageUnavailable => self.task_terminal_outcome(
+                session,
+                task,
+                TaskTerminalOutcomeKind::UsageUnavailable,
+                None,
+                None,
+                None,
+                None,
+                last_segment,
+            ),
+        }
+    }
+
+    /// The terminal outcome for a prepared request the approved tokens refuse.
+    #[allow(clippy::too_many_arguments)]
+    fn task_authority_outcome(
         &self,
         session: &Session,
         task: &Task,
         budget: &TaskExecutionBudget,
         usage: Option<&TaskUsage>,
         failure: &TaskRequestTokenAuthority,
-        plan: Option<&TaskPlan>,
-    ) -> Result<(ModelRun, String)> {
-        let (required, remaining) = match failure {
+        last_segment: Option<TaskSegmentSnapshot>,
+    ) -> Result<TaskTerminalOutcome> {
+        match failure {
             TaskRequestTokenAuthority::InputExceeded {
                 required_input_tokens,
                 remaining_input_tokens,
-            } => (*required_input_tokens, *remaining_input_tokens),
+            } => self.task_terminal_outcome(
+                session,
+                task,
+                TaskTerminalOutcomeKind::ApprovedBudgetExhausted,
+                Some(TaskBudgetDimension::InputTokens),
+                Some(TaskOutcomeFigures {
+                    approved: budget.input_tokens,
+                    used: usage.map_or(0, |usage| usage.input_tokens),
+                    required: Some(*required_input_tokens),
+                    remaining: Some(*remaining_input_tokens),
+                }),
+                None,
+                usage,
+                last_segment,
+            ),
             TaskRequestTokenAuthority::OutputExhausted {
                 remaining_output_tokens,
-            } => (0, *remaining_output_tokens),
-            TaskRequestTokenAuthority::UsageUnavailable => (0, 0),
-        };
-        self.audit_log.record(
-            "task_budget_token_exhausted",
-            &[
-                ("actor", "system".to_string()),
-                ("sessionId", session.id.clone()),
-                ("taskId", task.id.clone()),
-                ("dimension", failure.dimension().to_string()),
-                ("requiredTokens", required.to_string()),
-                ("remainingTokens", remaining.to_string()),
-                (
-                    "inputTokens",
-                    usage.map_or_else(
-                        || "unavailable".to_string(),
-                        |usage| usage.input_tokens.to_string(),
-                    ),
-                ),
-                (
-                    "outputTokens",
-                    usage.map_or_else(
-                        || "unavailable".to_string(),
-                        |usage| usage.output_tokens.to_string(),
-                    ),
-                ),
-            ],
-        )?;
-        let response =
-            task_budget_token_exhausted_response(budget, usage, failure, required, remaining, plan);
-        let mut run =
-            ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
-        run.content = response.clone();
-        Ok((run, response))
+            } => self.task_terminal_outcome(
+                session,
+                task,
+                TaskTerminalOutcomeKind::ApprovedBudgetExhausted,
+                Some(TaskBudgetDimension::OutputTokens),
+                Some(TaskOutcomeFigures {
+                    approved: budget.output_tokens,
+                    used: usage.map_or(0, |usage| usage.output_tokens),
+                    required: None,
+                    remaining: Some(*remaining_output_tokens),
+                }),
+                None,
+                usage,
+                last_segment,
+            ),
+            TaskRequestTokenAuthority::UsageUnavailable => self.task_terminal_outcome(
+                session,
+                task,
+                TaskTerminalOutcomeKind::UsageUnavailable,
+                None,
+                None,
+                None,
+                None,
+                last_segment,
+            ),
+        }
+    }
+
+    /// The terminal outcome for a request whose pinned/fixed minimum cannot
+    /// fit the configured window share.
+    fn cannot_fit_outcome(
+        &self,
+        session: &Session,
+        task: &Task,
+        attempt: &WithinTurnCompactionAttempt,
+        usage: Option<&TaskUsage>,
+        last_segment: Option<TaskSegmentSnapshot>,
+    ) -> Result<TaskTerminalOutcome> {
+        self.task_terminal_outcome(
+            session,
+            task,
+            TaskTerminalOutcomeKind::CompactionCannotFit,
+            None,
+            None,
+            Some(TaskCompactionFacts::from_attempt(attempt)),
+            usage,
+            last_segment,
+        )
     }
 
     /// The deterministic, content-safe digest of the task state a segment
@@ -7751,6 +7994,28 @@ impl ChatOrchestrator {
             notes_carried: turn_notes.carried,
             scanner: &self.scanner,
         })
+    }
+
+    /// The live state of the segment that is still open when a task stops.
+    ///
+    /// A declined boundary leaves its `segment_started` record at zeros and
+    /// without a progress digest, so the durable record cannot describe the
+    /// segment the turn actually ran. This builds the snapshot from the
+    /// counters, durable token totals and digest the engine holds now.
+    fn live_segment_snapshot(
+        &self,
+        tracker: &SegmentRunState,
+        action_rounds: u32,
+        exploration_rounds: u32,
+        usage: Option<&TaskUsage>,
+        progress_digest: String,
+    ) -> TaskSegmentSnapshot {
+        tracker.snapshot(
+            action_rounds,
+            exploration_rounds,
+            SegmentTokenTotals::from_usage(usage),
+            progress_digest,
+        )
     }
 
     /// Starts the first automatic segment, or resumes the one a pause left open.
@@ -8242,7 +8507,7 @@ impl ChatOrchestrator {
         // next model call, so one threshold crossing records one compaction
         // attempt rather than preparing the same request twice.
         let mut boundary_request: Option<PreparedTurnRequest> = None;
-        let (final_run, mut response, proposals, stop_reason) = loop {
+        let (mut final_run, mut response, proposals, stop_reason) = loop {
             // Spec 57 §5.4, in its order: a pause holds here, before the
             // cancel check, so a stop that arrives while paused ends the turn
             // through the same path as any other stop.
@@ -8410,6 +8675,15 @@ impl ChatOrchestrator {
                         normal_exploration_rounds: self.default_exploration_round_limit(),
                         progress_advanced: digest != tracker.start_digest,
                     });
+                    // Every stop below describes the segment this turn actually
+                    // ran, not its durable zeroed `segment_started` record.
+                    let last_segment = self.live_segment_snapshot(
+                        tracker,
+                        action_rounds,
+                        exploration_rounds,
+                        usage,
+                        digest.clone(),
+                    );
                     match decision {
                         SegmentContinuationDecision::Continue {
                             action_rounds: action_allowance,
@@ -8426,26 +8700,25 @@ impl ChatOrchestrator {
                             ) {
                                 Ok(cap) => cap,
                                 Err(failure) => {
-                                    let (run, response) = self.task_budget_token_stop(
+                                    let outcome = self.task_authority_outcome(
                                         &session,
                                         &task,
                                         &tracker.budget,
                                         usage,
                                         &failure,
-                                        plan.as_ref(),
+                                        Some(last_segment.clone()),
                                     )?;
-                                    break (
-                                        run,
-                                        response,
-                                        TurnProposals::default(),
-                                        StopReason::TokenBudget,
-                                    );
+                                    let (run, response, stop) = self.task_terminal_stop(outcome)?;
+                                    break (run, response, TurnProposals::default(), stop);
                                 }
                             };
                             // Prepared before the boundary is written: a
                             // request that cannot fit must leave the segment
                             // open and send nothing.
-                            let prepared = self.build_turn_request(
+                            let PreparedTurnRequest {
+                                request,
+                                compacted_call_ids,
+                            } = match self.build_turn_request(
                                 repository_root,
                                 &session,
                                 &task,
@@ -8457,16 +8730,28 @@ impl ChatOrchestrator {
                                 &active_protected,
                                 native_tools.clone(),
                                 Some(output_cap),
-                            )?;
+                            )? {
+                                TurnRequestDecision::Prepared(prepared) => prepared,
+                                TurnRequestDecision::CannotFit(attempt) => {
+                                    // No boundary is written and no request is
+                                    // sent: the segment stays open and the task
+                                    // settles with its own typed outcome.
+                                    let outcome = self.cannot_fit_outcome(
+                                        &session,
+                                        &task,
+                                        &attempt,
+                                        usage,
+                                        Some(last_segment.clone()),
+                                    )?;
+                                    let (run, response, stop) = self.task_terminal_stop(outcome)?;
+                                    break (run, response, TurnProposals::default(), stop);
+                                }
+                            };
                             // The round totals can still allow a segment while
                             // the exact next request would overspend an approved
                             // token total. Prove the already-prepared request
                             // without changing it; on failure nothing is sent
                             // and no segment is started.
-                            let PreparedTurnRequest {
-                                request,
-                                compacted_call_ids,
-                            } = prepared;
                             let prepared =
                                 match authorize_task_request(&request, &tracker.budget, usage) {
                                     Ok(()) => PreparedTurnRequest {
@@ -8474,20 +8759,17 @@ impl ChatOrchestrator {
                                         compacted_call_ids,
                                     },
                                     Err(failure) => {
-                                        let (run, response) = self.task_budget_token_stop(
+                                        let outcome = self.task_authority_outcome(
                                             &session,
                                             &task,
                                             &tracker.budget,
                                             usage,
                                             &failure,
-                                            plan.as_ref(),
+                                            Some(last_segment.clone()),
                                         )?;
-                                        break (
-                                            run,
-                                            response,
-                                            TurnProposals::default(),
-                                            StopReason::TokenBudget,
-                                        );
+                                        let (run, response, stop) =
+                                            self.task_terminal_stop(outcome)?;
+                                        break (run, response, TurnProposals::default(), stop);
                                     }
                                 };
                             let tokens = SegmentTokenTotals::from_usage(usage);
@@ -8569,6 +8851,17 @@ impl ChatOrchestrator {
                                     ),
                                 ],
                             )?;
+                            let outcome = self.segment_decline_outcome(
+                                &session,
+                                &task,
+                                reason,
+                                &tracker.budget,
+                                totals,
+                                usage,
+                                Some(last_segment),
+                            )?;
+                            let (run, response, stop) = self.task_terminal_stop(outcome)?;
+                            break (run, response, TurnProposals::default(), stop);
                         }
                     }
                 }
@@ -8623,27 +8916,35 @@ impl ChatOrchestrator {
                         ) {
                             Ok(cap) => Some(cap),
                             Err(failure) => {
-                                let (run, response) = self.task_budget_token_stop(
+                                let last_segment = self.live_segment_snapshot(
+                                    tracker,
+                                    action_rounds,
+                                    exploration_rounds,
+                                    task_usage.as_ref(),
+                                    self.segment_progress_digest(
+                                        plan.as_ref(),
+                                        &step_evidence,
+                                        &completed_tool_rounds,
+                                        &turn_notes,
+                                    ),
+                                );
+                                let outcome = self.task_authority_outcome(
                                     &session,
                                     &task,
                                     &tracker.budget,
                                     task_usage.as_ref(),
                                     &failure,
-                                    plan.as_ref(),
+                                    Some(last_segment),
                                 )?;
-                                break (
-                                    run,
-                                    response,
-                                    TurnProposals::default(),
-                                    StopReason::TokenBudget,
-                                );
+                                let (run, response, stop) = self.task_terminal_stop(outcome)?;
+                                break (run, response, TurnProposals::default(), stop);
                             }
                         },
                         // An unbudgeted task lets the request builder apply
                         // the configured output ceiling exactly as before.
                         None => None,
                     };
-                    self.build_turn_request(
+                    match self.build_turn_request(
                         repository_root,
                         &session,
                         &task,
@@ -8655,7 +8956,37 @@ impl ChatOrchestrator {
                         &active_protected,
                         tools,
                         output_cap,
-                    )?
+                    )? {
+                        TurnRequestDecision::Prepared(prepared) => prepared,
+                        TurnRequestDecision::CannotFit(attempt) => {
+                            // No model call and no segment boundary. The task
+                            // settles with its own cannot-fit outcome. An
+                            // unbudgeted task has no segment at all.
+                            let last_segment = segment_tracker.as_ref().map(|tracker| {
+                                self.live_segment_snapshot(
+                                    tracker,
+                                    action_rounds,
+                                    exploration_rounds,
+                                    task_usage.as_ref(),
+                                    self.segment_progress_digest(
+                                        plan.as_ref(),
+                                        &step_evidence,
+                                        &completed_tool_rounds,
+                                        &turn_notes,
+                                    ),
+                                )
+                            });
+                            let outcome = self.cannot_fit_outcome(
+                                &session,
+                                &task,
+                                &attempt,
+                                task_usage.as_ref(),
+                                last_segment,
+                            )?;
+                            let (run, response, stop) = self.task_terminal_stop(outcome)?;
+                            break (run, response, TurnProposals::default(), stop);
+                        }
+                    }
                 }
             };
             // A read whose body became a manifest may be performed again
@@ -8678,20 +9009,28 @@ impl ChatOrchestrator {
                 && let Err(failure) =
                     authorize_task_request(&request, &tracker.budget, task_usage.as_ref())
             {
-                let (run, response) = self.task_budget_token_stop(
+                let last_segment = self.live_segment_snapshot(
+                    tracker,
+                    action_rounds,
+                    exploration_rounds,
+                    task_usage.as_ref(),
+                    self.segment_progress_digest(
+                        plan.as_ref(),
+                        &step_evidence,
+                        &completed_tool_rounds,
+                        &turn_notes,
+                    ),
+                );
+                let outcome = self.task_authority_outcome(
                     &session,
                     &task,
                     &tracker.budget,
                     task_usage.as_ref(),
                     &failure,
-                    plan.as_ref(),
+                    Some(last_segment),
                 )?;
-                break (
-                    run,
-                    response,
-                    TurnProposals::default(),
-                    StopReason::TokenBudget,
-                );
+                let (run, response, stop) = self.task_terminal_stop(outcome)?;
+                break (run, response, TurnProposals::default(), stop);
             }
 
             let token_estimate: usize = request
@@ -11101,13 +11440,55 @@ impl ChatOrchestrator {
             .map(|proposal| PendingQuestionRef::recorded(proposal.question_id.clone()));
         let truly_completed = pending.is_none() && pending_question.is_none();
 
+        // Spec 103 Task 6 with spec 102 precedence: settle the typed outcome
+        // before its rendering is written anywhere. When a repair stall for this
+        // exact task already won the atomic settlement race, the store keeps
+        // that result; the response, audit status, control and presentation must
+        // then describe the stall, not the outcome this turn was about to claim.
+        let mut task_terminal_outcome: Option<TaskTerminalOutcome> = None;
+        let mut terminal_settled: Option<Task> = None;
+        let mut terminal_verification_report = None;
+        if let StopReason::TaskTerminal(outcome) = &stop_reason {
+            let settlement = self.session_store.settle_task_terminal_outcome_checked(
+                &task,
+                outcome.task_status(),
+                outcome,
+            )?;
+            if settlement.preserved_repair_stall {
+                let (stall_response, report) = self.verification_stall_presentation(
+                    repository_root,
+                    &session,
+                    &settlement.task,
+                )?;
+                response = stall_response;
+                final_run.content = response.clone();
+                terminal_verification_report = Some(report);
+                task = CompletionGateService::new(&self.session_store, repository_root)
+                    .settle(&settlement.task, CompletionSettlement::VerificationFailed)?
+                    .task;
+                terminal_settled = Some(task.clone());
+            } else {
+                self.audit_log
+                    .record("task_terminal_outcome", &outcome.audit_fields())?;
+                task_terminal_outcome = self
+                    .session_store
+                    .read_task_outcome(&session.id, &settlement.task.id)?;
+                task = settlement.task;
+                terminal_settled = Some(task.clone());
+            }
+        }
+
         // Spec 66 `context.md` D4: on a true completion the answer that
         // triggered the reminder is the turn's response, and the post-reminder
-        // answer follows it as a second message. A pause or budget stop keeps
-        // its own response — replacing it with the earlier answer would hide
-        // the card or the budget notice the user is being shown.
+        // answer follows it as a second message. Only a genuine answer does
+        // this: a pause, a round/token budget stop or a Task 6 terminal outcome
+        // keeps its own response, because replacing it with the earlier answer
+        // would hide the card or the engine-owned stop the user is being shown.
+        // The earlier answer is already in the transcript: `send_plan_reminder`
+        // wrote it before the stop, so it is preserved without becoming the
+        // turn's response.
         match pre_reminder_answer.take() {
-            Some(earlier) if truly_completed => {
+            Some(earlier) if truly_completed && matches!(stop_reason, StopReason::Answered) => {
                 if !response.trim().is_empty() {
                     self.session_store.append_message(
                         &session.id,
@@ -11131,13 +11512,20 @@ impl ChatOrchestrator {
         if truly_completed {
             // Attaching the buffer is the true end's job; a pause carried it
             // instead (spec 66 §5.3). Nothing here changes a step's status.
+            // A Task 6 stop that lost to a spec 102 repair stall records the
+            // authoritative status, not the kind it never settled.
+            let stop_label = match &task_terminal_outcome {
+                Some(outcome) => outcome.kind.as_str(),
+                None if matches!(stop_reason, StopReason::TaskTerminal(_)) => task.status.as_str(),
+                None => stop_reason.as_str(),
+            };
             self.settle_plan_at_turn_end(
                 &session,
                 &task,
                 &mut plan,
                 &mut step_evidence,
                 plan_reminder_sent,
-                stop_reason.as_str(),
+                stop_label,
             )?;
             if let Some(current) = plan.as_ref() {
                 sink.plan_finished(current);
@@ -11150,7 +11538,7 @@ impl ChatOrchestrator {
             // `await_answer`; never through `await_approval` (spec 50 §5.2).
             (None, Some(question)) => self.session_store.await_answer(&task, question)?,
             (None, None) => {
-                match stop_reason {
+                match &stop_reason {
                     // Spec 101: an answer is settled through the engine gate, so
                     // `complete` cannot be asserted by the model or reached with
                     // open plan work, a due verification or pending evidence.
@@ -11169,6 +11557,23 @@ impl ChatOrchestrator {
                         TaskStatus::TokenBudgetExhausted,
                         None,
                     )?,
+                    // Spec 103 Task 6: the status and the typed outcome are one
+                    // event, already settled above so a spec 102 repair stall
+                    // keeps the result it recorded first.
+                    StopReason::TaskTerminal(outcome) => match terminal_settled.take() {
+                        Some(settled) => settled,
+                        None => {
+                            let settled = self.session_store.settle_task_terminal_outcome(
+                                &task,
+                                outcome.task_status(),
+                                outcome,
+                            )?;
+                            task_terminal_outcome = self
+                                .session_store
+                                .read_task_outcome(&session.id, &settled.id)?;
+                            settled
+                        }
+                    },
                 }
             }
             (Some(_), Some(_)) => {
@@ -11199,6 +11604,13 @@ impl ChatOrchestrator {
                         "tool_budget_exhausted".to_string()
                     } else if stop_reason == StopReason::TokenBudget {
                         "token_budget_exhausted".to_string()
+                    } else if let Some(outcome) = &task_terminal_outcome {
+                        outcome.kind.as_str().to_string()
+                    } else if matches!(stop_reason, StopReason::TaskTerminal(_)) {
+                        // Spec 102's repair stall won the settlement race. The
+                        // durable status is the result; no Task 6 outcome was
+                        // written, so the audit may not name its kind.
+                        task.status.as_str().to_string()
                     } else if task.status == TaskStatus::Incomplete {
                         // The persisted verdict, not the fact that the model
                         // answered, is what the audit records (spec 101).
@@ -11241,8 +11653,13 @@ impl ChatOrchestrator {
             })
         });
         let task_control = self.task_control_for(&task);
-        let turn_presentation =
-            turn_presentation(&task.status, final_run.incomplete, false, Some(&task.id));
+        let turn_presentation = turn_presentation_with_outcome(
+            &task.status,
+            final_run.incomplete,
+            false,
+            Some(&task.id),
+            task_terminal_outcome.as_ref(),
+        );
         Ok(ChatTurnResult {
             session,
             task,
@@ -11258,7 +11675,7 @@ impl ChatOrchestrator {
             round_budget_proposal: None,
             check_batch: proposals.checks,
             context_review: None,
-            verification_report: None,
+            verification_report: terminal_verification_report,
             turn_notes: turn_notes.view(),
             cancelled: false,
             usage,
@@ -12984,6 +13401,30 @@ impl SegmentRunState {
             start_digest: self.start_digest.clone(),
         }
     }
+
+    /// The live state of this open segment, for a terminal outcome.
+    ///
+    /// Unlike the durable `segment_started` payload, this carries the counters
+    /// the segment reached, the monotonic task totals and the digest of the
+    /// engine state at the stop.
+    fn snapshot(
+        &self,
+        action_rounds: u32,
+        exploration_rounds: u32,
+        tokens: SegmentTokenTotals,
+        progress_digest: String,
+    ) -> TaskSegmentSnapshot {
+        TaskSegmentSnapshot {
+            segment: self.segment,
+            segment_action_rounds: action_rounds,
+            segment_exploration_rounds: exploration_rounds,
+            total_action_rounds: self.total_action_rounds(action_rounds),
+            total_exploration_rounds: self.total_exploration_rounds(exploration_rounds),
+            tokens,
+            start_digest: self.start_digest.clone(),
+            progress_digest: Some(progress_digest),
+        }
+    }
 }
 
 /// One completed native tool call, with the typed engine facts Task 4 needs to
@@ -14408,6 +14849,23 @@ impl PreparedTurnRequest {
             request,
             compacted_call_ids: BTreeSet::new(),
         }
+    }
+}
+
+/// What one request-preparation call decided (spec 103 Task 4 and Task 6).
+///
+/// A request that cannot fit is a typed terminal outcome rather than a
+/// `ClientError`: the engine must settle a task status that names the refusal,
+/// not hand a generic preparation failure to a caller. Invalid compaction
+/// metadata is deliberately not this variant; it remains a fail-closed error.
+enum TurnRequestDecision {
+    Prepared(PreparedTurnRequest),
+    CannotFit(WithinTurnCompactionAttempt),
+}
+
+impl TurnRequestDecision {
+    fn prepared(request: ModelRequest) -> Self {
+        Self::Prepared(PreparedTurnRequest::unchanged(request))
     }
 }
 
@@ -16552,61 +17010,6 @@ fn token_budget_exhausted_response(
     message.push_str(
         "\n\nRaise `agent_max_task_tokens` and ask again to carry on, or narrow the request.",
     );
-    message
-}
-
-/// Names the approved dimension that stopped the next request before it was
-/// sent, with the exact remaining/required figures.
-///
-/// Task 6 will replace this with its typed terminal outcome; until then the
-/// existing token-budget stop is the fail-closed status, and the prose must not
-/// claim the request was sent or that spend changed.
-fn task_budget_token_exhausted_response(
-    budget: &TaskExecutionBudget,
-    usage: Option<&TaskUsage>,
-    failure: &TaskRequestTokenAuthority,
-    required: u64,
-    remaining: u64,
-    plan: Option<&crate::plan::TaskPlan>,
-) -> String {
-    let spent = usage.map_or_else(
-        || "an unrecorded amount".to_string(),
-        |usage| {
-            format!(
-                "{} input / {} output tokens",
-                usage.input_tokens, usage.output_tokens
-            )
-        },
-    );
-    let detail = match failure {
-        TaskRequestTokenAuthority::InputExceeded { .. } => format!(
-            "The next request needs about {required} input tokens, but only {remaining} of the approved {} remain.",
-            budget.input_tokens
-        ),
-        TaskRequestTokenAuthority::OutputExhausted { .. } => format!(
-            "No approved output tokens remain ({} approved).",
-            budget.output_tokens
-        ),
-        TaskRequestTokenAuthority::UsageUnavailable => {
-            "The approved budget cannot be proved because no durable token usage was recorded."
-                .to_string()
-        }
-    };
-    let mut message = format!(
-        "This task stopped before its next model call under the approved execution budget ({} action rounds, {} exploration rounds, {} input tokens, {} output tokens). Spent so far: {spent}. {detail}",
-        budget.action_rounds, budget.exploration_rounds, budget.input_tokens, budget.output_tokens
-    );
-    let open: Vec<&str> = plan
-        .map(|plan| {
-            plan.open_steps()
-                .into_iter()
-                .map(|step| step.title.as_str())
-                .collect()
-        })
-        .unwrap_or_default();
-    if !open.is_empty() {
-        message.push_str(&format!("\n\nStill to do: {}.", open.join("; ")));
-    }
     message
 }
 

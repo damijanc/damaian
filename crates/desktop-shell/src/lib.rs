@@ -716,6 +716,11 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         .session_store
         .read_turn_notes(&session_id)
         .map_err(|error| error.to_string())?;
+    // Each task's typed terminal outcome (spec 103 Task 6), joined by `taskId`.
+    let task_outcomes = engine
+        .session_store
+        .read_task_outcomes(&session_id)
+        .map_err(|error| error.to_string())?;
     // Each turn's newest context manifest, joined by `taskId` (spec 27 §5.3),
     // and the session's pins and restriction (spec 27 §5.4).
     let task_contexts = engine
@@ -754,7 +759,7 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
             "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}],\"conversationView\":{},\"contextState\":{{\"pins\":{},\"restrictedPaths\":{}}},\"verification\":{},\"taskControl\":{},\"workerReturns\":{},\"protectedPathsControl\":{}}}",
             session_json(&session, engine.session_store.session_mode(&session.id)),
             messages_json(&messages, &question_states),
-            task_states_json(
+            task_states_json_with_outcomes(
                 &task_statuses,
                 &task_usage,
                 &task_plans,
@@ -762,7 +767,8 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
                 &task_web_diagnostics,
                 &task_notes,
                 &task_contexts,
-                &engine.config
+                &engine.config,
+                &task_outcomes
             ),
             conversation_json(&engine, &session_id),
             serde_json::to_string(&context_pins).unwrap_or_else(|_| "[]".to_string()),
@@ -791,9 +797,10 @@ fn worker_returns_json(engine: &WorkspaceEngine, returns: &[WorkerReturn]) -> St
                 .read_completion_report(&worker_return.worker_session_id, &worker_return.task_id)
                 .ok()
                 .flatten();
-            let control = workspace_engine::returned_task_control(
+            let control = workspace_engine::returned_task_control_with_outcome(
                 &worker_return.task_status,
                 report.as_ref(),
+                worker_return.terminal_outcome.as_ref(),
             );
             let mut value = serde_json::to_value(worker_return)
                 .unwrap_or_else(|_| serde_json::json!({"returnId": worker_return.return_id}));
@@ -7255,6 +7262,7 @@ fn session_fields_json(session: &Session) -> String {
 /// would render as a turn that cost nothing. Same for `reportedCost`, which is
 /// absent unless the provider actually reported one.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn task_states_json(
     statuses: &HashMap<String, String>,
     usage: &HashMap<String, TaskUsage>,
@@ -7264,6 +7272,34 @@ fn task_states_json(
     notes: &BTreeMap<String, TurnNotes>,
     contexts: &HashMap<String, ContextManifest>,
     config: &Config,
+) -> String {
+    task_states_json_with_outcomes(
+        statuses,
+        usage,
+        plans,
+        failure_kinds,
+        web_diagnostics,
+        notes,
+        contexts,
+        config,
+        &HashMap::new(),
+    )
+}
+
+/// [`task_states_json`] with each task's typed terminal outcome (spec 103
+/// Task 6), so a reloaded turn's presentation carries the same engine-owned
+/// label, explanation and actions as the live turn.
+#[allow(clippy::too_many_arguments)]
+fn task_states_json_with_outcomes(
+    statuses: &HashMap<String, String>,
+    usage: &HashMap<String, TaskUsage>,
+    plans: &HashMap<String, TaskPlan>,
+    failure_kinds: &HashMap<String, String>,
+    web_diagnostics: &HashMap<String, Vec<WebDiagnosticRecord>>,
+    notes: &BTreeMap<String, TurnNotes>,
+    contexts: &HashMap<String, ContextManifest>,
+    config: &Config,
+    outcomes: &HashMap<String, workspace_engine::TaskTerminalOutcome>,
 ) -> String {
     let mut entries: Vec<&String> = statuses.keys().collect();
     // Sorted so the payload is stable between requests.
@@ -7347,11 +7383,20 @@ fn task_states_json(
             };
             // Spec 101 Task 3: a reloaded turn draws its stop row and any
             // action from the engine's presentation, not from its status.
+            // Spec 103 Task 6 adds the typed terminal outcome so a bounded stop
+            // keeps its engine-owned label/explanation after reload.
+            let outcome = outcomes.get(*id);
             let turn_presentation = statuses
                 .get(*id)
                 .and_then(|status| workspace_engine::TaskStatus::parse(status))
                 .map(|status| {
-                    workspace_engine::turn_presentation(&status, false, false, Some(id.as_str()))
+                    workspace_engine::turn_presentation_with_outcome(
+                        &status,
+                        false,
+                        false,
+                        Some(id.as_str()),
+                        outcome,
+                    )
                 });
             let turn_presentation_field = match turn_presentation {
                 Some(presentation) => format!(
@@ -7360,8 +7405,15 @@ fn task_states_json(
                 ),
                 None => String::new(),
             };
+            let terminal_outcome_field = match outcome {
+                Some(outcome) => format!(
+                    ",\"terminalOutcome\":{}",
+                    serde_json::to_string(outcome).unwrap_or_else(|_| "null".to_string())
+                ),
+                None => String::new(),
+            };
             format!(
-                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}{}{}{}{}}}",
+                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}{}{}{}{}{}}}",
                 escape_json(id),
                 escape_json(&statuses[*id]),
                 usage_json,
@@ -7370,6 +7422,7 @@ fn task_states_json(
                 notes_field,
                 web_diagnostics_field,
                 turn_presentation_field,
+                terminal_outcome_field,
                 context_field
             )
         })
@@ -7596,10 +7649,11 @@ mod tests {
         resolve_shell_model_api_key, run_answer_question_request, run_continue_task_request_with,
         run_fetch_decision_request_with, run_server, run_terminal_command, save_config_file,
         session_verification_json, spawn_with_shell_stack, sweep_orphaned_processes,
-        symbol_repository, task_states_json, task_usage_json, terminal_cwd_for_repo,
-        turn_progress_event, validate_context_files, validate_working_folder,
-        validate_workspace_path, verification_report_json, verify_data_dir_schema_at,
-        web_diagnostic_json, web_diagnostic_reveal_target, write_basic_response, write_sse_event,
+        symbol_repository, task_states_json, task_states_json_with_outcomes, task_usage_json,
+        terminal_cwd_for_repo, turn_progress_event, validate_context_files,
+        validate_working_folder, validate_workspace_path, verification_report_json,
+        verify_data_dir_schema_at, web_diagnostic_json, web_diagnostic_reveal_target,
+        worker_returns_json, write_basic_response, write_sse_event,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
@@ -14473,6 +14527,155 @@ mod tests {
         assert!(json.contains("\"context\""), "{json}");
         assert!(json.contains("src/lib.rs"), "{json}");
         assert!(!json.contains("item content"), "{json}");
+    }
+
+    /// Spec 103 Task 6: a reloaded task carries the typed terminal outcome and
+    /// the same engine-owned control. The browser renders these fields; it has
+    /// no status-to-label or status-to-action table.
+    #[test]
+    fn a_reloaded_task_carries_its_typed_terminal_outcome_and_engine_control() {
+        isolated_data_dir();
+        let engine = WorkspaceEngine::new(Config {
+            data_dir: isolated_data_dir().to_path_buf(),
+            enable_index_watcher: false,
+            ..Config::default()
+        });
+        let session = engine
+            .session_store
+            .create_session("repo_outcome", "Worker")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "bounded", "mock", "m")
+            .unwrap();
+        let outcome = workspace_engine::TaskTerminalOutcome::new(
+            &session.id,
+            &task.id,
+            workspace_engine::TaskTerminalOutcomeKind::NoProgress,
+        );
+        engine
+            .session_store
+            .settle_task_terminal_outcome(&task, TaskStatus::TaskNoProgress, &outcome)
+            .unwrap();
+
+        let statuses = HashMap::from([(
+            task.id.clone(),
+            TaskStatus::TaskNoProgress.as_str().to_string(),
+        )]);
+        let outcomes = HashMap::from([(task.id.clone(), outcome.clone())]);
+        let json = task_states_json_with_outcomes(
+            &statuses,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &HashMap::new(),
+            &engine.config,
+            &outcomes,
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["terminalOutcome"]["kind"], "no_progress");
+        assert_eq!(
+            value["turnPresentation"]["terminalOutcome"]["kind"],
+            "no_progress"
+        );
+        assert_eq!(value["turnPresentation"]["indicatorState"], "incomplete");
+        assert_eq!(
+            value["turnPresentation"]["stopNotice"]["label"],
+            outcome.label()
+        );
+
+        let control = workspace_engine::TaskControlService::new(&engine.session_store, None)
+            .session_control(&session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            control
+                .terminal_outcome
+                .as_ref()
+                .map(|outcome| outcome.kind),
+            Some(workspace_engine::TaskTerminalOutcomeKind::NoProgress)
+        );
+        assert!(control.primary_action.is_none());
+        assert!(control.actions.is_empty());
+    }
+
+    /// Spec 103 Task 6: the parent's returned-worker JSON carries the typed
+    /// outcome and the same engine-owned returned control.
+    #[test]
+    fn a_parent_worker_return_carries_the_typed_outcome_and_control() {
+        isolated_data_dir();
+        let engine = WorkspaceEngine::new(Config {
+            data_dir: isolated_data_dir().to_path_buf(),
+            enable_index_watcher: false,
+            ..Config::default()
+        });
+        let parent = engine
+            .session_store
+            .create_session("repo_parent", "Parent")
+            .unwrap();
+        let worker = engine
+            .session_store
+            .create_session("repo_worker", "Worker")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&worker.id, "bounded", "mock", "m")
+            .unwrap();
+        let outcome = workspace_engine::TaskTerminalOutcome::new(
+            &worker.id,
+            &task.id,
+            workspace_engine::TaskTerminalOutcomeKind::ApprovedBudgetExhausted,
+        )
+        .with_dimension(workspace_engine::TaskBudgetDimension::ActionRounds);
+        let task = engine
+            .session_store
+            .settle_task_terminal_outcome(&task, TaskStatus::TaskBudgetExhausted, &outcome)
+            .unwrap();
+        let returned = workspace_engine::WorkerReturn::new(
+            &parent.id,
+            &worker.id,
+            &task.id,
+            "branch",
+            "/worktree",
+            task.status.as_str(),
+            "stopped",
+        )
+        .with_terminal_outcome(Some(outcome));
+
+        let json = worker_returns_json(&engine, &[returned]);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value[0]["terminalOutcome"]["kind"],
+            "approved_budget_exhausted"
+        );
+        assert_eq!(
+            value[0]["control"]["terminalOutcome"]["kind"],
+            "approved_budget_exhausted"
+        );
+        assert_eq!(value[0]["control"]["outcome"], "budget_exhausted");
+        assert!(value[0]["control"]["primaryAction"].is_null());
+    }
+
+    /// Spec 103 Task 6: the browser must not grow a status-to-policy table for
+    /// the new stops. It draws the engine-owned control fields it already has.
+    #[test]
+    fn app_js_keeps_no_terminal_outcome_policy() {
+        for forbidden in [
+            "task_budget_exhausted",
+            "task_compaction_cannot_fit",
+            "task_no_progress",
+            "approved_budget_exhausted",
+            "compaction_cannot_fit",
+        ] {
+            assert!(
+                !super::APP_JS.contains(forbidden),
+                "app.js must not map terminal outcomes itself: {forbidden}"
+            );
+        }
+        assert!(super::APP_JS.contains("taskControl"));
+        assert!(super::APP_JS.contains("turnPresentation"));
     }
 
     #[test]

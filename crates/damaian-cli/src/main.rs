@@ -488,14 +488,15 @@ fn run() -> workspace_engine::Result<()> {
                     .chat_orchestrator
                     .ask(repo, &prompt, &[], &mut adapter, &mut on_token)?
             };
-            if use_color(no_color_flag) {
-                print!("{}", render_markdown_to_ansi(&result.response));
-            } else {
-                print!("{}", result.response);
-            }
-            if !result.response.ends_with('\n') {
-                println!();
-            }
+            // One engine-owned output: the response is already the typed
+            // outcome rendering when the turn stopped with one, so the CLI
+            // prints it once and never re-renders the terminal section.
+            let (stdout, stderr) = turn_output(
+                &result.response,
+                result.task_control.terminal_outcome.as_ref(),
+                use_color(no_color_flag),
+            );
+            print!("{stdout}");
             // Spec 103 Task 2: the CLI has no interactive plan-review route, so
             // it presents the engine-owned budget rows verbatim. It chooses no
             // labels, units, dimensions or policy.
@@ -513,6 +514,7 @@ fn run() -> workspace_engine::Result<()> {
                     .collect::<Vec<_>>()
                     .join(",")
             );
+            eprint!("{stderr}");
         }
         "verify" => {
             let repo = require_arg(&args, 1, "<repo>")?;
@@ -555,14 +557,15 @@ fn run() -> workspace_engine::Result<()> {
                     &mut sink,
                 )?;
             }
-            if use_color(no_color_flag) {
-                print!("{}", render_markdown_to_ansi(&result.response));
-            } else {
-                print!("{}", result.response);
-            }
-            if !result.response.ends_with('\n') {
-                println!();
-            }
+            // One engine-owned output: the response is already the typed
+            // outcome rendering when the turn stopped with one, so the CLI
+            // prints it once and never re-renders the terminal section.
+            let (stdout, stderr) = turn_output(
+                &result.response,
+                result.task_control.terminal_outcome.as_ref(),
+                use_color(no_color_flag),
+            );
+            print!("{stdout}");
             if let Some(patch) = &result.patch_proposal {
                 // Engine-owned repair-scope facts, printed verbatim (spec 102
                 // Task 5). The CLI classifies no path.
@@ -571,6 +574,7 @@ fn run() -> workspace_engine::Result<()> {
                 }
                 eprintln!("repair_patch={}", escape(&patch.patch_id));
             }
+            eprint!("{stderr}");
         }
         "continue-repair" => {
             let repo = require_arg(&args, 1, "<repo>")?;
@@ -595,20 +599,22 @@ fn run() -> workspace_engine::Result<()> {
                 adapter.as_mut(),
                 &mut sink,
             )?;
-            if use_color(no_color_flag) {
-                print!("{}", render_markdown_to_ansi(&result.response));
-            } else {
-                print!("{}", result.response);
-            }
-            if !result.response.ends_with('\n') {
-                println!();
-            }
+            // One engine-owned output: the response is already the typed
+            // outcome rendering when the turn stopped with one, so the CLI
+            // prints it once and never re-renders the terminal section.
+            let (stdout, stderr) = turn_output(
+                &result.response,
+                result.task_control.terminal_outcome.as_ref(),
+                use_color(no_color_flag),
+            );
+            print!("{stdout}");
             if let Some(patch) = &result.patch_proposal {
                 if let Some(scope) = &patch.repair_scope {
                     eprintln!("{}", scope.render());
                 }
                 eprintln!("repair_patch={}", escape(&patch.patch_id));
             }
+            eprint!("{stderr}");
         }
         "propose-edit" => {
             let repo = require_arg(&args, 1, "<repo>")?;
@@ -1685,6 +1691,47 @@ fn command_proposal_json(proposal: &CommandProposal) -> String {
     )
 }
 
+/// One turn's user-facing output: the engine-owned response on stdout, and the
+/// engine-owned terminal section when the response is not already that section.
+///
+/// A bounded stop's response *is* `TaskTerminalOutcome::render()`, so printing
+/// both would repeat the label and explanation. The CLI still maps no status
+/// string and decides no action: both halves are the engine's text.
+fn turn_output(
+    response: &str,
+    outcome: Option<&workspace_engine::TaskTerminalOutcome>,
+    use_color: bool,
+) -> (String, String) {
+    let rendered = if use_color {
+        render_markdown_to_ansi(response)
+    } else {
+        response.to_string()
+    };
+    let mut stdout = rendered;
+    if !stdout.ends_with('\n') {
+        stdout.push('\n');
+    }
+    (stdout, terminal_outcome_output(response, outcome))
+}
+
+/// The terminal section to print after the response, if the response does not
+/// already carry it.
+fn terminal_outcome_output(
+    response: &str,
+    outcome: Option<&workspace_engine::TaskTerminalOutcome>,
+) -> String {
+    let Some(outcome) = outcome else {
+        return String::new();
+    };
+    let rendered = outcome.render();
+    if response.trim_end() == rendered.trim_end() {
+        // The response already is the engine rendering; printing the section
+        // again would show the same label and explanation twice.
+        return String::new();
+    }
+    rendered
+}
+
 fn escape(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -1696,6 +1743,8 @@ fn escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// Spec 102 Task 5: the CLI prints the engine's repair-scope rendering
     /// verbatim. It must not classify paths or decide whether repair may go on.
     #[test]
@@ -1717,6 +1766,88 @@ mod tests {
             assert!(
                 !production.contains(forbidden),
                 "the CLI must not rebuild repair-scope facts: {forbidden}"
+            );
+        }
+    }
+
+    /// Spec 103 Task 6: the CLI prints the engine-owned terminal label,
+    /// explanation and available actions exactly once. It maps no status string
+    /// and chooses no action.
+    #[test]
+    fn a_bounded_stop_is_printed_exactly_once() {
+        let outcome = workspace_engine::TaskTerminalOutcome::new(
+            "ses_test",
+            "task_test",
+            workspace_engine::TaskTerminalOutcomeKind::ApprovedBudgetExhausted,
+        )
+        .with_dimension(workspace_engine::TaskBudgetDimension::ActionRounds)
+        .with_figures(workspace_engine::TaskOutcomeFigures {
+            approved: 8,
+            used: 8,
+            required: None,
+            remaining: Some(0),
+        });
+        // The engine's response for a bounded stop *is* the typed rendering.
+        let response = outcome.render();
+        let label = outcome.label();
+        let explanation = outcome.explanation();
+
+        let (stdout, stderr) = turn_output(&response, Some(&outcome), false);
+        let combined = format!("{stdout}{stderr}");
+        assert_eq!(combined.matches(&label).count(), 1, "{combined}");
+        assert_eq!(combined.matches(&explanation).count(), 1, "{combined}");
+        assert!(
+            stdout.contains(&label),
+            "the response still carries the engine rendering: {stdout}"
+        );
+        assert!(stderr.is_empty(), "the section is not repeated: {stderr}");
+
+        // Colour rendering styles the same text; it must not duplicate it.
+        let (stdout, stderr) = turn_output(&response, Some(&outcome), true);
+        let combined = format!("{stdout}{stderr}");
+        assert_eq!(combined.matches(&label).count(), 1, "{combined}");
+        assert_eq!(combined.matches(&explanation).count(), 1, "{combined}");
+    }
+
+    /// A response that is not the typed rendering still gets the terminal
+    /// section, once, from the engine's own text.
+    #[test]
+    fn a_response_without_the_section_still_prints_it_once() {
+        let outcome = workspace_engine::TaskTerminalOutcome::new(
+            "ses_test",
+            "task_test",
+            workspace_engine::TaskTerminalOutcomeKind::NoProgress,
+        );
+        let (stdout, stderr) = turn_output("Done.", Some(&outcome), false);
+        let combined = format!("{stdout}{stderr}");
+        assert_eq!(combined.matches(&outcome.label()).count(), 1, "{combined}");
+        assert_eq!(
+            combined.matches(&outcome.explanation()).count(),
+            1,
+            "{combined}"
+        );
+        assert_eq!(stderr, outcome.render());
+    }
+
+    /// The CLI module itself owns no terminal policy: no status-to-behaviour
+    /// table, no kind match, no hand-written label.
+    #[test]
+    fn terminal_outcome_policy_stays_engine_owned() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the production source");
+        for forbidden in [
+            "task_budget_exhausted",
+            "task_compaction_cannot_fit",
+            "task_no_progress",
+            "TaskTerminalOutcomeKind::",
+            "approved_budget_exhausted",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "the CLI must not map a terminal status itself: {forbidden}"
             );
         }
     }

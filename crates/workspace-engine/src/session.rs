@@ -113,6 +113,12 @@ pub struct WorkerReturn {
     pub worktree: String,
     /// [`TaskStatus::as_str`] of the worker task when it finished.
     pub task_status: String,
+    /// The typed terminal outcome when the task stopped at an approved-task
+    /// bound (spec 103 Task 6). Every historical return written before this
+    /// form decodes as `None`, so the durable record stays backward
+    /// compatible; the parent's result card then keeps its pre-existing shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_outcome: Option<crate::task_outcomes::TaskTerminalOutcome>,
     pub response: String,
     pub created_at_ms: u128,
 }
@@ -137,9 +143,23 @@ impl WorkerReturn {
             branch: branch.into(),
             worktree: worktree.into(),
             task_status: task_status.into(),
+            terminal_outcome: None,
             response: response.into(),
             created_at_ms: now_millis(),
         }
+    }
+
+    /// Attaches the typed terminal outcome a bounded task stopped with.
+    ///
+    /// A builder rather than a new constructor: historical callers and stored
+    /// records keep the old shape, and a return without a bounded outcome is
+    /// still exactly what it was before spec 103 Task 6.
+    pub fn with_terminal_outcome(
+        mut self,
+        outcome: Option<crate::task_outcomes::TaskTerminalOutcome>,
+    ) -> Self {
+        self.terminal_outcome = outcome;
+        self
     }
 }
 
@@ -379,6 +399,18 @@ pub enum TaskStatus {
     /// the other that it needed more money — and collapsing them would leave
     /// the eval harness unable to tell them apart. Spec 21 §5.4.
     TokenBudgetExhausted,
+    /// Stopped because a worker's explicitly approved task execution budget was
+    /// exhausted (spec 103 Task 6). Distinct from the legacy round/token
+    /// ceilings beside it: this bound is the one the user reviewed with the
+    /// plan, and the typed outcome records which dimension ran out.
+    TaskBudgetExhausted,
+    /// Stopped because the pinned/fixed minimum could not fit the configured
+    /// request-window share (spec 103 Task 6 requirement 10). Non-success:
+    /// the task did not complete, and the same state cannot be sent.
+    TaskCompactionCannotFit,
+    /// Stopped because the engine-owned segment progress state repeated
+    /// (spec 103 Task 6, spec 102's progress rule).
+    TaskNoProgress,
     Interrupted,
     UnknownExternalOutcome,
 }
@@ -403,6 +435,9 @@ impl TaskStatus {
             Self::Cancelled,
             Self::ToolBudgetExhausted,
             Self::TokenBudgetExhausted,
+            Self::TaskBudgetExhausted,
+            Self::TaskCompactionCannotFit,
+            Self::TaskNoProgress,
             Self::Interrupted,
             Self::UnknownExternalOutcome,
         ]
@@ -424,6 +459,9 @@ impl TaskStatus {
             Self::Cancelled => "cancelled",
             Self::ToolBudgetExhausted => "tool_budget_exhausted",
             Self::TokenBudgetExhausted => "token_budget_exhausted",
+            Self::TaskBudgetExhausted => "task_budget_exhausted",
+            Self::TaskCompactionCannotFit => "task_compaction_cannot_fit",
+            Self::TaskNoProgress => "task_no_progress",
             Self::Interrupted => "interrupted",
             Self::UnknownExternalOutcome => "unknown_external_outcome",
         }
@@ -452,6 +490,9 @@ impl TaskStatus {
                 | Self::Cancelled
                 | Self::ToolBudgetExhausted
                 | Self::TokenBudgetExhausted
+                | Self::TaskBudgetExhausted
+                | Self::TaskCompactionCannotFit
+                | Self::TaskNoProgress
         )
     }
 
@@ -486,6 +527,9 @@ impl TaskStatus {
             | Self::Cancelled
             | Self::ToolBudgetExhausted
             | Self::TokenBudgetExhausted
+            | Self::TaskBudgetExhausted
+            | Self::TaskCompactionCannotFit
+            | Self::TaskNoProgress
             | Self::Interrupted
             | Self::UnknownExternalOutcome => false,
         }
@@ -684,6 +728,18 @@ pub struct TaskUsage {
     pub runs_without_cache_report: u32,
 }
 
+/// The result of settling one typed terminal outcome (spec 103 Task 6).
+///
+/// `preserved_repair_stall` is the spec 102 precedence decision: the durable log
+/// already stopped this exact task with a `verification_repair_stalled`, so the
+/// requested status and outcome were not written. A caller that presents the
+/// turn must use the returned task and must not claim the newer outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskTerminalSettlement {
+    pub task: Task,
+    pub preserved_repair_stall: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     data_dir: PathBuf,
@@ -850,6 +906,180 @@ impl SessionStore {
             }
         }
         Ok(found)
+    }
+
+    /// Settles a bounded task with its typed terminal outcome in one append.
+    ///
+    /// Spec 103 Task 6 requirement 10: the status and the typed outcome are one
+    /// event and one serialized JSONL line. A crash or partial write cannot
+    /// leave a terminal status whose outcome is missing, or an outcome attached
+    /// to a status that never landed.
+    ///
+    /// Spec 102's repair-stall result is authoritative. When the durable log
+    /// already holds a `verification_repair_stalled` event for this exact task,
+    /// this method writes nothing and returns the task unchanged: a later
+    /// budget or progress stop must not overwrite the stall that already stopped
+    /// verification.
+    pub fn settle_task_terminal_outcome(
+        &self,
+        task: &Task,
+        status: TaskStatus,
+        outcome: &crate::task_outcomes::TaskTerminalOutcome,
+    ) -> Result<Task> {
+        Ok(self
+            .settle_task_terminal_outcome_checked(task, status, outcome)?
+            .task)
+    }
+
+    /// [`Self::settle_task_terminal_outcome`] with the precedence decision.
+    ///
+    /// A caller that presents the result needs to know whether its outcome was
+    /// actually written: when a spec 102 repair stall won the atomic settlement
+    /// race, the returned task is the previous one and the newer outcome must
+    /// not be shown, audited or carried as the turn's presentation.
+    pub fn settle_task_terminal_outcome_checked(
+        &self,
+        task: &Task,
+        status: TaskStatus,
+        outcome: &crate::task_outcomes::TaskTerminalOutcome,
+    ) -> Result<TaskTerminalSettlement> {
+        if outcome.task_id != task.id || outcome.session_id != task.session_id {
+            return Err(ClientError::InvalidInput(format!(
+                "Terminal outcome for {} cannot describe task {}",
+                outcome.task_id, task.id
+            )));
+        }
+        if status != outcome.task_status() {
+            return Err(ClientError::InvalidInput(format!(
+                "Terminal outcome {} maps to {}, not {}",
+                outcome.kind.as_str(),
+                outcome.task_status().as_str(),
+                status.as_str()
+            )));
+        }
+        if !status.is_terminal() || status.is_successful() {
+            return Err(ClientError::InvalidInput(format!(
+                "Terminal outcome {} cannot settle a task as {}",
+                outcome.kind.as_str(),
+                status.as_str()
+            )));
+        }
+        let mut updated = task.clone();
+        updated.status = status;
+        updated.completed_at_ms = Some(now_millis());
+        let outcome_json = serde_json::to_string(outcome)
+            .map_err(|error| ClientError::Io(format!("terminal outcome serialization: {error}")))?;
+        let payload = format!(
+            "{{\"task\":{},\"terminalOutcome\":{}}}",
+            task_json(&updated),
+            outcome_json
+        );
+        let mut lock = SessionLogLock::acquire(&self.session_lock_path(&task.session_id))?;
+        let content =
+            fs::read_to_string(self.session_log_path(&task.session_id)).unwrap_or_default();
+        if repair_stall_recorded(&content, &task.id) {
+            return Ok(TaskTerminalSettlement {
+                task: task.clone(),
+                preserved_repair_stall: true,
+            });
+        }
+        self.append_session_event_locked(
+            &task.session_id,
+            "task_status_updated",
+            &payload,
+            &mut lock,
+        )?;
+        Ok(TaskTerminalSettlement {
+            task: updated,
+            preserved_repair_stall: false,
+        })
+    }
+
+    /// The newest typed terminal outcome for `task_id`, if any (spec 103 Task 6).
+    ///
+    /// The reader is deliberately exact-identity: unlike a task budget or a
+    /// segment total, a terminal outcome describes only the task that stopped.
+    /// It never follows `plan_resumed` ancestry, so a continuation task does not
+    /// inherit its predecessor's stop. A record for another task, a payload that
+    /// does not decode, an embedded identity that disagrees with the event, and
+    /// a newer format version are all skipped: a corrupt or future event must
+    /// not hide a readable earlier one or attach itself to another task.
+    /// Historical logs have no such payload and read as `None`.
+    pub fn read_task_outcome(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<crate::task_outcomes::TaskTerminalOutcome>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        let mut found = None;
+        for event in active_events(&content) {
+            if event.event_type != "task_status_updated" {
+                continue;
+            }
+            let task = event.payload.get("task").unwrap_or(&event.payload);
+            if task.get("id").and_then(|value| value.as_str()) != Some(task_id) {
+                continue;
+            }
+            let Some(value) = event.payload.get("terminalOutcome") else {
+                continue;
+            };
+            let Ok(outcome) =
+                serde_json::from_value::<crate::task_outcomes::TaskTerminalOutcome>(value.clone())
+            else {
+                continue;
+            };
+            if outcome.format_version > crate::task_outcomes::TASK_TERMINAL_OUTCOME_FORMAT_VERSION {
+                continue;
+            }
+            if outcome.task_id != task_id || outcome.session_id != session_id {
+                continue;
+            }
+            found = Some(outcome);
+        }
+        Ok(found)
+    }
+
+    /// Every task in a session that settled with a typed terminal outcome,
+    /// keyed by task id (spec 103 Task 6).
+    ///
+    /// A reloaded session uses this once instead of re-reading the log per task.
+    /// The same identity and version rules as [`Self::read_task_outcome`] apply,
+    /// and the newest readable record wins.
+    pub fn read_task_outcomes(
+        &self,
+        session_id: &str,
+    ) -> Result<HashMap<String, crate::task_outcomes::TaskTerminalOutcome>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(HashMap::new());
+        };
+        let mut outcomes = HashMap::new();
+        for event in active_events(&content) {
+            if event.event_type != "task_status_updated" {
+                continue;
+            }
+            let task = event.payload.get("task").unwrap_or(&event.payload);
+            let Some(task_id) = task.get("id").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(value) = event.payload.get("terminalOutcome") else {
+                continue;
+            };
+            let Ok(outcome) =
+                serde_json::from_value::<crate::task_outcomes::TaskTerminalOutcome>(value.clone())
+            else {
+                continue;
+            };
+            if outcome.format_version > crate::task_outcomes::TASK_TERMINAL_OUTCOME_FORMAT_VERSION {
+                continue;
+            }
+            if outcome.task_id != task_id || outcome.session_id != session_id {
+                continue;
+            }
+            outcomes.insert(task_id.to_string(), outcome);
+        }
+        Ok(outcomes)
     }
 
     /// The latest `failureKind` of every task in the session, keyed by task id.
@@ -4852,6 +5082,29 @@ fn active_events(content: &str) -> Vec<SessionEvent> {
         .into_iter()
         .filter(|event| event.seq <= limit || event.seq > marker_seq)
         .collect()
+}
+
+/// Whether the active log already holds a spec 102 repair-stall for `task_id`.
+///
+/// The event is read through the typed `VerificationEvent` so the task identity
+/// is the one the enum carries, never a guessed JSON key. A corrupt payload is
+/// not a stall: an unreadable event must not silently authorise overwriting a
+/// real terminal result, but it also must not invent one.
+fn repair_stall_recorded(content: &str, task_id: &str) -> bool {
+    active_events(content).iter().any(|event| {
+        event.event_type == "verification_repair_stalled"
+            && serde_json::from_value::<crate::verification::VerificationEvent>(
+                event.payload.clone(),
+            )
+            .ok()
+            .is_some_and(|typed| {
+                typed.task_id() == task_id
+                    && matches!(
+                        typed,
+                        crate::verification::VerificationEvent::RepairStalled { .. }
+                    )
+            })
+    })
 }
 
 /// Whether the active log contains this task's creation or a later status
