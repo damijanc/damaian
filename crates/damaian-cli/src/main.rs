@@ -496,6 +496,14 @@ fn run() -> workspace_engine::Result<()> {
             if !result.response.ends_with('\n') {
                 println!();
             }
+            // Spec 103 Task 2: the CLI has no interactive plan-review route, so
+            // it presents the engine-owned budget rows verbatim. It chooses no
+            // labels, units, dimensions or policy.
+            if let Some(plan) = &result.plan_proposal
+                && let Some(review) = &plan.budget_review
+            {
+                eprint!("{}", review.render());
+            }
             eprintln!(
                 "context_files={}",
                 result

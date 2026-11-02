@@ -35,6 +35,7 @@ use crate::model::TokenUsage;
 use crate::patch_engine::ProposedPatch;
 use crate::plan::TaskPlan;
 use crate::session::{DanglingAction, PendingApprovalRef, SessionStore, TaskStatus};
+use crate::task_budget::TaskBudgetReview;
 use crate::validation::{CommandProposal, CommandStore};
 use crate::verification::{VerificationEvent, fold_verification};
 use std::collections::{HashMap, HashSet};
@@ -459,6 +460,10 @@ pub enum ReattachedApproval {
         proposal_id: String,
         plan: TaskPlan,
         deferred_action: String,
+        /// The engine-proposed task budget this review offered, if any
+        /// (spec 103 Task 2). Re-read from the paused turn so a worker restart
+        /// reattaches the same values rather than reconstructing them.
+        budget_review: Option<TaskBudgetReview>,
     },
     /// A provider-fallback offer the turn had paused on (spec 56). Like a
     /// plan review its paused turn is on disk, so the offer is made again
@@ -802,11 +807,15 @@ fn reattach_plan(
     let deferred_action = paused
         .plan_review_deferred_action(proposal_id)
         .ok_or_else(|| format!("the paused turn behind plan review {proposal_id} is gone"))?;
+    let budget_review = paused
+        .plan_budget_review(proposal_id)
+        .map_err(|error| format!("plan review {proposal_id} has an unreadable budget: {error}"))?;
     Ok(ReattachedApproval::Plan {
         task_id: task_id.to_string(),
         proposal_id: proposal_id.to_string(),
         plan,
         deferred_action,
+        budget_review,
     })
 }
 

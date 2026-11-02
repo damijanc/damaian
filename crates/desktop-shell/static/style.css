@@ -5508,6 +5508,40 @@ body.worker-view #chat-model-menu {
   line-height: 1.45;
 }
 
+/* The engine-owned task budget (spec 103 Task 2). Rows are rendered as data;
+   the card chooses no labels, units or values. */
+.plan-budget-review {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 11px;
+}
+
+.plan-budget-note {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.plan-budget-rows {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 0;
+}
+
+.plan-budget-rows dt {
+  color: var(--muted);
+}
+
+.plan-budget-rows dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
 .plan-review-list {
   display: grid;
   gap: 6px;

@@ -1,6 +1,6 @@
 # Feature Spec: Bounded Worker Continuation and Within-Turn Compaction
 
-Status: Not started
+Status: In progress (started 2026-11-01)
 Order: 103 of 106
 Plan: none. This is a capability gap exposed by the 2026-10-31 single-worker
 attempt and `docs/PLAN/OBSERVATIONS.md` observation 42.
@@ -95,3 +95,189 @@ compaction changes what is sent rather than what is remembered.
   byte-identical before and after compaction.
 - No-progress and total-budget exhaustion stop with distinct non-success
   outcomes that survive worker restart.
+
+## 6. Implementation Plan
+
+**Started:** 2026-11-01
+
+### Global constraints
+
+- The engine owns budget validation, segment decisions, compaction eligibility,
+  pinned safety state and terminal outcomes. Desktop, CLI and worker transports
+  render or carry typed engine facts; they do not recreate those rules.
+- An approved task budget authorises only automatic segment boundaries. It
+  never approves a patch, command, check, browser action, MCP call, question,
+  provider fallback or any other existing decision.
+- The session and audit stores remain the complete append-only record. Request
+  compaction changes only the messages sent to the model and never rewrites or
+  deletes stored calls, results or approvals.
+- Repository configuration is untrusted. Every task-budget setting is
+  restrict-only at repository scope, and every new config field must be
+  classified explicitly in the overlay policy.
+- Compaction stores only redacted structured facts, hashes, counts and bounded
+  excerpts. It must not create a second unredacted tool-output store or promote
+  tool output into instructions.
+- Historical sessions, pending turns and worker records load with no approved
+  task budget and retain the current explicit **Continue** behavior.
+- Each task below is a fresh agent session. It implements only its named slice,
+  runs scoped checks, updates this table and stops. Workspace-wide Clippy and
+  tests remain for CI under `AGENTS.md`.
+
+| Task | State | Durable result |
+|---|---|---|
+| 1 · Durable task-budget model and policy | Done 2026-11-01 | `TaskExecutionBudget` and `TaskBudgetPolicy` now own the four finite dimensions, absolute product ceilings and inclusive ceiling validation (`task_budget.rs`). Eight explicit `worker_task_budget_*` config fields (four proposals, four ceilings) are exhaustively classified as capabilities; repository and profile overlays use the existing restrict-only merge, and `EffectivePolicy` labels every key. `Config::task_budget_policy()` reports the effective proposal and ceiling, and `Config::validate_task_budget()` rejects zero, overflow and above-ceiling values. `SessionStore::approve_plan_with_budget` writes one `plan_approved` event whose typed `PlanApproval` payload carries the reviewed budget beside `taskId` and `approvedBy`, so approval and allowance are one JSONL line that a partial write cannot split; `approve_plan` writes the same payload without a budget and remains compatible with historical readers. `read_task_budget` follows only `plan_resumed` ancestry, drops a budget when a new plan is created, lets each new `plan_approved` replace the task's earlier budget so the newest approval state wins, and skips a decoded budget that is zero, above an absolute ceiling or otherwise corrupt. Old plan approvals, the committed legacy session fixture and pending turns read as `None`. Evidence: new `tests/task_budget.rs` (11 tests), `permission_profiles` (87), `plan` (69), `task_budget` unit tests (4) and `foundation` config tests (6) pass; scoped clippy is clean. No change to the live round loop, worker host, plan-review UI/JSON, CLI presentation or model request construction. |
+| 2 · Worker plan-review approval surface | Done 2026-11-01 | `AgentPlanProposal` and the persisted `PendingPlanReview` now carry an optional `TaskBudgetReview`: the exact `Config::task_budget_policy()` proposal plus engine-owned title, note, typed dimension, label, value and unit rows. Only `SessionStore::worker_record` decides whether a review is offered one; inline sessions and historical pending turns stay budgetless. Approval goes through `resume_after_plan_decision_with_budget`. It now validates the whole decision before `PendingCommandStore::take` and before any durable write: the budget (missing, mismatched, raised, altered, zero, corrupt or above-current-ceiling) and, for an approval with a revision, the current plan plus the applied revision. The shared `validate_plan_approval` runs in the orchestrator and again in the atomic store writer, so duplicate step ids, a foreign task identity, an unusable step id or more than one in-progress step are refused while the pending review stays answerable; legitimate deletion, reorder and retitle still work. A budgeted revision and its budget are one `plan_approved` event: `PlanApproval` optionally carries the reviewed `TaskPlan`, and both plan replay functions treat it as current while `plan_created` stays readable; the budgetless two-event shape is unchanged. Replay ignores an embedded approval plan whose `task_id` disagrees with the approval key or whose structure is invalid/corrupt, so a hand-edited log cannot attach task B's plan under task A. Declining records neither approval. The effective ceiling is re-read only for an approval, so a decline still accepts the exact reviewed budget after configuration lowered that ceiling while the review waited — declining authorises no spend, and the user must always be able to refuse — while an altered budget on a decline is still refused and leaves the review answerable. Desktop plan JSON transports `budgetReview` verbatim when the engine offered one and omits the key entirely when it did not, so live inline and recovered historical budgetless reviews keep their exact pre-budget object shape; budgeted cases add exactly that key. `createPlanReview` loops over the engine rows with no dimension labels or policy and returns the exact typed budget over HTTP or the worker socket. `POST /api/worker-control` now forwards the optional `budget` form value to the socket's `budget` field for both approve and reject, and a route-level test proves the exact value reaches the supervisor request. Worker startup now consults durable task status, the pending decision and the paused turn: the newest actionable plan review is reattached as `WaitingForApproval` with `DecisionKind::Plan`, and the new progress file receives the same typed approval payload (including the persisted optional budget) and waiting status, so the restarted process can answer it over its control socket. The budget is read from the persisted review, never rebuilt from current configuration; historical reviews reattach budgetless, and missing or corrupt state restores nothing. This is the narrow exception to spec 57's restart rule; command, patch, check, fallback and round-budget decisions keep their old behaviour, and the 57 proposal records that. The live refusal path has the same rule: `WorkerHost::decide` clears its in-memory slot when it hands a plan job over, so a decision the engine refuses before `PendingCommandStore::take` (missing, mismatched, raised, altered, zero or above-current-ceiling budget, or an invalid revision) used to finish with an idle status while the durable review was still pending. `TurnDriver` now keeps the plan proposal id across the job and, on `Err`, re-reads durable state for that exact id: the task must still be `WaitingForApproval`, its pending decision must name the same `plan` proposal, the plan must belong to the task and validate, and the paused turn must still hold that plan review. Only then does it re-append the review card and a `waiting_for_approval` status carrying the error and settle the host back on the same proposal with `DecisionKind::Plan`. A consumed pending turn or any identity mismatch keeps the existing idle/terminal path, and no other decision kind is affected. The CLI has no interactive plan-review route, so `damaian ask` prints the engine rows with `TaskBudgetReview::render` and applies no rules of its own. Parent plan handoff still carries no budget; the receiving worker is offered only its own effective proposal. Evidence: `tests/plan_budget_review.rs` now has 15 tests, including invalid-revision refusal before the take with no event and a successful later decision, foreign/corrupt embedded-plan replay, and a budgeted decline under a ceiling lowered after the review (`a_decline_survives_a_ceiling_lowered_while_the_review_waited`, which fails against the earlier approval-only check), the desktop has exact shape tests for live inline, recovered historical and budgeted plan JSON, the route-level budget relay test, and a host/restart test that starts from durable waiting state, sees `WaitingForApproval` with the exact payload, sends the persisted budget over the control socket and resumes successfully. Focused `plan`, `plan_turn`, `task_budget`, `recovery_prompt` and desktop worker/control/recovery/plan tests pass; scoped Clippy is clean for workspace-engine, desktop-shell and damaian-cli; format, `node --check`, strict spec check, typos and `git diff --check` pass. `npm run lint:web` reports only the repository's known unrelated descending-specificity warning in `style.css`; it is not warning-free. After the refusal-path fix, `worker::tests::a_refused_plan_budget_keeps_the_durable_review_answerable` starts from a durable budgeted worker plan review, submits an altered budget over the live control socket, and asserts the worker stays `WaitingForApproval` on the same proposal with the durable review and its exact budget intact, the review card re-appended and the refusal error in progress; it then approves the exact reviewed budget over the same socket and observes the resumed turn finish. The test fails against the previous idle behaviour. Re-checked after the fix: `cargo fmt --all`; that focused test; the desktop-shell slice filtered to worker/control/recovery/plan (98 tests); and scoped Clippy for desktop-shell pass. `git diff --check` passes. The full gate is left to CI. |
+| 3 · Deterministic within-turn compactor | Done 2026-11-01 | New pure `workspace-engine/src/within_turn_compaction.rs` (`pub mod within_turn_compaction`, re-exported for Task 4) reduces a borrowed request view without touching `chat.rs`, the live model path, the session store or the audit log. `WithinTurnCompactionRequest` takes the messages, completed rounds, an explicit `BTreeSet` of pinned call ids, an explicit token target and a `SecretScanner`. Each `CompletedToolCall` supplies the typed facts the reducer must not infer: `CompactedToolKind`, a typed `ToolIdentity` (`Path`, `Command`, `Query`, `Url`, `Endpoint`), optional `LineRange`, `ToolResultOutcome` and an explicit `include_excerpt` flag. Only matching `tool`-role bodies change; assistant tool-call messages, message order, batched calls and every `tool_call_id` pairing stay byte-for-byte. Provider-valid pairing is validated before any size decision: unique completed ids across rounds, exactly one declaration on a message whose role is exactly `assistant` and one `tool` result per completed id (`tool_calls` on any other role are not a declaration), the result after its declaration, and every call in one `CompletedToolRound` declared by the same assistant message. A violation returns `WithinTurnCompactionInvalidInput` (`DuplicateCompletedCallId`, `DuplicateToolCallDeclaration`, `DuplicateToolResult`, `MissingToolCallDeclaration`, `MissingToolResult`, `ResultBeforeDeclaration`, `SplitRound`) as `WithinTurnCompactionOutcome::InvalidInput`, which carries no messages and is distinct from a size `CannotFit`; malformed input fails closed instead of picking or skipping an entry. Unrelated history calls need no metadata and pinned ids naming no round are accepted. Token accounting measures the complete provider-visible view through `provider_messages_json`/`provider_message_json` in `model.rs`, which `model_request_json` also uses: role, content, tool-call ids/names/arguments, `tool_call_id`, `reasoning_content` and JSON/array framing count even though they are constant across compaction. Request-level before/after/minimum estimates use the serialized message array; each fact's before/after covers its complete tool message, and a replacement must reduce the serialized array. Rounds are visited oldest-first and eligible results are replaced until the target fits; a replacement that would not reduce the estimate is skipped, and later results stay verbatim once the target is reached. Each body becomes manifest format 1: deterministic JSON containing only tool kind, redacted identity, optional typed range, outcome, a `sha256:` result hash and an optional excerpt. The hash is over the `SecretScanner`-redacted body, identities and excerpts are redacted, and the excerpt is capped at 400 characters (including its truncation marker). Tool output stays serialized JSON inside the tool role, so injection-shaped prose cannot become a system/user instruction. `Succeeded` and `FailedResolved` are eligible; `FailedUnresolved` and `UnknownExternalOutcome` remain verbatim even when not pinned. `WithinTurnCompactionOutcome` distinguishes `Unchanged`, `Compacted`, `InvalidInput` and `CannotFit`; the `CannotFit` refusal carries no messages and reports target, before and deterministic minimum token estimates plus eligible/pinned/ineligible/compacted counts and per-result facts, so Task 4 cannot send a partially authorised request. Facts carry redacted identity, hash, outcome, range, round/call identity and complete-message before/after token estimates but no body. Evidence: `tests/within_turn_compaction.rs` (24 tests) covers deterministic byte-for-byte output and ordering, path/range and command identity, batched pairing, identity/excerpt redaction with no raw secret in output or facts, quoted injection-shaped output, unresolved/unknown ineligibility, exact complete-message estimates and the content-only-fit false-positive case, oldest-first selection, pinned verbatim results, the typed minimum-too-large refusal, explicit/bounded excerpts, immutable caller input, duplicate completed ids/results/declarations, missing result/declaration, a non-assistant message carrying the completed id in `tool_calls`, reversed ordering, split-round metadata, invalid-input versus size-refusal outcomes, and unrelated/unused pins; 2 inline unit tests cover the fixed excerpt bound. `cargo fmt --all -- --check`, `cargo nextest run -p workspace-engine --test within_turn_compaction` (24 passed), the module's 2 inline tests, `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`, `npm run specs:check -- --strict` and `git diff --check` pass. Workspace-wide Clippy/tests are left to CI. |
+| 4 · Safety-pinned request integration | Done 2026-11-02 | New `workspace-engine/src/request_preparation.rs` owns the request decision. `prepare_request` measures the complete `model_request_json` body, uses `Config::context_window()` times `conversation_window_share` basis points as the deterministic threshold, subtracts the exact unchanged message-array overhead (model/options/native tool schemas) to derive a message target, re-measures the actual serialized request after reduction, and returns no request on `CannotFit` or `InvalidInput`. An `Unchanged` reduction is never sent after the caller has measured the complete request over the share: it is recorded as one `CannotFit` refusal with no request. When fixed request overhead alone exceeds the threshold, `request_tokens_minimum` is the exact minimum measured by serializing the same `ModelRequest` with an empty message array, not `request_tokens_before`. `RequestPreparationOutcome`, `WithinTurnCompactionAttempt` and `WithinTurnCompactionAttemptOutcome` are the typed engine surface for Task 6; the live loop currently fails closed through `ClientError::RequestPreparation` (`request_preparation_failed`). No resolved window preserves the pre-Task-4 request exactly. The live path is `ChatOrchestrator::build_turn_request`. Below the threshold it sends the legacy `bounded_messages` view byte for byte and writes no attempt. When the complete request crosses the threshold, safety-first selection takes precedence over the legacy message-count cut: the head, every system/user/plain-assistant message and every completed round holding a pinned result stay; `agent_max_turn_messages` remains a restrict-only bound on the remaining unpinned completed rounds; a native call the tracker cannot describe is pinned rather than guessed at; and `present_completed_rounds` describes only rounds still present in the selected view. The compatibility decision is therefore explicit: legacy byte-identical below the share, safety-first selection plus compaction at or above it, and a fail-closed refusal when the pinned/fixed minimum cannot fit or when the reducer makes no change at all. Completed native rounds are tracked at dispatch from `ToolCall`, `ToolAction` and `ActionOutcome`, preserving batched assistant rounds. `TrackedCompletedToolCall` carries Task 3's typed kind/identity/range/outcome plus the plan step open at dispatch and the canonical read key; `CompletedToolTracker` persists as `PendingChatTurn.completed_tool_rounds` with `#[serde(default)]`. Resume paths seed from the pending turn; the approved command and question resume dispatches add their typed result explicitly. `RecordedCall.compacted` records reads whose bodies became manifests. Pins are derived only from typed state: the latest result for every open plan step, every non-read or non-succeeded result, protected paths, safety/base hashes from plan and step evidence and findings with a file hash, open error-finding origin refs, and every unresolved or unknown outcome. The system/user/plain-assistant messages, approved plan and budget, pending proposal identifiers and bounded turn notes are not tool bodies, so safety selection keeps them verbatim. A budgeted worker plan approval puts the exact typed `TaskExecutionBudget` the user approved into that user note through `TaskExecutionBudget::approval_note`: all four values, taken from the validated reviewed/persisted budget, never a ceiling and never a UI-derived figure. A budgetless inline or historical approval keeps its pre-budget note bytes. When a read is compacted its canonical key is removed from `seen_read_calls` and marked in the durable call list, so the same read may be issued again through the ordinary tool path and remains repeatable after a reload. Each threshold-crossing attempt appends one `within_turn_compaction` session event and one audit fact with format version, session/task ids, threshold, complete-request before/after/minimum estimates, message estimates, target, fixed overhead, counts, redacted manifest facts and hashes, and no tool body; `SessionStore::read_within_turn_compaction_attempts` replays them from a fresh store. Deviations and scope: Task 4 does not implement Task 5 automatic segments or Task 6 terminal outcomes/presentation, and does not change any command, patch, check, question, browser, MCP or fallback approval route. Fetch results and any native call absent from the tracker are conservatively pinned, so a resumed fetch is never compacted even though its dispatch sits outside the loop. No second result store is created; the tracker holds identities and keys, not result bodies. Evidence: new `tests/within_turn_request_preparation.rs` (16 tests) covers byte-identical below-threshold requests with no attempt, fitting batched compaction, explicit pinned fixtures (system/current user, plan/budget, notes, protected path, open-step result, command, MCP/browser/fetch, unresolved error, unknown outcome), fixed-overhead triggering, the exact empty-message minimum on a fixed-overhead refusal, pinned-minimum refusal, invalid metadata, determinism, durable content-safe attempts with an unchanged transcript, reread after compaction, cannot-fit with no model call, and command/patch/question pauses after compaction. `a_reload_reconstructs_the_same_next_request_without_rewriting_the_transcript` is the reload acceptance test: it pauses a long-read turn at a deterministic question after the read was compacted, copies the persisted data directory, resumes once through the live engine and once through a fresh `WorkspaceEngine` over the copy, and asserts the two next requests have byte-identical `model_request_json` (same manifest, pinned notes result, call ids and note text), exactly one new attempt per threshold-crossing request in each branch, identical resumed attempt records, and a transcript that keeps its full bodies and paused prefix in both branches. `a_budgeted_worker_plan_approval_pins_the_exact_plan_and_budget_through_compaction` is the live test for requirement 6's plan/budget pin: it approves the exact reviewed worker budget, records a `Compacted` attempt for the resumed request, and asserts every model request carries the byte-identical approval note naming the plan and all four approved values while the prior read body is a manifest. A `request_preparation` inline regression test reaches the unchanged-reduction path and proves no request is returned; a `task_budget` unit test proves the approval note carries all four approved values. The inline `pending_turn_defaults_tests` proves a historical pending turn without `completed_tool_rounds` still loads. Adjacent suites pass: `within_turn_compaction` (24), `exploration_rounds`/`round_budget`/`token_ceiling`/`turn_notes` (95), `plan_turn`/`plan_budget_review`/`task_budget` (68), and scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`. `cargo fmt --all -- --check`, `npm run specs:check -- --strict` and `git diff --check` pass. The deterministic eval tier passes after the integration (`cargo run -p eval-harness -- run --tier deterministic`: task completion 1.000, approval-policy violations 0, restricted-path and secret violations 0, unrelated files changed 0). Workspace-wide Clippy/tests remain for CI. |
+| 5 · Automatic bounded worker segments | Done 2026-11-02 | New pure `workspace-engine/src/task_segments.rs` owns the typed segment model and the engine-owned predicate. `TaskSegmentStarted`/`TaskSegmentFinished` carry only format version, session/task ids, segment number, per-segment and monotonic task-total action/exploration counts, input/output token totals with an explicit `Measured`/`Estimated`/unavailable source, and start/progress SHA-256 digests; `TaskSegmentPauseState` is the persisted resume half. `SessionStore::append_task_segment_started/finished` append one typed session event each, `append_task_segment_boundary` writes the finished/started pair as one locked buffer, and `read_task_segments` is a fresh-store reader that follows only `plan_resumed` ancestry and skips undecodable or newer-format records. Matching `segment_started`/`segment_finished`/`segment_continuation_declined` audit facts carry the same numeric/identity/digest fields. The predicate `decide_segment_continuation` declines if any approved dimension is exhausted (total action rounds, exploration rounds, durable input tokens, durable output tokens), if `TaskUsage` is absent, or if the digest did not advance; cached input tokens are never extra allowance. Its allowance is `min(ordinary segment, remaining approved total)`, so a total smaller than one segment is respected, and Task 1's absolute task ceilings `ABSOLUTE_TASK_ACTION_ROUND_CEILING`/`ABSOLUTE_TASK_EXPLORATION_ROUND_CEILING` remain hard cumulative bounds; the legacy per-turn caps do not decide a multi-segment task. `progress_digest` hashes only authoritative engine state: plan step id/status/deduplicated evidence (timestamps, titles and model prose excluded), the deduplicated set of typed tool kind/redacted-identity-hash/range/outcome (call ids and token spend excluded), open-step evidence deduplicated, and the bounded note text hash/length/carried flag. `ChatOrchestrator` enables segments only when `SessionStore::read_task_budget` resolves an approved budget and `worker_record` proves a durable worker; inline tasks, budgetless workers and historical pending turns read `None` and keep the byte-identical explicit round-budget path. `PendingChatTurn.segment` is `#[serde(default, skip_serializing_if)]`, populated at every in-loop pause and omitted for the old shape; a resume reconstructs the open segment from the last `segment_started` record and never mints a second one; `validate_segment_resume` refuses a pending turn whose segment number, per-segment counts or digests disagree with the durable open segment. Compatibility decision: planning rounds before the budget approval become the first segment's baseline totals and the per-segment counters restart at zero, so the usual plan review does not start the task already at its checkpoint; totals still include them and never reset. Request authority ordering: `task_request_output_cap` computes the approved remaining output cap from durable usage and applies it to `ModelRequest::max_tokens` *before* `build_turn_request` constructs and measures the request, so Task 4 prepares, records and hands over the exact capped shape the adapter sends even when the provider/config has no `max_output_tokens`. `authorize_task_request` then measures only that already-prepared request's exact serialized input against the remaining approved input tokens and never mutates, enlarges or re-caps it. Both the forced-final boundary and the ordinary send path (including the first request after plan approval) use this order; missing durable usage or an exhausted output total fails closed before any request exists. At a forced-final checkpoint the engine first decides continuation, then prepares the exact capped request; only after preparation and the input check succeed are `segment_finished`/`segment_started` committed, and the prepared request is reused for the next model call (`boundary_request` is cleared if a steering note changes the conversation), so one threshold crossing records exactly one Task 4 compaction attempt. A cannot-fit or invalid preparation appends no boundary and sends no model call; Task 4's `ClientError::RequestPreparation` remains the transitional failure presentation Task 6 will type. On any decline the engine records the typed reason and falls back to the existing round-budget pause (for a budgeted worker even when `agent_max_task_tokens` is set, so it never takes the old synthetic `turn_continued` message); Task 6 replaces that transitional stop with its typed outcome. Every patch, command/check, question, browser, MCP, fetch, provider-fallback, plan/context review and other pause still wins immediately, and each persists the same segment state. Progress tradeoffs recorded for Task 6: false positives are avoided by excluding timestamps, token spend, transient call ids, model prose and repeated identical typed observations; false negatives are accepted for a genuinely new action whose typed identity/outcome/range is identical to an earlier one (for example the same command re-run with unchanged outcome) unless a plan step, note or evidence fact also advanced — that is deliberate because output text and call ids are not authoritative progress. Evidence: `tests/task_segments.rs` (16 tests) covers a four-started/three-finished-segment budgeted worker completing after one plan-budget approval with no round-budget proposal and no synthetic continuation message, exact started/finished ordering and totals, per-segment counts, estimated token totals and matching digests, content-safe session/audit payloads, a budget smaller than a segment, independent action/exploration token exhaustion through the pure predicate tests, an approved exploration total crossing the legacy 32-round cap and action totals passing 64, repeated typed calls recording `no_progress` and keeping the pause, command and question pauses/resumes with one segment and no duplicate events, a fresh engine resuming without duplicate events and refusing corrupt resume state, one compaction attempt per boundary preparation, a cannot-fit boundary sending no request and starting no segment, a budget request that would overspend input sending nothing, a provider/config with no `max_output_tokens` still carrying the approved remaining output cap on every post-approval request, and Task 4's recorded `request_tokens_after` matching the exact adapter request estimate. The unit tests add a near-threshold case where applying `max_tokens` only after measurement would have passed Task 4 and then exceeded the share; the capped request is measured and fails closed instead. `cargo nextest run -p workspace-engine --test task_segments --test round_budget --test plan_budget_review --test within_turn_request_preparation --test task_budget --test within_turn_compaction` passed 94/94; `task_segments` unit tests passed 14/14; scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` is clean; `cargo run -p eval-harness -- run --tier deterministic` passed (task completion 1.000, approval-policy violations 0, restricted-path and secret violations 0); `scripts/quality-gate.sh fmt node lint typos deny` passed fmt/node/lint/typos, with `deny` still failing only on the pre-existing `zip 8.6.0` advisory (`RUSTSEC`/GHSA-q7v9-x93c-xqv3) through `candle-core`, left untouched as an unrelated dependency fix; `npm run specs:check -- --strict` passed and `git diff --check` is clean. No production UI/desktop/CLI change. Spec status stays In progress; Tasks 6-7 remain Not started. |
+| 6 · Terminal outcomes, recovery and presentation | Not started | Add distinct durable budget-exhausted, compaction-cannot-fit and no-progress stops; recover them after worker restart and expose engine-owned status/actions without UI business logic. |
+| 7 · Evaluation, documentation and close-out | Not started | Exercise all requirements and acceptance cases, update user/security/troubleshooting/dependency records, run scoped checks and deterministic evaluation, and mark the spec Done. |
+
+### Task 1: durable task-budget model and policy
+
+Task 1 establishes the state later slices consume without changing turn
+continuation. Add an engine-owned `TaskExecutionBudget` covering total action
+rounds, exploration rounds, model input tokens and model output tokens, plus the
+effective ceiling/default model needed to propose and validate one. Budget
+values must be non-zero, finite and bounded by product/user/administrator
+policy. Per-segment limits are upper checkpoint bounds, not minimums, so an
+approved total may be lower than one segment; Task 5 caps a segment by the
+remaining total.
+
+Add explicit config fields for the proposed worker-task budget and its ceilings.
+Classify every field so repository and permission-profile overlays may only
+lower it; a repository cannot enlarge a user or administrator value. Config
+display/source attribution must report the effective values without inventing a
+different merge rule.
+
+Persist one typed approval fact with the task whose plan was approved, through
+an atomic `SessionStore` operation that later Task 2 can call with the plan
+approval. Readers resolve the budget only for that task and its legitimate
+continuation ancestry. Old `plan_approved` events, historical sessions and
+pending turns decode as `None`, which means today's explicit round-budget pause.
+The record contains only numeric limits, actor and identifiers; no prompt or tool
+content.
+
+Scoped evidence for Task 1:
+
+- validation accepts each boundary and rejects zero, overflow and any value
+  above the effective ceiling;
+- repository/profile overlays lower every field and cannot raise a user/admin
+  ceiling, with exhaustive overlay-classification tests;
+- budget approval and plan approval land atomically, replay through a fresh
+  `SessionStore`, follow only valid task continuations and never leak to an
+  unrelated task or session;
+- historical logs and pending-turn fixtures remain readable with no budget;
+- serde/audit output contains only the typed numeric/identity fields;
+- scoped format, Clippy, config/session tests, strict spec check and diff check
+  pass. Task 1 must not alter the live round loop, worker host, plan-review UI or
+  model request construction.
+
+### Task 2: worker plan-review approval surface
+
+Task 2 makes Task 1's budget a real user decision. A worker plan proposal gains
+engine-owned budget data and display labels derived from the effective policy.
+Only a genuine worker session may offer it. The plan-decision request carries
+the exact reviewed budget alongside any step revision, validates both before
+writing either, and records the plan plus budget in one store transaction.
+Decline records neither approval. Model prose, repository text and a parent
+handoff cannot raise the engine-proposed values.
+
+The desktop plan card, CLI and worker control socket render/transport the typed
+fields and decisions only. Reload and worker restart reattach the same pending
+review and values. Existing inline plan reviews and historical worker reviews
+without a budget retain their current shape and behavior.
+
+Scoped evidence for Task 2:
+
+- a plan review in an ordinary session offers no budget, while a session with a
+  durable `worker_record` offers exactly the effective `task_budget_policy`
+  proposal and its engine-built rows;
+- the pending turn persists the same review object and a fresh handle reloads
+  it byte-for-byte; reattachment through `PausedTurns` and recovery returns the
+  same values;
+- approving a revised plan and its budget writes one `plan_approved` event whose
+  payload carries both, replays from a fresh `SessionStore` as the current plan,
+  and leaves `plan_created` readable;
+- missing, mismatched, raised, altered, zero, corrupt and above-current-ceiling
+  budgets are refused before any plan revision or approval is written, and the
+  pending review remains answerable;
+- a budgetless/historical review keeps its old approval path and refuses an
+  injected budget; decline writes neither an approval nor a budget, still accepts
+  the exact reviewed budget after the effective ceiling was lowered while the
+  review waited, and refuses an altered one;
+- desktop JSON/card and the worker socket transport the exact typed object with
+  no hard-coded dimension labels, and the CLI prints only engine-owned rows;
+- scoped format, Clippy, the focused session/plan/worker tests, strict spec check
+  and diff check pass. Workspace-wide Clippy and tests remain for CI.
+
+### Task 3: deterministic within-turn compactor
+
+Task 3 adds a pure engine module that receives completed tool rounds plus an
+explicit pinned set and returns the reduced request view; it does not yet sit in
+the live request path. It walks eligible completed rounds oldest-first and
+replaces them with deterministic redacted manifests containing tool kind, path
+or command identity, range, outcome, result hash and a bounded excerpt only
+when the next request needs one. Call/result pairing, provider message validity
+and stable ordering are invariants.
+
+Tests cover deterministic output, reread identity, batched calls, redaction,
+injection-shaped output remaining quoted data, unresolved errors and unknown
+external outcomes being ineligible, exact token estimates, and refusal when the
+pinned minimum cannot fit. The stored transcript is unchanged.
+
+### Task 4: safety-pinned request integration
+
+Task 4 invokes the compactor before a model request would cross the configured
+share of the resolved provider context window. It pins verbatim the system
+instructions, current user request, approved plan and task budget, pending
+action, latest result for every open step, active failure findings, protected
+paths, action/proposal identifiers, safety file hashes, unresolved errors and
+unknown outcomes, and bounded turn notes. A compacted read may be performed
+again through the ordinary tool path.
+
+Each attempt appends a durable, content-safe event with before/after counts,
+token estimates, threshold, manifests and hashes. A reload reconstructs the
+same next request without rewriting the session transcript. Integration tests
+compare every pinned value byte-for-byte before and after compaction and prove
+that no existing approval boundary changes.
+
+### Task 5: automatic bounded worker segments
+
+Task 5 replaces a worker's ordinary round-budget pause with an internal segment
+boundary only when that worker has Task 2's approved budget, remains below every
+total and per-kind limit, Task 4 can fit the next request, and the engine-owned
+progress predicate says the last segment advanced. It resumes the same task,
+plan, notes and tool history without a synthetic user message. Action and
+exploration segment counters reset; total usage never does.
+
+Append typed `segment_started` and `segment_finished` facts with segment number,
+per-segment/total counts, token estimates and progress digest, but no raw tool
+content. Patch, command, check, browser, MCP, question and fallback pauses still
+win immediately. A worker without an approved budget produces the existing
+round-budget card unchanged.
+
+### Task 6: terminal outcomes, recovery and presentation
+
+Task 6 settles the three new non-success cases through typed engine outcomes:
+the approved total budget was exhausted (naming the limiting dimension), the
+pinned minimum cannot fit the request window, or the segment progress state
+repeated. No case is `complete`, and none offers generic **Continue** against the
+same approved bound. #102's repair-stall outcome remains authoritative when it
+already stopped verification.
+
+The outcome, last segment and usage survive a fresh engine and worker restart.
+Worker status, return, desktop and CLI carry engine-owned labels, explanations
+and available actions; JavaScript contains no status-to-policy table. Recovery
+never automatically repeats an unknown external action.
+
+### Task 7: evaluation, documentation and close-out
+
+Task 7 audits all ten requirements and six acceptance criteria against the
+integrated implementation. Add deterministic scenarios for a three-segment
+completion, the no-budget pause, independent command/patch approvals, long-read
+compaction plus reread, byte-identical pinned safety state, and the three typed
+stops across reload. Update `USER_GUIDE.md`, `TROUBLESHOOTING.md`, `SECURITY.md`,
+dependency status, `README.md` and `CHANGELOG.md`; run the repository-prescribed
+fast checks, scoped Clippy/tests and deterministic evaluation; record the
+evidence; and mark the spec Done. Workspace-wide Clippy and tests remain for CI.

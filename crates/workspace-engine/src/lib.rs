@@ -48,18 +48,22 @@ mod render;
 pub mod repair_scope;
 pub mod repository_map;
 pub mod repository_trust;
+pub mod request_preparation;
 pub mod secret_scanner;
 pub mod session;
 pub mod shell_path;
 pub mod stagnation;
 pub mod steering;
 pub mod symbol_index;
+pub mod task_budget;
 pub mod task_control;
+pub mod task_segments;
 pub mod tree_walk;
 pub mod validation;
 pub mod vector_index;
 pub mod verification;
 pub mod web_diagnostics;
+pub mod within_turn_compaction;
 pub mod worker_progress;
 pub mod workspace_engine;
 pub mod worktree;
@@ -248,12 +252,17 @@ pub use repository_map::{
 pub use repository_trust::{
     RepositoryAllowlistMigration, RepositoryConfigNotice, RepositoryTrustStore,
 };
+pub use request_preparation::{
+    RequestPreparationInput, RequestPreparationOutcome, WITHIN_TURN_REQUEST_FORMAT_VERSION,
+    WithinTurnCompactionAttempt, WithinTurnCompactionAttemptOutcome, prepare_request,
+    request_threshold_tokens,
+};
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
     ActionMarker, ChatMessage, ConsumedWorkerReturn, ContextPin, ContinuedTask, DanglingAction,
-    ExportFormat, PatchFileDecision, PendingApprovalRef, SearchOptions, Session, SessionSearchHit,
-    SessionSearchResult, SessionStore, Task, TaskStatus, TaskUsage, TurnNotes, WorkerRecord,
-    WorkerReturn,
+    ExportFormat, PatchFileDecision, PendingApprovalRef, PlanApproval, SearchOptions, Session,
+    SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskStatus, TaskUsage, TurnNotes,
+    WorkerRecord, WorkerReturn, validate_plan_approval,
 };
 pub use stagnation::{
     RepairStall, RepairStallReason, detect_repair_stall, proposed_patch_digest, repair_state_entry,
@@ -266,11 +275,23 @@ pub use symbol_index::{
     SymbolIndex, SymbolIndexStore, SymbolLoad, SymbolMatch, SymbolRef, SymbolReferences, merge,
     symbol_matches_json, symbol_references_json,
 };
+pub use task_budget::{
+    ABSOLUTE_TASK_ACTION_ROUND_CEILING, ABSOLUTE_TASK_EXPLORATION_ROUND_CEILING,
+    ABSOLUTE_TASK_INPUT_TOKEN_CEILING, ABSOLUTE_TASK_OUTPUT_TOKEN_CEILING, TaskBudgetDimension,
+    TaskBudgetPolicy, TaskBudgetReview, TaskBudgetReviewRow, TaskExecutionBudget,
+};
 pub use task_control::{
     TaskAction, TaskActionInput, TaskActionTransport, TaskCommand, TaskComposer, TaskControl,
     TaskControlService, TaskOutcomeKind, TurnIndicatorState, TurnPresentation, TurnStopNotice,
     WORKER_STALE_PROGRESS_AFTER_MS, WorkerBoardGroup, WorkerDot, WorkerProcessState,
     WorkerTaskFacts, continuation_prompt, returned_task_control, turn_presentation,
+};
+pub use task_segments::{
+    SegmentContinuationDecision, SegmentContinuationInput, SegmentDeclineReason,
+    SegmentProgressInput, SegmentTokenTotals, SegmentTotals, StoredTaskSegment,
+    TASK_SEGMENT_FORMAT_VERSION, TaskRequestTokenAuthority, TaskSegmentEvent, TaskSegmentFinished,
+    TaskSegmentPauseState, TaskSegmentStarted, authorize_task_request, decide_segment_continuation,
+    progress_digest, task_request_output_cap,
 };
 pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{
@@ -289,5 +310,12 @@ pub use web_diagnostics::{
     WebDiagnosticDetails, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
     WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WebDomSummary, WebFailedRequest,
     WebScenarioStep, WebSourceLocation,
+};
+pub use within_turn_compaction::{
+    CompactedResultFact, CompactedToolKind, CompletedToolCall, CompletedToolRound,
+    MAX_MANIFEST_EXCERPT_CHARS, ToolIdentity, ToolIdentityKind, ToolResultOutcome,
+    WITHIN_TURN_MANIFEST_VERSION, WithinTurnCompaction, WithinTurnCompactionInvalidInput,
+    WithinTurnCompactionOutcome, WithinTurnCompactionRefusal, WithinTurnCompactionRequest,
+    compact_within_turn,
 };
 pub use workspace_engine::WorkspaceEngine;

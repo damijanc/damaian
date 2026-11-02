@@ -89,6 +89,11 @@ pub enum ClientError {
     Io(String),
     Git(String),
     InvalidInput(String),
+    /// The next within-turn model request cannot be prepared safely (spec 103
+    /// Task 4): the pinned/fixed minimum does not fit the resolved window share,
+    /// or the completed tool metadata cannot be proven to match the request.
+    /// The turn fails closed without sending anything.
+    RequestPreparation(String),
     /// A provider refused the call, classified by [`ProviderRefusal`], with the
     /// provider's own message carried verbatim so the user learns what to fix.
     Provider(ProviderRefusal, String),
@@ -110,6 +115,7 @@ impl ClientError {
             Self::Io(_) => "io_error",
             Self::Git(_) => "git_error",
             Self::InvalidInput(_) => "invalid_input",
+            Self::RequestPreparation(_) => "request_preparation_failed",
             Self::Provider(refusal, _) => refusal.code(),
             Self::Cancelled => "cancelled",
         }
@@ -155,6 +161,7 @@ impl Display for ClientError {
             | Self::Io(message)
             | Self::Git(message)
             | Self::InvalidInput(message)
+            | Self::RequestPreparation(message)
             | Self::Provider(_, message) => formatter.write_str(message),
             Self::Cancelled => formatter.write_str("Stopped by user"),
         }

@@ -624,16 +624,24 @@ fn describe_approval(
             proposal_id,
             plan,
             deferred_action,
+            budget_review,
         } => Approval {
             session_id: session_id.to_string(),
             task_id,
             kind: "plan",
             payload: format!(
-                "{{\"proposalId\":\"{}\",\"deferredAction\":\"{}\",\"plan\":{}}}",
+                "{{\"proposalId\":\"{}\",\"deferredAction\":\"{}\",\"plan\":{}{}}}",
                 escape_json(&proposal_id),
                 escape_json(&deferred_action),
                 // The reattached review is a paused turn, still waiting.
-                plan_json(&plan, true)
+                plan_json(&plan, true),
+                // Absent, not null, when the review offered no budget: an
+                // inline or historical review keeps its pre-budget shape
+                // (spec 103 Task 2).
+                budget_review
+                    .and_then(|review| serde_json::to_string(&review).ok())
+                    .map(|review| format!(",\"budgetReview\":{review}"))
+                    .unwrap_or_default()
             ),
             unavailable_reason: None,
         },
@@ -1258,6 +1266,17 @@ mod tests {
             payload.contains("\"deferredAction\":\"apply a patch\""),
             "got {payload}"
         );
+        // Spec 103 Task 2: this historical review offered no budget, so the
+        // reattached payload keeps the exact pre-budget key set.
+        let sweep: serde_json::Value = serde_json::from_str(&payload).expect("the sweep is JSON");
+        let approval = &sweep["approvals"][0]["payload"];
+        let keys: Vec<&str> = approval
+            .as_object()
+            .expect("the payload is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, vec!["deferredAction", "plan", "proposalId"]);
         assert_eq!(
             engine
                 .session_store
@@ -1267,6 +1286,70 @@ mod tests {
                 .map(String::as_str),
             Some("waiting_for_approval")
         );
+    }
+
+    /// Spec 103 Task 2: a worker restart reattaches the same engine-built
+    /// budget review, not a value reconstructed from current configuration.
+    #[test]
+    fn a_reattached_plan_review_carries_its_budget_review() {
+        let (engine, dir) = engine("plan-budget");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Recovery")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "add retry", "mock", "m")
+            .unwrap();
+        let mut plan = TaskPlan::new(&task.id, 1);
+        plan.steps.push(PlanStep {
+            id: "step_1".to_string(),
+            title: "Add a retry helper".to_string(),
+            detail: None,
+            status: StepStatus::Pending,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+        });
+        engine.session_store.create_plan(&task, &plan).unwrap();
+        let pending = dir.join("chat").join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(
+            pending.join("planprop_budget.json"),
+            r#"{"proposal_id":"planprop_budget","plan_review":{"deferred_action":"apply a patch","budget":{"budget":{"actionRounds":96,"explorationRounds":144,"inputTokens":8000000,"outputTokens":512000},"title":"Task budget","note":"This worker may run up to these totals.","rows":[{"dimension":"actionRounds","label":"Action rounds","value":96,"unit":"rounds"},{"dimension":"explorationRounds","label":"Exploration rounds","value":144,"unit":"rounds"},{"dimension":"inputTokens","label":"Input tokens","value":8000000,"unit":"tokens"},{"dimension":"outputTokens","label":"Output tokens","value":512000,"unit":"tokens"}]}}}"#,
+        )
+        .unwrap();
+        engine
+            .session_store
+            .await_approval(
+                &task,
+                &PendingApprovalRef {
+                    kind: "plan".to_string(),
+                    proposal_id: "planprop_budget".to_string(),
+                },
+            )
+            .unwrap();
+
+        let (_, payload) = sweep(&engine);
+        let sweep: serde_json::Value = serde_json::from_str(&payload).expect("the sweep is JSON");
+        let approval = &sweep["approvals"][0]["payload"];
+        let keys: Vec<&str> = approval
+            .as_object()
+            .expect("the payload is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["budgetReview", "deferredAction", "plan", "proposalId"]
+        );
+        assert_eq!(approval["budgetReview"]["budget"]["actionRounds"], 96);
+        assert_eq!(
+            approval["budgetReview"]["rows"][0]["label"],
+            "Action rounds"
+        );
+        assert_eq!(approval["budgetReview"]["rows"][0]["unit"], "rounds");
     }
 
     /// Spec 51 §5.3: a fetch pause is saved with the verbatim URL, so a crash

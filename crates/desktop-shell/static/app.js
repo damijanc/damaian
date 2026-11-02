@@ -10317,6 +10317,9 @@ async function decideWorkerApproval(view, proposal, approved) {
       session_id: view.sessionId,
       command: approved ? "approve" : "reject",
       proposal_id: proposal.proposalId,
+      // The exact typed budget the engine proposed; absent for a budgetless
+      // review. The engine, not this card, validates it.
+      budget: proposal.budgetReview ? JSON.stringify(proposal.budgetReview.budget) : "",
     }),
   );
   pollWorkerProgressNow(view);
@@ -13633,6 +13636,32 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
       ? `Nothing has changed yet. ${settled.length === 1 ? "One step has" : `${settled.length} steps have`} already finished and cannot be removed.`
       : "Nothing has changed yet. Adjust the steps or approve them as they stand.";
 
+  // Spec 103 Task 2: the budget arrives with its title, note, rows, labels and
+  // units from the engine. This card renders those rows as data; it does not
+  // know which dimensions exist and applies no policy to their values.
+  const budgetReview = proposal.budgetReview;
+  let budgetSection = null;
+  if (budgetReview) {
+    budgetSection = document.createElement("div");
+    budgetSection.className = "plan-budget-review";
+    const budgetTitle = document.createElement("strong");
+    budgetTitle.className = "plan-budget-title";
+    budgetTitle.textContent = budgetReview.title;
+    const budgetNote = document.createElement("p");
+    budgetNote.className = "plan-budget-note";
+    budgetNote.textContent = budgetReview.note;
+    const budgetRows = document.createElement("dl");
+    budgetRows.className = "plan-budget-rows";
+    for (const row of budgetReview.rows || []) {
+      const label = document.createElement("dt");
+      label.textContent = row.label;
+      const value = document.createElement("dd");
+      value.textContent = `${row.value} ${row.unit}`;
+      budgetRows.append(label, value);
+    }
+    budgetSection.append(budgetTitle, budgetNote, budgetRows);
+  }
+
   const list = document.createElement("ol");
   list.className = "plan-review-list";
 
@@ -13775,6 +13804,8 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
           proposal_id: proposal.proposalId,
           approved: approved ? "true" : "false",
           steps: revision ? JSON.stringify(revision) : "",
+          // The exact typed budget the engine proposed, returned unchanged.
+          budget: proposal.budgetReview ? JSON.stringify(proposal.budgetReview.budget) : "",
         },
         {
           phase(payload) {
@@ -13891,7 +13922,9 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
     }
   });
 
-  wrapper.append(header, note, list, actions, output);
+  wrapper.append(header, note);
+  if (budgetSection) wrapper.append(budgetSection);
+  wrapper.append(list, actions, output);
   return wrapper;
 }
 

@@ -59,13 +59,25 @@ use crate::protected_paths::{
 use crate::provenance::{PostPatchResult, classify};
 use crate::repair_scope::RepairScopeReview;
 use crate::repository_map::RepositoryMapStore;
+use crate::request_preparation::{
+    RequestPreparationInput, RequestPreparationOutcome, WithinTurnCompactionAttempt,
+    prepare_request, request_threshold_tokens,
+};
 use crate::secret_scanner::SecretScanner;
 use crate::session::{
     ChatMessage, PendingApprovalRef, Session, SessionStore, Task, TaskStatus, TaskUsage,
+    validate_plan_approval,
 };
 use crate::stagnation::{RepairStall, detect_repair_stall, repair_state_entry};
 use crate::steering::TurnSteering;
+use crate::task_budget::{TaskBudgetPolicy, TaskBudgetReview, TaskExecutionBudget};
 use crate::task_control::{TaskControl, TurnPresentation, continuation_prompt, turn_presentation};
+use crate::task_segments::{
+    SegmentContinuationDecision, SegmentContinuationInput, SegmentProgressInput,
+    SegmentTokenTotals, SegmentTotals, TASK_SEGMENT_FORMAT_VERSION, TaskRequestTokenAuthority,
+    TaskSegmentFinished, TaskSegmentPauseState, TaskSegmentStarted, authorize_task_request,
+    decide_segment_continuation, progress_digest, task_request_output_cap,
+};
 use crate::validation::{
     CommandProposal, CommandStore, ValidationOrchestrator, command_approval_prompt,
     resolve_command_directory,
@@ -79,6 +91,9 @@ use crate::verification::{
 use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
     WebDiagnosticReport, WebDiagnosticsRunnerHandle,
+};
+use crate::within_turn_compaction::{
+    CompactedToolKind, CompletedToolCall, CompletedToolRound, ToolIdentity, ToolResultOutcome,
 };
 use crate::worktree_access::{foreign_worktrees, resolve_worktree};
 use serde::{Deserialize, Serialize};
@@ -507,6 +522,14 @@ pub struct AgentPlanProposal {
     /// progress line uses — so the card can say what the approval unblocks
     /// rather than asking the user to approve in the abstract.
     pub deferred_action: String,
+    /// The task execution budget this review offers, when the review belongs to
+    /// a genuine worker session (spec 103 Task 2).
+    ///
+    /// `None` for an inline plan review and for every historical review. The
+    /// review carries its own labels, units and rows, so a client renders it
+    /// generically and returns the exact [`TaskBudgetReview::budget`] it was
+    /// given.
+    pub budget_review: Option<TaskBudgetReview>,
 }
 
 /// A prompt for a worker started from a paused plan, and the task whose
@@ -1856,11 +1879,13 @@ impl ChatOrchestrator {
             0,
             0,
             turn_notes,
+            CompletedToolTracker::default(),
             Vec::new(),
             false,
             model_adapter,
             sink,
             options,
+            None,
         )
     }
 
@@ -2000,6 +2025,7 @@ impl ChatOrchestrator {
             turn_notes: turn_notes.text.clone(),
             turn_notes_carried: turn_notes.carried,
             calls: turn_notes.calls.clone(),
+            completed_tool_rounds: Vec::new(),
             step_evidence: Vec::new(),
             plan_reminder_sent: false,
             messages,
@@ -2013,6 +2039,7 @@ impl ChatOrchestrator {
             plan_review: None,
             provider_fallback: None,
             round_budget: None,
+            segment: None,
             question: None,
             check_batch: None,
             fetch_call: None,
@@ -2262,6 +2289,7 @@ impl ChatOrchestrator {
         self.record_memory_recall(&plan.manifest, &recalled_memory)?;
 
         let verification_turn = pending.turn_options.verification_turn;
+        let segment_pause = pending.segment.clone();
         let result = self.run_agentic_turn(
             &repository_root,
             pending.session,
@@ -2271,11 +2299,13 @@ impl ChatOrchestrator {
             pending.round,
             pending.exploration_rounds,
             turn_notes,
+            CompletedToolTracker::from(pending.completed_tool_rounds.clone()),
             pending.step_evidence,
             pending.plan_reminder_sent,
             model_adapter,
             sink,
             pending.turn_options,
+            segment_pause.as_ref(),
         )?;
         // A paused repair turn resumes here rather than in `run_repair_turn`,
         // so the attempt has to be closed by the same rule the other resume
@@ -3259,6 +3289,7 @@ impl ChatOrchestrator {
             turn_notes: String::new(),
             turn_notes_carried: false,
             calls: Vec::new(),
+            completed_tool_rounds: Vec::new(),
             step_evidence: Vec::new(),
             plan_reminder_sent: false,
             messages: Vec::new(),
@@ -3272,6 +3303,7 @@ impl ChatOrchestrator {
             plan_review: None,
             provider_fallback: None,
             round_budget: None,
+            segment: None,
             question: None,
             check_batch: Some(PendingCheckBatch {
                 checks: awaiting,
@@ -3877,11 +3909,13 @@ impl ChatOrchestrator {
             0,
             0,
             turn_notes,
+            CompletedToolTracker::default(),
             Vec::new(),
             false,
             model_adapter,
             sink,
             options,
+            None,
         )?;
         // A pause is not the end of the attempt: a command approval or a round
         // budget resumes the same turn and still counts as this attempt.
@@ -4256,11 +4290,13 @@ impl ChatOrchestrator {
             0,
             0,
             turn_notes,
+            CompletedToolTracker::default(),
             Vec::new(),
             false,
             model_adapter,
             sink,
             options,
+            None,
         )?;
         // The report stays with the turn, so the card the user would have seen
         // is still drawn above the continuation's answer.
@@ -4891,6 +4927,23 @@ impl ChatOrchestrator {
             None,
         )?;
 
+        // The approved dispatch happened here, outside the loop, so its typed
+        // result joins the tracker now (spec 103 Task 4).
+        let completed_tool_rounds = match (after_tool_action.as_ref(), after_tool_outcome.as_ref())
+        {
+            (Some(action), Some(outcome)) => self.tracker_with_resumed_call(
+                &pending.session.id,
+                &pending.task.id,
+                &pending.completed_tool_rounds,
+                pending.matched_tool_call.as_ref(),
+                &repository_root,
+                action,
+                outcome,
+            )?,
+            _ => CompletedToolTracker::from(pending.completed_tool_rounds.clone()),
+        };
+
+        let segment_pause = pending.segment.clone();
         let result = self.run_agentic_turn(
             &repository_root,
             pending.session,
@@ -4900,11 +4953,13 @@ impl ChatOrchestrator {
             pending.round + 1,
             pending.exploration_rounds,
             turn_notes,
+            completed_tool_rounds,
             step_evidence,
             pending.plan_reminder_sent,
             model_adapter,
             sink,
             pending.turn_options,
+            segment_pause.as_ref(),
         )?;
         self.verify_after_command_turn(
             &repository_root,
@@ -4968,24 +5023,21 @@ impl ChatOrchestrator {
         Ok(verified)
     }
 
-    /// Continues a chat turn that stopped to have its plan reviewed before
-    /// taking its first mutating step (spec 21 §5.5).
+    /// The budget a plan review offers, or `None` when this is not a worker.
     ///
-    /// `revised` is the user's edit of the step list: steps in the order they
-    /// should run, each naming an existing step id, with whatever title the
-    /// user wants it to carry. Omitting a step deletes it. `None` means the
-    /// plan was approved as proposed.
-    ///
-    /// A revision is recorded as `plan_revised` and the approval as
-    /// `plan_approved`, in that order, so the log holds both what the model
-    /// proposed and what the user decided to run — and `approved: false`
-    /// records neither, because nothing was approved.
-    ///
-    /// Nothing was dispatched when the turn paused, so there is no call to
-    /// execute or discard here: the turn resumes with the decision put to the
-    /// model as a message, and the model asks again for whatever it still
-    /// needs. Replaying the deferred call instead would run the step the user
-    /// may have just deleted.
+    /// Worker status comes from the durable worker record, not from prompt or
+    /// repository text and not from a caller saying "hand this to a worker":
+    /// only a session the engine itself spawned into a worktree may be offered
+    /// a task budget. An inline review in the same repository stays
+    /// budgetless.
+    fn worker_task_budget_review(&self, session_id: &str) -> Result<Option<TaskBudgetReview>> {
+        if self.session_store.worker_record(session_id)?.is_none() {
+            return Ok(None);
+        }
+        let policy = self.config.task_budget_policy();
+        Ok(Some(TaskBudgetReview::from_policy(&policy)))
+    }
+
     /// The prompt a worker gets for a turn paused on its plan review (spec 94):
     /// the request that started the turn and the plan as the user left it on
     /// the card. Read-only, so the pause survives a worker dialog the user
@@ -5113,6 +5165,26 @@ impl ChatOrchestrator {
         Ok(())
     }
 
+    /// Continues a chat turn that stopped to have its plan reviewed before
+    /// taking its first mutating step (spec 21 §5.5).
+    ///
+    /// `revised` is the user's edit of the step list: steps in the order they
+    /// should run, each naming an existing step id, with whatever title the
+    /// user wants it to carry. Omitting a step deletes it. `None` means the
+    /// plan was approved as proposed.
+    ///
+    /// For an inline or historical review, a revision is recorded as
+    /// `plan_revised` and the approval as `plan_approved`, in that order, so
+    /// the log holds both what the model proposed and what the user decided to
+    /// run — and `approved: false` records neither, because nothing was
+    /// approved. A worker review with a budget records a revision inside its
+    /// one `plan_approved` event instead (spec 103 Task 2).
+    ///
+    /// Nothing was dispatched when the turn paused, so there is no call to
+    /// execute or discard here: the turn resumes with the decision put to the
+    /// model as a message, and the model asks again for whatever it still
+    /// needs. Replaying the deferred call instead would run the step the user
+    /// may have just deleted.
     pub fn resume_after_plan_decision(
         &self,
         proposal_id: &str,
@@ -5122,19 +5194,75 @@ impl ChatOrchestrator {
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
-        let pending = self.pending_commands.take(proposal_id)?;
-        let turn_notes = TurnNotesState::from_pending(&pending);
+        self.resume_after_plan_decision_with_budget(
+            proposal_id,
+            approved,
+            revised,
+            None,
+            approved_by,
+            model_adapter,
+            sink,
+        )
+    }
+
+    /// [`Self::resume_after_plan_decision`] with the exact typed budget the
+    /// user reviewed (spec 103 Task 2).
+    ///
+    /// A budgeted worker review cannot be approved through the budgetless
+    /// entry point above: a decision that omits the allowance is not the
+    /// decision the user made. A budgetless review cannot be approved with an
+    /// injected one either. Both refusals happen before any plan revision or
+    /// approval is written, so a malformed request leaves the pending turn
+    /// answerable and the log unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_after_plan_decision_with_budget(
+        &self,
+        proposal_id: &str,
+        approved: bool,
+        revised: Option<Vec<PlanRevisionStep>>,
+        budget: Option<&TaskExecutionBudget>,
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        // Load before taking: a refused budget must leave the review pending so
+        // the user can answer it again, and must not consume the turn.
+        let pending = self.pending_commands.load(proposal_id)?;
         self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::PlanReview)?;
         let Some(review) = pending.plan_review.clone() else {
             // `refuse_unless_paused_for` just proved the pause is a plan review.
             unreachable!("a plan review pause must carry its review");
         };
+        validate_plan_budget_decision(
+            &review,
+            approved,
+            budget,
+            &self.config.task_budget_policy(),
+        )?;
+        // The plan half is validated here, still before `take`. An invalid
+        // revision must not consume the pending turn: the review has to remain
+        // answerable after a refusal, and nothing durable may be written for a
+        // step list this turn will never run. `SessionStore` rechecks the same
+        // rules at the atomic write below.
+        let current_plan = self
+            .session_store
+            .read_task_plan(&pending.session.id, &pending.task.id)?;
+        let revised_plan = match (approved, revised, &current_plan) {
+            (true, Some(revision), Some(current)) => {
+                let applied = apply_plan_revision(current, &revision);
+                validate_plan_approval(&pending.task, &applied)?;
+                Some(applied)
+            }
+            // A revision with no plan to revise is not a rewrite; the existing
+            // path below records the decision without inventing steps.
+            _ => None,
+        };
+        let pending = self.pending_commands.take(proposal_id)?;
+        let turn_notes = TurnNotesState::from_pending(&pending);
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
 
-        let mut plan = self
-            .session_store
-            .read_task_plan(&pending.session.id, &pending.task.id)?;
+        let mut plan = current_plan;
         let note = if !approved {
             // A declined plan is settled by the user's decision, not the
             // model's. Every non-terminal step becomes `Skipped`, so the plan
@@ -5162,21 +5290,47 @@ impl ChatOrchestrator {
             "The user reviewed this plan and declined it. Do not make any change to the repository. Explain briefly what you were going to do and what you would need from the user to proceed differently."
                 .to_string()
         } else {
-            let applied = match (revised, plan) {
-                (Some(revision), Some(current)) => {
-                    let revised_plan = apply_plan_revision(&current, &revision);
-                    self.session_store
-                        .revise_plan(&pending.task, &revised_plan)?;
+            let reviewed_budget = review.budget.as_ref().map(|review| review.budget);
+            let applied = match revised_plan {
+                Some(revised_plan) => {
+                    match reviewed_budget {
+                        // Spec 103 Task 2: a reviewed revision and its budget
+                        // are one durable decision. Neither line can survive a
+                        // partial write without the other.
+                        Some(budget) => self.session_store.approve_plan_with_budget_and_plan(
+                            &pending.task,
+                            approved_by,
+                            &budget,
+                            &revised_plan,
+                        )?,
+                        // Inline and historical reviews keep the two-event shape
+                        // that predates task budgets.
+                        None => {
+                            self.session_store
+                                .revise_plan(&pending.task, &revised_plan)?;
+                            self.session_store
+                                .approve_plan(&pending.task, approved_by)?;
+                        }
+                    }
                     Some(revised_plan)
                 }
-                // A revision with no plan to revise, or no revision at all:
-                // either way there is nothing to rewrite, and approving is
+                // No revision: there is nothing to rewrite, and approving is
                 // still a decision worth recording.
-                (_, plan) => plan,
+                None => {
+                    match reviewed_budget {
+                        Some(budget) => self.session_store.approve_plan_with_budget(
+                            &pending.task,
+                            approved_by,
+                            &budget,
+                        )?,
+                        None => self
+                            .session_store
+                            .approve_plan(&pending.task, approved_by)?,
+                    }
+                    plan
+                }
             };
-            self.session_store
-                .approve_plan(&pending.task, approved_by)?;
-            match applied {
+            let mut note = match applied {
                 Some(plan) => format!(
                     "The user reviewed the plan and approved it. The plan is now:\n{}\nContinue with the current step. You were about to: {}.",
                     plan.steps
@@ -5191,7 +5345,18 @@ impl ChatOrchestrator {
                     "The user reviewed the plan and approved it. Continue with the current step. You were about to: {}.",
                     review.deferred_action
                 ),
+            };
+            if let Some(budget) = reviewed_budget {
+                // Spec 103 Task 4: the approved plan and its exact task budget
+                // travel in the same user message the model sees, so the
+                // allowance is pinned as approved user content rather than
+                // inferred from the plan, repository text or a tool result. A
+                // budgetless review never reaches this branch, which keeps the
+                // historical note byte-for-byte.
+                note.push_str("\n\n");
+                note.push_str(&budget.approval_note());
             }
+            note
         };
 
         self.audit_log.record(
@@ -5227,6 +5392,7 @@ impl ChatOrchestrator {
             None,
         )?;
 
+        let segment_pause = pending.segment.clone();
         self.run_agentic_turn(
             &repository_root,
             pending.session,
@@ -5236,11 +5402,13 @@ impl ChatOrchestrator {
             pending.round + 1,
             pending.exploration_rounds,
             turn_notes,
+            CompletedToolTracker::from(pending.completed_tool_rounds.clone()),
             pending.step_evidence,
             pending.plan_reminder_sent,
             model_adapter,
             sink,
             pending.turn_options,
+            segment_pause.as_ref(),
         )
     }
 
@@ -5383,6 +5551,24 @@ impl ChatOrchestrator {
             None,
         )?;
 
+        let completed_tool_rounds = match pending
+            .matched_tool_call
+            .as_ref()
+            .and_then(|call| tool_action_from_call(call).ok().flatten())
+        {
+            Some(action) => self.tracker_with_resumed_call(
+                &pending.session.id,
+                &pending.task.id,
+                &pending.completed_tool_rounds,
+                pending.matched_tool_call.as_ref(),
+                &repository_root,
+                &action,
+                &ActionOutcome::Ok,
+            )?,
+            None => CompletedToolTracker::from(pending.completed_tool_rounds.clone()),
+        };
+
+        let segment_pause = pending.segment.clone();
         self.run_agentic_turn(
             &repository_root,
             pending.session,
@@ -5392,11 +5578,13 @@ impl ChatOrchestrator {
             pending.round + 1,
             pending.exploration_rounds,
             turn_notes,
+            completed_tool_rounds,
             pending.step_evidence,
             pending.plan_reminder_sent,
             model_adapter,
             sink,
             pending.turn_options,
+            segment_pause.as_ref(),
         )
     }
 
@@ -5587,6 +5775,7 @@ impl ChatOrchestrator {
             TaskStatus::PreparingContext,
             None,
         )?;
+        let segment_pause = pending.segment.clone();
         let result = self.run_agentic_turn(
             &repository_root,
             pending.session,
@@ -5596,11 +5785,13 @@ impl ChatOrchestrator {
             pending.round + 1,
             pending.exploration_rounds,
             turn_notes,
+            CompletedToolTracker::from(pending.completed_tool_rounds.clone()),
             pending.step_evidence,
             pending.plan_reminder_sent,
             model_adapter,
             sink,
             pending.turn_options,
+            segment_pause.as_ref(),
         )?;
         if pending.turn_options.verification_turn {
             return self.close_verification_resume(&repository_root, result);
@@ -5723,6 +5914,7 @@ impl ChatOrchestrator {
                 line,
                 key: Some(vec!["fetch_url".to_string(), url]),
                 writes: true,
+                compacted: false,
             });
         }
         Ok(())
@@ -5874,6 +6066,7 @@ impl ChatOrchestrator {
             ..pending.turn_options
         };
         let repository_root = PathBuf::from(&pending.repository_root);
+        let segment_pause = pending.segment.clone();
         let result = self.run_agentic_turn(
             &repository_root,
             pending.session,
@@ -5883,11 +6076,13 @@ impl ChatOrchestrator {
             pending.round,
             pending.exploration_rounds,
             turn_notes,
+            CompletedToolTracker::from(pending.completed_tool_rounds.clone()),
             pending.step_evidence,
             pending.plan_reminder_sent,
             model_adapter,
             sink,
             turn_options,
+            segment_pause.as_ref(),
         )?;
         if pending.turn_options.verification_turn {
             return self.close_verification_resume(&repository_root, result);
@@ -5984,6 +6179,7 @@ impl ChatOrchestrator {
                     round_budget_extension: rounds_granted,
                     ..pending.turn_options
                 };
+                let segment_pause = pending.segment.clone();
                 let result = self.run_agentic_turn(
                     &repository_root,
                     pending.session,
@@ -5993,11 +6189,13 @@ impl ChatOrchestrator {
                     pending.round,
                     pending.exploration_rounds,
                     turn_notes,
+                    CompletedToolTracker::from(pending.completed_tool_rounds.clone()),
                     pending.step_evidence,
                     pending.plan_reminder_sent,
                     model_adapter,
                     sink,
                     turn_options,
+                    segment_pause.as_ref(),
                 )?;
                 if pending.turn_options.verification_turn {
                     return self.close_verification_resume(&repository_root, result);
@@ -6025,6 +6223,7 @@ impl ChatOrchestrator {
                     round_budget_answer_now: true,
                     ..pending.turn_options
                 };
+                let segment_pause = pending.segment.clone();
                 let result = self.run_agentic_turn(
                     &repository_root,
                     pending.session,
@@ -6034,11 +6233,13 @@ impl ChatOrchestrator {
                     pending.round,
                     pending.exploration_rounds,
                     turn_notes,
+                    CompletedToolTracker::from(pending.completed_tool_rounds.clone()),
                     pending.step_evidence,
                     pending.plan_reminder_sent,
                     model_adapter,
                     sink,
                     turn_options,
+                    segment_pause.as_ref(),
                 )?;
                 if pending.turn_options.verification_turn {
                     return self.close_verification_resume(&repository_root, result);
@@ -6663,6 +6864,7 @@ impl ChatOrchestrator {
                     line,
                     key: self.call_key(repository_root, &action),
                     writes: matches!(action_effect(&action), ActionEffect::WritesRepository),
+                    compacted: false,
                 });
             }
         }
@@ -7193,6 +7395,470 @@ impl ChatOrchestrator {
         Ok(())
     }
 
+    /// One request selected for the next model call, plus what Task 4 did to it.
+    #[allow(clippy::too_many_arguments)]
+    fn build_turn_request(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        messages: &[ModelMessage],
+        turn_notes: &TurnNotesState,
+        completed_tool_rounds: &CompletedToolTracker,
+        plan: Option<&TaskPlan>,
+        step_evidence: &[Evidence],
+        protected: &TaskProtectedPaths,
+        tools: Option<Vec<ToolDefinition>>,
+        max_tokens: Option<u32>,
+    ) -> Result<PreparedTurnRequest> {
+        let notes_window = if self.config.agent_max_turn_notes_chars == 0 {
+            // Requirement 3: zero restores today's request exactly.
+            NotesWindow::none()
+        } else {
+            NotesWindow {
+                notes: &turn_notes.text,
+                carried: turn_notes.carried,
+                calls: &turn_notes.calls,
+                enabled: true,
+                notes_limit: self.config.agent_max_turn_notes_chars,
+                notice_cap: ELISION_NOTICE_LINE_CAP,
+                warning_cap: PRE_CUT_LINE_CAP,
+            }
+        };
+        // The legacy message-count window is exactly what today's request would
+        // send. Below the window share it is the request, byte for byte.
+        let legacy_request = self.request_for(
+            bounded_messages(messages, self.config.agent_max_turn_messages, &notes_window),
+            tools.clone(),
+            max_tokens,
+        );
+        let Some(context_window) = self.config.context_window() else {
+            return Ok(PreparedTurnRequest::unchanged(legacy_request));
+        };
+        let threshold =
+            request_threshold_tokens(context_window, self.config.conversation_window_share);
+        let request_tokens_before =
+            TokenEstimate::Prose.tokens(&model_request_json(&legacy_request));
+        if request_tokens_before <= threshold {
+            return Ok(PreparedTurnRequest::unchanged(legacy_request));
+        }
+
+        // The threshold is crossed. Safety pinning takes precedence over the
+        // legacy message-count cut: non-tool messages and rounds holding a
+        // pinned result stay, and only unpinned completed rounds are elided.
+        // The configured count remains a restrict-only bound on those rounds.
+        let mut pins = self.within_turn_pins(
+            repository_root,
+            &session.id,
+            completed_tool_rounds,
+            plan,
+            step_evidence,
+            protected,
+        )?;
+        // A native call the tracker cannot describe — a resumed dispatch from
+        // an older pending turn, or a call whose typed metadata was lost — is
+        // pinned rather than guessed at. Its message structure is read; its
+        // prose is not.
+        let tracked_ids = completed_tool_rounds.completed_call_ids();
+        for message in messages {
+            for call in &message.tool_calls {
+                if !tracked_ids.contains(call.id.as_str()) {
+                    pins.insert(call.id.clone());
+                }
+            }
+        }
+        let safety_request = self.request_for(
+            bounded_messages_preserving_safety(
+                messages,
+                self.config.agent_max_turn_messages,
+                &notes_window,
+                &pins,
+            ),
+            tools,
+            max_tokens,
+        );
+        // Only completed rounds still present in the selected request may be
+        // described to the reducer. A round the safety selection elided has no
+        // declaration or result to pair with, and claiming one would turn a
+        // legitimate elision into an invalid request.
+        let rounds = present_completed_rounds(
+            &safety_request.messages,
+            &completed_tool_rounds.as_compaction_rounds(),
+        );
+        let outcome = prepare_request(&RequestPreparationInput {
+            request: &safety_request,
+            completed_rounds: &rounds,
+            pinned_call_ids: &pins,
+            context_window: Some(context_window),
+            window_share_bps: self.config.conversation_window_share,
+            scanner: &self.scanner,
+            session_id: &session.id,
+            task_id: &task.id,
+        });
+        match outcome {
+            RequestPreparationOutcome::Unchanged => {
+                Ok(PreparedTurnRequest::unchanged(safety_request))
+            }
+            RequestPreparationOutcome::Compacted { request, attempt } => {
+                self.record_within_turn_compaction_attempt(&attempt)?;
+                let compacted_call_ids = attempt
+                    .facts
+                    .iter()
+                    .map(|fact| fact.call_id.clone())
+                    .collect();
+                Ok(PreparedTurnRequest {
+                    request,
+                    compacted_call_ids,
+                })
+            }
+            RequestPreparationOutcome::FailedClosed { attempt } => {
+                self.record_within_turn_compaction_attempt(&attempt)?;
+                let message = match attempt.outcome {
+                    crate::request_preparation::WithinTurnCompactionAttemptOutcome::CannotFit => {
+                        format!(
+                            "the next request cannot fit the configured window share: {} tokens (\u{2264} {} allowed) after compaction",
+                            attempt
+                                .request_tokens_minimum
+                                .unwrap_or(attempt.request_tokens_before),
+                            attempt.threshold_tokens
+                        )
+                    }
+                    _ => "the completed tool metadata does not match the request messages"
+                        .to_string(),
+                };
+                Err(ClientError::RequestPreparation(message))
+            }
+        }
+    }
+
+    /// Adds one call dispatched by a resume path to the paused turn's tracker.
+    ///
+    /// The resume paths execute an approved command, answer a question or make
+    /// an approved fetch outside the loop, so their typed result has to join the
+    /// tracker before the resumed turn prepares its next request.
+    #[allow(clippy::too_many_arguments)]
+    fn tracker_with_resumed_call(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        completed_tool_rounds: &[TrackedCompletedToolRound],
+        matched_tool_call: Option<&ToolCall>,
+        repository_root: &Path,
+        action: &ToolAction,
+        outcome: &ActionOutcome,
+    ) -> Result<CompletedToolTracker> {
+        let mut tracker = CompletedToolTracker::from(completed_tool_rounds.to_vec());
+        let Some(call) = matched_tool_call else {
+            return Ok(tracker);
+        };
+        let open_step_id = self
+            .session_store
+            .read_task_plan(session_id, task_id)?
+            .and_then(|current| {
+                current
+                    .steps
+                    .iter()
+                    .find(|step| step.status == StepStatus::InProgress)
+                    .map(|step| step.id.clone())
+            });
+        let read_key = self.call_key(repository_root, action);
+        if let Some(tracked) = tracked_completed_call(call, action, outcome, open_step_id, read_key)
+        {
+            tracker.push_round(vec![tracked]);
+        }
+        Ok(tracker)
+    }
+
+    fn request_for(
+        &self,
+        messages: Vec<ModelMessage>,
+        tools: Option<Vec<ToolDefinition>>,
+        max_tokens: Option<u32>,
+    ) -> ModelRequest {
+        ModelRequest {
+            provider: self.config.model_provider.clone(),
+            model: self.config.model_name.clone(),
+            messages,
+            temperature: Some("0".to_string()),
+            reasoning_level: Some(self.config.model_reasoning_level.clone()),
+            stream: true,
+            tools,
+            // A budgeted caller supplies the already-approved cap; every other
+            // caller keeps the configured provider/model ceiling.
+            max_tokens: max_tokens.or_else(|| self.config.max_output_tokens()),
+            request_usage: self.config.provider_reports_usage(),
+            emit_cache_breakpoints: self.config.supports_explicit_cache_breakpoints(),
+        }
+    }
+
+    /// Everything the next request must not lose, derived only from typed
+    /// engine state: the plan's open-step results and safety hashes, the
+    /// immediately preceding action identifiers, protected paths, findings and
+    /// every non-read or unresolved result.
+    fn within_turn_pins(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        tracker: &CompletedToolTracker,
+        plan: Option<&TaskPlan>,
+        step_evidence: &[Evidence],
+        protected: &TaskProtectedPaths,
+    ) -> Result<BTreeSet<String>> {
+        let mut pins = BTreeSet::new();
+        let mut safety_paths: BTreeSet<String> = BTreeSet::new();
+
+        if let Some(plan) = plan {
+            for step in &plan.steps {
+                for evidence in &step.evidence {
+                    collect_safety_path(evidence, &mut safety_paths);
+                }
+                if !step.status.is_terminal()
+                    && let Some(call_id) = tracker.latest_call_id_for_step(&step.id)
+                {
+                    pins.insert(call_id.to_string());
+                }
+            }
+        }
+        for evidence in step_evidence {
+            collect_safety_path(evidence, &mut safety_paths);
+        }
+
+        for finding in self
+            .session_store
+            .read_findings(session_id, repository_root)?
+        {
+            if finding.status() != FindingStatus::Open {
+                continue;
+            }
+            if finding.severity() == Severity::Error
+                && let Some(origin) = finding.origin_ref()
+            {
+                pins.insert(origin.to_string());
+            }
+            if finding.file_hash().is_some()
+                && let Some(range) = finding.range()
+            {
+                safety_paths.insert(range.path.clone());
+            }
+        }
+
+        for call in tracker.calls() {
+            // Conservative typed pinning: a non-read or non-succeeded result is
+            // never eligible, whether or not it carries a proposal identity.
+            if !is_compactable_read_kind(call.call.tool_kind) {
+                pins.insert(call.call.call_id.clone());
+                continue;
+            }
+            if !call.call.outcome.is_eligible() {
+                pins.insert(call.call.call_id.clone());
+                continue;
+            }
+            if call.call.identity.kind == crate::within_turn_compaction::ToolIdentityKind::Path
+                && (protected.covering_path(&call.call.identity.value).is_some()
+                    || safety_paths.contains(&call.call.identity.value))
+            {
+                pins.insert(call.call.call_id.clone());
+            }
+        }
+
+        Ok(pins)
+    }
+
+    fn record_within_turn_compaction_attempt(
+        &self,
+        attempt: &WithinTurnCompactionAttempt,
+    ) -> Result<()> {
+        self.session_store
+            .append_within_turn_compaction_attempt(&attempt.session_id, attempt)?;
+        self.audit_log
+            .record("within_turn_compaction", &attempt.audit_fields())?;
+        Ok(())
+    }
+
+    /// Turns a refused task-budget request into the existing pre-call token
+    /// stop, recording the typed dimension and the exact figures.
+    ///
+    /// Task 6 replaces this transitional presentation with a distinct durable
+    /// budget-exhausted outcome. What matters here is that the request is not
+    /// sent and no segment boundary is written.
+    fn task_budget_token_stop(
+        &self,
+        session: &Session,
+        task: &Task,
+        budget: &TaskExecutionBudget,
+        usage: Option<&TaskUsage>,
+        failure: &TaskRequestTokenAuthority,
+        plan: Option<&TaskPlan>,
+    ) -> Result<(ModelRun, String)> {
+        let (required, remaining) = match failure {
+            TaskRequestTokenAuthority::InputExceeded {
+                required_input_tokens,
+                remaining_input_tokens,
+            } => (*required_input_tokens, *remaining_input_tokens),
+            TaskRequestTokenAuthority::OutputExhausted {
+                remaining_output_tokens,
+            } => (0, *remaining_output_tokens),
+            TaskRequestTokenAuthority::UsageUnavailable => (0, 0),
+        };
+        self.audit_log.record(
+            "task_budget_token_exhausted",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
+                ("dimension", failure.dimension().to_string()),
+                ("requiredTokens", required.to_string()),
+                ("remainingTokens", remaining.to_string()),
+                (
+                    "inputTokens",
+                    usage.map_or_else(
+                        || "unavailable".to_string(),
+                        |usage| usage.input_tokens.to_string(),
+                    ),
+                ),
+                (
+                    "outputTokens",
+                    usage.map_or_else(
+                        || "unavailable".to_string(),
+                        |usage| usage.output_tokens.to_string(),
+                    ),
+                ),
+            ],
+        )?;
+        let response =
+            task_budget_token_exhausted_response(budget, usage, failure, required, remaining, plan);
+        let mut run =
+            ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
+        run.content = response.clone();
+        Ok((run, response))
+    }
+
+    /// The deterministic, content-safe digest of the task state a segment
+    /// boundary may treat as advancement (spec 103 Task 5).
+    fn segment_progress_digest(
+        &self,
+        plan: Option<&TaskPlan>,
+        step_evidence: &[Evidence],
+        completed_tool_rounds: &CompletedToolTracker,
+        turn_notes: &TurnNotesState,
+    ) -> String {
+        let rounds = completed_tool_rounds.as_compaction_rounds();
+        progress_digest(&SegmentProgressInput {
+            plan,
+            step_evidence,
+            completed_rounds: &rounds,
+            notes_text: &turn_notes.text,
+            notes_carried: turn_notes.carried,
+            scanner: &self.scanner,
+        })
+    }
+
+    /// Starts the first automatic segment, or resumes the one a pause left open.
+    ///
+    /// `None` is the whole budgetless path: an inline task, a worker without an
+    /// approved budget and every historical pending turn keep today's explicit
+    /// round-budget behaviour. Worker status is read from the durable worker
+    /// record, never from a prompt, label or UI state.
+    #[allow(clippy::too_many_arguments)]
+    fn task_segment_run_state(
+        &self,
+        session: &Session,
+        task: &Task,
+        action_rounds: u32,
+        exploration_rounds: u32,
+        plan: Option<&TaskPlan>,
+        step_evidence: &[Evidence],
+        completed_tool_rounds: &CompletedToolTracker,
+        turn_notes: &TurnNotesState,
+        normal_action_rounds: u32,
+        normal_exploration_rounds: u32,
+        resume_state: Option<&TaskSegmentPauseState>,
+    ) -> Result<Option<(SegmentRunState, bool)>> {
+        let Some(budget) = self.session_store.read_task_budget(&session.id, &task.id)? else {
+            return Ok(None);
+        };
+        if self.session_store.worker_record(&session.id)?.is_none() {
+            return Ok(None);
+        }
+        let mut usage_by_task = self.session_store.read_task_usage(&session.id)?;
+        let usage = usage_by_task.remove(&task.id);
+        let tokens = SegmentTokenTotals::from_usage(usage.as_ref());
+        let segments = self
+            .session_store
+            .read_task_segments(&session.id, &task.id)?;
+
+        if let Some(crate::task_segments::StoredTaskSegment {
+            event: crate::task_segments::TaskSegmentEvent::Started(started),
+            ..
+        }) = segments.last()
+        {
+            // The pending turn's `segment` field is the resume half: it must
+            // describe exactly the open durable segment. A mismatch means the
+            // log and the paused turn disagree (a hand-edited or partially
+            // written pair), so fail closed rather than continue under totals
+            // neither record can prove.
+            if let Some(resume) = resume_state {
+                validate_segment_resume(resume, started, action_rounds, exploration_rounds)?;
+            }
+            return Ok(Some((
+                SegmentRunState::resumed(
+                    &budget,
+                    started,
+                    normal_action_rounds,
+                    normal_exploration_rounds,
+                ),
+                false,
+            )));
+        }
+        if resume_state.is_some() {
+            return Err(ClientError::InvalidInput(
+                "a paused task segment has no durable segment_started record".to_string(),
+            ));
+        }
+
+        // The budget is approved at the plan review, after the planning rounds
+        // that produced and reviewed the plan. Those rounds are part of the
+        // task total, so they become the new segment's baseline and the
+        // per-segment counters restart at zero. Otherwise the first segment
+        // would begin already at its checkpoint and could never make progress.
+        let (prior_action, prior_exploration) = segments
+            .last()
+            .map(|segment| segment.totals())
+            .unwrap_or((0, 0));
+        let total_action_rounds = prior_action.saturating_add(action_rounds);
+        let total_exploration_rounds = prior_exploration.saturating_add(exploration_rounds);
+        let digest =
+            self.segment_progress_digest(plan, step_evidence, completed_tool_rounds, turn_notes);
+        let started = TaskSegmentStarted {
+            format_version: TASK_SEGMENT_FORMAT_VERSION,
+            session_id: session.id.clone(),
+            task_id: task.id.clone(),
+            segment: segments
+                .last()
+                .map(|segment| segment.segment() + 1)
+                .unwrap_or(1),
+            segment_action_rounds: 0,
+            segment_exploration_rounds: 0,
+            total_action_rounds,
+            total_exploration_rounds,
+            tokens,
+            start_digest: digest.clone(),
+        };
+        self.session_store
+            .append_task_segment_started(&session.id, &started)?;
+        self.audit_log
+            .record("segment_started", &started.audit_fields())?;
+        Ok(Some((
+            SegmentRunState::resumed(
+                &budget,
+                &started,
+                normal_action_rounds,
+                normal_exploration_rounds,
+            ),
+            true,
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_agentic_turn(
         &self,
@@ -7204,6 +7870,9 @@ impl ChatOrchestrator {
         mut action_rounds: u32,
         mut exploration_rounds: u32,
         mut turn_notes: TurnNotesState,
+        // Completed native tool rounds, carried across a pause so the next
+        // request after a reload compacts from the same typed facts.
+        mut completed_tool_rounds: CompletedToolTracker,
         // Evidence accrued before this resume, carried in the pending turn.
         // The turn starts empty; every pause seeds it (spec 66 §5.3).
         mut step_evidence: Vec<crate::plan::Evidence>,
@@ -7213,6 +7882,9 @@ impl ChatOrchestrator {
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
         turn_options: ChatTurnOptions,
+        // The open segment a paused turn left behind, validated against the
+        // durable `segment_started` record before it is reused (spec 103 Task 5).
+        segment_pause: Option<&TaskSegmentPauseState>,
     ) -> Result<ChatTurnResult> {
         // Every turn and inherited continuation gets the durable exclusions as
         // a reminder. This is never the enforcement boundary: proposal and
@@ -7505,7 +8177,7 @@ impl ChatOrchestrator {
         let mut round_budget_extension: u32 = turn_options.round_budget_extension;
         // The per-turn read allowance (spec 59 §5.2). It is fixed for the turn
         // and never extended by a continuation, so it is computed once here.
-        let max_exploration_rounds = self.default_exploration_round_limit();
+        let mut max_exploration_rounds = self.default_exploration_round_limit();
         // A notes record that survived without its call list (a hand-written or
         // partially written pending file) rebuilds the list from the messages
         // it saved, so the notice and the repeat rule still work.
@@ -7527,6 +8199,9 @@ impl ChatOrchestrator {
                 .unwrap_or(0);
             turn_notes.calls[since_write..]
                 .iter()
+                // A read whose result became a manifest is repeatable again,
+                // including after a reload (spec 103 Task 4).
+                .filter(|call| !call.compacted)
                 .filter_map(|call| call.key.clone())
                 .collect()
         };
@@ -7535,6 +8210,38 @@ impl ChatOrchestrator {
         // answer follows it as a second message (spec 66 `context.md` D4). A
         // pause or budget stop after the reminder keeps its own response.
         let mut pre_reminder_answer: Option<String> = None;
+        // Automatic worker segments (spec 103 Task 5). `None` for every inline
+        // task, every worker without an approved budget and every historical
+        // pending turn, which keeps the explicit round-budget path exactly.
+        let (mut segment_tracker, segment_started_new) = match self.task_segment_run_state(
+            &session,
+            &task,
+            action_rounds,
+            exploration_rounds,
+            plan.as_ref(),
+            &step_evidence,
+            &completed_tool_rounds,
+            &turn_notes,
+            self.tool_round_limit(web_debug_mode) + round_budget_extension,
+            max_exploration_rounds,
+            segment_pause,
+        )? {
+            Some((tracker, started_new)) => (Some(tracker), started_new),
+            None => (None, false),
+        };
+        if segment_started_new {
+            // The planning rounds before the budget approval are the new
+            // segment's baseline, not its first counters.
+            action_rounds = 0;
+            exploration_rounds = 0;
+        }
+        if let Some(tracker) = &segment_tracker {
+            max_exploration_rounds = max_exploration_rounds.min(tracker.exploration_allowance);
+        }
+        // A request prepared for an automatic boundary is reused for the very
+        // next model call, so one threshold crossing records one compaction
+        // attempt rather than preparing the same request twice.
+        let mut boundary_request: Option<PreparedTurnRequest> = None;
         let (final_run, mut response, proposals, stop_reason) = loop {
             // Spec 57 §5.4, in its order: a pause holds here, before the
             // cancel check, so a stop that arrives while paused ends the turn
@@ -7610,6 +8317,9 @@ impl ChatOrchestrator {
                     sink.progress(TurnProgress::NoteAdded {
                         message_id: message.id,
                     });
+                    // The prepared request predates this note, so it is no
+                    // longer the exact next request.
+                    boundary_request = None;
                 }
             }
 
@@ -7647,8 +8357,23 @@ impl ChatOrchestrator {
                 }
             }
 
-            let max_rounds = (self.tool_round_limit(web_debug_mode) + round_budget_extension)
+            // A budgeted task reads its durable usage once for this iteration.
+            // The approved output cap is applied before `build_turn_request`
+            // constructs and measures the request, so Task 4 sees exactly the
+            // shape the adapter will send; the post-preparation check then
+            // measures that same object without changing it.
+            let task_usage = if segment_tracker.is_some() {
+                let mut usage_by_task = self.session_store.read_task_usage(&session.id)?;
+                usage_by_task.remove(&task.id)
+            } else {
+                None
+            };
+
+            let mut max_rounds = (self.tool_round_limit(web_debug_mode) + round_budget_extension)
                 .min(ABSOLUTE_TURN_ROUND_CAP);
+            if let Some(tracker) = &segment_tracker {
+                max_rounds = max_rounds.min(tracker.action_allowance);
+            }
             let force_final = action_rounds >= max_rounds;
             // Spec 61 §5.1: at the round budget, with no token ceiling to
             // continue under, pause before the forced final call instead of
@@ -7656,65 +8381,318 @@ impl ChatOrchestrator {
             // when the user answers *Answer now*. #47's continuation still
             // applies when a ceiling is set and the absolute cap is not yet
             // reached, so the forced call proceeds on that path.
-            if force_final
-                && !turn_options.round_budget_answer_now
-                && (self.config.agent_max_task_tokens.is_none()
-                    || action_rounds >= ABSOLUTE_TOOL_ROUND_CAP)
-            {
-                return self.pause_for_round_budget(
-                    repository_root,
-                    session,
-                    task,
-                    context_files,
-                    messages,
-                    action_rounds,
-                    exploration_rounds,
-                    turn_notes,
-                    step_evidence.clone(),
-                    plan_reminder_sent,
-                    max_rounds,
-                    round_budget_extension,
-                    turn_options,
-                );
+            //
+            // Spec 103 Task 5: a worker whose plan carries an approved task
+            // budget crosses this checkpoint internally instead, provided every
+            // approved total still allows progress, the engine-owned progress
+            // digest advanced, and Task 4 can fit the exact next request. The
+            // segment is committed only after that request is prepared, so one
+            // threshold crossing records one compaction attempt.
+            if force_final && !turn_options.round_budget_answer_now {
+                if let Some(tracker) = segment_tracker.as_mut() {
+                    let totals = SegmentTotals {
+                        action_rounds: tracker.total_action_rounds(action_rounds),
+                        exploration_rounds: tracker.total_exploration_rounds(exploration_rounds),
+                    };
+                    let usage = task_usage.as_ref();
+                    let digest = self.segment_progress_digest(
+                        plan.as_ref(),
+                        &step_evidence,
+                        &completed_tool_rounds,
+                        &turn_notes,
+                    );
+                    let decision = decide_segment_continuation(&SegmentContinuationInput {
+                        budget: &tracker.budget,
+                        totals,
+                        usage,
+                        normal_action_rounds: self.tool_round_limit(web_debug_mode)
+                            + round_budget_extension,
+                        normal_exploration_rounds: self.default_exploration_round_limit(),
+                        progress_advanced: digest != tracker.start_digest,
+                    });
+                    match decision {
+                        SegmentContinuationDecision::Continue {
+                            action_rounds: action_allowance,
+                            exploration_rounds: exploration_allowance,
+                        } => {
+                            // The approved output cap is part of the request
+                            // bytes, so apply it before Task 4 prepares and
+                            // measures the request. The measured shape is then
+                            // exactly what the adapter sends.
+                            let output_cap = match task_request_output_cap(
+                                &tracker.budget,
+                                usage,
+                                self.config.max_output_tokens(),
+                            ) {
+                                Ok(cap) => cap,
+                                Err(failure) => {
+                                    let (run, response) = self.task_budget_token_stop(
+                                        &session,
+                                        &task,
+                                        &tracker.budget,
+                                        usage,
+                                        &failure,
+                                        plan.as_ref(),
+                                    )?;
+                                    break (
+                                        run,
+                                        response,
+                                        TurnProposals::default(),
+                                        StopReason::TokenBudget,
+                                    );
+                                }
+                            };
+                            // Prepared before the boundary is written: a
+                            // request that cannot fit must leave the segment
+                            // open and send nothing.
+                            let prepared = self.build_turn_request(
+                                repository_root,
+                                &session,
+                                &task,
+                                &messages,
+                                &turn_notes,
+                                &completed_tool_rounds,
+                                plan.as_ref(),
+                                &step_evidence,
+                                &active_protected,
+                                native_tools.clone(),
+                                Some(output_cap),
+                            )?;
+                            // The round totals can still allow a segment while
+                            // the exact next request would overspend an approved
+                            // token total. Prove the already-prepared request
+                            // without changing it; on failure nothing is sent
+                            // and no segment is started.
+                            let PreparedTurnRequest {
+                                request,
+                                compacted_call_ids,
+                            } = prepared;
+                            let prepared =
+                                match authorize_task_request(&request, &tracker.budget, usage) {
+                                    Ok(()) => PreparedTurnRequest {
+                                        request,
+                                        compacted_call_ids,
+                                    },
+                                    Err(failure) => {
+                                        let (run, response) = self.task_budget_token_stop(
+                                            &session,
+                                            &task,
+                                            &tracker.budget,
+                                            usage,
+                                            &failure,
+                                            plan.as_ref(),
+                                        )?;
+                                        break (
+                                            run,
+                                            response,
+                                            TurnProposals::default(),
+                                            StopReason::TokenBudget,
+                                        );
+                                    }
+                                };
+                            let tokens = SegmentTokenTotals::from_usage(usage);
+                            let finished = TaskSegmentFinished {
+                                format_version: TASK_SEGMENT_FORMAT_VERSION,
+                                session_id: session.id.clone(),
+                                task_id: task.id.clone(),
+                                segment: tracker.segment,
+                                segment_action_rounds: action_rounds,
+                                segment_exploration_rounds: exploration_rounds,
+                                total_action_rounds: totals.action_rounds,
+                                total_exploration_rounds: totals.exploration_rounds,
+                                tokens,
+                                start_digest: tracker.start_digest.clone(),
+                                progress_digest: digest.clone(),
+                            };
+                            let started = TaskSegmentStarted {
+                                format_version: TASK_SEGMENT_FORMAT_VERSION,
+                                session_id: session.id.clone(),
+                                task_id: task.id.clone(),
+                                segment: tracker.segment + 1,
+                                segment_action_rounds: 0,
+                                segment_exploration_rounds: 0,
+                                total_action_rounds: totals.action_rounds,
+                                total_exploration_rounds: totals.exploration_rounds,
+                                tokens,
+                                start_digest: digest.clone(),
+                            };
+                            self.session_store.append_task_segment_boundary(
+                                &session.id,
+                                &finished,
+                                &started,
+                            )?;
+                            self.audit_log
+                                .record("segment_finished", &finished.audit_fields())?;
+                            self.audit_log
+                                .record("segment_started", &started.audit_fields())?;
+
+                            tracker.prior_action_rounds = totals.action_rounds;
+                            tracker.prior_exploration_rounds = totals.exploration_rounds;
+                            tracker.segment += 1;
+                            tracker.start_digest = digest;
+                            tracker.action_allowance = action_allowance;
+                            tracker.exploration_allowance = exploration_allowance;
+                            action_rounds = 0;
+                            exploration_rounds = 0;
+                            round_budget_extension = 0;
+                            max_exploration_rounds = exploration_allowance;
+                            boundary_request = Some(prepared);
+                            continue;
+                        }
+                        SegmentContinuationDecision::Declined(reason) => {
+                            self.audit_log.record(
+                                "segment_continuation_declined",
+                                &[
+                                    ("actor", "system".to_string()),
+                                    ("sessionId", session.id.clone()),
+                                    ("taskId", task.id.clone()),
+                                    ("segment", tracker.segment.to_string()),
+                                    ("reason", reason.as_str().to_string()),
+                                    ("totalActionRounds", totals.action_rounds.to_string()),
+                                    (
+                                        "totalExplorationRounds",
+                                        totals.exploration_rounds.to_string(),
+                                    ),
+                                    (
+                                        "inputTokens",
+                                        usage.map_or_else(
+                                            || "unavailable".to_string(),
+                                            |usage| usage.input_tokens.to_string(),
+                                        ),
+                                    ),
+                                    (
+                                        "outputTokens",
+                                        usage.map_or_else(
+                                            || "unavailable".to_string(),
+                                            |usage| usage.output_tokens.to_string(),
+                                        ),
+                                    ),
+                                ],
+                            )?;
+                        }
+                    }
+                }
+                if segment_tracker.is_some()
+                    || self.config.agent_max_task_tokens.is_none()
+                    || action_rounds >= ABSOLUTE_TOOL_ROUND_CAP
+                {
+                    return self.pause_for_round_budget(
+                        repository_root,
+                        session,
+                        task,
+                        context_files,
+                        messages,
+                        action_rounds,
+                        exploration_rounds,
+                        turn_notes,
+                        completed_tool_rounds.clone(),
+                        step_evidence.clone(),
+                        plan_reminder_sent,
+                        max_rounds,
+                        round_budget_extension,
+                        turn_options,
+                        segment_tracker.as_ref(),
+                    );
+                }
             }
             let tools = if force_final {
                 None
             } else {
                 native_tools.clone()
             };
-            let request = ModelRequest {
-                provider: self.config.model_provider.clone(),
-                model: self.config.model_name.clone(),
-                // Bounded, not the raw array: a long turn's tool results would
-                // otherwise grow the request without limit (requirement 6).
-                // The notes, the calls-aware notice and the pre-cut warning are
-                // inserted beside the unchanged bounded tail (spec 65 §5.2).
-                messages: bounded_messages(
-                    &messages,
-                    self.config.agent_max_turn_messages,
-                    &if self.config.agent_max_turn_notes_chars == 0 {
-                        // Requirement 3: zero restores today's request exactly.
-                        NotesWindow::none()
-                    } else {
-                        NotesWindow {
-                            notes: &turn_notes.text,
-                            carried: turn_notes.carried,
-                            calls: &turn_notes.calls,
-                            enabled: true,
-                            notes_limit: self.config.agent_max_turn_notes_chars,
-                            notice_cap: ELISION_NOTICE_LINE_CAP,
-                            warning_cap: PRE_CUT_LINE_CAP,
-                        }
-                    },
-                ),
-                temperature: Some("0".to_string()),
-                reasoning_level: Some(self.config.model_reasoning_level.clone()),
-                stream: true,
-                tools,
-                max_tokens: self.config.max_output_tokens(),
-                request_usage: self.config.provider_reports_usage(),
-                emit_cache_breakpoints: self.config.supports_explicit_cache_breakpoints(),
+            // One engine-owned request-preparation path. Below the window share
+            // this is exactly the legacy bounded request; at or above it, the
+            // safety-first selection and Task 3's reducer decide what is sent
+            // (spec 103 Task 4). A request prepared for an automatic boundary
+            // is reused rather than prepared a second time.
+            let PreparedTurnRequest {
+                request,
+                compacted_call_ids,
+            } = match boundary_request.take() {
+                Some(prepared) => prepared,
+                None => {
+                    // Apply the approved output cap before Task 4 constructs
+                    // and measures the request. The field is part of the
+                    // request bytes, so doing it afterwards would let Task 4
+                    // judge a different shape from the one the adapter sends.
+                    let output_cap = match segment_tracker.as_ref() {
+                        Some(tracker) => match task_request_output_cap(
+                            &tracker.budget,
+                            task_usage.as_ref(),
+                            self.config.max_output_tokens(),
+                        ) {
+                            Ok(cap) => Some(cap),
+                            Err(failure) => {
+                                let (run, response) = self.task_budget_token_stop(
+                                    &session,
+                                    &task,
+                                    &tracker.budget,
+                                    task_usage.as_ref(),
+                                    &failure,
+                                    plan.as_ref(),
+                                )?;
+                                break (
+                                    run,
+                                    response,
+                                    TurnProposals::default(),
+                                    StopReason::TokenBudget,
+                                );
+                            }
+                        },
+                        // An unbudgeted task lets the request builder apply
+                        // the configured output ceiling exactly as before.
+                        None => None,
+                    };
+                    self.build_turn_request(
+                        repository_root,
+                        &session,
+                        &task,
+                        &messages,
+                        &turn_notes,
+                        &completed_tool_rounds,
+                        plan.as_ref(),
+                        &step_evidence,
+                        &active_protected,
+                        tools,
+                        output_cap,
+                    )?
+                }
             };
+            // A read whose body became a manifest may be performed again
+            // through the ordinary tool path. Identity is the typed canonical
+            // key recorded at dispatch, never a text heuristic.
+            for key in completed_tool_rounds.compacted_read_keys(&compacted_call_ids) {
+                seen_read_calls.remove(&key);
+                for call in &mut turn_notes.calls {
+                    if call.key.as_ref() == Some(&key) {
+                        call.compacted = true;
+                    }
+                }
+            }
+            // A budgeted task has no untracked model call. The request was
+            // already built with its approved output cap, so this check only
+            // measures the exact prepared input and never changes the request.
+            // The first request after approval is checked here too, so planning
+            // spend cannot authorise another call.
+            if let Some(tracker) = segment_tracker.as_ref()
+                && let Err(failure) =
+                    authorize_task_request(&request, &tracker.budget, task_usage.as_ref())
+            {
+                let (run, response) = self.task_budget_token_stop(
+                    &session,
+                    &task,
+                    &tracker.budget,
+                    task_usage.as_ref(),
+                    &failure,
+                    plan.as_ref(),
+                )?;
+                break (
+                    run,
+                    response,
+                    TurnProposals::default(),
+                    StopReason::TokenBudget,
+                );
+            }
 
             let token_estimate: usize = request
                 .messages
@@ -7934,9 +8912,11 @@ impl ChatOrchestrator {
                             action_rounds,
                             exploration_rounds,
                             turn_notes,
+                            completed_tool_rounds.clone(),
                             step_evidence.clone(),
                             plan_reminder_sent,
                             turn_options,
+                            segment_tracker.as_ref(),
                             offer,
                         );
                     }
@@ -8377,6 +9357,9 @@ impl ChatOrchestrator {
             // its first call has run. Later calls join it (spec 03 §7): a
             // response is one assistant turn, whatever number of calls it made.
             let mut round_message: Option<usize> = None;
+            // The calls that complete in this round, kept together so a batched
+            // assistant round stays one tracker round (spec 103 Task 4).
+            let mut round_completed: Vec<TrackedCompletedToolCall> = Vec::new();
             // Kept out of `model_run`, which a terminal arm moves.
             let round_reasoning = model_run.reasoning_content.clone();
             for (index, (matched_tool_call, tool_action)) in
@@ -8423,8 +9406,10 @@ impl ChatOrchestrator {
                     })
                 {
                     let deferred_action = tool_action_label(&tool_action);
+                    let budget_review = self.worker_task_budget_review(&session.id)?;
                     let response = plan_review_response(current, &deferred_action);
                     let proposal_id = create_id("planreview");
+                    completed_tool_rounds.push_round(std::mem::take(&mut round_completed));
                     self.pending_commands.save(&PendingChatTurn {
                         proposal_id: proposal_id.clone(),
                         session: session.clone(),
@@ -8436,6 +9421,7 @@ impl ChatOrchestrator {
                         turn_notes: turn_notes.text.clone(),
                         turn_notes_carried: turn_notes.carried,
                         calls: turn_notes.calls.clone(),
+                        completed_tool_rounds: completed_tool_rounds.rounds.clone(),
                         // A pause carries the open step's evidence and the
                         // reminder flag; neither is attached or reset here.
                         step_evidence: step_evidence.clone(),
@@ -8454,9 +9440,13 @@ impl ChatOrchestrator {
                         web_diagnostic_call: None,
                         plan_review: Some(PendingPlanReview {
                             deferred_action: deferred_action.clone(),
+                            budget: budget_review.clone(),
                         }),
                         provider_fallback: None,
                         round_budget: None,
+                        segment: segment_tracker
+                            .as_ref()
+                            .map(|tracker| tracker.pause_state(action_rounds, exploration_rounds)),
                         question: None,
                         check_batch: None,
                         fetch_call: None,
@@ -8480,6 +9470,7 @@ impl ChatOrchestrator {
                                 id: proposal_id,
                                 plan: current.clone(),
                                 deferred_action,
+                                budget_review,
                             }),
                             ..Default::default()
                         },
@@ -8555,8 +9546,12 @@ impl ChatOrchestrator {
                 if matches!(tool_action, ToolAction::WebDiagnostic(_)) {
                     web_debug_mode = true;
                 }
-                let max_rounds = (self.tool_round_limit(web_debug_mode) + round_budget_extension)
+                let mut max_rounds = (self.tool_round_limit(web_debug_mode)
+                    + round_budget_extension)
                     .min(ABSOLUTE_TURN_ROUND_CAP);
+                if let Some(tracker) = &segment_tracker {
+                    max_rounds = max_rounds.min(tracker.action_allowance);
+                }
                 sink.phase(
                     PhaseKind::Tool,
                     tool_action_label(&tool_action),
@@ -8567,6 +9562,16 @@ impl ChatOrchestrator {
                     turn_notes.text.chars().count(),
                 );
 
+                // Which plan step was open when this call ran. Captured before
+                // dispatch because `complete_step` may advance the plan from
+                // inside the same round (spec 103 Task 4).
+                let open_step_id = plan.as_ref().and_then(|current| {
+                    current
+                        .steps
+                        .iter()
+                        .find(|step| step.status == StepStatus::InProgress)
+                        .map(|step| step.id.clone())
+                });
                 // Bracket the dispatch, not the leaf call: `ValidationOrchestrator`
                 // and `McpClient` hold no `SessionStore` and receive no `Task`, so
                 // marking inside them would mean threading session state through
@@ -8731,6 +9736,8 @@ impl ChatOrchestrator {
 
                             if proposal.requires_approval || proposal.blocked {
                                 let response = command_proposal_response(&proposal);
+                                completed_tool_rounds
+                                    .push_round(std::mem::take(&mut round_completed));
                                 self.pending_commands.save(&PendingChatTurn {
                                     proposal_id: proposal.id.clone(),
                                     session: session.clone(),
@@ -8742,6 +9749,7 @@ impl ChatOrchestrator {
                                     turn_notes: turn_notes.text.clone(),
                                     turn_notes_carried: turn_notes.carried,
                                     calls: turn_notes.calls.clone(),
+                                    completed_tool_rounds: completed_tool_rounds.rounds.clone(),
                                     step_evidence: step_evidence.clone(),
                                     plan_reminder_sent,
                                     messages: messages.clone(),
@@ -8755,6 +9763,9 @@ impl ChatOrchestrator {
                                     plan_review: None,
                                     provider_fallback: None,
                                     round_budget: None,
+                                    segment: segment_tracker.as_ref().map(|tracker| {
+                                        tracker.pause_state(action_rounds, exploration_rounds)
+                                    }),
                                     question: None,
                                     check_batch: None,
                                     fetch_call: None,
@@ -9255,6 +10266,8 @@ impl ChatOrchestrator {
                                         query: inspection.url.query.clone(),
                                         fragment: inspection.url.fragment.clone(),
                                     };
+                                    completed_tool_rounds
+                                        .push_round(std::mem::take(&mut round_completed));
                                     self.pending_commands.save(&PendingChatTurn {
                                         proposal_id: proposal_id.clone(),
                                         session: session.clone(),
@@ -9268,6 +10281,7 @@ impl ChatOrchestrator {
                                         turn_notes: turn_notes.text.clone(),
                                         turn_notes_carried: turn_notes.carried,
                                         calls: turn_notes.calls.clone(),
+                                        completed_tool_rounds: completed_tool_rounds.rounds.clone(),
                                         step_evidence: step_evidence.clone(),
                                         plan_reminder_sent,
                                         messages: messages.clone(),
@@ -9281,6 +10295,9 @@ impl ChatOrchestrator {
                                         plan_review: None,
                                         provider_fallback: None,
                                         round_budget: None,
+                                        segment: segment_tracker.as_ref().map(|tracker| {
+                                            tracker.pause_state(action_rounds, exploration_rounds)
+                                        }),
                                         question: None,
                                         check_batch: None,
                                         fetch_call: Some(PendingFetchCall {
@@ -9341,6 +10358,8 @@ impl ChatOrchestrator {
                                     force_approval_cause.as_ref(),
                                 );
                                 let response = proposal.prompt.clone();
+                                completed_tool_rounds
+                                    .push_round(std::mem::take(&mut round_completed));
                                 self.pending_commands.save(&PendingChatTurn {
                                     proposal_id,
                                     session: session.clone(),
@@ -9352,6 +10371,7 @@ impl ChatOrchestrator {
                                     turn_notes: turn_notes.text.clone(),
                                     turn_notes_carried: turn_notes.carried,
                                     calls: turn_notes.calls.clone(),
+                                    completed_tool_rounds: completed_tool_rounds.rounds.clone(),
                                     step_evidence: step_evidence.clone(),
                                     plan_reminder_sent,
                                     messages: messages.clone(),
@@ -9365,6 +10385,9 @@ impl ChatOrchestrator {
                                     plan_review: None,
                                     provider_fallback: None,
                                     round_budget: None,
+                                    segment: segment_tracker.as_ref().map(|tracker| {
+                                        tracker.pause_state(action_rounds, exploration_rounds)
+                                    }),
                                     question: None,
                                     check_batch: None,
                                     fetch_call: None,
@@ -9461,6 +10484,8 @@ impl ChatOrchestrator {
                                     force_approval_cause.as_ref(),
                                 );
                                 let response = proposal.prompt.clone();
+                                completed_tool_rounds
+                                    .push_round(std::mem::take(&mut round_completed));
                                 self.pending_commands.save(&PendingChatTurn {
                                     proposal_id,
                                     session: session.clone(),
@@ -9472,6 +10497,7 @@ impl ChatOrchestrator {
                                     turn_notes: turn_notes.text.clone(),
                                     turn_notes_carried: turn_notes.carried,
                                     calls: turn_notes.calls.clone(),
+                                    completed_tool_rounds: completed_tool_rounds.rounds.clone(),
                                     step_evidence: step_evidence.clone(),
                                     plan_reminder_sent,
                                     messages: messages.clone(),
@@ -9489,6 +10515,9 @@ impl ChatOrchestrator {
                                     plan_review: None,
                                     provider_fallback: None,
                                     round_budget: None,
+                                    segment: segment_tracker.as_ref().map(|tracker| {
+                                        tracker.pause_state(action_rounds, exploration_rounds)
+                                    }),
                                     question: None,
                                     check_batch: None,
                                     fetch_call: None,
@@ -9741,6 +10770,8 @@ impl ChatOrchestrator {
                                         &question,
                                         &redacted_input,
                                     )?;
+                                    completed_tool_rounds
+                                        .push_round(std::mem::take(&mut round_completed));
                                     self.pending_commands.save(&PendingChatTurn {
                                         proposal_id: question.question_id().to_string(),
                                         session: session.clone(),
@@ -9754,6 +10785,7 @@ impl ChatOrchestrator {
                                         turn_notes: turn_notes.text.clone(),
                                         turn_notes_carried: turn_notes.carried,
                                         calls: turn_notes.calls.clone(),
+                                        completed_tool_rounds: completed_tool_rounds.rounds.clone(),
                                         step_evidence: step_evidence.clone(),
                                         plan_reminder_sent,
                                         messages: messages.clone(),
@@ -9767,6 +10799,9 @@ impl ChatOrchestrator {
                                         plan_review: None,
                                         provider_fallback: None,
                                         round_budget: None,
+                                        segment: segment_tracker.as_ref().map(|tracker| {
+                                            tracker.pause_state(action_rounds, exploration_rounds)
+                                        }),
                                         question: Some(PendingQuestion {
                                             question_id: question.question_id().to_string(),
                                         }),
@@ -9824,6 +10859,17 @@ impl ChatOrchestrator {
                 if writes_this_call {
                     wrote_this_round = true;
                 }
+                // Typed tracker metadata for the next request's safety pins and
+                // manifests. Captured before `action_outcome` is consumed below.
+                let tracked_completed = matched_tool_call.as_ref().and_then(|call| {
+                    tracked_completed_call(
+                        call,
+                        &after_tool_action,
+                        &action_outcome,
+                        open_step_id.clone(),
+                        dispatched_call_key.clone(),
+                    )
+                });
                 // Accrued before the marker is consumed, since the marker id is
                 // what ties this evidence back to the action in the log. Evidence
                 // belongs to whichever step is open; with no plan there is nothing
@@ -9943,6 +10989,9 @@ impl ChatOrchestrator {
                         "Command result:\n{tool_result_text}"
                     )));
                 }
+                if let Some(tracked) = tracked_completed {
+                    round_completed.push(tracked);
+                }
                 // Spec 65 §5.3: the durable per-turn record the notice, the
                 // warning and a resumed turn's seen-call set read. A call that
                 // opened no assistant message (the text-envelope command) has
@@ -9954,9 +11003,13 @@ impl ChatOrchestrator {
                         line: call_line.unwrap_or_default(),
                         key: dispatched_call_key,
                         writes: writes_this_call,
+                        compacted: false,
                     });
                 }
             }
+            // A terminal arm may already have moved this round into the pause;
+            // an ordinary round reaches here with the calls still to publish.
+            completed_tool_rounds.push_round(std::mem::take(&mut round_completed));
 
             if let Some(finished) = terminal {
                 break finished;
@@ -10232,9 +11285,11 @@ impl ChatOrchestrator {
         action_rounds: u32,
         exploration_rounds: u32,
         turn_notes: TurnNotesState,
+        completed_tool_rounds: CompletedToolTracker,
         step_evidence: Vec<crate::plan::Evidence>,
         plan_reminder_sent: bool,
         turn_options: ChatTurnOptions,
+        segment: Option<&SegmentRunState>,
         offer: PendingProviderFallback,
     ) -> Result<ChatTurnResult> {
         let proposal_id = create_id("fallback");
@@ -10250,6 +11305,7 @@ impl ChatOrchestrator {
             turn_notes: turn_notes.text.clone(),
             turn_notes_carried: turn_notes.carried,
             calls: turn_notes.calls.clone(),
+            completed_tool_rounds: completed_tool_rounds.rounds.clone(),
             step_evidence,
             plan_reminder_sent,
             // The request as the provider refused it: approving re-issues this
@@ -10265,6 +11321,7 @@ impl ChatOrchestrator {
             plan_review: None,
             provider_fallback: Some(offer.clone()),
             round_budget: None,
+            segment: segment.map(|tracker| tracker.pause_state(action_rounds, exploration_rounds)),
             question: None,
             check_batch: None,
             fetch_call: None,
@@ -10366,11 +11423,13 @@ impl ChatOrchestrator {
         action_rounds: u32,
         exploration_rounds: u32,
         turn_notes: TurnNotesState,
+        completed_tool_rounds: CompletedToolTracker,
         step_evidence: Vec<crate::plan::Evidence>,
         plan_reminder_sent: bool,
         max_rounds: u32,
         rounds_granted: u32,
         turn_options: ChatTurnOptions,
+        segment: Option<&SegmentRunState>,
     ) -> Result<ChatTurnResult> {
         let proposal_id = create_id("roundbudget");
         let response = round_budget_pause_response(action_rounds, max_rounds, exploration_rounds);
@@ -10391,6 +11450,7 @@ impl ChatOrchestrator {
             turn_notes: turn_notes.text.clone(),
             turn_notes_carried: turn_notes.carried,
             calls: turn_notes.calls.clone(),
+            completed_tool_rounds: completed_tool_rounds.rounds.clone(),
             step_evidence,
             plan_reminder_sent,
             // The conversation so far, unchanged: nothing was dispatched, so
@@ -10406,6 +11466,7 @@ impl ChatOrchestrator {
             plan_review: None,
             provider_fallback: None,
             round_budget: Some(pause),
+            segment: segment.map(|tracker| tracker.pause_state(action_rounds, exploration_rounds)),
             question: None,
             check_batch: None,
             fetch_call: None,
@@ -11788,6 +12849,11 @@ struct RecordedCall {
     key: Option<Vec<String>>,
     #[serde(default)]
     writes: bool,
+    /// The read result this call produced was replaced by a within-turn
+    /// manifest (spec 103 Task 4). The model may repeat the call through the
+    /// ordinary tool path, so the resume-time seen-call set ignores it.
+    #[serde(default)]
+    compacted: bool,
 }
 
 /// The notes and call list a turn carries across a pause (spec 65 §5.6).
@@ -11816,6 +12882,398 @@ impl TurnNotesState {
             carried: self.carried,
         })
     }
+}
+
+/// Proves a paused turn's segment record still describes the durable segment.
+///
+/// The paused turn may be resumed one round on (a command or patch decision
+/// re-enters the round that was deferred) or on the same round (a question or
+/// fetch decision), so its counter may differ from the durable baseline by at
+/// most one. Everything else must match byte-for-byte; a mismatch is corrupt
+/// state, not a later segment.
+fn validate_segment_resume(
+    resume: &TaskSegmentPauseState,
+    started: &TaskSegmentStarted,
+    action_rounds: u32,
+    exploration_rounds: u32,
+) -> Result<()> {
+    let totals_match = resume.total_action_rounds
+        == started
+            .total_action_rounds
+            .saturating_add(resume.segment_action_rounds)
+        && resume.total_exploration_rounds
+            == started
+                .total_exploration_rounds
+                .saturating_add(resume.segment_exploration_rounds);
+    let counters_match = (resume.segment_action_rounds == action_rounds
+        || resume.segment_action_rounds.saturating_add(1) == action_rounds)
+        && resume.segment_exploration_rounds == exploration_rounds;
+    if resume.segment == started.segment
+        && resume.start_digest == started.start_digest
+        && totals_match
+        && counters_match
+    {
+        return Ok(());
+    }
+    Err(ClientError::InvalidInput(format!(
+        "the paused task segment {} does not match durable segment {}",
+        resume.segment, started.segment
+    )))
+}
+
+/// One automatic worker segment's in-memory state (spec 103 Task 5).
+///
+/// The current segment's counters stay in the turn loop (`action_rounds`,
+/// `exploration_rounds`); this carries the monotonic task totals and the
+/// boundary decisions. Totals never reset at a boundary; only the current
+/// segment's counters do.
+struct SegmentRunState {
+    segment: u32,
+    prior_action_rounds: u32,
+    prior_exploration_rounds: u32,
+    start_digest: String,
+    action_allowance: u32,
+    exploration_allowance: u32,
+    budget: TaskExecutionBudget,
+}
+
+impl SegmentRunState {
+    fn resumed(
+        budget: &TaskExecutionBudget,
+        started: &TaskSegmentStarted,
+        normal_action_rounds: u32,
+        normal_exploration_rounds: u32,
+    ) -> Self {
+        // Task totals are bounded by the approved budget and Task 1's absolute
+        // task ceilings. The legacy one-turn caps bound one ordinary turn and
+        // must not shrink a multi-segment task total.
+        let action_cap = budget
+            .action_rounds
+            .min(crate::task_budget::ABSOLUTE_TASK_ACTION_ROUND_CEILING);
+        let exploration_cap = budget
+            .exploration_rounds
+            .min(crate::task_budget::ABSOLUTE_TASK_EXPLORATION_ROUND_CEILING);
+        Self {
+            segment: started.segment,
+            prior_action_rounds: started.total_action_rounds,
+            prior_exploration_rounds: started.total_exploration_rounds,
+            start_digest: started.start_digest.clone(),
+            action_allowance: normal_action_rounds
+                .min(action_cap.saturating_sub(started.total_action_rounds)),
+            exploration_allowance: normal_exploration_rounds
+                .min(exploration_cap.saturating_sub(started.total_exploration_rounds)),
+            budget: *budget,
+        }
+    }
+
+    fn total_action_rounds(&self, current: u32) -> u32 {
+        self.prior_action_rounds.saturating_add(current)
+    }
+
+    fn total_exploration_rounds(&self, current: u32) -> u32 {
+        self.prior_exploration_rounds.saturating_add(current)
+    }
+
+    fn pause_state(&self, action_rounds: u32, exploration_rounds: u32) -> TaskSegmentPauseState {
+        TaskSegmentPauseState {
+            segment: self.segment,
+            segment_action_rounds: action_rounds,
+            segment_exploration_rounds: exploration_rounds,
+            total_action_rounds: self.total_action_rounds(action_rounds),
+            total_exploration_rounds: self.total_exploration_rounds(exploration_rounds),
+            start_digest: self.start_digest.clone(),
+        }
+    }
+}
+
+/// One completed native tool call, with the typed engine facts Task 4 needs to
+/// compact it without reading model-visible prose (spec 103 Task 4).
+///
+/// `call` is Task 3's reducer metadata. `plan_step_id` is the step that was
+/// open when the call ran, captured from the plan at dispatch time. `read_key`
+/// is [`ChatOrchestrator::call_key`]'s canonical identity, so a compacted read
+/// can be removed from the seen-call set by key rather than by text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrackedCompletedToolCall {
+    #[serde(flatten)]
+    call: CompletedToolCall,
+    #[serde(default)]
+    plan_step_id: Option<String>,
+    #[serde(default)]
+    read_key: Option<Vec<String>>,
+}
+
+/// The calls that completed in one assistant round. Batched calls stay together
+/// so a provider-valid request keeps its batched pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrackedCompletedToolRound {
+    calls: Vec<TrackedCompletedToolCall>,
+}
+
+/// The durable completed-tool tracker a paused turn carries (spec 103 Task 4).
+///
+/// Historical pending turns have no such field and load with an empty tracker,
+/// which is exactly the pre-Task-4 request path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompletedToolTracker {
+    #[serde(default)]
+    rounds: Vec<TrackedCompletedToolRound>,
+}
+
+impl From<Vec<TrackedCompletedToolRound>> for CompletedToolTracker {
+    fn from(rounds: Vec<TrackedCompletedToolRound>) -> Self {
+        Self { rounds }
+    }
+}
+
+impl CompletedToolTracker {
+    fn push_round(&mut self, calls: Vec<TrackedCompletedToolCall>) {
+        if !calls.is_empty() {
+            self.rounds.push(TrackedCompletedToolRound { calls });
+        }
+    }
+
+    fn as_compaction_rounds(&self) -> Vec<CompletedToolRound> {
+        self.rounds
+            .iter()
+            .map(|round| CompletedToolRound {
+                calls: round.calls.iter().map(|call| call.call.clone()).collect(),
+            })
+            .collect()
+    }
+
+    fn calls(&self) -> impl Iterator<Item = &TrackedCompletedToolCall> {
+        self.rounds.iter().flat_map(|round| round.calls.iter())
+    }
+
+    /// The newest completed call that ran while this plan step was open.
+    fn latest_call_id_for_step(&self, step_id: &str) -> Option<&str> {
+        self.rounds
+            .iter()
+            .rev()
+            .find_map(|round| {
+                round
+                    .calls
+                    .iter()
+                    .rev()
+                    .find(|call| call.plan_step_id.as_deref() == Some(step_id))
+            })
+            .map(|call| call.call.call_id.as_str())
+    }
+
+    /// Every call id the tracker can describe.
+    fn completed_call_ids(&self) -> BTreeSet<&str> {
+        self.calls()
+            .map(|call| call.call.call_id.as_str())
+            .collect()
+    }
+
+    /// The canonical keys of reads whose bodies a preparation attempt replaced.
+    fn compacted_read_keys(&self, call_ids: &BTreeSet<String>) -> Vec<Vec<String>> {
+        self.calls()
+            .filter(|call| call_ids.contains(&call.call.call_id))
+            .filter_map(|call| call.read_key.clone())
+            .collect()
+    }
+}
+
+/// The typed compaction identity of a dispatched action.
+///
+/// Every value comes from the action the engine decoded and dispatched, never
+/// from the result text. `read_only` says whether the action's effect makes its
+/// result a candidate for compaction at all.
+fn compaction_identity(
+    action: &ToolAction,
+) -> Option<(CompactedToolKind, ToolIdentity, Option<LineRange>, bool)> {
+    match action {
+        ToolAction::ReadFile { path, range, .. } => Some((
+            CompactedToolKind::ReadFile,
+            ToolIdentity::path(path.clone()),
+            *range,
+            true,
+        )),
+        ToolAction::ListDirectory { dir, .. } => Some((
+            CompactedToolKind::ListDirectory,
+            ToolIdentity::path(dir.clone().unwrap_or_else(|| ".".to_string())),
+            None,
+            true,
+        )),
+        ToolAction::SearchContent { pattern, .. } => Some((
+            CompactedToolKind::SearchContent,
+            ToolIdentity::query(pattern.clone()),
+            None,
+            true,
+        )),
+        ToolAction::SearchCodebase { query, .. } => Some((
+            CompactedToolKind::SearchCodebase,
+            ToolIdentity::query(query.clone()),
+            None,
+            true,
+        )),
+        ToolAction::ReadGitStatus { .. } => Some((
+            CompactedToolKind::ReadGitStatus,
+            ToolIdentity::command("git status"),
+            None,
+            true,
+        )),
+        ToolAction::ReadGitDiff {
+            staged,
+            paths,
+            stat,
+            base,
+            ..
+        } => {
+            let mut command = String::from("git diff");
+            if *stat {
+                command.push_str(" --stat");
+            }
+            if *staged {
+                command.push_str(" --staged");
+            }
+            if let Some(base) = base {
+                command.push(' ');
+                command.push_str(base);
+            }
+            if !paths.is_empty() {
+                command.push_str(" --");
+                for path in paths {
+                    command.push(' ');
+                    command.push_str(path);
+                }
+            }
+            Some((
+                CompactedToolKind::ReadGitDiff,
+                ToolIdentity::command(command),
+                None,
+                true,
+            ))
+        }
+        ToolAction::ListWorktrees { .. } => Some((
+            CompactedToolKind::ListWorktrees,
+            ToolIdentity::command("git worktree list"),
+            None,
+            true,
+        )),
+        ToolAction::ReadGitLog {
+            base, max_count, ..
+        } => {
+            let mut command = String::from("git log");
+            if let Some(base) = base {
+                command.push(' ');
+                command.push_str(base);
+            }
+            if let Some(max_count) = max_count {
+                command.push_str(&format!(" --max-count={max_count}"));
+            }
+            Some((
+                CompactedToolKind::ReadGitLog,
+                ToolIdentity::command(command),
+                None,
+                true,
+            ))
+        }
+        ToolAction::Command(request) => Some((
+            CompactedToolKind::Command,
+            ToolIdentity::command(request.command.clone()),
+            None,
+            false,
+        )),
+        ToolAction::WebDiagnostic(call) => Some((
+            CompactedToolKind::WebDiagnostic,
+            ToolIdentity::url(call.url.clone()),
+            None,
+            false,
+        )),
+        ToolAction::McpCall {
+            server_id,
+            tool_name,
+            ..
+        } => Some((
+            CompactedToolKind::McpCall,
+            ToolIdentity::endpoint(format!("{server_id}/{tool_name}")),
+            None,
+            false,
+        )),
+        ToolAction::FetchUrl { url } => Some((
+            CompactedToolKind::FetchUrl,
+            ToolIdentity::url(url.clone()),
+            None,
+            false,
+        )),
+        ToolAction::ProposePatch(edit) => Some((
+            CompactedToolKind::Command,
+            ToolIdentity::path(
+                edit.changes
+                    .first()
+                    .map(|change| change.path.clone())
+                    .unwrap_or_default(),
+            ),
+            None,
+            false,
+        )),
+        ToolAction::EditFile { edits, .. } => Some((
+            CompactedToolKind::Command,
+            ToolIdentity::path(
+                edits
+                    .first()
+                    .map(|edit| edit.path.clone())
+                    .unwrap_or_default(),
+            ),
+            None,
+            false,
+        )),
+        ToolAction::ProposePlan(_)
+        | ToolAction::CompleteStep
+        | ToolAction::AskUser(_)
+        | ToolAction::TurnNotes { .. }
+        | ToolAction::ProposeMemory { .. } => Some((
+            CompactedToolKind::Command,
+            ToolIdentity::endpoint(tool_action_marker(action).0.to_string()),
+            None,
+            false,
+        )),
+    }
+}
+
+/// Turns one completed native dispatch into the tracker entry Task 4 persists.
+///
+/// A cancelled dispatch did nothing, so it is not a completed round. A call
+/// without a native id (the text-envelope command) has no provider pairing to
+/// preserve and is not tracked either.
+fn tracked_completed_call(
+    call: &ToolCall,
+    action: &ToolAction,
+    outcome: &ActionOutcome,
+    plan_step_id: Option<String>,
+    read_key: Option<Vec<String>>,
+) -> Option<TrackedCompletedToolCall> {
+    if *outcome == ActionOutcome::Cancelled {
+        return None;
+    }
+    let (tool_kind, identity, range, read_only) = compaction_identity(action)?;
+    let result_outcome = match outcome {
+        ActionOutcome::Cancelled => ToolResultOutcome::UnknownExternalOutcome,
+        ActionOutcome::Failed => ToolResultOutcome::FailedUnresolved,
+        ActionOutcome::CommandExit(Some(0), _) => ToolResultOutcome::Succeeded,
+        ActionOutcome::CommandExit(_, _) => ToolResultOutcome::FailedUnresolved,
+        ActionOutcome::FileRead { .. } => ToolResultOutcome::Succeeded,
+        ActionOutcome::Ok => ToolResultOutcome::Succeeded,
+    };
+    Some(TrackedCompletedToolCall {
+        call: CompletedToolCall {
+            call_id: call.id.clone(),
+            tool_kind,
+            identity,
+            range,
+            outcome: result_outcome,
+            include_excerpt: read_only,
+        },
+        plan_step_id,
+        read_key,
+    })
 }
 
 /// Conversation state saved when a chat turn pauses on a command that needs
@@ -11853,6 +13311,12 @@ struct PendingChatTurn {
     /// pending turns loadable with an empty list.
     #[serde(default)]
     calls: Vec<RecordedCall>,
+    /// Completed native tool rounds, with the typed metadata Task 4 needs to
+    /// compact a later request deterministically (spec 103 Task 4).
+    /// `#[serde(default)]` keeps pending turns written before this tracker
+    /// existed loadable, with the pre-Task-4 request path.
+    #[serde(default)]
+    completed_tool_rounds: Vec<TrackedCompletedToolRound>,
     /// Evidence accrued for the step that was open when the turn paused. A
     /// pause carries it so a step closed after the resume is judged on
     /// everything it ran (spec 66 §5.3), without attaching anything to the step
@@ -11916,6 +13380,13 @@ struct PendingChatTurn {
     /// pending turns written before the pause existed loadable.
     #[serde(default)]
     round_budget: Option<RoundBudgetPause>,
+    /// The automatic worker-segment state at this pause (spec 103 Task 5).
+    ///
+    /// Defaulted and omitted when absent, so an unbudgeted worker, an inline
+    /// task and every historical pending turn keep the exact pending-turn shape
+    /// they had before segments existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    segment: Option<TaskSegmentPauseState>,
     /// Present when the pause is a question the model asked (spec 50). As with
     /// a plan review nothing was dispatched: the turn stopped to let a human
     /// answer, and `round` is the round the question was asked in, because
@@ -11997,6 +13468,14 @@ impl BrowserCheck {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PendingPlanReview {
     deferred_action: String,
+    /// The engine-proposed budget offer (spec 103 Task 2), persisted verbatim
+    /// so a reload or worker restart reattaches the same values. Defaulted so
+    /// every pending turn written before budgets existed loads budgetless and
+    /// keeps today's approval behaviour. Skipped on the wire when absent, so
+    /// an inline review keeps the exact pending-turn shape it had before task
+    /// budgets existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    budget: Option<TaskBudgetReview>,
 }
 
 /// The persisted half of a pre-send context review (spec 27 §5.1).
@@ -12101,6 +13580,48 @@ impl PausedTurns {
             .get("deferred_action")?
             .as_str()
             .map(str::to_string)
+    }
+
+    /// The engine-proposed budget a paused plan review offered, or `None` for
+    /// an inline or historical review (spec 103 Task 2).
+    ///
+    /// Read back verbatim from the pending turn rather than rebuilt from
+    /// configuration: a reload or worker restart must reattach the exact
+    /// values the user is looking at, even if a config edit happened since.
+    ///
+    /// A missing pending turn or a review without a `budget` field is a
+    /// budgetless review, not an error. A field that is present but does not
+    /// decode, or decodes to a budget that fails its own bounds, is `Err`: a
+    /// caller reattaching a review must not silently downgrade a corrupt
+    /// allowance to "no allowance", because that would present a different
+    /// decision from the one the log says was offered.
+    pub fn plan_budget_review(&self, proposal_id: &str) -> Result<Option<TaskBudgetReview>> {
+        let path = PendingCommandStore::new(&self.data_dir).path_for(proposal_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
+            ClientError::InvalidInput(format!(
+                "the paused review {proposal_id} is not readable: {error}"
+            ))
+        })?;
+        let Some(budget) = value
+            .get("plan_review")
+            .and_then(|review| review.get("budget"))
+        else {
+            return Ok(None);
+        };
+        if budget.is_null() {
+            return Ok(None);
+        }
+        let review =
+            serde_json::from_value::<TaskBudgetReview>(budget.clone()).map_err(|error| {
+                ClientError::InvalidInput(format!(
+                    "the paused review {proposal_id} has a corrupt task budget: {error}"
+                ))
+            })?;
+        review.budget.validate()?;
+        Ok(Some(review))
     }
 
     /// The provider a paused fallback offer would answer with, or `None` when
@@ -12873,6 +14394,258 @@ fn bounded_messages(
         bounded.push(ModelMessage::system(warning));
     }
     bounded
+}
+
+/// The request selected for one model call, plus the call ids Task 4 compacted.
+struct PreparedTurnRequest {
+    request: ModelRequest,
+    compacted_call_ids: BTreeSet<String>,
+}
+
+impl PreparedTurnRequest {
+    fn unchanged(request: ModelRequest) -> Self {
+        Self {
+            request,
+            compacted_call_ids: BTreeSet::new(),
+        }
+    }
+}
+
+/// The safety-first selection used only once the request would cross the
+/// window share (spec 103 Task 4).
+///
+/// Precedence, in order: the system/user head, every system/user message, and
+/// every completed round holding a pinned result are kept; the configured
+/// message budget then bounds the remaining unpinned completed rounds, oldest
+/// first. This never splits an assistant round from its results, and it cannot
+/// send fewer pinned values than the legacy cut because it only ever keeps more.
+fn bounded_messages_preserving_safety(
+    messages: &[ModelMessage],
+    max_messages: usize,
+    window: &NotesWindow<'_>,
+    pinned_call_ids: &BTreeSet<String>,
+) -> Vec<ModelMessage> {
+    let head_len = messages.len().min(HEAD_MESSAGES);
+    let mut protected = vec![false; messages.len()];
+    for (index, message) in messages.iter().enumerate() {
+        // System and user text is never elided. A plain assistant answer is not
+        // part of a completed tool round either, so it stays too; only an
+        // assistant tool-call message is a round declaration that may be cut.
+        if index < head_len
+            || message.role == "system"
+            || message.role == "user"
+            || (message.role == "assistant" && message.tool_calls.is_empty())
+        {
+            protected[index] = true;
+        }
+    }
+    for (index, message) in messages.iter().enumerate() {
+        if message.role == "tool"
+            && let Some(call_id) = &message.tool_call_id
+            && pinned_call_ids.contains(call_id)
+        {
+            protected[index] = true;
+        }
+        if message.role == "assistant"
+            && message
+                .tool_calls
+                .iter()
+                .any(|call| pinned_call_ids.contains(&call.id))
+        {
+            protected[index] = true;
+            // A pinned declaration keeps its whole round, so no tool result is
+            // left without the call it answers.
+            let mut next = index + 1;
+            while next < messages.len() && messages[next].role != "assistant" {
+                protected[next] = true;
+                next += 1;
+            }
+        }
+    }
+
+    let mut dropped = vec![false; messages.len()];
+    let budget = max_messages.saturating_sub(3);
+    let mut kept_tail = messages.len().saturating_sub(head_len);
+    if messages.len() > max_messages {
+        let mut index = head_len;
+        while index < messages.len() {
+            if messages[index].role != "assistant" {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            let mut end = index + 1;
+            while end < messages.len() && messages[end].role != "assistant" {
+                end += 1;
+            }
+            let group_len = end - start;
+            let group_protected = (start..end).any(|position| protected[position]);
+            if !group_protected && kept_tail > budget {
+                for slot in dropped.iter_mut().take(end).skip(start) {
+                    *slot = true;
+                }
+                kept_tail = kept_tail.saturating_sub(group_len);
+            }
+            index = end;
+        }
+    }
+
+    let dropped_messages = dropped.iter().filter(|dropped| **dropped).count();
+    let mut bounded = messages[..head_len].to_vec();
+    if window.enabled && !window.notes.is_empty() {
+        let header = if window.carried {
+            CARRIED_NOTES_HEADER
+        } else {
+            NOTES_HEADER
+        };
+        bounded.push(ModelMessage::system(format!("{header}\n{}", window.notes)));
+    }
+    if dropped_messages > 0 {
+        bounded.push(ModelMessage::system(safety_elision_notice(
+            messages, &dropped, window,
+        )));
+    }
+    for (index, message) in messages.iter().enumerate().skip(head_len) {
+        if !dropped[index] {
+            bounded.push(message.clone());
+        }
+    }
+    if window.enabled
+        && kept_tail >= budget
+        && let Some(warning) = safety_pre_cut_warning(messages, &dropped, window)
+    {
+        bounded.push(ModelMessage::system(warning));
+    }
+    bounded
+}
+
+fn safety_elision_notice(
+    messages: &[ModelMessage],
+    dropped: &[bool],
+    window: &NotesWindow<'_>,
+) -> String {
+    let message_count = dropped.iter().filter(|dropped| **dropped).count();
+    let results = messages
+        .iter()
+        .zip(dropped)
+        .filter(|(message, dropped)| **dropped && message.role == "tool")
+        .count();
+    let mut notice = format!(
+        "Earlier rounds of this turn were elided to bound the request: {message_count} messages ({results} call results) omitted."
+    );
+    let elided = window
+        .calls
+        .iter()
+        .filter(|call| dropped.get(call.message_index).copied().unwrap_or(false));
+    let (lines, more) = rendered_call_lines(elided, window.notice_cap);
+    if !lines.is_empty() {
+        notice.push_str(" Calls already made, oldest first:\n");
+        notice.push_str(&lines.join("\n"));
+        if more > 0 {
+            notice.push_str(&format!("\n  …and {more} more"));
+        }
+    }
+    notice.push_str("\nThe session log still holds every result. Your notes are above.");
+    notice
+}
+
+fn safety_pre_cut_warning(
+    messages: &[ModelMessage],
+    dropped: &[bool],
+    window: &NotesWindow<'_>,
+) -> Option<String> {
+    let oldest = window.calls.iter().find(|call| {
+        !dropped.get(call.message_index).copied().unwrap_or(false)
+            && messages
+                .get(call.message_index)
+                .is_some_and(|message| message.role != "tool")
+    })?;
+    let (lines, more) = rendered_call_lines(
+        window.calls.iter().filter(|call| {
+            call.round == oldest.round && !dropped.get(call.message_index).copied().unwrap_or(false)
+        }),
+        window.warning_cap,
+    );
+    let mut warning = format!(
+        "The window is full. With your next request, round {} leaves it:",
+        oldest.round
+    );
+    for line in lines {
+        warning.push('\n');
+        warning.push_str(&line);
+    }
+    if more > 0 {
+        warning.push_str(&format!("\n…and {more} more in that round."));
+    }
+    Some(warning)
+}
+
+/// The path whose hash a later patch or finding safety check rests on, when the
+/// evidence carries one. Only typed evidence variants are read.
+fn collect_safety_path(evidence: &Evidence, paths: &mut BTreeSet<String>) {
+    match evidence {
+        Evidence::FileRead { path, .. } => {
+            paths.insert(path.clone());
+        }
+        Evidence::PatchApplied { files, .. } => {
+            for file in files {
+                paths.insert(file.path.clone());
+            }
+        }
+        Evidence::CommandExit { .. } | Evidence::Findings { .. } => {}
+    }
+}
+
+/// The tool kinds whose completed results may be replaced by a manifest.
+///
+/// Everything else is pinned by type: a command, browser call, MCP call, fetch,
+/// patch, edit, plan, question, notes or memory result is never eligible, so a
+/// compaction decision cannot become an approval or erase an external effect.
+fn is_compactable_read_kind(kind: CompactedToolKind) -> bool {
+    matches!(
+        kind,
+        CompactedToolKind::ReadFile
+            | CompactedToolKind::ListDirectory
+            | CompactedToolKind::SearchContent
+            | CompactedToolKind::SearchCodebase
+            | CompactedToolKind::ReadGitStatus
+            | CompactedToolKind::ReadGitDiff
+            | CompactedToolKind::ListWorktrees
+            | CompactedToolKind::ReadGitLog
+    )
+}
+
+/// Keeps only completed rounds whose every call still has both an assistant
+/// declaration and a tool result in the selected request.
+///
+/// This is a structural presence check over ids, not a reading of message text.
+/// The safety selection keeps whole rounds, so a round is normally all present
+/// or all absent; a partially present round is left out rather than described to
+/// the reducer as a pair that does not exist.
+fn present_completed_rounds(
+    messages: &[ModelMessage],
+    rounds: &[CompletedToolRound],
+) -> Vec<CompletedToolRound> {
+    let declarations: BTreeSet<&str> = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .flat_map(|message| message.tool_calls.iter().map(|call| call.id.as_str()))
+        .collect();
+    let results: BTreeSet<&str> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect();
+    rounds
+        .iter()
+        .filter(|round| {
+            round.calls.iter().all(|call| {
+                declarations.contains(call.call_id.as_str())
+                    && results.contains(call.call_id.as_str())
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// How many calls the elision notice and the pre-cut warning list (spec 65
@@ -13684,6 +15457,60 @@ fn apply_plan_revision(current: &TaskPlan, revision: &[PlanRevisionStep]) -> Tas
     }
     revised.steps = steps;
     revised
+}
+
+/// Checks the budget half of a plan-review decision before anything is written.
+///
+/// The reviewed budget is the engine's proposal: a client may send it back or
+/// omit it on a decline, and may never change, raise or invent one. The
+/// effective ceiling is read again here rather than trusted from the pending
+/// turn, because configuration can change while a review waits — a budget that
+/// was valid when offered must still fit the ceiling it is approved under.
+/// Only an approval actually spends the allowance, so only an approval is
+/// measured against that re-read ceiling: a lowered ceiling must never leave
+/// the user unable to decline work they no longer want to fund.
+///
+/// A budgetless (inline or historical) review keeps its old behaviour, which
+/// includes rejecting a budget a client injected into a decision that never
+/// offered one.
+fn validate_plan_budget_decision(
+    review: &PendingPlanReview,
+    approved: bool,
+    supplied: Option<&TaskExecutionBudget>,
+    policy: &TaskBudgetPolicy,
+) -> Result<()> {
+    let Some(reviewed) = &review.budget else {
+        return match supplied {
+            None => Ok(()),
+            Some(_) => Err(ClientError::InvalidInput(
+                "this plan review offers no task budget, so none can be supplied".to_string(),
+            )),
+        };
+    };
+    let Some(supplied) = supplied else {
+        // Declining needs no allowance: the user is refusing the work, and the
+        // worker control socket's reject may therefore omit it.
+        return if approved {
+            Err(ClientError::InvalidInput(
+                "approving this worker plan requires the exact reviewed task budget".to_string(),
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    // A client that does send the budget back must return the reviewed one
+    // unchanged. That holds for a decline too: it records no allowance, so
+    // accepting a different one would only hide a client bug.
+    if supplied != &reviewed.budget {
+        return Err(ClientError::InvalidInput(
+            "the task budget does not match the one reviewed".to_string(),
+        ));
+    }
+    supplied.validate()?;
+    if approved {
+        supplied.validate_against(&policy.ceiling)?;
+    }
+    Ok(())
 }
 
 /// The text a paused turn shows while its plan is under review.
@@ -14728,6 +16555,61 @@ fn token_budget_exhausted_response(
     message
 }
 
+/// Names the approved dimension that stopped the next request before it was
+/// sent, with the exact remaining/required figures.
+///
+/// Task 6 will replace this with its typed terminal outcome; until then the
+/// existing token-budget stop is the fail-closed status, and the prose must not
+/// claim the request was sent or that spend changed.
+fn task_budget_token_exhausted_response(
+    budget: &TaskExecutionBudget,
+    usage: Option<&TaskUsage>,
+    failure: &TaskRequestTokenAuthority,
+    required: u64,
+    remaining: u64,
+    plan: Option<&crate::plan::TaskPlan>,
+) -> String {
+    let spent = usage.map_or_else(
+        || "an unrecorded amount".to_string(),
+        |usage| {
+            format!(
+                "{} input / {} output tokens",
+                usage.input_tokens, usage.output_tokens
+            )
+        },
+    );
+    let detail = match failure {
+        TaskRequestTokenAuthority::InputExceeded { .. } => format!(
+            "The next request needs about {required} input tokens, but only {remaining} of the approved {} remain.",
+            budget.input_tokens
+        ),
+        TaskRequestTokenAuthority::OutputExhausted { .. } => format!(
+            "No approved output tokens remain ({} approved).",
+            budget.output_tokens
+        ),
+        TaskRequestTokenAuthority::UsageUnavailable => {
+            "The approved budget cannot be proved because no durable token usage was recorded."
+                .to_string()
+        }
+    };
+    let mut message = format!(
+        "This task stopped before its next model call under the approved execution budget ({} action rounds, {} exploration rounds, {} input tokens, {} output tokens). Spent so far: {spent}. {detail}",
+        budget.action_rounds, budget.exploration_rounds, budget.input_tokens, budget.output_tokens
+    );
+    let open: Vec<&str> = plan
+        .map(|plan| {
+            plan.open_steps()
+                .into_iter()
+                .map(|step| step.title.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !open.is_empty() {
+        message.push_str(&format!("\n\nStill to do: {}.", open.join("; ")));
+    }
+    message
+}
+
 /// "1 read-only round" / "2 read-only rounds": the count is often zero or one,
 /// and the label reads as a bare count in the progress stream too.
 fn read_only_rounds(count: u32) -> String {
@@ -15127,6 +17009,71 @@ mod environment_classification_tests {
 }
 
 #[cfg(test)]
+mod pending_turn_defaults_tests {
+    use super::*;
+
+    #[test]
+    fn a_pending_turn_written_before_the_completed_tool_tracker_still_loads() {
+        let pending = PendingChatTurn {
+            proposal_id: "proposal".to_string(),
+            session: Session {
+                id: "session".to_string(),
+                repository_id: "repository".to_string(),
+                title: "title".to_string(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                summary: String::new(),
+                origin: "user".to_string(),
+            },
+            task: Task {
+                id: "task".to_string(),
+                session_id: "session".to_string(),
+                status: TaskStatus::WaitingForApproval,
+                user_prompt: "prompt".to_string(),
+                model_provider: "mock".to_string(),
+                model_name: "mock".to_string(),
+                created_at_ms: 0,
+                completed_at_ms: None,
+            },
+            repository_root: "/tmp".to_string(),
+            context_files: Vec::new(),
+            round: 0,
+            exploration_rounds: 0,
+            turn_notes: String::new(),
+            turn_notes_carried: false,
+            calls: Vec::new(),
+            completed_tool_rounds: Vec::new(),
+            step_evidence: Vec::new(),
+            plan_reminder_sent: false,
+            messages: Vec::new(),
+            matched_tool_call: None,
+            last_content: String::new(),
+            turn_options: ChatTurnOptions::default(),
+            reasoning_content: None,
+            round_calls_fed_back: false,
+            mcp_call: None,
+            web_diagnostic_call: None,
+            plan_review: None,
+            provider_fallback: None,
+            round_budget: None,
+            segment: None,
+            question: None,
+            check_batch: None,
+            fetch_call: None,
+            context_review: None,
+        };
+        let mut value = serde_json::to_value(&pending).expect("a pending turn serializes");
+        value
+            .as_object_mut()
+            .expect("a pending turn is an object")
+            .remove("completed_tool_rounds");
+        let loaded: PendingChatTurn =
+            serde_json::from_value(value).expect("a historical pending turn must load");
+        assert!(loaded.completed_tool_rounds.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod repair_scope_ordering_tests {
     /// Spec 102 Task 5: the first persisted patch must already carry its
     /// repair-scope review. Attaching it after the turn returns would leave a
@@ -15487,6 +17434,7 @@ mod evidence_tests {
             line: line.to_string(),
             key: None,
             writes: false,
+            compacted: false,
         }
     }
 
@@ -18114,11 +20062,13 @@ done
                 0,
                 0,
                 TurnNotesState::default(),
+                CompletedToolTracker::default(),
                 Vec::new(),
                 false,
                 &mut adapter,
                 &mut sink,
                 ChatTurnOptions::default(),
+                None,
             )
             .unwrap();
 
@@ -18214,11 +20164,13 @@ done
             0,
             0,
             TurnNotesState::default(),
+            CompletedToolTracker::default(),
             Vec::new(),
             false,
             &mut adapter,
             &mut sink,
             ChatTurnOptions::default(),
+            None,
         );
 
         assert!(result.is_err(), "the read failure must end the turn");

@@ -4,6 +4,7 @@ use crate::error::{ClientError, Result};
 use crate::hash::repository_id_for_root;
 use crate::model::TokenUsage;
 use crate::profile::{ProfileCapabilities, ProfileId};
+use crate::task_budget::{TaskBudgetPolicy, TaskExecutionBudget};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -384,6 +385,42 @@ pub struct Config {
     /// user's money on the repository's say-so. `0` restores today's behaviour,
     /// where every read counts as an action round.
     pub agent_max_exploration_rounds: u32,
+    /// The total action-round allowance a worker plan review proposes (spec 103
+    /// Task 1). This is a task-wide budget, not a per-segment limit:
+    /// [`Self::agent_max_tool_rounds`] remains the checkpoint inside it.
+    ///
+    /// Restrict-only, lower wins. A repository may lower the proposal, never
+    /// raise it, because a larger total spends more of the user's money.
+    pub worker_task_budget_action_rounds: u32,
+    /// The total exploration-round allowance a worker plan review proposes.
+    ///
+    /// Restrict-only, lower wins, for the same reason as the action-round
+    /// proposal.
+    pub worker_task_budget_exploration_rounds: u32,
+    /// The total input tokens a worker task may spend, as proposed at plan
+    /// review. Restrict-only, lower wins.
+    pub worker_task_budget_input_tokens: u64,
+    /// The total output tokens a worker task may spend, as proposed at plan
+    /// review. Restrict-only, lower wins.
+    pub worker_task_budget_output_tokens: u64,
+    /// The effective ceiling for a worker task's total action rounds.
+    ///
+    /// Restrict-only at repository and profile scope: a lower value narrows what
+    /// one repository may spend, and a raise would enlarge a user or
+    /// administrator ceiling.
+    pub worker_task_budget_max_action_rounds: u32,
+    /// The effective ceiling for a worker task's total exploration rounds.
+    ///
+    /// Restrict-only at repository and profile scope.
+    pub worker_task_budget_max_exploration_rounds: u32,
+    /// The effective ceiling for a worker task's input tokens.
+    ///
+    /// Restrict-only at repository and profile scope.
+    pub worker_task_budget_max_input_tokens: u64,
+    /// The effective ceiling for a worker task's output tokens.
+    ///
+    /// Restrict-only at repository and profile scope.
+    pub worker_task_budget_max_output_tokens: u64,
     /// Larger budget for turns that are explicitly debugging a web page or
     /// that call a first-class browser diagnostic tool.
     pub agent_web_debug_max_tool_rounds: u32,
@@ -1260,6 +1297,14 @@ impl Config {
             agent_max_turn_messages,
             agent_max_turn_notes_chars,
             agent_max_exploration_rounds,
+            worker_task_budget_action_rounds,
+            worker_task_budget_exploration_rounds,
+            worker_task_budget_input_tokens,
+            worker_task_budget_output_tokens,
+            worker_task_budget_max_action_rounds,
+            worker_task_budget_max_exploration_rounds,
+            worker_task_budget_max_input_tokens,
+            worker_task_budget_max_output_tokens,
             project_roots_added,
             project_roots_removed,
             shell,
@@ -1785,6 +1830,68 @@ impl Config {
             outcome.record(scope, "agent_max_exploration_rounds", None, loosened);
         }
 
+        // Spec 103 Task 1: every worker-task budget proposal and ceiling is a
+        // capability, not a preference. Raising one spends more of the user's
+        // money on the repository's or profile's say-so, so an untrusted scope
+        // may only lower it. A value equal to the current one is refused as an
+        // untrusted no-op, like every other restrict-only limit here.
+        for (key, current, incoming) in [
+            (
+                "worker_task_budget_action_rounds",
+                &mut self.worker_task_budget_action_rounds,
+                worker_task_budget_action_rounds,
+            ),
+            (
+                "worker_task_budget_exploration_rounds",
+                &mut self.worker_task_budget_exploration_rounds,
+                worker_task_budget_exploration_rounds,
+            ),
+            (
+                "worker_task_budget_max_action_rounds",
+                &mut self.worker_task_budget_max_action_rounds,
+                worker_task_budget_max_action_rounds,
+            ),
+            (
+                "worker_task_budget_max_exploration_rounds",
+                &mut self.worker_task_budget_max_exploration_rounds,
+                worker_task_budget_max_exploration_rounds,
+            ),
+        ] {
+            if let Some(value) = incoming
+                && let Some(loosened) = restrict_only_u32(current, value, key, trusted, rejected)
+            {
+                outcome.record(scope, key, None, loosened);
+            }
+        }
+        for (key, current, incoming) in [
+            (
+                "worker_task_budget_input_tokens",
+                &mut self.worker_task_budget_input_tokens,
+                worker_task_budget_input_tokens,
+            ),
+            (
+                "worker_task_budget_output_tokens",
+                &mut self.worker_task_budget_output_tokens,
+                worker_task_budget_output_tokens,
+            ),
+            (
+                "worker_task_budget_max_input_tokens",
+                &mut self.worker_task_budget_max_input_tokens,
+                worker_task_budget_max_input_tokens,
+            ),
+            (
+                "worker_task_budget_max_output_tokens",
+                &mut self.worker_task_budget_max_output_tokens,
+                worker_task_budget_max_output_tokens,
+            ),
+        ] {
+            if let Some(value) = incoming
+                && let Some(loosened) = restrict_only_u64(current, value, key, trusted, rejected)
+            {
+                outcome.record(scope, key, None, loosened);
+            }
+        }
+
         // Spec 51 D12: a repository may lower how many pages leave the machine
         // in one turn, never raise it.
         if let Some(value) = web_fetch_max_per_turn
@@ -2203,6 +2310,48 @@ impl Config {
     /// configuration error. Remote endpoints keep failing loudly.
     pub fn model_endpoint_is_loopback(&self) -> bool {
         crate::web_diagnostics::is_loopback_url(&self.model_base_url)
+    }
+
+    /// The effective worker-task budget policy (spec 103 Task 1).
+    ///
+    /// The ceiling is the configured maximum for each dimension. The default is
+    /// the configured proposal clamped to that ceiling, so a lower ceiling —
+    /// whether the user chose it or a repository/profile lowered it — is what a
+    /// plan review actually offers. This is the same overlay merge every other
+    /// key uses; there is no second resolver.
+    pub fn task_budget_policy(&self) -> TaskBudgetPolicy {
+        let ceiling = TaskExecutionBudget {
+            action_rounds: self.worker_task_budget_max_action_rounds,
+            exploration_rounds: self.worker_task_budget_max_exploration_rounds,
+            input_tokens: self.worker_task_budget_max_input_tokens,
+            output_tokens: self.worker_task_budget_max_output_tokens,
+        };
+        let proposed = TaskExecutionBudget {
+            action_rounds: self.worker_task_budget_action_rounds,
+            exploration_rounds: self.worker_task_budget_exploration_rounds,
+            input_tokens: self.worker_task_budget_input_tokens,
+            output_tokens: self.worker_task_budget_output_tokens,
+        };
+        TaskBudgetPolicy {
+            default: proposed.clamped_to(&ceiling),
+            ceiling,
+        }
+    }
+
+    /// Validates an explicitly proposed task budget against this configuration.
+    ///
+    /// Two rules apply, and each has its own failure so the caller can show why
+    /// a review was refused:
+    ///
+    /// - every dimension is non-zero and inside the absolute product ceiling;
+    /// - no dimension exceeds [`Self::task_budget_policy`]'s effective ceiling.
+    ///
+    /// Per-segment limits are upper bounds on a checkpoint, not minimum totals:
+    /// a user or repository may approve a total below one segment, and the
+    /// segment logic caps a segment by the remaining total instead.
+    pub fn validate_task_budget(&self, budget: &TaskExecutionBudget) -> Result<()> {
+        let policy = self.task_budget_policy();
+        budget.validate_against(&policy.ceiling)
     }
 
     /// The explicit `max_tokens` to send for the active provider and model.
@@ -3049,6 +3198,46 @@ impl Config {
         );
         push_line(
             &mut output,
+            "worker_task_budget_action_rounds",
+            &self.worker_task_budget_action_rounds.to_string(),
+        );
+        push_line(
+            &mut output,
+            "worker_task_budget_exploration_rounds",
+            &self.worker_task_budget_exploration_rounds.to_string(),
+        );
+        push_line(
+            &mut output,
+            "worker_task_budget_input_tokens",
+            &self.worker_task_budget_input_tokens.to_string(),
+        );
+        push_line(
+            &mut output,
+            "worker_task_budget_output_tokens",
+            &self.worker_task_budget_output_tokens.to_string(),
+        );
+        push_line(
+            &mut output,
+            "worker_task_budget_max_action_rounds",
+            &self.worker_task_budget_max_action_rounds.to_string(),
+        );
+        push_line(
+            &mut output,
+            "worker_task_budget_max_exploration_rounds",
+            &self.worker_task_budget_max_exploration_rounds.to_string(),
+        );
+        push_line(
+            &mut output,
+            "worker_task_budget_max_input_tokens",
+            &self.worker_task_budget_max_input_tokens.to_string(),
+        );
+        push_line(
+            &mut output,
+            "worker_task_budget_max_output_tokens",
+            &self.worker_task_budget_max_output_tokens.to_string(),
+        );
+        push_line(
+            &mut output,
             "agent_web_debug_max_tool_rounds",
             &self.agent_web_debug_max_tool_rounds.to_string(),
         );
@@ -3218,6 +3407,28 @@ impl Default for Config {
             // (spec 59 §5.4). The number is a starting point; the long-task
             // scenario is what checks it.
             agent_max_exploration_rounds: 24,
+            // Spec 103 Task 1: six ordinary segments at the default per-segment
+            // limits (6 × 16 actions, 6 × 24 reads). Observation 42 measured
+            // delegated specification tasks at up to 78 action and 72 read
+            // rounds, so this covers a real implementation task without making
+            // the proposal an open-ended spend.
+            worker_task_budget_action_rounds: 96,
+            worker_task_budget_exploration_rounds: 144,
+            // A generous but finite starting point: about 125 requests at the
+            // 64k context ceiling, and a reply allowance well above one model
+            // response. Both can be lowered by a repository or profile.
+            worker_task_budget_input_tokens: 8_000_000,
+            worker_task_budget_output_tokens: 512_000,
+            // The absolute product ceilings. A user or administrator may lower
+            // these, and an untrusted scope may only lower them further.
+            worker_task_budget_max_action_rounds:
+                crate::task_budget::ABSOLUTE_TASK_ACTION_ROUND_CEILING,
+            worker_task_budget_max_exploration_rounds:
+                crate::task_budget::ABSOLUTE_TASK_EXPLORATION_ROUND_CEILING,
+            worker_task_budget_max_input_tokens:
+                crate::task_budget::ABSOLUTE_TASK_INPUT_TOKEN_CEILING,
+            worker_task_budget_max_output_tokens:
+                crate::task_budget::ABSOLUTE_TASK_OUTPUT_TOKEN_CEILING,
             // No ceiling by default: this must not change what an existing
             // configuration does on upgrade (§5.4).
             agent_max_task_tokens: None,
@@ -3341,6 +3552,18 @@ pub struct ConfigOverlay {
     pub agent_max_turn_messages: Option<usize>,
     pub agent_max_turn_notes_chars: Option<usize>,
     pub agent_max_exploration_rounds: Option<u32>,
+    /// Spec 103 Task 1: the worker-task budget a plan review proposes, and the
+    /// ceilings that bound it. Every field is restrict-only at repository and
+    /// profile scope, so an untrusted checkout can lower a proposal but never
+    /// enlarge what the user or an administrator allowed.
+    pub worker_task_budget_action_rounds: Option<u32>,
+    pub worker_task_budget_exploration_rounds: Option<u32>,
+    pub worker_task_budget_input_tokens: Option<u64>,
+    pub worker_task_budget_output_tokens: Option<u64>,
+    pub worker_task_budget_max_action_rounds: Option<u32>,
+    pub worker_task_budget_max_exploration_rounds: Option<u32>,
+    pub worker_task_budget_max_input_tokens: Option<u64>,
+    pub worker_task_budget_max_output_tokens: Option<u64>,
     pub project_roots_added: Option<Vec<String>>,
     pub project_roots_removed: Option<Vec<String>>,
     pub shell: Option<String>,
@@ -3539,6 +3762,17 @@ classify_overlay_fields! {
     // Spec 59: restrict-only, so a capability — a repository may lower the
     // read allowance, never raise it (§5.4).
     agent_max_exploration_rounds => Capability,
+    // Spec 103 Task 1: the worker-task budget proposal and its ceilings all
+    // decide how much of the user's money one task may spend, so every field is
+    // restrict-only at repository and profile scope.
+    worker_task_budget_action_rounds => Capability,
+    worker_task_budget_exploration_rounds => Capability,
+    worker_task_budget_input_tokens => Capability,
+    worker_task_budget_output_tokens => Capability,
+    worker_task_budget_max_action_rounds => Capability,
+    worker_task_budget_max_exploration_rounds => Capability,
+    worker_task_budget_max_input_tokens => Capability,
+    worker_task_budget_max_output_tokens => Capability,
     // A root changes which directory an approved command runs in, never
     // whether it needs approval or what is readable, and committing a
     // manifest makes the same root (spec 24, context.md §6).
@@ -3855,6 +4089,62 @@ impl ConfigOverlay {
             }
             "agent_max_exploration_rounds" => {
                 self.agent_max_exploration_rounds = Some(parse_exploration_round_count(key, value)?)
+            }
+            "worker_task_budget_action_rounds" => {
+                self.worker_task_budget_action_rounds = Some(parse_task_budget_rounds(
+                    key,
+                    value,
+                    crate::task_budget::ABSOLUTE_TASK_ACTION_ROUND_CEILING,
+                )?)
+            }
+            "worker_task_budget_exploration_rounds" => {
+                self.worker_task_budget_exploration_rounds = Some(parse_task_budget_rounds(
+                    key,
+                    value,
+                    crate::task_budget::ABSOLUTE_TASK_EXPLORATION_ROUND_CEILING,
+                )?)
+            }
+            "worker_task_budget_input_tokens" => {
+                self.worker_task_budget_input_tokens = Some(parse_task_budget_tokens(
+                    key,
+                    value,
+                    crate::task_budget::ABSOLUTE_TASK_INPUT_TOKEN_CEILING,
+                )?)
+            }
+            "worker_task_budget_output_tokens" => {
+                self.worker_task_budget_output_tokens = Some(parse_task_budget_tokens(
+                    key,
+                    value,
+                    crate::task_budget::ABSOLUTE_TASK_OUTPUT_TOKEN_CEILING,
+                )?)
+            }
+            "worker_task_budget_max_action_rounds" => {
+                self.worker_task_budget_max_action_rounds = Some(parse_task_budget_rounds(
+                    key,
+                    value,
+                    crate::task_budget::ABSOLUTE_TASK_ACTION_ROUND_CEILING,
+                )?)
+            }
+            "worker_task_budget_max_exploration_rounds" => {
+                self.worker_task_budget_max_exploration_rounds = Some(parse_task_budget_rounds(
+                    key,
+                    value,
+                    crate::task_budget::ABSOLUTE_TASK_EXPLORATION_ROUND_CEILING,
+                )?)
+            }
+            "worker_task_budget_max_input_tokens" => {
+                self.worker_task_budget_max_input_tokens = Some(parse_task_budget_tokens(
+                    key,
+                    value,
+                    crate::task_budget::ABSOLUTE_TASK_INPUT_TOKEN_CEILING,
+                )?)
+            }
+            "worker_task_budget_max_output_tokens" => {
+                self.worker_task_budget_max_output_tokens = Some(parse_task_budget_tokens(
+                    key,
+                    value,
+                    crate::task_budget::ABSOLUTE_TASK_OUTPUT_TOKEN_CEILING,
+                )?)
             }
             "shell" => self.shell = Some(value.to_string()),
             "command_path_from_interactive_shell" => {
@@ -4257,6 +4547,14 @@ impl ConfigOverlay {
             agent_max_turn_messages,
             agent_max_turn_notes_chars,
             agent_max_exploration_rounds,
+            worker_task_budget_action_rounds,
+            worker_task_budget_exploration_rounds,
+            worker_task_budget_input_tokens,
+            worker_task_budget_output_tokens,
+            worker_task_budget_max_action_rounds,
+            worker_task_budget_max_exploration_rounds,
+            worker_task_budget_max_input_tokens,
+            worker_task_budget_max_output_tokens,
             project_roots_added,
             project_roots_removed,
             shell,
@@ -4493,6 +4791,62 @@ impl ConfigOverlay {
             push_line(
                 &mut output,
                 "agent_max_exploration_rounds",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = worker_task_budget_action_rounds {
+            push_line(
+                &mut output,
+                "worker_task_budget_action_rounds",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = worker_task_budget_exploration_rounds {
+            push_line(
+                &mut output,
+                "worker_task_budget_exploration_rounds",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = worker_task_budget_input_tokens {
+            push_line(
+                &mut output,
+                "worker_task_budget_input_tokens",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = worker_task_budget_output_tokens {
+            push_line(
+                &mut output,
+                "worker_task_budget_output_tokens",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = worker_task_budget_max_action_rounds {
+            push_line(
+                &mut output,
+                "worker_task_budget_max_action_rounds",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = worker_task_budget_max_exploration_rounds {
+            push_line(
+                &mut output,
+                "worker_task_budget_max_exploration_rounds",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = worker_task_budget_max_input_tokens {
+            push_line(
+                &mut output,
+                "worker_task_budget_max_input_tokens",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = worker_task_budget_max_output_tokens {
+            push_line(
+                &mut output,
+                "worker_task_budget_max_output_tokens",
                 &value.to_string(),
             );
         }
@@ -5724,6 +6078,28 @@ fn restrict_only_u32(
     None
 }
 
+/// [`restrict_only_limit`] for a `u64` value: the worker-task token budgets and
+/// ceilings are `u64`-typed, like `agent_max_task_tokens`, while the helpers
+/// above cover `usize`, `u32` and `u16`. Spec 103 Task 1.
+fn restrict_only_u64(
+    current: &mut u64,
+    value: u64,
+    key: &str,
+    trusted: bool,
+    rejected: &mut Vec<RejectedConfigKey>,
+) -> Option<bool> {
+    if trusted || value < *current {
+        let loosens = value > *current;
+        *current = value;
+        return Some(loosens);
+    }
+    rejected.push(RejectedConfigKey::new(
+        key,
+        RepositoryKeyClass::RestrictOnly,
+    ));
+    None
+}
+
 /// [`restrict_only_limit`] for a context share in basis points (spec 26 §5.2).
 ///
 /// Lowering a share is the restriction: it sends less of the repository's own
@@ -5808,6 +6184,47 @@ fn parse_task_token_ceiling(key: &str, value: &str) -> Result<u64> {
             "{key} must be at least 1000"
         )))
     }
+}
+
+/// A worker-task round budget or ceiling (spec 103 Task 1).
+///
+/// Zero is refused: a task that may spend no round cannot start, which reads as
+/// a broken install rather than a budget. Values above `u32::MAX` are reported
+/// as overflow instead of being truncated, and values above the absolute
+/// product ceiling cannot be expressed as configuration at any scope.
+fn parse_task_budget_rounds(key: &str, value: &str, ceiling: u32) -> Result<u32> {
+    let parsed = parse_u64(key, value)?;
+    let parsed = u32::try_from(parsed)
+        .map_err(|_| ClientError::InvalidInput(format!("{key} must be at most {}", u32::MAX)))?;
+    if parsed == 0 {
+        return Err(ClientError::InvalidInput(format!(
+            "{key} must be at least 1"
+        )));
+    }
+    if parsed > ceiling {
+        return Err(ClientError::InvalidInput(format!(
+            "{key} must be at most {ceiling}"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// A worker-task token budget or ceiling (spec 103 Task 1). Zero is refused for
+/// the same reason as a zero round budget; the absolute product ceiling caps an
+/// administratively configured value.
+fn parse_task_budget_tokens(key: &str, value: &str, ceiling: u64) -> Result<u64> {
+    let parsed = parse_u64(key, value)?;
+    if parsed == 0 {
+        return Err(ClientError::InvalidInput(format!(
+            "{key} must be at least 1"
+        )));
+    }
+    if parsed > ceiling {
+        return Err(ClientError::InvalidInput(format!(
+            "{key} must be at most {ceiling}"
+        )));
+    }
+    Ok(parsed)
 }
 
 /// The repair loop's own default is 16 (spec 96), so the old ceiling of 8

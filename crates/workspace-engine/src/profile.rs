@@ -398,6 +398,14 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         agent_max_turn_messages,
         agent_max_turn_notes_chars,
         agent_max_exploration_rounds,
+        worker_task_budget_action_rounds,
+        worker_task_budget_exploration_rounds,
+        worker_task_budget_input_tokens,
+        worker_task_budget_output_tokens,
+        worker_task_budget_max_action_rounds,
+        worker_task_budget_max_exploration_rounds,
+        worker_task_budget_max_input_tokens,
+        worker_task_budget_max_output_tokens,
         project_roots_added,
         project_roots_removed,
         shell,
@@ -658,6 +666,14 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         agent_max_turn_messages,
         agent_max_turn_notes_chars,
         agent_max_exploration_rounds,
+        worker_task_budget_action_rounds,
+        worker_task_budget_exploration_rounds,
+        worker_task_budget_input_tokens,
+        worker_task_budget_output_tokens,
+        worker_task_budget_max_action_rounds,
+        worker_task_budget_max_exploration_rounds,
+        worker_task_budget_max_input_tokens,
+        worker_task_budget_max_output_tokens,
         web_fetch_max_per_turn,
         mcp_enabled,
         mcp_server_allowlist,
@@ -800,6 +816,35 @@ fn equals_base_limit(key: &str, carried: &ConfigOverlay, base: &Config) -> bool 
         }
         "agent_max_exploration_rounds" => {
             carried.agent_max_exploration_rounds == Some(base.agent_max_exploration_rounds)
+        }
+        "worker_task_budget_action_rounds" => {
+            carried.worker_task_budget_action_rounds == Some(base.worker_task_budget_action_rounds)
+        }
+        "worker_task_budget_exploration_rounds" => {
+            carried.worker_task_budget_exploration_rounds
+                == Some(base.worker_task_budget_exploration_rounds)
+        }
+        "worker_task_budget_input_tokens" => {
+            carried.worker_task_budget_input_tokens == Some(base.worker_task_budget_input_tokens)
+        }
+        "worker_task_budget_output_tokens" => {
+            carried.worker_task_budget_output_tokens == Some(base.worker_task_budget_output_tokens)
+        }
+        "worker_task_budget_max_action_rounds" => {
+            carried.worker_task_budget_max_action_rounds
+                == Some(base.worker_task_budget_max_action_rounds)
+        }
+        "worker_task_budget_max_exploration_rounds" => {
+            carried.worker_task_budget_max_exploration_rounds
+                == Some(base.worker_task_budget_max_exploration_rounds)
+        }
+        "worker_task_budget_max_input_tokens" => {
+            carried.worker_task_budget_max_input_tokens
+                == Some(base.worker_task_budget_max_input_tokens)
+        }
+        "worker_task_budget_max_output_tokens" => {
+            carried.worker_task_budget_max_output_tokens
+                == Some(base.worker_task_budget_max_output_tokens)
         }
         "web_fetch_max_per_turn" => {
             carried.web_fetch_max_per_turn == Some(base.web_fetch_max_per_turn)

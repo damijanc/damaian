@@ -403,6 +403,56 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "agent_max_exploration_rounds=32\n",
             Reported("agent_max_exploration_rounds"),
         ),
+        // Spec 103 Task 1: every worker-task budget proposal and ceiling is
+        // restrict-only, so a repository may lower one and never raise it.
+        case(
+            "worker_task_budget_action_rounds",
+            "worker_task_budget_action_rounds=64\n",
+            "worker_task_budget_action_rounds=128\n",
+            Reported("worker_task_budget_action_rounds"),
+        ),
+        case(
+            "worker_task_budget_exploration_rounds",
+            "worker_task_budget_exploration_rounds=96\n",
+            "worker_task_budget_exploration_rounds=192\n",
+            Reported("worker_task_budget_exploration_rounds"),
+        ),
+        case(
+            "worker_task_budget_input_tokens",
+            "worker_task_budget_input_tokens=4000000\n",
+            "worker_task_budget_input_tokens=8000000\n",
+            Reported("worker_task_budget_input_tokens"),
+        ),
+        case(
+            "worker_task_budget_output_tokens",
+            "worker_task_budget_output_tokens=256000\n",
+            "worker_task_budget_output_tokens=512000\n",
+            Reported("worker_task_budget_output_tokens"),
+        ),
+        case(
+            "worker_task_budget_max_action_rounds",
+            "worker_task_budget_max_action_rounds=128\n",
+            "worker_task_budget_max_action_rounds=256\n",
+            Reported("worker_task_budget_max_action_rounds"),
+        ),
+        case(
+            "worker_task_budget_max_exploration_rounds",
+            "worker_task_budget_max_exploration_rounds=192\n",
+            "worker_task_budget_max_exploration_rounds=384\n",
+            Reported("worker_task_budget_max_exploration_rounds"),
+        ),
+        case(
+            "worker_task_budget_max_input_tokens",
+            "worker_task_budget_max_input_tokens=16000000\n",
+            "worker_task_budget_max_input_tokens=32000000\n",
+            Reported("worker_task_budget_max_input_tokens"),
+        ),
+        case(
+            "worker_task_budget_max_output_tokens",
+            "worker_task_budget_max_output_tokens=1000000\n",
+            "worker_task_budget_max_output_tokens=2000000\n",
+            Reported("worker_task_budget_max_output_tokens"),
+        ),
         // Spec 65: the same shape for the notes bound.
         case(
             "agent_max_turn_notes_chars",

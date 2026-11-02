@@ -962,7 +962,13 @@ fn control_route(
     match command.as_str() {
         "message" | "note" => forward("text", "text", true)?,
         "resume" => forward("note", "note", false)?,
-        "approve" | "reject" => forward("proposal_id", "proposalId", true)?,
+        "approve" | "reject" => {
+            forward("proposal_id", "proposalId", true)?;
+            // Spec 103 Task 2: the plan card posts the exact typed budget it
+            // was shown. Forward it untouched; the worker and the engine
+            // validate it, this route only carries it.
+            forward("budget", "budget", false)?;
+        }
         "checks" => {
             forward("proposal_id", "proposalId", true)?;
             forward("decisions", "decisions", true)?;

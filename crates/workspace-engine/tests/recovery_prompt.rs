@@ -406,6 +406,7 @@ fn a_plan_review_interrupted_by_a_crash_is_re_presented() {
             proposal_id,
             plan,
             deferred_action,
+            budget_review: _,
         } => {
             assert_eq!(task_id, &task.id);
             assert_eq!(proposal_id, "planprop_1");

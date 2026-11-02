@@ -1504,7 +1504,14 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
     }
 }
 
-fn message_json(message: &ModelMessage) -> String {
+/// Serializes exactly one message as [`model_request_json`] sends it.
+///
+/// Request budgeting and compaction estimate tokens over the provider-visible
+/// message, not only its `content`: role, tool-call ids/names/arguments,
+/// `tool_call_id`, `reasoning_content` and the JSON framing all count against a
+/// provider's context window. Keeping this as the single message serializer
+/// means that estimate cannot silently drift from the request that is sent.
+pub fn provider_message_json(message: &ModelMessage) -> String {
     let mut object = format!("{{\"role\":\"{}\"", audit_escape_json(&message.role));
     if message.tool_calls.is_empty() {
         object.push_str(&format!(
@@ -1553,15 +1560,24 @@ fn message_json(message: &ModelMessage) -> String {
     object
 }
 
-pub fn model_request_json(request: &ModelRequest) -> String {
-    let messages = request
-        .messages
+/// Serializes the message array exactly as [`model_request_json`] sends it.
+///
+/// The array framing (brackets and separators) is provider-visible too, so a
+/// caller budgeting the message view measures this string rather than a sum of
+/// independently rounded message estimates.
+pub fn provider_messages_json(messages: &[ModelMessage]) -> String {
+    let messages = messages
         .iter()
-        .map(message_json)
+        .map(provider_message_json)
         .collect::<Vec<_>>()
         .join(",");
+    format!("[{messages}]")
+}
+
+pub fn model_request_json(request: &ModelRequest) -> String {
+    let messages = provider_messages_json(&request.messages);
     let mut body = format!(
-        "{{\"model\":\"{}\",\"messages\":[{}],\"stream\":{}",
+        "{{\"model\":\"{}\",\"messages\":{},\"stream\":{}",
         audit_escape_json(&request.model),
         messages,
         request.stream

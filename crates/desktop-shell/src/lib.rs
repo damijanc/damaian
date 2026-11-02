@@ -23,16 +23,16 @@ use workspace_engine::{
     PatchApplyOutcome, PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId, ProjectIdentity,
     ProposedFilePatch, ProtectedPathAction, QuestionState, RepositoryConfigReport,
     ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, SessionStore,
-    StepStatus, SymbolRef, Task, TaskPlan, TaskProtectedPathsControl, TaskUsage, TokenUsage,
-    TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationEvent,
-    VerificationOutcome, VerificationReport, WebDiagnosticCall, WebDiagnosticKind,
-    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
-    WorkerReturn, WorkspaceEngine, allow_always_eligible, builtin_context_window,
-    builtin_token_defaults, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
-    export_profile, fold_verification, import_profile, normalize_mcp_server_id,
-    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
-    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
-    review_profile_import, review_profile_rejections, select_profile,
+    StepStatus, SymbolRef, Task, TaskExecutionBudget, TaskPlan, TaskProtectedPathsControl,
+    TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation,
+    VerificationEvent, VerificationOutcome, VerificationReport, WebDiagnosticCall,
+    WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
+    WebDiagnosticsRunnerHandle, WorkerReturn, WorkspaceEngine, allow_always_eligible,
+    builtin_context_window, builtin_token_defaults, command_approval_prompt, custom_profile_ids,
+    ensure_data_dir_schema, export_profile, fold_verification, import_profile,
+    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
+    parse_hunk_selection, parse_mcp_transport, patch_diff_text, profile_import_base,
+    repository_id_for_root, review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -3933,6 +3933,10 @@ fn run_resume_plan_request(
         Some(raw) => Some(parse_plan_revision(raw)?),
         None => None,
     };
+    // Transport only: the typed budget the card returned is handed back
+    // unchanged. The engine decides whether it matches the review, is within
+    // the effective ceiling, or is allowed at all.
+    let budget = parse_task_budget(form.get("budget"))?;
     let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
 
     let mut adapter = chat_model_adapter(&engine.config, || {
@@ -3954,15 +3958,25 @@ fn run_resume_plan_request(
     };
     engine
         .chat_orchestrator
-        .resume_after_plan_decision(
+        .resume_after_plan_decision_with_budget(
             &proposal_id,
             approved,
             revised,
+            budget.as_ref(),
             "desktop_user",
             adapter.as_mut(),
             &mut sink,
         )
         .map_err(|error| error.to_string())
+}
+
+fn parse_task_budget(raw: Option<&String>) -> Result<Option<TaskExecutionBudget>, String> {
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    serde_json::from_str::<TaskExecutionBudget>(raw)
+        .map(Some)
+        .map_err(|error| format!("Invalid task budget: {error}"))
 }
 
 /// Sends or declines a paused pre-send context review (spec 27 §5.1).
@@ -6322,12 +6336,25 @@ fn plan_proposal_json(proposal: Option<&AgentPlanProposal>) -> String {
     let Some(proposal) = proposal else {
         return "null".to_string();
     };
+    // The engine owns the budget's title, note, rows, labels and units. This is
+    // transport: the object goes out exactly as the engine built it, and the
+    // client returns `budgetReview.budget` unchanged on approval. When the
+    // engine offered none, the key is absent rather than null, so an inline or
+    // historical review keeps the exact shape it had before task budgets
+    // existed (spec 103 Task 2).
+    let budget_review = proposal
+        .budget_review
+        .as_ref()
+        .and_then(|review| serde_json::to_string(review).ok())
+        .map(|review| format!(",\"budgetReview\":{review}"))
+        .unwrap_or_default();
     format!(
-        "{{\"proposalId\":\"{}\",\"deferredAction\":\"{}\",\"plan\":{}}}",
+        "{{\"proposalId\":\"{}\",\"deferredAction\":\"{}\",\"plan\":{}{}}}",
         escape_json(&proposal.id),
         escape_json(&proposal.deferred_action),
         // The review card is a turn waiting for a human, not one that ended.
-        plan_json(&proposal.plan, true)
+        plan_json(&proposal.plan, true),
+        budget_review
     )
 }
 
@@ -7589,10 +7616,10 @@ mod tests {
         Evidence, FailureFingerprint, FailureProvenance, FetchComponentFlag, FindingEvidence,
         GeneratedSecretWarning, LanguageServerHub, LanguageServerLaunch, LanguageServerState,
         LanguageServerStatus, MockModelAdapter, PendingQuestionRef, PhaseKind, PlanStep,
-        RepairScopeReview, SecretScanner, SessionMode, StepStatus, TaskPlan, TaskStatus, TaskUsage,
-        ToolCall, TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource, VerificationEvent,
-        VerificationOutcome, VerificationReport, WebDiagnosticRecord, WebDiagnosticReport,
-        WorkspaceEngine,
+        RepairScopeReview, SecretScanner, SessionMode, StepStatus, TaskBudgetReview, TaskPlan,
+        TaskStatus, TaskUsage, ToolCall, TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource,
+        VerificationEvent, VerificationOutcome, VerificationReport, WebDiagnosticRecord,
+        WebDiagnosticReport, WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
         fold_verification,
     };
@@ -8270,6 +8297,7 @@ mod tests {
             id: "planreview_1".to_string(),
             plan: sample_plan(),
             deferred_action: "Preparing a patch".to_string(),
+            budget_review: None,
         }));
         assert!(
             json.contains("\"proposalId\":\"planreview_1\""),
@@ -8277,7 +8305,82 @@ mod tests {
         );
         assert!(json.contains("\"deferredAction\":\"Preparing a patch\""));
         assert!(json.contains("\"title\":\"Add a bounded backoff\""));
+        // Spec 103 Task 2: an inline review offered no budget, so the key is
+        // absent — exactly the pre-budget shape, not `budgetReview:null`.
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let keys: Vec<&str> = value
+            .as_object()
+            .expect("the proposal is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["deferredAction", "plan", "proposalId"],
+            "an inline review keeps its old JSON shape"
+        );
         assert_eq!(plan_proposal_json(None), "null");
+    }
+
+    #[test]
+    fn the_plan_card_transports_the_engine_budget_review_verbatim() {
+        // Spec 103 Task 2: the desktop is transport. The exact review object the
+        // engine built, including labels and units, is what the card receives.
+        let review = TaskBudgetReview::from_policy(&Config::default().task_budget_policy());
+        let json = plan_proposal_json(Some(&AgentPlanProposal {
+            id: "planreview_budget".to_string(),
+            plan: sample_plan(),
+            deferred_action: "Preparing a patch".to_string(),
+            budget_review: Some(review.clone()),
+        }));
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            value["budgetReview"],
+            serde_json::to_value(&review).expect("the review serializes")
+        );
+        let keys: Vec<&str> = value
+            .as_object()
+            .expect("the proposal is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["budgetReview", "deferredAction", "plan", "proposalId"],
+            "a worker review adds exactly the budget key"
+        );
+    }
+
+    #[test]
+    fn the_plan_card_renders_budget_rows_without_dimension_logic() {
+        // The JS must not map dimensions to labels, units or policy. It shows
+        // the rows the engine sends and posts the typed budget back untouched.
+        let app = include_str!("../static/app.js");
+        let card = app
+            .split("function createPlanReview")
+            .nth(1)
+            .and_then(|rest| rest.split("function createBaselineBatchCard").next())
+            .expect("the plan review card");
+        assert!(card.contains("budgetReview.rows"), "{card}");
+        assert!(card.contains("row.label"), "{card}");
+        assert!(card.contains("row.unit"), "{card}");
+        assert!(
+            card.contains("JSON.stringify(proposal.budgetReview.budget)"),
+            "{card}"
+        );
+        for forbidden in [
+            "action rounds",
+            "exploration rounds",
+            "actionRounds",
+            "explorationRounds",
+            "inputTokens",
+            "outputTokens",
+        ] {
+            assert!(
+                !card.contains(forbidden),
+                "the plan card hard-codes budget policy: {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -14930,7 +15033,13 @@ mod tests {
 
             let proposal_id = waiting["proposalId"].as_str().unwrap().to_string();
             assert_eq!(
-                send(&host, ControlCommand::Approve { proposal_id })["ok"],
+                send(
+                    &host,
+                    ControlCommand::Approve {
+                        proposal_id,
+                        budget: None,
+                    }
+                )["ok"],
                 true
             );
             assert_eq!(settle(&host)["state"], "idle");
@@ -15161,6 +15270,7 @@ mod tests {
                 &host,
                 ControlCommand::Approve {
                     proposal_id: "chatcmd_not_this_one".to_string(),
+                    budget: None,
                 },
             );
             assert_eq!(wrong["ok"], false, "{wrong}");
@@ -15170,7 +15280,8 @@ mod tests {
                 send(
                     &host,
                     ControlCommand::Approve {
-                        proposal_id: proposal_id.clone()
+                        proposal_id: proposal_id.clone(),
+                        budget: None,
                     }
                 )["ok"],
                 true
@@ -15219,7 +15330,13 @@ mod tests {
                 "the command's file made verification due"
             );
             assert_eq!(
-                send(&host, ControlCommand::Approve { proposal_id })["ok"],
+                send(
+                    &host,
+                    ControlCommand::Approve {
+                        proposal_id,
+                        budget: None,
+                    }
+                )["ok"],
                 false,
                 "a decision resumes once"
             );
@@ -15253,7 +15370,13 @@ mod tests {
             assert_eq!(approvals[0]["proposal"]["proposalId"], proposal_id.as_str());
 
             assert_eq!(
-                send(&host, ControlCommand::Approve { proposal_id })["ok"],
+                send(
+                    &host,
+                    ControlCommand::Approve {
+                        proposal_id,
+                        budget: None,
+                    }
+                )["ok"],
                 true
             );
             let done = settle(&host);
@@ -15583,7 +15706,13 @@ mod tests {
             assert_eq!(waiting["state"], "waiting_for_approval", "{waiting}");
             let proposal_id = waiting["proposalId"].as_str().unwrap().to_string();
             assert_eq!(
-                send(&host, ControlCommand::Approve { proposal_id })["ok"],
+                send(
+                    &host,
+                    ControlCommand::Approve {
+                        proposal_id,
+                        budget: None,
+                    }
+                )["ok"],
                 true
             );
             assert_eq!(settle(&host)["state"], "idle");
@@ -16889,6 +17018,22 @@ exec /bin/cat > /dev/null
                 "the socket's own answer"
             );
             control(&[("command", "approve"), ("proposal_id", "prop_1")]).unwrap();
+            // Spec 103 Task 2: the plan card posts the exact typed budget as a
+            // form value; this route must relay it to the socket's `budget`
+            // field byte-for-byte, on approve and on reject.
+            let budget = r#"{"actionRounds":96,"explorationRounds":144,"inputTokens":8000000,"outputTokens":512000}"#;
+            control(&[
+                ("command", "approve"),
+                ("proposal_id", "prop_budget_approve"),
+                ("budget", budget),
+            ])
+            .unwrap();
+            control(&[
+                ("command", "reject"),
+                ("proposal_id", "prop_budget_reject"),
+                ("budget", budget),
+            ])
+            .unwrap();
             control(&[("command", "resume"), ("note", "carry on")]).unwrap();
             control(&[("command", "resume")]).unwrap();
             control(&[("command", "pause")]).unwrap();
@@ -16912,6 +17057,16 @@ exec /bin/cat > /dev/null
                     json!({"command": "message", "text": "First prompt\nwith two lines"}),
                     json!({"command": "note", "text": "check the tests & docs"}),
                     json!({"command": "approve", "proposalId": "prop_1"}),
+                    json!({
+                        "command": "approve",
+                        "proposalId": "prop_budget_approve",
+                        "budget": budget,
+                    }),
+                    json!({
+                        "command": "reject",
+                        "proposalId": "prop_budget_reject",
+                        "budget": budget,
+                    }),
                     json!({"command": "resume", "note": "carry on"}),
                     json!({"command": "resume"}),
                     json!({"command": "pause"}),

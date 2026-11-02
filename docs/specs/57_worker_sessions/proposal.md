@@ -336,7 +336,7 @@ Commands:
 | `pause` | Sets the pause flag (§5.4). |
 | `resume {note?}` | Clears it, optionally queuing a note first. |
 | `note {text}` | Queues a steering note. Refused while waiting for approval. |
-| `approve {proposalId}` / `reject {proposalId}` | Resolves a pending command or plan approval (§5.6). |
+| `approve {proposalId, budget?}` / `reject {proposalId, budget?}` | Resolves a pending command or plan approval (§5.6). A worker plan review's optional `budget` is the exact typed value the card showed (spec 103 Task 2). |
 | `stop` | Cancels the current turn at the next safe point. Refused while waiting for approval: reject the approval, or `shutdown`. |
 | `shutdown` | Stops any turn, kills child processes, exits. |
 | `status` | Returns `{sessionId, pid, state}`, `state` being `idle`, `running`, `paused`, `waiting_for_approval` or `shutting_down`, plus `proposalId` while waiting. |
@@ -698,7 +698,12 @@ As built (Task 10), with no new route:
   for a worker are read with its worktree as `repo`.
 - **Restart.** A restarted worker is idle, with a new progress file. When the
   old process was waiting for approval, the toast says that approval ended
-  with it and its command did not run (Task 7), and the card is gone.
+  with it and its command did not run (Task 7), and the card is gone. **Spec
+  103 Task 2 makes one narrow exception:** a durable plan review is reattached
+  from its paused turn and session log, with the exact persisted budget (or
+  none for a historical review), so the restarted worker waits on the same
+  card and can answer it over its control socket. Command, patch, check,
+  fallback and round-budget decisions keep the behaviour above.
 - **Setting off.** Workers show as ordinary sessions: no strip, no header
   line, no poll, and the composer as it was. **Decided in Task 11:** the
   shell keeps refusing `stop` and `shutdown` (403) while the setting is off,

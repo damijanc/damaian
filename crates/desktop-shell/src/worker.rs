@@ -25,9 +25,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 use workspace_engine::worker_progress::{ProgressKind, ProgressWriter};
 use workspace_engine::{
-    CancelToken, ChatTurnOptions, ChatTurnResult, Config, ModelAdapter, PhaseKind, ProcessRegistry,
-    RepositoryConfigReport, RoundBudgetDecision, SecretScanner, SessionStore, Task, TaskStatus,
-    TurnProgress, TurnSink, TurnSteering, WorkerReturn,
+    AgentPlanProposal, CancelToken, ChatTurnOptions, ChatTurnResult, Config, ModelAdapter,
+    PausedTurns, PendingDecision, PhaseKind, ProcessRegistry, RepositoryConfigReport,
+    RoundBudgetDecision, SecretScanner, SessionStore, Task, TaskExecutionBudget, TaskStatus,
+    TurnProgress, TurnSink, TurnSteering, WorkerReturn, validate_plan_approval,
 };
 
 /// The first argument that selects worker mode, in both `main`s.
@@ -96,11 +97,14 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let host = Arc::new(WorkerHost::new(session_id.clone(), Arc::clone(&shutdown)));
     // The key is moved into the adapter builder and goes nowhere else: not
     // the environment of anything this worker runs, not a file, not a log.
-    let driver = TurnDriver::new(
+    let mut driver = TurnDriver::new(
         &session_id,
         &data_dir,
         Box::new(move |config: &Config| crate::chat_model_adapter(config, || Ok(api_key.clone()))),
     )?;
+    // Spec 103 Task 2: a durable plan review survives the restart. Everything
+    // else keeps spec 57's behaviour and ends with the process.
+    driver.restore_pending_plan_review(&host);
     start_turn_thread(&host, driver)?;
     let served = Arc::clone(&host);
     crate::spawn_with_shell_stack("damaian-worker-control", move || {
@@ -367,9 +371,17 @@ pub(crate) enum ControlCommand {
     },
     Approve {
         proposal_id: String,
+        /// The exact typed budget a plan card returned, when it offered one
+        /// (spec 103 Task 2). `None` for every other approval kind and for a
+        /// budgetless plan review; the engine decides whether that is allowed.
+        budget: Option<TaskExecutionBudget>,
     },
     Reject {
         proposal_id: String,
+        /// Carried when the card had one and the client sent it back. A reject
+        /// authorises nothing, so the engine accepts its absence; an invented
+        /// budget on a review that offered none is still refused there.
+        budget: Option<TaskExecutionBudget>,
     },
     /// Runs the verification a settled patch made due, and the spec 77
     /// continuation after it, in this process (spec 80).
@@ -437,6 +449,15 @@ fn parse_command(
         }
     };
     let required = |value: Option<String>| value.ok_or("a required argument is missing");
+    let budget = |value: Option<String>| -> Result<Option<TaskExecutionBudget>, &'static str> {
+        value
+            .filter(|raw| !raw.trim().is_empty())
+            .map(|raw| {
+                serde_json::from_str::<TaskExecutionBudget>(&raw)
+                    .map_err(|_| "the budget is not a valid task budget")
+            })
+            .transpose()
+    };
     let parsed = match command {
         "message" => ControlCommand::Message {
             text: required(take("text", MAX_REQUEST_BYTES as usize)?)?,
@@ -450,9 +471,11 @@ fn parse_command(
         },
         "approve" => ControlCommand::Approve {
             proposal_id: required(take("proposalId", MAX_PROPOSAL_ID_BYTES)?)?,
+            budget: budget(take("budget", MAX_REQUEST_BYTES as usize)?)?,
         },
         "reject" => ControlCommand::Reject {
             proposal_id: required(take("proposalId", MAX_PROPOSAL_ID_BYTES)?)?,
+            budget: budget(take("budget", MAX_REQUEST_BYTES as usize)?)?,
         },
         "verify" => ControlCommand::Verify,
         "continue-repair" => ControlCommand::ContinueRepair,
@@ -574,6 +597,7 @@ enum TurnJob {
         proposal_id: String,
         kind: DecisionKind,
         approved: bool,
+        budget: Option<TaskExecutionBudget>,
     },
     /// The verification a settled patch made due (spec 80).
     Verify,
@@ -678,8 +702,14 @@ impl WorkerHost {
                 (json!({"ok": true}), true)
             }
             ControlCommand::Message { text } => (self.start(TurnJob::Message(text)), false),
-            ControlCommand::Approve { proposal_id } => (self.decide(proposal_id, true), false),
-            ControlCommand::Reject { proposal_id } => (self.decide(proposal_id, false), false),
+            ControlCommand::Approve {
+                proposal_id,
+                budget,
+            } => (self.decide(proposal_id, true, budget), false),
+            ControlCommand::Reject {
+                proposal_id,
+                budget,
+            } => (self.decide(proposal_id, false, budget), false),
             ControlCommand::Verify => (self.start(TurnJob::Verify), false),
             ControlCommand::ContinueRepair => (self.start(TurnJob::ContinueRepair), false),
             ControlCommand::ContinueTask { task_id, note } => {
@@ -746,7 +776,12 @@ impl WorkerHost {
         self.hand_over(&mut slot, job)
     }
 
-    fn decide(&self, proposal_id: String, approved: bool) -> Value {
+    fn decide(
+        &self,
+        proposal_id: String,
+        approved: bool,
+        budget: Option<TaskExecutionBudget>,
+    ) -> Value {
         let mut slot = self.slot();
         let kind = match &slot.pending {
             Some((pending, kind))
@@ -765,6 +800,7 @@ impl WorkerHost {
                 proposal_id,
                 kind,
                 approved,
+                budget,
             },
         );
         if answer["ok"] == true {
@@ -890,6 +926,139 @@ impl TurnDriver {
         })
     }
 
+    /// Reattaches a durable plan review after a process restart (spec 103
+    /// Task 2).
+    ///
+    /// Only a plan review is restored. Its paused turn is on disk, so the
+    /// restarted process can resume it exactly where the previous one stopped.
+    /// Command, patch, check and fallback decisions keep spec 57's behaviour:
+    /// those approvals ended with the process and this method does not guess
+    /// at them.
+    ///
+    /// The budget comes from the persisted review, never from current
+    /// configuration: a config edit between processes must not change what the
+    /// user is looking at. A historical review with no budget reattaches
+    /// budgetless. Missing or corrupt durable state restores nothing — it is
+    /// not repaired, reconstructed or authorised.
+    fn restore_pending_plan_review(&mut self, host: &WorkerHost) {
+        let store = SessionStore::new(&self.data_dir);
+        let Ok(tasks) = store.read_tasks(&self.session_id) else {
+            return;
+        };
+        // The newest task still waiting on a person is the actionable one.
+        let Some(task) = tasks
+            .iter()
+            .rev()
+            .find(|task| task.status == TaskStatus::WaitingForApproval)
+        else {
+            return;
+        };
+        let Ok(Some(PendingDecision::Approval(pending))) =
+            store.pending_decision_for(&self.session_id, &task.id)
+        else {
+            return;
+        };
+        if pending.kind != "plan" {
+            return;
+        }
+        let Some(proposal) = self.durable_plan_proposal(&store, task, &pending.proposal_id) else {
+            return;
+        };
+        self.announce_plan_review(&proposal, None);
+        host.settle(Some((pending.proposal_id, DecisionKind::Plan)));
+    }
+
+    /// A plan decision whose engine validation refused it before the pending
+    /// turn was consumed (spec 103 Task 2).
+    ///
+    /// `decide` clears the host's slot as soon as it hands the job over, so the
+    /// turn's `Err` would otherwise report idle even though the durable review
+    /// is still there and answerable. Restoring is conditional on re-reading
+    /// that state, not on the error: if `PendingCommandStore::take` already
+    /// consumed the turn, or the task, plan or proposal no longer agree, the
+    /// failure is terminal and keeps its existing idle reporting.
+    fn restore_refused_plan_review(
+        &mut self,
+        host: &WorkerHost,
+        proposal_id: &str,
+        error: &str,
+    ) -> bool {
+        let Some(proposal) = self.durable_plan_review(proposal_id) else {
+            return false;
+        };
+        self.announce_plan_review(&proposal, Some(error));
+        host.settle(Some((proposal_id.to_string(), DecisionKind::Plan)));
+        true
+    }
+
+    /// The exact durable plan review `proposal_id` names, when the session
+    /// still holds it: a task waiting on that proposal as a plan, a usable plan
+    /// for the task, and a paused turn that is the same plan review.
+    ///
+    /// Everything comes from durable state. Current configuration is not
+    /// consulted, so a config edit cannot change what is restored.
+    fn durable_plan_review(&self, proposal_id: &str) -> Option<AgentPlanProposal> {
+        let store = SessionStore::new(&self.data_dir);
+        let tasks = store.read_tasks(&self.session_id).ok()?;
+        let task = tasks.into_iter().find(|task| {
+            task.status == TaskStatus::WaitingForApproval
+                && matches!(
+                    store.pending_decision_for(&self.session_id, &task.id),
+                    Ok(Some(PendingDecision::Approval(pending)))
+                        if pending.kind == "plan" && pending.proposal_id == proposal_id
+                )
+        })?;
+        self.durable_plan_proposal(&store, &task, proposal_id)
+    }
+
+    /// Rebuilds the review object from the durable plan and paused turn. A
+    /// missing or corrupt part is not repaired, because presenting a different
+    /// decision from the one the log records would be worse than none.
+    fn durable_plan_proposal(
+        &self,
+        store: &SessionStore,
+        task: &Task,
+        proposal_id: &str,
+    ) -> Option<AgentPlanProposal> {
+        let plan = store.read_task_plan(&self.session_id, &task.id).ok()??;
+        // The same rule the approval itself will recheck: the plan must belong
+        // to this task and be structurally usable.
+        if validate_plan_approval(task, &plan).is_err() {
+            return None;
+        }
+        let paused = PausedTurns::new(&self.data_dir);
+        let deferred_action = paused.plan_review_deferred_action(proposal_id)?;
+        // `Err` is a present but corrupt budget. Treating it as budgetless
+        // would silently offer a different decision from the durable one.
+        let budget_review = paused.plan_budget_review(proposal_id).ok()?;
+        Some(AgentPlanProposal {
+            id: proposal_id.to_string(),
+            plan,
+            deferred_action,
+            budget_review,
+        })
+    }
+
+    /// Writes the review card again and the status that says the worker is
+    /// holding on it. Repeating the card is what lets a live UI answer a
+    /// refused decision without reconnecting: it clears its approval when the
+    /// job starts.
+    fn announce_plan_review(&mut self, proposal: &AgentPlanProposal, error: Option<&str>) {
+        let approval = json!({
+            "kind": "plan",
+            "proposal": parsed(&crate::plan_proposal_json(Some(proposal))),
+        });
+        append_progress(&mut self.progress, ProgressKind::Approval, approval);
+        let mut status = json!({
+            "state": WorkerState::WaitingForApproval.as_str(),
+            "taskStatus": TaskStatus::WaitingForApproval.as_str(),
+        });
+        if let Some(error) = error {
+            status["error"] = json!(error);
+        }
+        append_progress(&mut self.progress, ProgressKind::Status, status);
+    }
+
     fn serve(mut self, host: &WorkerHost, jobs: Receiver<TurnJob>) {
         for job in jobs {
             self.run(host, job);
@@ -897,6 +1066,16 @@ impl TurnDriver {
     }
 
     fn run(&mut self, host: &WorkerHost, job: TurnJob) {
+        // Only a plan decision has a pending review that can outlive the job.
+        // The id is kept because `take_turn` consumes the job.
+        let refused_plan = match &job {
+            TurnJob::Decide {
+                proposal_id,
+                kind: DecisionKind::Plan,
+                ..
+            } => Some(proposal_id.clone()),
+            _ => None,
+        };
         let (cancel, steering) = host.turn_handles();
         append_progress(
             &mut self.progress,
@@ -931,6 +1110,15 @@ impl TurnDriver {
                 host.settle(pending);
             }
             Err(error) => {
+                // A plan decision can be refused before the pending turn is
+                // consumed — a wrong or missing budget, or an invalid revision
+                // (spec 103 Task 2). The durable review is still answerable, so
+                // the worker must not report idle or return a waiting task.
+                if let Some(proposal_id) = refused_plan
+                    && self.restore_refused_plan_review(host, &proposal_id, &error)
+                {
+                    return;
+                }
                 // The engine can persist `Failed` and then return `Err` — a
                 // denied `before_context` hook, a provider refusal, a model
                 // failure. That task is just as terminal as an `Ok` result, so
@@ -1059,6 +1247,7 @@ impl TurnDriver {
                 proposal_id,
                 kind: DecisionKind::Command,
                 approved,
+                ..
             } => chat.resume_after_command_decision(
                 &proposal_id,
                 approved,
@@ -1070,10 +1259,12 @@ impl TurnDriver {
                 proposal_id,
                 kind: DecisionKind::Plan,
                 approved,
-            } => chat.resume_after_plan_decision(
+                budget,
+            } => chat.resume_after_plan_decision_with_budget(
                 &proposal_id,
                 approved,
                 None,
+                budget.as_ref(),
                 "desktop_user",
                 adapter.as_mut(),
                 &mut sink,
@@ -1082,6 +1273,7 @@ impl TurnDriver {
                 proposal_id,
                 kind: DecisionKind::RoundBudget,
                 approved,
+                ..
             } => chat.resume_round_budget(
                 &proposal_id,
                 if approved {
@@ -1177,7 +1369,9 @@ pub(crate) fn host_in_process(
         session_id.to_string(),
         Arc::new(ShutdownSignal::default()),
     ));
-    start_turn_thread(&host, TurnDriver::new(session_id, data_dir, adapter_for)?)?;
+    let mut driver = TurnDriver::new(session_id, data_dir, adapter_for)?;
+    driver.restore_pending_plan_review(&host);
+    start_turn_thread(&host, driver)?;
     Ok(host)
 }
 
@@ -1628,6 +1822,382 @@ mod tests {
         assert!(raw.contains("[REDACTED_"), "{raw}");
     }
 
+    /// Spec 103 Task 2: a restarted worker reattaches a durable plan review,
+    /// writes the same typed approval into its new progress file, and can
+    /// answer it over the control socket with the exact persisted budget.
+    #[test]
+    fn a_restarted_worker_reattaches_and_answers_the_durable_plan_review() {
+        // Short, because the control socket's path must fit `sun_path`.
+        let data_dir = scratch("rp");
+        let repo = data_dir.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/a.rs"), "fn main() {}\n").unwrap();
+
+        let store = SessionStore::new(&data_dir);
+        let session = store
+            .create_session(&workspace_engine::repository_id_for_root(&repo), "Worker")
+            .unwrap()
+            .id;
+        store
+            .record_worker_spawned(
+                &session,
+                &workspace_engine::WorkerRecord {
+                    parent_session_id: None,
+                    parent_task_id: None,
+                    inherited_protected_paths: Vec::new(),
+                    source_repository: repo.clone(),
+                    worktree_path: repo.clone(),
+                    branch: "main".to_string(),
+                    base_commit: "0000000".to_string(),
+                    included_uncommitted: false,
+                    git_commands: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        // One real engine turn pauses on its plan review, so every durable
+        // fact the restart reads was written by the ordinary path.
+        let engine = workspace_engine::WorkspaceEngine::new(Config {
+            data_dir: data_dir.clone(),
+            enable_index_watcher: false,
+            ..Config::default()
+        });
+        let mut adapter = workspace_engine::MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new(), String::new(), "Done.".to_string()],
+            vec![
+                vec![workspace_engine::ToolCall {
+                    id: "call_plan".to_string(),
+                    name: "propose_plan".to_string(),
+                    arguments_json:
+                        r#"{"steps":[{"title":"Read the retry helper"},{"title":"Add a bounded backoff"}]}"#
+                            .to_string(),
+                }],
+                vec![workspace_engine::ToolCall {
+                    id: "call_patch".to_string(),
+                    name: "propose_patch".to_string(),
+                    arguments_json:
+                        r#"{"summary":"Add src/retry.rs","files":[{"path":"src/retry.rs","content":"pub fn added() {}\n"}]}"#
+                            .to_string(),
+                }],
+                Vec::new(),
+            ],
+        );
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        let paused = engine
+            .chat_orchestrator
+            .ask_with_session(
+                &repo,
+                "Add retry handling",
+                &[],
+                Some(&session),
+                &mut adapter,
+                &mut sink,
+            )
+            .expect("the worker turn should pause on its plan");
+        let proposal = paused.plan_proposal.expect("the plan is reviewed");
+        let review = proposal
+            .budget_review
+            .clone()
+            .expect("a worker review offers its budget");
+        let task_id = paused.task.id.clone();
+        drop(engine);
+
+        // A fresh host and driver: what `run_worker` builds on startup.
+        let host = host_in_process(
+            &session,
+            &data_dir,
+            Box::new(|_config: &Config| {
+                Ok(Box::new(workspace_engine::MockModelAdapter::new("Done."))
+                    as Box<dyn ModelAdapter>)
+            }),
+        )
+        .unwrap();
+
+        let snapshot = host.snapshot();
+        assert_eq!(snapshot["state"], "waiting_for_approval", "{snapshot}");
+        assert_eq!(snapshot["proposalId"], proposal.id.as_str(), "{snapshot}");
+
+        let events =
+            workspace_engine::worker_progress::read_progress_after(&data_dir, &session, 0).unwrap();
+        let approval = events
+            .iter()
+            .find(|event| event["kind"] == "approval")
+            .expect("the restarted worker writes the approval card");
+        assert_eq!(approval["payload"]["kind"], "plan");
+        assert_eq!(
+            approval["payload"]["proposal"]["proposalId"],
+            proposal.id.as_str()
+        );
+        assert_eq!(
+            approval["payload"]["proposal"]["budgetReview"],
+            serde_json::to_value(&review).unwrap(),
+            "the persisted review, not current configuration"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event["kind"] == "status" && event["payload"]["state"] == "waiting_for_approval"
+            }),
+            "the new progress file reports the reattached wait: {events:?}"
+        );
+
+        // Answer it the way the shell does: over the control socket, with the
+        // exact typed budget the card showed.
+        let (listener, path) = bind_control_socket(&data_dir, &session).unwrap();
+        let served = Arc::clone(&host);
+        std::thread::spawn(move || serve_control(listener, TOKEN, &served));
+        let stream = UnixStream::connect(&path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let budget =
+            serde_json::to_string(&serde_json::to_string(&review.budget).unwrap()).unwrap();
+        writeln!(
+            writer,
+            r#"{{"token":"{TOKEN}","command":"approve","proposalId":"{}","budget":{budget}}}"#,
+            proposal.id
+        )
+        .unwrap();
+        let mut answer = String::new();
+        BufReader::new(stream).read_line(&mut answer).unwrap();
+        let answer: Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(answer["ok"], true, "{answer}");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while host.snapshot()["state"] != "idle" {
+            assert!(
+                Instant::now() < deadline,
+                "the resumed turn did not finish: {}",
+                host.snapshot()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            store.read_task_budget(&session, &task_id).unwrap(),
+            Some(review.budget),
+            "the restarted process approved the exact reattached budget"
+        );
+    }
+
+    /// Spec 103 Task 2: a plan decision refused before `PendingCommandStore`
+    /// consumed the paused turn must leave the worker waiting on the same
+    /// durable review, not idle, and the same live socket must then be able to
+    /// approve the exact reviewed budget.
+    #[test]
+    fn a_refused_plan_budget_keeps_the_durable_review_answerable() {
+        let data_dir = scratch("fp");
+        let repo = data_dir.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/a.rs"), "fn main() {}\n").unwrap();
+
+        let store = SessionStore::new(&data_dir);
+        let session = store
+            .create_session(&workspace_engine::repository_id_for_root(&repo), "Worker")
+            .unwrap()
+            .id;
+        store
+            .record_worker_spawned(
+                &session,
+                &workspace_engine::WorkerRecord {
+                    parent_session_id: None,
+                    parent_task_id: None,
+                    inherited_protected_paths: Vec::new(),
+                    source_repository: repo.clone(),
+                    worktree_path: repo.clone(),
+                    branch: "main".to_string(),
+                    base_commit: "0000000".to_string(),
+                    included_uncommitted: false,
+                    git_commands: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        // A real engine turn writes the durable budgeted review.
+        let engine = workspace_engine::WorkspaceEngine::new(Config {
+            data_dir: data_dir.clone(),
+            enable_index_watcher: false,
+            ..Config::default()
+        });
+        let mut adapter = workspace_engine::MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new(), String::new(), "Done.".to_string()],
+            vec![
+                vec![workspace_engine::ToolCall {
+                    id: "call_plan".to_string(),
+                    name: "propose_plan".to_string(),
+                    arguments_json:
+                        r#"{"steps":[{"title":"Read the retry helper"},{"title":"Add a bounded backoff"}]}"#
+                            .to_string(),
+                }],
+                vec![workspace_engine::ToolCall {
+                    id: "call_patch".to_string(),
+                    name: "propose_patch".to_string(),
+                    arguments_json:
+                        r#"{"summary":"Add src/retry.rs","files":[{"path":"src/retry.rs","content":"pub fn added() {}\n"}]}"#
+                            .to_string(),
+                }],
+                Vec::new(),
+            ],
+        );
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        let paused = engine
+            .chat_orchestrator
+            .ask_with_session(
+                &repo,
+                "Add retry handling",
+                &[],
+                Some(&session),
+                &mut adapter,
+                &mut sink,
+            )
+            .expect("the worker turn should pause on its plan");
+        let proposal = paused.plan_proposal.expect("the plan is reviewed");
+        let review = proposal
+            .budget_review
+            .clone()
+            .expect("a worker review offers its budget");
+        let task_id = paused.task.id.clone();
+        drop(engine);
+
+        let host = host_in_process(
+            &session,
+            &data_dir,
+            Box::new(|_config: &Config| {
+                Ok(Box::new(workspace_engine::MockModelAdapter::new("Done."))
+                    as Box<dyn ModelAdapter>)
+            }),
+        )
+        .unwrap();
+        let snapshot = host.snapshot();
+        assert_eq!(snapshot["state"], "waiting_for_approval", "{snapshot}");
+        assert_eq!(snapshot["proposalId"], proposal.id.as_str(), "{snapshot}");
+
+        let (listener, path) = bind_control_socket(&data_dir, &session).unwrap();
+        let served = Arc::clone(&host);
+        std::thread::spawn(move || serve_control(listener, TOKEN, &served));
+        let stream = UnixStream::connect(&path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut send = |body: String| -> Value {
+            writeln!(writer, "{body}").unwrap();
+            let mut answer = String::new();
+            reader.read_line(&mut answer).unwrap();
+            serde_json::from_str(&answer).unwrap()
+        };
+
+        // A changed budget is refused by the engine before the take. The
+        // current bug reports idle here and drops the host's proposal slot.
+        let mut altered = review.budget;
+        altered.action_rounds += 1;
+        let budget = serde_json::to_string(&serde_json::to_string(&altered).unwrap()).unwrap();
+        let answer = send(format!(
+            r#"{{"token":"{TOKEN}","command":"approve","proposalId":"{}","budget":{budget}}}"#,
+            proposal.id
+        ));
+        assert_eq!(answer["ok"], true, "{answer}");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let events = loop {
+            let events =
+                workspace_engine::worker_progress::read_progress_after(&data_dir, &session, 0)
+                    .unwrap();
+            let restored = events.iter().any(|event| {
+                event["kind"] == "status"
+                    && event["payload"]["state"] == "waiting_for_approval"
+                    && event["payload"]["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("does not match"))
+            });
+            if restored {
+                break events;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the refused decision never returned to the waiting state: {events:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        let snapshot = host.snapshot();
+        assert_eq!(snapshot["state"], "waiting_for_approval", "{snapshot}");
+        assert_eq!(snapshot["proposalId"], proposal.id.as_str(), "{snapshot}");
+
+        // The durable review is untouched and still answerable, and the live
+        // UI was given the card again.
+        let paused = PausedTurns::new(&data_dir);
+        assert_eq!(
+            paused.plan_review_deferred_action(&proposal.id).as_deref(),
+            Some(proposal.deferred_action.as_str())
+        );
+        assert_eq!(
+            paused.plan_budget_review(&proposal.id).unwrap(),
+            Some(review.clone())
+        );
+        assert_eq!(
+            store.pending_decision_for(&session, &task_id).unwrap(),
+            Some(PendingDecision::Approval(
+                workspace_engine::PendingApprovalRef {
+                    kind: "plan".to_string(),
+                    proposal_id: proposal.id.clone(),
+                }
+            ))
+        );
+        assert_eq!(
+            store.read_task_budget(&session, &task_id).unwrap(),
+            None,
+            "the refused budget was not recorded"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event["kind"] == "approval"
+                    && event["payload"]["proposal"]["proposalId"] == proposal.id.as_str()
+            }),
+            "the review card is shown again for the live UI: {events:?}"
+        );
+
+        // The exact reviewed budget resumes the same turn.
+        let budget =
+            serde_json::to_string(&serde_json::to_string(&review.budget).unwrap()).unwrap();
+        let answer = send(format!(
+            r#"{{"token":"{TOKEN}","command":"approve","proposalId":"{}","budget":{budget}}}"#,
+            proposal.id
+        ));
+        assert_eq!(answer["ok"], true, "{answer}");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while host.snapshot()["state"] != "idle" {
+            assert!(
+                Instant::now() < deadline,
+                "the resumed turn did not finish: {}",
+                host.snapshot()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            store.read_task_budget(&session, &task_id).unwrap(),
+            Some(review.budget),
+            "the same socket approved the exact reviewed budget"
+        );
+    }
+
     #[test]
     fn requests_are_validated_against_the_command_table() {
         let request = |body: &str| parse_request(format!("{{{body}}}").as_bytes(), TOKEN);
@@ -1649,8 +2219,36 @@ mod tests {
         assert_eq!(
             with_token(r#""command":"approve","proposalId":"p1""#),
             ParsedRequest::Command(ControlCommand::Approve {
-                proposal_id: "p1".to_string()
+                proposal_id: "p1".to_string(),
+                budget: None,
             })
+        );
+        // Spec 103 Task 2: the exact typed budget travels over the socket and
+        // is parsed by the engine type, not by a client-side field list.
+        assert_eq!(
+            with_token(
+                r#""command":"approve","proposalId":"p1","budget":"{\"actionRounds\":96,\"explorationRounds\":144,\"inputTokens\":8000000,\"outputTokens\":512000}""#
+            ),
+            ParsedRequest::Command(ControlCommand::Approve {
+                proposal_id: "p1".to_string(),
+                budget: Some(TaskExecutionBudget {
+                    action_rounds: 96,
+                    exploration_rounds: 144,
+                    input_tokens: 8_000_000,
+                    output_tokens: 512_000,
+                }),
+            })
+        );
+        assert_eq!(
+            with_token(r#""command":"approve","proposalId":"p1","budget":"""#),
+            ParsedRequest::Command(ControlCommand::Approve {
+                proposal_id: "p1".to_string(),
+                budget: None,
+            })
+        );
+        assert_eq!(
+            with_token(r#""command":"reject","proposalId":"p1","budget":"not-json""#),
+            ParsedRequest::Invalid("the budget is not a valid task budget")
         );
         assert_eq!(
             with_token(r#""command":"message","text":"go""#),

@@ -9,11 +9,13 @@ use crate::file_access::LineRange;
 use crate::hash::{create_id, now_millis};
 use crate::mode::SessionMode;
 use crate::model::{TokenUsage, UsageSource};
+use crate::plan::TaskPlan;
 use crate::protected_paths::{
     ProtectedPath, ProtectedPathAction, ProtectedPathSource, TASK_PROTECTED_PATHS_EVENT,
     TaskProtectedPaths, TaskProtectedPathsEvent,
 };
 use crate::secret_scanner::SecretScanner;
+use crate::task_budget::TaskExecutionBudget;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -165,6 +167,118 @@ pub struct ContinuedTask {
     pub task: Task,
     /// The conversation position immediately before the task was created.
     pub position: u64,
+}
+
+/// One `plan_approved` event's typed payload (spec 103 Task 1).
+///
+/// The plan decision and the task execution budget the user reviewed are one
+/// event and one serialized JSONL line. Writing them as two lines was not
+/// atomic: a crash or partial write could leave the first complete line while
+/// tearing the second, producing an approved plan whose allowance is missing or
+/// an allowance whose plan was never approved. One line makes the decision and
+/// its bound durable together, and a torn line is dropped whole by
+/// [`parse_event`].
+///
+/// `budget` is optional so every historical `plan_approved` payload — written
+/// before task budgets existed — still decodes, as `None`, which keeps today's
+/// explicit round-budget pause. `plan` is optional for the same reason and for
+/// the budgetless path: an approval that carries no revision names no new plan
+/// and leaves the replayed plan unchanged.
+///
+/// A budgeted worker approval that also revised steps writes the reviewed plan
+/// here rather than as a separate `plan_revised` line. That keeps "these are
+/// the steps" and "this is the allowance" in one JSONL line: a partial write
+/// cannot leave an approved revision without its budget, or a budget attached
+/// to a step list the user never approved. The original `plan_created` event
+/// remains in the log, so both what was proposed and what was approved stay
+/// readable.
+///
+/// The record carries only numbers, the task identifier, the approving actor
+/// and the plan text the user already saw; no prompt or tool content is ever
+/// added to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanApproval {
+    pub task_id: String,
+    pub approved_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<TaskExecutionBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<TaskPlan>,
+}
+
+/// The structural rules a plan submitted with its approval must satisfy.
+///
+/// The step list is replayed later as the task's current plan, so a malformed
+/// one would be durable before anyone could notice. These are the invariants
+/// the live plan already relies on: it belongs to the task being approved, no
+/// two steps share an id (or an update could not address one of them), and at
+/// most one step is in progress. Step content is not re-validated here: the
+/// user is allowed to retitle a step, and the store records what they chose.
+///
+/// Public because the orchestrator must apply the same rules to a requested
+/// revision *before* it consumes the pending turn (spec 103 Task 2), while
+/// [`SessionStore::approve_plan_with_budget_and_plan`] rechecks them at the
+/// write. One validator means the pre-write decision and the durable write
+/// cannot drift apart.
+pub fn validate_plan_approval(task: &Task, plan: &TaskPlan) -> Result<()> {
+    if plan.task_id != task.id {
+        return Err(ClientError::InvalidInput(format!(
+            "plan belongs to task {} but task {} is being approved",
+            plan.task_id, task.id
+        )));
+    }
+    validate_plan_structure(plan)
+}
+
+/// The structural half of [`validate_plan_approval`], for a caller that does
+/// not yet have the task record (or a replay whose task identity is checked
+/// beside it).
+///
+/// A step id is the only way an update names a step, so an empty or duplicated
+/// id is unusable rather than merely unusual. More than one `InProgress` step
+/// is a state the panel relies on never seeing.
+fn validate_plan_structure(plan: &TaskPlan) -> Result<()> {
+    if plan.task_id.is_empty() {
+        return Err(ClientError::InvalidInput(
+            "approved plan needs a task id".to_string(),
+        ));
+    }
+    let mut ids = HashSet::new();
+    for step in &plan.steps {
+        if step.id.is_empty() {
+            return Err(ClientError::InvalidInput(
+                "approved plan steps need an id".to_string(),
+            ));
+        }
+        if !ids.insert(step.id.as_str()) {
+            return Err(ClientError::InvalidInput(format!(
+                "approved plan has more than one step with id {}",
+                step.id
+            )));
+        }
+    }
+    if plan.violates_single_in_progress() {
+        return Err(ClientError::InvalidInput(
+            "approved plan has more than one step in progress".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The plan a `plan_approved` payload may replay as current.
+///
+/// A hand-edited log must not attach task B's plan under task A, so the
+/// embedded plan's own task id has to agree with the approval's key. Its
+/// structure must also hold, because replaying a malformed plan would make it
+/// the current plan without anyone having approved those exact steps. Anything
+/// else is ignored whole, exactly as an unreadable event is.
+fn replayable_approved_plan(approval: PlanApproval) -> Option<TaskPlan> {
+    let plan = approval.plan?;
+    if plan.task_id != approval.task_id || validate_plan_structure(&plan).is_err() {
+        return None;
+    }
+    Some(plan)
 }
 
 /// The user's decision about one or more files of a patch.
@@ -990,6 +1104,200 @@ impl SessionStore {
             "conversation_compaction_failed",
             &format!("{{\"reason\":\"{}\"}}", escape_json(reason)),
         )
+    }
+
+    /// Appends one within-turn request-preparation attempt (spec 103 Task 4).
+    ///
+    /// The stored transcript is untouched: this is one more event, and
+    /// [`Self::read_messages`] keeps returning every message. The payload is the
+    /// typed, content-safe record — counts, estimates, redacted identities,
+    /// hashes and manifest facts, never a tool body.
+    pub fn append_within_turn_compaction_attempt(
+        &self,
+        session_id: &str,
+        attempt: &crate::request_preparation::WithinTurnCompactionAttempt,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(attempt).map_err(|error| {
+            crate::error::ClientError::Io(format!(
+                "within-turn compaction attempt serialization: {error}"
+            ))
+        })?;
+        self.append_session_event(session_id, "within_turn_compaction", &payload)
+    }
+
+    /// Every active within-turn request-preparation attempt, oldest first.
+    ///
+    /// A payload in a format version this build does not know is skipped rather
+    /// than failing the log: the log is append-only and a later reader must not
+    /// let one unknown record hide every readable one.
+    pub fn read_within_turn_compaction_attempts(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::request_preparation::WithinTurnCompactionAttempt>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        let mut attempts = Vec::new();
+        for event in active_events(&content) {
+            if event.event_type != "within_turn_compaction" {
+                continue;
+            }
+            let Ok(attempt) = serde_json::from_value::<
+                crate::request_preparation::WithinTurnCompactionAttempt,
+            >(event.payload.clone()) else {
+                continue;
+            };
+            if attempt.format_version
+                > crate::request_preparation::WITHIN_TURN_REQUEST_FORMAT_VERSION
+            {
+                continue;
+            }
+            attempts.push(attempt);
+        }
+        Ok(attempts)
+    }
+
+    /// Appends one `segment_started` event (spec 103 Task 5).
+    ///
+    /// The payload is the typed, content-safe segment record: counts, token
+    /// totals, a token source and a digest. It never carries a prompt, plan
+    /// prose, tool body, command text, path or finding.
+    pub fn append_task_segment_started(
+        &self,
+        session_id: &str,
+        event: &crate::task_segments::TaskSegmentStarted,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(event).map_err(|error| {
+            crate::error::ClientError::Io(format!("task segment started serialization: {error}"))
+        })?;
+        self.append_session_event(session_id, "segment_started", &payload)
+    }
+
+    /// Appends one `segment_finished` event (spec 103 Task 5).
+    pub fn append_task_segment_finished(
+        &self,
+        session_id: &str,
+        event: &crate::task_segments::TaskSegmentFinished,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(event).map_err(|error| {
+            crate::error::ClientError::Io(format!("task segment finished serialization: {error}"))
+        })?;
+        self.append_session_event(session_id, "segment_finished", &payload)
+    }
+
+    /// Appends a committed boundary as one finished/started pair (spec 103
+    /// Task 5).
+    ///
+    /// Both facts describe one transition. Writing them as one buffer under the
+    /// append lock means a crash cannot leave a finished segment with no
+    /// successor boundary record beyond the ordinary torn-last-line case, which
+    /// readers treat as "no boundary was committed".
+    pub fn append_task_segment_boundary(
+        &self,
+        session_id: &str,
+        finished: &crate::task_segments::TaskSegmentFinished,
+        started: &crate::task_segments::TaskSegmentStarted,
+    ) -> Result<()> {
+        let finished_payload = serde_json::to_string(finished).map_err(|error| {
+            crate::error::ClientError::Io(format!("task segment finished serialization: {error}"))
+        })?;
+        let started_payload = serde_json::to_string(started).map_err(|error| {
+            crate::error::ClientError::Io(format!("task segment started serialization: {error}"))
+        })?;
+        let mut lock = SessionLogLock::acquire(&self.session_lock_path(session_id))?;
+        self.append_session_events_locked(
+            session_id,
+            &[
+                ("segment_finished", &finished_payload),
+                ("segment_started", &started_payload),
+            ],
+            &mut lock,
+        )
+    }
+
+    /// Every typed segment event for `task_id` and its plan-continuation
+    /// ancestry, oldest first (spec 103 Task 5).
+    ///
+    /// Ancestry follows the same `plan_resumed` edges as
+    /// [`Self::read_task_budget`], so a continued task keeps its totals. A
+    /// payload that does not decode or whose format version is newer than this
+    /// build is skipped: the append-only log must not let one unknown record
+    /// hide every readable one or make a historical session unreadable.
+    pub fn read_task_segments(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<crate::task_segments::StoredTaskSegment>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        let events = active_events(&content);
+        let mut carried_from: HashMap<String, String> = HashMap::new();
+        for event in &events {
+            if event.event_type != "plan_resumed" {
+                continue;
+            }
+            let (Some(event_task), Some(from)) = (event.text("taskId"), event.text("resumedFrom"))
+            else {
+                continue;
+            };
+            carried_from.insert(event_task, from);
+        }
+        let mut ancestry = HashSet::new();
+        let mut current = task_id.to_string();
+        while ancestry.insert(current.clone()) {
+            let Some(from) = carried_from.get(&current) else {
+                break;
+            };
+            current = from.clone();
+        }
+
+        let mut segments = Vec::new();
+        for event in events {
+            // The exact names are `segment_started`/`segment_finished`. The
+            // longer spellings were written only by an unreleased build of this
+            // same task; accepting them keeps a local session log readable
+            // without changing what this build writes.
+            let started = matches!(
+                event.event_type.as_str(),
+                "segment_started" | "task_segment_started"
+            );
+            let finished = matches!(
+                event.event_type.as_str(),
+                "segment_finished" | "task_segment_finished"
+            );
+            if !started && !finished {
+                continue;
+            }
+            let event_task = event.text("taskId").unwrap_or_default();
+            if !ancestry.contains(&event_task) {
+                continue;
+            }
+            let typed = if started {
+                serde_json::from_value::<crate::task_segments::TaskSegmentStarted>(
+                    event.payload.clone(),
+                )
+                .ok()
+                .map(crate::task_segments::TaskSegmentEvent::Started)
+            } else {
+                serde_json::from_value::<crate::task_segments::TaskSegmentFinished>(
+                    event.payload.clone(),
+                )
+                .ok()
+                .map(crate::task_segments::TaskSegmentEvent::Finished)
+            };
+            let Some(typed_event) = typed else {
+                continue;
+            };
+            if typed_event.format_version() > crate::task_segments::TASK_SEGMENT_FORMAT_VERSION {
+                continue;
+            }
+            segments.push(crate::task_segments::StoredTaskSegment {
+                seq: event.seq,
+                event: typed_event,
+            });
+        }
+        Ok(segments)
     }
 
     /// The newest recorded compaction failure, if any *since the last
@@ -2774,6 +3082,22 @@ impl SessionStore {
                         plan = Some(created);
                     }
                 }
+                // Spec 103 Task 2: a reviewed revision approved together with a
+                // budget travels in the approval payload. It is current exactly
+                // as a `plan_revised` plan would be, while `plan_created` and
+                // any earlier revision remain earlier events in the log.
+                "plan_approved" => {
+                    let Ok(approval) =
+                        serde_json::from_value::<PlanApproval>(event.payload.clone())
+                    else {
+                        continue;
+                    };
+                    if approval.task_id == task_id
+                        && let Some(reviewed) = replayable_approved_plan(approval)
+                    {
+                        plan = Some(reviewed);
+                    }
+                }
                 "plan_step_updated" => {
                     let Some(current) = plan.as_mut() else {
                         continue;
@@ -2824,6 +3148,17 @@ impl SessionStore {
                         serde_json::from_value::<crate::plan::TaskPlan>(event.payload.clone())
                     {
                         plans.insert(created.task_id.clone(), created);
+                    }
+                }
+                "plan_approved" => {
+                    let Ok(approval) =
+                        serde_json::from_value::<PlanApproval>(event.payload.clone())
+                    else {
+                        continue;
+                    };
+                    let task_id = approval.task_id.clone();
+                    if let Some(reviewed) = replayable_approved_plan(approval) {
+                        plans.insert(task_id, reviewed);
                     }
                 }
                 "plan_step_updated" => {
@@ -3424,15 +3759,69 @@ impl SessionStore {
     /// writes `plan_revised` and then this, so there is one event to read
     /// whether the user approved as-proposed or edited first.
     pub fn approve_plan(&self, task: &Task, approved_by: &str) -> Result<()> {
-        self.append_session_event(
-            &task.session_id,
-            "plan_approved",
-            &format!(
-                "{{\"taskId\":\"{}\",\"approvedBy\":\"{}\"}}",
-                escape_json(&task.id),
-                escape_json(approved_by)
-            ),
-        )
+        self.append_plan_approval(task, approved_by, None, None)
+    }
+
+    /// Records the reviewed plan and its task execution budget as one
+    /// `plan_approved` event (spec 103 Task 1).
+    ///
+    /// Task 2 calls this once the user accepts a worker plan review. The budget
+    /// is validated before anything is written, so a rejected value leaves no
+    /// approval behind. Plan and budget share one typed payload and one
+    /// JSONL line rather than two lines that a crash between writes could split,
+    /// so "the plan was approved" and "this is the allowance it was approved
+    /// with" cannot disagree afterward.
+    pub fn approve_plan_with_budget(
+        &self,
+        task: &Task,
+        approved_by: &str,
+        budget: &TaskExecutionBudget,
+    ) -> Result<()> {
+        budget.validate()?;
+        self.append_plan_approval(task, approved_by, Some(budget), None)
+    }
+
+    /// Records a reviewed plan and its task execution budget as one
+    /// `plan_approved` event (spec 103 Task 2).
+    ///
+    /// A revision the user accepted and the allowance it runs under are one
+    /// decision. Writing the revision as `plan_revised` and the allowance as a
+    /// second line would let a partial append leave the revision without its
+    /// budget, or an approval whose step list is not the one the user just
+    /// approved. Here the reviewed plan travels in `PlanApproval::plan`, and
+    /// [`Self::read_task_plan`] replays it as current while `plan_created`
+    /// remains history.
+    ///
+    /// Both the plan and the budget are validated before the single append, so
+    /// a refused revision writes neither.
+    pub fn approve_plan_with_budget_and_plan(
+        &self,
+        task: &Task,
+        approved_by: &str,
+        budget: &TaskExecutionBudget,
+        plan: &TaskPlan,
+    ) -> Result<()> {
+        budget.validate()?;
+        validate_plan_approval(task, plan)?;
+        self.append_plan_approval(task, approved_by, Some(budget), Some(plan))
+    }
+
+    fn append_plan_approval(
+        &self,
+        task: &Task,
+        approved_by: &str,
+        budget: Option<&TaskExecutionBudget>,
+        plan: Option<&TaskPlan>,
+    ) -> Result<()> {
+        let approval = PlanApproval {
+            task_id: task.id.clone(),
+            approved_by: approved_by.to_string(),
+            budget: budget.copied(),
+            plan: plan.cloned(),
+        };
+        let payload = serde_json::to_string(&approval)
+            .map_err(|error| ClientError::Io(format!("plan approval serialization: {error}")))?;
+        self.append_session_event(&task.session_id, "plan_approved", &payload)
     }
 
     /// Records that the user let this task's refused model call be answered by
@@ -3546,6 +3935,89 @@ impl SessionStore {
         Ok(false)
     }
 
+    /// The approved task execution budget for `task_id`, or `None` when the
+    /// task has no approved budget (spec 103 Task 1).
+    ///
+    /// Resolution follows exactly the plan-approval rule beside it: budgets are
+    /// keyed by the task that earned them, travel across `plan_resumed` edges,
+    /// and are dropped for a task that proposes a new plan. A budget therefore
+    /// reaches only the task it was approved for and that task's legitimate
+    /// continuation ancestry — never a sibling, a new user task in the same
+    /// session, or a task in another session.
+    ///
+    /// Each `plan_approved` event replaces whatever budget an earlier approval
+    /// of the same task left behind, so the newest approval state wins even when
+    /// it carries no usable budget. Old `plan_approved` payloads carry no
+    /// budget, so historical sessions, pending turns and worker records read as
+    /// `None`, which is today's explicit round-budget pause. A payload whose
+    /// budget does not decode, or whose decoded values are zero or above an
+    /// absolute product ceiling, also leaves no budget for that approval, for
+    /// the same reason an unreadable plan event is skipped: the durable record
+    /// must not turn a corrupt or hand-edited payload into a budget nobody could
+    /// have approved, nor keep an older budget the newest approval superseded.
+    pub fn read_task_budget(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TaskExecutionBudget>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        let mut budgets: HashMap<String, TaskExecutionBudget> = HashMap::new();
+        let mut carried_from: HashMap<String, String> = HashMap::new();
+        for event in active_events(&content) {
+            let Some(event_task) = event.text("taskId") else {
+                continue;
+            };
+            match event.event_type.as_str() {
+                "plan_approved" => {
+                    // The newest approval decides: drop the task's earlier
+                    // budget before considering this payload, so an approval
+                    // that carries no budget, a corrupt budget or an invalid
+                    // one clears the old value instead of silently retaining
+                    // an allowance the user did not just approve.
+                    budgets.remove(&event_task);
+                    let Ok(approval) =
+                        serde_json::from_value::<PlanApproval>(event.payload.clone())
+                    else {
+                        continue;
+                    };
+                    if approval.task_id != event_task {
+                        continue;
+                    }
+                    let Some(budget) = approval.budget else {
+                        continue;
+                    };
+                    if budget.validate().is_ok() {
+                        budgets.insert(event_task, budget);
+                    }
+                }
+                "plan_resumed" => {
+                    if let Some(from) = event.text("resumedFrom") {
+                        carried_from.insert(event_task, from);
+                    }
+                }
+                "plan_created" => {
+                    budgets.remove(&event_task);
+                    carried_from.remove(&event_task);
+                }
+                _ => {}
+            }
+        }
+        let mut current = task_id.to_string();
+        let mut visited = HashSet::new();
+        while visited.insert(current.clone()) {
+            if let Some(budget) = budgets.get(&current) {
+                return Ok(Some(*budget));
+            }
+            let Some(from) = carried_from.get(&current) else {
+                break;
+            };
+            current = from.clone();
+        }
+        Ok(None)
+    }
+
     /// Whether `task_id`'s plan was carried in by [`Self::resume_plan`] and
     /// nothing has changed it since: no step closed or started, no evidence
     /// appended, and no plan of the task's own proposed or revised.
@@ -3566,7 +4038,9 @@ impl SessionStore {
             }
             match event.event_type.as_str() {
                 "plan_resumed" => untouched = true,
-                "plan_created" | "plan_revised" | "plan_step_updated" => untouched = false,
+                "plan_created" | "plan_revised" | "plan_step_updated" | "plan_approved" => {
+                    untouched = false;
+                }
                 _ => {}
             }
         }
