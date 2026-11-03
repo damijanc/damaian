@@ -2896,15 +2896,16 @@ impl ChatOrchestrator {
             .session_store
             .read_task_plan(&session.id, &task.id)?
             .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
-        // A whole-suite validation which the plan explicitly puts at its end
-        // belongs to that final plan step. Running it after every applied
-        // patch is both expensive and makes the test's evidence describe the
-        // wrong point in the task. The worker will run it once when it reaches
-        // the planned step through its ordinary command and approval flow.
-        // Checks the plan did not schedule remain immediate repair feedback.
+        // A required whole-suite check the plan carries on an open step belongs
+        // to that plan step: running it after every applied patch is expensive
+        // and makes the evidence describe the wrong point in the task. The
+        // worker runs it once when it reaches the planned step through its
+        // ordinary command and approval flow. Checks the plan did not schedule
+        // — smaller, different, or optional ones — remain immediate repair
+        // feedback (spec 105 §4).
         let checks: Vec<_> = checks
             .into_iter()
-            .filter(|(check, _)| !plan_has_open_check_command(&plan, &check.command))
+            .filter(|(check, _)| !plan_defers_check(&plan, check))
             .collect();
         let mut selected: Vec<CheckId> = checks.iter().map(|(check, _)| check.clone()).collect();
         if let Some(browser) = &browser {
@@ -14423,31 +14424,28 @@ fn reset_verify_step(plan: &mut TaskPlan, step_id: &str) {
     }
 }
 
-/// Whether an open user-visible plan step owns this exact check command.
+/// Whether an open (non-terminal, non-`verify_`) plan step carries a `required`
+/// structured check whose identity is `check` (spec 105 §4).
 ///
-/// Plans intentionally store human-readable titles rather than model-supplied
-/// command metadata. Match only an exact command phrase (optionally fenced in
-/// backticks) so post-patch verification defers a planned `cargo test` without
-/// treating a vague mention of testing as the same work.
-fn plan_has_open_check_command(plan: &TaskPlan, command: &str) -> bool {
-    plan.steps
-        .iter()
-        .any(|step| plan_step_names_command(step, command))
-}
-
-fn plan_step_names_command(step: &PlanStep, command: &str) -> bool {
-    if step.id.starts_with("verify_") || step.status.is_terminal() {
-        return false;
-    }
-    let named = |text: &str| {
-        text.split('`').any(|segment| segment.trim() == command)
-            || text
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .windows(command.split_whitespace().count())
-                .any(|words| words.join(" ") == command)
-    };
-    named(&step.title) || step.detail.as_deref().is_some_and(named)
+/// The match is the full identity — command *and* working directory — so a
+/// planned whole-suite check is deferred to its own plan step, while a check at
+/// a different directory or with a different command still runs now. Only a
+/// `required: true` check is a deferral target; an optional check is not.
+/// Historical prose-only plans carry no `PlannedCheck`, so they defer nothing
+/// (requirement 10): a command named in a step's text is no longer a signal.
+fn plan_defers_check(plan: &TaskPlan, check: &CheckId) -> bool {
+    plan.steps.iter().any(|step| {
+        if step.id.starts_with("verify_") || step.status.is_terminal() {
+            return false;
+        }
+        let Some(planned) = step.check.as_ref() else {
+            return false;
+        };
+        if !planned.required {
+            return false;
+        }
+        CheckId::new(planned.working_directory.as_str(), planned.command.as_str()) == *check
+    })
 }
 
 fn root_label(working_directory: &str) -> &str {

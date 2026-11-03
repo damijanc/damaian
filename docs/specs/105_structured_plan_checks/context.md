@@ -18,11 +18,13 @@ matching `CheckId`'s existing `""` convention.
 
 ## 2. #97's prose matching is what retires
 
-`chat.rs:14426` `plan_has_open_check_command` / `plan_step_names_command` do the
+`chat.rs` `plan_has_open_check_command` / `plan_step_names_command` did the
 prose match: an exact command in a backtick span or as a whitespace token
 sequence, on any non-terminal non-`verify_` step's `title` or `detail`.
-Requirement 4 retires this entirely — the deferral in `run_verification_checks`
-(`chat.rs:2904`) becomes structured. Two consequences to record, not dodge:
+Requirement 4 retired this entirely in Task 2 — the deferral filter in
+`run_verification_checks` is now `plan_defers_check`, a `CheckId` equality
+(`working_directory` + `command`) against a `required: true` `PlannedCheck` on
+an open plan step. Two consequences, recorded and deliberately not dodged:
 
 - A historical prose-only plan that says "Run `cargo test`" no longer defers
   that suite after every patch; it reverts to per-patch automatic checks,
@@ -30,8 +32,10 @@ Requirement 4 retires this entirely — the deferral in `run_verification_checks
   intent ("historical plans remain supported with no required structured checks")
   and is a deliberate behaviour change from #97.
 - The #97 test `verification_defers_a_planned_final_check_without_two_steps_in_progress`
-  is rewritten to attach a structured check to the final step rather than to
-  name a command in prose.
+  was rewritten to attach a structured check to the final step rather than to
+  name a command in prose, and a counter-case was added: a planned check at a
+  different directory, with a different command, or with `required: false` is
+  not a deferral target and the discovered check still runs.
 
 ## 3. The plan tool schema and the parse path
 

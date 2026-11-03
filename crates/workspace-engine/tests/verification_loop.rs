@@ -18,13 +18,14 @@ use workspace_engine::plan::StepStatus;
 use workspace_engine::{
     CancelToken, ChatTurnResult, CheckBaseline, CheckId, CheckOutcome, CommandPurpose,
     CompletionReasonCode, Config, ContextDecision, Evidence, FailureProvenance, HookConfig,
-    HookEvent, HookMode, HookSource, MockModelAdapter, PausedTurns, PlanReport, PlanStep,
-    ReattachedApproval, RepairStallReason, RoundBudgetDecision, Selection, SessionStore,
-    SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink, VerificationEvent,
-    VerificationOutcome, VerificationReport, VerificationState, WebDiagnosticCall,
-    WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkerRecord, WorkspaceEngine, fold_verification, is_documentation,
-    pending_verifications, propose_checks, reattach_pending_approvals, select_roots,
+    HookEvent, HookMode, HookSource, MockModelAdapter, PLANNED_CHECK_VERSION, PausedTurns,
+    PlanReport, PlanStep, PlannedCheck, ReattachedApproval, RepairStallReason, RoundBudgetDecision,
+    Selection, SessionStore, SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink,
+    VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
+    WebDiagnosticCall, WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerRecord, WorkspaceEngine,
+    fold_verification, is_documentation, pending_verifications, propose_checks,
+    reattach_pending_approvals, select_roots,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -1670,12 +1671,13 @@ fn an_auto_runnable_check_runs_and_the_report_says_passed() {
     let _ = fs::remove_dir_all(&data_dir);
 }
 
-/// Spec 97: a whole-suite `cargo test` at the end of a carried plan must not
-/// run after every patch. It stays pending for the worker's final plan step,
-/// so post-patch verification neither spends the suite nor opens a competing
-/// `verify_*` step beside the implementation work. Replay every durable log
-/// prefix: the finished plan alone would miss the transient state shown in the
-/// UI.
+/// Spec 105 §4: a required whole-suite check carried on a plan step must not
+/// run after every patch. The deferral keys on the step's structured
+/// `PlannedCheck` identity — command and directory — not on a command named in
+/// prose. It stays pending for the worker's final plan step, so post-patch
+/// verification neither spends the suite nor opens a competing `verify_*` step
+/// beside the implementation work. Replay every durable log prefix: the
+/// finished plan alone would miss the transient state shown in the UI.
 #[test]
 fn verification_defers_a_planned_final_check_without_two_steps_in_progress() {
     let root = temp_dir("planned-check-invariant");
@@ -1709,14 +1711,20 @@ fn verification_defers_a_planned_final_check_without_two_steps_in_progress() {
         },
         PlanStep {
             id: "test".to_string(),
-            title: "Run `cargo test`".to_string(),
+            title: "Validate the change".to_string(),
             detail: None,
             status: StepStatus::Pending,
             depends_on: Vec::new(),
             started_at_ms: None,
             completed_at_ms: None,
             evidence: Vec::new(),
-            check: None,
+            check: Some(PlannedCheck {
+                version: PLANNED_CHECK_VERSION,
+                command: "cargo test".to_string(),
+                working_directory: String::new(),
+                purpose: "validates the final tree".to_string(),
+                required: true,
+            }),
         },
     ]);
     engine.session_store.create_plan(&task, &plan).unwrap();
@@ -1796,6 +1804,96 @@ fn verification_defers_a_planned_final_check_without_two_steps_in_progress() {
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// Spec 105 §4 counter-cases: the deferral matches the *full* identity, so a
+/// planned check at a different directory, or with a different command, does
+/// not defer the discovered root `cargo test`. Only an exact
+/// `CheckId { working_directory, command }` match defers; anything else still
+/// runs as immediate repair feedback.
+#[test]
+fn a_planned_check_with_a_different_directory_or_command_is_not_deferred() {
+    for planned in [
+        PlannedCheck {
+            version: PLANNED_CHECK_VERSION,
+            command: "cargo test".to_string(),
+            working_directory: "crates/engine".to_string(),
+            purpose: "same command, different directory".to_string(),
+            required: true,
+        },
+        PlannedCheck {
+            version: PLANNED_CHECK_VERSION,
+            command: "cargo nextest run".to_string(),
+            working_directory: String::new(),
+            purpose: "different command, same directory".to_string(),
+            required: true,
+        },
+        PlannedCheck {
+            version: PLANNED_CHECK_VERSION,
+            command: "cargo test".to_string(),
+            working_directory: String::new(),
+            purpose: "same identity, but optional".to_string(),
+            required: false,
+        },
+    ] {
+        let root = temp_dir("planned-check-counter");
+        let data_dir = temp_dir("planned-check-counter-data");
+        cargofile(&root);
+        let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+        let (session, task_id) = applied_change(
+            &engine,
+            &root,
+            &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+        );
+        let task = engine
+            .session_store
+            .read_tasks(&session)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .expect("the patch task");
+        let mut plan = TaskPlan::new(&task.id, 0);
+        plan.steps.extend([
+            PlanStep {
+                id: "implement".to_string(),
+                title: "Implement the change".to_string(),
+                detail: None,
+                status: StepStatus::InProgress,
+                depends_on: Vec::new(),
+                started_at_ms: Some(1),
+                completed_at_ms: None,
+                evidence: Vec::new(),
+                check: None,
+            },
+            PlanStep {
+                id: "test".to_string(),
+                title: "Validate the change".to_string(),
+                detail: None,
+                status: StepStatus::Pending,
+                depends_on: Vec::new(),
+                started_at_ms: None,
+                completed_at_ms: None,
+                evidence: Vec::new(),
+                check: Some(planned),
+            },
+        ]);
+        engine.session_store.create_plan(&task, &plan).unwrap();
+
+        let mut adapter = MockModelAdapter::new("");
+        let result = run_verification(&engine, &root, &session, &mut adapter);
+        let report = result
+            .verification_report
+            .as_ref()
+            .expect("the root cargo test still runs rather than defers");
+        assert_eq!(
+            report.passed,
+            vec![CheckId::new("", "cargo test")],
+            "a check at a different identity must not be deferred: {report:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&data_dir);
+    }
 }
 
 #[test]
