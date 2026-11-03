@@ -111,6 +111,51 @@ pub enum Evidence {
     Findings { refs: Vec<String>, failing: usize },
 }
 
+/// The current [`PlannedCheck`] wire format. A plan written with a later
+/// version can be detected rather than silently misread as the current shape.
+pub const PLANNED_CHECK_VERSION: u32 = 1;
+
+/// A structured check a plan step requires (spec 105).
+///
+/// Plan-level data: the command, the repository-relative directory it runs in,
+/// why it is required, and whether it must pass before the task may complete.
+/// It is deliberately **not** a runtime classification — `purpose` here says
+/// why the check is required and is shown on the review card, distinct from the
+/// runtime [`CommandPurpose`] that says what a run command was for
+/// (context.md §7).
+///
+/// Its identity is `verification::CheckId`: `command` plus `working_directory`,
+/// where the empty directory is the repository root. Nothing in this type
+/// authorises the command to run; it only records what the approved plan
+/// requires, and each check still follows command policy when it is reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedCheck {
+    /// The plan-check format this was written with.
+    #[serde(default = "default_planned_check_version")]
+    pub version: u32,
+    pub command: String,
+    /// Repository-relative directory; the empty string is the repository root,
+    /// matching `CheckId`'s convention.
+    #[serde(default)]
+    pub working_directory: String,
+    /// Why the check is required, e.g. "validates the final tree".
+    pub purpose: String,
+    /// Whether the task may not complete until this check has current passing
+    /// evidence. The model proposes `true`; the user may change it on the
+    /// review card before approval.
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+fn default_planned_check_version() -> u32 {
+    PLANNED_CHECK_VERSION
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanStep {
@@ -127,6 +172,13 @@ pub struct PlanStep {
     /// concerned and nothing observable confirms it. The completion report says
     /// so rather than hiding it — see [`PlanStep::is_unverified`].
     pub evidence: Vec<Evidence>,
+    /// A structured required check for this step (spec 105). Authoritative only
+    /// once the plan is approved; `None` for historical steps and for the
+    /// verification steps the loop itself adds. Omitted from the wire when
+    /// absent, so a plan whose steps carry no check keeps the pre-spec shape
+    /// (context.md §10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<PlannedCheck>,
 }
 
 impl PlanStep {

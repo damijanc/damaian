@@ -50,7 +50,10 @@ use crate::model::{
 use crate::navigation::NavigationController;
 use crate::patch_engine::{PatchEngine, ProposedChange, ProposedFilePatch, ProposedPatch};
 use crate::path_policy::PathPolicy;
-use crate::plan::{Evidence, PlanStep, StepStatus, TaskPlan, status_from_evidence};
+use crate::plan::{
+    Evidence, PLANNED_CHECK_VERSION, PlanStep, PlannedCheck, StepStatus, TaskPlan,
+    status_from_evidence,
+};
 use crate::process_registry::ProcessRegistry;
 use crate::protected_paths::{
     ProtectedPathAction, ProtectedPathSource, TaskProtectedPaths, ensure_patch_paths_allowed,
@@ -2943,6 +2946,7 @@ impl ChatOrchestrator {
                     started_at_ms: None,
                     completed_at_ms: None,
                     evidence: Vec::new(),
+                    check: None,
                 });
                 step_id
             };
@@ -2962,6 +2966,7 @@ impl ChatOrchestrator {
                     started_at_ms: None,
                     completed_at_ms: None,
                     evidence: Vec::new(),
+                    check: None,
                 }),
             }
             reset_verify_step(&mut plan, &step_id);
@@ -10362,6 +10367,7 @@ impl ChatOrchestrator {
                                         started_at_ms: (index == 0).then_some(now),
                                         completed_at_ms: None,
                                         evidence: Vec::new(),
+                                        check: step.check.clone(),
                                     });
                                 }
                                 self.session_store.create_plan(&task, &proposed)?;
@@ -15461,6 +15467,7 @@ pub(crate) struct CommandRequest {
 pub(crate) struct ProposedStep {
     title: String,
     detail: Option<String>,
+    check: Option<PlannedCheck>,
 }
 
 /// What a matched tool call (native `tools`/`tool_calls`, or the
@@ -16235,7 +16242,7 @@ fn propose_plan_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "propose_plan".to_string(),
         description: "Propose an ordered plan for non-trivial work, before starting it. Use this when the task needs more than one step — a single question or a single file read needs no plan. Do not report a step's outcome here; call complete_step when a step's work is done and Damaian will record how it ended from what it observed. If the context shows a plan carried forward from an earlier turn and the user has moved on to different work, propose a new plan before starting on the old one; the earlier plan stays recorded.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"steps\":{\"type\":\"array\",\"minItems\":2,\"items\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"Short imperative title for the step\"},\"detail\":{\"type\":\"string\",\"description\":\"Optional longer description\"}},\"required\":[\"title\"]}}},\"required\":[\"steps\"]}".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"steps\":{\"type\":\"array\",\"minItems\":2,\"items\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"Short imperative title for the step\"},\"detail\":{\"type\":\"string\",\"description\":\"Optional longer description\"},\"check\":{\"type\":\"object\",\"description\":\"An optional required check for this step: a command that must pass before the task completes. Proposed for review only; it authorises nothing on its own.\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The exact command to run\"},\"workingDirectory\":{\"type\":\"string\",\"description\":\"Repository-relative directory to run it in; empty or omitted means the repository root\"},\"purpose\":{\"type\":\"string\",\"description\":\"Why this check is required\"},\"required\":{\"type\":\"boolean\",\"description\":\"Whether the task may not complete until this check passes; defaults to true\"}},\"required\":[\"command\"]}},\"required\":[\"title\"]}}},\"required\":[\"steps\"]}".to_string(),
     }
 }
 
@@ -16414,6 +16421,38 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
                         .and_then(|value| value.as_str())
                         .map(str::trim)
                         .filter(|value| !value.is_empty())?;
+                    // A check is optional, and a proposed check authorises
+                    // nothing on its own (spec 105 §2). It only becomes
+                    // authoritative once the user approves the plan. A check
+                    // without a command is not a check, so it is dropped the
+                    // same way a step with no title is.
+                    let check = entry.get("check").and_then(|value| {
+                        let command = value
+                            .get("command")
+                            .and_then(|command| command.as_str())
+                            .map(str::trim)
+                            .filter(|command| !command.is_empty())?;
+                        Some(PlannedCheck {
+                            version: PLANNED_CHECK_VERSION,
+                            command: command.to_string(),
+                            working_directory: value
+                                .get("workingDirectory")
+                                .and_then(|dir| dir.as_str())
+                                .map(str::trim)
+                                .unwrap_or_default()
+                                .to_string(),
+                            purpose: value
+                                .get("purpose")
+                                .and_then(|purpose| purpose.as_str())
+                                .map(str::trim)
+                                .unwrap_or_default()
+                                .to_string(),
+                            required: value
+                                .get("required")
+                                .and_then(|required| required.as_bool())
+                                .unwrap_or(true),
+                        })
+                    });
                     Some(ProposedStep {
                         title: title.to_string(),
                         detail: entry
@@ -16422,6 +16461,7 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
                             .map(str::to_string),
+                        check,
                     })
                 })
                 .collect();
@@ -19111,6 +19151,84 @@ mod clarification_tests {
         assert!(properties.get("allowFreeText").is_some());
         assert!(definition.description.contains("authorises nothing"));
     }
+
+    #[test]
+    fn propose_plan_parses_a_structured_check() {
+        let parsed = tool_action_from_call(&ToolCall {
+            id: "call_1".to_string(),
+            name: "propose_plan".to_string(),
+            arguments_json: serde_json::json!({
+                "steps": [
+                    {
+                        "title": "Run the engine suite",
+                        "check": {
+                            "command": "cargo nextest run -p workspace-engine",
+                            "workingDirectory": "",
+                            "purpose": "validates the final tree",
+                            "required": true,
+                        },
+                    },
+                    { "title": "Write the report" },
+                ],
+            })
+            .to_string(),
+        })
+        .unwrap()
+        .expect("a decoded plan");
+
+        let ToolAction::ProposePlan(steps) = parsed else {
+            panic!("expected a plan");
+        };
+        assert_eq!(steps.len(), 2);
+        let check = steps[0]
+            .check
+            .as_ref()
+            .expect("the first step carries a check");
+        assert_eq!(check.version, PLANNED_CHECK_VERSION);
+        assert_eq!(check.command, "cargo nextest run -p workspace-engine");
+        assert_eq!(check.working_directory, "");
+        assert_eq!(check.purpose, "validates the final tree");
+        assert!(check.required);
+        // A step without a check parses to none.
+        assert!(steps[1].check.is_none());
+    }
+
+    #[test]
+    fn propose_plan_drops_a_check_without_a_command_and_defaults_missing_fields() {
+        // A proposed check authorises nothing on its own (spec 105 §2); one
+        // without a command is not a check, so it is dropped the same way a
+        // step with no title is. The remaining optional fields default: empty
+        // directory is the repository root, and `required` is true.
+        let parsed = tool_action_from_call(&ToolCall {
+            id: "call_1".to_string(),
+            name: "propose_plan".to_string(),
+            arguments_json: serde_json::json!({
+                "steps": [
+                    { "title": "First", "check": { "purpose": "no command here" } },
+                    {
+                        "title": "Second",
+                        "check": { "command": "cargo test" },
+                    },
+                ],
+            })
+            .to_string(),
+        })
+        .unwrap()
+        .expect("a decoded plan");
+
+        let ToolAction::ProposePlan(steps) = parsed else {
+            panic!("expected a plan");
+        };
+        assert!(steps[0].check.is_none(), "{:?}", steps[0].check);
+        let check = steps[1]
+            .check
+            .as_ref()
+            .expect("the second step carries a check");
+        assert_eq!(check.command, "cargo test");
+        assert_eq!(check.working_directory, "");
+        assert_eq!(check.purpose, "");
+        assert!(check.required);
+    }
 }
 
 /// Layer 3 of spec 20's working modes (`docs/specs/20_working_modes`): the
@@ -21281,6 +21399,7 @@ mod approval_prompt_wording_tests {
             started_at_ms: Some(1),
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         });
         plan.steps.push(crate::plan::PlanStep {
             id: "step_2".to_string(),
@@ -21291,6 +21410,7 @@ mod approval_prompt_wording_tests {
             started_at_ms: Some(1),
             completed_at_ms: Some(2),
             evidence: Vec::new(),
+            check: None,
         });
         plan.steps.push(crate::plan::PlanStep {
             id: "step_3".to_string(),
@@ -21301,6 +21421,7 @@ mod approval_prompt_wording_tests {
             started_at_ms: None,
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         });
 
         let text = plan_reminder_message(&plan);

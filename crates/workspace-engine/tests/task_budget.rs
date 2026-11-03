@@ -44,6 +44,7 @@ fn step(id: &str) -> PlanStep {
         started_at_ms: None,
         completed_at_ms: None,
         evidence: Vec::new(),
+        check: None,
     }
 }
 

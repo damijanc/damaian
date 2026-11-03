@@ -1235,6 +1235,7 @@ mod tests {
             started_at_ms: None,
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         });
         engine.session_store.create_plan(&task, &plan).unwrap();
         let pending = dir.join("chat").join("pending");
@@ -1311,6 +1312,7 @@ mod tests {
             started_at_ms: None,
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         });
         engine.session_store.create_plan(&task, &plan).unwrap();
         let pending = dir.join("chat").join("pending");

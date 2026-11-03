@@ -307,6 +307,7 @@ fn a_plan_whose_only_open_steps_are_verification_steps_is_not_picked_up() {
             started_at_ms: None,
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         });
     }
     engine

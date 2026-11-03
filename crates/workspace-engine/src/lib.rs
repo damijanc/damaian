@@ -206,8 +206,8 @@ pub use patch_engine::{
 };
 pub use path_policy::PathPolicy;
 pub use plan::{
-    Evidence, PatchedFile, PlanReport, PlanStep, ReportedStep, StepOutcome, StepStatus, TaskPhase,
-    TaskPlan,
+    Evidence, PLANNED_CHECK_VERSION, PatchedFile, PlanReport, PlanStep, PlannedCheck, ReportedStep,
+    StepOutcome, StepStatus, TaskPhase, TaskPlan,
 };
 pub use process_registry::{
     ProcessIdentity, ProcessKind, ProcessRegistry, RegisteredProcess, RegistrationHandle,

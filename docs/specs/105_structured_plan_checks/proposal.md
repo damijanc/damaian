@@ -1,6 +1,6 @@
 # Feature Spec: Approved Plans Own Structured Required Checks
 
-Status: Not started (planned 2026-11-03; see [context.md](context.md) and
+Status: In progress (started 2026-11-03; Task 1 done — see
 [tasks.md](tasks.md))
 Order: 105 of 106
 Plan: none. This closes the verification-scheduling gap exposed by the

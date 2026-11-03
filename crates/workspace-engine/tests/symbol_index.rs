@@ -2854,6 +2854,7 @@ fn a_language_server_error_leaves_the_active_plan_step_unchanged() {
             path: "src/x.rs".to_string(),
             hash: workspace_engine::hash::file_hash(fixture.repo.root.join("src/x.rs")).unwrap(),
         }],
+        check: None,
     });
     engine.session_store.create_plan(&task, &plan).unwrap();
     let before = engine

@@ -148,13 +148,12 @@ sequence works as one system.
   window on 2026-10-26, so the reuse slice is no longer blocked by either.
   #49's own `Depends on:` line still names Phase 1 WP3 (provider capability
   validation) as unspecified, so it is not in the ready set.
+  [#105](105_structured_plan_checks/proposal.md) started 2026-11-03; Task 1 (the
+  structured-check model, schema, parse and replay) is done.
 - **Ready:** #33 MCP management. It was serialised behind #30 on `chat.rs`;
   with #30 Done it is free to start, from a `main` that contains #30's turn
-  path so it does not rebase over it.
-  [#105](105_structured_plan_checks/proposal.md) is planned (its `context.md`
-  and `tasks.md` are written; its last unmet dependency, #101, is built). Both
-  #33 and #105 edit `chat.rs`, so they must not be implemented concurrently with
-  each other. #103 and #104 are Done.
+  path so it does not rebase over it. #33 and #105 both edit `chat.rs`, so they
+  must not be implemented concurrently with each other. #103 and #104 are Done.
 - **Blocked:** #37 on #33; #52 on #33; #54 on Phase 1 WP3 (provider capability
   validation), which is unspecified. In the
   single-worker sequence, [#106](106_single_worker_spec_acceptance.md) remains
@@ -926,7 +925,7 @@ is ready.
 | 102 | [102_repair_provenance_and_stagnation.md](102_repair_provenance_and_stagnation.md) | **Done 2026-11-01.** Six tasks: durable evidence and provenance; pre-apply baseline decisions; provenance-gated repair; stagnation and oscillation stops; engine-owned repair scope and thin presentation; integration and close-out. Checks are baselined before the patch that first selects them, repair targets only introduced regressions, environment failures do not trigger source edits, and repeated or oscillating repairs stop before the numeric limit. Its §7 records the requirement and acceptance evidence, five deterministic scenarios, and the scoped local checks; the full gate is left to CI. |
 | 103 | [103_bounded_worker_continuation.md](103_bounded_worker_continuation.md) | **Done 2026-11-03.** Seven tasks: durable task-budget model and restrict-only policy; worker plan-review approval; pure within-turn compaction; safety-pinned request integration; bounded automatic worker segments; durable terminal outcomes and recovery; evaluation and close-out. Task 7 added eight deterministic eval scenarios covering three-segment completion after one budget approval, the genuine budgetless worker pause, independent command and patch approvals, planned-worker long-read compaction plus an ordered reread, byte-identical pinned safety state, and the three typed stops across a fresh engine, with exact segment counts. It also added focused engine regressions proving a planned budgeted worker compacts an older read while the latest open-step result, worker-record protected paths, `PatchApplied` base hashes and active error-finding pins stay verbatim. The user, troubleshooting, security, README and changelog records are updated. Scoped checks and the deterministic tier pass locally; the full seven-check gate passed in CI on 2026-11-03 (Quality run 41601326024). |
 | 104 | [104_worker_questions/](104_worker_questions/proposal.md) | **Done 2026-11-03** (converted to a folder and built that day; scoped checks in its [`tasks.md`](104_worker_questions/tasks.md), the full gate is left to CI). An app-managed worker can persist a real clarification, show **Needs your answer**, and resume through its control socket without treating an answer as an approval or guessing a material product decision. The offering test is split into a durable question route and a synchronous user; the worker prompt asks on material ambiguity while a headless turn stops as incomplete; a restart reattaches an open question without a model call. |
-| 105 | [105_structured_plan_checks/](105_structured_plan_checks/proposal.md) | **Not started; planned 2026-11-03.** Approved plan steps will carry structured required checks with command, directory and current evidence, replacing #97's prose match and giving the completion gate an engine-owned verification obligation. The design and six-task plan are in its `context.md` and `tasks.md`. |
+| 105 | [105_structured_plan_checks/](105_structured_plan_checks/proposal.md) | **In progress since 2026-11-03; Task 1 done.** Approved plan steps will carry structured required checks with command, directory and current evidence, replacing #97's prose match and giving the completion gate an engine-owned verification obligation. The design and six-task plan are in its `context.md` and `tasks.md`; Task 1 (the `PlannedCheck` model, schema, parse and historical replay) is done. |
 | 106 | [106_single_worker_spec_acceptance.md](106_single_worker_spec_acceptance.md) | **Not started; blocked on #105.** #101, #102, #103 and #104 are built. A deterministic fixture and three consecutive fresh live runs will prove that one real worker can finish one specification-sized task without generic rescue prompts, while all existing safety decisions remain explicit. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order

@@ -7766,6 +7766,7 @@ mod tests {
                 purpose: workspace_engine::CommandPurpose::Other,
                 command_hash: None,
             }],
+            check: None,
         });
         plan.steps.push(PlanStep {
             id: "step_2".to_string(),
@@ -7776,6 +7777,7 @@ mod tests {
             started_at_ms: Some(8),
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         });
         plan
     }
@@ -10331,6 +10333,7 @@ mod tests {
                 started_at_ms: None,
                 completed_at_ms: None,
                 evidence: Vec::new(),
+                check: None,
             });
         }
         engine.session_store.create_plan(&reviewing, &plan).unwrap();
@@ -10528,6 +10531,7 @@ mod tests {
                         path: "upload.rs".to_string(),
                         hash: "sha256:0".to_string(),
                     }],
+                    check: None,
                 },
                 workspace_engine::PlanStep {
                     id: "step_2".to_string(),
@@ -10538,6 +10542,7 @@ mod tests {
                     started_at_ms: Some(2),
                     completed_at_ms: Some(3),
                     evidence: Vec::new(),
+                    check: None,
                 },
                 workspace_engine::PlanStep {
                     id: "step_3".to_string(),
@@ -10548,6 +10553,7 @@ mod tests {
                     started_at_ms: None,
                     completed_at_ms: None,
                     evidence: Vec::new(),
+                    check: None,
                 },
             ],
         };
@@ -16084,6 +16090,7 @@ mod tests {
                 started_at_ms: None,
                 completed_at_ms: None,
                 evidence: Vec::new(),
+                check: None,
             });
             store().create_plan(&task, &plan).unwrap();
             store()
@@ -17543,6 +17550,7 @@ exec /bin/cat > /dev/null
                 started_at_ms: None,
                 completed_at_ms: None,
                 evidence: Vec::new(),
+                check: None,
             });
             store.create_plan(&task, &plan).unwrap();
             let report = workspace_engine::CompletionGateReport {
@@ -19102,6 +19110,7 @@ mod commit_message_tests {
             started_at_ms: None,
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         });
         engine.session_store.create_plan(&task, &plan).unwrap();
         Fixture {

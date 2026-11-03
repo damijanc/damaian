@@ -1,5 +1,7 @@
 # Spec 105 tasks
 
+**Started:** 2026-11-03
+
 Implementation plan for [`proposal.md`](proposal.md). The design and the
 planning corrections live there and in [`context.md`](context.md).
 
@@ -24,7 +26,7 @@ planning corrections live there and in [`context.md`](context.md).
 
 | Task | State | Durable result |
 |---|---|---|
-| 1 · Structured check model, schema, parse and replay | Not started | |
+| 1 · Structured check model, schema, parse and replay | Done 2026-11-03 | Versioned `PlannedCheck` (`version: u32` = `PLANNED_CHECK_VERSION`, plus `command`, repository-relative `working_directory` with empty = root, `purpose`, `required: bool`) in `plan.rs`, exported from `lib.rs`. `PlanStep.check: Option<PlannedCheck>` carries `#[serde(default, skip_serializing_if = "Option::is_none")]` so historical plan JSON and plans whose steps carry no check keep the pre-spec wire shape. `propose_plan_tool_definition`'s step schema gains an optional `check` object, and `tool_action_from_call` parses it into a `PlannedCheck` (a check without a `command` is dropped; `working_directory` defaults to `""`, `required` to `true`), which the `ProposePlan` dispatch then copies onto the built `PlanStep`. `validate_plan_structure` / `validate_plan_approval` already accept the field without re-validating a check's command — step content is deliberately not re-validated because the user may edit it — so no session.rs change was needed. The remaining `PlanStep { .. }` literals across workspace-engine and desktop-shell gained `check: None`. Tests: a plan with a structured check round-trips (camelCase wire), a step without a check omits the `check` key, a replayed pre-spec `plan_created`/`plan_approved` loads with `None`, and two parse tests (`propose_plan_parses_a_structured_check`, `propose_plan_drops_a_check_without_a_command_and_defaults_missing_fields`). |
 | 2 · Structured deferral in the verification loop | Not started | |
 | 3 · Authoritative approval and the plan review card | Not started | |
 | 4 · Mutation-batch generation and evidence staleness | Not started | |

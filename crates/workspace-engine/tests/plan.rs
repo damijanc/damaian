@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::plan::{
-    Evidence, PlanStep, StepOutcome, StepStatus, TaskPhase, TaskPlan, status_from_evidence,
+    Evidence, PlanStep, PlannedCheck, StepOutcome, StepStatus, TaskPhase, TaskPlan,
+    status_from_evidence,
 };
-use workspace_engine::{CommandPurpose, SessionStore, Task, TaskStatus};
+use workspace_engine::{CommandPurpose, PLANNED_CHECK_VERSION, SessionStore, Task, TaskStatus};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -30,6 +31,7 @@ fn step(id: &str, status: StepStatus) -> PlanStep {
         started_at_ms: None,
         completed_at_ms: None,
         evidence: Vec::new(),
+        check: None,
     }
 }
 
@@ -117,6 +119,7 @@ fn a_plan_round_trips_through_json_unchanged() {
                 purpose: CommandPurpose::Other,
                 command_hash: None,
             }],
+            check: None,
         }],
     };
 
@@ -151,6 +154,65 @@ fn an_absent_exit_code_survives_the_round_trip_as_absent() {
         evidence
     );
     assert!(!text.contains("\"exitCode\":0"), "got: {text}");
+}
+
+#[test]
+fn a_plan_with_a_structured_check_round_trips() {
+    // Spec 105 Task 1: a step may carry a structured check, and it must
+    // survive the JSON round trip with its identity intact. The wire uses
+    // camelCase, because the shell reads these events directly.
+    let check = PlannedCheck {
+        version: PLANNED_CHECK_VERSION,
+        command: "cargo nextest run -p workspace-engine".to_string(),
+        working_directory: String::new(),
+        purpose: "validates the final tree".to_string(),
+        required: true,
+    };
+    let plan = TaskPlan {
+        task_id: "task_1".to_string(),
+        created_at_ms: 1_700_000_000_000,
+        steps: vec![PlanStep {
+            id: "step_1".to_string(),
+            title: "Run the engine suite".to_string(),
+            detail: None,
+            status: StepStatus::Pending,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+            check: Some(check.clone()),
+        }],
+    };
+
+    let text = serde_json::to_string(&plan).expect("a plan serializes");
+    assert_eq!(
+        serde_json::from_str::<TaskPlan>(&text).expect("and reads back"),
+        plan
+    );
+    assert_eq!(plan.steps[0].check.as_ref(), Some(&check));
+    // camelCase on the wire.
+    assert!(text.contains("\"workingDirectory\""), "got: {text}");
+    assert!(
+        text.contains("\"command\":\"cargo nextest run -p workspace-engine\""),
+        "got: {text}"
+    );
+    assert!(text.contains("\"required\":true"), "got: {text}");
+}
+
+#[test]
+fn a_step_without_a_check_omits_the_check_key() {
+    // Spec 105 requirement 10 / context.md §10: a step that carries no check
+    // keeps the pre-spec JSON shape rather than gaining a null `check` key.
+    let plan = TaskPlan {
+        task_id: "task_1".to_string(),
+        created_at_ms: 1_700_000_000_000,
+        steps: vec![step("step_1", StepStatus::Pending)],
+    };
+    let text = serde_json::to_string(&plan).expect("a plan serializes");
+    assert!(!text.contains("\"check\""), "got: {text}");
+    // And it still reads back as no check.
+    let back: TaskPlan = serde_json::from_str(&text).expect("and reads back");
+    assert!(back.steps[0].check.is_none());
 }
 
 #[test]
@@ -286,6 +348,56 @@ fn a_pre_spec_63_log_replays_with_the_same_step_statuses() {
             step.id
         );
     }
+}
+
+#[test]
+fn a_pre_spec_plan_with_no_check_field_replays_with_none() {
+    // Spec 105 requirement 10: a plan written before structured checks — no
+    // `check` key on any step — must load with `None` on every step and invent
+    // no check. Both the original `plan_created` and the approved plan carried
+    // by `plan_approved` are exercised, written raw in the pre-spec shape so
+    // the test does not depend on the current serializer omitting the key.
+    let fixture = Fixture::new("pre-spec-check");
+    let task = fixture.task("add retry handling");
+
+    let step_json = r#"{"id":"step_1","title":"Add the retry helper","detail":null,"status":"pending","dependsOn":[],"startedAtMs":1,"completedAtMs":null,"evidence":[]}"#;
+    fixture.append_raw(&format!(
+        r#"{{"eventId":"evt_created","seq":10,"timestampMs":1,"eventType":"plan_created","payload":{{"taskId":"{task}","createdAtMs":1,"steps":[{step}]}}}}"#,
+        task = task.id,
+        step = step_json,
+    ));
+
+    let created = fixture
+        .store
+        .read_task_plan(&fixture.session_id, &task.id)
+        .unwrap()
+        .expect("a plan was created");
+    assert_eq!(created.steps.len(), 1);
+    assert!(
+        created.steps[0].check.is_none(),
+        "{:?}",
+        created.steps[0].check
+    );
+
+    // An approval that carried the reviewed plan (spec 103) is current the same
+    // way a revision is; its pre-spec plan also names no check.
+    fixture.append_raw(&format!(
+        r#"{{"eventId":"evt_approved","seq":11,"timestampMs":1,"eventType":"plan_approved","payload":{{"taskId":"{task}","approvedBy":"user","plan":{{"taskId":"{task}","createdAtMs":1,"steps":[{step}]}}}}}}"#,
+        task = task.id,
+        step = step_json,
+    ));
+
+    let approved = fixture
+        .store
+        .read_task_plan(&fixture.session_id, &task.id)
+        .unwrap()
+        .expect("an approved plan replays");
+    assert_eq!(approved.steps.len(), 1);
+    assert!(
+        approved.steps[0].check.is_none(),
+        "{:?}",
+        approved.steps[0].check
+    );
 }
 
 #[test]

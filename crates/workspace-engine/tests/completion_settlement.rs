@@ -279,6 +279,7 @@ fn plan_with(task_id: &str, status: StepStatus) -> TaskPlan {
         started_at_ms: None,
         completed_at_ms: None,
         evidence: Vec::new(),
+        check: None,
     }];
     plan
 }

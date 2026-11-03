@@ -117,6 +117,7 @@ fn complete_plan() -> TaskPlan {
             path: "src/retry.rs".to_string(),
             hash: "sha256:abc".to_string(),
         }],
+        check: None,
     });
     plan
 }
@@ -1704,6 +1705,7 @@ fn verification_defers_a_planned_final_check_without_two_steps_in_progress() {
             started_at_ms: Some(1),
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         },
         PlanStep {
             id: "test".to_string(),
@@ -1714,6 +1716,7 @@ fn verification_defers_a_planned_final_check_without_two_steps_in_progress() {
             started_at_ms: None,
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         },
     ]);
     engine.session_store.create_plan(&task, &plan).unwrap();
@@ -3948,6 +3951,7 @@ fn open_plan(engine: &WorkspaceEngine, session_id: &str, task_id: &str, open: &[
             started_at_ms: None,
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         });
     }
     engine.session_store.create_plan(&task, &plan).unwrap();

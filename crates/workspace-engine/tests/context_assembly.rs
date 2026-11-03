@@ -1024,6 +1024,7 @@ fn a_carried_plan_becomes_a_plan_state_item() {
             started_at_ms: None,
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         },
         PlanStep {
             id: "2".to_string(),
@@ -1034,6 +1035,7 @@ fn a_carried_plan_becomes_a_plan_state_item() {
             started_at_ms: None,
             completed_at_ms: None,
             evidence: Vec::new(),
+            check: None,
         },
     ];
     engine.session_store.create_plan(&task, &plan).unwrap();
