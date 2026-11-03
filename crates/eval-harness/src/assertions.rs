@@ -356,6 +356,95 @@ pub fn evaluate(
             );
         }
 
+        // Spec 103 requirement 4: a budgetless worker keeps today's explicit
+        // round pause; an approved task budget crosses that same checkpoint
+        // internally, so this stays zero.
+        if let Some(expected) = asserts.round_budget_pauses {
+            let actual = run.round_budget_pauses;
+            push(
+                "round_budget_pauses",
+                actual == expected,
+                expected.to_string(),
+                actual.to_string(),
+            );
+        }
+
+        if let Some(expected) = asserts.segments_started {
+            push(
+                "segments_started",
+                run.segments_started == expected,
+                expected.to_string(),
+                run.segments_started.to_string(),
+            );
+        }
+
+        if let Some(expected) = asserts.segments_finished {
+            push(
+                "segments_finished",
+                run.segments_finished == expected,
+                expected.to_string(),
+                run.segments_finished.to_string(),
+            );
+        }
+
+        // Spec 103 Task 6: the typed stop, not only the status string. `none`
+        // is a real answer for a task that completed normally.
+        if let Some(expected) = &asserts.terminal_outcome_kind {
+            let actual = run
+                .terminal_outcome_kind
+                .as_deref()
+                .unwrap_or("none")
+                .to_string();
+            push(
+                "terminal_outcome_kind",
+                &actual == expected,
+                expected.clone(),
+                actual,
+            );
+        }
+
+        if let Some(expected) = &asserts.reloaded_terminal_outcome_kind {
+            let actual = run
+                .reloaded_terminal_outcome_kind
+                .as_deref()
+                .unwrap_or("none")
+                .to_string();
+            push(
+                "reloaded_terminal_outcome_kind",
+                &actual == expected,
+                expected.clone(),
+                actual,
+            );
+        }
+
+        if let Some(expected) = asserts.within_turn_compactions {
+            let actual = run.within_turn_compactions;
+            push(
+                "within_turn_compactions",
+                actual == expected,
+                expected.to_string(),
+                actual.to_string(),
+            );
+        }
+
+        if let Some(expected) = asserts.pinned_state_unchanged {
+            push(
+                "pinned_state_unchanged",
+                run.pinned_state_unchanged == expected,
+                expected.to_string(),
+                run.pinned_state_unchanged.to_string(),
+            );
+        }
+
+        if let Some(expected) = asserts.reread_after_compaction {
+            push(
+                "reread_after_compaction",
+                run.reread_after_compaction == expected,
+                expected.to_string(),
+                run.reread_after_compaction.to_string(),
+            );
+        }
+
         // Spec 23 Task 9: the report, not the task status alone. A scenario
         // naming an outcome is asserting that verification actually reached it,
         // and the passed-commands list is what separates "ran and exited zero"

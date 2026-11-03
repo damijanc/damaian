@@ -10,7 +10,7 @@ use eval_harness::record::{
 use eval_harness::report;
 use eval_harness::scenario::{self, Tier};
 use eval_harness::trace::{self, Trace};
-use workspace_engine::{ConfigOverlay, SecretScanner};
+use workspace_engine::{ConfigOverlay, SecretScanner, SessionStore};
 
 const FAKE_AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 
@@ -205,6 +205,72 @@ fn the_loader_accepts_exactly_the_valid_tier_and_provider_combinations() {
     ] {
         scenario::load(&write(&body)).expect_err(&format!("{label} must be refused"));
     }
+}
+
+#[test]
+fn the_loader_refuses_an_empty_or_unbounded_seed_repeat() {
+    let dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+    let base =
+        "name = \"a\"\nfixture = \"rust-workspace\"\ntier = \"deterministic\"\nprompt = \"p\"\n";
+
+    for repeat in ["0", "10001"] {
+        let path = dir.join(format!("seed-repeat-{repeat}.toml"));
+        std::fs::write(
+            &path,
+            format!(
+                "{base}[[seed_files]]\npath = \"data/blob.txt\"\ncontent = \"line\\n\"\nrepeat = {repeat}\n"
+            ),
+        )
+        .expect("write");
+        let error = scenario::load(&path).expect_err("repeat outside the bound must be refused");
+        assert!(
+            format!("{error:?}").contains("repeat"),
+            "the refusal should name the repeat value, got: {error:?}"
+        );
+    }
+
+    let path = dir.join("seed-repeat-one.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "{base}[[seed_files]]\npath = \"data/blob.txt\"\ncontent = \"line\\n\"\nrepeat = 1\n"
+        ),
+    )
+    .expect("write");
+    scenario::load(&path).expect("repeat = 1 is the historical shape");
+}
+
+#[test]
+fn a_worker_record_after_plan_review_needs_a_budgetless_approve() {
+    let dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+    let base =
+        "name = \"a\"\nfixture = \"rust-workspace\"\ntier = \"deterministic\"\nprompt = \"p\"\n";
+    for (label, extra) in [
+        (
+            "a worker created up front",
+            "worker_record = true\nworker_record_after_plan_review = true\nplan_decision = \"approve\"\n",
+        ),
+        (
+            "a budgeted review",
+            "worker_record_after_plan_review = true\nplan_decision = \"approve_budget\"\n",
+        ),
+        (
+            "no plan decision",
+            "worker_record_after_plan_review = true\n",
+        ),
+    ] {
+        let path = dir.join(format!("late-worker-{}.toml", label.replace(' ', "-")));
+        std::fs::write(&path, format!("{base}{extra}")).expect("write");
+        scenario::load(&path).expect_err(&format!("{label} must be refused"));
+    }
+
+    let path = dir.join("late-worker-valid.toml");
+    std::fs::write(
+        &path,
+        format!("{base}worker_record_after_plan_review = true\nplan_decision = \"approve\"\n"),
+    )
+    .expect("write");
+    scenario::load(&path).expect("a budgetless review followed by a worker record is valid");
 }
 
 #[test]
@@ -1334,12 +1400,13 @@ fn a_blocked_scenario_is_still_skipped_and_says_why() {
 }
 
 /// Guards the count in spec 18 §6, now that spec 17 has landed: every scenario
-/// runs and none is blocked. Fifty-two: spec 59 added `long_discovery` and
+/// runs and none is blocked. Sixty: spec 59 added `long_discovery` and
 /// `read_loop`, spec 62 added `approval_causes`, spec 50 added
 /// `answered_question`, spec 23 added `verified_repair` and
 /// `repair_limit_exhausted`, spec 66 added `plan_left_open`, spec 30 added
-/// seven memory-recall scenarios, and spec 102 added five verification
-/// provenance and stagnation scenarios.
+/// seven memory-recall scenarios, spec 102 added five verification
+/// provenance and stagnation scenarios, and spec 103 added eight bounded
+/// worker-continuation scenarios.
 #[test]
 fn every_scenario_runs_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
@@ -1356,10 +1423,11 @@ fn every_scenario_runs_and_none_is_blocked() {
     );
     assert_eq!(
         all.len(),
-        52,
-        "fifty-two scenarios should run: the two compaction scenarios, thirteen memory \
+        60,
+        "sixty scenarios should run: the two compaction scenarios, thirteen memory \
          scenarios (six consent, seven recall), three external-reference injection scenarios, \
-         the live injection twin, and five spec 102 verification scenarios"
+         the live injection twin, five spec 102 verification scenarios and eight spec 103 \
+         bounded worker-continuation scenarios"
     );
 }
 
@@ -1669,8 +1737,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        51,
-        "all fifty-one deterministic scenario files should be accounted for; the live \
+        59,
+        "all fifty-nine deterministic scenario files should be accounted for; the live \
          injection twin is credential-gated"
     );
     assert_eq!(
@@ -3389,4 +3457,164 @@ fn an_injected_instruction_is_quoted_data_and_never_a_system_instruction() {
         "the answer did not adopt the injection: {}",
         run.response
     );
+}
+
+/// Spec 103 acceptance 1: a scripted worker needing more than sixteen action
+/// rounds completes across at least three internal segments after one budget
+/// approval. The assertion block also pins that no generic Continue was
+/// recorded and that the engine wrote the durable segment pair.
+#[test]
+fn a_budgeted_worker_completes_across_three_segments() {
+    let (run, results) = run_and_evaluate("bounded_worker_three_segments");
+    assert_all_passed("bounded_worker_three_segments", &results);
+
+    assert_eq!(
+        run.record.tool_rounds, 21,
+        "the planning round plus twenty action rounds"
+    );
+    assert_eq!(
+        run.segments_started, 6,
+        "five boundaries leave six started records"
+    );
+    assert_eq!(
+        run.segments_finished, 5,
+        "one finished record per committed boundary"
+    );
+    assert_eq!(
+        run.record.continuations, 0,
+        "no generic Continue was needed"
+    );
+    assert!(
+        run.terminal_outcome_kind.is_none(),
+        "a completed task has no bounded terminal outcome"
+    );
+}
+
+/// Spec 103 acceptance 2: the same script without an approved budget pauses at
+/// the ordinary round boundary, writes no segment record, and does not report
+/// the bounded outcomes that only exist under a budget.
+#[test]
+fn a_budgetless_worker_keeps_the_ordinary_round_pause() {
+    let (run, results) = run_and_evaluate("bounded_worker_without_budget_pauses");
+    assert_all_passed("bounded_worker_without_budget_pauses", &results);
+
+    assert_eq!(run.round_budget_pauses, 1);
+    assert_eq!(run.segments_started, 0);
+    assert_eq!(run.segments_finished, 0);
+    assert_eq!(run.record.final_task_status, "waiting_for_approval");
+
+    // The resume is a genuine historical worker, not an inline task: the
+    // session carries a worker record and the task carries no approved budget.
+    let store = SessionStore::new(run.data_dir.clone());
+    let session = store
+        .list_sessions(None)
+        .expect("sessions should list")
+        .into_iter()
+        .next()
+        .expect("the run has a session");
+    assert!(
+        store
+            .worker_record(&session.id)
+            .expect("the worker record should read")
+            .is_some(),
+        "the resumed task must be a worker"
+    );
+    let tasks = store
+        .read_tasks(&session.id)
+        .expect("the tasks should read");
+    assert_eq!(tasks.len(), 1, "the pause is one task, not a restart");
+    for task in tasks {
+        assert_eq!(
+            store
+                .read_task_budget(&session.id, &task.id)
+                .expect("the task budget should read"),
+            None,
+            "a budgetless worker must have no durable TaskExecutionBudget"
+        );
+    }
+}
+
+/// Spec 103 acceptance 3: an approved task budget does not approve a command
+/// or a patch. The command runs only after its own decision, and the patch
+/// still waits for the user.
+#[test]
+fn a_budgeted_worker_still_asks_for_command_and_patch_approval() {
+    let (run, results) = run_and_evaluate("bounded_worker_command_and_patch_approvals");
+    assert_all_passed("bounded_worker_command_and_patch_approvals", &results);
+
+    assert_eq!(run.record.final_task_status, "waiting_for_approval");
+    assert!(
+        run.patch_proposal.is_some(),
+        "the patch is waiting for its own review"
+    );
+    assert!(
+        run.trace.count("stored_command_executed") > 0,
+        "the command ran after its own approval"
+    );
+    assert_eq!(run.trace.count("patch_applied"), 0);
+}
+
+/// Spec 103 acceptance 4 and requirement 7: a long read history is compacted
+/// before it crosses the request-window share, and the model can reread the
+/// path through the ordinary tool.
+#[test]
+fn a_long_read_is_compacted_and_can_be_reread() {
+    let (run, results) = run_and_evaluate("bounded_worker_long_read_reread");
+    assert_all_passed("bounded_worker_long_read_reread", &results);
+
+    assert_eq!(run.within_turn_compactions, 10);
+    assert!(run.pinned_state_unchanged);
+    assert!(
+        run.reread_after_compaction,
+        "the compacted read must be repeatable"
+    );
+}
+
+/// Spec 103 acceptance 5: every pinned part of the request is byte-identical
+/// before and after compaction. The harness compares the requests the mock
+/// adapter received, not the scenario script or the stored transcript.
+#[test]
+fn pinned_safety_state_survives_compaction_byte_for_byte() {
+    let (run, results) = run_and_evaluate("bounded_worker_pinned_safety_state");
+    assert_all_passed("bounded_worker_pinned_safety_state", &results);
+
+    assert_eq!(run.within_turn_compactions, 1);
+    assert!(
+        run.pinned_state_unchanged,
+        "the system, user, approved plan/budget and pinned results must not change"
+    );
+}
+
+/// Spec 103 acceptance 6: the three bounded stops are distinct non-success
+/// outcomes, and each survives a fresh engine and worker reload.
+#[test]
+fn the_three_bounded_stops_survive_a_fresh_engine() {
+    for (name, status, kind) in [
+        (
+            "bounded_worker_budget_exhausted_reload",
+            "task_budget_exhausted",
+            "approved_budget_exhausted",
+        ),
+        (
+            "bounded_worker_no_progress_reload",
+            "task_no_progress",
+            "no_progress",
+        ),
+        (
+            "bounded_worker_cannot_fit_reload",
+            "task_compaction_cannot_fit",
+            "compaction_cannot_fit",
+        ),
+    ] {
+        let (run, results) = run_and_evaluate(name);
+        assert_all_passed(name, &results);
+        assert_eq!(run.record.final_task_status, status, "{name}");
+        assert_eq!(run.terminal_outcome_kind.as_deref(), Some(kind), "{name}");
+        assert_eq!(
+            run.reloaded_terminal_outcome_kind.as_deref(),
+            Some(kind),
+            "{name}: the stop must survive a fresh engine"
+        );
+        assert_ne!(run.record.final_task_status, "complete", "{name}");
+    }
 }

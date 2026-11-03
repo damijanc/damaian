@@ -100,7 +100,22 @@ pub struct SeedMessage {
 pub struct SeedFile {
     pub path: String,
     pub content: String,
+    /// How many times `content` is written. A long-read scenario needs a file
+    /// far larger than the request window, and spelling tens of kilobytes into
+    /// the scenario would make the scenario harder to read than the behaviour
+    /// it measures. One is the historical shape and the default.
+    #[serde(default = "default_seed_file_repeat")]
+    pub repeat: u32,
 }
+
+fn default_seed_file_repeat() -> u32 {
+    1
+}
+
+/// A repeat factor is a convenience for a long-read fixture, not an unbounded
+/// allocation knob. The largest scenario uses 500; this leaves ample headroom
+/// while refusing a typo that would try to write gigabytes.
+const MAX_SEED_FILE_REPEAT: u32 = 10_000;
 
 /// One confirmed memory entry written into the run's store before the turn
 /// starts (spec 30 Task 6).
@@ -198,6 +213,35 @@ pub struct Asserts {
     /// is a measurement of the run; an exact count is script-dependent in the
     /// deterministic tier and therefore `deterministic_only`.
     pub exploration_rounds: Option<u64>,
+    /// How many round-budget pauses the run reached (spec 61, spec 103
+    /// requirement 4). One for a budgetless worker at the ordinary segment
+    /// limit; zero when an approved task budget crossed that limit internally.
+    pub round_budget_pauses: Option<u64>,
+    /// Durable `segment_started` records for the run's task (spec 103 Task 5).
+    /// An exact count: the script and its approved budget are fixed, so a
+    /// different number means the engine crossed a different boundary.
+    pub segments_started: Option<u64>,
+    /// Durable `segment_finished` records for the run's task. One fewer than
+    /// the started records while the last segment stays open.
+    pub segments_finished: Option<u64>,
+    /// The engine-owned terminal outcome kind, or `none` when the task did not
+    /// stop on a bounded outcome (spec 103 Task 6).
+    pub terminal_outcome_kind: Option<String>,
+    /// The same kind read back from a fresh engine after the run. A bounded stop
+    /// that only exists in the process's memory would read `none` here.
+    pub reloaded_terminal_outcome_kind: Option<String>,
+    /// How many durable within-turn compaction attempts the run recorded
+    /// (spec 103 Task 4). Counted, not boolean, so a run that compacted twice
+    /// is distinguishable from one that never crossed the threshold.
+    pub within_turn_compactions: Option<u64>,
+    /// That every safety-pinned message and pinned tool result was byte-identical
+    /// in the request before and after a compaction, and that at least one
+    /// compaction happened. The harness compares the requests the mock adapter
+    /// actually received (spec 103 Task 4).
+    pub pinned_state_unchanged: Option<bool>,
+    /// That a path whose read was compacted was read again later in the same
+    /// turn (spec 103 requirement 7).
+    pub reread_after_compaction: Option<bool>,
     /// Exactly how many `turn_notes` calls the run dispatched (spec 65 §5.9).
     pub notes_calls: Option<u64>,
     /// That at least this many notes were carried from an earlier turn into a
@@ -363,6 +407,20 @@ pub enum RoundBudgetDecision {
     AnswerNow,
 }
 
+/// How a scenario answers a worker's plan review (spec 103).
+///
+/// `Approve` is the pre-budget decision: the plan is approved, the task keeps
+/// the ordinary round budget. `ApproveBudget` approves the same plan with a
+/// task execution budget, which is what lets the engine cross segment
+/// boundaries internally. A scenario that does not declare one never answers a
+/// plan review, exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanDecision {
+    Approve,
+    ApproveBudget,
+}
+
 #[derive(Debug, Clone)]
 pub struct Scenario {
     pub name: String,
@@ -371,6 +429,24 @@ pub struct Scenario {
     pub prompt: String,
     pub provider: Option<String>,
     pub blocked_on: Option<String>,
+    /// Create a genuine worker session before the first ask, so a plan review
+    /// offers the engine's task-budget proposal (spec 103 Task 2).
+    pub worker_record: bool,
+    /// Turn the session into a worker *after* a budgetless plan review was
+    /// produced but before it is approved. This is the faithful construction of
+    /// a historical, budgetless worker: the review it is answering was created
+    /// without a budget offer, and the resumed task has a durable worker record
+    /// but no `TaskExecutionBudget` (spec 103 requirement 4).
+    pub worker_record_after_plan_review: bool,
+    /// Answer the worker's plan review, if the script produces one.
+    pub plan_decision: Option<PlanDecision>,
+    /// The mock provider's resolved context window. The deterministic tier has
+    /// no real provider, so a within-turn compaction scenario has to declare
+    /// the window whose share it wants to cross (spec 103 Task 4).
+    pub context_window: Option<u32>,
+    /// Reopen the store with a fresh engine after the run and read the task's
+    /// terminal outcome (spec 103 Task 6).
+    pub reload_outcome: bool,
     /// A path and replacement content the runner writes *after* the patch is
     /// proposed and before it is applied. The only way to create the `base_hash`
     /// conflict §5.4 asserts, since the conflict is defined by the file changing
@@ -468,6 +544,16 @@ struct RawScenario {
     prompt: String,
     provider: Option<String>,
     blocked_on: Option<String>,
+    #[serde(default)]
+    worker_record: bool,
+    #[serde(default)]
+    worker_record_after_plan_review: bool,
+    #[serde(default)]
+    plan_decision: Option<PlanDecision>,
+    #[serde(default)]
+    context_window: Option<u32>,
+    #[serde(default)]
+    reload_outcome: bool,
     #[serde(default)]
     modify_after_proposal: Option<ModifyAfterProposal>,
     #[serde(default)]
@@ -621,8 +707,8 @@ pub fn load(path: &Path) -> Result<Scenario> {
         .map_err(|error| ClientError::InvalidInput(format!("{}: {error}", path.display())))?;
 
     let tier = Tier::parse(&raw.tier)?;
-    if tier == Tier::Deterministic
-        && let Some(provider) = raw.provider.as_deref()
+    if let Some(provider) = raw.provider.as_deref()
+        && tier == Tier::Deterministic
         && provider != "mock"
     {
         return Err(ClientError::InvalidInput(format!(
@@ -630,6 +716,52 @@ pub fn load(path: &Path) -> Result<Scenario> {
              deterministic tier must not reach the network",
             path.display()
         )));
+    }
+    if raw.context_window == Some(0) {
+        return Err(ClientError::InvalidInput(format!(
+            "{}: context_window must be greater than zero",
+            path.display()
+        )));
+    }
+    if raw.plan_decision == Some(PlanDecision::ApproveBudget) && !raw.worker_record {
+        return Err(ClientError::InvalidInput(format!(
+            "{}: approve_budget needs worker_record = true; only a genuine worker review \
+             offers a task budget",
+            path.display()
+        )));
+    }
+    if raw.worker_record_after_plan_review {
+        if raw.worker_record {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: worker_record_after_plan_review and worker_record are mutually exclusive; \
+                 the review is budgetless only when the session is not a worker yet",
+                path.display()
+            )));
+        }
+        if raw.plan_decision != Some(PlanDecision::Approve) {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: worker_record_after_plan_review needs plan_decision = \"approve\"; a \
+                 budgeted review must be created by a genuine worker",
+                path.display()
+            )));
+        }
+    }
+    for file in &raw.seed_files {
+        if file.repeat == 0 {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: seed file {} has repeat = 0; it would write nothing",
+                path.display(),
+                file.path
+            )));
+        }
+        if file.repeat > MAX_SEED_FILE_REPEAT {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: seed file {} repeat = {} exceeds the {MAX_SEED_FILE_REPEAT} limit",
+                path.display(),
+                file.path,
+                file.repeat
+            )));
+        }
     }
 
     let mut turns = Vec::with_capacity(raw.turns.len());
@@ -708,6 +840,11 @@ pub fn load(path: &Path) -> Result<Scenario> {
         prompt: raw.prompt,
         provider: raw.provider,
         blocked_on: raw.blocked_on,
+        worker_record: raw.worker_record,
+        worker_record_after_plan_review: raw.worker_record_after_plan_review,
+        plan_decision: raw.plan_decision,
+        context_window: raw.context_window,
+        reload_outcome: raw.reload_outcome,
         modify_after_proposal: raw
             .modify_after_proposal
             .map(|change| (change.path, change.content)),

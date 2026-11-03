@@ -1,0 +1,49 @@
+name = "bounded_worker_pinned_safety_state"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Do the two steps and then answer."
+context_window = 40000
+
+# Spec 103 acceptance 5 and requirement 8: system instructions, the user
+# request and an unresolved result stay byte-identical when an eligible read is
+# compacted around them. The missing read cannot be compacted at all, so it is
+# the pinned result the harness compares; it must never be dropped or turned
+# into data the model could treat as an instruction.
+config_overlay = """
+agent_max_tool_rounds=8
+agent_max_exploration_rounds=24
+"""
+
+[[seed_files]]
+path = "data/blob.txt"
+repeat = 500
+content = "The upload client rejects an empty payload and reports the error to its caller.\n"
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "data/missing.txt" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "data/blob.txt" } },
+]
+
+[[turn]]
+content = "The notes describe an upload client that rejects an empty payload."
+
+[assert]
+continuations = 0
+task_count = 1
+final_task_status = "complete"
+within_turn_compactions = 1
+pinned_state_unchanged = true
+deterministic_only = [
+  "continuations",
+  "task_count",
+  "final_task_status",
+  "within_turn_compactions",
+  "pinned_state_unchanged",
+]

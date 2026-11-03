@@ -1,0 +1,42 @@
+name = "bounded_worker_cannot_fit_reload"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Do it."
+worker_record = true
+context_window = 100
+reload_outcome = true
+
+# Spec 103 acceptance 6 and requirement 10: the fixed request overhead alone
+# exceeds the configured window share, so no partially reduced request is sent.
+# This is a genuine worker with no approved task budget, so it cannot take the
+# unapproved segment route either. The task settles compaction_cannot_fit and a
+# fresh engine reads the same outcome after the run.
+config_overlay = """
+agent_max_tool_rounds=2
+agent_max_exploration_rounds=4
+"""
+
+[[turn]]
+content = "This response must never be requested."
+
+[assert]
+continuations = 0
+task_count = 1
+final_task_status = "task_compaction_cannot_fit"
+round_budget_pauses = 0
+segments_started = 0
+segments_finished = 0
+model_calls_at_most = 0
+terminal_outcome_kind = "compaction_cannot_fit"
+reloaded_terminal_outcome_kind = "compaction_cannot_fit"
+deterministic_only = [
+  "continuations",
+  "task_count",
+  "final_task_status",
+  "round_budget_pauses",
+  "segments_started",
+  "segments_finished",
+  "model_calls_at_most",
+  "terminal_outcome_kind",
+  "reloaded_terminal_outcome_kind",
+]

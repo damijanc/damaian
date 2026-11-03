@@ -46,7 +46,10 @@ API keys under your control.
 - **Command approval.** Read-only commands run on their own; everything else
   shows the full command and waits for you. Docker commands always ask.
 - **Long turns.** **Stop** (or `Escape`) ends a turn; one that runs out of tool
-  rounds pauses on **Continue — N more** or **Answer now**.
+  rounds pauses on **Continue — N more** or **Answer now**. A worker with an
+  approved task budget crosses those checkpoints on its own, compacts older read
+  results when the next request would fill the context window, and stops with a
+  typed outcome when the budget, the window or progress runs out.
 - **Cost.** Each reply shows tokens, model calls, prompt-cache hit rate and a
   cost at your own rates; `agent_max_task_tokens` caps one turn.
 - **Provider fallback.** If your provider refuses a turn, Damaian can offer a
@@ -61,7 +64,9 @@ API keys under your control.
 - **The repo bar** above the prompt shows branch, change count and a **Fix**
   action when a check found errors.
 - **Worker sessions** (opt-in) run handed-off tasks in their own Git worktree,
-  tracked on each project's **Workers** board.
+  tracked on each project's **Workers** board. A reviewed task budget lets a
+  worker cross internal round checkpoints without repeated **Continue**, while
+  every patch, command and check still needs its own decision.
 - **Hand-offs:** open the folder in VS Code, Finder or the built-in terminal;
   connect MCP servers; script it with the `damaian` CLI, built from source (see
   [Development](docs/DEVELOPMENT.md#cli)).

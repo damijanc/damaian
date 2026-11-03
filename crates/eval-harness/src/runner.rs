@@ -8,8 +8,9 @@ use workspace_engine::{
     MemoryStore, MemoryStoreConfig, MemoryTarget, MockModelAdapter, ModelAdapter,
     ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, PatchApplyOutcome, ProcessRegistry,
     ProjectIdentity, ProjectKeySource, ProposalOrigin, Result, RoundBudgetDecision, SecretScanner,
-    SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink, UsageSource,
-    UserConfirmation, VerificationEvent, VerificationReport, WorkspaceEngine, classify_session,
+    SessionStore, Task, TaskExecutionBudget, TaskStatus, TaskTerminalOutcome, ToolCall,
+    TurnProgress, TurnSink, UsageSource, UserConfirmation, VerificationEvent, VerificationReport,
+    WithinTurnCompactionAttemptOutcome, WorkerRecord, WorkspaceEngine, classify_session,
     evidence_ref_for, resume,
 };
 
@@ -19,8 +20,8 @@ use crate::record::{
     RecordedRecovery, RunRecord, Tokens,
 };
 use crate::scenario::{
-    CrashMidAction, RoundBudgetDecision as ScenarioRoundBudgetDecision, STUB_BASE_PLACEHOLDER,
-    Scenario, Tier,
+    CrashMidAction, PlanDecision, RoundBudgetDecision as ScenarioRoundBudgetDecision,
+    STUB_BASE_PLACEHOLDER, Scenario, Tier,
 };
 use crate::stub::StubServer;
 use crate::trace::{self, Trace};
@@ -84,6 +85,24 @@ pub struct Run {
     /// (spec 51 Task 9). Captured before the server is dropped, because the
     /// count is a measurement of the run rather than of a live listener.
     pub stub_requests: u64,
+    /// How many ordinary round-budget pauses the turn reached. Zero for a
+    /// worker whose approved task budget crossed the boundary internally.
+    pub round_budget_pauses: u64,
+    /// Durable segment records for the run's task (spec 103 Task 5).
+    pub segments_started: u64,
+    pub segments_finished: u64,
+    /// The engine-owned terminal outcome kind, when the task stopped on one.
+    pub terminal_outcome_kind: Option<String>,
+    /// The same kind read back from a fresh engine after the run.
+    pub reloaded_terminal_outcome_kind: Option<String>,
+    /// Durable within-turn compaction attempts (spec 103 Task 4).
+    pub within_turn_compactions: u64,
+    /// Whether every safety-pinned message and pinned result survived a
+    /// compaction byte-for-byte. `false` when no compaction happened, because a
+    /// vacuous pass would measure nothing.
+    pub pinned_state_unchanged: bool,
+    /// Whether a path whose read was compacted was read again later.
+    pub reread_after_compaction: bool,
     /// The first model request's message contents, joined (spec 30 Task 6).
     /// Only the deterministic tier can supply it: the mock adapter records its
     /// requests. This is the rendered context the model actually received, so
@@ -255,7 +274,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
                 ))
             })?;
         }
-        std::fs::write(&path, &file.content).map_err(|error| {
+        std::fs::write(&path, file.content.repeat(file.repeat as usize)).map_err(|error| {
             workspace_engine::ClientError::Io(format!("{}: seed file: {error}", path.display()))
         })?;
     }
@@ -264,7 +283,9 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     pre_approve_stub(&mut config, stub.as_ref());
     config.model_provider = "mock".to_string();
     config.model_name = "mock".to_string();
-    config.model_providers.push(mock_provider());
+    let mut provider = mock_provider();
+    provider.context_window = scenario.context_window;
+    config.model_providers.push(provider);
     let scanner = SecretScanner::new(config.secret_patterns.clone());
     let mut engine = WorkspaceEngine::new(config);
     // The stub page server binds 127.0.0.1. This is the harness's own
@@ -296,6 +317,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     run.continuation_request = continuation_request(&run.trace, &adapter.requests);
     run.answer_request = answer_request(&run.trace, &adapter.requests);
     (run.compacted_request, run.compacted_system_prompt) = compacted_requests(&adapter.requests);
+    run.pinned_state_unchanged = pinned_state_survived(&run.trace, &adapter.requests);
     run.request = adapter.requests.first().map(flattened_request);
     run.system_prompt = adapter
         .requests
@@ -441,6 +463,117 @@ fn flattened_request(request: &ModelRequest) -> String {
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Whether every safety-pinned part of a compacted request is byte-identical to
+/// the request before it.
+///
+/// The audit event is written before the request after it is prepared, so the
+/// number of `model_request_prepared` events before the compaction names the
+/// compacted request. The post-compaction request must contain the complete
+/// pre-request prefix: every message keeps its role, `tool_call_id`,
+/// `tool_calls` and `reasoning_content`; every non-tool message is byte-identical;
+/// every tool result the attempt's own manifests do not name is byte-identical;
+/// and a compacted result may change only its content. A dropped, reordered or
+/// renamed pinned message therefore fails. `false` when no compaction happened:
+/// a vacuous pass would report safety evidence for a run that never exercised
+/// the path.
+fn pinned_state_survived(trace: &Trace, requests: &[ModelRequest]) -> bool {
+    let mut saw_compaction = false;
+    for (position, event) in trace.events.iter().enumerate() {
+        if event.event_type != "within_turn_compaction"
+            || event.field("outcome") != Some("compacted")
+        {
+            continue;
+        }
+        let index = trace.events[..position]
+            .iter()
+            .filter(|event| event.event_type == "model_request_prepared")
+            .count();
+        let Some(before) = index.checked_sub(1).and_then(|index| requests.get(index)) else {
+            continue;
+        };
+        let Some(after) = requests.get(index) else {
+            continue;
+        };
+        if after.messages.len() < before.messages.len() {
+            return false;
+        }
+
+        let compacted: BTreeSet<String> = event
+            .field("manifests")
+            .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(text).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|fact| {
+                fact.get("callId")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+
+        for (left, right) in before.messages.iter().zip(after.messages.iter()) {
+            if left.role != right.role
+                || left.tool_call_id != right.tool_call_id
+                || left.tool_calls != right.tool_calls
+                || left.reasoning_content != right.reasoning_content
+            {
+                return false;
+            }
+            let was_compacted = left.role == "tool"
+                && left
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| compacted.contains(id));
+            // Only a body the manifests name may differ, and only in content,
+            // which the full comparison below no longer covers.
+            if !was_compacted && left != right {
+                return false;
+            }
+        }
+        saw_compaction = true;
+    }
+    saw_compaction
+}
+
+/// Whether a read of a path happened *after* that path was compacted.
+///
+/// The audit trace is ordered, so a `file_read` for a path after the earliest
+/// `within_turn_compaction` fact naming that path is a genuine reread. Counting
+/// occurrences alone would also accept a duplicate read that happened before the
+/// first compaction.
+fn reread_after_compaction(trace: &Trace) -> bool {
+    let mut compacted_paths: BTreeSet<String> = BTreeSet::new();
+    for event in &trace.events {
+        match event.event_type.as_str() {
+            "within_turn_compaction" if event.field("outcome") == Some("compacted") => {
+                let facts: Vec<serde_json::Value> = event
+                    .field("manifests")
+                    .and_then(|text| serde_json::from_str(text).ok())
+                    .unwrap_or_default();
+                for fact in facts {
+                    let Some(identity) = fact.get("identity") else {
+                        continue;
+                    };
+                    if identity.get("kind").and_then(|kind| kind.as_str()) != Some("path") {
+                        continue;
+                    }
+                    if let Some(value) = identity.get("value").and_then(|value| value.as_str()) {
+                        compacted_paths.insert(value.to_string());
+                    }
+                }
+            }
+            "file_read" => {
+                if let Some(reference) = event.field("resourcePath")
+                    && compacted_paths.contains(reference)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The live tier: the same scenario files against a real provider, **ignoring
@@ -605,6 +738,14 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
         conversation_compactions: 0,
         compaction_facts_only: false,
         stub_requests: 0,
+        round_budget_pauses: 0,
+        segments_started: 0,
+        segments_finished: 0,
+        terminal_outcome_kind: None,
+        reloaded_terminal_outcome_kind: None,
+        within_turn_compactions: 0,
+        pinned_state_unchanged: false,
+        reread_after_compaction: false,
         request: None,
         system_prompt: None,
         trace: Trace::default(),
@@ -940,6 +1081,23 @@ fn content_terms(text: &str) -> BTreeSet<String> {
     terms
 }
 
+/// The durable worker record a scenario uses to make its session genuine. The
+/// Git fields describe the fixture checkout, not a real worktree, because the
+/// harness only needs the engine's worker proof.
+fn worker_record_for(materialized: &Materialized) -> WorkerRecord {
+    WorkerRecord {
+        parent_session_id: None,
+        parent_task_id: None,
+        inherited_protected_paths: Vec::new(),
+        source_repository: materialized.root.clone(),
+        worktree_path: materialized.root.clone(),
+        branch: "main".to_string(),
+        base_commit: "0000000".to_string(),
+        included_uncommitted: false,
+        git_commands: Vec::new(),
+    }
+}
+
 /// Drives one turn and builds its record. Shared by both tiers so there is one
 /// implementation of "what a run record means" rather than two that drift.
 #[allow(clippy::too_many_arguments)]
@@ -976,6 +1134,8 @@ fn drive(
     let seeded_session = if !scenario.seed_conversation.is_empty()
         || scenario.compact_before_prompt
         || scenario.mode.is_some()
+        || scenario.worker_record
+        || scenario.plan_decision.is_some()
     {
         let repository_id = engine
             .indexer
@@ -984,6 +1144,11 @@ fn drive(
         let session = engine
             .session_store
             .create_session(&repository_id, &scenario.prompt)?;
+        if scenario.worker_record {
+            engine
+                .session_store
+                .record_worker_spawned(&session.id, &worker_record_for(materialized))?;
+        }
         if let Some(mode) = scenario.mode {
             engine
                 .session_store
@@ -1030,10 +1195,94 @@ fn drive(
 
     // Captured before any resume: the resumed turn does not carry the proposal
     // that stopped the original one, and `approval_required` asserts on it.
-    let original_command_proposal = outcome
+    let mut original_command_proposal = outcome
         .as_ref()
         .ok()
         .and_then(|result| result.command_proposal.clone());
+
+    // Spec 103 Task 2: a scripted worker pauses on its plan review. Answering
+    // it with the reviewed budget is what authorises later automatic segments;
+    // answering it without one keeps the ordinary round boundary. The plan
+    // review is a real decision, so a scenario that declares one and produces
+    // no review is a broken script, not a skipped step.
+    let mut outcome = outcome;
+    if let Some(decision) = scenario.plan_decision {
+        let proposal = outcome
+            .as_ref()
+            .ok()
+            .and_then(|result| result.plan_proposal.clone())
+            .ok_or_else(|| {
+                ClientError::InvalidInput(format!(
+                    "{}: plan_decision is set but the turn proposed no plan to review (ended {})",
+                    scenario.name,
+                    match &outcome {
+                        Ok(result) => format!("{:?}", result.task.status),
+                        Err(error) => format!("{error:?}"),
+                    }
+                ))
+            })?;
+        // Spec 103 requirement 4's historical worker: the review was produced
+        // by an inline session, so it carries no budget offer. Recording the
+        // worker afterwards makes the resumed task a genuine worker with no
+        // durable TaskExecutionBudget, exactly the state a worker created before
+        // budgets existed resumes from.
+        if scenario.worker_record_after_plan_review {
+            if proposal.budget_review.is_some() {
+                return Err(ClientError::InvalidInput(format!(
+                    "{}: worker_record_after_plan_review needs a budgetless review",
+                    scenario.name
+                )));
+            }
+            let session_id = outcome
+                .as_ref()
+                .ok()
+                .map(|result| result.session.id.clone())
+                .expect("an outcome that produced a review has a session");
+            engine
+                .session_store
+                .record_worker_spawned(&session_id, &worker_record_for(materialized))?;
+        }
+        let budget: Option<TaskExecutionBudget> = match decision {
+            PlanDecision::Approve => None,
+            PlanDecision::ApproveBudget => Some(
+                proposal
+                    .budget_review
+                    .as_ref()
+                    .map(|review| review.budget)
+                    .ok_or_else(|| {
+                        ClientError::InvalidInput(format!(
+                            "{}: approve_budget needs a worker plan review offering a budget",
+                            scenario.name
+                        ))
+                    })?,
+            ),
+        };
+        let cancel = CancelToken::new();
+        let mut on_resume_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_resume_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        outcome = engine
+            .chat_orchestrator
+            .resume_after_plan_decision_with_budget(
+                &proposal.id,
+                true,
+                None,
+                budget.as_ref(),
+                "eval-harness",
+                adapter,
+                &mut sink,
+            );
+        if let Ok(result) = &outcome
+            && let Some(proposal) = &result.command_proposal
+        {
+            original_command_proposal = Some(proposal.clone());
+        }
+    }
 
     // Captured here for the same reason the proposal is: both are consumed by
     // the status match below. A resumed turn re-reads the same task, so its
@@ -1621,6 +1870,66 @@ fn drive(
             })
     });
 
+    // Spec 103 Task 6: read the durable facts before the match consumes the
+    // outcome. These are what the bounded-stop assertions and the fresh-engine
+    // reload compare, and none of them is inferred from the script.
+    let run_session_id = outcome
+        .as_ref()
+        .ok()
+        .map(|result| result.session.id.clone());
+    let run_task_id = outcome.as_ref().ok().map(|result| result.task.id.clone());
+    // Durable audit fact, not the terminal proposal: a pause that was later
+    // resumed no longer appears on the final result but still happened.
+    let round_budget_pauses = trace.count("round_budget_paused");
+    let terminal_outcome: Option<TaskTerminalOutcome> = outcome
+        .as_ref()
+        .ok()
+        .and_then(|result| result.task_control.terminal_outcome.clone());
+    let (segments_started, segments_finished) = match (&run_session_id, &run_task_id) {
+        (Some(session_id), Some(task_id)) => {
+            let segments = engine
+                .session_store
+                .read_task_segments(session_id, task_id)?;
+            (
+                segments.iter().filter(|event| event.is_started()).count() as u64,
+                segments.iter().filter(|event| event.is_finished()).count() as u64,
+            )
+        }
+        _ => (0, 0),
+    };
+    let compaction_attempts = match &run_session_id {
+        Some(session_id) => engine
+            .session_store
+            .read_within_turn_compaction_attempts(session_id)
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let within_turn_compactions = compaction_attempts
+        .iter()
+        .filter(|attempt| attempt.outcome == WithinTurnCompactionAttemptOutcome::Compacted)
+        .count() as u64;
+    let reloaded_terminal_outcome_kind = if scenario.reload_outcome {
+        match (&run_session_id, &run_task_id) {
+            (Some(session_id), Some(task_id)) => {
+                let fresh = WorkspaceEngine::new(Config {
+                    data_dir: engine.config.data_dir.clone(),
+                    enable_index_watcher: false,
+                    ..engine.config.clone()
+                });
+                fresh
+                    .session_store
+                    .read_task_outcome(session_id, task_id)
+                    .ok()
+                    .flatten()
+                    .map(|outcome| outcome.kind.as_str().to_string())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let reread_after_compaction = reread_after_compaction(&trace);
+
     let (final_status, response, context_files, command_proposal, patch_proposal) = match outcome {
         Ok(result) => (
             if result.cancelled {
@@ -1743,6 +2052,16 @@ fn drive(
         conversation_compactions,
         compaction_facts_only,
         stub_requests: 0,
+        round_budget_pauses,
+        segments_started,
+        segments_finished,
+        terminal_outcome_kind: terminal_outcome
+            .as_ref()
+            .map(|outcome| outcome.kind.as_str().to_string()),
+        reloaded_terminal_outcome_kind,
+        within_turn_compactions,
+        pinned_state_unchanged: false,
+        reread_after_compaction,
         request: None,
         system_prompt: None,
         trace,
@@ -1903,8 +2222,191 @@ fn now_millis() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::baseline_approved;
+    use super::{baseline_approved, pinned_state_survived, reread_after_compaction};
     use crate::scenario::{self, CheckDecision};
+    use crate::trace::{Event, Trace};
+    use workspace_engine::{ModelMessage, ModelRequest, ToolCall};
+
+    fn request(messages: Vec<ModelMessage>) -> ModelRequest {
+        ModelRequest {
+            provider: "mock".to_string(),
+            model: "mock".to_string(),
+            messages,
+            temperature: Some("0".to_string()),
+            reasoning_level: Some("none".to_string()),
+            stream: true,
+            tools: None,
+            max_tokens: Some(64),
+            request_usage: true,
+            emit_cache_breakpoints: false,
+        }
+    }
+
+    fn prepared() -> Event {
+        Event {
+            event_type: "model_request_prepared".to_string(),
+            fields: serde_json::Map::new(),
+        }
+    }
+
+    fn compaction(compacted_call_ids: &[&str]) -> Event {
+        let manifests = compacted_call_ids
+            .iter()
+            .map(|id| serde_json::json!({ "callId": id }))
+            .collect::<Vec<_>>();
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "outcome".to_string(),
+            serde_json::Value::String("compacted".to_string()),
+        );
+        fields.insert(
+            "manifests".to_string(),
+            serde_json::Value::String(serde_json::to_string(&manifests).unwrap()),
+        );
+        Event {
+            event_type: "within_turn_compaction".to_string(),
+            fields,
+        }
+    }
+
+    fn file_read(path: &str) -> Event {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "resourcePath".to_string(),
+            serde_json::Value::String(path.to_string()),
+        );
+        Event {
+            event_type: "file_read".to_string(),
+            fields,
+        }
+    }
+
+    fn compaction_of_path(path: &str) -> Event {
+        let manifests = vec![serde_json::json!({
+            "callId": "c1",
+            "identity": { "kind": "path", "value": path },
+        })];
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "outcome".to_string(),
+            serde_json::Value::String("compacted".to_string()),
+        );
+        fields.insert(
+            "manifests".to_string(),
+            serde_json::Value::String(serde_json::to_string(&manifests).unwrap()),
+        );
+        Event {
+            event_type: "within_turn_compaction".to_string(),
+            fields,
+        }
+    }
+
+    #[test]
+    fn a_read_before_the_compaction_is_not_a_reread() {
+        let trace = Trace {
+            events: vec![
+                file_read("data/blob0.txt"),
+                compaction_of_path("data/blob0.txt"),
+            ],
+        };
+        assert!(!reread_after_compaction(&trace));
+    }
+
+    #[test]
+    fn a_read_after_the_compaction_is_a_reread() {
+        let trace = Trace {
+            events: vec![
+                compaction_of_path("data/blob0.txt"),
+                file_read("data/blob0.txt"),
+            ],
+        };
+        assert!(reread_after_compaction(&trace));
+    }
+
+    fn calls(ids: &[&str]) -> ModelMessage {
+        ModelMessage::assistant_with_tool_calls(
+            "",
+            ids.iter()
+                .map(|id| ToolCall {
+                    id: (*id).to_string(),
+                    name: "read_file".to_string(),
+                    arguments_json: "{}".to_string(),
+                })
+                .collect(),
+            Some("reasoning".to_string()),
+        )
+    }
+
+    fn messages() -> Vec<ModelMessage> {
+        vec![
+            ModelMessage::system("SYSTEM"),
+            ModelMessage::user("USER"),
+            calls(&["c1", "c2"]),
+            ModelMessage::tool("c1", "OLD BODY"),
+            ModelMessage::tool("c2", "PINNED BODY"),
+            ModelMessage::assistant("DONE"),
+        ]
+    }
+
+    fn survived(before: Vec<ModelMessage>, after: Vec<ModelMessage>) -> bool {
+        let trace = Trace {
+            events: vec![prepared(), compaction(&["c1"])],
+        };
+        pinned_state_survived(&trace, &[request(before), request(after)])
+    }
+
+    #[test]
+    fn a_compacted_body_may_change_only_its_content() {
+        let mut after = messages();
+        after[3].content = "{\"manifestVersion\":1}".to_string();
+        assert!(survived(messages(), after));
+    }
+
+    #[test]
+    fn a_dropped_pinned_tail_fails() {
+        let mut after = messages();
+        after.pop();
+        assert!(!survived(messages(), after));
+    }
+
+    #[test]
+    fn a_changed_tool_result_id_fails() {
+        let mut after = messages();
+        after[4].tool_call_id = Some("renamed".to_string());
+        assert!(!survived(messages(), after));
+    }
+
+    #[test]
+    fn a_changed_assistant_tool_call_fails() {
+        let mut after = messages();
+        after[2].tool_calls[0].arguments_json = "{\"path\":\"other\"}".to_string();
+        assert!(!survived(messages(), after));
+    }
+
+    #[test]
+    fn changed_assistant_reasoning_fails() {
+        let mut after = messages();
+        after[2].reasoning_content = Some("different".to_string());
+        assert!(!survived(messages(), after));
+    }
+
+    #[test]
+    fn a_modified_pinned_result_fails() {
+        let mut after = messages();
+        after[4].content = "CHANGED".to_string();
+        assert!(!survived(messages(), after));
+    }
+
+    #[test]
+    fn a_run_without_a_compaction_is_not_a_pass() {
+        let trace = Trace {
+            events: vec![prepared()],
+        };
+        assert!(!pinned_state_survived(
+            &trace,
+            &[request(messages()), request(messages())]
+        ));
+    }
 
     /// A declined baseline is `unknown_provenance` and starts no repair (spec
     /// 102 Task 3), so the harness must approve the baselines whose checks the

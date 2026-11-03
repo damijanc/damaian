@@ -1,0 +1,67 @@
+name = "bounded_worker_command_and_patch_approvals"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Change the upload constant, then add the retry module."
+worker_record = true
+plan_decision = "approve_budget"
+approval_decision = true
+
+# Spec 103 acceptance 3 and requirement 3: an approved task budget authorises
+# segment boundaries only. The command still pauses for its own decision, and
+# after that approval the patch still pauses for its own review.
+config_overlay = """
+agent_max_tool_rounds=8
+agent_max_exploration_rounds=24
+worker_task_budget_action_rounds=10
+worker_task_budget_exploration_rounds=24
+"""
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_plan", arguments = { steps = [ { title = "Change the upload constant" }, { title = "Add the retry module" } ] } },
+]
+
+# The first run_command is the deferred mutating action that raises the
+# plan-review gate; it is dropped without a proposal or an execution. The second
+# is the real post-approval command the user decides on with `approval_decision`.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "sed -i '' 's/1/2/' src/upload.rs", reason = "Bump the upload constant." } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "sed -i '' 's/1/2/' src/upload.rs", reason = "Bump the upload constant." } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Add src/retry.rs", files = [ { path = "src/retry.rs", content = "pub fn added() {}\n" } ] } },
+]
+
+[[turn]]
+content = "Both changes are ready."
+
+[assert]
+continuations = 0
+task_count = 1
+final_task_status = "waiting_for_approval"
+round_budget_pauses = 0
+command_executed = true
+patch_applied = false
+approval_required = true
+terminal_outcome_kind = "none"
+deterministic_only = [
+  "continuations",
+  "task_count",
+  "final_task_status",
+  "round_budget_pauses",
+  "command_executed",
+  "patch_applied",
+  "approval_required",
+  "terminal_outcome_kind",
+]

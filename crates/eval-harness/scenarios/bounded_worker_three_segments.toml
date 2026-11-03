@@ -1,0 +1,184 @@
+name = "bounded_worker_three_segments"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Implement retry handling across the crate, one bounded step at a time."
+worker_record = true
+plan_decision = "approve_budget"
+
+# Spec 103 acceptance 1: more than sixteen action rounds complete across at
+# least three internal segments after one task-budget approval.
+#
+# The ordinary segment limit is pinned to 4 and the approved total to 24, so
+# twenty scripted action rounds cross five internal boundaries without a
+# generic Continue. Each round reads a distinct range, so the engine-owned
+# progress digest advances.
+#
+# The `complete_step` beside each read is load-bearing, not bookkeeping. The
+# plan has only two steps, so after the first two calls the rest fail with
+# "No step is in progress" by design. They must stay: `round_is_exploration`
+# charges a round to the exploration allowance only when every decoded call is
+# a read or notes call, and `complete_step` is `ShapesTurn`. Removing them
+# would turn the later read rounds into exploration rounds, leaving fewer than
+# seventeen action rounds and breaking acceptance 1.
+config_overlay = """
+agent_max_tool_rounds=4
+agent_max_exploration_rounds=24
+worker_task_budget_action_rounds=24
+worker_task_budget_exploration_rounds=24
+"""
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_plan", arguments = { steps = [ { title = "Read the upload client" }, { title = "Add retry handling" } ] } },
+]
+
+# This run_command is the deferred mutating action that raises the plan-review
+# gate. The gate drops it without dispatching, so it is never approved or run;
+# the resumed turn asks the model again and starts with the first read below.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "sed -i '' 's/1/2/' src/upload.rs", reason = "Bump the upload constant." } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 1 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 2 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 3 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 4 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 5 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 6 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 7 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/checkout.rs", start_line = 1, end_line = 1 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/checkout.rs", start_line = 1, end_line = 2 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/checkout.rs", start_line = 1, end_line = 3 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/checkout.rs", start_line = 1, end_line = 4 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/checkout.rs", start_line = 1, end_line = 5 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/checkout.rs", start_line = 1, end_line = 6 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/checkout.rs", start_line = 1, end_line = 7 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/lib.rs", start_line = 1, end_line = 1 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/lib.rs", start_line = 1, end_line = 2 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/lib.rs", start_line = 1, end_line = 3 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/lib.rs", start_line = 1, end_line = 4 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/lib.rs", start_line = 1, end_line = 5 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/lib.rs", start_line = 1, end_line = 6 } },
+  { name = "complete_step", arguments = {} },
+]
+[[turn]]
+content = "Retry handling is implemented across the crate."
+
+[assert]
+continuations = 0
+task_count = 1
+final_task_status = "complete"
+round_budget_pauses = 0
+segments_started = 6
+segments_finished = 5
+terminal_outcome_kind = "none"
+deterministic_only = [
+  "continuations",
+  "task_count",
+  "final_task_status",
+  "round_budget_pauses",
+  "segments_started",
+  "segments_finished",
+  "terminal_outcome_kind",
+]

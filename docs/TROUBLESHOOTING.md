@@ -35,6 +35,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | The provider refused a call (rate limit, quota, auth) | [Provider refusal classifications](#provider-refusal-classifications) |
 | A refusal offered no switch to another provider | [A refusal offered no switch to my other provider](#a-refusal-offered-no-switch-to-my-other-provider) |
 | A turn stopped early, or asks *Answer now* / *Continue* | [A turn stopped early](#a-turn-stopped-early-which-budget-ran-out) |
+| A worker stopped on its task budget, a full request, or no progress | [A worker stopped on its approved task budget](#a-worker-stopped-on-its-approved-task-budget-a-full-request-or-no-progress) |
 | A crash-recovery card, or a task marked unknown outcome | [After a crash: what recovery decided](#after-a-crash-what-recovery-decided) |
 | Processes left over after a crash | [After a crash: what was still running](#after-a-crash-what-was-still-running) |
 | A worker won't start | [A worker will not start](#a-worker-will-not-start) |
@@ -1664,6 +1665,62 @@ charged to `agent_max_tool_rounds`.
   another `agent_max_tool_rounds` at a time, and records `turn_continued` each
   time, until the token ceiling stops it or it reaches 16 action rounds. At 16
   rounds it pauses as above.
+
+### A worker stopped on its approved task budget, a full request, or no progress
+
+A worker whose plan was approved with a task budget follows the same totals
+across internal segments ([spec 103](specs/103_bounded_worker_continuation.md)).
+When its task stops, the session log's `task_status_updated` payload carries
+both the terminal status and a typed `terminalOutcome`; the audit log repeats
+the same facts as `task_terminal_outcome`. The three ordinary stops are:
+
+- `task_budget_exhausted` / `approved_budget_exhausted`: a reviewed total was
+  spent. `terminalOutcome.dimension` names `action_rounds`,
+  `exploration_rounds`, `input_tokens` or `output_tokens`, and `figures` holds
+  the approved and used counts. An input stop may also carry `required` and
+  `remaining` when the next request needed more than was left.
+- `task_compaction_cannot_fit` / `compaction_cannot_fit`: the fixed request
+  overhead plus the state that must stay verbatim is larger than the configured
+  share of the context window. `terminalOutcome.compaction` records the window,
+  share, threshold and the smallest measured request. Nothing was sent and no
+  segment boundary was written.
+- `task_no_progress` / `no_progress`: the next segment repeated the same plan
+  state and typed tool results, so the engine declined to spend more of the
+  budget.
+
+None of these is `complete`, and none offers **Continue** against the same
+approved bound. The outcome, the last open segment and the durable usage are
+read back through a fresh engine, so **Restart worker** shows the same stop
+rather than resuming the turn.
+
+A segment boundary writes `segment_finished` and `segment_started` session
+events and the matching audit facts. A request that crossed the window share
+writes `within_turn_compaction`, with counts and token estimates but no tool
+body; the transcript is unchanged. To inspect one task:
+
+```bash
+SESSION_FILE="$DATA_DIR/sessions/<session-id>.jsonl"
+
+# Every segment boundary this task committed.
+jq -c 'select(.eventType=="segment_finished" or .eventType=="segment_started")
+       | {event: .eventType, segment: .payload.segment,
+          action: .payload.segmentActionRounds,
+          exploration: .payload.segmentExplorationRounds,
+          totalAction: .payload.totalActionRounds}' "$SESSION_FILE"
+
+# The bounded stop and its limiting dimension, if any.
+jq -c 'select(.eventType=="task_status_updated" and .payload.terminalOutcome)
+       | {status: .payload.task.status,
+          kind: .payload.terminalOutcome.kind,
+          dimension: .payload.terminalOutcome.dimension,
+          figures: .payload.terminalOutcome.figures}' "$SESSION_FILE"
+```
+
+A `within_turn_compaction` record whose `outcome` is `cannot_fit` is the
+precursor to the second stop; `compacted` is the ordinary case and means only
+the next request was reduced. `pinnedResults` and `completedRounds` show how
+much of the history had to stay verbatim. A budgetless worker never writes
+segment events; its ordinary `round_budget` pause is unchanged.
 
 ### A task ended incomplete: what the completion gate saw
 

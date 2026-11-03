@@ -7650,9 +7650,14 @@ impl ChatOrchestrator {
     }
 
     /// Everything the next request must not lose, derived only from typed
-    /// engine state: the plan's open-step results and safety hashes, the
+    /// engine state: the plan's open-step results and patch/base-hash paths, the
     /// immediately preceding action identifiers, protected paths, findings and
     /// every non-read or unresolved result.
+    ///
+    /// Historical `FileRead` evidence deliberately does not pin its result body.
+    /// The evidence keeps its path and hash for the durable plan, and the newest
+    /// read for an open step stays pinned below, so an older completed read is
+    /// still eligible for a compaction manifest in a planned task.
     fn within_turn_pins(
         &self,
         repository_root: &Path,
@@ -15042,9 +15047,12 @@ fn safety_pre_cut_warning(
 /// evidence carries one. Only typed evidence variants are read.
 fn collect_safety_path(evidence: &Evidence, paths: &mut BTreeSet<String>) {
     match evidence {
-        Evidence::FileRead { path, .. } => {
-            paths.insert(path.clone());
-        }
+        // A historical read is not a body pin. Its durable path and hash stay in
+        // the step evidence, and the latest result for an open step is pinned by
+        // call id, so pinning every earlier read too would leave a planned task
+        // with no eligible result to compact. Patch paths are different: they
+        // carry the base hashes a later safety decision verifies.
+        Evidence::FileRead { .. } => {}
         Evidence::PatchApplied { files, .. } => {
             for file in files {
                 paths.insert(file.path.clone());

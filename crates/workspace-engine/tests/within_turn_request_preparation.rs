@@ -13,14 +13,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use workspace_engine::finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange};
 use workspace_engine::model::{model_request_json, provider_message_json};
 use workspace_engine::{
     CancelToken, ChatTurnOptions, ChatTurnResult, CompactedToolKind, CompletedToolCall,
-    CompletedToolRound, Config, MockModelAdapter, ModelMessage, ModelProviderConfig, ModelRequest,
-    PhaseKind, RequestPreparationInput, RequestPreparationOutcome, SecretScanner, Session,
-    SessionStore, TokenEstimate, ToolCall, ToolDefinition, ToolIdentity, ToolResultOutcome,
-    TurnProgress, TurnSink, WithinTurnCompactionAttemptOutcome, WorkerRecord, WorkspaceEngine,
-    prepare_request, repository_id_for_root,
+    CompletedToolRound, Config, Evidence, MockModelAdapter, ModelMessage, ModelProviderConfig,
+    ModelRequest, PatchedFile, PhaseKind, ProtectedPath, ProtectedPathKind,
+    RequestPreparationInput, RequestPreparationOutcome, SecretScanner, Session, SessionStore,
+    TokenEstimate, ToolCall, ToolDefinition, ToolIdentity, ToolResultOutcome, TurnProgress,
+    TurnSink, WithinTurnCompactionAttemptOutcome, WorkerRecord, WorkspaceEngine, prepare_request,
+    repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -152,6 +154,35 @@ fn resume_answer(
     )
 }
 
+fn approve_plan_with_budget(
+    engine: &WorkspaceEngine,
+    proposal: &workspace_engine::AgentPlanProposal,
+    budget: Option<&workspace_engine::TaskExecutionBudget>,
+    adapter: &mut MockModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_plan_decision_with_budget(
+            &proposal.id,
+            true,
+            None,
+            budget,
+            "tester",
+            adapter,
+            &mut sink,
+        )
+        .expect("the reviewed plan should be approved")
+}
+
 /// Recursively copies a data directory for the reload branch. The paused state
 /// is small (session log, pending turn, audit) and the copy must not share a
 /// mutable file with the live branch.
@@ -170,6 +201,14 @@ fn copy_dir_all(source: &Path, target: &Path) {
 }
 
 fn worker_session(engine: &WorkspaceEngine, repo: &Path) -> Session {
+    worker_session_with_protected_paths(engine, repo, Vec::new())
+}
+
+fn worker_session_with_protected_paths(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    inherited_protected_paths: Vec<ProtectedPath>,
+) -> Session {
     let session = engine
         .session_store
         .create_session(&repository_id_for_root(repo), "Worker")
@@ -181,7 +220,7 @@ fn worker_session(engine: &WorkspaceEngine, repo: &Path) -> Session {
             &WorkerRecord {
                 parent_session_id: None,
                 parent_task_id: None,
-                inherited_protected_paths: Vec::new(),
+                inherited_protected_paths,
                 source_repository: repo.to_path_buf(),
                 worktree_path: repo.to_path_buf(),
                 branch: "main".to_string(),
@@ -275,6 +314,13 @@ fn find_tool_message<'a>(request: &'a ModelRequest, call_id: &str) -> &'a ModelM
         .iter()
         .find(|message| message.role == "tool" && message.tool_call_id.as_deref() == Some(call_id))
         .unwrap_or_else(|| panic!("no tool result for {call_id}"))
+}
+
+fn tool_message<'a>(request: &'a ModelRequest, call_id: &str) -> Option<&'a ModelMessage> {
+    request
+        .messages
+        .iter()
+        .find(|message| message.role == "tool" && message.tool_call_id.as_deref() == Some(call_id))
 }
 
 fn is_manifest(content: &str) -> bool {
@@ -642,6 +688,15 @@ fn huge_file(repo: &Path, name: &str, marker: &str) -> String {
     content
 }
 
+/// A read large enough to matter but small enough to stay pinned inside the
+/// window while other, larger reads are compacted around it.
+fn medium_file(repo: &Path, name: &str, marker: &str) -> String {
+    let line = "line of text that makes a read large ".repeat(15);
+    let content = format!("{marker}\n{}", format!("{line}\n").repeat(80));
+    fs::write(repo.join(name), &content).expect("file should be written");
+    content
+}
+
 #[test]
 fn a_threshold_crossing_attempt_is_durable_content_safe_and_leaves_the_transcript_alone() {
     let repo = temp_repo("durable");
@@ -989,6 +1044,405 @@ fn a_budgeted_worker_plan_approval_pins_the_exact_plan_and_budget_through_compac
         assert!(
             expected_note.contains(&value),
             "value {value} must be in the approved note"
+        );
+    }
+}
+
+#[test]
+fn a_planned_worker_compacts_an_older_read_and_keeps_the_open_step_result() {
+    let repo = temp_repo("planned-read-compaction");
+    huge_file(&repo, "old.txt", "OLD");
+    huge_file(&repo, "new.txt", "NEW");
+    let engine = engine(&repo, Some(100_000), 100);
+    let session = worker_session(&engine, &repo);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            "Planning.".to_string(),
+            "Preparing the change.".to_string(),
+            "Reading the first file.".to_string(),
+            "Reading the second file.".to_string(),
+            "Re-reading the first file.".to_string(),
+            "Done.".to_string(),
+        ],
+        vec![
+            vec![tool_call(
+                "plan",
+                "propose_plan",
+                r#"{"steps":[{"title":"Compare the two files"},{"title":"Report the result"}]}"#,
+            )],
+            // The plan-review gate pauses before a mutating action. This call is
+            // deferred and dropped, so the resume asks the model again and the
+            // next scripted turn is the first read.
+            vec![tool_call(
+                "deferred",
+                "propose_patch",
+                r#"{"summary":"Add a file","files":[{"path":"never.txt","content":"never\n"}]}"#,
+            )],
+            vec![read_call("old_read", "old.txt")],
+            vec![read_call("new_read", "new.txt")],
+            vec![read_call("old_reread", "old.txt")],
+            Vec::new(),
+        ],
+    );
+    let (paused, _) = run_turn_for_session(
+        &engine,
+        &repo,
+        Some(&session.id),
+        "Compare the two files.",
+        &mut adapter,
+    );
+    let paused = paused.expect("the worker should pause on its plan review");
+    let proposal = paused.plan_proposal.expect("the plan is reviewed");
+    let budget = proposal
+        .budget_review
+        .as_ref()
+        .expect("a worker review offers the task budget")
+        .budget;
+    let finished = approve_plan_with_budget(&engine, &proposal, Some(&budget), &mut adapter);
+
+    // The older read is a manifest while the newest result for the still-open
+    // step keeps its full body. `latest_call_id_for_step` is the only reason
+    // the second read stays pinned, so this is the planned-worker regression.
+    let attempts = engine
+        .session_store
+        .read_within_turn_compaction_attempts(&finished.session.id)
+        .expect("attempts should read");
+    let first = attempts
+        .iter()
+        .find(|attempt| attempt.outcome == WithinTurnCompactionAttemptOutcome::Compacted)
+        .expect("the planned worker should compact an older read");
+    assert!(
+        first.eligible_results > 0,
+        "a planned worker's older read must be eligible: {first:?}"
+    );
+    assert!(
+        first.facts.iter().any(|fact| fact.call_id == "old_read"),
+        "the first read is the older completed result: {first:?}"
+    );
+    assert!(
+        first.facts.iter().all(|fact| fact.call_id != "new_read"),
+        "the latest result for the open step must stay pinned: {first:?}"
+    );
+
+    let compacted_request = adapter
+        .requests
+        .iter()
+        .find(|request| {
+            let old = tool_message(request, "old_read");
+            let new = tool_message(request, "new_read");
+            old.is_some_and(|message| is_manifest(&message.content))
+                && new.is_some_and(|message| !is_manifest(&message.content))
+        })
+        .expect("one request must hold the manifest and the pinned current result");
+    assert!(
+        tool_message(compacted_request, "new_read")
+            .expect("the current result is present")
+            .content
+            .contains("Content of new.txt"),
+        "the latest result must reach the model unchanged"
+    );
+
+    // The durable evidence keeps the path and the hash of every read even when
+    // the request body is gone.
+    let plan = engine
+        .session_store
+        .read_task_plan(&finished.session.id, &finished.task.id)
+        .expect("the plan should read")
+        .expect("the plan should exist");
+    let mut reads = Vec::new();
+    for step in &plan.steps {
+        for evidence in &step.evidence {
+            if let Evidence::FileRead { path, hash } = evidence {
+                reads.push((path.clone(), hash.clone()));
+            }
+        }
+    }
+    for (path, expected_file) in [("old.txt", "old.txt"), ("new.txt", "new.txt")] {
+        let expected = workspace_engine::hash::file_hash(repo.join(expected_file))
+            .expect("the fixture file should hash");
+        assert!(
+            reads
+                .iter()
+                .any(|(read, hash)| read == path && hash == &expected),
+            "the durable FileRead evidence for {path} keeps the file hash: {reads:?}"
+        );
+    }
+    assert_eq!(
+        reads.iter().filter(|(path, _)| path == "old.txt").count(),
+        2,
+        "the reread is durable evidence too: {reads:?}"
+    );
+}
+
+#[test]
+fn a_planned_worker_pins_protected_and_base_hash_paths_through_compaction() {
+    let repo = temp_repo("planned-safety-paths");
+    huge_file(&repo, "old1.txt", "OLD ONE");
+    huge_file(&repo, "protected.txt", "PROTECTED");
+    huge_file(&repo, "old2.txt", "OLD TWO");
+    huge_file(&repo, "base.txt", "BASE");
+    let engine = engine(&repo, Some(150_000), 100);
+    // The protection comes from the durable worker record, not from parsing the
+    // prompt, so this test exercises `TaskProtectedPaths` in `within_turn_pins`.
+    let session = worker_session_with_protected_paths(
+        &engine,
+        &repo,
+        vec![ProtectedPath {
+            path: "protected.txt".to_string(),
+            kind: ProtectedPathKind::File,
+        }],
+    );
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            "Planning.".to_string(),
+            "Preparing the change.".to_string(),
+            "Reading the first old file.".to_string(),
+            "Reading the protected file.".to_string(),
+            "Reading the second old file.".to_string(),
+            "Reading the base-hash file.".to_string(),
+            "Done.".to_string(),
+        ],
+        vec![
+            vec![tool_call(
+                "plan",
+                "propose_plan",
+                r#"{"steps":[{"title":"Inspect all four files"},{"title":"Report the result"}]}"#,
+            )],
+            vec![tool_call(
+                "deferred",
+                "propose_patch",
+                r#"{"summary":"Add a file","files":[{"path":"never.txt","content":"never\n"}]}"#,
+            )],
+            vec![read_call("old1_read", "old1.txt")],
+            vec![read_call("protected_read", "protected.txt")],
+            vec![read_call("old2_read", "old2.txt")],
+            vec![read_call("base_read", "base.txt")],
+            Vec::new(),
+        ],
+    );
+    let (paused, _) = run_turn_for_session(
+        &engine,
+        &repo,
+        Some(&session.id),
+        "Inspect the four files.",
+        &mut adapter,
+    );
+    let paused = paused.expect("the worker should pause on its plan review");
+    // A patch already applied to `base.txt` is a safety path independent of the
+    // worker record: its base hash is what a later patch decision verifies.
+    engine
+        .session_store
+        .append_step_evidence(
+            &session.id,
+            &paused.task.id,
+            Evidence::PatchApplied {
+                marker_id: "base-marker".to_string(),
+                files: vec![PatchedFile {
+                    path: "base.txt".to_string(),
+                    applied_hash: "base-hash".to_string(),
+                }],
+            },
+        )
+        .expect("the durable patch evidence should append");
+    let proposal = paused.plan_proposal.expect("the plan is reviewed");
+    let budget = proposal
+        .budget_review
+        .as_ref()
+        .expect("a worker review offers the task budget")
+        .budget;
+    let finished = approve_plan_with_budget(&engine, &proposal, Some(&budget), &mut adapter);
+
+    let attempts = engine
+        .session_store
+        .read_within_turn_compaction_attempts(&finished.session.id)
+        .expect("attempts should read");
+    let compacted: Vec<_> = attempts
+        .iter()
+        .filter(|attempt| attempt.outcome == WithinTurnCompactionAttemptOutcome::Compacted)
+        .collect();
+    assert!(!compacted.is_empty(), "the long read history must compact");
+    // At the final crossing the protected read is older than `old2_read`, so an
+    // unprotected reducer would choose it first. Choosing `old2_read` instead is
+    // what makes this assertion load-bearing rather than incidental.
+    assert!(
+        compacted
+            .iter()
+            .any(|attempt| attempt.facts.iter().any(|fact| fact.call_id == "old2_read")),
+        "the eligible second read compacts around the protected path: {compacted:?}"
+    );
+    for pinned in ["protected_read", "base_read"] {
+        assert!(
+            compacted
+                .iter()
+                .all(|attempt| attempt.facts.iter().all(|fact| fact.call_id != pinned)),
+            "{pinned} must never become a manifest: {compacted:?}"
+        );
+    }
+
+    let compacted_request = adapter
+        .requests
+        .iter()
+        .find(|request| {
+            tool_message(request, "old2_read").is_some_and(|message| is_manifest(&message.content))
+        })
+        .expect("one request holds the compacted eligible read");
+    for (call_id, path) in [
+        ("protected_read", "protected.txt"),
+        ("base_read", "base.txt"),
+    ] {
+        let message =
+            tool_message(compacted_request, call_id).expect("the pinned result is present");
+        assert!(
+            !is_manifest(&message.content) && message.content.contains(path),
+            "{path} must reach the model verbatim"
+        );
+    }
+
+    let plan = engine
+        .session_store
+        .read_task_plan(&finished.session.id, &finished.task.id)
+        .expect("the plan should read")
+        .expect("the plan should exist");
+    assert!(
+        plan.steps.iter().any(|step| {
+            step.evidence.iter().any(|evidence| {
+                matches!(
+                    evidence,
+                    Evidence::PatchApplied { files, .. }
+                        if files.iter().any(|file| file.path == "base.txt")
+                )
+            })
+        }),
+        "the base-hash evidence stays durable"
+    );
+}
+
+#[test]
+fn a_planned_worker_pins_an_active_error_finding_and_its_origin_call() {
+    let repo = temp_repo("planned-finding-pins");
+    medium_file(&repo, "origin.txt", "ORIGIN");
+    medium_file(&repo, "finding.txt", "FINDING");
+    huge_file(&repo, "old1.txt", "OLD ONE");
+    huge_file(&repo, "old2.txt", "OLD TWO");
+    huge_file(&repo, "latest.txt", "LATEST");
+    let engine = engine(&repo, Some(150_000), 100);
+    let session = worker_session(&engine, &repo);
+    let finding = Finding::new(
+        FindingDraft {
+            source: FindingSource::Compiler,
+            severity: Severity::Error,
+            summary: "The compiler reports a broken call".to_string(),
+            details: None,
+            range: Some(SourceRange {
+                path: "finding.txt".to_string(),
+                start_line: 1,
+                start_column: Some(1),
+                end_line: Some(2),
+                end_column: None,
+            }),
+            code: Some("E0308".to_string()),
+        },
+        &SecretScanner::default(),
+    )
+    .with_origin_ref("origin_read")
+    .with_file_hash(
+        workspace_engine::hash::file_hash(repo.join("finding.txt"))
+            .expect("the finding file should hash"),
+    );
+    engine
+        .session_store
+        .record_finding(&session.id, &finding)
+        .expect("the open finding should record");
+
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            "Planning.".to_string(),
+            "Preparing the change.".to_string(),
+            "Reading the finding origin.".to_string(),
+            "Reading the finding file.".to_string(),
+            "Reading the first old file.".to_string(),
+            "Reading the second old file.".to_string(),
+            "Reading the latest file.".to_string(),
+            "Done.".to_string(),
+        ],
+        vec![
+            vec![tool_call(
+                "plan",
+                "propose_plan",
+                r#"{"steps":[{"title":"Inspect the files"},{"title":"Report the result"}]}"#,
+            )],
+            vec![tool_call(
+                "deferred",
+                "propose_patch",
+                r#"{"summary":"Add a file","files":[{"path":"never.txt","content":"never\n"}]}"#,
+            )],
+            vec![read_call("origin_read", "origin.txt")],
+            vec![read_call("finding_read", "finding.txt")],
+            vec![read_call("old1_read", "old1.txt")],
+            vec![read_call("old2_read", "old2.txt")],
+            vec![read_call("latest_read", "latest.txt")],
+            Vec::new(),
+        ],
+    );
+    let (paused, _) = run_turn_for_session(
+        &engine,
+        &repo,
+        Some(&session.id),
+        "Inspect the files.",
+        &mut adapter,
+    );
+    let paused = paused.expect("the worker should pause on its plan review");
+    let proposal = paused.plan_proposal.expect("the plan is reviewed");
+    let budget = proposal
+        .budget_review
+        .as_ref()
+        .expect("a worker review offers the task budget")
+        .budget;
+    let finished = approve_plan_with_budget(&engine, &proposal, Some(&budget), &mut adapter);
+
+    let attempts = engine
+        .session_store
+        .read_within_turn_compaction_attempts(&finished.session.id)
+        .expect("attempts should read");
+    let compacted: Vec<_> = attempts
+        .iter()
+        .filter(|attempt| attempt.outcome == WithinTurnCompactionAttemptOutcome::Compacted)
+        .collect();
+    assert!(!compacted.is_empty(), "the long read history must compact");
+    for pinned in ["origin_read", "finding_read"] {
+        assert!(
+            compacted
+                .iter()
+                .all(|attempt| attempt.facts.iter().all(|fact| fact.call_id != pinned)),
+            "{pinned} is pinned by the open error finding: {compacted:?}"
+        );
+    }
+    assert!(
+        compacted.iter().any(|attempt| attempt
+            .facts
+            .iter()
+            .any(|fact| fact.call_id == "old1_read" || fact.call_id == "old2_read")),
+        "the unprotected reads compact around the finding pins: {compacted:?}"
+    );
+
+    let compacted_request = adapter
+        .requests
+        .iter()
+        .find(|request| {
+            tool_message(request, "old1_read").is_some_and(|message| is_manifest(&message.content))
+                || tool_message(request, "old2_read")
+                    .is_some_and(|message| is_manifest(&message.content))
+        })
+        .expect("one request holds an unprotected manifest");
+    for (call_id, path, marker) in [
+        ("origin_read", "origin.txt", "ORIGIN"),
+        ("finding_read", "finding.txt", "FINDING"),
+    ] {
+        let message =
+            tool_message(compacted_request, call_id).expect("the pinned result is present");
+        assert!(
+            !is_manifest(&message.content) && message.content.contains(marker),
+            "{path} must reach the model verbatim"
         );
     }
 }
