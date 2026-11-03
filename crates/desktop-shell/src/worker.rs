@@ -104,7 +104,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     )?;
     // Spec 103 Task 2: a durable plan review survives the restart. Everything
     // else keeps spec 57's behaviour and ends with the process.
-    driver.restore_pending_plan_review(&host);
+    driver.restore_pending_decision(&host);
     start_turn_thread(&host, driver)?;
     let served = Arc::clone(&host);
     crate::spawn_with_shell_stack("damaian-worker-control", move || {
@@ -383,6 +383,14 @@ pub(crate) enum ControlCommand {
         /// budget on a review that offered none is still refused there.
         budget: Option<TaskExecutionBudget>,
     },
+    /// Answers a question the turn paused on (spec 104). It is separate from
+    /// `approve`/`reject` because an answer authorises nothing; each endpoint
+    /// refuses the other's ids.
+    AnswerQuestion {
+        question_id: String,
+        answer: String,
+        selected_option: Option<usize>,
+    },
     /// Runs the verification a settled patch made due, and the spec 77
     /// continuation after it, in this process (spec 80).
     Verify,
@@ -440,6 +448,26 @@ fn parse_command(
     command: &str,
     mut fields: Map<String, Value>,
 ) -> Result<ControlCommand, &'static str> {
+    // Read before the field-taking closure borrows `fields`. A JSON number and
+    // the route's string form are both accepted; anything else is refused
+    // rather than guessed at.
+    let selected_option = if command == "answer_question" {
+        match fields.remove("selectedOption") {
+            None | Some(Value::Null) => None,
+            Some(Value::Number(number)) => Some(
+                usize::try_from(number.as_u64().ok_or("selectedOption must be a number")?)
+                    .map_err(|_| "selectedOption must be a number")?,
+            ),
+            Some(Value::String(raw)) if raw.trim().is_empty() => None,
+            Some(Value::String(raw)) => Some(
+                raw.parse::<usize>()
+                    .map_err(|_| "selectedOption must be a number")?,
+            ),
+            Some(_) => return Err("selectedOption must be a number"),
+        }
+    } else {
+        None
+    };
     let mut take = |name: &str, limit: usize| -> Result<Option<String>, &'static str> {
         match fields.remove(name) {
             None => Ok(None),
@@ -476,6 +504,11 @@ fn parse_command(
         "reject" => ControlCommand::Reject {
             proposal_id: required(take("proposalId", MAX_PROPOSAL_ID_BYTES)?)?,
             budget: budget(take("budget", MAX_REQUEST_BYTES as usize)?)?,
+        },
+        "answer_question" => ControlCommand::AnswerQuestion {
+            question_id: required(take("questionId", MAX_PROPOSAL_ID_BYTES)?)?,
+            answer: required(take("answer", MAX_REQUEST_BYTES as usize)?)?,
+            selected_option,
         },
         "verify" => ControlCommand::Verify,
         "continue-repair" => ControlCommand::ContinueRepair,
@@ -578,6 +611,9 @@ enum DecisionKind {
     /// A verification's check card (spec 80). Answered with `checks`, which
     /// carries a decision per check; `approve` and `reject` refuse it.
     Checks,
+    /// A model question (spec 104). Answered with `answer_question`; the
+    /// approval commands refuse it and it authorises nothing.
+    Question,
 }
 
 /// The turn the host holds. The cancel token and the steering belong to the
@@ -608,6 +644,12 @@ enum TurnJob {
     Checks {
         proposal_id: String,
         decisions: Vec<(String, bool)>,
+    },
+    /// A question's answer, resuming the turn that asked (spec 104).
+    AnswerQuestion {
+        question_id: String,
+        answer: String,
+        selected_option: Option<usize>,
     },
     /// Spec 101 Task 3: continue the exact task a rendered control named.
     ContinueTask {
@@ -710,6 +752,14 @@ impl WorkerHost {
                 proposal_id,
                 budget,
             } => (self.decide(proposal_id, false, budget), false),
+            ControlCommand::AnswerQuestion {
+                question_id,
+                answer,
+                selected_option,
+            } => (
+                self.answer_question(question_id, answer, selected_option),
+                false,
+            ),
             ControlCommand::Verify => (self.start(TurnJob::Verify), false),
             ControlCommand::ContinueRepair => (self.start(TurnJob::ContinueRepair), false),
             ControlCommand::ContinueTask { task_id, note } => {
@@ -794,6 +844,9 @@ impl WorkerHost {
         if kind == DecisionKind::Checks {
             return refusal("a check card is answered with `checks`");
         }
+        if kind == DecisionKind::Question {
+            return refusal("a question is answered with `answer_question`");
+        }
         let answer = self.hand_over(
             &mut slot,
             TurnJob::Decide {
@@ -801,6 +854,38 @@ impl WorkerHost {
                 kind,
                 approved,
                 budget,
+            },
+        );
+        if answer["ok"] == true {
+            slot.pending = None;
+        }
+        answer
+    }
+
+    /// `answer_question`: a question the turn paused on (spec 104). A
+    /// question is not an approval, so every other pending kind is refused
+    /// here and this id cannot reach `approve` or `reject`.
+    fn answer_question(
+        &self,
+        question_id: String,
+        answer: String,
+        selected_option: Option<usize>,
+    ) -> Value {
+        let mut slot = self.slot();
+        match &slot.pending {
+            Some((pending, DecisionKind::Question))
+                if slot.state == WorkerState::WaitingForApproval && *pending == question_id => {}
+            Some((_, _)) if slot.state == WorkerState::WaitingForApproval => {
+                return refusal("that id is not a pending question");
+            }
+            _ => return refusal("no question with that id is pending"),
+        }
+        let answer = self.hand_over(
+            &mut slot,
+            TurnJob::AnswerQuestion {
+                question_id,
+                answer,
+                selected_option,
             },
         );
         if answer["ok"] == true {
@@ -846,7 +931,9 @@ impl WorkerHost {
             return refusal("this worker hosts no turns");
         };
         let carried = match job {
-            TurnJob::Decide { .. } | TurnJob::Checks { .. } => slot.steering.drain_notes(),
+            TurnJob::Decide { .. } | TurnJob::Checks { .. } | TurnJob::AnswerQuestion { .. } => {
+                slot.steering.drain_notes()
+            }
             TurnJob::Message(_)
             | TurnJob::Verify
             | TurnJob::ContinueRepair
@@ -874,10 +961,15 @@ impl WorkerHost {
             "pid": self.pid,
             "state": slot.state.as_str(),
         });
-        if let (WorkerState::WaitingForApproval, Some((proposal_id, _))) =
-            (slot.state, &slot.pending)
-        {
-            snapshot["proposalId"] = json!(proposal_id);
+        if let (WorkerState::WaitingForApproval, Some((id, kind))) = (slot.state, &slot.pending) {
+            // A question id is not a proposal id (spec 50 §5.2), so it is
+            // reported under its own key and never as one an approval route
+            // could act on.
+            if *kind == DecisionKind::Question {
+                snapshot["questionId"] = json!(id);
+            } else {
+                snapshot["proposalId"] = json!(id);
+            }
         }
         snapshot
     }
@@ -926,21 +1018,19 @@ impl TurnDriver {
         })
     }
 
-    /// Reattaches a durable plan review after a process restart (spec 103
-    /// Task 2).
+    /// Reattaches a durable decision after a process restart: a plan review
+    /// (spec 103 Task 2) or an open question (spec 104).
     ///
-    /// Only a plan review is restored. Its paused turn is on disk, so the
-    /// restarted process can resume it exactly where the previous one stopped.
-    /// Command, patch, check and fallback decisions keep spec 57's behaviour:
-    /// those approvals ended with the process and this method does not guess
-    /// at them.
+    /// Its paused turn is on disk, so the restarted process can resume it
+    /// exactly where the previous one stopped. Command, patch, check and
+    /// fallback decisions keep spec 57's behaviour: those approvals ended with
+    /// the process and this method does not guess at them.
     ///
-    /// The budget comes from the persisted review, never from current
-    /// configuration: a config edit between processes must not change what the
-    /// user is looking at. A historical review with no budget reattaches
-    /// budgetless. Missing or corrupt durable state restores nothing — it is
-    /// not repaired, reconstructed or authorised.
-    fn restore_pending_plan_review(&mut self, host: &WorkerHost) {
+    /// A plan review's budget comes from the persisted review, never from
+    /// current configuration: a config edit between processes must not change
+    /// what the user is looking at. Missing or corrupt durable state restores
+    /// nothing — it is not repaired, reconstructed or authorised.
+    fn restore_pending_decision(&mut self, host: &WorkerHost) {
         let store = SessionStore::new(&self.data_dir);
         let Ok(tasks) = store.read_tasks(&self.session_id) else {
             return;
@@ -953,19 +1043,118 @@ impl TurnDriver {
         else {
             return;
         };
-        let Ok(Some(PendingDecision::Approval(pending))) =
-            store.pending_decision_for(&self.session_id, &task.id)
-        else {
+        match store.pending_decision_for(&self.session_id, &task.id) {
+            Ok(Some(PendingDecision::Approval(pending))) => {
+                if pending.kind != "plan" {
+                    return;
+                }
+                let Some(proposal) = self.durable_plan_proposal(&store, task, &pending.proposal_id)
+                else {
+                    return;
+                };
+                self.announce_plan_review(&proposal, None);
+                host.settle(Some((pending.proposal_id, DecisionKind::Plan)));
+            }
+            Ok(Some(PendingDecision::Question(pending))) => {
+                self.restore_open_question(host, &store, task, pending.question_id());
+            }
+            _ => {}
+        }
+    }
+
+    /// Puts an unanswered question back in front of the user after a restart.
+    ///
+    /// An answered question is not reattached: spec 50's crash rule already
+    /// says an answered question must never be asked again, and the card that
+    /// would be drawn is disabled. It is left to spec 57's ordinary restart
+    /// behaviour instead of pretending it is still open.
+    fn restore_open_question(
+        &mut self,
+        host: &WorkerHost,
+        store: &SessionStore,
+        task: &Task,
+        question_id: &str,
+    ) {
+        let Ok(Some(state)) = store.question_state(&self.session_id, question_id) else {
             return;
         };
-        if pending.kind != "plan" {
+        if state.task_id != task.id || state.answer.is_some() {
             return;
         }
-        let Some(proposal) = self.durable_plan_proposal(&store, task, &pending.proposal_id) else {
-            return;
+        append_progress(
+            &mut self.progress,
+            ProgressKind::Question,
+            json!({
+                "questionId": state.question_id,
+                "question": state.question,
+            }),
+        );
+        append_progress(
+            &mut self.progress,
+            ProgressKind::Status,
+            json!({
+                "state": WorkerState::WaitingForApproval.as_str(),
+                "taskStatus": TaskStatus::WaitingForApproval.as_str(),
+                "questionId": state.question_id,
+            }),
+        );
+        host.settle(Some((state.question_id, DecisionKind::Question)));
+    }
+
+    /// A question answer the engine refused before consuming the pause — an
+    /// invalid option, free text when the question does not allow it, or a
+    /// raced answer. The durable question is still open, so the worker must
+    /// stay waiting on it instead of reporting idle and dropping its slot.
+    fn restore_refused_question(
+        &mut self,
+        host: &WorkerHost,
+        question_id: &str,
+        error: &str,
+    ) -> bool {
+        let store = SessionStore::new(&self.data_dir);
+        let Ok(Some(state)) = store.question_state(&self.session_id, question_id) else {
+            return false;
         };
-        self.announce_plan_review(&proposal, None);
-        host.settle(Some((pending.proposal_id, DecisionKind::Plan)));
+        if state.answer.is_some() {
+            return false;
+        }
+        let Ok(tasks) = store.read_tasks(&self.session_id) else {
+            return false;
+        };
+        let Some(task) = tasks
+            .iter()
+            .find(|task| task.id == state.task_id && task.status == TaskStatus::WaitingForApproval)
+        else {
+            return false;
+        };
+        let still_linked = matches!(
+            store.pending_decision_for(&self.session_id, &task.id),
+            Ok(Some(PendingDecision::Question(pending)))
+                if pending.question_id() == question_id
+        );
+        if !still_linked {
+            return false;
+        }
+        append_progress(
+            &mut self.progress,
+            ProgressKind::Question,
+            json!({
+                "questionId": state.question_id,
+                "question": state.question,
+            }),
+        );
+        append_progress(
+            &mut self.progress,
+            ProgressKind::Status,
+            json!({
+                "state": WorkerState::WaitingForApproval.as_str(),
+                "taskStatus": TaskStatus::WaitingForApproval.as_str(),
+                "questionId": state.question_id,
+                "error": error,
+            }),
+        );
+        host.settle(Some((state.question_id, DecisionKind::Question)));
+        true
     }
 
     /// A plan decision whose engine validation refused it before the pending
@@ -1066,14 +1255,18 @@ impl TurnDriver {
     }
 
     fn run(&mut self, host: &WorkerHost, job: TurnJob) {
-        // Only a plan decision has a pending review that can outlive the job.
-        // The id is kept because `take_turn` consumes the job.
+        // Only a plan decision or a question has a pending state that can
+        // outlive the job. The id is kept because `take_turn` consumes the job.
         let refused_plan = match &job {
             TurnJob::Decide {
                 proposal_id,
                 kind: DecisionKind::Plan,
                 ..
             } => Some(proposal_id.clone()),
+            _ => None,
+        };
+        let refused_question = match &job {
+            TurnJob::AnswerQuestion { question_id, .. } => Some(question_id.clone()),
             _ => None,
         };
         let (cancel, steering) = host.turn_handles();
@@ -1088,6 +1281,20 @@ impl TurnDriver {
                 if let Some(approval) = approval_payload(&result) {
                     append_progress(&mut self.progress, ProgressKind::Approval, approval);
                 }
+                // Spec 104: a question is not an approval, so it gets its own
+                // progress kind carrying only the id and the redacted display
+                // text. The card itself is rebuilt from the session log, which
+                // is where its options live.
+                if let Some(question) = &result.question_proposal {
+                    append_progress(
+                        &mut self.progress,
+                        ProgressKind::Question,
+                        json!({
+                            "questionId": question.question_id,
+                            "question": question.question,
+                        }),
+                    );
+                }
                 let returned = self.record_parent_return(&result.task, &result.response);
                 let state = if pending.is_some() {
                     WorkerState::WaitingForApproval
@@ -1098,6 +1305,9 @@ impl TurnDriver {
                     "state": state.as_str(),
                     "taskStatus": result.task.status.as_str()
                 });
+                if let Some(question) = &result.question_proposal {
+                    status["questionId"] = json!(question.question_id);
+                }
                 // Spec 103 Task 6: the progress/status line carries the same
                 // typed outcome the board control and parent return use. The
                 // shell never reconstructs it from a status string.
@@ -1122,6 +1332,13 @@ impl TurnDriver {
                 // the worker must not report idle or return a waiting task.
                 if let Some(proposal_id) = refused_plan
                     && self.restore_refused_plan_review(host, &proposal_id, &error)
+                {
+                    return;
+                }
+                // The same rule for an answer the engine refused: the durable
+                // question is still open and the card must stay answerable.
+                if let Some(question_id) = refused_question
+                    && self.restore_refused_question(host, &question_id, &error)
                 {
                     return;
                 }
@@ -1252,7 +1469,10 @@ impl TurnDriver {
                 Some(&self.session_id),
                 adapter.as_mut(),
                 &mut sink,
-                ChatTurnOptions::default(),
+                // Spec 104: a worker has a durable question route but no
+                // synchronous user, so `ask_user` is offered and `fetch_url` is
+                // not. Approval still resumes the same pending turn.
+                ChatTurnOptions::worker(),
             ),
             TurnJob::Decide {
                 proposal_id,
@@ -1303,6 +1523,23 @@ impl TurnDriver {
             } => Err(workspace_engine::ClientError::InvalidInput(
                 "a check card is answered with `checks`".to_string(),
             )),
+            TurnJob::Decide {
+                kind: DecisionKind::Question,
+                ..
+            } => Err(workspace_engine::ClientError::InvalidInput(
+                "a question is answered with `answer_question`".to_string(),
+            )),
+            TurnJob::AnswerQuestion {
+                question_id,
+                answer,
+                selected_option,
+            } => chat.resume_after_answer(
+                &question_id,
+                &answer,
+                selected_option,
+                adapter.as_mut(),
+                &mut sink,
+            ),
             TurnJob::Verify => {
                 chat.verify_due(&repository, &self.session_id, adapter.as_mut(), &mut sink)
             }
@@ -1381,7 +1618,7 @@ pub(crate) fn host_in_process(
         Arc::new(ShutdownSignal::default()),
     ));
     let mut driver = TurnDriver::new(session_id, data_dir, adapter_for)?;
-    driver.restore_pending_plan_review(&host);
+    driver.restore_pending_decision(&host);
     start_turn_thread(&host, driver)?;
     Ok(host)
 }
@@ -1503,6 +1740,9 @@ fn parsed(json_text: &str) -> Value {
 fn pending_decision(result: &ChatTurnResult) -> Option<(String, DecisionKind)> {
     if result.task.status != TaskStatus::WaitingForApproval {
         return None;
+    }
+    if let Some(question) = &result.question_proposal {
+        return Some((question.question_id.clone(), DecisionKind::Question));
     }
     if let Some(batch) = &result.check_batch {
         return Some((batch.id.clone(), DecisionKind::Checks));
@@ -2303,10 +2543,43 @@ mod tests {
                 decisions: "[]".to_string(),
             })
         );
+        // Spec 104: a question answer is its own command, with an optional
+        // selected option accepted as the socket's number or the route's string.
+        assert_eq!(
+            with_token(r#""command":"answer_question","questionId":"q1","answer":"The CLI""#),
+            ParsedRequest::Command(ControlCommand::AnswerQuestion {
+                question_id: "q1".to_string(),
+                answer: "The CLI".to_string(),
+                selected_option: None,
+            })
+        );
+        assert_eq!(
+            with_token(
+                r#""command":"answer_question","questionId":"q1","answer":"The CLI","selectedOption":0"#
+            ),
+            ParsedRequest::Command(ControlCommand::AnswerQuestion {
+                question_id: "q1".to_string(),
+                answer: "The CLI".to_string(),
+                selected_option: Some(0),
+            })
+        );
+        assert_eq!(
+            with_token(
+                r#""command":"answer_question","questionId":"q1","answer":"The CLI","selectedOption":"1""#
+            ),
+            ParsedRequest::Command(ControlCommand::AnswerQuestion {
+                question_id: "q1".to_string(),
+                answer: "The CLI".to_string(),
+                selected_option: Some(1),
+            })
+        );
         for invalid in [
             r#""command":"verify","text":"x""#,
             r#""command":"continue-repair","text":"x""#,
             r#""command":"checks","proposalId":"b1""#,
+            r#""command":"answer_question","questionId":"q1""#,
+            r#""command":"answer_question","answer":"yes""#,
+            r#""command":"answer_question","questionId":"q1","answer":"yes","selectedOption":"first""#,
             r#""command":"status","text":"x""#,
             r#""command":"note""#,
             r#""command":"note","text":7"#,
@@ -2332,6 +2605,44 @@ mod tests {
             with_token(&long_resume),
             ParsedRequest::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn a_question_and_an_approval_are_refused_on_each_others_endpoint() {
+        let served = ServedWorker::start("qe");
+        {
+            let mut slot = served.host.slot();
+            slot.state = WorkerState::WaitingForApproval;
+            slot.pending = Some(("question_1".to_string(), DecisionKind::Question));
+        }
+        let approve =
+            format!(r#"{{"token":"{TOKEN}","command":"approve","proposalId":"question_1"}}"#);
+        let answer = served.connect().exchange(&approve).unwrap();
+        assert_eq!(answer["ok"], false, "{answer}");
+        assert!(
+            answer["error"]
+                .as_str()
+                .unwrap()
+                .contains("answer_question"),
+            "{answer}"
+        );
+
+        {
+            let mut slot = served.host.slot();
+            slot.pending = Some(("proposal_1".to_string(), DecisionKind::Command));
+        }
+        let answer_question = format!(
+            r#"{{"token":"{TOKEN}","command":"answer_question","questionId":"proposal_1","answer":"yes"}}"#
+        );
+        let answer = served.connect().exchange(&answer_question).unwrap();
+        assert_eq!(answer["ok"], false, "{answer}");
+        assert!(
+            answer["error"]
+                .as_str()
+                .unwrap()
+                .contains("not a pending question"),
+            "{answer}"
+        );
     }
 
     #[test]
@@ -2491,6 +2802,7 @@ mod tests {
                     report: None,
                     alive: true,
                     state: workspace_engine::WorkerProcessState::Idle,
+                    pending_question: false,
                     has_run: true,
                     turn_error: None,
                     last_progress_at_ms: None,
@@ -2528,6 +2840,7 @@ mod tests {
                     report: None,
                     alive: true,
                     state: workspace_engine::WorkerProcessState::Idle,
+                    pending_question: false,
                     has_run: true,
                     turn_error: None,
                     last_progress_at_ms: None,
@@ -2544,6 +2857,305 @@ mod tests {
             store.read_tasks(&session).unwrap().last().unwrap().status,
             TaskStatus::TaskNoProgress
         );
+    }
+
+    /// Spec 104: a worker asks without a synchronous user, settles while its
+    /// process is idle, and the same process resumes the turn from the control
+    /// socket's `answer_question`.
+    #[test]
+    fn a_worker_question_settles_and_resumes_from_the_answer_command() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let data_dir = scratch("question-answer");
+        let repo = data_dir.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/a.rs"), "fn main() {}\n").unwrap();
+        let store = SessionStore::new(&data_dir);
+        let session = store
+            .create_session(&workspace_engine::repository_id_for_root(&repo), "Worker")
+            .unwrap()
+            .id;
+        store
+            .record_worker_spawned(
+                &session,
+                &workspace_engine::WorkerRecord {
+                    parent_session_id: None,
+                    parent_task_id: None,
+                    inherited_protected_paths: Vec::new(),
+                    source_repository: repo.clone(),
+                    worktree_path: repo.clone(),
+                    branch: "main".to_string(),
+                    base_commit: "0000000".to_string(),
+                    included_uncommitted: false,
+                    git_commands: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let host = host_in_process(
+            &session,
+            &data_dir,
+            Box::new(move |_config: &Config| {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Box::new(
+                        workspace_engine::MockModelAdapter::new_sequence_with_tool_calls(
+                            vec![String::new()],
+                            vec![vec![workspace_engine::ToolCall {
+                                id: "call_question".to_string(),
+                                name: "ask_user".to_string(),
+                                arguments_json:
+                                    r#"{"question":"Did you mean the CLI or the shell?","options":["The CLI","The shell"]}"#
+                                        .to_string(),
+                            }]],
+                        ),
+                    ) as Box<dyn ModelAdapter>)
+                } else {
+                    Ok(Box::new(workspace_engine::MockModelAdapter::new(
+                        "The CLI it is.",
+                    )) as Box<dyn ModelAdapter>)
+                }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.dispatch(ControlCommand::Message {
+                text: "Do the thing".to_string(),
+            })
+            .0["ok"],
+            true
+        );
+        let question_id = wait_for_question(&host);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one model call asked");
+
+        let events =
+            workspace_engine::worker_progress::read_progress_after(&data_dir, &session, 0).unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event["kind"] == "question"
+                    && event["payload"]["questionId"] == question_id.as_str()
+                    && event["payload"]["question"] == "Did you mean the CLI or the shell?"
+                    && event["payload"].get("options").is_none()
+            }),
+            "the question line carries only its id and text: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event["kind"] == "status"
+                    && event["payload"]["state"] == "waiting_for_approval"
+                    && event["payload"]["questionId"] == question_id.as_str()
+            }),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| event["kind"] == "approval"),
+            "a question must not be projected as an approval: {events:?}"
+        );
+
+        // An answer the engine refuses (free text where only options are
+        // allowed) leaves the same durable question waiting. The host must not
+        // drop it and report idle.
+        assert_eq!(
+            host.dispatch(ControlCommand::AnswerQuestion {
+                question_id: question_id.clone(),
+                answer: "Both, actually".to_string(),
+                selected_option: None,
+            })
+            .0["ok"],
+            true
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let snapshot = host.snapshot();
+            let refused =
+                workspace_engine::worker_progress::read_progress_after(&data_dir, &session, 0)
+                    .unwrap()
+                    .iter()
+                    .any(|event| {
+                        event["kind"] == "status"
+                            && event["payload"]["questionId"] == question_id.as_str()
+                            && event["payload"]["error"]
+                                .as_str()
+                                .is_some_and(|error| error.contains("option"))
+                    });
+            if refused {
+                assert_eq!(snapshot["state"], "waiting_for_approval", "{snapshot}");
+                assert_eq!(snapshot["questionId"], question_id.as_str(), "{snapshot}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the refused answer did not return to the question: {snapshot}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert_eq!(
+            host.dispatch(ControlCommand::AnswerQuestion {
+                question_id: question_id.clone(),
+                answer: "The CLI".to_string(),
+                selected_option: Some(0),
+            })
+            .0["ok"],
+            true
+        );
+        wait_until_state(&host, "idle");
+
+        let results: Vec<String> = store
+            .read_messages(&session)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| message.content)
+            .collect();
+        assert!(
+            results
+                .iter()
+                .any(|result| result
+                    .contains("The user answered: \"The CLI\" (option 0: \"The CLI\")")),
+            "{results:?}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "the answer resumed the turn"
+        );
+    }
+
+    /// Spec 104: restarting a worker with an unanswered question puts the same
+    /// question back in front of the user without a model call.
+    #[test]
+    fn a_restarted_worker_reattaches_an_open_question() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let data_dir = scratch("question-restart");
+        let repo = data_dir.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/a.rs"), "fn main() {}\n").unwrap();
+        let store = SessionStore::new(&data_dir);
+        let session = store
+            .create_session(&workspace_engine::repository_id_for_root(&repo), "Worker")
+            .unwrap()
+            .id;
+        store
+            .record_worker_spawned(
+                &session,
+                &workspace_engine::WorkerRecord {
+                    parent_session_id: None,
+                    parent_task_id: None,
+                    inherited_protected_paths: Vec::new(),
+                    source_repository: repo.clone(),
+                    worktree_path: repo.clone(),
+                    branch: "main".to_string(),
+                    base_commit: "0000000".to_string(),
+                    included_uncommitted: false,
+                    git_commands: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        // A real engine turn writes the durable question and its paused turn.
+        let engine = workspace_engine::WorkspaceEngine::new(Config {
+            data_dir: data_dir.clone(),
+            enable_index_watcher: false,
+            ..Config::default()
+        });
+        let mut adapter = workspace_engine::MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new()],
+            vec![vec![workspace_engine::ToolCall {
+                id: "call_question".to_string(),
+                name: "ask_user".to_string(),
+                arguments_json: r#"{"question":"Which one?","options":["A","B"]}"#.to_string(),
+            }]],
+        );
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        let paused = engine
+            .chat_orchestrator
+            .ask_with_session_with_options(
+                &repo,
+                "Which one?",
+                &[],
+                Some(&session),
+                &mut adapter,
+                &mut sink,
+                ChatTurnOptions::worker(),
+            )
+            .expect("the worker turn asks");
+        let question_id = paused
+            .question_proposal
+            .expect("the durable question")
+            .question_id;
+        drop(engine);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let host = host_in_process(
+            &session,
+            &data_dir,
+            Box::new(move |_config: &Config| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(workspace_engine::MockModelAdapter::new("Done."))
+                    as Box<dyn ModelAdapter>)
+            }),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "reattaching a question must not start a model call"
+        );
+        let snapshot = host.snapshot();
+        assert_eq!(snapshot["state"], "waiting_for_approval", "{snapshot}");
+        assert_eq!(snapshot["questionId"], question_id.as_str(), "{snapshot}");
+        let events =
+            workspace_engine::worker_progress::read_progress_after(&data_dir, &session, 0).unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event["kind"] == "question"
+                    && event["payload"]["questionId"] == question_id.as_str()
+            }),
+            "{events:?}"
+        );
+    }
+
+    /// Waits for a question pause, returning its id.
+    fn wait_for_question(host: &WorkerHost) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let snapshot = host.snapshot();
+            if let Some(question_id) = snapshot["questionId"].as_str() {
+                assert_eq!(snapshot["state"], "waiting_for_approval", "{snapshot}");
+                return question_id.to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the worker never waited on its question: {snapshot}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_until_state(host: &WorkerHost, state: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while host.snapshot()["state"] != state {
+            assert!(
+                Instant::now() < deadline,
+                "the worker never reached {state}: {}",
+                host.snapshot()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// The control server on a thread against a temp data dir.

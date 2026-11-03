@@ -7028,6 +7028,11 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
         const label = document.createElement("div");
         label.className = "visually-hidden";
         label.textContent = "Assistant question";
+        // A worker's open question belongs to the worker process, so its
+        // answer goes through the control socket (spec 104). An ordinary
+        // session keeps the shell's answer route.
+        const questionSession = message.sessionId || currentSessionId;
+        const workerQuestion = isWorkerSession(questionSession);
         const card = createQuestionCard(
           {
             questionId: message.id,
@@ -7036,7 +7041,13 @@ function renderMessages(messages, tasks = [], compactions = [], conversation = n
             allowFreeText: message.allowFreeText === true,
           },
           repo(),
-          { answered },
+          {
+            answered,
+            onAnswer: workerQuestion
+              ? (value, selectedOption) =>
+                  answerWorkerQuestion(questionSession, message.id, value, selectedOption)
+              : null,
+          },
         );
         article.append(label, card);
         $("chat-log").append(article);
@@ -8448,7 +8459,7 @@ async function openWorkerSessionAt(sessionId, { source = "", review = false } = 
     // The worker's approval card arrives with the view's first progress read.
     await workerViewCaughtUp();
     const cards = $("chat-log").querySelectorAll(
-      ".command-approval, .patch-preview, .recovery-card",
+      ".command-approval, .patch-preview, .recovery-card, .question-card",
     );
     cards[cards.length - 1]?.scrollIntoView({ block: "center" });
   }
@@ -9709,6 +9720,7 @@ function syncWorkerView() {
       lastPhase: null,
       plan: null,
       approval: null,
+      question: null,
       liveText: "",
       live: null,
       pendingNotes: [],
@@ -9810,6 +9822,7 @@ async function applyWorkerProgress(view, answer) {
   // The first read catches up silently: what finished is already in the log.
   const live = view.caughtUp;
   let jobEnded = false;
+  let questionSeen = false;
   for (const event of Array.isArray(answer.events) ? answer.events : []) {
     view.after = Math.max(view.after, Number(event.seq) || 0);
     if (Number.isFinite(event.timestampMs)) view.lastActivityAtMs = event.timestampMs;
@@ -9819,7 +9832,13 @@ async function applyWorkerProgress(view, answer) {
       view.state = payload.state || view.state;
       if (view.state === "running" && before !== "paused" && before !== "running") {
         // A new job: a turn, or the rest of one after an approval.
-        Object.assign(view, { liveText: "", plan: null, approval: null, lastPhase: null });
+        Object.assign(view, {
+          liveText: "",
+          plan: null,
+          approval: null,
+          question: null,
+          lastPhase: null,
+        });
         Object.assign(view, { turnError: "", hasRun: true });
         if (live) {
           finishWorkerLive(view);
@@ -9835,6 +9854,9 @@ async function applyWorkerProgress(view, answer) {
         view.turnError = payload.error || "";
         view.liveText = "";
         view.plan = null;
+        // A waiting question has no approval card; the transcript draws the
+        // question itself (spec 104).
+        if (payload.questionId) view.approval = null;
         if (live) {
           finishWorkerLive(view);
           jobEnded = true;
@@ -9857,6 +9879,11 @@ async function applyWorkerProgress(view, answer) {
       if (live) renderPlanPanel(showWorkerLive(view).target, payload);
     } else if (event.kind === "approval") {
       view.approval = payload;
+    } else if (event.kind === "question") {
+      // The card itself is drawn from the session log, where its options are
+      // recorded; this line only says the worker is holding a question.
+      view.question = payload;
+      questionSeen = true;
     } else if (event.kind === "note" && live) {
       await showWorkerNote(view, payload.messageId);
     }
@@ -9868,6 +9895,9 @@ async function applyWorkerProgress(view, answer) {
     view.caughtUp = true;
     if (view.alive && (view.state === "running" || view.state === "paused")) showWorkerLive(view);
     renderWorkerView(view);
+    // A question may have been recorded between the log read and this first
+    // progress read; redraw the log so its card appears now.
+    if (questionSeen && view.state === "waiting_for_approval") await loadSession(view.sessionId);
     view.resolveReady();
     return;
   }
@@ -9894,6 +9924,7 @@ function resetWorkerViewForRestart(view) {
     lastPhase: null,
     plan: null,
     approval: null,
+    question: null,
     liveText: "",
     turnError: "",
     pendingNotes: [],
@@ -10305,6 +10336,26 @@ async function sendWorkerChecks(view, proposal, decisions) {
       command: "checks",
       proposal_id: proposal.proposalId,
       decisions: JSON.stringify(decisions),
+    }),
+  );
+  pollWorkerProgressNow(view);
+}
+
+// Spec 104: a worker's question is answered in its own process. The answer
+// authorises nothing; it only resumes the paused turn.
+async function answerWorkerQuestion(sessionId, questionId, answer, selectedOption) {
+  const view = workerView;
+  if (!view || view.sessionId !== sessionId || !view.alive) {
+    throw new Error("Restart the worker to answer this question.");
+  }
+  await api(
+    "/api/worker-control",
+    form({
+      session_id: sessionId,
+      command: "answer_question",
+      question_id: questionId,
+      answer,
+      selected_option: selectedOption === null ? "" : String(selectedOption),
     }),
   );
   pollWorkerProgressNow(view);
@@ -12150,7 +12201,7 @@ async function appendGitStatusAfterChange(repoPath) {
 //
 // `answered` is the recorded answer when the card is rebuilt from the
 // transcript or a recovered turn; `null` means it is still open.
-function createQuestionCard(question, questionRepo, { answered = null } = {}) {
+function createQuestionCard(question, questionRepo, { answered = null, onAnswer = null } = {}) {
   const wrapper = document.createElement("section");
   wrapper.className = "question-card";
   wrapper.dataset.questionId = question.questionId || "";
@@ -12240,6 +12291,24 @@ function createQuestionCard(question, questionRepo, { answered = null } = {}) {
   if (answered !== null) setDisabled(true);
 
   async function submit(value, selectedOption) {
+    // Spec 104: a worker's answer goes to its own control socket, never to the
+    // shell's answer route, because the paused turn lives in the worker's
+    // process. The callback is supplied only for a worker session.
+    if (onAnswer) {
+      setDisabled(true);
+      status.hidden = false;
+      status.textContent = "Answering…";
+      try {
+        await onAnswer(value, selectedOption);
+      } catch (error) {
+        status.textContent = error.message;
+        setDisabled(false);
+        return;
+      }
+      appendChatMessage("answer", value);
+      settle(value);
+      return;
+    }
     if (chatSubmitting) {
       toast("A turn is already running");
       return;

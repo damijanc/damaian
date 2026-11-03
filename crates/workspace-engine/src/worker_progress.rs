@@ -25,6 +25,10 @@ pub enum ProgressKind {
     /// (spec 98). The payload carries `taskId` and `paths`, each
     /// `{"path": …, "kind": "file" | "directory"}`.
     ProtectedPaths,
+    /// A question the model asked and the worker is waiting on (spec 104).
+    /// The payload carries only `questionId` and the already-redacted
+    /// `question` display text; the options live in the session log.
+    Question,
 }
 
 impl ProgressKind {
@@ -38,6 +42,7 @@ impl ProgressKind {
             Self::Approval => "approval",
             Self::Note => "note",
             Self::ProtectedPaths => "protected_paths",
+            Self::Question => "question",
         }
     }
 }

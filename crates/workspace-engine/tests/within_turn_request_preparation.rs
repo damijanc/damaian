@@ -120,10 +120,7 @@ fn run_turn_for_session(
             session_id,
             adapter,
             &mut sink,
-            ChatTurnOptions {
-                user_present: true,
-                ..ChatTurnOptions::default()
-            },
+            ChatTurnOptions::interactive(),
         );
     }
     (result, progress)

@@ -234,6 +234,15 @@ prompt for those contexts instructs it to proceed under an explicitly stated
 assumption and record it — which lands in the task report (Phase 5 WP7) as a
 line saying what was assumed and why.
 
+> **Amended by [spec 104](../104_worker_questions/proposal.md).** Availability
+> is now two capabilities: a durable `question_route_available` and a
+> `synchronous_user_present`. An app-managed worker has the route without a
+> synchronous user, so it is offered `ask_user` and pauses durably. A truly
+> headless turn has neither, so the tool stays absent; its prompt now allows a
+> stated assumption only for low-impact ambiguity and says a material one must
+> stop as incomplete rather than guess. `fetch_url` still requires the
+> synchronous user. The rest of this section is unchanged.
+
 [Spec 20](../20_working_modes/proposal.md)'s mode gate is the mechanism: the tool is
 read-only and available in every mode, and the headless case is an execution
 context that narrows the offered set, never a mode that widens one.

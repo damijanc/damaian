@@ -699,6 +699,21 @@ fn turn(
     user_present: bool,
     adapter: &mut dyn ModelAdapter,
 ) -> ChatTurnResult {
+    let options = if user_present {
+        ChatTurnOptions::interactive()
+    } else {
+        ChatTurnOptions::default()
+    };
+    turn_with_options(engine, repo, session_id, options, adapter)
+}
+
+fn turn_with_options(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: Option<&str>,
+    options: ChatTurnOptions,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
     let cancel = CancelToken::new();
     let mut on_token = |_token: &str| {};
     let mut on_progress = |_event: TurnProgress| {};
@@ -717,10 +732,7 @@ fn turn(
             session_id,
             adapter,
             &mut sink,
-            ChatTurnOptions {
-                user_present,
-                ..ChatTurnOptions::default()
-            },
+            options,
         )
         .expect("the turn should run")
 }
@@ -728,9 +740,23 @@ fn turn(
 /// The tool names the first model request of a turn offered, in a session set
 /// to `mode` beforehand.
 fn offered_tools(repo: &Path, mode: SessionMode, user_present: bool, cap: u32) -> Vec<String> {
+    let options = if user_present {
+        ChatTurnOptions::interactive()
+    } else {
+        ChatTurnOptions::default()
+    };
+    offered_tools_with(repo, mode, options, cap)
+}
+
+fn offered_tools_with(
+    repo: &Path,
+    mode: SessionMode,
+    options: ChatTurnOptions,
+    cap: u32,
+) -> Vec<String> {
     let engine = engine_for(repo, cap);
     let mut warm = MockModelAdapter::new("Ready.");
-    let session = turn(&engine, repo, None, user_present, &mut warm)
+    let session = turn_with_options(&engine, repo, None, options, &mut warm)
         .session
         .id;
     engine
@@ -738,7 +764,7 @@ fn offered_tools(repo: &Path, mode: SessionMode, user_present: bool, cap: u32) -
         .set_session_mode(&session, mode, "user")
         .unwrap();
     let mut adapter = MockModelAdapter::new("Done.");
-    turn(&engine, repo, Some(&session), user_present, &mut adapter);
+    turn_with_options(&engine, repo, Some(&session), options, &mut adapter);
     adapter.requests[0]
         .tools
         .as_ref()
@@ -968,6 +994,29 @@ fn ask_user_is_not_offered_without_a_user() {
 }
 
 #[test]
+fn a_worker_turn_is_offered_ask_user_but_not_a_synchronous_fetch() {
+    let repo = temp_repo("worker-offer");
+    let names = offered_tools_with(&repo, SessionMode::Code, ChatTurnOptions::worker(), 2);
+    assert!(names.iter().any(|name| name == "ask_user"), "{names:?}");
+    assert!(
+        !names.iter().any(|name| name == "fetch_url"),
+        "a worker has no synchronous user to approve a first host: {names:?}"
+    );
+    // The rest of the list is still there: this is a real worker offer.
+    assert!(names.iter().any(|name| name == "read_file"), "{names:?}");
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_headless_turn_is_offered_neither_the_question_route_nor_a_fetch() {
+    let repo = temp_repo("headless-offer");
+    let names = offered_tools_with(&repo, SessionMode::Code, ChatTurnOptions::default(), 2);
+    assert!(!names.iter().any(|name| name == "ask_user"), "{names:?}");
+    assert!(!names.iter().any(|name| name == "fetch_url"), "{names:?}");
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
 fn a_cap_of_zero_means_ask_user_is_not_offered() {
     let repo = temp_repo("cap-zero");
     let names = offered_tools(&repo, SessionMode::Code, true, 0);
@@ -1004,6 +1053,8 @@ fn an_unoffered_ask_user_call_is_refused_as_a_tool_result_and_the_turn_continues
     assert_eq!(results.len(), 1, "{results:?}");
     assert!(results[0].contains("No user can answer"), "{results:?}");
     assert!(results[0].contains("assumption"), "{results:?}");
+    assert!(results[0].contains("materially"), "{results:?}");
+    assert!(results[0].contains("incomplete"), "{results:?}");
     // The turn went on to a second model call and finished on its answer.
     assert_eq!(adapter.requests.len(), 2);
     assert_eq!(result.response, "Assuming the CLI.");
@@ -1081,6 +1132,103 @@ fn a_question_is_answered_and_the_turn_continues() {
     assert_eq!(state.answer, Some(("The CLI".to_string(), Some(0))));
     assert_eq!(pending_turns(&repo), 0, "resuming consumes the pause");
 
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_worker_turn_can_ask_and_resume_the_same_turn_after_its_process_was_idle() {
+    let repo = temp_repo("worker-answered");
+    let engine = engine_for(&repo, 2);
+    let mut adapter = asks_then_answers(CLI_OR_SHELL_CALL);
+    let paused = turn_with_options(
+        &engine,
+        &repo,
+        None,
+        ChatTurnOptions::worker(),
+        &mut adapter,
+    );
+    let proposal = paused
+        .question_proposal
+        .clone()
+        .expect("a worker turn may ask");
+    assert_eq!(paused.task.status, TaskStatus::WaitingForApproval);
+    assert_eq!(
+        engine
+            .session_store
+            .pending_approval_for(&paused.session.id, &paused.task.id)
+            .unwrap(),
+        None,
+        "a worker question is still not an approval"
+    );
+
+    let mut resumed_adapter = MockModelAdapter::new("The shell it is.");
+    let resumed = resume_after_answer(
+        &engine,
+        &proposal.question_id,
+        "The shell",
+        Some(1),
+        &mut resumed_adapter,
+    )
+    .expect("the worker's answer resumes the same turn");
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    assert_eq!(resumed.response, "The shell it is.");
+    let last = resumed_adapter.requests[0]
+        .messages
+        .last()
+        .expect("the resumed request has messages");
+    assert!(
+        last.content
+            .contains("The user answered: \"The shell\" (option 1: \"The shell\")"),
+        "{}",
+        last.content
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_worker_answer_never_satisfies_a_command_approval() {
+    let repo = temp_repo("worker-answer-command");
+    let engine = engine_for(&repo, 2);
+    let mut adapter = asks_then_answers(CLI_OR_SHELL_CALL);
+    let paused = turn_with_options(
+        &engine,
+        &repo,
+        None,
+        ChatTurnOptions::worker(),
+        &mut adapter,
+    );
+    let question_id = paused
+        .question_proposal
+        .as_ref()
+        .unwrap()
+        .question_id
+        .clone();
+    let command = ToolCall {
+        id: "call_worker_command".to_string(),
+        name: "run_command".to_string(),
+        arguments_json: r#"{"command":"touch should-not-run.txt","reason":"Write a marker file."}"#
+            .to_string(),
+    };
+    let mut command_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Approval needed.".to_string()],
+        vec![vec![command], Vec::new()],
+    );
+    let resumed = resume_after_answer(
+        &engine,
+        &question_id,
+        "The CLI",
+        Some(0),
+        &mut command_adapter,
+    )
+    .expect("the turn resumes and then pauses on the command");
+    assert!(
+        resumed.command_proposal.is_some(),
+        "the answer must not approve the command"
+    );
+    assert!(
+        !repo.join("should-not-run.txt").exists(),
+        "the command ran on a question answer"
+    );
     fs::remove_dir_all(repo).unwrap();
 }
 

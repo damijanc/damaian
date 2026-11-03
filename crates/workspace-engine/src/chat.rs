@@ -807,13 +807,22 @@ pub struct ChatTurnOptions {
     /// offer, which is the fail-closed direction, never cause a switch.
     #[serde(default)]
     pub provider_fallback_used: bool,
-    /// Someone can answer a question mid-turn (spec 50 `context.md` §4). Only
-    /// then is `ask_user` offered; otherwise the system prompt tells the model
-    /// to proceed under a stated assumption. It defaults to `false`, so a
-    /// driver that never sets it — the CLI, the eval harness, anything added
-    /// later — fails safe: nothing waits forever for an answer.
+    /// A real person is present *while this turn runs*, which is what
+    /// `fetch_url` needs because its first host approval is a dialog on the
+    /// turn's own path (spec 51 §5.3).
+    ///
+    /// Spec 104 split the old `user_present` test in two. The alias keeps
+    /// pending turns written before the split loadable: an old `true` was
+    /// always an interactive session, so it grants both capabilities below.
+    #[serde(default, alias = "user_present")]
+    pub synchronous_user_present: bool,
+    /// A question can be delivered to a person and answered later, without
+    /// the asker being synchronously present (spec 104). The desktop app's
+    /// ordinary sessions set this, app-managed workers set only this, and a
+    /// truly headless CLI or eval turn sets neither. `ask_user` is offered
+    /// when this is true and the per-turn cap is above zero.
     #[serde(default)]
-    pub user_present: bool,
+    pub question_route_available: bool,
     /// Extra tool rounds granted to this turn across round-budget continuations
     /// (spec 61 §5.2). Seeded on resume from the pending turn's running
     /// `rounds_granted`, so the resumed turn's `max_rounds` continues where it
@@ -840,6 +849,34 @@ pub struct ChatTurnOptions {
     /// batch; the ordinary turn path must not write a second resume edge.
     #[serde(default)]
     pub plan_already_carried: bool,
+}
+
+impl ChatTurnOptions {
+    /// An ordinary desktop session: a person is here and a question can also
+    /// be answered after the turn pauses.
+    pub fn interactive() -> Self {
+        Self {
+            synchronous_user_present: true,
+            question_route_available: true,
+            ..Self::default()
+        }
+    }
+
+    /// An app-managed worker: no one is present synchronously, but a question
+    /// becomes a durable pause the worker's own session can answer.
+    pub fn worker() -> Self {
+        Self {
+            question_route_available: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether `ask_user` may be offered. An old persisted `user_present=true`
+    /// grants the route through [`Self::synchronous_user_present`], so a
+    /// pending turn written before spec 104 keeps its capability.
+    pub fn question_route(&self) -> bool {
+        self.question_route_available || self.synchronous_user_present
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1840,7 +1877,7 @@ impl ChatOrchestrator {
         let messages = vec![
             ModelMessage::system(system_prompt_for_session(
                 mode,
-                options.user_present,
+                &options,
                 offer_handoffs,
                 &self.config.shell,
             )),
@@ -3651,6 +3688,10 @@ impl ChatOrchestrator {
                 ("reasons", reasons),
             ],
         )?;
+        let options = ChatTurnOptions {
+            plan_already_carried: true,
+            ..engine_started_turn_options(&self.session_store, session_id)
+        };
         self.ask_with_session_using_task(
             repository_root,
             &prompt,
@@ -3659,10 +3700,7 @@ impl ChatOrchestrator {
             continued.position,
             model_adapter,
             sink,
-            ChatTurnOptions {
-                plan_already_carried: true,
-                ..ChatTurnOptions::default()
-            },
+            options,
         )
     }
 
@@ -3875,10 +3913,14 @@ impl ChatOrchestrator {
             self.conversation_window_tokens(),
             &self.scanner,
         );
+        let options = ChatTurnOptions {
+            verification_turn: true,
+            ..engine_started_turn_options(&self.session_store, &session.id)
+        };
         let messages = vec![
             ModelMessage::system(system_prompt_for_session(
                 SessionMode::Code,
-                false,
+                &options,
                 false,
                 &self.config.shell,
             )),
@@ -3889,10 +3931,6 @@ impl ChatOrchestrator {
             )),
         ];
         note_turn_overhead(&mut context.manifest, &prompt_conversation, &messages);
-        let options = ChatTurnOptions {
-            verification_turn: true,
-            ..Default::default()
-        };
         // Spec 27 §5.1: a repair turn is a turn, so the pre-send review holds it
         // too. `resume_after_context_decision` carries `verification_turn` and
         // closes a resumed repair that answers without a patch through
@@ -4293,10 +4331,11 @@ impl ChatOrchestrator {
         );
         let offer_handoffs = self.config.enable_worker_sessions
             && self.session_store.worker_record(&session.id)?.is_none();
+        let options = engine_started_turn_options(&self.session_store, &session.id);
         let messages = vec![
             ModelMessage::system(system_prompt_for_session(
                 SessionMode::Code,
-                false,
+                &options,
                 offer_handoffs,
                 &self.config.shell,
             )),
@@ -4307,7 +4346,6 @@ impl ChatOrchestrator {
             )),
         ];
         note_turn_overhead(&mut context.manifest, &prompt_conversation, &messages);
-        let options = ChatTurnOptions::default();
         if self.config.pause_for_context_review {
             return self.pause_for_context_review(
                 repository_root,
@@ -8190,7 +8228,7 @@ impl ChatOrchestrator {
         // "not offered", never "offered and always refused". Decided once, so
         // the offer and Layer 3's refusal below cannot disagree.
         let ask_user_offered = self.config.supports_native_tools()
-            && turn_options.user_present
+            && turn_options.question_route()
             && self.config.agent_max_questions_per_turn > 0
             && permits(
                 mode,
@@ -8209,7 +8247,7 @@ impl ChatOrchestrator {
         // approved, so the tool is withheld where `ask_user` is withheld. A cap
         // of 0 means "not offered", never "offered and always refused".
         let fetch_url_offered = self.config.supports_native_tools()
-            && turn_options.user_present
+            && turn_options.synchronous_user_present
             && self.config.web_fetch_max_per_turn > 0
             && permits(
                 mode,
@@ -14299,16 +14337,34 @@ pub(crate) fn apply_protected_paths_reminder(
     }
 }
 
-/// [`system_prompt`] plus the handoff paragraph when the session is offered
+/// Turn options for a turn the engine starts itself rather than one a host
+/// started. A worker keeps its question route (spec 104); every other
+/// engine-started turn keeps spec 50's headless default.
+fn engine_started_turn_options(
+    store: &crate::session::SessionStore,
+    session_id: &str,
+) -> ChatTurnOptions {
+    match store.worker_record(session_id) {
+        Ok(Some(_)) => ChatTurnOptions::worker(),
+        _ => ChatTurnOptions::default(),
+    }
+}
+
+/// `system_prompt` plus the handoff paragraph when the session is offered
 /// handoffs. `system_prompt` itself never changes, which is how the setting
 /// being off stays byte-for-byte off (spec 57 requirement 1).
 fn system_prompt_for_session(
     mode: SessionMode,
-    user_present: bool,
+    options: &ChatTurnOptions,
     offer_handoffs: bool,
     shell: &str,
 ) -> String {
-    let prompt = system_prompt(mode, user_present, shell);
+    let prompt = system_prompt_with_capabilities(
+        mode,
+        options.question_route(),
+        options.synchronous_user_present,
+        shell,
+    );
     if offer_handoffs {
         format!("{prompt}\n\n{WORKTREE_TASK_PARAGRAPH}\n\n{WORKER_HANDOFF_PARAGRAPH}")
     } else {
@@ -14423,7 +14479,7 @@ fn hash_existing_files(root: &Path, paths: &[String]) -> BTreeMap<String, String
 }
 
 /// The tool result for an `ask_user` call nobody can answer.
-const NO_USER_CAN_ANSWER: &str = "No user can answer a question in this context, so the question was not asked. Proceed under an explicitly stated assumption, and say in your answer what you assumed and why.";
+const NO_USER_CAN_ANSWER: &str = "No user can answer a question in this context, so the question was not asked. Where an ambiguity is small and the default is low-impact, proceed under an explicitly stated assumption, and say in your answer what you assumed and why. Where it would materially change the scope, public behaviour, destructive actions or acceptance criteria, do not guess: stop and report the task incomplete, explaining what you need decided.";
 
 /// What `read_file` returned this task, for the egress guard (spec 51 D9).
 ///
@@ -14480,16 +14536,34 @@ fn answered_question_result(
     }
 }
 
-/// What a turn with nobody to ask is told instead of being offered `ask_user`
-/// (spec 50 `context.md` §4). Where a user is present the prompt carries no
-/// word about asking: the tool's own description does that, and the prompt
-/// stays byte-identical to what it was before spec 50.
-const HEADLESS_PARAGRAPH: &str = "No user is available to answer questions during this task. Where the request is ambiguous, do not stop to ask: proceed under an explicitly stated assumption, and say in your answer what you assumed and why.";
+/// What a turn with no answer route is told instead of being offered
+/// `ask_user` (spec 50 `context.md` §4; amended by spec 104). Low-impact
+/// ambiguity may still be settled by a stated assumption, but a material one
+/// must stop rather than guess, because nobody can correct it later.
+const HEADLESS_PARAGRAPH: &str = "No user is available to answer questions during this task. Where an ambiguity is small and the default is low-impact, do not stop: proceed under an explicitly stated assumption, and say in your answer what you assumed and why. Where the answer would materially change the scope, public behaviour, destructive actions or acceptance criteria, do not guess: stop and report the task incomplete, explaining what you need decided.";
 
+/// A turn whose question route exists but whose user is not synchronously
+/// present (spec 104), which is every app-managed worker turn. The tool is the
+/// route; this paragraph only sets the bar for using it. The ordinary
+/// interactive prompt stays byte-identical to what it was before spec 50.
+const WORKER_QUESTION_PARAGRAPH: &str = "A user can answer a question, but not while you are working: asking pauses this task until they respond. Prefer proceeding under an explicitly stated assumption for low-impact ambiguity. Ask with `ask_user` when the answer would materially change the scope, public behaviour, destructive actions or acceptance criteria, and say why you cannot decide it from the repository.";
+
+#[cfg(test)]
 fn system_prompt(mode: SessionMode, user_present: bool, shell: &str) -> String {
+    system_prompt_with_capabilities(mode, user_present, user_present, shell)
+}
+
+fn system_prompt_with_capabilities(
+    mode: SessionMode,
+    question_route: bool,
+    synchronous_user_present: bool,
+    shell: &str,
+) -> String {
     let prompt = mode_system_prompt(mode, shell);
-    if user_present {
+    if synchronous_user_present {
         prompt
+    } else if question_route {
+        format!("{prompt}\n\n{WORKER_QUESTION_PARAGRAPH}")
     } else {
         format!("{prompt}\n\n{HEADLESS_PARAGRAPH}")
     }
@@ -18674,8 +18748,13 @@ mod worker_handoff_tests {
 
         for mode in ALL_MODES {
             for user_present in [true, false] {
+                let options = ChatTurnOptions {
+                    synchronous_user_present: user_present,
+                    question_route_available: user_present,
+                    ..ChatTurnOptions::default()
+                };
                 assert_eq!(
-                    system_prompt_for_session(mode, user_present, true, "/bin/zsh"),
+                    system_prompt_for_session(mode, &options, true, "/bin/zsh"),
                     format!(
                         "{}\n\n{worktree_task}\n\n{from_the_spec}",
                         system_prompt(mode, user_present, "/bin/zsh")
@@ -18690,8 +18769,13 @@ mod worker_handoff_tests {
     fn no_mode_changes_when_handoffs_are_not_offered() {
         for mode in ALL_MODES {
             for user_present in [true, false] {
+                let options = ChatTurnOptions {
+                    synchronous_user_present: user_present,
+                    question_route_available: user_present,
+                    ..ChatTurnOptions::default()
+                };
                 assert_eq!(
-                    system_prompt_for_session(mode, user_present, false, "/bin/zsh"),
+                    system_prompt_for_session(mode, &options, false, "/bin/zsh"),
                     system_prompt(mode, user_present, "/bin/zsh"),
                     "{mode:?}"
                 );
@@ -18877,11 +18961,35 @@ mod clarification_tests {
     #[test]
     fn without_a_user_the_prompt_gains_only_the_headless_paragraph() {
         assert!(HEADLESS_PARAGRAPH.contains("assumption"));
+        assert!(HEADLESS_PARAGRAPH.contains("materially"));
+        assert!(HEADLESS_PARAGRAPH.contains("incomplete"));
         for mode in ALL_MODES {
             assert_eq!(
                 system_prompt(mode, false, "/bin/zsh"),
                 format!("{}\n\n{HEADLESS_PARAGRAPH}", prompt_before_spec_50(mode)),
                 "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_worker_route_keeps_the_assumption_rule_and_asks_for_material_ambiguity() {
+        assert!(WORKER_QUESTION_PARAGRAPH.contains("explicitly stated assumption"));
+        assert!(WORKER_QUESTION_PARAGRAPH.contains("materially change"));
+        assert!(WORKER_QUESTION_PARAGRAPH.contains("ask_user"));
+        for mode in ALL_MODES {
+            let prompt = system_prompt_with_capabilities(mode, true, false, "/bin/zsh");
+            assert_eq!(
+                prompt,
+                format!(
+                    "{}\n\n{WORKER_QUESTION_PARAGRAPH}",
+                    prompt_before_spec_50(mode)
+                ),
+                "{mode:?}"
+            );
+            assert!(
+                !prompt.contains(HEADLESS_PARAGRAPH),
+                "a worker has an answer route, so it is not headless: {mode:?}"
             );
         }
     }
@@ -21030,7 +21138,12 @@ mod approval_prompt_wording_tests {
         );
         // A summary that covers part of the span and a window that carries the
         // rest still never places model-authored text in the system prompt.
-        let system = system_prompt_for_session(SessionMode::Code, false, false, "/bin/zsh");
+        let system = system_prompt_for_session(
+            SessionMode::Code,
+            &ChatTurnOptions::default(),
+            false,
+            "/bin/zsh",
+        );
         assert!(!system.contains("begin prior conversation summary"));
         assert!(!system.contains("keep the API stable"));
 

@@ -3896,10 +3896,7 @@ fn a_question_pause_does_not_dispatch_before_task_complete() {
         &root,
         None,
         &mut adapter,
-        ChatTurnOptions {
-            user_present: true,
-            ..ChatTurnOptions::default()
-        },
+        ChatTurnOptions::interactive(),
     )
     .expect("the turn pauses for the answer");
 
@@ -4560,10 +4557,7 @@ fn request_approval_does_not_turn_a_question_into_an_approval() {
         &root,
         None,
         &mut adapter,
-        ChatTurnOptions {
-            user_present: true,
-            ..ChatTurnOptions::default()
-        },
+        ChatTurnOptions::interactive(),
     )
     .expect("the refused question is a tool result");
 

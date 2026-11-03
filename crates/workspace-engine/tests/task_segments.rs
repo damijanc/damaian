@@ -788,14 +788,8 @@ fn a_command_pause_and_resume_keeps_the_same_segment() {
 fn a_question_pause_and_resume_keeps_the_same_segment() {
     let repo = temp_repo("question");
     let engine = engine_for(&repo, |_| {});
-    let (proposal_id, session, approved) = plan_review(
-        &engine,
-        &repo,
-        ChatTurnOptions {
-            user_present: true,
-            ..ChatTurnOptions::default()
-        },
-    );
+    let (proposal_id, session, approved) =
+        plan_review(&engine, &repo, ChatTurnOptions::interactive());
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
         vec![String::new()],
         vec![vec![call(
@@ -1300,14 +1294,8 @@ fn task4_measures_the_same_capped_request_the_adapter_receives() {
 fn a_corrupt_pending_segment_resume_state_fails_closed() {
     let repo = temp_repo("corrupt-resume");
     let engine = engine_for(&repo, |_| {});
-    let (proposal_id, session, approved) = plan_review(
-        &engine,
-        &repo,
-        ChatTurnOptions {
-            user_present: true,
-            ..ChatTurnOptions::default()
-        },
-    );
+    let (proposal_id, session, approved) =
+        plan_review(&engine, &repo, ChatTurnOptions::interactive());
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
         vec![String::new()],
         vec![vec![call(

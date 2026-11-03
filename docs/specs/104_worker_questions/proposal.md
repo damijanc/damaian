@@ -1,12 +1,13 @@
 # Feature Spec: A Worker Can Ask Instead of Guessing
 
-Status: Not started
+Status: Done 2026-11-03 (Tasks 1–6; scoped local checks are recorded in
+[`tasks.md`](tasks.md), and the full seven-check gate is left to CI).
 Order: 104 of 106
 Plan: none. This is a single-worker capability gap found during the 2026-10-31
 investigation.
-Depends on: [#50](50_model_initiated_clarification/proposal.md) (durable
-questions), [#57](57_worker_sessions/proposal.md) (worker process and control
-socket), and [#99](99_worker_task_outcomes.md) (worker outcome UI), all built.
+Depends on: [#50](../50_model_initiated_clarification/proposal.md) (durable
+questions), [#57](../57_worker_sessions/proposal.md) (worker process and control
+socket), and [#99](../99_worker_task_outcomes.md) (worker outcome UI), all built.
 Everything else named below is a cross-reference, not a prerequisite.
 
 ## 1. Motivation
@@ -73,3 +74,46 @@ permitted by #50.
   explains that material ambiguity must stop as incomplete rather than guess.
 - The question limit, secret screening and recovery tests from #50 pass for a
   worker session as well as an ordinary one.
+
+## 6. Implementation Notes
+
+The execution order, corrections and scoped-check evidence are in
+[`tasks.md`](tasks.md); the decisions planning had to settle are in
+[`context.md`](context.md). Where the feature landed:
+
+- **Two capabilities (Tasks 1–2).** `ChatTurnOptions` now carries
+  `question_route_available` and `synchronous_user_present`; the old
+  `user_present` JSON key is a serde alias for the second so pending turns keep
+  loading. `ask_user` is offered when the route exists and the cap is above
+  zero; `fetch_url` still requires the synchronous user. A worker-only prompt
+  keeps the stated-assumption rule and asks on material ambiguity; a headless
+  prompt now says material ambiguity must stop as incomplete rather than guess.
+- **Worker host (Task 3).** A worker turn starts with `ChatTurnOptions::worker()`
+  and settles `WaitingForApproval` on a question id. The host writes a
+  `question` progress line carrying only the id and redacted display text, puts
+  the id in its status line, and answers through the distinct
+  `answer_question` control command. `approve`/`reject` refuse a question id and
+  `answer_question` refuses every other pending kind; the status snapshot uses
+  `questionId`, never `proposalId`.
+- **Restart (Task 4).** `restore_pending_decision` reattaches a plan review as
+  before and now also an unanswered question, writing the same progress and
+  settling the same id without a model call. An already-answered question is
+  not reattached: spec 50's rule is that an answered question is never asked
+  again.
+- **Outcome and UI (Task 5).** `WorkerTaskFacts` gained `pending_question`, and
+  the engine renders **Needs your answer** with a new `NeedsAnswer` outcome,
+  the *Needs you* group, no composer and the review action. The board's
+  `doing` uses the same headline. The worker view draws the existing question
+  card from the transcript and routes its answer through the control socket;
+  *Review* now scrolls to that card too.
+- **Tests and documentation (Task 6).** Engine tests cover the two-capability
+  split, worker offering and answer routing, the prompt split, and a question
+  never satisfying an approval. Desktop tests cover socket parsing, the two
+  endpoints refusing each other, live settle/answer, restart reattachment, the
+  progress projection and the control route's field names. `USER_GUIDE.md`,
+  `TROUBLESHOOTING.md` and the spec README were updated.
+
+No manual browser walk was performed. The card is the spec 50 component
+unchanged except for which route its answer takes, and the reload/restart
+behaviour is covered by the automated tests above; a visual walk remains the
+one uncovered check.

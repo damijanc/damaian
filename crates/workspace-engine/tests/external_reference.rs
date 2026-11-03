@@ -1973,10 +1973,7 @@ fn fetch_turn(
             session_id,
             adapter,
             &mut sink,
-            ChatTurnOptions {
-                user_present: true,
-                ..ChatTurnOptions::default()
-            },
+            ChatTurnOptions::interactive(),
         )
         .expect("the turn should run")
 }

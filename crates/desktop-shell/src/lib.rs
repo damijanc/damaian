@@ -4524,10 +4524,7 @@ fn run_chat_request_with_task(
         cancel,
         steering: None,
     };
-    let turn_options = ChatTurnOptions {
-        user_present: true,
-        ..ChatTurnOptions::default()
-    };
+    let turn_options = ChatTurnOptions::interactive();
     engine
         .chat_orchestrator
         .ask_with_session_using_task(
@@ -4599,13 +4596,11 @@ fn run_chat_request_with(
         cancel,
         steering: None,
     };
-    let turn_options = ChatTurnOptions {
-        // The desktop app is the one executor with a user present: the question
-        // card and `/api/answer-question-stream` deliver the answer. Every
-        // other driver leaves this false and is never offered `ask_user`.
-        user_present: true,
-        ..ChatTurnOptions::default()
-    };
+    // The desktop app is an interactive executor: the question card and
+    // `/api/answer-question-stream` deliver an answer, and `fetch_url` may ask
+    // for a host synchronously. Every other driver sets neither or, for an
+    // app-managed worker, only the question route (spec 104).
+    let turn_options = ChatTurnOptions::interactive();
     engine
         .chat_orchestrator
         .ask_with_session_with_options(
@@ -8160,10 +8155,7 @@ mod tests {
                 None,
                 &mut adapter,
                 &mut sink,
-                ChatTurnOptions {
-                    user_present: true,
-                    ..ChatTurnOptions::default()
-                },
+                ChatTurnOptions::interactive(),
             )
             .expect("the command pauses for approval");
         assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
@@ -8196,10 +8188,7 @@ mod tests {
                 None,
                 &mut adapter,
                 &mut sink,
-                ChatTurnOptions {
-                    user_present: true,
-                    ..ChatTurnOptions::default()
-                },
+                ChatTurnOptions::interactive(),
             )
             .expect("the turn pauses on a question");
         assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
@@ -17241,6 +17230,15 @@ exec /bin/cat > /dev/null
             control(&[("command", "resume")]).unwrap();
             control(&[("command", "pause")]).unwrap();
             control(&[("command", "continue-repair")]).unwrap();
+            // Spec 104: a question answer has its own command name and field
+            // names; the route must not turn it into an approval.
+            control(&[
+                ("command", "answer_question"),
+                ("question_id", "question_1"),
+                ("answer", "The CLI"),
+                ("selected_option", "0"),
+            ])
+            .unwrap();
 
             let seen = requests.lock().unwrap().clone();
             let token = seen[0]["token"].as_str().unwrap().to_string();
@@ -17274,6 +17272,12 @@ exec /bin/cat > /dev/null
                     json!({"command": "resume"}),
                     json!({"command": "pause"}),
                     json!({"command": "continue-repair"}),
+                    json!({
+                        "command": "answer_question",
+                        "questionId": "question_1",
+                        "answer": "The CLI",
+                        "selectedOption": "0",
+                    }),
                 ]
             );
 
@@ -17625,6 +17629,91 @@ exec /bin/cat > /dev/null
             assert_eq!(
                 page["control"]["primaryAction"]["command"],
                 "review_decision"
+            );
+
+            fixture.supervisor.shutdown_all();
+        }
+
+        /// Spec 104: a waiting question is projected as **Needs your answer**,
+        /// grouped under *Needs you* with the review action, and never as an
+        /// approval.
+        #[test]
+        fn a_worker_question_is_needs_your_answer_on_the_board_and_progress() {
+            let fixture = Fixture::new();
+            let spawned = fixture.spawn("Waiting on a question", None);
+            let task = fixture
+                .store()
+                .create_task(&spawned.session_id, "Ask first", "mock", "mock")
+                .unwrap();
+            fixture
+                .store()
+                .update_task_status(&task, TaskStatus::WaitingForApproval, None)
+                .unwrap();
+            let mut writer = ProgressWriter::create(
+                &fixture.config.data_dir,
+                &spawned.session_id,
+                SecretScanner::new(Vec::new()),
+            )
+            .unwrap();
+            writer
+                .append(
+                    ProgressKind::Question,
+                    json!({"questionId": "question_1", "question": "Which one?"}),
+                )
+                .unwrap();
+            writer
+                .append(
+                    ProgressKind::Status,
+                    json!({
+                        "state": "waiting_for_approval",
+                        "taskStatus": "waiting_for_approval",
+                        "questionId": "question_1",
+                    }),
+                )
+                .unwrap();
+
+            let rows = fixture
+                .route(
+                    "GET",
+                    "/api/workers",
+                    &[("repo", fixture.repo.to_str().unwrap())],
+                    &[],
+                )
+                .unwrap()["workers"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let row = rows
+                .iter()
+                .find(|row| row["sessionId"] == spawned.session_id.as_str())
+                .unwrap();
+            assert_eq!(row["group"], "needs_you");
+            assert_eq!(row["doing"], "Needs your answer");
+            assert_eq!(row["control"]["outcome"], "needs_answer");
+            assert_eq!(row["control"]["headline"], "Needs your answer");
+            assert_eq!(row["control"]["needsDecision"], true);
+            assert_eq!(
+                row["control"]["primaryAction"]["command"],
+                "review_decision"
+            );
+            assert_eq!(row["control"]["composer"], Value::Null);
+
+            let page = fixture
+                .route(
+                    "GET",
+                    "/api/worker-progress",
+                    &[("session", spawned.session_id.as_str()), ("after", "0")],
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(page["control"]["outcome"], "needs_answer");
+            assert!(
+                !page["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["kind"] == "approval"),
+                "a question is not an approval: {page}"
             );
 
             fixture.supervisor.shutdown_all();

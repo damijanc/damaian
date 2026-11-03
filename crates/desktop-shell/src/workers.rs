@@ -973,6 +973,13 @@ fn control_route(
             forward("proposal_id", "proposalId", true)?;
             forward("decisions", "decisions", true)?;
         }
+        // Spec 104: a question has its own route name so a client cannot send
+        // an answer through `approve`, and the worker refuses the reverse.
+        "answer_question" => {
+            forward("question_id", "questionId", true)?;
+            forward("answer", "answer", true)?;
+            forward("selected_option", "selectedOption", false)?;
+        }
         "pause" | "status" | "verify" | "continue-repair" => {}
         "continue-task" => {
             forward("task_id", "taskId", true)?;
@@ -1077,6 +1084,9 @@ fn progress_control(
                 report: None,
                 alive,
                 state: WorkerProcessState::parse(if alive { reported } else { "exited" }),
+                // Spec 104: a status line names the question it is waiting on;
+                // an approval has no such key.
+                pending_question: status["questionId"].is_string(),
                 has_run,
                 turn_error: status["error"].as_str(),
                 last_progress_at_ms,
@@ -1165,6 +1175,7 @@ fn worker_row(
                 report: None,
                 alive,
                 state: WorkerProcessState::parse(state),
+                pending_question: status["questionId"].is_string(),
                 has_run: parsed_task_status.is_some(),
                 turn_error: status["error"].as_str(),
                 last_progress_at_ms,

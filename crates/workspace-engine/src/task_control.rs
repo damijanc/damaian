@@ -33,6 +33,9 @@ pub enum TaskOutcomeKind {
     Working,
     Paused,
     NeedsDecision,
+    /// A worker is waiting on an answer to a model question (spec 104). It is
+    /// a decision-shaped pause but not an approval, and its label says so.
+    NeedsAnswer,
     Complete,
     Incomplete,
     Stopped,
@@ -55,6 +58,7 @@ impl TaskOutcomeKind {
             Self::Working => "working",
             Self::Paused => "paused",
             Self::NeedsDecision => "needs_decision",
+            Self::NeedsAnswer => "needs_answer",
             Self::Complete => "complete",
             Self::Incomplete => "incomplete",
             Self::Stopped => "stopped",
@@ -342,6 +346,10 @@ pub struct WorkerTaskFacts<'a> {
     pub report: Option<&'a CompletionGateReport>,
     pub alive: bool,
     pub state: WorkerProcessState,
+    /// The worker's progress record says the pause is a model question, not an
+    /// approval (spec 104). Set by the host from the question id in its status
+    /// line; the engine owns the label and group.
+    pub pending_question: bool,
     pub has_run: bool,
     pub turn_error: Option<&'a str>,
     pub last_progress_at_ms: Option<u128>,
@@ -758,6 +766,29 @@ impl TaskControl {
                     ),
                     placeholder: "Add a note: the worker reads it as it resumes".to_string(),
                 }),
+                terminal_outcome: outcome.cloned(),
+            };
+        }
+
+        if waiting_for_decision && facts.pending_question {
+            return Self {
+                task_id: task.map(|task| task.id.clone()),
+                status: task_status,
+                outcome: TaskOutcomeKind::NeedsAnswer,
+                dot: WorkerDot::NeedsYou,
+                group: WorkerBoardGroup::NeedsYou,
+                headline: "Needs your answer".to_string(),
+                detail: "Answer the question below before the task can continue.".to_string(),
+                needs_decision: true,
+                ended: false,
+                progress_current: true,
+                show_round: false,
+                reasons,
+                waivers,
+                primary_action: Some(review_action()),
+                board_action: Some(review_action()),
+                actions: Vec::new(),
+                composer: None,
                 terminal_outcome: outcome.cloned(),
             };
         }
@@ -1443,6 +1474,7 @@ impl<'a> TaskControlService<'a> {
                 report: report.as_ref(),
                 alive: facts.alive,
                 state: facts.state,
+                pending_question: facts.pending_question,
                 has_run: facts.has_run,
                 turn_error: facts.turn_error,
                 last_progress_at_ms: facts.last_progress_at_ms,
@@ -1716,6 +1748,7 @@ mod tests {
             report: None,
             alive: true,
             state: WorkerProcessState::Idle,
+            pending_question: false,
             has_run: true,
             turn_error: None,
             last_progress_at_ms: None,
@@ -1733,6 +1766,7 @@ mod tests {
             report: Some(&report),
             alive: true,
             state: WorkerProcessState::Idle,
+            pending_question: false,
             has_run: true,
             turn_error: None,
             last_progress_at_ms: None,
@@ -1754,6 +1788,7 @@ mod tests {
             report: None,
             alive: true,
             state: WorkerProcessState::Idle,
+            pending_question: false,
             has_run: true,
             turn_error: None,
             last_progress_at_ms: None,
@@ -1767,6 +1802,36 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_question_reads_as_needs_your_answer_not_a_decision() {
+        let waiting = task(TaskStatus::WaitingForApproval);
+        let control = TaskControl::for_worker(WorkerTaskFacts {
+            task: Some(&waiting),
+            reported_task_status: None,
+            report: None,
+            alive: true,
+            state: WorkerProcessState::WaitingForApproval,
+            pending_question: true,
+            has_run: true,
+            turn_error: None,
+            last_progress_at_ms: None,
+            now_ms: 0,
+        });
+        assert!(control.needs_decision, "a waiting question still blocks");
+        assert_eq!(control.outcome, TaskOutcomeKind::NeedsAnswer);
+        assert_eq!(control.dot, WorkerDot::NeedsYou);
+        assert_eq!(control.group, WorkerBoardGroup::NeedsYou);
+        assert_eq!(control.headline, "Needs your answer");
+        assert_ne!(control.headline, "Needs your decision");
+        assert!(control.composer.is_none());
+        let action = control.primary_action.expect("review");
+        assert_eq!(action.command, TaskCommand::ReviewDecision);
+        assert_eq!(
+            control.board_action.map(|action| action.command),
+            Some(TaskCommand::ReviewDecision)
+        );
+    }
+
+    #[test]
     fn a_reported_or_typed_waiting_state_needs_a_decision_without_a_shell_flag() {
         let running = task(TaskStatus::RunningTool);
         let reported = TaskControl::for_worker(WorkerTaskFacts {
@@ -1775,6 +1840,7 @@ mod tests {
             report: None,
             alive: true,
             state: WorkerProcessState::Idle,
+            pending_question: false,
             has_run: true,
             turn_error: None,
             last_progress_at_ms: None,
@@ -1789,6 +1855,7 @@ mod tests {
             report: None,
             alive: true,
             state: WorkerProcessState::WaitingForApproval,
+            pending_question: false,
             has_run: true,
             turn_error: None,
             last_progress_at_ms: None,
@@ -1860,6 +1927,7 @@ mod tests {
             report: None,
             alive: true,
             state: WorkerProcessState::Running,
+            pending_question: false,
             has_run: true,
             turn_error: None,
             last_progress_at_ms: Some(1_000),
@@ -1882,6 +1950,7 @@ mod tests {
             report: Some(&report),
             alive: true,
             state: WorkerProcessState::Idle,
+            pending_question: false,
             has_run: true,
             turn_error: None,
             last_progress_at_ms: None,

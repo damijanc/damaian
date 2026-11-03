@@ -1613,6 +1613,11 @@ fn fetch_turn(
         cancel: &cancel,
         steering: None,
     };
+    let options = if user_present {
+        ChatTurnOptions::interactive()
+    } else {
+        ChatTurnOptions::default()
+    };
     engine
         .chat_orchestrator
         .ask_with_session_with_options(
@@ -1622,10 +1627,7 @@ fn fetch_turn(
             session_id,
             adapter,
             &mut sink,
-            ChatTurnOptions {
-                user_present,
-                ..ChatTurnOptions::default()
-            },
+            options,
         )
         .expect("the turn should run")
 }

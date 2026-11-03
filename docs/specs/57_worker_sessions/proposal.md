@@ -336,7 +336,8 @@ Commands:
 | `pause` | Sets the pause flag (§5.4). |
 | `resume {note?}` | Clears it, optionally queuing a note first. |
 | `note {text}` | Queues a steering note. Refused while waiting for approval. |
-| `approve {proposalId, budget?}` / `reject {proposalId, budget?}` | Resolves a pending command or plan approval (§5.6). A worker plan review's optional `budget` is the exact typed value the card showed (spec 103 Task 2). |
+| `approve {proposalId, budget?}` / `reject {proposalId, budget?}` | Resolves a pending command or plan approval (§5.6). A worker plan review's optional `budget` is the exact typed value the card showed (spec 103 Task 2). A question id is refused by both. |
+| `answer_question {questionId, answer, selectedOption?}` | Answers a model question and resumes the paused turn (spec 104). It authorises nothing; an approval or check id is refused. |
 | `stop` | Cancels the current turn at the next safe point. Refused while waiting for approval: reject the approval, or `shutdown`. |
 | `shutdown` | Stops any turn, kills child processes, exits. |
 | `status` | Returns `{sessionId, pid, state}`, `state` being `idle`, `running`, `paused`, `waiting_for_approval` or `shutting_down`, plus `proposalId` while waiting. |
@@ -499,12 +500,13 @@ with `seq` or `kind`:
 
 | `kind` | Carries |
 |---|---|
-| `status` | `{state, taskStatus?, error?}`: the worker's state (as `status` reports it), the turn's `TaskStatus` when known, and the error of a turn that failed to run. Written when a job starts, on pause and resume, and when a job ends |
+| `status` | `{state, taskStatus?, error?, questionId?}`: the worker's state (as `status` reports it), the turn's `TaskStatus` when known, the error of a turn that failed to run, and the id of a waiting question (spec 104). Written when a job starts, on pause and resume, and when a job ends |
 | `phase` | `phase`, `label`, `round`, `maxRounds` — today's SSE payload |
 | `plan` | today's `plan` payload |
 | `text` | model output text, batched about every 250 ms |
 | `tool` | the tool label of a `phase` event of kind `tool` — what the shell already shows while a tool runs. Durations are the gaps between events; outcome is not recorded here (the audit log has it) |
 | `approval` | `{kind, proposal}`: `kind` is `command`, `plan`, `patch` or `fallback`, and `proposal` is the shell's own JSON for it |
+| `question` | `{questionId, question}`: the model asked a question and the worker is waiting (spec 104). Options stay in the session log, and no `approval` line is written |
 | `note` | a steering note was added |
 
 Every string in the payload, at any depth, passes through
@@ -702,8 +704,11 @@ As built (Task 10), with no new route:
   103 Task 2 makes one narrow exception:** a durable plan review is reattached
   from its paused turn and session log, with the exact persisted budget (or
   none for a historical review), so the restarted worker waits on the same
-  card and can answer it over its control socket. Command, patch, check,
-  fallback and round-budget decisions keep the behaviour above.
+  card and can answer it over its control socket. **Spec 104 adds a second:**
+  an unanswered model question is reattached from the same durable state and
+  answered with `answer_question`, while an answered question is not re-asked.
+  Command, patch, check, fallback and round-budget decisions keep the behaviour
+  above.
 - **Setting off.** Workers show as ordinary sessions: no strip, no header
   line, no poll, and the composer as it was. **Decided in Task 11:** the
   shell keeps refusing `stop` and `shutdown` (403) while the setting is off,

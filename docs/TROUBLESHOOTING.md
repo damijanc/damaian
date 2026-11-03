@@ -1239,6 +1239,32 @@ jq -r 'select(.eventType=="question_asked" or .eventType=="question_answered") |
   "\(.seq) \(.eventType) \(.payload.questionId)"' "$SESSION_FILE"
 ```
 
+**A worker's waiting question is also visible in its progress file.** The
+worker writes one `question` line carrying `questionId` and the redacted
+question text, then a `status` line whose payload has `state:
+"waiting_for_approval"`, `taskStatus: "waiting_for_approval"` and
+`questionId`. There is no `approval` line for it. That status key is what makes
+the board say **Needs your answer** instead of **Needs your decision**. The
+answer travels over the worker's control socket as `answer_question`, never
+through `approve` or `reject`:
+
+```bash
+# From the worker's progress file.
+jq -c 'select(.kind=="question" or
+               (.kind=="status" and .payload.questionId))
+       | {kind: .kind, questionId: .payload.questionId}' \
+  "$DATA_DIR/sessions/<worker-session-id>.progress.jsonl"
+
+# The durable question and answer.
+jq -r 'select(.eventType=="question_asked" or .eventType=="question_answered") |
+  "\(.seq) \(.eventType) \(.payload.questionId)"' \
+  "$DATA_DIR/sessions/<worker-session-id>.jsonl"
+```
+
+A restarted worker reattaches an unanswered question without a model call; an
+already-answered question is not re-asked.
+
+
 Every line is parsed as JSON on read, and a line that does not parse is
 **discarded rather than half-read** — a truncated tail cannot turn into a
 phantom message. The count of discarded lines is available

@@ -772,12 +772,13 @@ fn base_config(materialized: &Materialized) -> Config {
 /// same condition as `ask_user` [spec 51 §5.3], and a fetch scenario
 /// pre-approves its stub host so nothing actually pauses for an answer the
 /// script does not have. Everything else keeps the defaults, which is headless:
-/// the tool is absent and the prompt tells the model to proceed under a stated
-/// assumption (spec 50 `context.md` §4, §9).
+/// neither the question route nor a synchronous user (spec 104), so the tool is
+/// absent and the prompt tells the model to stop on material ambiguity.
 fn turn_options(scenario: &Scenario) -> ChatTurnOptions {
-    ChatTurnOptions {
-        user_present: !scenario.answers.is_empty() || scenario.user_present,
-        ..ChatTurnOptions::default()
+    if !scenario.answers.is_empty() || scenario.user_present {
+        ChatTurnOptions::interactive()
+    } else {
+        ChatTurnOptions::default()
     }
 }
 

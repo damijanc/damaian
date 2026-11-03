@@ -1613,6 +1613,7 @@ fn the_parent_return_carries_the_same_typed_outcome_and_control() {
                 report: None,
                 alive: true,
                 state: workspace_engine::WorkerProcessState::Idle,
+                pending_question: false,
                 has_run: true,
                 turn_error: None,
                 last_progress_at_ms: None,
