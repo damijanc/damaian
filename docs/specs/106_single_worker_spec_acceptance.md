@@ -8,9 +8,9 @@ Depends on: [#18](18_local_evaluation_harness/proposal.md) (evaluation
 harness), [#98](98_task_scoped_protected_patch_paths.md) (scope fence),
 [#101](101_closed_task_completion.md),
 [#102](102_repair_provenance_and_stagnation.md),
-[#103](103_bounded_worker_continuation.md), [#104](104_worker_questions.md),
-and [#105](105_structured_plan_checks.md) — #18, #98, #101 and #102 are built;
-**#103–#105 are not built, so this spec remains blocked on them**.
+[#103](103_bounded_worker_continuation.md), [#104](104_worker_questions/proposal.md),
+and [#105](105_structured_plan_checks.md) — #18, #98, #101, #102, #103 and #104
+are built; **#105 is not built, so this spec remains blocked on it**.
 
 ## 1. Motivation
 
