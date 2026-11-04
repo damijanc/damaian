@@ -283,6 +283,7 @@ fn a_stall_summary_does_not_double_the_explanation_period() {
                 termination: Some(CheckTermination::Exited { exit_code: 1 }),
             },
             file_hashes: BTreeMap::new(),
+            generation: 0,
         },
         VerificationEvent::RepairStalled {
             task_id: "task".to_string(),
@@ -441,6 +442,7 @@ fn repair_stall_is_one_terminal_event_that_replays_as_a_stop() {
                 termination: Some(CheckTermination::Exited { exit_code: 1 }),
             },
             file_hashes: BTreeMap::new(),
+            generation: 0,
         },
         VerificationEvent::RepairState {
             task_id: "task".to_string(),

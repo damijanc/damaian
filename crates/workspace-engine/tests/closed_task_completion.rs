@@ -94,6 +94,7 @@ fn ran(
             .iter()
             .map(|(path, hash)| ((*path).to_string(), (*hash).to_string()))
             .collect(),
+        generation: 0,
     }
 }
 
@@ -103,6 +104,7 @@ fn skipped(task_id: &str, check: CheckId, reason: SkipReason) -> VerificationEve
         check,
         outcome: CheckOutcome::Skipped(reason),
         file_hashes: BTreeMap::new(),
+        generation: 0,
     }
 }
 

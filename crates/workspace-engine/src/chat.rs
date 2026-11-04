@@ -2575,6 +2575,18 @@ impl ChatOrchestrator {
                 "No verification is due in this session".to_string(),
             ));
         };
+        // Requirement 9's "once per batch" skip compares against checks from
+        // this task's own continuation chain, never every task in the session:
+        // two independent plans can both sit at generation 0, and a check an
+        // unrelated task ran must not suppress this one.
+        let chain = self
+            .session_store
+            .task_continuation_chain(session_id, &due.task_id)?;
+        let scoped_state = fold_verification(
+            events
+                .iter()
+                .filter(|event| chain.contains(event.task_id())),
+        );
         // A repair patch whose every file the user rejected left the failing
         // attempt open and nothing to verify. It closes as
         // `no_repair_applied`, and the attempt count does not increase: no
@@ -2692,6 +2704,7 @@ impl ChatOrchestrator {
                     browser,
                     changed,
                     file_hashes,
+                    &scoped_state,
                     model_adapter,
                     sink,
                 ),
@@ -2713,6 +2726,7 @@ impl ChatOrchestrator {
             browser,
             changed,
             file_hashes,
+            &scoped_state,
             model_adapter,
             sink,
         )
@@ -2827,6 +2841,7 @@ impl ChatOrchestrator {
             .session_store
             .read_task_plan(&session.id, &task.id)?
             .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        let generation = plan.mutation_generation();
 
         for pending_check in &batch.checks {
             let Some((_, approved)) = decisions
@@ -2878,6 +2893,7 @@ impl ChatOrchestrator {
                     check,
                     outcome,
                     file_hashes: batch.file_hashes.clone(),
+                    generation,
                 },
             )?;
         }
@@ -2908,6 +2924,9 @@ impl ChatOrchestrator {
         browser: Option<BrowserCheck>,
         changed: Vec<String>,
         file_hashes: BTreeMap<String, String>,
+        // Verification state scoped to this task's continuation chain, so the
+        // "once per batch" filter never suppresses a check for another task.
+        scoped_state: &crate::verification::VerificationState,
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
@@ -2915,6 +2934,7 @@ impl ChatOrchestrator {
             .session_store
             .read_task_plan(&session.id, &task.id)?
             .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        let generation = plan.mutation_generation();
         // A required whole-suite check the plan carries on an open step belongs
         // to that plan step: running it after every applied patch is expensive
         // and makes the evidence describe the wrong point in the task. The
@@ -2922,9 +2942,28 @@ impl ChatOrchestrator {
         // ordinary command and approval flow. Checks the plan did not schedule
         // — smaller, different, or optional ones — remain immediate repair
         // feedback (spec 105 §4).
+        //
+        // The second filter is requirement 9's "once per mutation batch": a
+        // check that already passed at the current generation and whose files
+        // still match is not run again merely because another patch landed in
+        // the same primary step. A stale or failed run is re-run, so repair
+        // feedback stays intact. A plan-less task has no batch to collapse, so
+        // its per-patch feedback is unchanged.
+        let batch_scoped = plan
+            .steps
+            .iter()
+            .any(|step| !step.id.starts_with("verify_"));
         let checks: Vec<_> = checks
             .into_iter()
             .filter(|(check, _)| !plan_defers_check(&plan, check))
+            .filter(|(check, _)| {
+                if !batch_scoped {
+                    return true;
+                }
+                !scoped_state.checks.get(check).is_some_and(|run| {
+                    run.outcome.is_passed() && !run.is_stale(&file_hashes, generation)
+                })
+            })
             .collect();
         let mut selected: Vec<CheckId> = checks.iter().map(|(check, _)| check.clone()).collect();
         if let Some(browser) = &browser {
@@ -3011,6 +3050,7 @@ impl ChatOrchestrator {
                         check: check.clone(),
                         outcome: CheckOutcome::Skipped(SkipReason::Blocked { reason }),
                         file_hashes: file_hashes.clone(),
+                        generation,
                     },
                 )?;
                 sink.progress(TurnProgress::Plan(plan.clone()));
@@ -3045,6 +3085,7 @@ impl ChatOrchestrator {
                     check: check.clone(),
                     outcome,
                     file_hashes: file_hashes.clone(),
+                    generation,
                 },
             )?;
         }
@@ -3067,6 +3108,7 @@ impl ChatOrchestrator {
                     check: browser.check().clone(),
                     outcome,
                     file_hashes: file_hashes.clone(),
+                    generation,
                 },
             )?;
         }

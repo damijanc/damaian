@@ -9418,6 +9418,7 @@ mod tests {
                     termination: Some(CheckTermination::Exited { exit_code: 1 }),
                 },
                 file_hashes: BTreeMap::new(),
+                generation: 0,
             },
             VerificationEvent::Provenance {
                 task_id: "task".to_string(),
@@ -9499,6 +9500,7 @@ mod tests {
                     termination: CheckTermination::MissingExecutable,
                 },
                 file_hashes: BTreeMap::new(),
+                generation: 0,
             },
             VerificationEvent::Provenance {
                 task_id: "task".to_string(),

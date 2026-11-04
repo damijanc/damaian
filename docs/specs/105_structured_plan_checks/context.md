@@ -86,11 +86,23 @@ generation counter adds a monotonic batch identity: applied patches and
 modifying commands within one primary plan step share one generation, and the
 generation advances when the step closes (or a new primary step begins). Check
 evidence records the generation it validated; a later generation (or a changed
-digest) marks it stale without deleting history. Open decision for the owner:
-whether the generation is a field on `TaskPlan`/task state or derived from the
-plan-step boundaries already recorded, and how it interacts with
-`start_verification_step`'s existing "one step active" rule — record the choice
-in this file when it is made.
+digest) marks it stale without deleting history.
+
+Resolved 2026-11-04 (Task 4): the generation is **derived**, not a stored
+counter. A stored counter would be a second source of truth that can disagree
+with the plan after recovery, and the primary-step boundaries are already
+durable in the log (`plan_step_updated`). `TaskPlan::mutation_generation()`
+derives it as the number of primary (non-`verify_`) steps that have left
+`Pending`, minus one, so the first step is generation 0 and each later step
+advances it. A task with no plan, or no primary step, reads as generation 0 —
+the same value historical plans carry, so backward compatibility is automatic
+rather than a `#[serde(default)]` on a stored field. Because `verify_*` steps
+are excluded, the verification loop's own steps (which `start_verification_step`
+opens while a primary step is still active) never advance the batch, so the
+"one step active" rule is unaffected. `CheckRun::is_stale(current_hashes,
+current_generation)` is the single place that decides stale — a changed digest
+or an advanced generation — and `VerificationReport::build` feeds it the
+generation derived from the plan it already holds.
 
 ## 7. `purpose` is a new concept, not `CommandPurpose`
 

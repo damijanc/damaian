@@ -493,6 +493,7 @@ fn a_crashed_failed_verification_settles_failed_with_its_report() {
                 termination: None,
             },
             file_hashes: BTreeMap::new(),
+            generation: 0,
         },
         VerificationEvent::Finished {
             task_id: task.id.clone(),

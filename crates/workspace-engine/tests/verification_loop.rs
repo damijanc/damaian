@@ -50,6 +50,7 @@ fn ran(check: CheckId, exit_code: Option<i32>) -> VerificationEvent {
             termination: None,
         },
         file_hashes: BTreeMap::new(),
+        generation: 0,
     }
 }
 
@@ -70,6 +71,30 @@ fn ran_with_hashes(
             .iter()
             .map(|(path, hash)| ((*path).to_string(), (*hash).to_string()))
             .collect(),
+        generation: 0,
+    }
+}
+
+/// A check that ran against a named generation and file digest (spec 105).
+fn ran_at_generation(
+    check: CheckId,
+    exit_code: Option<i32>,
+    hashes: &[(&str, &str)],
+    generation: u32,
+) -> VerificationEvent {
+    VerificationEvent::Check {
+        task_id: "task".to_string(),
+        check,
+        outcome: CheckOutcome::Ran {
+            exit_code,
+            marker_id: "marker".to_string(),
+            termination: None,
+        },
+        file_hashes: hashes
+            .iter()
+            .map(|(path, hash)| ((*path).to_string(), (*hash).to_string()))
+            .collect(),
+        generation,
     }
 }
 
@@ -79,6 +104,7 @@ fn skipped(check: CheckId, reason: SkipReason) -> VerificationEvent {
         check,
         outcome: CheckOutcome::Skipped(reason),
         file_hashes: BTreeMap::new(),
+        generation: 0,
     }
 }
 
@@ -501,6 +527,123 @@ fn an_interrupted_check_is_never_reported_as_passed() {
             .failed
             .iter()
             .any(|item| item.check == interrupted && item.reason == "no result was recorded")
+    );
+}
+
+// --- Mutation-batch generation (spec 105 Task 4) --------------------------
+
+fn step(id: &str, title: &str, status: StepStatus) -> PlanStep {
+    PlanStep {
+        id: id.to_string(),
+        title: title.to_string(),
+        detail: None,
+        status,
+        depends_on: Vec::new(),
+        started_at_ms: None,
+        completed_at_ms: None,
+        evidence: Vec::new(),
+        check: None,
+    }
+}
+
+#[test]
+fn two_patches_in_one_implementation_step_are_one_generation() {
+    let mut plan = empty_plan();
+    let mut implement = step("implement", "Implement the change", StepStatus::InProgress);
+    implement.evidence.extend([
+        Evidence::PatchApplied {
+            marker_id: "patch-a".to_string(),
+            files: Vec::new(),
+        },
+        Evidence::PatchApplied {
+            marker_id: "patch-b".to_string(),
+            files: Vec::new(),
+        },
+    ]);
+    plan.steps.push(implement);
+    plan.steps
+        .push(step("test", "Validate the change", StepStatus::Pending));
+
+    // Two patches in one open primary step are one mutation batch: the
+    // generation does not count patches.
+    assert_eq!(plan.mutation_generation(), 0);
+
+    // Closing the implementation step and opening the final step advances the
+    // generation, not the number of patches.
+    plan.steps[0].status = StepStatus::Completed;
+    plan.steps[1].status = StepStatus::InProgress;
+    assert_eq!(plan.mutation_generation(), 1);
+}
+
+#[test]
+fn closing_the_final_check_step_records_the_current_generation() {
+    let mut plan = empty_plan();
+    plan.steps.push(step(
+        "implement",
+        "Implement the change",
+        StepStatus::Completed,
+    ));
+    plan.steps
+        .push(step("test", "Validate the change", StepStatus::InProgress));
+    let generation = plan.mutation_generation();
+    assert_eq!(generation, 1);
+
+    let check = CheckId::new("", "cargo test");
+    let events = [
+        started(0, std::slice::from_ref(&check)),
+        ran_at_generation(check.clone(), Some(0), &[], generation),
+        finished(VerificationOutcome::Passed),
+    ];
+    let report = VerificationReport::build(&state(&events), &plan, &[], &BTreeMap::new());
+    assert_eq!(
+        report.passed,
+        vec![check],
+        "evidence recorded at the final step's generation is current, not stale"
+    );
+    assert!(report.stale.is_empty());
+}
+
+#[test]
+fn a_mutation_or_an_advanced_generation_makes_a_check_stale_without_deleting_history() {
+    let check = CheckId::new("", "cargo test");
+    let ran = ran_at_generation(check.clone(), Some(0), &[("src/a.rs", "h1")], 0);
+    let state = state(&[started(0, std::slice::from_ref(&check)), ran]);
+
+    // Advancing to the next primary step (generation 1) makes the evidence
+    // stale even though the file digest is unchanged.
+    let mut advanced = empty_plan();
+    advanced.steps.push(step(
+        "implement",
+        "Implement the change",
+        StepStatus::Completed,
+    ));
+    advanced
+        .steps
+        .push(step("test", "Validate the change", StepStatus::InProgress));
+    let mut current = BTreeMap::new();
+    current.insert("src/a.rs".to_string(), "h1".to_string());
+    let report = VerificationReport::build(&state, &advanced, &[], &current);
+    assert!(report.passed.is_empty());
+    assert_eq!(report.stale, vec![check.clone()]);
+
+    // A changed digest makes it stale at the same generation too.
+    let mut same_generation = empty_plan();
+    same_generation.steps.push(step(
+        "implement",
+        "Implement the change",
+        StepStatus::InProgress,
+    ));
+    let mut changed = BTreeMap::new();
+    changed.insert("src/a.rs".to_string(), "h2".to_string());
+    let report = VerificationReport::build(&state, &same_generation, &[], &changed);
+    assert_eq!(report.stale, vec![check.clone()]);
+
+    // Staleness does not delete history: the original run is still in the fold.
+    let run = state.checks.get(&check).expect("history is preserved");
+    assert_eq!(run.generation, 0);
+    assert_eq!(
+        run.file_hashes,
+        BTreeMap::from([("src/a.rs".to_string(), "h1".to_string())])
     );
 }
 

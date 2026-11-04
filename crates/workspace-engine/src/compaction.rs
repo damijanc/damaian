@@ -1101,6 +1101,7 @@ mod tests {
                 termination: None,
             },
             file_hashes: BTreeMap::new(),
+            generation: 0,
         }];
         let approvals = vec![ApprovalDigest {
             kind: "command".to_string(),

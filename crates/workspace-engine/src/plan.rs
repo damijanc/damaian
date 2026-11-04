@@ -320,6 +320,26 @@ impl TaskPlan {
             .collect()
     }
 
+    /// The current mutation-batch generation (spec 105 §4).
+    ///
+    /// Derived from the primary plan steps' boundaries, never stored: a stored
+    /// counter would be a second source of truth that can disagree with the
+    /// plan after recovery, and the boundaries are already durable in the log.
+    /// A primary step is one the worker works through in order (`step_N`); the
+    /// verification loop's own `verify_*` steps are secondary and never advance
+    /// the batch. The generation is the number of primary steps that have left
+    /// `Pending` (begun), minus one, so the first step is generation 0 and each
+    /// later step advances it by one. A task with no plan, or with no primary
+    /// step, reads as generation 0 — the same value historical plans carry.
+    pub fn mutation_generation(&self) -> u32 {
+        self.steps
+            .iter()
+            .filter(|step| !step.id.starts_with("verify_"))
+            .filter(|step| step.status != StepStatus::Pending)
+            .count()
+            .saturating_sub(1) as u32
+    }
+
     /// Requirement 3's phase, **derived** from step state and never stored.
     ///
     /// §5.1: derived rather than set independently, so the phase cannot say

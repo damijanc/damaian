@@ -538,6 +538,30 @@ pub struct CheckRun {
     /// The hash of every file the task had changed when the check ran, so a
     /// later edit, rollback or patch can make the result stale (proposal §5.6).
     pub file_hashes: BTreeMap<String, String>,
+    /// The mutation-batch generation this run validated (spec 105 §4). A later
+    /// generation marks the run stale without deleting it. Absent from runs
+    /// recorded before this spec, so it reads as generation 0.
+    #[serde(default)]
+    pub generation: u32,
+}
+
+impl CheckRun {
+    /// Whether later mutations made this run's evidence stale (spec 105 §4).
+    ///
+    /// Stale when the mutation-batch generation advanced, or when a file this
+    /// run validated changed. A deleted file is absent from `current_hashes`,
+    /// which is a mismatch.
+    pub fn is_stale(
+        &self,
+        current_hashes: &BTreeMap<String, String>,
+        current_generation: u32,
+    ) -> bool {
+        self.generation != current_generation
+            || self
+                .file_hashes
+                .iter()
+                .any(|(path, hash)| current_hashes.get(path) != Some(hash))
+    }
 }
 
 fn normalized_text(text: &str) -> String {
@@ -644,6 +668,12 @@ pub enum VerificationEvent {
         check: CheckId,
         outcome: CheckOutcome,
         file_hashes: BTreeMap<String, String>,
+        /// The mutation-batch generation this run validated (spec 105 §4).
+        /// Absent from events written before this spec, so it replays as 0.
+        /// Generation 0 is omitted on the wire so a check at the first step
+        /// keeps the pre-spec event shape.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        generation: u32,
     },
     #[serde(rename = "verification_finished", rename_all = "camelCase")]
     Finished {
@@ -791,6 +821,7 @@ impl VerificationState {
                 check,
                 outcome,
                 file_hashes,
+                generation,
                 ..
             } => {
                 if passing(outcome) {
@@ -801,6 +832,7 @@ impl VerificationState {
                     CheckRun {
                         outcome: outcome.clone(),
                         file_hashes: file_hashes.clone(),
+                        generation: *generation,
                     },
                 );
             }
@@ -867,6 +899,10 @@ pub fn fold_verification<'a>(
 /// signalled, so it is unknown, and unknown is not passed.
 fn passing(outcome: &CheckOutcome) -> bool {
     outcome.is_passed()
+}
+
+fn is_zero(generation: &u32) -> bool {
+    *generation == 0
 }
 
 fn failure_reason(exit_code: Option<i32>) -> String {
@@ -949,6 +985,7 @@ impl VerificationReport {
         files_changed: &[String],
         current_hashes: &BTreeMap<String, String>,
     ) -> Self {
+        let current_generation = plan.mutation_generation();
         let mut report = Self {
             files_changed: files_changed.to_vec(),
             passed: Vec::new(),
@@ -987,7 +1024,7 @@ impl VerificationReport {
                     reason_label: reason.description(),
                 }),
                 CheckOutcome::Environment { termination } => {
-                    if is_stale(run, current_hashes) {
+                    if run.is_stale(current_hashes, current_generation) {
                         report.stale.push(check.clone());
                         continue;
                     }
@@ -997,7 +1034,7 @@ impl VerificationReport {
                     });
                 }
                 CheckOutcome::Ran { exit_code, .. } => {
-                    if is_stale(run, current_hashes) {
+                    if run.is_stale(current_hashes, current_generation) {
                         report.stale.push(check.clone());
                         continue;
                     }
@@ -1032,7 +1069,7 @@ impl VerificationReport {
             let Some(run) = state.checks.get(check) else {
                 continue;
             };
-            if passing(&run.outcome) || is_stale(run, current_hashes) {
+            if passing(&run.outcome) || run.is_stale(current_hashes, current_generation) {
                 continue;
             }
             let Some(termination) = run.outcome.termination() else {
@@ -1376,13 +1413,6 @@ impl VerificationReport {
         }
         "none".to_string()
     }
-}
-
-fn is_stale(run: &CheckRun, current_hashes: &BTreeMap<String, String>) -> bool {
-    // A deleted file is absent from `current_hashes`, which is a mismatch.
-    run.file_hashes
-        .iter()
-        .any(|(path, hash)| current_hashes.get(path) != Some(hash))
 }
 
 fn labels(checks: &[CheckId]) -> Vec<String> {

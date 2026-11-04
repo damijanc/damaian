@@ -435,6 +435,7 @@ fn seed_facts(engine: &WorkspaceEngine, session: &Session, task: &Task) {
                     termination: None,
                 },
                 file_hashes: std::collections::BTreeMap::new(),
+                generation: 0,
             },
         )
         .unwrap();

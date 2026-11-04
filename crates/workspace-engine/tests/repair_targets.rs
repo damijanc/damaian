@@ -276,6 +276,7 @@ fn state_and_report() -> VerificationReport {
                 termination: Some(exited(1)),
             },
             file_hashes: BTreeMap::new(),
+            generation: 0,
         },
         VerificationEvent::Check {
             task_id: "task".to_string(),
@@ -286,6 +287,7 @@ fn state_and_report() -> VerificationReport {
                 termination: Some(exited(1)),
             },
             file_hashes: BTreeMap::new(),
+            generation: 0,
         },
         VerificationEvent::Check {
             task_id: "task".to_string(),
@@ -294,6 +296,7 @@ fn state_and_report() -> VerificationReport {
                 termination: CheckTermination::MissingExecutable,
             },
             file_hashes: BTreeMap::new(),
+            generation: 0,
         },
         VerificationEvent::Check {
             task_id: "task".to_string(),
@@ -304,6 +307,7 @@ fn state_and_report() -> VerificationReport {
                 termination: Some(exited(1)),
             },
             file_hashes: BTreeMap::new(),
+            generation: 0,
         },
         VerificationEvent::Provenance {
             task_id: "task".to_string(),
@@ -421,6 +425,7 @@ fn an_environment_only_report_has_no_repair_target() {
                 termination: CheckTermination::SpawnFailed,
             },
             file_hashes: BTreeMap::new(),
+            generation: 0,
         },
         VerificationEvent::Finished {
             task_id: "task".to_string(),
@@ -468,6 +473,7 @@ fn a_historical_failure_without_recorded_termination_is_unknown_not_environment(
                 termination: None,
             },
             file_hashes: BTreeMap::new(),
+            generation: 0,
         },
         VerificationEvent::Finished {
             task_id: "task".to_string(),
