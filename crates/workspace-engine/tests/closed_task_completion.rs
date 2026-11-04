@@ -11,14 +11,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use workspace_engine::hash::file_hash;
+use workspace_engine::hash::{file_hash, sha256};
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
-    CheckId, CheckOutcome, ClientError, CompletionFacts, CompletionGateReport,
-    CompletionGateService, CompletionReasonCode, PendingApprovalRef, PendingDecision,
-    PendingQuestionRef, PlanStep, Session, SessionStore, SkipReason, Task, TaskPlan, TaskStatus,
-    VerificationEvent, VerificationOutcome, VerificationState, fold_verification,
-    repository_id_for_root,
+    CheckId, CheckOutcome, ClientError, CommandPurpose, CompletionFacts, CompletionGateReport,
+    CompletionGateService, CompletionReasonCode, Evidence, PLANNED_CHECK_VERSION,
+    PendingApprovalRef, PendingDecision, PendingQuestionRef, PlanStep, PlannedCheck, Session,
+    SessionStore, SkipReason, Task, TaskPlan, TaskStatus, VerificationEvent, VerificationOutcome,
+    VerificationState, fold_verification, repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -60,6 +60,35 @@ fn check(directory: &str, command: &str) -> CheckId {
     CheckId::new(directory, command)
 }
 
+/// A plan step carrying a `required: true` structured check at the root.
+fn checked_step(id: &str, command: &str, status: StepStatus) -> PlanStep {
+    checked_step_in(id, command, "", status)
+}
+
+/// A plan step carrying a `required: true` structured check in a directory.
+fn checked_step_in(id: &str, command: &str, directory: &str, status: StepStatus) -> PlanStep {
+    let mut step = step(id, status);
+    step.check = Some(PlannedCheck {
+        version: PLANNED_CHECK_VERSION,
+        command: command.to_string(),
+        working_directory: directory.to_string(),
+        purpose: "validates the final tree".to_string(),
+        required: true,
+    });
+    step
+}
+
+/// The `CommandExit` a deferred required check leaves on its plan step when the
+/// worker runs the exact command as an ordinary command.
+fn command_exit(command: &str, exit_code: Option<i32>) -> Evidence {
+    Evidence::CommandExit {
+        marker_id: "marker".to_string(),
+        exit_code,
+        purpose: CommandPurpose::Check,
+        command_hash: Some(sha256(command)),
+    }
+}
+
 fn due(task_id: &str) -> VerificationEvent {
     VerificationEvent::Due {
         task_id: task_id.to_string(),
@@ -81,6 +110,7 @@ fn ran(
     check: CheckId,
     exit_code: Option<i32>,
     hashes: &[(&str, &str)],
+    generation: u32,
 ) -> VerificationEvent {
     VerificationEvent::Check {
         task_id: task_id.to_string(),
@@ -94,17 +124,22 @@ fn ran(
             .iter()
             .map(|(path, hash)| ((*path).to_string(), (*hash).to_string()))
             .collect(),
-        generation: 0,
+        generation,
     }
 }
 
-fn skipped(task_id: &str, check: CheckId, reason: SkipReason) -> VerificationEvent {
+fn skipped(
+    task_id: &str,
+    check: CheckId,
+    reason: SkipReason,
+    generation: u32,
+) -> VerificationEvent {
     VerificationEvent::Check {
         task_id: task_id.to_string(),
         check,
         outcome: CheckOutcome::Skipped(reason),
         file_hashes: BTreeMap::new(),
-        generation: 0,
+        generation,
     }
 }
 
@@ -157,12 +192,25 @@ fn every_blocking_fact_produces_its_stable_reason_code() {
     let declined = check("", "cargo fmt --check");
     let stale = check("", "cargo deny check");
 
+    // The required checks come from the plan's structured checks, not from the
+    // verification selection. Six terminal primary steps sit at generation 5,
+    // so every recorded run names that generation to stay current; the stale
+    // check is stale by file hash rather than by generation.
     let plan = plan(
         task_id,
         vec![
             step("implement", StepStatus::Pending),
-            step("verify_1", StepStatus::InProgress),
-            step("document", StepStatus::Skipped),
+            checked_step_in(
+                "failing",
+                "cargo test",
+                "crates/engine",
+                StepStatus::Completed,
+            ),
+            checked_step_in("missing", "npm test", "packages/web", StepStatus::Completed),
+            checked_step("blocked", "cargo clippy", StepStatus::Completed),
+            checked_step("declined", "cargo fmt --check", StepStatus::Completed),
+            checked_step("stale", "cargo deny check", StepStatus::Completed),
+            checked_step("passing", "cargo test", StepStatus::Completed),
         ],
     );
     let verification = state(&[
@@ -177,24 +225,26 @@ fn every_blocking_fact_produces_its_stable_reason_code() {
                 stale.clone(),
             ],
         ),
-        ran(task_id, passing, Some(0), &[]),
-        ran(task_id, failing, Some(1), &[]),
+        ran(task_id, passing, Some(0), &[], 5),
+        ran(task_id, failing, Some(1), &[], 5),
         skipped(
             task_id,
             blocked,
             SkipReason::Blocked {
                 reason: "not allowed".to_string(),
             },
+            5,
         ),
-        skipped(task_id, declined.clone(), SkipReason::DeclinedByUser),
+        skipped(task_id, declined.clone(), SkipReason::DeclinedByUser, 5),
         ran(
             task_id,
             stale.clone(),
             Some(0),
             &[("src/lib.rs", "sha256:old")],
+            5,
         ),
-        // Finished first, then a fresh due: the checks stay selected and the
-        // run is due without also being started-but-unfinished.
+        // Finished first, then a fresh due: the run is due without also being
+        // started-but-unfinished.
         finished(task_id, VerificationOutcome::Passed),
         due(task_id),
     ]);
@@ -257,13 +307,20 @@ fn a_started_verification_without_a_finish_blocks_on_its_own() {
 fn a_complete_plan_with_a_passing_current_check_is_eligible() {
     let task_id = "task_1";
     let check = check("", "cargo test");
-    let plan = plan(task_id, vec![step("implement", StepStatus::Completed)]);
+    let plan = plan(
+        task_id,
+        vec![checked_step(
+            "implement",
+            "cargo test",
+            StepStatus::Completed,
+        )],
+    );
     let report = evaluate(
         task_id,
         Some(&plan),
         &state(&[
             started(task_id, std::slice::from_ref(&check)),
-            ran(task_id, check, Some(0), &[]),
+            ran(task_id, check, Some(0), &[], 0),
             finished(task_id, VerificationOutcome::Passed),
         ]),
         None,
@@ -279,13 +336,20 @@ fn a_complete_plan_with_a_passing_current_check_is_eligible() {
 fn a_declined_check_is_a_named_waiver_and_never_a_pass() {
     let task_id = "task_1";
     let declined = check("", "cargo test");
-    let plan = plan(task_id, vec![step("implement", StepStatus::Completed)]);
+    let plan = plan(
+        task_id,
+        vec![checked_step(
+            "implement",
+            "cargo test",
+            StepStatus::Completed,
+        )],
+    );
     let report = evaluate(
         task_id,
         Some(&plan),
         &state(&[
             started(task_id, std::slice::from_ref(&declined)),
-            skipped(task_id, declined.clone(), SkipReason::DeclinedByUser),
+            skipped(task_id, declined.clone(), SkipReason::DeclinedByUser, 0),
             finished(task_id, VerificationOutcome::NothingVerified),
         ]),
         None,
@@ -297,6 +361,72 @@ fn a_declined_check_is_a_named_waiver_and_never_a_pass() {
     assert_eq!(report.waivers.len(), 1);
     assert_eq!(report.waivers[0].check, declined);
     assert!(report.waivers[0].explanation.contains("declined"));
+}
+
+/// A deferred required check never produces a `CheckRun`: the worker runs it as
+/// an ordinary command at its plan step, recording a `CommandExit`. The gate
+/// reads that evidence from the step when the loop recorded nothing.
+#[test]
+fn a_deferred_required_check_passes_through_its_step_command() {
+    let task_id = "task_1";
+    let mut test = checked_step("test", "cargo test", StepStatus::Completed);
+    test.evidence = vec![command_exit("cargo test", Some(0))];
+    let plan = plan(task_id, vec![test]);
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert!(report.eligible, "{report:?}");
+    assert!(report.reasons.is_empty());
+    assert!(report.waivers.is_empty());
+}
+
+#[test]
+fn a_deferred_required_check_fails_through_its_step_command() {
+    let task_id = "task_1";
+    let mut test = checked_step("test", "cargo test", StepStatus::Completed);
+    test.evidence = vec![command_exit("cargo test", Some(1))];
+    let plan = plan(task_id, vec![test]);
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert!(!report.eligible);
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckFailed]
+    );
+}
+
+#[test]
+fn a_deferred_required_check_without_a_command_is_missing() {
+    let task_id = "task_1";
+    let plan = plan(
+        task_id,
+        vec![checked_step("test", "cargo test", StepStatus::Completed)],
+    );
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert!(!report.eligible);
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckMissing]
+    );
+}
+
+#[test]
+fn a_deferred_required_check_is_stale_when_a_later_step_begins() {
+    let task_id = "task_1";
+    let mut test = checked_step("test", "cargo test", StepStatus::Completed);
+    test.evidence = vec![command_exit("cargo test", Some(0))];
+    let plan = plan(task_id, vec![test, step("document", StepStatus::Completed)]);
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert!(!report.eligible);
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckStale]
+    );
 }
 
 #[test]
@@ -391,7 +521,14 @@ fn the_service_accepts_a_complete_passing_task_and_notices_staleness() {
     let task = store
         .create_task(&session.id, "change the file", "mock", "mock-model")
         .unwrap();
-    let plan = plan(&task.id, vec![step("implement", StepStatus::Completed)]);
+    let plan = plan(
+        &task.id,
+        vec![checked_step(
+            "implement",
+            "cargo test",
+            StepStatus::Completed,
+        )],
+    );
     store.create_plan(&task, &plan).unwrap();
 
     fs::create_dir_all(root.join("src")).unwrap();
@@ -412,6 +549,7 @@ fn the_service_accepts_a_complete_passing_task_and_notices_staleness() {
                 cargo_test,
                 Some(0),
                 &[("src/lib.rs", hash.as_str())],
+                0,
             ),
         )
         .unwrap();
@@ -438,7 +576,14 @@ fn the_service_accepts_a_complete_passing_task_and_notices_staleness() {
 #[test]
 fn the_service_sees_checks_from_a_sibling_continuation_but_not_another_task() {
     let (root, store, session, first) = fixture("chain");
-    let first_plan = plan(&first.id, vec![step("implement", StepStatus::Completed)]);
+    let first_plan = plan(
+        &first.id,
+        vec![checked_step(
+            "implement",
+            "cargo test",
+            StepStatus::Completed,
+        )],
+    );
     store.create_plan(&first, &first_plan).unwrap();
 
     let verification = store
@@ -468,7 +613,7 @@ fn the_service_sees_checks_from_a_sibling_continuation_but_not_another_task() {
     store
         .append_verification_event(
             &session.id,
-            &ran(&verification.id, cargo_test, Some(1), &[]),
+            &ran(&verification.id, cargo_test, Some(1), &[], 0),
         )
         .unwrap();
     store

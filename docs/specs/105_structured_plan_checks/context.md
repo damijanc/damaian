@@ -77,6 +77,37 @@ set overlap but are not the same (a deferred final-suite check is not selected
 until it runs at its plan step), so the gate must not reuse `selected` as the
 source of "required".
 
+Resolved 2026-11-04 (Task 5): the evidence for a required check is read from
+**one of two existing stores, never a third**. The gate iterates the plan's
+primary steps, maps each `required: true` `PlannedCheck` to
+`CheckId::new(working_directory, command)`, and then:
+
+- **Ran through the loop (non-deferred).** A `CheckRun` in
+  `verification.checks` is the evidence. Currentness is
+  `CheckRun::is_stale(current_hashes, current_generation)` — the generation the
+  run recorded against the plan's current `mutation_generation()`, plus the
+  file digest it validated. This is the same rule the loop's own report uses.
+- **Deferred to its plan step.** Task 2 removed the check from the selection, so
+  there is no `CheckRun`; the worker ran the exact command at the step through
+  spec 97's ordinary command flow, which recorded an `Evidence::CommandExit` on
+  the plan step. The gate matches the latest `CommandExit` whose `command_hash`
+  equals `sha256(planned.command)`. That evidence records no generation, so
+  currentness is read from the step's position: the step is terminal **and** no
+  later primary step has left `Pending` (a later primary step leaving `Pending`
+  is exactly what advances `mutation_generation()`). A non-terminal step, or a
+  step followed by a begun step, is stale.
+
+The `CheckRun` is authoritative when both exist (a check deferred and run as a
+command can later be re-run by the loop after a continuation, and the `CheckRun`
+is the more recent evidence); the `CommandExit` is the fallback. A discovered
+check that is not on the plan is **not** a gate obligation at all — its pass,
+failure or skip is reported by the verification loop, not by the completion
+gate, so a discovered `cargo test` failure settles the task `failed` through
+the verification settlement while the gate report itself names only the open
+plan work. This is the deliberate consequence of requirement 6 and non-goal 3
+("structured required checks define the completion obligation").
+
+
 ## 6. Mutation-batch generation sits beside the existing file-hash staleness
 
 `CheckOutcome::Ran` already records `file_hashes` (`verification.rs`, the

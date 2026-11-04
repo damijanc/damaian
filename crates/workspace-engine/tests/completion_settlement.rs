@@ -16,9 +16,10 @@ use workspace_engine::plan::StepStatus;
 use workspace_engine::{
     AuditLog, COMPLETION_SETTLEMENT_ACTION, CancelToken, ChatTurnResult, CheckId, CheckOutcome,
     CompletionGateReport, CompletionReason, CompletionReasonCode, CompletionSettlement,
-    CompletionSettlementMarker, Config, MockModelAdapter, ModelAdapter, PlanStep, SecretScanner,
-    SessionStore, TaskPlan, TaskStatus, ToolCall, TurnProgress, TurnSink, VerificationEvent,
-    WorkspaceEngine, classify_session, repository_id_for_root,
+    CompletionSettlementMarker, Config, MockModelAdapter, ModelAdapter, PLANNED_CHECK_VERSION,
+    PlanStep, PlannedCheck, SecretScanner, SessionStore, TaskPlan, TaskStatus, ToolCall,
+    TurnProgress, TurnSink, VerificationEvent, WorkspaceEngine, classify_session,
+    repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -477,6 +478,18 @@ fn a_crashed_failed_verification_settles_failed_with_its_report() {
         &fixture.root,
         CompletionSettlement::VerificationFailed,
     );
+    // The gate sources required checks from the plan, not from the verification
+    // selection, so the crashed task must carry the `cargo test` check the
+    // verification failed on.
+    let mut plan = plan_with(&task.id, StepStatus::Completed);
+    plan.steps[0].check = Some(PlannedCheck {
+        version: PLANNED_CHECK_VERSION,
+        command: "cargo test".to_string(),
+        working_directory: String::new(),
+        purpose: "validates the final tree".to_string(),
+        required: true,
+    });
+    fixture.store.create_plan(&task, &plan).unwrap();
     let check = CheckId::new("", "cargo test");
     for event in [
         VerificationEvent::Started {

@@ -2196,21 +2196,19 @@ fn two_checks_needing_approval_produce_one_batch_and_one_resume() {
         .find(|item| item.check.command == "npm run test")
         .expect("the declined check is reported as skipped");
     assert_eq!(declined.reason, SkipReason::DeclinedByUser);
-    // Spec 101: the declined check is a named waiver, but the browser check
-    // that was skipped for want of a running target is not a pass either, so
-    // the task settles incomplete rather than complete.
+    // Spec 105: only a `required: true` structured check on the approved plan
+    // is a completion obligation. These are discovered checks — the declined
+    // `npm run test` and the browser check skipped for want of a running target
+    // — so they do not gate completion; the task settles complete.
     let settled = engine
         .session_store
         .read_completion_report(&session, &resumed.task.id)
         .unwrap()
         .expect("the settlement carries the gate report");
-    assert_eq!(resumed.task.status, TaskStatus::Incomplete);
-    assert_eq!(
-        settled.reason_codes(),
-        vec![workspace_engine::CompletionReasonCode::RequiredCheckSkipped]
-    );
-    assert_eq!(settled.waivers.len(), 1);
-    assert_eq!(settled.waivers[0].check, declined.check.clone());
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    assert!(settled.eligible, "{settled:?}");
+    assert!(settled.reasons.is_empty());
+    assert!(settled.waivers.is_empty());
 
     let plan = engine
         .session_store
@@ -4429,10 +4427,13 @@ fn a_failed_verification_is_not_continued() {
         .unwrap()
         .expect("a failed verification still carries the gate report");
     assert!(!settled.eligible);
-    assert!(
-        settled
-            .reason_codes()
-            .contains(&CompletionReasonCode::RequiredCheckFailed),
+    // Spec 105: the failed `cargo test` is a discovered check, not a
+    // `required: true` structured check on the plan, so it is not a gate
+    // obligation; the report names the open plan work instead. The failed
+    // status comes from the verification settlement, not from the gate.
+    assert_eq!(
+        settled.reason_codes(),
+        vec![CompletionReasonCode::OpenPlanSteps],
         "{settled:?}"
     );
 

@@ -10,7 +10,8 @@
 //!
 //! Two boundaries stay outside this module. Spec 102 decides whether a failed
 //! check was *caused* by the task, and spec 105 derives required checks from
-//! prose. Here a check is required because it was selected, and a failure is
+//! the approved plan's structured [`crate::plan::PlannedCheck`]s. Here a check
+//! is required because the plan marks it `required: true`, and a failure is
 //! reported as a failure without assigning provenance.
 //!
 //! The only waiver is an explicit user decision. A check the user declined is
@@ -24,12 +25,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::clarification::PendingDecision;
 use crate::error::{ClientError, Result};
-use crate::hash::{file_hash, repository_id_for_root};
-use crate::plan::{PlanStep, TaskPlan};
+use crate::hash::{file_hash, repository_id_for_root, sha256};
+use crate::plan::{Evidence, PlanStep, StepStatus, TaskPlan};
 use crate::session::{SessionStore, Task, TaskStatus};
 use crate::verification::{
-    CheckId, CheckOutcome, CheckRun, SkipReason, VerificationReport, VerificationState,
-    fold_verification,
+    CheckId, CheckOutcome, CheckRun, SkipReason, VerificationState, fold_verification,
 };
 
 /// A plan step whose id starts with this is the verification loop's own step,
@@ -61,13 +61,13 @@ pub enum CompletionReasonCode {
     VerificationUnfinished,
     /// A proposal or question is still waiting for the user.
     PendingDecision,
-    /// A selected check has no recorded result at all.
+    /// A required check has no recorded result at all.
     RequiredCheckMissing,
-    /// A selected check ran and did not pass.
+    /// A required check ran and did not pass.
     RequiredCheckFailed,
-    /// A selected check ran, but the files it covered have changed since.
+    /// A required check ran, but the files it covered have changed since.
     RequiredCheckStale,
-    /// A selected check was skipped for a reason other than an explicit user
+    /// A required check was skipped for a reason other than an explicit user
     /// decline, so it does not verify the current state.
     RequiredCheckSkipped,
 }
@@ -96,7 +96,7 @@ pub struct CompletionReason {
     pub explanation: String,
 }
 
-/// A selected check the user explicitly declined.
+/// A required check the user explicitly declined.
 ///
 /// A waiver is a named exception, not a pass: it says the check did not run and
 /// that the user chose that. Only [`SkipReason::DeclinedByUser`] produces one.
@@ -206,8 +206,10 @@ impl CompletionGateReport {
     pub fn evaluate(facts: CompletionFacts<'_>) -> Self {
         let empty_plan = TaskPlan::new(facts.task_id, 0);
         let plan = facts.plan.unwrap_or(&empty_plan);
-        let verification =
-            VerificationReport::build(facts.verification, plan, &[], facts.current_hashes);
+        // Required checks are sourced from the approved plan (spec 105 §5),
+        // not from `verification.selected`, so currentness is decided here from
+        // the plan's mutation-batch generation and the checkout's content.
+        let current_generation = plan.mutation_generation();
 
         let mut reasons = Vec::new();
         let mut waivers = Vec::new();
@@ -254,19 +256,91 @@ impl CompletionGateReport {
             });
         }
 
-        for check in &facts.verification.selected {
-            let run = facts.verification.checks.get(check);
-            if verification.stale.contains(check) {
-                reasons.push(CompletionReason {
-                    code: CompletionReasonCode::RequiredCheckStale,
-                    explanation: format!(
-                        "Required check {} ran, but the files it covered have changed since.",
-                        check.label()
-                    ),
-                });
+        for step in plan
+            .steps
+            .iter()
+            .filter(|step| !step.id.starts_with(VERIFICATION_STEP_PREFIX))
+        {
+            let Some(planned) = step.check.as_ref() else {
+                continue;
+            };
+            if !planned.required {
                 continue;
             }
-            let Some(run) = run else {
+            let check = CheckId::new(planned.working_directory.as_str(), planned.command.as_str());
+            // The evidence for a required check is one of two things. A check
+            // that ran through the verification loop has a `CheckRun` keyed by
+            // identity; a check deferred to its own plan step was run by the
+            // worker as an ordinary command, which records a `CommandExit` on
+            // the step instead. The `CheckRun` is authoritative when present.
+            if let Some(run) = facts.verification.checks.get(&check) {
+                if run.is_stale(facts.current_hashes, current_generation) {
+                    reasons.push(CompletionReason {
+                        code: CompletionReasonCode::RequiredCheckStale,
+                        explanation: format!(
+                            "Required check {} ran, but the files it covered have changed since.",
+                            check.label()
+                        ),
+                    });
+                    continue;
+                }
+                match &run.outcome {
+                    CheckOutcome::Skipped(SkipReason::DeclinedByUser) => {
+                        waivers.push(CompletionWaiver {
+                            check: check.clone(),
+                            explanation: format!(
+                                "{} was declined by you, so it is waived for this task.",
+                                check.label()
+                            ),
+                        });
+                    }
+                    CheckOutcome::Skipped(reason) => {
+                        reasons.push(CompletionReason {
+                            code: CompletionReasonCode::RequiredCheckSkipped,
+                            explanation: format!(
+                                "Required check {} was skipped ({}), so it does not verify the current state.",
+                                check.label(),
+                                reason.description()
+                            ),
+                        });
+                    }
+                    CheckOutcome::Ran { .. } if passing(run) => {}
+                    CheckOutcome::Environment { termination } => {
+                        reasons.push(CompletionReason {
+                            code: CompletionReasonCode::RequiredCheckFailed,
+                            explanation: format!(
+                                "Required check {} could not run: {}.",
+                                check.label(),
+                                termination.description()
+                            ),
+                        });
+                    }
+                    CheckOutcome::Ran { exit_code, .. } => {
+                        reasons.push(CompletionReason {
+                            code: CompletionReasonCode::RequiredCheckFailed,
+                            explanation: format!(
+                                "Required check {} failed: {}.",
+                                check.label(),
+                                command_failure_reason(*exit_code)
+                            ),
+                        });
+                    }
+                }
+                continue;
+            }
+
+            // Deferred path: the latest run of the exact command on the step is
+            // the evidence. It records no generation, so currentness is read
+            // from the step's position in the plan.
+            let Some(Evidence::CommandExit { exit_code, .. }) =
+                step.evidence.iter().rev().find(|evidence| {
+                    matches!(
+                        evidence,
+                        Evidence::CommandExit { command_hash: Some(hash), .. }
+                            if hash == &sha256(&check.command)
+                    )
+                })
+            else {
                 reasons.push(CompletionReason {
                     code: CompletionReasonCode::RequiredCheckMissing,
                     explanation: format!(
@@ -276,53 +350,25 @@ impl CompletionGateReport {
                 });
                 continue;
             };
-            match &run.outcome {
-                CheckOutcome::Skipped(SkipReason::DeclinedByUser) => {
-                    waivers.push(CompletionWaiver {
-                        check: check.clone(),
-                        explanation: format!(
-                            "{} was declined by you, so it is waived for this task.",
-                            check.label()
-                        ),
-                    });
-                }
-                CheckOutcome::Skipped(reason) => {
-                    reasons.push(CompletionReason {
-                        code: CompletionReasonCode::RequiredCheckSkipped,
-                        explanation: format!(
-                            "Required check {} was skipped ({}), so it does not verify the current state.",
-                            check.label(),
-                            reason.description()
-                        ),
-                    });
-                }
-                CheckOutcome::Ran { .. } if passing(run) => {}
-                CheckOutcome::Environment { termination } => {
-                    reasons.push(CompletionReason {
-                        code: CompletionReasonCode::RequiredCheckFailed,
-                        explanation: format!(
-                            "Required check {} could not run: {}.",
-                            check.label(),
-                            termination.description()
-                        ),
-                    });
-                }
-                CheckOutcome::Ran { .. } => {
-                    let reason = verification
-                        .failed
-                        .iter()
-                        .find(|failed| &failed.check == check)
-                        .map(|failed| failed.reason.clone())
-                        .unwrap_or_else(|| "did not pass".to_string());
-                    reasons.push(CompletionReason {
-                        code: CompletionReasonCode::RequiredCheckFailed,
-                        explanation: format!(
-                            "Required check {} failed: {}.",
-                            check.label(),
-                            reason
-                        ),
-                    });
-                }
+            if !step_is_current(plan, step) {
+                reasons.push(CompletionReason {
+                    code: CompletionReasonCode::RequiredCheckStale,
+                    explanation: format!(
+                        "Required check {} ran, but the files it covered have changed since.",
+                        check.label()
+                    ),
+                });
+                continue;
+            }
+            if *exit_code != Some(0) {
+                reasons.push(CompletionReason {
+                    code: CompletionReasonCode::RequiredCheckFailed,
+                    explanation: format!(
+                        "Required check {} failed: {}.",
+                        check.label(),
+                        command_failure_reason(*exit_code)
+                    ),
+                });
             }
         }
 
@@ -344,6 +390,44 @@ impl CompletionGateReport {
 /// `None` means killed or signalled, which is unknown, not zero.
 fn passing(run: &CheckRun) -> bool {
     run.outcome.is_passed()
+}
+
+/// The report's wording for a failed run's exit: an exit code, or that the
+/// command was killed or signalled (which is unknown, never a zero).
+fn command_failure_reason(exit_code: Option<i32>) -> String {
+    match exit_code {
+        Some(code) => format!("exit code {code}"),
+        None => "killed or signalled".to_string(),
+    }
+}
+
+/// Whether a deferred check's step still holds the current mutation batch.
+///
+/// A deferred required check runs as an ordinary command at its plan step, so
+/// its evidence is the step's [`Evidence::CommandExit`] rather than a
+/// [`CheckRun`]. Unlike a `CheckRun`, that evidence records no generation, so
+/// currentness is read from the step's position: the evidence is current only
+/// while the step is terminal and no later primary step has begun, because a
+/// later primary step leaving `Pending` is exactly what advances the batch.
+fn step_is_current(plan: &TaskPlan, step: &PlanStep) -> bool {
+    if !step.status.is_terminal() {
+        return false;
+    }
+    let mut seen = false;
+    for candidate in plan
+        .steps
+        .iter()
+        .filter(|candidate| !candidate.id.starts_with(VERIFICATION_STEP_PREFIX))
+    {
+        if candidate.id == step.id {
+            seen = true;
+            continue;
+        }
+        if seen && candidate.status != StepStatus::Pending {
+            return false;
+        }
+    }
+    seen
 }
 
 fn open_steps_explanation(open: &[&PlanStep]) -> String {
