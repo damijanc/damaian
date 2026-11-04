@@ -29,8 +29,9 @@ finished task.
    says the task is closed. A model cannot assert or tool-call its way around
    the gate.
 2. A planned task is closed only when every non-verification plan step is
-   terminal, no verification is due or running, no proposal or question is
-   pending, and every required check known to the task has a current terminal
+   either completed or skipped — a blocked step is outstanding, not closed —
+   when no verification is due or running, no proposal or question is pending,
+   and every required check known to the task has a current terminal
    disposition.
 3. A skipped or declined check counts only as an explicit user waiver. It is
    never represented as passed, and the completion report names the waiver.
@@ -63,8 +64,16 @@ finished task.
 Add a `CompletionGate` report computed from the task, active plan, verification
 state, pending links and required-check evidence. It contains a boolean
 `eligible` plus stable reason codes such as `open_plan_steps`,
-`verification_due`, `pending_decision`, `required_check_missing` and
-`required_check_failed`.
+`blocked_plan_steps`, `verification_due`, `pending_decision`,
+`required_check_missing` and `required_check_failed`.
+
+`Blocked` is terminal for the step itself — its outcome is settled, and a plan
+revision may not delete it — but it is not finished work. The gate therefore
+reports a blocked step as `blocked_plan_steps` rather than folding it into
+`open_plan_steps`. `open_plan_steps` reads `TaskPlan::open_steps`, which is also
+spec 66's reminder set; that reminder deliberately stays quiet about a blocked
+step because the model has already been told, while completion must not treat
+it as done.
 
 The final `StopReason::Answered` settlement calls the gate. Eligible work keeps
 today's `complete`; ineligible work writes `incomplete` and stores the reason
@@ -256,7 +265,7 @@ criterion depends on #102, #103, #104, #105 or #106.
 | Requirement | Evidence |
 |---|---|
 | 1 · `complete` only through the engine gate | `completion.rs::CompletionGateService::settle` is the only path from a newly settled planned task to `TaskStatus::Complete`; answered turns, successful verification and the plan-review hand-off all settle through it. `completion_settlement` tests cover the answered and verification paths; `plan_turn` proves the hand-off records an eligible report. Synthetic commit/branch tasks carry no plan and keep their own action outcome. |
-| 2 · every plan step, verification, pending decision and selected check is closed | `CompletionGateReport::evaluate` reads the active plan, folded verification state, newest pending decision and current file hashes. `closed_task_completion` pins the full reason matrix, including due, started-but-unfinished, missing, failed, stale and policy-skipped checks. |
+| 2 · every plan step, verification, pending decision and selected check is closed, and no step is blocked | `CompletionGateReport::evaluate` reads the active plan, folded verification state, newest pending decision and current file hashes. `closed_task_completion` pins the full reason matrix, including due, started-but-unfinished, missing, failed, stale and policy-skipped checks. `a_blocked_plan_step_blocks_the_gate_with_its_own_reason` and `the_service_settles_a_blocked_step_incomplete_and_a_skipped_step_complete` pin a blocked step as outstanding (`blocked_plan_steps`) while a skipped step stays closed. |
 | 3 · declined checks are named waivers, never passes | `CompletionReasonCode` has no waiver variant; `CompletionWaiver` is produced only for `SkipReason::DeclinedByUser`, and the check still never enters `passed`. A policy-skipped check is `required_check_skipped` and blocks. |
 | 4 · an answer with work left is `incomplete` | `run_agentic_turn` settles `StopReason::Answered` through the gate; `two_answers_with_an_open_plan_settle_incomplete_and_keep_the_plan` proves the single #66 reminder, unchanged plan and two transcript answers. `plan_left_open_at_end` is the deterministic scenario for the same outcome. |
 | 5 · terminal but resumable, in an ordinary session and a worker | `TaskStatus::Incomplete` is terminal and not successful. `TaskControl::for_session` and `TaskControl::for_worker` offer **Continue task** with the exact `taskId`; `SessionStore::continue_incomplete_task` writes the new task and `plan_resumed` edge in one locked batch and compares the whole report. `ChatOrchestrator::continue_incomplete_task` builds the prompt from the durable reasons. Engine, route and worker tests cover carry, refusal, stale click, wrong repository and the next run settling `complete`. |
@@ -271,7 +280,7 @@ criterion depends on #102, #103, #104, #105 or #106.
 | Two answers with an open plan get one reminder and end `incomplete`, plan unchanged | `completion_settlement::two_answers_with_an_open_plan_settle_incomplete_and_keep_the_plan`; deterministic `plan_left_open_at_end`. |
 | Completing the remaining steps and checks changes the next run to `complete` | `task_control::completing_the_carried_plan_on_the_next_run_settles_complete`; `completion_settlement::a_closed_plan_settles_complete_with_an_eligible_report`. |
 | A declined required check is a named waiver, never pass evidence | `closed_task_completion::a_declined_check_is_a_named_waiver_and_never_a_pass`; the full reason-matrix test. |
-| Due verification, pending patch/question or open required step prevents `complete` | `closed_task_completion::every_blocking_fact_produces_its_stable_reason_code`; the shell route test where an answered command task with a due verification settles `incomplete`; the worker progress/outcome tests. |
+| Due verification, pending patch/question, blocked step or open required step prevents `complete` | `closed_task_completion::every_blocking_fact_produces_its_stable_reason_code`; `closed_task_completion::a_blocked_plan_step_blocks_the_gate_with_its_own_reason` and `the_service_settles_a_blocked_step_incomplete_and_a_skipped_step_complete`; the shell route test where an answered command task with a due verification settles `incomplete`; the worker progress/outcome tests. |
 | Reloading an incomplete worker shows **Incomplete — Continue task** and carries the same plan | `worker_supervisor::worker_outcomes_use_engine_control_and_preserve_incomplete`; `worker_turns::continuing_an_incomplete_task_through_the_route_carries_plan_and_reasons`; `worker_turns::a_worker_continues_only_the_exact_task_its_control_named`; engine `task_control` carry test. |
 | Historical `complete` events are not rewritten | `closed_task_completion::a_historical_status_event_has_no_report_and_stays_valid`; reports are additive siblings and the stricter rule applies only to new settlements. |
 
@@ -326,3 +335,44 @@ run, so it proves the engine paths, not model behaviour against a real provider.
 The live acceptance for this spec is therefore the truthful state machine above,
 not a claim that a worker can finish an arbitrarily large task; #103 and #106
 own that longer-horizon evidence.
+
+### Review fix 2026-11-04: a blocked step is outstanding (R1)
+
+The review of specs 101–105 found that the gate used
+`StepStatus::is_terminal`, which counts `Blocked`. A plan whose last step failed
+its command therefore had no open steps; an answer after that settled
+`complete`. The gate now reports `blocked_plan_steps` for a blocked
+non-verification step, and `open_plan_steps` reads `TaskPlan::open_steps`, so it
+stays the same set as spec 66's reminder. `StepStatus::is_terminal` is
+unchanged, so plan-revision protection still keeps a blocked step.
+
+The regression test was written first:
+`a_blocked_plan_step_blocks_the_gate_with_its_own_reason` failed with
+`CompletionGateReport { task_id: "task_1", eligible: true, reasons: [], waivers: [] }`,
+and `the_service_settles_a_blocked_step_incomplete_and_a_skipped_step_complete`
+failed with `left: Complete, right: Incomplete`. Both pass now, and
+`a_skipped_plan_step_is_closed` pins the boundary.
+
+Continuation is unchanged here: `SessionStore::continue_incomplete_task`
+(`session.rs:3204`) still writes `plan_resumed` only when some step is
+non-terminal, so a plan whose only outstanding step is blocked does not resume
+yet. R2 owns carrying the source plan and reasons for every `incomplete`
+settlement.
+
+Checks run locally on 2026-11-04:
+
+- `scripts/quality-gate.sh fmt node lint typos deny`: all five passed after
+  `npm ci` (the first `lint` run exited 127 because `node_modules` was absent).
+- `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`:
+  passed.
+- `cargo nextest run -p workspace-engine --test closed_task_completion`: 21
+  passed.
+- `cargo nextest run -p workspace-engine --locked --no-fail-fast`: 2486 passed,
+  30 skipped. An earlier run of the same suite failed once in
+  `symbol_index::a_server_that_never_answers_costs_one_timeout_per_file_and_never_delays_a_reader`
+  (`assertion left == right failed: every opened file is closed again`, left
+  `["src/a.rs", "src/b.rs", "src/c.rs"]`, right `["src/a.rs", "src/b.rs"]`); the
+  test passed when rerun alone and in the second full run. No loopback-port test
+  failed.
+
+Workspace clippy and the other crates' suites are left to CI.

@@ -313,6 +313,10 @@ impl TaskPlan {
     /// The steps whose outcome is still open: `Pending` or `InProgress`, in
     /// plan order. `Blocked` is terminal for this purpose (#21 already stops
     /// the handoff and tells the model), so it is not open.
+    ///
+    /// This is the reminder/handoff set (spec 66 §5.1). The completion gate
+    /// uses it for `open_plan_steps` and reports a `Blocked` step separately as
+    /// `blocked_plan_steps`: settlement is not completion (spec 101, R1).
     pub fn open_steps(&self) -> Vec<&PlanStep> {
         self.steps
             .iter()

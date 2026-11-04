@@ -15,10 +15,10 @@ use workspace_engine::hash::{file_hash, sha256};
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
     CheckId, CheckOutcome, ClientError, CommandPurpose, CompletionFacts, CompletionGateReport,
-    CompletionGateService, CompletionReasonCode, Evidence, PLANNED_CHECK_VERSION,
-    PendingApprovalRef, PendingDecision, PendingQuestionRef, PlanStep, PlannedCheck, Session,
-    SessionStore, SkipReason, Task, TaskPlan, TaskStatus, VerificationEvent, VerificationOutcome,
-    VerificationState, fold_verification, repository_id_for_root,
+    CompletionGateService, CompletionReasonCode, CompletionSettlement, Evidence,
+    PLANNED_CHECK_VERSION, PendingApprovalRef, PendingDecision, PendingQuestionRef, PlanStep,
+    PlannedCheck, Session, SessionStore, SkipReason, Task, TaskPlan, TaskStatus, VerificationEvent,
+    VerificationOutcome, VerificationState, fold_verification, repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -282,6 +282,88 @@ fn every_blocking_fact_produces_its_stable_reason_code() {
             .reasons
             .iter()
             .all(|reason| !reason.explanation.is_empty())
+    );
+}
+
+/// R1 regression from the 2026-11-04 review of specs 101–105: the gate
+/// filtered on `StepStatus::is_terminal`, which counts `Blocked`, so a plan
+/// whose last step failed its command had no open steps and answered itself
+/// `complete`. A blocked step is outstanding work with its own reason.
+#[test]
+fn a_blocked_plan_step_blocks_the_gate_with_its_own_reason() {
+    let task_id = "task_1";
+    let plan = plan(task_id, vec![step("run-tests", StepStatus::Blocked)]);
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert!(
+        !report.eligible,
+        "a blocked step is not finished: {report:?}"
+    );
+    assert_eq!(
+        report
+            .reason_codes()
+            .iter()
+            .map(|code| code.as_str())
+            .collect::<Vec<_>>(),
+        vec!["blocked_plan_steps"]
+    );
+    assert!(
+        report.reasons[0].explanation.contains("run-tests"),
+        "{}",
+        report.reasons[0].explanation
+    );
+}
+
+/// The other side of R1: `Skipped` is a settled step, so a plan holding only a
+/// skipped step has nothing outstanding. Only `Blocked` changed meaning.
+#[test]
+fn a_skipped_plan_step_is_closed() {
+    let task_id = "task_1";
+    let plan = plan(task_id, vec![step("run-tests", StepStatus::Skipped)]);
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert!(report.eligible, "{report:?}");
+    assert!(report.reasons.is_empty());
+}
+
+#[test]
+fn the_service_settles_a_blocked_step_incomplete_and_a_skipped_step_complete() {
+    let (root, store, _session, blocked_task) = fixture("settle-blocked");
+    let blocked_plan = plan(
+        &blocked_task.id,
+        vec![step("run-tests", StepStatus::Blocked)],
+    );
+    store.create_plan(&blocked_task, &blocked_plan).unwrap();
+
+    let service = CompletionGateService::new(&store, &root);
+    let settled = service
+        .settle(&blocked_task, CompletionSettlement::Gate)
+        .unwrap();
+    assert_eq!(
+        settled.task.status,
+        TaskStatus::Incomplete,
+        "{:?}",
+        settled.report
+    );
+
+    let (root, store, _session, skipped_task) = fixture("settle-skipped");
+    let skipped_plan = plan(
+        &skipped_task.id,
+        vec![step("run-tests", StepStatus::Skipped)],
+    );
+    store.create_plan(&skipped_task, &skipped_plan).unwrap();
+
+    let service = CompletionGateService::new(&store, &root);
+    let settled = service
+        .settle(&skipped_task, CompletionSettlement::Gate)
+        .unwrap();
+    assert_eq!(
+        settled.task.status,
+        TaskStatus::Complete,
+        "{:?}",
+        settled.report
     );
 }
 

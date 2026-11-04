@@ -55,6 +55,16 @@ pub const COMPLETION_SETTLEMENT_ACTION: &str = "completion_settlement";
 pub enum CompletionReasonCode {
     /// At least one non-verification plan step is still pending or in progress.
     OpenPlanSteps,
+    /// At least one non-verification plan step is blocked by a failed command.
+    ///
+    /// `Blocked` is terminal for a step (`StepStatus::is_terminal`), because the
+    /// step's own outcome is settled and a plan revision must not delete it.
+    /// It is not finished work, though: the command the step ran did not
+    /// succeed, so the task cannot be closed. It gets its own code rather than
+    /// joining [`Self::OpenPlanSteps`], whose set is [`TaskPlan::open_steps`]
+    /// and the #66 reminder's set (spec 66 §5.1 deliberately keeps blocked
+    /// steps out of the reminder: the model was already told the step blocked).
+    BlockedPlanSteps,
     /// A verification is due and has not finished.
     VerificationDue,
     /// A verification run started but recorded no finished event.
@@ -77,6 +87,7 @@ impl CompletionReasonCode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::OpenPlanSteps => "open_plan_steps",
+            Self::BlockedPlanSteps => "blocked_plan_steps",
             Self::VerificationDue => "verification_due",
             Self::VerificationUnfinished => "verification_unfinished",
             Self::PendingDecision => "pending_decision",
@@ -214,17 +225,33 @@ impl CompletionGateReport {
         let mut reasons = Vec::new();
         let mut waivers = Vec::new();
 
+        // `open_steps` is the reminder's set: `Pending` or `InProgress`
+        // (spec 66 §5.1). Using it here keeps the gate's `OpenPlanSteps` and
+        // the #66 reminder describing the same steps; a `Blocked` step is
+        // reported separately below because its outcome is settled but the
+        // work is not finished.
         let open: Vec<&PlanStep> = plan
-            .steps
-            .iter()
-            .filter(|step| {
-                !step.id.starts_with(VERIFICATION_STEP_PREFIX) && !step.status.is_terminal()
-            })
+            .open_steps()
+            .into_iter()
+            .filter(|step| !step.id.starts_with(VERIFICATION_STEP_PREFIX))
             .collect();
         if !open.is_empty() {
             reasons.push(CompletionReason {
                 code: CompletionReasonCode::OpenPlanSteps,
                 explanation: open_steps_explanation(&open),
+            });
+        }
+        let blocked: Vec<&PlanStep> = plan
+            .steps
+            .iter()
+            .filter(|step| {
+                !step.id.starts_with(VERIFICATION_STEP_PREFIX) && step.status == StepStatus::Blocked
+            })
+            .collect();
+        if !blocked.is_empty() {
+            reasons.push(CompletionReason {
+                code: CompletionReasonCode::BlockedPlanSteps,
+                explanation: blocked_steps_explanation(&blocked),
             });
         }
 
@@ -441,6 +468,23 @@ fn open_steps_explanation(open: &[&PlanStep]) -> String {
     } else {
         format!("{} planned steps are still open: {titles}.", open.len())
     }
+}
+
+fn blocked_steps_explanation(blocked: &[&PlanStep]) -> String {
+    let titles = blocked
+        .iter()
+        .map(|step| format!("\"{}\"", step.title))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if blocked.len() == 1 {
+        "planned step is blocked"
+    } else {
+        "planned steps are blocked"
+    };
+    format!(
+        "{} {noun}: {titles}. A blocked step's command did not succeed, so the work is not finished.",
+        blocked.len()
+    )
 }
 
 /// The completion gate bound to one repository checkout and session log.
