@@ -86,7 +86,22 @@ fn command_exit(command: &str, exit_code: Option<i32>) -> Evidence {
         exit_code,
         purpose: CommandPurpose::Check,
         command_hash: Some(sha256(command)),
+        working_directory: String::new(),
     }
+}
+
+/// A `CommandExit` as a session log written before the working directory was
+/// recorded: the JSON has no directory field at all. Loaded through serde so
+/// the compatibility of an old log is what the test exercises.
+fn legacy_command_exit(command: &str, exit_code: Option<i32>) -> Evidence {
+    serde_json::from_value(serde_json::json!({
+        "kind": "commandExit",
+        "markerId": "marker",
+        "exitCode": exit_code,
+        "purpose": "check",
+        "commandHash": sha256(command),
+    }))
+    .expect("a pre-directory command exit should load")
 }
 
 fn due(task_id: &str) -> VerificationEvent {
@@ -509,6 +524,44 @@ fn a_deferred_required_check_is_stale_when_a_later_step_begins() {
         report.reason_codes(),
         vec![CompletionReasonCode::RequiredCheckStale]
     );
+}
+
+/// A `CommandExit` written before the working directory was recorded carries no
+/// directory. It must not satisfy a required check whose directory is not the
+/// repository root: the old event cannot prove where the command ran.
+#[test]
+fn a_command_exit_written_before_the_directory_was_recorded_does_not_satisfy_a_subdirectory_check()
+{
+    let task_id = "task_1";
+    let mut test = checked_step_in("test", "cargo test", "crates/foo", StepStatus::Completed);
+    test.evidence = vec![legacy_command_exit("cargo test", Some(0))];
+    let plan = plan(task_id, vec![test]);
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckMissing],
+        "an old event with no directory cannot stand for a subdirectory check"
+    );
+}
+
+/// For a root-directory check an event with no recorded directory still
+/// satisfies it. Before the directory was recorded, every matching command was
+/// treated as a root check, so this keeps an in-flight session's existing
+/// evidence meaningful instead of invalidating it on upgrade. The choice is
+/// recorded in spec 105's review-fix note.
+#[test]
+fn a_command_exit_written_before_the_directory_was_recorded_still_satisfies_a_root_check() {
+    let task_id = "task_1";
+    let mut test = checked_step("test", "cargo test", StepStatus::Completed);
+    test.evidence = vec![legacy_command_exit("cargo test", Some(0))];
+    let plan = plan(task_id, vec![test]);
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert!(report.eligible, "{report:?}");
+    assert!(report.reasons.is_empty());
 }
 
 /// Spec 105 requirement 10: the gate reads structured checks, never plan

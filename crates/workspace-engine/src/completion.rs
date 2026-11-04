@@ -356,15 +356,21 @@ impl CompletionGateReport {
                 continue;
             }
 
-            // Deferred path: the latest run of the exact command on the step is
-            // the evidence. It records no generation, so currentness is read
-            // from the step's position in the plan.
+            // Deferred path: the latest run of the exact command in the exact
+            // directory on the step is the evidence. Identity is the full
+            // `CheckId` — command *and* working directory — not the command
+            // alone. It records no generation, so currentness is read from the
+            // step's position in the plan.
             let Some(Evidence::CommandExit { exit_code, .. }) =
                 step.evidence.iter().rev().find(|evidence| {
                     matches!(
                         evidence,
-                        Evidence::CommandExit { command_hash: Some(hash), .. }
-                            if hash == &sha256(&check.command)
+                        Evidence::CommandExit {
+                            command_hash: Some(hash),
+                            working_directory,
+                            ..
+                        } if hash == &sha256(&check.command)
+                            && working_directory == &check.working_directory
                     )
                 })
             else {

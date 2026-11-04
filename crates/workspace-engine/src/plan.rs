@@ -10,6 +10,7 @@
 //! a stage of a multi-turn project.
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 use crate::command_purpose::CommandPurpose;
 
@@ -92,6 +93,14 @@ pub enum Evidence {
         /// line; those are judged one exit at a time, as they always were.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command_hash: Option<String>,
+        /// The repository-relative directory the command ran in, normalized
+        /// like `CheckId`: `/` separators, and `""` for the repository root.
+        /// Written since spec 105's 2026-11-04 review fix. An event written
+        /// before it reads as the root, which is the directory the pre-fix
+        /// gate assumed; it is also `""` for evidence that is not a command
+        /// line, whose `command_hash` is `None` and therefore matches nothing.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        working_directory: String,
     },
     /// A patch was applied, with the hash actually written per file.
     #[serde(rename_all = "camelCase")]
@@ -154,6 +163,29 @@ fn default_planned_check_version() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+/// The repository-relative directory a planned check names, in the form a
+/// [`crate::verification::CheckId`] uses: `""` is the repository root, `/` is
+/// the separator, and a leading `./` or trailing `/` is gone.
+///
+/// Built on [`crate::command_policy::relative_location`]'s lexical
+/// normalization, which is also how a discovered check's directory is formed,
+/// so the plan and the evidence compare as one identity. A relative path is
+/// resolved against `repository_root`; an absolute one is used as it is.
+/// `None` means the path is outside the repository — absolute, or escaping it
+/// with `..` — and the caller must refuse rather than guess.
+pub fn normalize_planned_check_directory(
+    repository_root: &Path,
+    working_directory: &str,
+) -> Option<String> {
+    let requested = working_directory.trim();
+    let resolved = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        repository_root.join(requested)
+    };
+    crate::command_policy::relative_location(repository_root, &resolved)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

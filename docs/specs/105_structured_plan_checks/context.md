@@ -48,6 +48,13 @@ replayed plans load with `None`. `validate_plan_structure` /
 `validate_plan_approval` (`session.rs:244`) must accept the field the same way
 they accept retitle/reorder: the user may edit a proposed check, so the
 structure check does not re-validate its command against the live invariants.
+The directory is different: both the model's `propose_plan` and the review
+card's revision pass through `normalize_planned_check_directory` before the
+`PlannedCheck` is stored, so the plan carries the same form as a discovered
+`CheckId` (`""` root, `/` separators, no leading `./`, no trailing `/`). A
+directory that is absolute outside the repository, or escapes it with `..`, is
+dropped from a proposal (like a check with no command) and rejects a revision
+with a clear error rather than being guessed at.
 
 ## 4. "Authoritative after approval" is the settled plan, which already exists
 
@@ -90,8 +97,11 @@ primary steps, maps each `required: true` `PlannedCheck` to
 - **Deferred to its plan step.** Task 2 removed the check from the selection, so
   there is no `CheckRun`; the worker ran the exact command at the step through
   spec 97's ordinary command flow, which recorded an `Evidence::CommandExit` on
-  the plan step. The gate matches the latest `CommandExit` whose `command_hash`
-  equals `sha256(planned.command)`. That evidence records no generation, so
+  the plan step. The gate matches the latest `CommandExit` whose
+  `command_hash` equals `sha256(planned.command)` **and** whose recorded
+  `working_directory` equals the planned directory (2026-11-04 review fix R3;
+  the directory is normalized like `CheckId`, and an exit written before it was
+  recorded reads as the root). That evidence records no generation, so
   currentness is read from the step's position: the step is terminal **and** no
   later primary step has left `Pending` (a later primary step leaving `Pending`
   is exactly what advances `mutation_generation()`). A non-terminal step, or a

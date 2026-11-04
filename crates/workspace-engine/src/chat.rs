@@ -8,7 +8,8 @@ use crate::clarification::{
     QUESTION_MAX_CHARS, validate_answer,
 };
 use crate::command_policy::{
-    ApprovalCause, CommandClassification, CommandRisk, allow_always_eligible, is_validation_command,
+    ApprovalCause, CommandClassification, CommandRisk, allow_always_eligible,
+    is_validation_command, relative_location,
 };
 use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
@@ -52,7 +53,7 @@ use crate::patch_engine::{PatchEngine, ProposedChange, ProposedFilePatch, Propos
 use crate::path_policy::PathPolicy;
 use crate::plan::{
     Evidence, PLANNED_CHECK_VERSION, PlanStep, PlannedCheck, StepStatus, TaskPlan,
-    status_from_evidence,
+    normalize_planned_check_directory, status_from_evidence,
 };
 use crate::process_registry::ProcessRegistry;
 use crate::protected_paths::{
@@ -168,11 +169,14 @@ enum ActionOutcome {
 ///
 /// `command` is the command line that ran, when the action was one. Only its
 /// hash is kept, so a later run of the same command can supersede this exit
-/// (spec 21 §5.3).
+/// (spec 21 §5.3). `working_directory` is the directory it ran in, already
+/// repository-relative and normalized the way a `CheckId` is; spec 105's check
+/// identity is that directory *and* the command.
 fn evidence_for(
     outcome: &ActionOutcome,
     marker_id: &str,
     command: Option<&str>,
+    working_directory: Option<&str>,
 ) -> Option<crate::plan::Evidence> {
     match outcome {
         ActionOutcome::CommandExit(exit_code, purpose) => {
@@ -181,6 +185,7 @@ fn evidence_for(
                 exit_code: *exit_code,
                 purpose: *purpose,
                 command_hash: command.map(command_hash),
+                working_directory: working_directory.unwrap_or_default().to_string(),
             })
         }
         // No marker id: unlike a command, the fact worth keeping is *which
@@ -2955,7 +2960,7 @@ impl ChatOrchestrator {
             .any(|step| !step.id.starts_with("verify_"));
         let checks: Vec<_> = checks
             .into_iter()
-            .filter(|(check, _)| !plan_defers_check(&plan, check))
+            .filter(|(check, _)| !plan_defers_check(repository_root, &plan, check))
             .filter(|(check, _)| {
                 if !batch_scoped {
                     return true;
@@ -3220,6 +3225,11 @@ impl ChatOrchestrator {
             exit_code,
             purpose: record.execution.purpose,
             command_hash: Some(command_hash(&record.execution.command)),
+            working_directory: relative_location(
+                repository_root,
+                Path::new(&record.execution.working_directory),
+            )
+            .unwrap_or_else(|| record.execution.working_directory.clone()),
         }];
         if let Some(findings) = findings {
             evidence.push(findings);
@@ -3307,6 +3317,7 @@ impl ChatOrchestrator {
             purpose: CommandPurpose::Check,
             // A browser check is not a command line; each run stands alone.
             command_hash: None,
+            working_directory: String::new(),
         };
         if let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id) {
             step.evidence = vec![evidence];
@@ -4976,6 +4987,13 @@ impl ChatOrchestrator {
                 // action marker, so the execution's own id is the breadcrumb —
                 // it is the `commandId` on the `stored_command_executed`
                 // record that carries the exit (spec 66 `context.md` D14).
+                // The directory comes from the execution, not the proposal,
+                // because that is where the runner actually ran it.
+                let command_directory = relative_location(
+                    &repository_root,
+                    Path::new(&record.execution.working_directory),
+                )
+                .unwrap_or_else(|| record.execution.working_directory.clone());
                 if let Some(evidence) = evidence_for(
                     &ActionOutcome::CommandExit(
                         record.execution.exit_code,
@@ -4983,6 +5001,7 @@ impl ChatOrchestrator {
                     ),
                     &record.execution.id,
                     Some(&command_request.command),
+                    Some(&command_directory),
                 ) {
                     step_evidence.push(evidence);
                 }
@@ -5219,13 +5238,16 @@ impl ChatOrchestrator {
         let plan = self
             .session_store
             .read_task_plan(&pending.session.id, &pending.task.id)?;
+        let repository_root = PathBuf::from(&pending.repository_root);
         let steps: Vec<String> = match (revised, plan) {
-            (Some(revision), Some(current)) => apply_plan_revision(&current, &revision)
-                .steps
-                .into_iter()
-                .filter(|step| !step.status.is_terminal())
-                .map(|step| step.title)
-                .collect(),
+            (Some(revision), Some(current)) => {
+                apply_plan_revision(&repository_root, &current, &revision)?
+                    .steps
+                    .into_iter()
+                    .filter(|step| !step.status.is_terminal())
+                    .map(|step| step.title)
+                    .collect()
+            }
             (_, Some(current)) => current
                 .steps
                 .into_iter()
@@ -5410,9 +5432,10 @@ impl ChatOrchestrator {
         let current_plan = self
             .session_store
             .read_task_plan(&pending.session.id, &pending.task.id)?;
+        let repository_root = PathBuf::from(&pending.repository_root);
         let revised_plan = match (approved, revised, &current_plan) {
             (true, Some(revision), Some(current)) => {
-                let applied = apply_plan_revision(current, &revision);
+                let applied = apply_plan_revision(&repository_root, current, &revision)?;
                 validate_plan_approval(&pending.task, &applied)?;
                 Some(applied)
             }
@@ -5422,7 +5445,6 @@ impl ChatOrchestrator {
         };
         let pending = self.pending_commands.take(proposal_id)?;
         let turn_notes = TurnNotesState::from_pending(&pending);
-        let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
 
         let mut plan = current_plan;
@@ -10057,6 +10079,11 @@ impl ChatOrchestrator {
                 // rather than through `ActionOutcome` (spec 22 `context.md` §14).
                 let mut command_findings: Option<crate::plan::Evidence> = None;
                 let mut command_termination: Option<CommandTermination> = None;
+                // The directory the command actually ran in, repository-relative
+                // for the evidence (spec 105's check identity). Carried out of
+                // the arm like the termination: `CommandExecution` is not
+                // persisted.
+                let mut command_directory: Option<String> = None;
                 // Kept for `after_tool`; the dispatch match below consumes the
                 // action's fields.
                 let after_tool_action = tool_action.clone();
@@ -10288,6 +10315,13 @@ impl ChatOrchestrator {
                             // — so it is carried out of the arm rather than looked up.
                             let exit_code = record.execution.exit_code;
                             command_termination = Some(record.execution.termination);
+                            command_directory = Some(
+                                relative_location(
+                                    repository_root,
+                                    Path::new(&record.execution.working_directory),
+                                )
+                                .unwrap_or_else(|| record.execution.working_directory.clone()),
+                            );
                             (
                                 tool_call_summary(&command_request),
                                 command_context,
@@ -10430,7 +10464,10 @@ impl ChatOrchestrator {
                                         started_at_ms: (index == 0).then_some(now),
                                         completed_at_ms: None,
                                         evidence: Vec::new(),
-                                        check: step.check.clone(),
+                                        check: normalized_proposed_check(
+                                            repository_root,
+                                            step.check.clone(),
+                                        ),
                                     });
                                 }
                                 self.session_store.create_plan(&task, &proposed)?;
@@ -11330,6 +11367,7 @@ impl ChatOrchestrator {
                         &action_outcome,
                         action_marker.id(),
                         action_command(&after_tool_action),
+                        command_directory.as_deref(),
                     )
                 {
                     step_evidence.push(evidence);
@@ -14489,13 +14527,14 @@ fn reset_verify_step(plan: &mut TaskPlan, step_id: &str) {
 /// Whether an open (non-terminal, non-`verify_`) plan step carries a `required`
 /// structured check whose identity is `check` (spec 105 §4).
 ///
-/// The match is the full identity — command *and* working directory — so a
-/// planned whole-suite check is deferred to its own plan step, while a check at
-/// a different directory or with a different command still runs now. Only a
-/// `required: true` check is a deferral target; an optional check is not.
-/// Historical prose-only plans carry no `PlannedCheck`, so they defer nothing
-/// (requirement 10): a command named in a step's text is no longer a signal.
-fn plan_defers_check(plan: &TaskPlan, check: &CheckId) -> bool {
+/// The match is the full identity — command *and* working directory — in the
+/// same normalized directory form a discovered `CheckId` uses. A plan stored
+/// before the input normalization, or written by a caller that did not go
+/// through it, still compares correctly. Only a `required: true` check is a
+/// deferral target; an optional check is not. Historical prose-only plans carry
+/// no `PlannedCheck`, so they defer nothing (requirement 10): a command named in
+/// a step's text is no longer a signal.
+fn plan_defers_check(repository_root: &Path, plan: &TaskPlan, check: &CheckId) -> bool {
     plan.steps.iter().any(|step| {
         if step.id.starts_with("verify_") || step.status.is_terminal() {
             return false;
@@ -14506,7 +14545,12 @@ fn plan_defers_check(plan: &TaskPlan, check: &CheckId) -> bool {
         if !planned.required {
             return false;
         }
-        CheckId::new(planned.working_directory.as_str(), planned.command.as_str()) == *check
+        let Some(directory) =
+            normalize_planned_check_directory(repository_root, &planned.working_directory)
+        else {
+            return false;
+        };
+        CheckId::new(directory, planned.command.as_str()) == *check
     })
 }
 
@@ -16025,6 +16069,20 @@ fn action_awaits_plan_review(
     }
 }
 
+/// A model-proposed check with its directory in `CheckId` form, or `None` when
+/// that directory cannot be repository-relative. Dropping it is the same
+/// outcome as a check with no command: the step keeps its prose and no check
+/// obligation is invented from a path the engine cannot trust.
+fn normalized_proposed_check(
+    repository_root: &Path,
+    check: Option<PlannedCheck>,
+) -> Option<PlannedCheck> {
+    let mut check = check?;
+    check.working_directory =
+        normalize_planned_check_directory(repository_root, &check.working_directory)?;
+    Some(check)
+}
+
 /// Rebuilds a plan from the user's revision, in the order the user put the
 /// steps in.
 ///
@@ -16044,8 +16102,15 @@ fn action_awaits_plan_review(
 /// step. The user is reordering, retitling and shaping the structured check,
 /// not asserting anything about its status or its evidence — those remain the
 /// engine's to decide (§3). A `Preserve` check leaves the existing one in
-/// place; `Remove` clears it; `Set` replaces it with what the user approved.
-fn apply_plan_revision(current: &TaskPlan, revision: &[PlanRevisionStep]) -> TaskPlan {
+/// place; `Remove` clears it; `Set` replaces it with what the user approved,
+/// after its directory is normalized to the `CheckId` form. A directory that is
+/// outside the repository is refused: the review stays answerable rather than
+/// storing a check that can never match.
+fn apply_plan_revision(
+    repository_root: &Path,
+    current: &TaskPlan,
+    revision: &[PlanRevisionStep],
+) -> Result<TaskPlan> {
     let mut revised = current.clone();
     let mut steps: Vec<crate::plan::PlanStep> = current
         .steps
@@ -16065,12 +16130,25 @@ fn apply_plan_revision(current: &TaskPlan, revision: &[PlanRevisionStep]) -> Tas
         match &edit.check {
             PlanRevisionCheck::Preserve => {}
             PlanRevisionCheck::Remove => step.check = None,
-            PlanRevisionCheck::Set(check) => step.check = Some(check.clone()),
+            PlanRevisionCheck::Set(check) => {
+                let mut check = check.clone();
+                check.working_directory = normalize_planned_check_directory(
+                    repository_root,
+                    &check.working_directory,
+                )
+                .ok_or_else(|| {
+                    ClientError::InvalidInput(format!(
+                        "The check directory `{}` is outside this repository. Use a repository-relative directory such as `crates/foo`, or the repository root.",
+                        check.working_directory
+                    ))
+                })?;
+                step.check = Some(check);
+            }
         }
         steps.push(step);
     }
     revised.steps = steps;
-    revised
+    Ok(revised)
 }
 
 /// Checks the budget half of a plan-review decision before anything is written.
@@ -17748,18 +17826,20 @@ mod evidence_tests {
     }
 
     #[test]
-    fn a_failing_command_produces_evidence_carrying_its_code() {
+    fn a_failing_command_produces_evidence_carrying_its_code_and_directory() {
         assert_eq!(
             evidence_for(
                 &ActionOutcome::CommandExit(Some(1), CommandPurpose::Check),
                 "action_1",
-                Some("cargo test")
+                Some("cargo test"),
+                Some("crates/engine")
             ),
             Some(Evidence::CommandExit {
                 marker_id: "action_1".to_string(),
                 exit_code: Some(1),
                 purpose: CommandPurpose::Check,
                 command_hash: Some(crate::hash::sha256("cargo test")),
+                working_directory: "crates/engine".to_string(),
             })
         );
     }
@@ -17773,6 +17853,7 @@ mod evidence_tests {
             evidence_for(
                 &ActionOutcome::CommandExit(None, CommandPurpose::Other),
                 "action_1",
+                None,
                 None
             ),
             Some(Evidence::CommandExit {
@@ -17780,6 +17861,7 @@ mod evidence_tests {
                 exit_code: None,
                 purpose: CommandPurpose::Other,
                 command_hash: None,
+                working_directory: String::new(),
             })
         );
     }
@@ -17792,6 +17874,7 @@ mod evidence_tests {
             evidence_for(
                 &ActionOutcome::CommandExit(Some(1), CommandPurpose::Exploration),
                 "action_1",
+                None,
                 None
             ),
             Some(Evidence::CommandExit {
@@ -17799,6 +17882,7 @@ mod evidence_tests {
                 exit_code: Some(1),
                 purpose: CommandPurpose::Exploration,
                 command_hash: None,
+                working_directory: String::new(),
             })
         );
     }
@@ -17809,7 +17893,10 @@ mod evidence_tests {
         // served is done. Manufacturing a success record from it is exactly
         // the letter-not-spirit failure requirement 6 guards against — it
         // would make every step look verified.
-        assert_eq!(evidence_for(&ActionOutcome::Ok, "action_1", None), None);
+        assert_eq!(
+            evidence_for(&ActionOutcome::Ok, "action_1", None, None),
+            None
+        );
     }
 
     #[test]
@@ -17817,7 +17904,10 @@ mod evidence_tests {
         // `Failed` carries no exit code, so there is nothing to record that
         // would not be invented. The step's own status comes from the absence
         // of confirming evidence, not from a fabricated failure record.
-        assert_eq!(evidence_for(&ActionOutcome::Failed, "action_1", None), None);
+        assert_eq!(
+            evidence_for(&ActionOutcome::Failed, "action_1", None, None),
+            None
+        );
     }
 
     /// Requirement 5: a command that was killed reports why it stopped. `-1` is
@@ -18301,6 +18391,50 @@ mod evidence_tests {
             concurrent < sequential,
             "four concurrent searches should beat four sequential ones: \
              concurrent {concurrent:?} vs sequential {sequential:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod plan_deferral_tests {
+    use super::*;
+    use crate::plan::{PlanStep, PlannedCheck, StepStatus, TaskPlan};
+
+    fn plan_with_check(directory: &str) -> TaskPlan {
+        let mut plan = TaskPlan::new("task_1", 0);
+        plan.steps.push(PlanStep {
+            id: "test".to_string(),
+            title: "Validate the change".to_string(),
+            detail: None,
+            status: StepStatus::InProgress,
+            depends_on: Vec::new(),
+            started_at_ms: Some(1),
+            completed_at_ms: None,
+            evidence: Vec::new(),
+            check: Some(PlannedCheck {
+                version: PLANNED_CHECK_VERSION,
+                command: "cargo test".to_string(),
+                working_directory: directory.to_string(),
+                purpose: "validates the final tree".to_string(),
+                required: true,
+            }),
+        });
+        plan
+    }
+
+    /// Spec 105: the plan's identity and the discovered `CheckId` are compared
+    /// in the same normalized directory form. A model or card that writes
+    /// `./crates/foo` must defer the discovered check in `crates/foo`.
+    #[test]
+    fn a_planned_check_with_a_dot_prefix_defers_the_normalized_discovered_check() {
+        let plan = plan_with_check("./crates/foo");
+        assert!(
+            plan_defers_check(
+                Path::new("/repo"),
+                &plan,
+                &CheckId::new("crates/foo", "cargo test")
+            ),
+            "`./crates/foo` and `crates/foo` are the same check directory"
         );
     }
 }

@@ -31,9 +31,9 @@ use workspace_engine::{
     WorkspaceEngine, allow_always_eligible, builtin_context_window, builtin_token_defaults,
     command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
     fold_verification, import_profile, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
-    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
-    select_profile,
+    normalize_model_reasoning_level, normalize_planned_check_directory, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
+    review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -3475,7 +3475,7 @@ fn handle_plan_worker_prompt(stream: &mut TcpStream, request: &Request) -> Resul
     let repo = required_form(&form, "repo")?;
     let proposal_id = required_form(&form, "proposal_id")?;
     let revised = match form.get("steps").filter(|value| !value.is_empty()) {
-        Some(raw) => Some(parse_plan_revision(raw)?),
+        Some(raw) => Some(parse_plan_revision(raw, Path::new(&repo))?),
         None => None,
     };
     let engine = engine_for_repo(&repo)?;
@@ -3938,7 +3938,7 @@ fn run_resume_plan_request(
     let proposal_id = required_form(form, "proposal_id")?;
     let approved = form.get("approved").map(String::as_str) == Some("true");
     let revised = match form.get("steps").filter(|value| !value.is_empty()) {
-        Some(raw) => Some(parse_plan_revision(raw)?),
+        Some(raw) => Some(parse_plan_revision(raw, Path::new(&repo))?),
         None => None,
     };
     // Transport only: the typed budget the card returned is handed back
@@ -4316,7 +4316,7 @@ impl ModelAdapter for NoModelCall {
     }
 }
 
-fn parse_plan_revision(raw: &str) -> Result<Vec<PlanRevisionStep>, String> {
+fn parse_plan_revision(raw: &str, repository_root: &Path) -> Result<Vec<PlanRevisionStep>, String> {
     let parsed: Vec<serde_json::Value> =
         serde_json::from_str(raw).map_err(|error| format!("Invalid plan revision: {error}"))?;
     parsed
@@ -4338,8 +4338,21 @@ fn parse_plan_revision(raw: &str) -> Result<Vec<PlanRevisionStep>, String> {
                 None => PlanRevisionCheck::Preserve,
                 Some(serde_json::Value::Null) => PlanRevisionCheck::Remove,
                 Some(value) => {
-                    let planned: PlannedCheck = serde_json::from_value(value.clone())
+                    let mut planned: PlannedCheck = serde_json::from_value(value.clone())
                         .map_err(|error| format!("Invalid step check: {error}"))?;
+                    // The card sends what the user typed; the engine stores the
+                    // `CheckId` form so the plan and the run command's evidence
+                    // agree. A directory that cannot be repository-relative is
+                    // refused rather than rewritten into a check that can never
+                    // match.
+                    planned.working_directory =
+                        normalize_planned_check_directory(repository_root, &planned.working_directory)
+                            .ok_or_else(|| {
+                                format!(
+                                    "The check directory `{}` is outside the repository. Use a repository-relative directory such as `crates/foo`, or the repository root.",
+                                    planned.working_directory
+                                )
+                            })?;
                     PlanRevisionCheck::Set(planned)
                 }
             };
@@ -7801,6 +7814,7 @@ mod tests {
                 exit_code: Some(0),
                 purpose: workspace_engine::CommandPurpose::Other,
                 command_hash: None,
+                working_directory: String::new(),
             }],
             check: None,
         });
@@ -7858,6 +7872,7 @@ mod tests {
                 {"id":"step_3","title":"Set a check","check":{"command":"cargo test","workingDirectory":"","purpose":"why","required":true,"version":7}},
                 {"id":"step_4","title":"An optional check","check":{"command":"cargo doc","workingDirectory":"docs","purpose":"optional","required":false}}
             ]"#,
+            Path::new("/repo"),
         )
         .expect("a revision parses");
         assert_eq!(parsed.len(), 4);
@@ -7885,6 +7900,44 @@ mod tests {
                 required: false,
             })
         );
+    }
+
+    #[test]
+    fn a_plan_revision_normalizes_a_check_directory_like_a_check_id() {
+        // Spec 105: the card sends what the user typed; the route stores the
+        // `CheckId` form so the plan and the run command's evidence agree.
+        let parsed = parse_plan_revision(
+            r#"[
+                {"id":"step_1","title":"Root","check":{"command":"cargo test","workingDirectory":".","purpose":"why","required":true}},
+                {"id":"step_2","title":"Subdirectory","check":{"command":"ls","workingDirectory":"./crates/foo/","purpose":"why","required":true}},
+                {"id":"step_3","title":"Already relative","check":{"command":"ls","workingDirectory":"crates/foo","purpose":"why","required":true}}
+            ]"#,
+            Path::new("/repo"),
+        )
+        .expect("a revision parses");
+        let directories: Vec<&str> = parsed
+            .iter()
+            .filter_map(|step| match &step.check {
+                PlanRevisionCheck::Set(check) => Some(check.working_directory.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(directories, vec!["", "crates/foo", "crates/foo"]);
+    }
+
+    #[test]
+    fn a_plan_revision_rejects_a_check_directory_outside_the_repository() {
+        for directory in ["../outside", "/etc"] {
+            let raw = format!(
+                r#"[{{"id":"step_1","title":"Run","check":{{"command":"ls","workingDirectory":"{directory}","purpose":"why","required":true}}}}]"#
+            );
+            let error = parse_plan_revision(&raw, Path::new("/repo"))
+                .expect_err("a directory outside the repository is refused");
+            assert!(
+                error.contains("outside the repository"),
+                "{directory}: {error}"
+            );
+        }
     }
 
     #[test]

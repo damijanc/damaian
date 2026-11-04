@@ -1082,6 +1082,7 @@ mod tests {
             exit_code: Some(0),
             purpose: crate::command_purpose::CommandPurpose::Check,
             command_hash: Some("hash".to_string()),
+            working_directory: String::new(),
         };
         let patched = Evidence::PatchApplied {
             marker_id: "act_2".to_string(),

@@ -7,6 +7,7 @@
 //! at a time, and — the one this spec exists for — that a step's status comes
 //! from what the engine observed and not from what the model said about it.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -15,9 +16,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::plan::{Evidence, StepStatus, TaskPlan};
 use workspace_engine::{
-    CancelToken, ChatTurnResult, CommandPurpose, Config, MockModelAdapter, ModelAdapter, ModelRun,
-    PLANNED_CHECK_VERSION, PlanRevisionCheck, PlanRevisionStep, PlannedCheck, TaskStatus,
-    TokenUsage, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
+    CancelToken, ChatTurnResult, CommandPurpose, CompletionFacts, CompletionGateReport,
+    CompletionReasonCode, Config, MockModelAdapter, ModelAdapter, ModelRun, PLANNED_CHECK_VERSION,
+    PlanRevisionCheck, PlanRevisionStep, PlannedCheck, TaskStatus, TokenUsage, ToolCall,
+    TurnProgress, TurnSink, VerificationEvent, WorkspaceEngine, fold_verification,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -150,6 +152,17 @@ fn decide(
     revised: Option<Vec<PlanRevisionStep>>,
     adapter: &mut dyn ModelAdapter,
 ) -> ChatTurnResult {
+    try_decide(engine, proposal_id, approved, revised, adapter)
+        .expect("the resumed turn should run")
+}
+
+fn try_decide(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    approved: bool,
+    revised: Option<Vec<PlanRevisionStep>>,
+    adapter: &mut dyn ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
     let cancel = CancelToken::new();
     let mut on_token = |_token: &str| {};
     let mut on_progress = |_event: TurnProgress| {};
@@ -159,10 +172,14 @@ fn decide(
         cancel: &cancel,
         steering: None,
     };
-    engine
-        .chat_orchestrator
-        .resume_after_plan_decision(proposal_id, approved, revised, "tester", adapter, &mut sink)
-        .expect("the resumed turn should run")
+    engine.chat_orchestrator.resume_after_plan_decision(
+        proposal_id,
+        approved,
+        revised,
+        "tester",
+        adapter,
+        &mut sink,
+    )
 }
 
 /// A `propose_patch` call that would create one new file.
@@ -180,6 +197,21 @@ fn plan_of(engine: &WorkspaceEngine, result: &ChatTurnResult) -> Option<TaskPlan
         .session_store
         .read_task_plan(&result.session.id, &result.task.id)
         .expect("the plan should read")
+}
+
+/// The completion gate over the plan the turn left behind and no verification
+/// runs. The deferred check's evidence is the step's own `CommandExit`, so an
+/// empty `CheckRun` state is the whole of what the gate reads for it.
+fn gate_report(engine: &WorkspaceEngine, result: &ChatTurnResult) -> CompletionGateReport {
+    let plan = plan_of(engine, result).expect("the plan should read");
+    let verification = fold_verification(std::iter::empty::<&VerificationEvent>());
+    CompletionGateReport::evaluate(CompletionFacts {
+        task_id: &result.task.id,
+        plan: Some(&plan),
+        verification: &verification,
+        pending: None,
+        current_hashes: &BTreeMap::new(),
+    })
 }
 
 #[test]
@@ -974,6 +1006,302 @@ fn approving_a_plan_with_a_required_check_runs_no_command_and_the_check_still_ne
             .map(|check| check.command.as_str()),
         Some("cargo test"),
         "the approved plan still carries the required check"
+    );
+}
+
+/// Spec 105's check identity is directory + command. A required check in
+/// `crates/foo` is not satisfied by the same command run at the repository
+/// root, even though the exact command text matches. This drives the command
+/// through the real `run_command` path so the directory the gate sees is the
+/// one the command actually ran in.
+#[test]
+fn a_required_check_in_a_subdirectory_is_missing_when_the_command_ran_at_the_root() {
+    let repo = temp_repo("check-directory-root");
+    fs::create_dir_all(repo.join("crates/foo")).expect("the check directory should exist");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[
+                {"title":"Make the change"},
+                {"title":"Run the check","check":{"command":"ls","workingDirectory":"crates/foo","purpose":"validates the final tree","required":true}}
+            ]}"#,
+        )],
+        // A mutation is what raises the plan review; `ls` alone never would.
+        vec![patch_call("src/b.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+    let mut after = scripted(vec![
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"ls","reason":"Run the required check"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+    let result = decide(&engine, &proposal.id, true, None, &mut after);
+
+    let plan = plan_of(&engine, &result).expect("the settled plan should read back");
+    assert_eq!(plan.steps[1].status, StepStatus::Completed);
+    assert_eq!(
+        plan.steps[1]
+            .evidence
+            .iter()
+            .find_map(|evidence| match evidence {
+                Evidence::CommandExit {
+                    working_directory, ..
+                } => Some(working_directory.as_str()),
+                _ => None,
+            }),
+        Some(""),
+        "the run at the root records the repository root, not `crates/foo`"
+    );
+    assert_eq!(
+        gate_report(&engine, &result).reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckMissing],
+        "the same command at the repository root is a different check"
+    );
+}
+
+/// The other half of the same identity: the command run in the required
+/// directory satisfies the check. This guards against fixing the mismatch by
+/// never matching at all.
+#[test]
+fn a_required_check_in_a_subdirectory_passes_when_the_command_ran_there() {
+    let repo = temp_repo("check-directory-subdir");
+    fs::create_dir_all(repo.join("crates/foo")).expect("the check directory should exist");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[
+                {"title":"Make the change"},
+                {"title":"Run the check","check":{"command":"ls","workingDirectory":"crates/foo","purpose":"validates the final tree","required":true}}
+            ]}"#,
+        )],
+        // A mutation is what raises the plan review; `ls` alone never would.
+        vec![patch_call("src/b.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+    let mut after = scripted(vec![
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"ls","reason":"Run the required check","working_directory":"crates/foo"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+    let result = decide(&engine, &proposal.id, true, None, &mut after);
+
+    let plan = plan_of(&engine, &result).expect("the settled plan should read back");
+    assert_eq!(
+        plan.steps[1]
+            .evidence
+            .iter()
+            .find_map(|evidence| match evidence {
+                Evidence::CommandExit {
+                    working_directory, ..
+                } => Some(working_directory.as_str()),
+                _ => None,
+            }),
+        Some("crates/foo"),
+        "the run records the directory `run_command` actually used"
+    );
+    let report = gate_report(&engine, &result);
+    assert!(report.eligible, "{report:?}");
+    assert!(report.reasons.is_empty(), "{report:?}");
+}
+
+/// A model naturally writes `.` for the repository root. The planned check's
+/// directory is stored in the `CheckId` form (`""`), so the same command run at
+/// the root satisfies it instead of leaving a check that can never match.
+#[test]
+fn a_plan_check_with_a_dot_directory_matches_the_command_run_at_the_root() {
+    let repo = temp_repo("check-directory-dot");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[
+                {"title":"Make the change"},
+                {"title":"Run the check","check":{"command":"ls","workingDirectory":".","purpose":"validates the final tree","required":true}}
+            ]}"#,
+        )],
+        vec![patch_call("src/b.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+    assert_eq!(
+        proposal.plan.steps[1]
+            .check
+            .as_ref()
+            .map(|check| check.working_directory.as_str()),
+        Some(""),
+        "`.` is the repository root in `CheckId` form"
+    );
+
+    let mut after = scripted(vec![
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"ls","reason":"Run the required check"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+    let result = decide(&engine, &proposal.id, true, None, &mut after);
+
+    let report = gate_report(&engine, &result);
+    assert!(report.eligible, "{report:?}");
+}
+
+/// `./crates/foo/` is the same directory as `crates/foo` to `CheckId`, so it
+/// must defer and match the command run there.
+#[test]
+fn a_plan_check_with_a_relative_subdirectory_matches_the_command_run_there() {
+    let repo = temp_repo("check-directory-relative");
+    fs::create_dir_all(repo.join("crates/foo")).expect("the check directory should exist");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[
+                {"title":"Make the change"},
+                {"title":"Run the check","check":{"command":"ls","workingDirectory":"./crates/foo/","purpose":"validates the final tree","required":true}}
+            ]}"#,
+        )],
+        vec![patch_call("src/b.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+    assert_eq!(
+        proposal.plan.steps[1]
+            .check
+            .as_ref()
+            .map(|check| check.working_directory.as_str()),
+        Some("crates/foo"),
+        "a leading `./` and trailing `/` name the same directory"
+    );
+
+    let mut after = scripted(vec![
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"ls","reason":"Run the required check","working_directory":"crates/foo"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+    let result = decide(&engine, &proposal.id, true, None, &mut after);
+
+    let report = gate_report(&engine, &result);
+    assert!(report.eligible, "{report:?}");
+}
+
+/// A directory that cannot be repository-relative is refused, not guessed at.
+/// The check is dropped the same way a check with no command is, and the step's
+/// prose remains.
+#[test]
+fn a_plan_check_with_a_directory_outside_the_repository_is_dropped() {
+    for (index, directory) in ["../outside", "/etc"].iter().enumerate() {
+        let repo = temp_repo(&format!("check-drop-{index}"));
+        let engine = engine_for(&repo);
+        let proposed = serde_json::json!({
+            "steps": [
+                {"title":"Make the change"},
+                {
+                    "title":"Run the check",
+                    "check": {
+                        "command":"ls",
+                        "workingDirectory": directory,
+                        "purpose":"validates the final tree",
+                        "required":true
+                    }
+                }
+            ]
+        });
+        let mut adapter = scripted(vec![
+            vec![call("propose_plan", &proposed.to_string())],
+            vec![patch_call("src/b.rs")],
+        ]);
+        let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+        let proposal = paused.plan_proposal.expect("the plan should be put up");
+
+        assert!(
+            proposal.plan.steps[1].check.is_none(),
+            "{directory}: a check outside the repository is dropped, not reinterpreted"
+        );
+        assert_eq!(proposal.plan.steps[1].title, "Run the check");
+    }
+}
+
+/// The engine's own revision path refuses a directory it cannot place, and
+/// leaves the review answerable. A valid revision is stored in `CheckId` form.
+#[test]
+fn a_plan_revision_with_a_directory_outside_the_repository_is_rejected() {
+    let repo = temp_repo("revision-check-directory");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Make the change"},{"title":"Run the check"}]}"#,
+        )],
+        vec![patch_call("src/b.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+    let first_id = proposal.plan.steps[0].id.clone();
+    let step_id = proposal.plan.steps[1].id.clone();
+
+    let revision = |directory: &str| {
+        vec![
+            PlanRevisionStep {
+                id: first_id.clone(),
+                title: "Make the change".to_string(),
+                check: PlanRevisionCheck::Preserve,
+            },
+            PlanRevisionStep {
+                id: step_id.clone(),
+                title: "Run the check".to_string(),
+                check: PlanRevisionCheck::Set(PlannedCheck {
+                    version: PLANNED_CHECK_VERSION,
+                    command: "ls".to_string(),
+                    working_directory: directory.to_string(),
+                    purpose: "validates the final tree".to_string(),
+                    required: true,
+                }),
+            },
+        ]
+    };
+
+    let error = try_decide(
+        &engine,
+        &proposal.id,
+        true,
+        Some(revision("../outside")),
+        &mut MockModelAdapter::new("Done."),
+    )
+    .expect_err("a directory outside the repository is refused");
+    assert!(
+        error.to_string().contains("outside this repository"),
+        "{error}"
+    );
+
+    let result = decide(
+        &engine,
+        &proposal.id,
+        true,
+        Some(revision("./crates/foo/")),
+        &mut scripted(vec![]),
+    );
+    let plan = plan_of(&engine, &result).expect("the settled plan should read back");
+    assert_eq!(
+        plan.steps[1]
+            .check
+            .as_ref()
+            .map(|check| check.working_directory.as_str()),
+        Some("crates/foo"),
+        "the valid revision is stored normalized after the refusal was answered again"
     );
 }
 

@@ -7,13 +7,13 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::plan::{
     Evidence, PlanStep, PlannedCheck, StepOutcome, StepStatus, TaskPhase, TaskPlan,
-    status_from_evidence,
+    normalize_planned_check_directory, status_from_evidence,
 };
 use workspace_engine::{CommandPurpose, PLANNED_CHECK_VERSION, SessionStore, Task, TaskStatus};
 
@@ -118,6 +118,7 @@ fn a_plan_round_trips_through_json_unchanged() {
                 exit_code: Some(0),
                 purpose: CommandPurpose::Other,
                 command_hash: None,
+                working_directory: String::new(),
             }],
             check: None,
         }],
@@ -147,6 +148,7 @@ fn an_absent_exit_code_survives_the_round_trip_as_absent() {
         exit_code: None,
         purpose: CommandPurpose::Other,
         command_hash: None,
+        working_directory: String::new(),
     };
     let text = serde_json::to_string(&evidence).expect("evidence serializes");
     assert_eq!(
@@ -259,6 +261,7 @@ fn the_newest_event_per_step_wins_on_replay() {
         exit_code: Some(0),
         purpose: CommandPurpose::Other,
         command_hash: None,
+        working_directory: String::new(),
     }];
     fixture.store.update_plan_step(&task, &first).unwrap();
 
@@ -685,6 +688,7 @@ fn command_exit(exit_code: Option<i32>) -> Evidence {
         exit_code,
         purpose: CommandPurpose::Other,
         command_hash: None,
+        working_directory: String::new(),
     }
 }
 
@@ -781,6 +785,7 @@ fn run_of(command: &str, exit_code: Option<i32>) -> Evidence {
         exit_code,
         purpose: CommandPurpose::Other,
         command_hash: Some(format!("hash-of:{command}")),
+        working_directory: String::new(),
     }
 }
 
@@ -844,6 +849,67 @@ fn a_command_hash_is_omitted_when_absent_and_read_back_when_present() {
     assert_eq!(serde_json::from_str::<Evidence>(&text).unwrap(), new);
 }
 
+/// Spec 105's review fix: the working directory is part of a check's identity,
+/// so it is recorded on the exit and survives the log. An empty root directory
+/// is omitted, and an event written before the field existed loads as the root.
+#[test]
+fn a_command_exit_working_directory_is_omitted_at_the_root_and_read_back_elsewhere() {
+    let root = command_exit(Some(0));
+    let text = serde_json::to_string(&root).unwrap();
+    assert!(!text.contains("workingDirectory"), "{text}");
+    assert_eq!(serde_json::from_str::<Evidence>(&text).unwrap(), root);
+
+    let elsewhere = Evidence::CommandExit {
+        marker_id: "action_1".to_string(),
+        exit_code: Some(0),
+        purpose: CommandPurpose::Other,
+        command_hash: None,
+        working_directory: "crates/engine".to_string(),
+    };
+    let text = serde_json::to_string(&elsewhere).unwrap();
+    assert!(
+        text.contains("\"workingDirectory\":\"crates/engine\""),
+        "{text}"
+    );
+    assert_eq!(serde_json::from_str::<Evidence>(&text).unwrap(), elsewhere);
+
+    let legacy: Evidence = serde_json::from_str(
+        r#"{"kind":"commandExit","markerId":"action_1","exitCode":0,"purpose":"other"}"#,
+    )
+    .unwrap();
+    assert_eq!(legacy, root);
+}
+
+/// Spec 105: a planned check's directory is normalized to the same form a
+/// discovered `CheckId` uses, and a directory outside the repository is
+/// refused instead of being guessed at.
+#[test]
+fn a_planned_check_directory_is_normalized_like_a_check_id() {
+    let root = Path::new("/repo");
+    for (input, expected) in [
+        ("", ""),
+        (".", ""),
+        ("./", ""),
+        ("./crates/foo/", "crates/foo"),
+        ("crates/foo", "crates/foo"),
+        ("crates/./foo", "crates/foo"),
+        ("/repo/crates/foo", "crates/foo"),
+    ] {
+        assert_eq!(
+            normalize_planned_check_directory(root, input).as_deref(),
+            Some(expected),
+            "{input}"
+        );
+    }
+    for outside in ["../outside", "/etc", "crates/../../outside"] {
+        assert_eq!(
+            normalize_planned_check_directory(root, outside),
+            None,
+            "{outside} is outside the repository"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Exploration does not block. Spec 63 §5.3.
 // ---------------------------------------------------------------------------
@@ -854,6 +920,7 @@ fn exit_with_purpose(exit_code: Option<i32>, purpose: CommandPurpose) -> Evidenc
         exit_code,
         purpose,
         command_hash: None,
+        working_directory: String::new(),
     }
 }
 
