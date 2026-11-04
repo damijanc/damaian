@@ -13674,6 +13674,110 @@ function createRoundBudgetOffer(proposal, proposalRepo) {
 //
 // `decide` is for a worker's plan (spec 57 §5.6), as on the command card. The
 // worker's `approve` takes no revision, so its steps are shown, not edited.
+
+// The check editor on one editable plan-review step (spec 105 §7). The step's
+// check is the object `plan_json` sent — `{ command, workingDirectory, purpose,
+// required, version }` — or `null` for none. Editing mutates that object in
+// place, so the revision the card later sends carries exactly what the user
+// settled. `version` is transported, not shown: the change path keeps the
+// existing value, and the add path omits it so the server defaults a new check.
+function planCheckControl(step, index) {
+  const wrap = document.createElement("div");
+  wrap.className = "plan-review-check";
+
+  function field(initial, placeholder) {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "plan-review-check-input";
+    input.value = initial ?? "";
+    input.placeholder = placeholder;
+    return input;
+  }
+
+  function renderForm(existing) {
+    wrap.innerHTML = "";
+    const command = field(existing?.command, "command");
+    const directory = field(existing?.workingDirectory, "directory (empty = repository root)");
+    const purpose = field(existing?.purpose, "why (purpose)");
+    const required = document.createElement("input");
+    required.type = "checkbox";
+    required.checked = existing ? existing.required !== false : true;
+    const requiredLabel = document.createElement("label");
+    requiredLabel.className = "plan-review-check-required";
+    requiredLabel.title = "When unchecked the check still runs but does not gate completion";
+    requiredLabel.append(required, document.createTextNode("Required"));
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "btn-sm btn-primary";
+    save.textContent = "Save";
+    save.addEventListener("click", () => {
+      if (command.value.trim() === "") return;
+      const next = {
+        command: command.value.trim(),
+        workingDirectory: directory.value.trim(),
+        purpose: purpose.value.trim(),
+        required: required.checked,
+      };
+      // A changed check keeps the version it already had; a newly added one
+      // omits it so the server defaults it to the current version.
+      if (existing?.version !== undefined) next.version = existing.version;
+      step.check = next;
+      render();
+    });
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-sm btn-quiet";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", render);
+    wrap.append(command, directory, purpose, requiredLabel, save, cancel);
+  }
+
+  function render() {
+    wrap.innerHTML = "";
+    if (step.check) {
+      const label = document.createElement("span");
+      label.className = "plan-review-check-label";
+      label.textContent = planCheckTitle(step.check);
+      const change = document.createElement("button");
+      change.type = "button";
+      change.className = "btn-icon";
+      change.title = "Change this check";
+      change.setAttribute("aria-label", `Change check for step ${index + 1}`);
+      change.textContent = "✎";
+      change.addEventListener("click", () => renderForm(step.check));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn-icon";
+      remove.title = "Remove this check";
+      remove.setAttribute("aria-label", `Remove check from step ${index + 1}`);
+      remove.textContent = "×";
+      remove.addEventListener("click", () => {
+        step.check = null;
+        render();
+      });
+      wrap.append(label, change, remove);
+    } else {
+      const add = document.createElement("button");
+      add.type = "button";
+      add.className = "btn-sm btn-quiet";
+      add.textContent = "+ Add a required check";
+      add.setAttribute("aria-label", `Add a check to step ${index + 1}`);
+      add.addEventListener("click", () => renderForm(null));
+      wrap.append(add);
+    }
+  }
+  render();
+  return wrap;
+}
+
+// The card lists a check's command and directory; `required: false` is visually
+// distinct from a required check so the user can see which checks gate
+// completion.
+function planCheckTitle(check) {
+  const kind = check.required === false ? "Check (optional)" : "Required check";
+  return `${kind}: ${checkLabel(check)}`;
+}
+
 function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = null } = {}) {
   const plan = proposal.plan || { steps: [] };
   const editable = decideInWorker
@@ -13682,7 +13786,11 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
   const settled = decideInWorker
     ? plan.steps || []
     : (plan.steps || []).filter((step) => step.outcome !== "outstanding");
-  let steps = editable.map((step) => ({ id: step.id, title: step.title }));
+  let steps = editable.map((step) => ({
+    id: step.id,
+    title: step.title,
+    check: step.check ?? null,
+  }));
 
   const wrapper = document.createElement("div");
   wrapper.className = "command-approval";
@@ -13793,6 +13901,7 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
         renderRows();
       });
       row.append(input, up, down, remove);
+      row.append(planCheckControl(step, index));
       list.append(row);
     });
   }
@@ -13830,11 +13939,17 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
   // a reorder back is not a revision, and recording one would put a
   // `plan_revised` event in the log describing no change.
   function revisionOrNull() {
+    const sameCheck = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
     const same =
       steps.length === editable.length &&
-      steps.every(
-        (step, index) => step.id === editable[index].id && step.title === editable[index].title,
-      );
+      steps.every((step, index) => {
+        const original = editable[index];
+        return (
+          step.id === original.id &&
+          step.title === original.title &&
+          sameCheck(step.check, original.check)
+        );
+      });
     return same ? null : steps;
   }
 

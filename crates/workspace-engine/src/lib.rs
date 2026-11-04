@@ -85,8 +85,9 @@ pub use chat::{
     AgentFetchProposal, AgentPatchProposal, AgentPlanProposal, AgentQuestionProposal,
     AgentRoundBudgetProposal, ChatOrchestrator, ChatTurnOptions, ChatTurnResult, ContextDecision,
     FetchComponentFlag, FetchDecision, McpTokenResolver, MemoryDisplayEntry, PausedTurns,
-    PendingFetchCall, PhaseKind, PlanRevisionStep, PlanWorkerPrompt, ResumeDecisionOptions,
-    RoundBudgetDecision, RoundBudgetPause, TurnPhase, TurnProgress, TurnSink,
+    PendingFetchCall, PhaseKind, PlanRevisionCheck, PlanRevisionStep, PlanWorkerPrompt,
+    ResumeDecisionOptions, RoundBudgetDecision, RoundBudgetPause, TurnPhase, TurnProgress,
+    TurnSink,
 };
 pub use checkpoint::{
     CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,

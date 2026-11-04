@@ -16,7 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::plan::{Evidence, StepStatus, TaskPlan};
 use workspace_engine::{
     CancelToken, ChatTurnResult, CommandPurpose, Config, MockModelAdapter, ModelAdapter, ModelRun,
-    PlanRevisionStep, TaskStatus, TokenUsage, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
+    PLANNED_CHECK_VERSION, PlanRevisionCheck, PlanRevisionStep, PlannedCheck, TaskStatus,
+    TokenUsage, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -817,10 +818,12 @@ fn a_revision_is_what_the_work_goes_on_to_follow() {
         PlanRevisionStep {
             id: ids[0].clone(),
             title: "Read the retry helper".to_string(),
+            check: PlanRevisionCheck::Preserve,
         },
         PlanRevisionStep {
             id: ids[1].clone(),
             title: "Add a backoff capped at 30s".to_string(),
+            check: PlanRevisionCheck::Preserve,
         },
     ];
     let mut after = scripted(vec![vec![patch_call("src/retry.rs")]]);
@@ -832,6 +835,100 @@ fn a_revision_is_what_the_work_goes_on_to_follow() {
     assert!(
         log_of(&repo, &result.session.id).contains("plan_revised"),
         "the revision is its own event, so the log holds both versions"
+    );
+}
+
+#[test]
+fn a_revision_carries_the_users_check_edits_into_the_settled_plan() {
+    // Spec 105 §2, §7: the review card lets the user change, remove or add a
+    // proposed check, and the settled plan records exactly what they approved.
+    let repo = temp_repo("revise-check");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[
+                {"title":"Implement the change","check":{"command":"cargo test","workingDirectory":"","purpose":"validates","required":true}},
+                {"title":"Run the suite","check":{"command":"cargo nextest run","workingDirectory":"","purpose":"final","required":true}},
+                {"title":"Write the report"}
+            ]}"#,
+        )],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+    let ids: Vec<String> = proposal
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.id.clone())
+        .collect();
+    assert_eq!(
+        proposal.plan.steps[0]
+            .check
+            .as_ref()
+            .map(|c| c.command.as_str()),
+        Some("cargo test")
+    );
+
+    // Change the first check (new command, directory and purpose, and toggle
+    // `required` off), remove the second, and add one to the third.
+    let revision = vec![
+        PlanRevisionStep {
+            id: ids[0].clone(),
+            title: "Implement the change".to_string(),
+            check: PlanRevisionCheck::Set(PlannedCheck {
+                version: PLANNED_CHECK_VERSION,
+                command: "cargo test -p engine".to_string(),
+                working_directory: "crates/engine".to_string(),
+                purpose: "changed".to_string(),
+                required: false,
+            }),
+        },
+        PlanRevisionStep {
+            id: ids[1].clone(),
+            title: "Run the suite".to_string(),
+            check: PlanRevisionCheck::Remove,
+        },
+        PlanRevisionStep {
+            id: ids[2].clone(),
+            title: "Write the report".to_string(),
+            check: PlanRevisionCheck::Set(PlannedCheck {
+                version: PLANNED_CHECK_VERSION,
+                command: "cargo doc".to_string(),
+                working_directory: String::new(),
+                purpose: "added".to_string(),
+                required: false,
+            }),
+        },
+    ];
+    let mut after = scripted(vec![vec![patch_call("src/retry.rs")]]);
+    let result = decide(&engine, &proposal.id, true, Some(revision), &mut after);
+
+    let plan = plan_of(&engine, &result).expect("the settled plan should read back");
+    assert_eq!(plan.steps.len(), 3);
+    assert_eq!(
+        plan.steps[0].check,
+        Some(PlannedCheck {
+            version: PLANNED_CHECK_VERSION,
+            command: "cargo test -p engine".to_string(),
+            working_directory: "crates/engine".to_string(),
+            purpose: "changed".to_string(),
+            required: false,
+        }),
+        "the changed check records the new purpose and the toggled required flag"
+    );
+    assert_eq!(plan.steps[1].check, None, "the removed check is gone");
+    assert_eq!(
+        plan.steps[2].check,
+        Some(PlannedCheck {
+            version: PLANNED_CHECK_VERSION,
+            command: "cargo doc".to_string(),
+            working_directory: String::new(),
+            purpose: "added".to_string(),
+            required: false,
+        }),
+        "the added check is what the user approved"
     );
 }
 
@@ -865,6 +962,7 @@ fn a_revision_may_not_delete_a_step_that_already_ran() {
     let revision = vec![PlanRevisionStep {
         id: second,
         title: "Add a backoff capped at 30s".to_string(),
+        check: PlanRevisionCheck::Preserve,
     }];
     let mut after = scripted(vec![vec![patch_call("src/retry.rs")]]);
     let result = decide(&engine, &proposal.id, true, Some(revision), &mut after);
@@ -1911,6 +2009,7 @@ fn a_plan_under_review_is_handed_to_a_worker() {
             Some(vec![PlanRevisionStep {
                 id: plan.steps[1].id.clone(),
                 title: "Add a capped backoff".to_string(),
+                check: PlanRevisionCheck::Preserve,
             }]),
         )
         .unwrap()

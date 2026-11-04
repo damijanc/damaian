@@ -5554,6 +5554,7 @@ body.worker-view #chat-model-menu {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 /* A step that already ran is shown but not editable: the engine refuses to
@@ -5572,6 +5573,43 @@ body.worker-view #chat-model-menu {
   color: var(--ink);
   font-size: 12px;
   padding: 3px 7px;
+}
+
+/* The structured check on one editable plan-review step (spec 105 §7): the
+   command, directory, purpose and required flag the user may add, change or
+   remove before approval. */
+.plan-review-check {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.plan-review-check-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.plan-review-check-input {
+  flex: 1 1 120px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12px;
+  padding: 3px 7px;
+}
+
+.plan-review-check-required {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--ink);
+  white-space: nowrap;
 }
 
 @keyframes turn-indicator-pulse {

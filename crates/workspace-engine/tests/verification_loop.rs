@@ -20,8 +20,8 @@ use workspace_engine::{
     CompletionReasonCode, Config, ContextDecision, Evidence, FailureProvenance, HookConfig,
     HookEvent, HookMode, HookSource, MockModelAdapter, PLANNED_CHECK_VERSION, PausedTurns,
     PlanReport, PlanStep, PlannedCheck, ReattachedApproval, RepairStallReason, RoundBudgetDecision,
-    Selection, SessionStore, SkipReason, TaskPlan, TaskStatus, TurnProgress, TurnSink,
-    VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
+    Selection, SessionStore, SkipReason, TaskExecutionBudget, TaskPlan, TaskStatus, TurnProgress,
+    TurnSink, VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
     WebDiagnosticCall, WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport,
     WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerRecord, WorkspaceEngine,
     fold_verification, is_documentation, pending_verifications, propose_checks,
@@ -1894,6 +1894,98 @@ fn a_planned_check_with_a_different_directory_or_command_is_not_deferred() {
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&data_dir);
     }
+}
+
+/// Spec 105 §2: a structured check is authoritative only once the user approves
+/// the plan. The deferral reads `read_task_plan`, which replays the settled
+/// `plan_approved` plan, so an approval that removes a proposed check makes the
+/// deferral stop deferring it — the check runs as immediate feedback. The
+/// proposed plan (`plan_created`, what a fresh `propose_plan` call writes) is
+/// not what drives the deferral.
+#[test]
+fn the_deferral_follows_the_settled_plan_not_the_proposed_plan() {
+    let root = temp_dir("planned-check-approval");
+    let data_dir = temp_dir("planned-check-approval-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, task_id) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let task = engine
+        .session_store
+        .read_tasks(&session)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .expect("the patch task");
+
+    // The model proposes a plan whose final step requires `cargo test`.
+    let required = PlannedCheck {
+        version: PLANNED_CHECK_VERSION,
+        command: "cargo test".to_string(),
+        working_directory: String::new(),
+        purpose: "validates the final tree".to_string(),
+        required: true,
+    };
+    let mut proposed = TaskPlan::new(&task.id, 0);
+    proposed.steps.extend([
+        PlanStep {
+            id: "implement".to_string(),
+            title: "Implement the change".to_string(),
+            detail: None,
+            status: StepStatus::InProgress,
+            depends_on: Vec::new(),
+            started_at_ms: Some(1),
+            completed_at_ms: None,
+            evidence: Vec::new(),
+            check: None,
+        },
+        PlanStep {
+            id: "test".to_string(),
+            title: "Validate the change".to_string(),
+            detail: None,
+            status: StepStatus::Pending,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+            check: Some(required),
+        },
+    ]);
+    engine.session_store.create_plan(&task, &proposed).unwrap();
+
+    // The user approves a settled plan that removes the check from the final
+    // step. The proposal still names it, but the settled plan does not.
+    let mut approved = proposed;
+    approved.steps[1].check = None;
+    engine
+        .session_store
+        .approve_plan_with_budget_and_plan(
+            &task,
+            "tester",
+            &TaskExecutionBudget::try_new(100, 100, 1_000_000, 100_000).unwrap(),
+            &approved,
+        )
+        .unwrap();
+
+    // Verification reads the settled plan, so the removed check is not a
+    // deferral target and runs now as immediate feedback.
+    let mut adapter = MockModelAdapter::new("");
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+    let report = result
+        .verification_report
+        .as_ref()
+        .expect("the removed check still runs rather than defers");
+    assert_eq!(
+        report.passed,
+        vec![CheckId::new("", "cargo test")],
+        "the deferral must follow the approved plan, not the proposal: {report:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
 }
 
 #[test]

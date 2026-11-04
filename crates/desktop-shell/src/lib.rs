@@ -20,19 +20,20 @@ use workspace_engine::{
     GeneratedSecretWarning, GitMutation, HookActivation, HookEvent, LanguageServerStatus,
     LineRange, McpClient, McpServerConfig, McpTokenResolver, McpTransport, MemoryRecallRef,
     MemoryScope, ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter,
-    PatchApplyOutcome, PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId, ProjectIdentity,
-    ProposedFilePatch, ProtectedPathAction, QuestionState, RepositoryConfigReport,
-    ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, SessionStore,
-    StepStatus, SymbolRef, Task, TaskExecutionBudget, TaskPlan, TaskProtectedPathsControl,
-    TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation,
-    VerificationEvent, VerificationOutcome, VerificationReport, WebDiagnosticCall,
-    WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkerReturn, WorkspaceEngine, allow_always_eligible,
-    builtin_context_window, builtin_token_defaults, command_approval_prompt, custom_profile_ids,
-    ensure_data_dir_schema, export_profile, fold_verification, import_profile,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    parse_hunk_selection, parse_mcp_transport, patch_diff_text, profile_import_base,
-    repository_id_for_root, review_profile_import, review_profile_rejections, select_profile,
+    PatchApplyOutcome, PausedTurns, PlanRevisionCheck, PlanRevisionStep, PlannedCheck,
+    ProcessRegistry, ProfileId, ProjectIdentity, ProposedFilePatch, ProtectedPathAction,
+    QuestionState, RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision,
+    SearchOptions, Session, SessionMode, SessionStore, StepStatus, SymbolRef, Task,
+    TaskExecutionBudget, TaskPlan, TaskProtectedPathsControl, TaskUsage, TokenUsage, TurnNotes,
+    TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationEvent, VerificationOutcome,
+    VerificationReport, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerReturn,
+    WorkspaceEngine, allow_always_eligible, builtin_context_window, builtin_token_defaults,
+    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
+    fold_verification, import_profile, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
+    select_profile,
 };
 
 mod keychain;
@@ -4329,9 +4330,23 @@ fn parse_plan_revision(raw: &str) -> Result<Vec<PlanRevisionStep>, String> {
                 .get("title")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| "Each revised step needs a title".to_string())?;
+            // Spec 105: the check key's three spellings mean three intents.
+            // Absent means the client predates structured checks and the step's
+            // existing check must be preserved, never silently dropped; `null`
+            // removes it; an object sets it.
+            let check = match entry.get("check") {
+                None => PlanRevisionCheck::Preserve,
+                Some(serde_json::Value::Null) => PlanRevisionCheck::Remove,
+                Some(value) => {
+                    let planned: PlannedCheck = serde_json::from_value(value.clone())
+                        .map_err(|error| format!("Invalid step check: {error}"))?;
+                    PlanRevisionCheck::Set(planned)
+                }
+            };
             Ok(PlanRevisionStep {
                 id: id.to_string(),
                 title: title.to_string(),
+                check,
             })
         })
         .collect()
@@ -6289,7 +6304,7 @@ pub(crate) fn plan_json(plan: &TaskPlan, active: bool) -> String {
         .zip(report.steps.iter())
         .map(|(step, reported)| {
             format!(
-                "{{\"id\":\"{}\",\"title\":\"{}\",\"detail\":{},\"status\":\"{}\",\"outcome\":\"{}\",\"evidence\":{}}}",
+                "{{\"id\":\"{}\",\"title\":\"{}\",\"detail\":{},\"status\":\"{}\",\"outcome\":\"{}\",\"evidence\":{},\"check\":{}}}",
                 escape_json(&step.id),
                 escape_json(&step.title),
                 step.detail
@@ -6298,7 +6313,8 @@ pub(crate) fn plan_json(plan: &TaskPlan, active: bool) -> String {
                     .unwrap_or_else(|| "null".to_string()),
                 serde_status(step.status),
                 reported.outcome.as_str(),
-                serde_json::to_string(&step.evidence).unwrap_or_else(|_| "[]".to_string())
+                serde_json::to_string(&step.evidence).unwrap_or_else(|_| "[]".to_string()),
+                check_json(&step.check)
             )
         })
         .collect::<Vec<_>>()
@@ -6328,6 +6344,25 @@ fn serde_status(status: StepStatus) -> &'static str {
         StepStatus::Completed => "completed",
         StepStatus::Blocked => "blocked",
         StepStatus::Skipped => "skipped",
+    }
+}
+
+/// A step's structured check for the review card (spec 105 §7): the fields the
+/// user sees — command, directory, purpose and required — plus the
+/// engine-internal `version`, which the card transports but does not display.
+/// Carrying `version` keeps a re-approval from re-stamping a future-version
+/// check to the current one when the user changed nothing.
+fn check_json(check: &Option<PlannedCheck>) -> String {
+    match check {
+        None => "null".to_string(),
+        Some(check) => format!(
+            "{{\"command\":\"{}\",\"workingDirectory\":\"{}\",\"purpose\":\"{}\",\"required\":{},\"version\":{}}}",
+            escape_json(&check.command),
+            escape_json(&check.working_directory),
+            escape_json(&check.purpose),
+            check.required,
+            check.version,
+        ),
     }
 }
 
@@ -7637,9 +7672,9 @@ mod tests {
         fetch_decision_error_code, fetch_decision_error_json, fetch_proposal_json,
         forget_model_api_key, generated_secret_warnings_json, handle_connection, index_html,
         json_error, json_optional_string, keychain, language_servers_json, mcp_browser_arguments,
-        message_json, parse_form, parse_path_list, patch_payload_json, percent_decode, phase_json,
-        plan_json, plan_proposal_json, question_proposal_json, relay_turn_events,
-        remember_model_api_key, render_markdown_with_optional_file_links,
+        message_json, parse_form, parse_path_list, parse_plan_revision, patch_payload_json,
+        percent_decode, phase_json, plan_json, plan_proposal_json, question_proposal_json,
+        relay_turn_events, remember_model_api_key, render_markdown_with_optional_file_links,
         repository_config_review_json, repository_config_write_target, require_api_token,
         resolve_shell_model_api_key, run_answer_question_request, run_continue_task_request_with,
         run_fetch_decision_request_with, run_server, run_terminal_command, save_config_file,
@@ -7664,11 +7699,12 @@ mod tests {
         CheckTermination, CompletionGateReport, CompletionReason, CompletionReasonCode, Config,
         Evidence, FailureFingerprint, FailureProvenance, FetchComponentFlag, FindingEvidence,
         GeneratedSecretWarning, LanguageServerHub, LanguageServerLaunch, LanguageServerState,
-        LanguageServerStatus, MockModelAdapter, PendingQuestionRef, PhaseKind, PlanStep,
-        RepairScopeReview, SecretScanner, SessionMode, StepStatus, TaskBudgetReview, TaskPlan,
-        TaskStatus, TaskUsage, ToolCall, TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource,
-        VerificationEvent, VerificationOutcome, VerificationReport, WebDiagnosticRecord,
-        WebDiagnosticReport, WorkspaceEngine,
+        LanguageServerStatus, MockModelAdapter, PLANNED_CHECK_VERSION, PendingQuestionRef,
+        PhaseKind, PlanRevisionCheck, PlanStep, PlannedCheck, RepairScopeReview, SecretScanner,
+        SessionMode, StepStatus, TaskBudgetReview, TaskPlan, TaskStatus, TaskUsage, ToolCall,
+        TurnNotes, TurnPhase, TurnProgress, TurnSink, UsageSource, VerificationEvent,
+        VerificationOutcome, VerificationReport, WebDiagnosticRecord, WebDiagnosticReport,
+        WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
         fold_verification,
     };
@@ -7780,6 +7816,75 @@ mod tests {
             check: None,
         });
         plan
+    }
+
+    #[test]
+    fn the_plan_card_lists_a_step_check_command_and_directory() {
+        // Spec 105 §7: the review card must show each proposed check's command
+        // and directory, so the user can see and shape what they are approving.
+        let mut plan = sample_plan();
+        plan.steps[1].check = Some(PlannedCheck {
+            version: PLANNED_CHECK_VERSION,
+            command: "cargo nextest run -p workspace-engine".to_string(),
+            working_directory: "crates/workspace-engine".to_string(),
+            purpose: "validates the final tree".to_string(),
+            required: true,
+        });
+
+        let json = plan_json(&plan, true);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid plan JSON");
+        let check = &value["steps"][1]["check"];
+        assert_eq!(check["command"], "cargo nextest run -p workspace-engine");
+        assert_eq!(check["workingDirectory"], "crates/workspace-engine");
+        assert_eq!(check["purpose"], "validates the final tree");
+        assert_eq!(check["required"], true);
+        // The card transports the engine-internal version so a re-approval does
+        // not re-stamp a future-version check.
+        assert_eq!(check["version"], PLANNED_CHECK_VERSION);
+        // A step without a check reads as null, not an absent key.
+        assert_eq!(value["steps"][0]["check"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_plan_revision_round_trips_a_structured_check() {
+        // Spec 105 §2: the revision's `check` key has three spellings — absent
+        // preserves the existing check (a pre-check client), null removes it,
+        // and an object sets it. A set check keeps its `version` verbatim, and a
+        // `required: false` check parses as optional rather than being coerced.
+        let parsed = parse_plan_revision(
+            r#"[
+                {"id":"step_1","title":"Keep its check"},
+                {"id":"step_2","title":"Drop its check","check":null},
+                {"id":"step_3","title":"Set a check","check":{"command":"cargo test","workingDirectory":"","purpose":"why","required":true,"version":7}},
+                {"id":"step_4","title":"An optional check","check":{"command":"cargo doc","workingDirectory":"docs","purpose":"optional","required":false}}
+            ]"#,
+        )
+        .expect("a revision parses");
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0].check, PlanRevisionCheck::Preserve);
+        assert_eq!(parsed[1].check, PlanRevisionCheck::Remove);
+        assert_eq!(
+            parsed[2].check,
+            PlanRevisionCheck::Set(PlannedCheck {
+                version: 7,
+                command: "cargo test".to_string(),
+                working_directory: String::new(),
+                purpose: "why".to_string(),
+                required: true,
+            })
+        );
+        // A check without a version defaults to the current one; `required:
+        // false` is preserved as false, not coerced to true.
+        assert_eq!(
+            parsed[3].check,
+            PlanRevisionCheck::Set(PlannedCheck {
+                version: PLANNED_CHECK_VERSION,
+                command: "cargo doc".to_string(),
+                working_directory: "docs".to_string(),
+                purpose: "optional".to_string(),
+                required: false,
+            })
+        );
     }
 
     #[test]

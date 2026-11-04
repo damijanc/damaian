@@ -16,8 +16,8 @@ use workspace_engine::plan::{StepStatus, TaskPlan};
 use workspace_engine::recovery::ReattachedApproval;
 use workspace_engine::{
     AuditLog, CancelToken, ChatTurnResult, CommandStore, Config, MockModelAdapter, PatchStore,
-    PausedTurns, PlanRevisionStep, Session, TaskExecutionBudget, TaskStatus, ToolCall,
-    TurnProgress, TurnSink, WorkerRecord, WorkspaceEngine, repository_id_for_root,
+    PausedTurns, PlanRevisionCheck, PlanRevisionStep, Session, TaskExecutionBudget, TaskStatus,
+    ToolCall, TurnProgress, TurnSink, WorkerRecord, WorkspaceEngine, repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -303,10 +303,12 @@ fn a_revised_plan_and_budget_are_one_event_and_replay_fresh() {
         PlanRevisionStep {
             id: ids[0].clone(),
             title: "Read the retry helper".to_string(),
+            check: PlanRevisionCheck::Preserve,
         },
         PlanRevisionStep {
             id: ids[1].clone(),
             title: "Add a backoff capped at 30s".to_string(),
+            check: PlanRevisionCheck::Preserve,
         },
     ];
     let result = decide(
@@ -394,10 +396,12 @@ fn an_invalid_revision_is_refused_before_the_pending_review_is_taken() {
         PlanRevisionStep {
             id: ids[0].clone(),
             title: "First copy".to_string(),
+            check: PlanRevisionCheck::Preserve,
         },
         PlanRevisionStep {
             id: ids[0].clone(),
             title: "Second copy".to_string(),
+            check: PlanRevisionCheck::Preserve,
         },
     ];
     let before = log_events(&engine, &worker.session.id);
@@ -425,6 +429,7 @@ fn an_invalid_revision_is_refused_before_the_pending_review_is_taken() {
     let valid = vec![PlanRevisionStep {
         id: ids[0].clone(),
         title: "Read the retry helper".to_string(),
+        check: PlanRevisionCheck::Preserve,
     }];
     let result = decide(
         &engine,

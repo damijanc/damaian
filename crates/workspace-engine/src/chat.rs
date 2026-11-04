@@ -672,6 +672,22 @@ pub enum RoundBudgetDecision {
     AnswerNow,
 }
 
+/// How a plan revision's `check` key maps onto the step it names (spec 105 §2,
+/// §7).
+///
+/// The revision is the full surviving step list, so the three wire spellings
+/// mean three different things: the key absent means the client predates
+/// structured checks and wants the existing check preserved — never a silent
+/// removal; `null` removes the check; an object sets it. The user shapes a
+/// proposed check here, and only the settled plan stores what they approved.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PlanRevisionCheck {
+    #[default]
+    Preserve,
+    Remove,
+    Set(PlannedCheck),
+}
+
 /// One step of a user's revision to a proposed plan.
 ///
 /// Identifies the step by id rather than position so a reorder and a deletion
@@ -682,6 +698,9 @@ pub enum RoundBudgetDecision {
 pub struct PlanRevisionStep {
     pub id: String,
     pub title: String,
+    /// The structured check the user settled on for this step: preserve the
+    /// existing one, remove it, or set a new one.
+    pub check: PlanRevisionCheck,
 }
 
 // No `Eq`: it carries a `ModelRun`, whose `reported_cost` is an `Option<f64>`.
@@ -15978,9 +15997,11 @@ fn action_awaits_plan_review(
 /// reason `read_task_plan` ignores an update for an unknown step id: the step
 /// list is not something a revision may grow.
 ///
-/// Everything but the title is carried over from the existing step. The user
-/// is reordering and retitling work, not asserting anything about its status
-/// or its evidence — those remain the engine's to decide (§5.3).
+/// Everything but the title and the check is carried over from the existing
+/// step. The user is reordering, retitling and shaping the structured check,
+/// not asserting anything about its status or its evidence — those remain the
+/// engine's to decide (§3). A `Preserve` check leaves the existing one in
+/// place; `Remove` clears it; `Set` replaces it with what the user approved.
 fn apply_plan_revision(current: &TaskPlan, revision: &[PlanRevisionStep]) -> TaskPlan {
     let mut revised = current.clone();
     let mut steps: Vec<crate::plan::PlanStep> = current
@@ -15998,6 +16019,11 @@ fn apply_plan_revision(current: &TaskPlan, revision: &[PlanRevisionStep]) -> Tas
         }
         let mut step = existing.clone();
         step.title = edit.title.clone();
+        match &edit.check {
+            PlanRevisionCheck::Preserve => {}
+            PlanRevisionCheck::Remove => step.check = None,
+            PlanRevisionCheck::Set(check) => step.check = Some(check.clone()),
+        }
         steps.push(step);
     }
     revised.steps = steps;

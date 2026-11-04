@@ -109,6 +109,13 @@ directory, and the edit path carries `PlannedCheck` changes (add, remove,
 retitle, change directory) through `approve_plan_with_budget_and_plan`, so the
 settled `TaskPlan` records exactly what the user approved.
 
+Task 3 follow-up: the editor (`app.js planCheckControl`) now also edits
+`purpose` and toggles `required`, so a `required: false` check is recorded and
+rendered as "Check (optional)". `check_json` now transports `version` so a
+re-approval of an unchanged future-version check is not silently re-stamped to
+`PLANNED_CHECK_VERSION`; the editor keeps the existing `version` on change and
+omits it on add, letting the server default a new check to the current version.
+
 ## 9. Recovery and continuation carry structured state for free
 
 A `PlannedCheck` lives on the persisted `TaskPlan`, and check evidence already
