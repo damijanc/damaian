@@ -1400,13 +1400,13 @@ fn a_blocked_scenario_is_still_skipped_and_says_why() {
 }
 
 /// Guards the count in spec 18 §6, now that spec 17 has landed: every scenario
-/// runs and none is blocked. Sixty: spec 59 added `long_discovery` and
+/// runs and none is blocked. Sixty-one: spec 59 added `long_discovery` and
 /// `read_loop`, spec 62 added `approval_causes`, spec 50 added
 /// `answered_question`, spec 23 added `verified_repair` and
 /// `repair_limit_exhausted`, spec 66 added `plan_left_open`, spec 30 added
 /// seven memory-recall scenarios, spec 102 added five verification
-/// provenance and stagnation scenarios, and spec 103 added eight bounded
-/// worker-continuation scenarios.
+/// provenance and stagnation scenarios, spec 103 added eight bounded
+/// worker-continuation scenarios, plus one spec 105 required-check scenario.
 #[test]
 fn every_scenario_runs_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
@@ -1423,11 +1423,11 @@ fn every_scenario_runs_and_none_is_blocked() {
     );
     assert_eq!(
         all.len(),
-        60,
-        "sixty scenarios should run: the two compaction scenarios, thirteen memory \
+        61,
+        "sixty-one scenarios should run: the two compaction scenarios, thirteen memory \
          scenarios (six consent, seven recall), three external-reference injection scenarios, \
-         the live injection twin, five spec 102 verification scenarios and eight spec 103 \
-         bounded worker-continuation scenarios"
+         the live injection twin, five spec 102 verification scenarios, eight spec 103 \
+         bounded worker-continuation scenarios and one spec 105 required-check scenario"
     );
 }
 
@@ -1737,8 +1737,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        59,
-        "all fifty-nine deterministic scenario files should be accounted for; the live \
+        60,
+        "all sixty deterministic scenario files should be accounted for; the live \
          injection twin is credential-gated"
     );
     assert_eq!(
