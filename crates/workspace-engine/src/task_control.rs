@@ -15,10 +15,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::completion::{
-    CompletionGateReport, CompletionReason, CompletionReasonCode, CompletionWaiver,
-};
+use crate::completion::{CompletionGateReport, CompletionReason, CompletionWaiver};
 use crate::error::{ClientError, Result};
+use crate::plan::{StepStatus, TaskPlan};
 use crate::session::{SessionStore, Task, TaskStatus};
 
 /// A running worker with no progress for this long says so. Presentation only;
@@ -1159,10 +1158,19 @@ pub fn returned_task_control_with_outcome(
 ///
 /// The user does not have to type "continue"; the action itself authorizes a
 /// new run. The prompt names the durable completion reasons and waivers, says
-/// that the plan is carried, and states that nothing is approved by continuing.
+/// whether the task's plan is carried, and states that nothing is approved by
+/// continuing. A source task that settled `incomplete` may have only an unmet
+/// required check while every step is terminal, and may have a blocked step, so
+/// the prompt never claims that no plan was carried merely because no step is
+/// open (2026-11-04 review fix R2).
+///
 /// An optional user note is appended as data, never as an instruction that
 /// widens the execution boundary.
-pub fn continuation_prompt(report: &CompletionGateReport, note: Option<&str>) -> String {
+pub fn continuation_prompt(
+    report: &CompletionGateReport,
+    plan: Option<&TaskPlan>,
+    note: Option<&str>,
+) -> String {
     let mut prompt = String::from(
         "Continue the task that ended incomplete. The completion gate recorded these facts:\n",
     );
@@ -1175,22 +1183,28 @@ pub fn continuation_prompt(report: &CompletionGateReport, note: Option<&str>) ->
     if report.reasons.is_empty() && report.waivers.is_empty() {
         prompt.push_str("- The task was not closed.\n");
     }
-    if report
-        .reason_codes()
-        .contains(&CompletionReasonCode::OpenPlanSteps)
-    {
+    if let Some(plan) = plan {
+        let blocked = plan
+            .steps
+            .iter()
+            .any(|step| step.status == StepStatus::Blocked);
         prompt.push_str(
-            "\nThe task's open plan and its completed-step evidence are carried into this run. \
-             Continue from the plan, finish its remaining work, and do not redo steps that are \
-             already terminal. This continuation is not an approval: every patch, command, \
+            "\nThe task's plan and its completed-step evidence are carried into this run",
+        );
+        if blocked {
+            prompt.push_str(", including its blocked step");
+        }
+        prompt.push_str(
+            ". Continue from the plan, finish its remaining work, and do not redo steps that \
+             are already terminal. This continuation is not an approval: every patch, command, \
              check, question and fallback still needs its own explicit approval.\n",
         );
     } else {
         prompt.push_str(
-            "\nNo plan step is open, so none is carried. Continue from the recorded completion \
-             facts above and close the outstanding verification or required check before the \
-             task can finish. This continuation is not an approval: every patch, command, \
-             check, question and fallback still needs its own explicit approval.\n",
+            "\nThis task carries no plan. Continue from the recorded completion facts above and \
+             close the outstanding verification or required check before the task can finish. \
+             This continuation is not an approval: every patch, command, check, question and \
+             fallback still needs its own explicit approval.\n",
         );
     }
     if let Some(note) = note.filter(|note| !note.trim().is_empty()) {
@@ -1679,6 +1693,7 @@ fn format_elapsed(ms: u128) -> String {
 mod tests {
     use super::*;
     use crate::completion::CompletionReasonCode;
+    use crate::plan::PlanStep;
 
     fn task(status: TaskStatus) -> Task {
         Task {
@@ -2009,13 +2024,47 @@ mod tests {
     }
 
     #[test]
-    fn a_continuation_prompt_claims_a_carried_plan_only_when_one_is_open() {
-        let planned = continuation_prompt(&incomplete_report(), None);
+    fn a_continuation_prompt_names_the_carried_plan_even_when_no_step_is_open() {
+        let planned = continuation_prompt(
+            &incomplete_report(),
+            Some(&TaskPlan::new("task_1", 0)),
+            None,
+        );
         assert!(
-            planned.contains("open plan and its completed-step evidence"),
+            planned.contains("plan and its completed-step evidence"),
             "{planned}"
         );
         assert!(planned.contains("not an approval"), "{planned}");
+
+        let blocked_report = CompletionGateReport {
+            task_id: "task_1".to_string(),
+            eligible: false,
+            reasons: vec![CompletionReason {
+                code: CompletionReasonCode::BlockedPlanSteps,
+                explanation: "1 planned step is blocked: \"Run tests\".".to_string(),
+            }],
+            waivers: Vec::new(),
+        };
+        let mut blocked_plan = TaskPlan::new("task_1", 0);
+        blocked_plan.steps.push(PlanStep {
+            id: "test".to_string(),
+            title: "Run tests".to_string(),
+            detail: None,
+            status: StepStatus::Blocked,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+            check: None,
+        });
+        let prompt = continuation_prompt(
+            &blocked_report,
+            Some(&blocked_plan),
+            Some("Run the checks."),
+        );
+        assert!(!prompt.contains("No plan step is open"), "{prompt}");
+        assert!(prompt.contains("including its blocked step"), "{prompt}");
+        assert!(prompt.contains("Run the checks."), "{prompt}");
 
         let verification_only = CompletionGateReport {
             task_id: "task_1".to_string(),
@@ -2026,9 +2075,9 @@ mod tests {
             }],
             waivers: Vec::new(),
         };
-        let prompt = continuation_prompt(&verification_only, Some("Run the checks."));
-        assert!(!prompt.contains("open plan"), "{prompt}");
-        assert!(prompt.contains("No plan step is open"), "{prompt}");
+        let prompt = continuation_prompt(&verification_only, None, Some("Run the checks."));
+        assert!(prompt.contains("carries no plan"), "{prompt}");
+        assert!(!prompt.contains("No plan step is open"), "{prompt}");
         assert!(prompt.contains("Run the checks."), "{prompt}");
     }
 }

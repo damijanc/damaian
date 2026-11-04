@@ -3150,17 +3150,20 @@ impl SessionStore {
         self.append_session_event(&task.session_id, "plan_resumed", &payload)
     }
 
-    /// Carries an incomplete task's open plan into a new run in one locked
+    /// Carries an incomplete task's plan into a new run in one locked
     /// transaction (spec 101 Task 3).
     ///
     /// The latest task must still be the named task, must still be
     /// `incomplete`, and must carry the exact completion report the prompt was
     /// built from. Comparing the whole report under the lock is what refuses a
     /// second click, a stale browser control, or a request whose task was
-    /// re-settled between rendering and clicking. When the plan still has
-    /// non-terminal steps, its `plan_resumed` edge is written in the same event
-    /// batch as `task_created`, so a crash cannot leave a continuation task
-    /// without the work it promised to carry.
+    /// re-settled between rendering and clicking. The source plan is carried
+    /// whenever the task has one — not only when a step is still open — because
+    /// an `incomplete` settlement can rest on an unmet required check while
+    /// every step is terminal, or on blocked steps (2026-11-04 review fix R2).
+    /// Its `plan_resumed` edge is written in the same event batch as
+    /// `task_created`, so a crash cannot leave a continuation task without the
+    /// work and completion obligations it promised to carry.
     ///
     /// `None` means nothing was written: the caller must not start a model
     /// call. The new task is ordinary `Created`, not approved and not granted
@@ -3200,12 +3203,10 @@ impl SessionStore {
             created_at_ms: now_millis(),
             completed_at_ms: None,
         };
-        let plan_payload = match self.read_task_plan(session_id, source_task_id)? {
-            Some(plan) if plan.steps.iter().any(|step| !step.status.is_terminal()) => {
-                Some(resumed_plan_payload(&plan, &task, source_task_id)?)
-            }
-            _ => None,
-        };
+        let plan_payload = self
+            .read_task_plan(session_id, source_task_id)?
+            .map(|plan| resumed_plan_payload(&plan, &task, source_task_id))
+            .transpose()?;
         let task_payload = task_json(&task);
         let mut events = vec![("task_created", task_payload.as_str())];
         if let Some(payload) = plan_payload.as_deref() {

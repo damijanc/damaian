@@ -7,15 +7,17 @@
 //! wrong-repository target creates nothing.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
-    CancelToken, ChatTurnResult, CompletionGateReport, CompletionReason, CompletionReasonCode,
-    Config, MockModelAdapter, ModelAdapter, PlanStep, TaskPlan, TaskStatus, ToolCall, TurnProgress,
-    TurnSink, WorkspaceEngine, hash::repository_id_for_root,
+    CancelToken, ChatTurnResult, CompletionGateReport, CompletionGateService, CompletionReason,
+    CompletionReasonCode, Config, MockModelAdapter, ModelAdapter, PLANNED_CHECK_VERSION, PlanStep,
+    PlannedCheck, TaskPlan, TaskStatus, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
+    hash::repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -54,6 +56,18 @@ fn step(id: &str, status: StepStatus) -> PlanStep {
         evidence: Vec::new(),
         check: None,
     }
+}
+
+fn checked_step(id: &str, command: &str, status: StepStatus) -> PlanStep {
+    let mut step = step(id, status);
+    step.check = Some(PlannedCheck {
+        version: PLANNED_CHECK_VERSION,
+        command: command.to_string(),
+        working_directory: String::new(),
+        purpose: "validates the final tree".to_string(),
+        required: true,
+    });
+    step
 }
 
 fn report(task_id: &str) -> CompletionGateReport {
@@ -145,6 +159,94 @@ fn log_events(repo: &Path, session_id: &str) -> Vec<serde_json::Value> {
     .lines()
     .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
     .collect()
+}
+
+fn ask(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    prompt: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = sink(&cancel, &mut on_token, &mut on_progress);
+    engine
+        .chat_orchestrator
+        .ask_with_session(repo, prompt, &[], None, adapter, &mut sink)
+        .expect("the turn should run")
+}
+
+/// Drives a turn through tool-call rounds, ending with a plain answer so the
+/// loop terminates rather than running to the round limit.
+fn scripted(rounds: Vec<Vec<ToolCall>>) -> MockModelAdapter {
+    let mut responses: Vec<String> = rounds.iter().map(|_| String::new()).collect();
+    let mut calls = rounds;
+    responses.push("Done.".to_string());
+    calls.push(Vec::new());
+    MockModelAdapter::new_sequence_with_tool_calls(responses, calls)
+}
+
+fn plan_call(titles: &[&str]) -> ToolCall {
+    let steps = titles
+        .iter()
+        .map(|title| format!(r#"{{"title":"{title}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    call("propose_plan", &format!(r#"{{"steps":[{steps}]}}"#))
+}
+
+fn check_call() -> ToolCall {
+    call(
+        "run_command",
+        r#"{"command":"./check","reason":"Run the repository check"}"#,
+    )
+}
+
+fn complete_step_call() -> ToolCall {
+    call("complete_step", "{}")
+}
+
+fn approve_plan(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = sink(&cancel, &mut on_token, &mut on_progress);
+    engine
+        .chat_orchestrator
+        .resume_after_plan_decision(proposal_id, true, None, "tester", adapter, &mut sink)
+        .expect("the plan decision should resume the turn")
+}
+
+fn approve_command(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = sink(&cancel, &mut on_token, &mut on_progress);
+    engine
+        .chat_orchestrator
+        .resume_after_command_decision(proposal_id, true, "tester", adapter, &mut sink)
+        .expect("the command decision should resume the turn")
+}
+
+/// A repository whose `./check` fails once and then passes, by touching
+/// `.fixed` on the failing run. Both runs need the normal command decision.
+fn write_recovering_check(repo: &Path) {
+    fs::write(
+        repo.join("check"),
+        "#!/bin/sh\nif [ -f .fixed ]; then exit 0; fi\ntouch .fixed\nexit 1\n",
+    )
+    .expect("the check script should be written");
+    fs::set_permissions(repo.join("check"), fs::Permissions::from_mode(0o755))
+        .expect("the check script should be executable");
 }
 
 #[test]
@@ -490,6 +592,277 @@ fn a_wrong_repository_target_is_refused_before_anything_is_created() {
     assert_eq!(
         engine.session_store.read_tasks(&session_id).unwrap().len(),
         before
+    );
+}
+
+/// R2 regression from the 2026-11-04 review of specs 101–105: a source task
+/// can settle `incomplete` with only an unmet required check while every plan
+/// step is already terminal. Continue used to write `plan_resumed` only when a
+/// step was non-terminal, so that continuation carried no plan, no required
+/// check and no verification chain; the model's next answer settled `complete`
+/// without running anything.
+#[test]
+fn continuing_a_task_with_only_a_missing_required_check_keeps_the_check() {
+    let repo = temp_repo("continue-required-check");
+    let engine = engine_for(&repo);
+    let store = &engine.session_store;
+    let session = store
+        .create_session(&repository_id_for_root(&repo), "Required check")
+        .unwrap();
+    let task = store
+        .create_task(&session.id, "Run the check", "mock", "mock")
+        .unwrap();
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps = vec![checked_step("test", "cargo test", StepStatus::Completed)];
+    store.create_plan(&task, &plan).unwrap();
+    let report = CompletionGateService::new(store, &repo)
+        .report(&session.id, &task.id)
+        .unwrap();
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckMissing],
+        "the source task has one unmet required check and no open step: {report:?}"
+    );
+    store
+        .update_task_status_with_completion(&task, TaskStatus::Incomplete, &report)
+        .unwrap();
+    let mut adapter = MockModelAdapter::new("The task is done.");
+
+    let result = continue_task(&engine, &repo, &session.id, &task.id, None, &mut adapter)
+        .expect("the engine authorizes the continuation");
+
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Incomplete,
+        "answering without the check must not close the continued task"
+    );
+    let carried = store
+        .read_task_plan(&session.id, &result.task.id)
+        .unwrap()
+        .expect("the source plan is carried even though every step is terminal");
+    assert_eq!(carried.steps[0].status, StepStatus::Completed);
+    assert!(
+        carried.steps[0].check.is_some(),
+        "the carried plan still declares its required check: {carried:?}"
+    );
+    let continued_report = store
+        .read_completion_report(&session.id, &result.task.id)
+        .unwrap()
+        .expect("the continued task settles through the gate");
+    assert_eq!(
+        continued_report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckMissing],
+        "{continued_report:?}"
+    );
+}
+
+/// R2 regression: a source task stopped by blocked plan steps must carry the
+/// blocked plan into the continuation. Before R2 the plan was only carried when
+/// a step was non-terminal, so `Blocked` (terminal but unfinished) lost the
+/// plan and the gate returned eligible.
+#[test]
+fn continuing_a_task_stopped_by_a_blocked_step_carries_the_blocked_plan() {
+    let repo = temp_repo("continue-blocked");
+    let engine = engine_for(&repo);
+    let store = &engine.session_store;
+    let session = store
+        .create_session(&repository_id_for_root(&repo), "Blocked step")
+        .unwrap();
+    let task = store
+        .create_task(&session.id, "Run the tests", "mock", "mock")
+        .unwrap();
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps = vec![step("test", StepStatus::Blocked)];
+    store.create_plan(&task, &plan).unwrap();
+    let report = CompletionGateService::new(store, &repo)
+        .report(&session.id, &task.id)
+        .unwrap();
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::BlockedPlanSteps],
+        "{report:?}"
+    );
+    store
+        .update_task_status_with_completion(&task, TaskStatus::Incomplete, &report)
+        .unwrap();
+    let mut adapter = MockModelAdapter::new("The task is done.");
+
+    let result = continue_task(&engine, &repo, &session.id, &task.id, None, &mut adapter)
+        .expect("the engine authorizes the continuation");
+
+    assert!(
+        !result.task.user_prompt.contains("No plan step is open"),
+        "the continuation prompt must not deny the carried plan: {}",
+        result.task.user_prompt
+    );
+    let carried = store
+        .read_task_plan(&session.id, &result.task.id)
+        .unwrap()
+        .expect("the blocked plan is carried");
+    assert_eq!(carried.steps[0].status, StepStatus::Blocked);
+    let continued_report = store
+        .read_completion_report(&session.id, &result.task.id)
+        .unwrap()
+        .expect("the continued task settles through the gate");
+    assert_eq!(
+        continued_report.reason_codes(),
+        vec![CompletionReasonCode::BlockedPlanSteps],
+        "the continued task's gate still sees the blocked step: {continued_report:?}"
+    );
+}
+
+/// Drives the source turn end to end: propose a plan, approve it, run the
+/// failing check, approve the command, and close the step so its evidence
+/// leaves it blocked. The source task settles `incomplete` with
+/// `blocked_plan_steps`.
+fn seed_incomplete_with_a_blocked_command(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+) -> (String, String) {
+    let mut first = scripted(vec![
+        vec![plan_call(&["Run the check", "Report"])],
+        vec![check_call()],
+    ]);
+    let paused = ask(engine, repo, "Check the folder", &mut first);
+    let review = paused
+        .plan_proposal
+        .expect("the mutating check puts the plan up for review");
+
+    // The plan decision asks the model again, and the command needs its own
+    // normal one-shot approval.
+    let mut command_round = scripted(vec![vec![check_call()]]);
+    let paused = approve_plan(engine, &review.id, &mut command_round);
+    let command = paused
+        .command_proposal
+        .expect("the check needs command approval");
+
+    let mut finish = scripted(vec![vec![complete_step_call()]]);
+    let result = approve_command(engine, &command.id, &mut finish);
+
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Incomplete,
+        "the failing command must settle the source task incomplete: {result:?}"
+    );
+    let plan = engine
+        .session_store
+        .read_task_plan(&result.session.id, &result.task.id)
+        .unwrap()
+        .expect("the source plan reads");
+    assert_eq!(plan.steps[0].status, StepStatus::Blocked);
+    assert_eq!(plan.steps[1].status, StepStatus::Pending);
+    let report = engine
+        .session_store
+        .read_completion_report(&result.session.id, &result.task.id)
+        .unwrap()
+        .expect("the source task carries its gate report");
+    assert!(
+        report
+            .reason_codes()
+            .contains(&CompletionReasonCode::BlockedPlanSteps),
+        "{report:?}"
+    );
+    (result.session.id, result.task.id)
+}
+
+/// R2 follow-up: a continuation must not only carry a blocked step; the model
+/// must be able to clear it by rerunning the same command after the cause is
+/// fixed, close the plan, and settle `complete`. Both command runs go through
+/// the ordinary approval decision.
+#[test]
+fn a_continued_blocked_step_recovers_when_the_same_command_passes() {
+    let repo = temp_repo("continue-blocked-recovers");
+    write_recovering_check(&repo);
+    let engine = engine_for(&repo);
+    let (session_id, source_task_id) = seed_incomplete_with_a_blocked_command(&engine, &repo);
+
+    // The first run touched `.fixed`, so this run exits 0. It still asks for
+    // its own command approval; the carried plan is already approved.
+    let mut request = scripted(vec![vec![check_call()]]);
+    let paused = continue_task(
+        &engine,
+        &repo,
+        &session_id,
+        &source_task_id,
+        None,
+        &mut request,
+    )
+    .expect("the engine authorizes the continuation");
+    assert!(
+        paused.plan_proposal.is_none(),
+        "the carried plan is already approved"
+    );
+    let command = paused
+        .command_proposal
+        .expect("the rerun needs its own command approval");
+
+    let mut finish = scripted(vec![vec![complete_step_call()], vec![complete_step_call()]]);
+    let result = approve_command(&engine, &command.id, &mut finish);
+
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Complete,
+        "rerunning the same command and closing both steps must complete the carried task"
+    );
+    let plan = engine
+        .session_store
+        .read_task_plan(&session_id, &result.task.id)
+        .unwrap()
+        .expect("the carried plan stays attached");
+    assert_eq!(plan.steps[0].status, StepStatus::Completed);
+    assert_eq!(plan.steps[1].status, StepStatus::Completed);
+    let report = engine
+        .session_store
+        .read_completion_report(&session_id, &result.task.id)
+        .unwrap()
+        .expect("the completed task carries its gate report");
+    assert!(report.eligible, "{report:?}");
+    assert!(report.reasons.is_empty(), "{report:?}");
+}
+
+/// The other side: a continuation that calls `complete_step` without rerunning
+/// the failed command cannot clear the block, and the task stays incomplete
+/// with `blocked_plan_steps`.
+#[test]
+fn a_continued_blocked_step_stays_blocked_without_rerunning_the_command() {
+    let repo = temp_repo("continue-blocked-stays");
+    write_recovering_check(&repo);
+    let engine = engine_for(&repo);
+    let (session_id, source_task_id) = seed_incomplete_with_a_blocked_command(&engine, &repo);
+
+    let mut adapter = scripted(vec![vec![complete_step_call()]]);
+    let result = continue_task(
+        &engine,
+        &repo,
+        &session_id,
+        &source_task_id,
+        None,
+        &mut adapter,
+    )
+    .expect("the engine authorizes the continuation");
+
+    assert_eq!(result.task.status, TaskStatus::Incomplete);
+    let plan = engine
+        .session_store
+        .read_task_plan(&session_id, &result.task.id)
+        .unwrap()
+        .expect("the carried plan stays attached");
+    assert_eq!(
+        plan.steps[0].status,
+        StepStatus::Blocked,
+        "complete_step without the same command passing leaves the step blocked"
+    );
+    assert_eq!(plan.steps[1].status, StepStatus::Pending);
+    let report = engine
+        .session_store
+        .read_completion_report(&session_id, &result.task.id)
+        .unwrap()
+        .expect("the continued task carries its gate report");
+    assert!(
+        report
+            .reason_codes()
+            .contains(&CompletionReasonCode::BlockedPlanSteps),
+        "{report:?}"
     );
 }
 

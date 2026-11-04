@@ -3725,7 +3725,8 @@ impl ChatOrchestrator {
                 "The incomplete task has no recorded completion report".to_string(),
             ));
         };
-        let prompt = continuation_prompt(&report, note);
+        let plan = self.session_store.read_task_plan(session_id, task_id)?;
+        let prompt = continuation_prompt(&report, plan.as_ref(), note);
         let Some(continued) = self.session_store.continue_incomplete_task(
             session_id,
             task_id,

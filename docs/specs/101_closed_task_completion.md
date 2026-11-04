@@ -40,7 +40,9 @@ finished task.
    plan and the reasons from the completion gate remain attached.
 5. `incomplete` is terminal for the current run but resumable. An ordinary
    session and a worker both offer **Continue task**; continuing carries the
-   same approved plan and completion reasons into the next run.
+   same approved plan — including when every step is already terminal or a step
+   is blocked — and the source task's unmet completion reasons into the next
+   run.
 6. A worker progress record and #99's outcome renderer distinguish
    **Complete** from **Incomplete**. A result returned through #100 carries the
    truthful status; #100 does not translate `incomplete` into success.
@@ -83,7 +85,13 @@ it may be useful — but is not treated as the execution verdict.
 `TaskStatus::Incomplete` is terminal but not successful. It is included in
 session listing, progress reconstruction, worker return, task reports and
 recovery classification. Continuing it follows the same durable-plan carry
-path as a budget continuation, without granting more approvals.
+path as a budget continuation, without granting more approvals. The source
+plan is carried whenever the task has one, not only while a step is open:
+an `incomplete` settlement can rest on an unmet required check after every
+step is terminal, or on blocked steps whose outcome is settled but whose work
+is not finished. Carrying the plan is what keeps those completion obligations
+visible to the continued task's gate; the continuation prompt names the carried
+plan rather than claiming that no step is open.
 
 ## 5. Acceptance
 
@@ -268,7 +276,7 @@ criterion depends on #102, #103, #104, #105 or #106.
 | 2 · every plan step, verification, pending decision and selected check is closed, and no step is blocked | `CompletionGateReport::evaluate` reads the active plan, folded verification state, newest pending decision and current file hashes. `closed_task_completion` pins the full reason matrix, including due, started-but-unfinished, missing, failed, stale and policy-skipped checks. `a_blocked_plan_step_blocks_the_gate_with_its_own_reason` and `the_service_settles_a_blocked_step_incomplete_and_a_skipped_step_complete` pin a blocked step as outstanding (`blocked_plan_steps`) while a skipped step stays closed. |
 | 3 · declined checks are named waivers, never passes | `CompletionReasonCode` has no waiver variant; `CompletionWaiver` is produced only for `SkipReason::DeclinedByUser`, and the check still never enters `passed`. A policy-skipped check is `required_check_skipped` and blocks. |
 | 4 · an answer with work left is `incomplete` | `run_agentic_turn` settles `StopReason::Answered` through the gate; `two_answers_with_an_open_plan_settle_incomplete_and_keep_the_plan` proves the single #66 reminder, unchanged plan and two transcript answers. `plan_left_open_at_end` is the deterministic scenario for the same outcome. |
-| 5 · terminal but resumable, in an ordinary session and a worker | `TaskStatus::Incomplete` is terminal and not successful. `TaskControl::for_session` and `TaskControl::for_worker` offer **Continue task** with the exact `taskId`; `SessionStore::continue_incomplete_task` writes the new task and `plan_resumed` edge in one locked batch and compares the whole report. `ChatOrchestrator::continue_incomplete_task` builds the prompt from the durable reasons. Engine, route and worker tests cover carry, refusal, stale click, wrong repository and the next run settling `complete`. |
+| 5 · terminal but resumable, in an ordinary session and a worker | `TaskStatus::Incomplete` is terminal and not successful. `TaskControl::for_session` and `TaskControl::for_worker` offer **Continue task** with the exact `taskId`; `SessionStore::continue_incomplete_task` writes the new task and `plan_resumed` edge in one locked batch and compares the whole report. `ChatOrchestrator::continue_incomplete_task` builds the prompt from the durable reasons and the source plan. Engine, route and worker tests cover carry, refusal, stale click, wrong repository and the next run settling `complete`. `continuing_a_task_with_only_a_missing_required_check_keeps_the_check` and `continuing_a_task_stopped_by_a_blocked_step_carries_the_blocked_plan` pin that a plan is carried even when every step is terminal or a step is blocked, and `a_continuation_prompt_names_the_carried_plan_even_when_no_step_is_open` pins the prompt. |
 | 6 · worker progress and #100 preserve the truthful outcome | The worker progress status carries `TaskStatus::as_str()` and `/api/worker-progress` returns the engine `control`; the board row and result card draw its headline/detail. `returned_task_control` labels an incomplete return **Task incomplete** and never success, while #100's **Continue with result** remains a separate action. Source tests prove `app.js` has no task-status outcome table. |
 | 7 · recovery recomputes the gate | `recovery::settle_crashed_completions` validates the marker's root, session and task, recomputes the report from the checkout and writes the status through the same service; it never reads a stored `eligible` boolean. Tests cover a crash window settling `incomplete`, `complete` and `failed`, an unusable root staying `interrupted`, an unknown future status being left alone, a dangling side effect outranking the marker, and a marker whose status already landed being closed without a rewrite. |
 | 8 · approval boundaries unchanged | Continuing grants no patch, command, check, question or fallback approval. The prompt says so, the route carries only the target id and optional note, and the worker host refuses the command while a turn is running or waiting. A question answer remains neither an approval nor a waiver. |
@@ -374,5 +382,52 @@ Checks run locally on 2026-11-04:
   `["src/a.rs", "src/b.rs", "src/c.rs"]`, right `["src/a.rs", "src/b.rs"]`); the
   test passed when rerun alone and in the second full run. No loopback-port test
   failed.
+
+Workspace clippy and the other crates' suites are left to CI.
+
+### Review fix 2026-11-04: a continuation always carries the plan (R2)
+
+The review found that `SessionStore::continue_incomplete_task` wrote
+`plan_resumed` only when the source plan still had a non-terminal step. An
+`incomplete` settlement can rest on an unmet required check after every step is
+terminal, or on a blocked step (terminal but unfinished). In both cases Continue
+carried no plan, no required check and no verification chain, so the next model
+answer settled `complete` without running anything.
+
+The continuation transaction now writes `plan_resumed` whenever the source task
+has a plan. The continued task's gate therefore still sees the plan's unmet
+required checks and its blocked steps. `continuation_prompt` now receives the
+source plan: it names the carried plan, says explicitly when it includes a
+blocked step, and says plainly when the task carries no plan instead of
+claiming that no step is open. Continue still grants no approval, and the
+automatic continuation in `chat.rs` that reopens only an `incomplete` whose sole
+blocker is `open_plan_steps` is unchanged.
+
+The regression tests were written first:
+`continuing_a_task_with_only_a_missing_required_check_keeps_the_check` failed
+with `assertion left == right failed: answering without the check must not close
+the continued task`, left `Complete`, right `Incomplete`; and
+`continuing_a_task_stopped_by_a_blocked_step_carries_the_blocked_plan` failed
+because the prompt said `No plan step is open, so none is carried.` Both pass
+now, along with
+`a_continuation_prompt_names_the_carried_plan_even_when_no_step_is_open`.
+
+Checks run locally on 2026-11-04:
+
+- `scripts/quality-gate.sh fmt node lint typos deny`: all five passed after
+  `cargo fmt --all` and `npm ci` (the first run failed `fmt` on the new test
+  formatting, and `lint` exited 127 because `node_modules` was absent).
+- `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`,
+  `cargo clippy -p desktop-shell --all-targets --locked -- -D warnings`, and
+  `cargo clippy -p damaian-cli --all-targets --locked -- -D warnings`: passed.
+- `cargo nextest run -p workspace-engine --test task_control`: 10 passed; the
+  `task_control` library tests: 12 passed.
+- `cargo nextest run -p workspace-engine --locked --no-fail-fast`:
+  2488 passed, 30 skipped on the second run. The first run passed 2487 with one
+  leaky test and failed the known timing-sensitive
+  `shell_path::a_shell_that_does_not_answer_is_killed_at_the_timeout`, which
+  panicked at `shell_path.rs:160` with
+  `called Result::unwrap() on an Err value: Os { code: 2, kind: NotFound, message: "No such file or directory" }`;
+  it passed when rerun alone. No loopback-port test failed.
 
 Workspace clippy and the other crates' suites are left to CI.
