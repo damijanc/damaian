@@ -19295,6 +19295,89 @@ mod clarification_tests {
         assert_eq!(check.purpose, "");
         assert!(check.required);
     }
+
+    #[test]
+    fn a_proposed_check_never_carries_an_approval_field() {
+        // Spec 105 requirement 8: repository text — task instructions or
+        // `AGENTS.md` — can name a check, but only the model's `propose_plan`
+        // output becomes a `PlannedCheck`, and that output is a proposal the
+        // user reviews. The schema offers no way to mark a check approved or
+        // trusted, and the parser reads only the four structured fields, so an
+        // extra "approved"/"trusted" key a repository string might smuggle in is
+        // ignored rather than honoured. The type has no authority bit: a
+        // `PlannedCheck` is data the user approves, never a command already
+        // authorised.
+        let parsed = tool_action_from_call(&ToolCall {
+            id: "call_1".to_string(),
+            name: "propose_plan".to_string(),
+            arguments_json: serde_json::json!({
+                "steps": [
+                    { "title": "First" },
+                    {
+                        "title": "Second",
+                        "check": {
+                            "command": "cargo test",
+                            "workingDirectory": "",
+                            "purpose": "validates",
+                            "required": true,
+                            "approved": true,
+                            "trusted": true,
+                        },
+                    },
+                ],
+            })
+            .to_string(),
+        })
+        .unwrap()
+        .expect("a decoded plan");
+
+        let ToolAction::ProposePlan(steps) = parsed else {
+            panic!("expected a plan");
+        };
+        let check = steps[1]
+            .check
+            .as_ref()
+            .expect("the second step carries a check");
+        // The parsed check is exactly a `PlannedCheck`; the smuggled approval
+        // keys have nowhere to land.
+        assert_eq!(
+            *check,
+            PlannedCheck {
+                version: PLANNED_CHECK_VERSION,
+                command: "cargo test".to_string(),
+                working_directory: String::new(),
+                purpose: "validates".to_string(),
+                required: true,
+            }
+        );
+
+        // The schema offers no approval field for a check either, so the model
+        // cannot even *ask* that a check be pre-approved.
+        let definition = propose_plan_tool_definition();
+        let schema: serde_json::Value = serde_json::from_str(&definition.parameters_json).unwrap();
+        let check_props =
+            schema["properties"]["steps"]["items"]["properties"]["check"]["properties"]
+                .as_object()
+                .expect("the check schema is an object");
+        for key in ["command", "workingDirectory", "purpose", "required"] {
+            assert!(
+                check_props.contains_key(key),
+                "the check schema is missing {key}: {check_props:?}"
+            );
+        }
+        for key in ["approved", "trusted", "auto", "allow"] {
+            assert!(
+                !check_props.contains_key(key),
+                "the check schema must not offer an approval field {key}: {check_props:?}"
+            );
+        }
+        assert!(
+            definition
+                .parameters_json
+                .contains("authorises nothing on its own"),
+            "the check's own schema description says it authorises nothing"
+        );
+    }
 }
 
 /// Layer 3 of spec 20's working modes (`docs/specs/20_working_modes`): the

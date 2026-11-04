@@ -1306,6 +1306,25 @@ are, and a **Task incomplete** card names the reasons, such as "Verification is
 due and has not run." A check you declined is named as a waiver and never
 counted as a passed check; a check skipped by policy is still a blocker.
 
+**A required check is a completion obligation.** When an approved plan step
+carries a required check, the task may not complete until that exact command has
+a current passing result in its directory, or you have explicitly waived it. The
+completion report names each required check with one of four dispositions:
+
+- **Passed** — the check ran, exited zero, and the files it covered have not
+  changed since.
+- **Failed** — the check ran and did not exit zero.
+- **Stale** — the check ran, but the files it covered changed afterwards (a
+  later patch, a rollback, or an edit outside Damaian), so its result no longer
+  describes the current tree. It must run again before the task can complete.
+- **Waived** — you declined the check; it is named in the report and never
+  counted as passed.
+
+A required check whose result is missing blocks completion as well. A check the
+model *named* but that is not on the approved plan, or one on a step you marked
+optional, is not an obligation: it may run as ordinary feedback, but it does not
+gate the task.
+
 **Continue task** on that card starts a new run with the same plan and the same
 completion reasons, without typing "continue". You can add a note, which is
 appended as your message. Continuing is not an approval: every patch, command,
@@ -1347,6 +1366,18 @@ You can:
 - **Delete** a step with **×**.
 - **Approve** the plan as it stands, or **Decline** it.
 - **Run in a worker** (with Worker sessions on, outside a worker): opens the New worker dialog with your request and the plan as the card shows it, edits included. Once the worker starts, this turn ends here with nothing changed, its steps are marked skipped, and the card links to the worker. Handing over is not an approval: the worker puts the plan up for review again before its first change, and that is where you approve it. Cancel the dialog and the card is still waiting for an answer.
+
+**Required checks on the card.** A step may carry a **required check** — a
+command the plan says must pass before the task can complete, such as `cargo
+test` at the repository root. The card lists each one as its command and the
+directory it runs in, with why it is required. Like the steps themselves, a
+check is only a proposal here: the model named it (often because your task
+instructions or an `AGENTS.md` file named it), but nothing has run it. You can
+change its command or directory, edit its purpose, mark it optional, or remove
+it, and the plan you approve records exactly the check you kept. **Approving the
+plan does not run the check.** When the worker reaches that step, the command
+goes through the ordinary command-approval path and asks for its own decision,
+exactly as if the plan had never mentioned it.
 
 A plan whose steps only read things — listing files, searching, reading source
 — is never put up for approval, because there is nothing to undo.

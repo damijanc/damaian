@@ -1,0 +1,47 @@
+name = "approved_plan_required_check"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Add retry handling, then validate the change."
+plan_decision = "approve"
+
+# Spec 105 acceptance: an approved plan step that carries a required check is a
+# completion obligation. The plan is proposed with a `cargo test` check, the
+# user approves it, the model completes both steps, and answers "done" without
+# ever running the check. The completion gate truthfully settles `incomplete`
+# rather than trusting the answer: the required check is missing.
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_plan", arguments = { steps = [
+    { title = "Add retry handling" },
+    { title = "Validate the change", check = { command = "cargo test", workingDirectory = "", purpose = "validates the final tree", required = true } },
+  ] } },
+]
+
+# This run_command is the deferred mutating action that raises the plan-review
+# gate. The gate drops it without dispatching, so it is never approved or run.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "sed -i '' 's/1/2/' src/upload.rs", reason = "Bump the upload constant." } },
+]
+
+# After approval the model closes both steps without running the required check.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "complete_step", arguments = {} },
+  { name = "complete_step", arguments = {} },
+]
+
+[[turn]]
+content = "Retry handling is added and validated."
+
+[assert]
+final_task_status = "incomplete"
+task_count = 1
+deterministic_only = [
+  "final_task_status",
+  "task_count",
+]

@@ -1789,6 +1789,57 @@ report, so "failed" and "incomplete" stay distinct. Declining a required check
 can close a task, but only as a named waiver; it never turns the check into
 evidence that passed.
 
+**A required check reads as stale or missing.** When an approved plan step
+carries a `required` check, the gate names that check's disposition in the
+completion report (`required_check_*` reason codes, and the check itself in
+`waivers`):
+
+- **stale** — the check ran, but the files it covered changed afterwards. Two
+  things make a check stale: a later mutation batch began (a newer primary plan
+  step left `Pending`), or a file the check validated changed on disk. The
+  report reason is `required_check_stale`.
+- **missing** — the exact command never left a result. A check deferred to its
+  own plan step leaves a `commandExit` on that step; a check the loop ran
+  leaves a `verification_check` event. If neither is present, the reason is
+  `required_check_missing`.
+
+A check named only in the plan's prose — a step whose title or detail says "Run
+`cargo test`" but carries no `check` field — is **not** a required check: it
+never appears in the completion report, and a historical plan keeps loading
+without inventing one.
+
+The durable evidence to inspect:
+
+```bash
+# The settled plan and which steps carry a required check (command + directory).
+# `plan_created` and `plan_resumed` carry the plan directly; `plan_approved`
+# carries the reviewed plan under `.payload.plan`.
+jq -c 'select(.eventType=="plan_created" or .eventType=="plan_resumed")
+       | {kind: .eventType, checks: [.payload.steps[]
+           | select(.check.required)
+           | {step: .id, command: .check.command, dir: .check.workingDirectory}]}
+      ' "$SESSION_FILE"
+
+# A check the verification loop ran, and its outcome and generation.
+jq -c 'select(.eventType=="verification_check")
+       | {check: .payload.check, outcome: .payload.outcome,
+          generation: .payload.generation}
+      ' "$SESSION_FILE"
+
+# A deferred check run as an ordinary command leaves a commandExit on its step.
+jq -c 'select(.eventType=="plan_step_updated")
+       | select(.payload.step.evidence != null)
+       | {step: .payload.step.id,
+          exits: [.payload.step.evidence[] | select(.kind=="commandExit")
+                   | {exitCode, commandHash}]}
+      ' "$SESSION_FILE"
+```
+
+The plan is the source of truth for *which* checks are required; the verification
+and step evidence hold *what ran and when*. Recovery and continuation replay the
+same settled plan (`read_task_plan`), so a continued or recovered task's gate
+reads the carried plan's checks rather than re-parsing the step text.
+
 ### Notes: what the assistant kept, and why a later turn knows something
 
 A turn can write short `turn_notes` during an investigation (spec 65). The

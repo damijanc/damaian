@@ -429,6 +429,29 @@ fn a_deferred_required_check_is_stale_when_a_later_step_begins() {
     );
 }
 
+/// Spec 105 requirement 10: the gate reads structured checks, never plan
+/// prose. A historical plan whose step text names a command — "Run `cargo
+/// test`" — but carries no `check` field is eligible: nothing invents a required
+/// check from prose, and the `CommandExit` a prose step happened to record does
+/// not become one either.
+#[test]
+fn a_prose_only_plan_invents_no_required_check_for_the_gate() {
+    let task_id = "task_1";
+    let mut prose = step("test", StepStatus::Completed);
+    prose.title = "Run the suite".to_string();
+    prose.detail = Some("Run `cargo test` to validate the final tree".to_string());
+    // No `check` field: the prose names a command but carries no structured
+    // check, exactly what a pre-spec plan or a plan the model wrote without the
+    // check object looks like.
+    let plan = plan(task_id, vec![prose]);
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert!(report.eligible, "{report:?}");
+    assert!(report.reasons.is_empty());
+    assert!(report.waivers.is_empty());
+}
+
 #[test]
 fn a_pending_question_blocks_and_never_becomes_a_waiver() {
     let task_id = "task_1";

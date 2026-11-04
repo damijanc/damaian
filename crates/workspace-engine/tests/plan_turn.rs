@@ -933,6 +933,51 @@ fn a_revision_carries_the_users_check_edits_into_the_settled_plan() {
 }
 
 #[test]
+fn approving_a_plan_with_a_required_check_runs_no_command_and_the_check_still_needs_approval() {
+    // Spec 105 requirement 3: approving a plan that carries a required check is
+    // not command approval. The approval settles the plan (and its check) but
+    // runs nothing; when the worker reaches the check, the command still follows
+    // command policy and pauses for its own one-shot approval.
+    let repo = temp_repo("approve-check");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[
+                {"title":"Implement the change"},
+                {"title":"Validate","check":{"command":"cargo test","workingDirectory":"","purpose":"validates the final tree","required":true}}
+            ]}"#,
+        )],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+
+    // Approving the plan runs nothing: the resumed turn's first call is the
+    // check command, which still pauses on command policy's own card.
+    let mut after = scripted(vec![vec![call(
+        "run_command",
+        r#"{"command":"cargo test","reason":"Run the required check"}"#,
+    )]]);
+    let result = decide(&engine, &proposal.id, true, None, &mut after);
+
+    assert!(
+        result.command_proposal.is_some(),
+        "the required check still waits for command approval; the plan approval did not run it"
+    );
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+    let settled = plan_of(&engine, &result).expect("the settled plan should read back");
+    assert_eq!(
+        settled.steps[1]
+            .check
+            .as_ref()
+            .map(|check| check.command.as_str()),
+        Some("cargo test"),
+        "the approved plan still carries the required check"
+    );
+}
+
+#[test]
 fn a_revision_may_not_delete_a_step_that_already_ran() {
     // A completed step carries evidence tied to a state of the repository.
     // Honouring a deletion would leave a plan whose history no longer
