@@ -359,10 +359,15 @@ impl CompletionGateReport {
             // Deferred path: the latest run of the exact command in the exact
             // directory on the step is the evidence. Identity is the full
             // `CheckId` — command *and* working directory — not the command
-            // alone. It records no generation, so currentness is read from the
-            // step's position in the plan.
-            let Some(Evidence::CommandExit { exit_code, .. }) =
-                step.evidence.iter().rev().find(|evidence| {
+            // alone. The exit records no generation, so currentness is read
+            // from the durable plan record: the batch boundary and any mutation
+            // recorded after this exit (spec 105 requirement 5).
+            let Some((evidence_index, Evidence::CommandExit { exit_code, .. })) = step
+                .evidence
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, evidence)| {
                     matches!(
                         evidence,
                         Evidence::CommandExit {
@@ -383,7 +388,7 @@ impl CompletionGateReport {
                 });
                 continue;
             };
-            if !step_is_current(plan, step) {
+            if !deferred_evidence_is_current(plan, step, evidence_index) {
                 reasons.push(CompletionReason {
                     code: CompletionReasonCode::RequiredCheckStale,
                     explanation: format!(
@@ -434,14 +439,61 @@ fn command_failure_reason(exit_code: Option<i32>) -> String {
     }
 }
 
-/// Whether a deferred check's step still holds the current mutation batch.
+/// Whether a deferred check's evidence at `evidence_index` is current.
 ///
 /// A deferred required check runs as an ordinary command at its plan step, so
 /// its evidence is the step's [`Evidence::CommandExit`] rather than a
 /// [`CheckRun`]. Unlike a `CheckRun`, that evidence records no generation, so
-/// currentness is read from the step's position: the evidence is current only
-/// while the step is terminal and no later primary step has begun, because a
-/// later primary step leaving `Pending` is exactly what advances the batch.
+/// currentness is read from two durable plan facts:
+///
+/// 1. [`step_is_current`] — the evidence still belongs to the current mutation
+///    batch. A later primary step beginning is the boundary
+///    [`TaskPlan::mutation_generation`] counts, so a check from an earlier
+///    batch is stale even before the later step mutates anything.
+/// 2. no [`Evidence::PatchApplied`] follows the exit in the plan's own order —
+///    not in wall-clock order, which can tie, and not only in a later step: a
+///    patch can land after the check and before the same step closes
+///    (spec 105 requirement 5).
+fn deferred_evidence_is_current(plan: &TaskPlan, step: &PlanStep, evidence_index: usize) -> bool {
+    step_is_current(plan, step) && !mutation_after(plan, step, evidence_index)
+}
+
+/// Whether a patch was applied after `evidence_index` on `step`.
+///
+/// The order is the durable plan record: evidence within a step is in the
+/// order it was observed, and a later step in the plan comes after every
+/// earlier step. A `PatchApplied` is the only mutation the plan records, so it
+/// is the mutation-generation signal available to deferred evidence.
+fn mutation_after(plan: &TaskPlan, step: &PlanStep, evidence_index: usize) -> bool {
+    let is_mutation = |evidence: &Evidence| matches!(evidence, Evidence::PatchApplied { .. });
+    let mut after_step = false;
+    for candidate in &plan.steps {
+        if candidate.id == step.id {
+            after_step = true;
+            if candidate
+                .evidence
+                .iter()
+                .skip(evidence_index + 1)
+                .any(is_mutation)
+            {
+                return true;
+            }
+            continue;
+        }
+        if after_step && candidate.evidence.iter().any(is_mutation) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a deferred check's step still holds the current mutation batch.
+///
+/// The evidence is current only while the step is terminal and no later
+/// primary step has begun, because a later primary step leaving `Pending` is
+/// exactly what advances [`TaskPlan::mutation_generation`]. This is the batch
+/// half of currentness; [`mutation_after`] adds the within-batch mutations that
+/// the step boundary cannot see.
 fn step_is_current(plan: &TaskPlan, step: &PlanStep) -> bool {
     if !step.status.is_terminal() {
         return false;

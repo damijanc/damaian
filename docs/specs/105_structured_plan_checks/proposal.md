@@ -41,7 +41,9 @@ engine-owned statement that all requested checks had passed on the final tree.
 5. Check evidence records command, directory, exit, findings and a digest of
    the task-changed files it validated — including when a deferred check runs
    as an ordinary command at its plan step. Identity is directory plus command.
-   Any later mutation of those files makes the evidence stale.
+   Any later mutation of those files makes the evidence stale, including one
+   applied after the check in the same step; rerunning the same check in the
+   same directory after the mutation makes it current again.
 6. #101's completion gate requires current terminal evidence for every
    required check. Passed evidence satisfies it; failed or missing evidence
    does not. A declined check satisfies only an explicit waiver and is named in
@@ -97,6 +99,17 @@ exit written before the directory was recorded reads as the root: it cannot
 satisfy a check in a subdirectory, and it still satisfies a root check, which is
 what the pre-fix gate assumed of every matching command.
 
+Deferred evidence currentness is decided from the durable plan record, never a
+wall-clock comparison that can tie. The evidence must still belong to the
+current mutation batch — its step terminal and no later primary step begun,
+which is the boundary [`TaskPlan::mutation_generation`] counts — and no
+[`Evidence::PatchApplied`] may follow the matching `CommandExit` in plan order,
+whether on the same step or a later one. A patch merely proposed, declined or
+never applied records no `PatchApplied` and so leaves the check current. A rerun
+of the exact command in the exact directory after the patch is the newest
+matching exit and is current again. This reuses spec 21's applied-patch evidence
+and spec 105 Task 4's batch boundary rather than adding another counter.
+
 ## 5. Acceptance
 
 - A plan with `cargo nextest run -p workspace-engine` at the repository root
@@ -106,6 +119,11 @@ what the pre-fix gate assumed of every matching command.
   closing the final check step records current evidence.
 - Mutating a validated file makes the required check stale and prevents
   `complete` until it reruns or the user explicitly waives it.
+- A patch applied after the deferred check in its own step makes that check
+  stale; rerunning the same check in the same directory after the patch makes it
+  current again and lets the task complete.
+- A patch applied in a later step also makes the deferred check stale, while a
+  patch that is only proposed, declined or never applied leaves it current.
 - Old prose-only plans still load and do not invent required checks.
 - A deferred check matches only the directory it requires: the same command run
   at the root does not satisfy a check in a subdirectory, and a pre-directory
@@ -131,8 +149,8 @@ directory. The field is `#[serde(default, skip_serializing_if =
 "String::is_empty")]`, so existing session logs load with the root. That is the
 deliberate choice for an event written before this change: it cannot satisfy a
 subdirectory check, and it still satisfies a root check, because the pre-fix
-gate treated every matching command as a root check. The staleness rule
-(`step_is_current`) is unchanged; R4 owns it.
+gate treated every matching command as a root check. The staleness rule was left
+for R4, below.
 
 The regression tests were written first. `plan_turn`
 `a_required_check_in_a_subdirectory_is_missing_when_the_command_ran_at_the_root`
@@ -179,3 +197,43 @@ normalizer and deferral tests
 `a_planned_check_directory_is_normalized_like_a_check_id`,
 `a_planned_check_with_a_dot_prefix_defers_the_normalized_discovered_check` and
 `a_plan_revision_with_a_directory_outside_the_repository_is_rejected`.
+
+## Review fix 2026-11-05: deferred check evidence tracks later mutations (R4)
+
+The same review found that the deferred path's currentness rule,
+`step_is_current`, only checked the step's position. A patch applied after the
+check but before the step closed therefore left the `CommandExit` looking
+current, and the task could settle `complete` on a tree the check never saw. The
+finding was verified in the code; a regression test reproduces it.
+
+Currentness for a deferred check is now two durable plan facts, not a
+wall-clock comparison. The exit must still belong to the current mutation batch
+— its step terminal and no later primary step begun, the boundary
+`TaskPlan::mutation_generation` counts — **and** no `Evidence::PatchApplied` may
+follow the matching `CommandExit` in plan order, on the same step or a later
+one. `step_is_current` is kept because it adds the batch-boundary half: a later
+primary step beginning advances the generation even before it mutates anything,
+so a check from an earlier batch is stale then too. The new mutation half is
+`mutation_after` in `completion.rs`. It reuses spec 21's applied-patch evidence
+and spec 105 Task 4's derived generation rather than adding a counter or
+timestamp. A patch that is only proposed, declined or never applied records no
+`PatchApplied`, so it leaves the check current; a rerun of the exact check in the
+exact directory is the newest matching exit and is current again. The
+`CheckRun` (verification-loop) staleness path is unchanged.
+
+The regression test was written first. `closed_task_completion`
+`a_patch_applied_after_the_deferred_check_makes_its_evidence_stale` failed with
+`assertion failed: !report.eligible` — the gate considered the check current
+because its step was terminal. `plan_turn`
+`a_patch_applied_after_the_deferred_check_makes_its_evidence_stale` failed with
+`left: Complete, right: Incomplete`: the check ran, a real patch was applied,
+the step closed, and the task still completed. Both pass now. The matching
+guards are `a_deferred_check_rerun_after_a_patch_is_current` and
+`rerunning_the_deferred_check_after_the_patch_makes_it_current` (the rerun is
+current), `a_patch_applied_in_a_later_step_makes_the_check_stale` and
+`a_patch_applied_in_a_later_step_makes_the_check_step_stale` (the later step
+still invalidates it), and
+`a_patch_that_is_declined_or_never_applied_does_not_make_the_check_stale`
+(a pending or declined card records no mutation). The later-step guards already
+passed before the fix because `step_is_current` covered that position; they keep
+the behaviour from regressing when staleness starts reading mutations.

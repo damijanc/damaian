@@ -90,6 +90,16 @@ fn command_exit(command: &str, exit_code: Option<i32>) -> Evidence {
     }
 }
 
+/// The `PatchApplied` a real apply appends to the step that was open when it
+/// landed. Its file list does not matter to the gate, only that a mutation was
+/// recorded.
+fn patch_applied() -> Evidence {
+    Evidence::PatchApplied {
+        marker_id: "apply_marker".to_string(),
+        files: Vec::new(),
+    }
+}
+
 /// A `CommandExit` as a session log written before the working directory was
 /// recorded: the JSON has no directory field at all. Loaded through serde so
 /// the compatibility of an old log is what the test exercises.
@@ -516,6 +526,64 @@ fn a_deferred_required_check_is_stale_when_a_later_step_begins() {
     let mut test = checked_step("test", "cargo test", StepStatus::Completed);
     test.evidence = vec![command_exit("cargo test", Some(0))];
     let plan = plan(task_id, vec![test, step("document", StepStatus::Completed)]);
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert!(!report.eligible);
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckStale]
+    );
+}
+
+/// R4 regression from the 2026-11-04 review of specs 101–105: within the same
+/// step, a patch applied after the check was ignored because currentness only
+/// looked at step position. The latest durable record here is a mutation, so
+/// the check no longer describes the tree the task would close on.
+#[test]
+fn a_patch_applied_after_the_deferred_check_makes_its_evidence_stale() {
+    let task_id = "task_1";
+    let mut test = checked_step("test", "cargo test", StepStatus::Completed);
+    test.evidence = vec![command_exit("cargo test", Some(0)), patch_applied()];
+    let plan = plan(task_id, vec![test]);
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert!(!report.eligible);
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckStale]
+    );
+}
+
+/// The rerun is the newest evidence, so it is current even though a patch sits
+/// between it and the earlier pass.
+#[test]
+fn a_deferred_check_rerun_after_a_patch_is_current() {
+    let task_id = "task_1";
+    let mut test = checked_step("test", "cargo test", StepStatus::Completed);
+    test.evidence = vec![
+        command_exit("cargo test", Some(0)),
+        patch_applied(),
+        command_exit("cargo test", Some(0)),
+    ];
+    let plan = plan(task_id, vec![test]);
+
+    let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+    assert!(report.eligible, "{report:?}");
+}
+
+/// A patch in a later step is also a mutation after the check. The step-position
+/// rule already caught this one; it stays current only if no mutation follows.
+#[test]
+fn a_patch_applied_in_a_later_step_makes_the_check_stale() {
+    let task_id = "task_1";
+    let mut test = checked_step("test", "cargo test", StepStatus::Completed);
+    test.evidence = vec![command_exit("cargo test", Some(0))];
+    let mut later = step("document", StepStatus::Completed);
+    later.evidence = vec![patch_applied()];
+    let plan = plan(task_id, vec![test, later]);
 
     let report = evaluate(task_id, Some(&plan), &state(&[]), None, &BTreeMap::new());
 

@@ -68,6 +68,30 @@ fn ask(
         .expect("the turn should run")
 }
 
+/// [`ask`], continuing an existing session so the turn picks up its carried
+/// plan.
+fn ask_in_session(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: &str,
+    prompt: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .ask_with_session(repo, prompt, &[], Some(session_id), adapter, &mut sink)
+        .expect("the turn should run")
+}
+
 /// [`ask`], keeping every plan the turn reported as it went.
 fn ask_watching_plans(
     engine: &WorkspaceEngine,
@@ -212,6 +236,107 @@ fn gate_report(engine: &WorkspaceEngine, result: &ChatTurnResult) -> CompletionG
         pending: None,
         current_hashes: &BTreeMap::new(),
     })
+}
+
+/// Runs the verification a patch application made due, the way the client
+/// does after its apply settles.
+fn run_verification_due(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .verify_due(repo, session_id, adapter, &mut sink)
+        .expect("the due verification should run")
+}
+
+/// Continues the newest incomplete task through the engine's own continuation
+/// route, carrying its plan and completion report.
+fn continue_task(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: &str,
+    task_id: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .continue_incomplete_task(repo, session_id, task_id, None, adapter, &mut sink)
+        .expect("the continuation should run")
+}
+
+const CHECK_ON_SECOND_STEP: &str = r#"{"steps":[
+    {"title":"Make the change"},
+    {"title":"Run the check","check":{"command":"ls","workingDirectory":"","purpose":"validates the final tree","required":true}}
+]}"#;
+
+/// Runs the deferred check on its plan step, lets the turn end so the engine
+/// attaches the check's evidence, then proposes a patch in a later turn while
+/// that same step is still open. The patch turn ends on the patch proposal, so
+/// the step stays `InProgress` until another turn closes it.
+fn run_check_then_propose_a_patch(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    plan_json: &str,
+    patch_path: &str,
+) -> (ChatTurnResult, String) {
+    let mut adapter = scripted(vec![
+        vec![call("propose_plan", plan_json)],
+        // The mutation is what puts the plan up for review; the check alone
+        // would not.
+        vec![patch_call(patch_path)],
+    ]);
+    let paused = ask(engine, repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+
+    // Run the check and answer: a plain answer is a true turn end, so the
+    // command's exit is attached to the still-open step.
+    let mut after = scripted(vec![
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"ls","reason":"Run the required check"}"#,
+        )],
+    ]);
+    let checked = decide(engine, &proposal.id, true, None, &mut after);
+
+    // A later turn proposes the patch. The check step is still open, so an
+    // apply lands its `PatchApplied` after the check's exit on the same step.
+    let mut patch_adapter = scripted(vec![vec![patch_call(patch_path)]]);
+    let proposed = ask_in_session(
+        engine,
+        repo,
+        &checked.session.id,
+        "Continue with the change",
+        &mut patch_adapter,
+    );
+    let patch = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("the patch is proposed while the check step is open")
+        .patch_id
+        .clone();
+    (proposed, patch)
 }
 
 #[test]
@@ -1303,6 +1428,228 @@ fn a_plan_revision_with_a_directory_outside_the_repository_is_rejected() {
         Some("crates/foo"),
         "the valid revision is stored normalized after the refusal was answered again"
     );
+}
+
+/// R4 regression from the 2026-11-04 review of specs 101–105: a deferred
+/// required check's evidence was current merely because its step was terminal
+/// and no later step had begun. A patch applied after the check, still in the
+/// same step, left the evidence stale in fact but current to the gate, so the
+/// task could close on a tree the check never saw.
+#[test]
+fn a_patch_applied_after_the_deferred_check_makes_its_evidence_stale() {
+    let repo = temp_repo("check-stale-same-step");
+    let engine = engine_for(&repo);
+    let (checked, patch) =
+        run_check_then_propose_a_patch(&engine, &repo, CHECK_ON_SECOND_STEP, "src/added.rs");
+    let open_plan = plan_of(&engine, &checked).expect("the open plan should read back");
+    assert!(
+        open_plan.steps[1]
+            .evidence
+            .iter()
+            .any(|evidence| matches!(evidence, Evidence::CommandExit { .. })),
+        "the check ran before the patch: steps={:?}",
+        open_plan
+            .steps
+            .iter()
+            .map(|step| (&step.id, step.status, &step.evidence))
+            .collect::<Vec<_>>()
+    );
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo, &patch, None, None, "tester", false)
+        .expect("the approved patch applies");
+
+    // Clear the patch's verification due through its ordinary route. The
+    // verification turn carries the plan; the stale check stops it continuing.
+    let verified = run_verification_due(
+        &engine,
+        &repo,
+        &checked.session.id,
+        &mut MockModelAdapter::new("Done."),
+    );
+    let mut adapter = scripted(vec![vec![call("complete_step", "{}")]]);
+    let result = continue_task(
+        &engine,
+        &repo,
+        &checked.session.id,
+        &verified.task.id,
+        &mut adapter,
+    );
+
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Incomplete,
+        "the check ran before the patch, so closing the step cannot complete the task"
+    );
+    let report = engine
+        .session_store
+        .read_completion_report(&checked.session.id, &result.task.id)
+        .unwrap()
+        .expect("the continued task settles through the gate");
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckStale],
+        "{report:?}"
+    );
+}
+
+/// The other side of the same rule: rerunning the exact check after the patch
+/// makes its evidence current again, so the same step can close the task.
+#[test]
+fn rerunning_the_deferred_check_after_the_patch_makes_it_current() {
+    let repo = temp_repo("check-rerun-same-step");
+    let engine = engine_for(&repo);
+    let (checked, patch) =
+        run_check_then_propose_a_patch(&engine, &repo, CHECK_ON_SECOND_STEP, "src/added.rs");
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo, &patch, None, None, "tester", false)
+        .expect("the approved patch applies");
+
+    let verified = run_verification_due(
+        &engine,
+        &repo,
+        &checked.session.id,
+        &mut MockModelAdapter::new("Done."),
+    );
+    let mut adapter = scripted(vec![
+        vec![call(
+            "run_command",
+            r#"{"command":"ls","reason":"Run the required check again"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+    let result = continue_task(
+        &engine,
+        &repo,
+        &checked.session.id,
+        &verified.task.id,
+        &mut adapter,
+    );
+
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Complete,
+        "the rerun validates the patched tree: {:?}",
+        result.task
+    );
+    let report = engine
+        .session_store
+        .read_completion_report(&checked.session.id, &result.task.id)
+        .unwrap()
+        .expect("the completed task carries its report");
+    assert!(report.eligible, "{report:?}");
+}
+
+/// A patch applied in a later step also invalidates the earlier check's
+/// evidence. That case already read as stale before R4 because the later step
+/// had begun; the test keeps the rule from regressing when staleness starts
+/// tracking mutations rather than step position alone.
+#[test]
+fn a_patch_applied_in_a_later_step_makes_the_check_step_stale() {
+    let repo = temp_repo("check-stale-later-step");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[
+                {"title":"Run the check","check":{"command":"ls","workingDirectory":"","purpose":"validates the final tree","required":true}},
+                {"title":"Make the change"}
+            ]}"#,
+        )],
+        vec![patch_call("src/added.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+    let mut after = scripted(vec![
+        vec![call(
+            "run_command",
+            r#"{"command":"ls","reason":"Run the required check"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        vec![patch_call("src/added.rs")],
+    ]);
+    let result = decide(&engine, &proposal.id, true, None, &mut after);
+    let patch = result
+        .patch_proposal
+        .as_ref()
+        .expect("the patch is proposed in the later step")
+        .patch_id
+        .clone();
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo, &patch, None, None, "tester", false)
+        .expect("the approved patch applies");
+
+    let verified = run_verification_due(
+        &engine,
+        &repo,
+        &result.session.id,
+        &mut MockModelAdapter::new("Done."),
+    );
+    let mut adapter = scripted(vec![vec![call("complete_step", "{}")]]);
+    let result = continue_task(
+        &engine,
+        &repo,
+        &result.session.id,
+        &verified.task.id,
+        &mut adapter,
+    );
+
+    assert_eq!(result.task.status, TaskStatus::Incomplete);
+    let report = engine
+        .session_store
+        .read_completion_report(&result.session.id, &result.task.id)
+        .unwrap()
+        .expect("the continued task settles through the gate");
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckStale],
+        "{report:?}"
+    );
+}
+
+/// A patch that is only proposed, or proposed and declined, leaves no
+/// `PatchApplied` in the plan, so the check that ran before it is still
+/// current. Staleness is a fact about mutations, not about a pending card.
+#[test]
+fn a_patch_that_is_declined_or_never_applied_does_not_make_the_check_stale() {
+    for declined in [false, true] {
+        let repo = temp_repo(&format!("check-not-applied-{declined}"));
+        let engine = engine_for(&repo);
+        let (checked, patch) =
+            run_check_then_propose_a_patch(&engine, &repo, CHECK_ON_SECOND_STEP, "src/added.rs");
+        if declined {
+            engine
+                .edit_orchestrator
+                .reject_stored_patch(&patch, "tester")
+                .expect("the patch is declined");
+        }
+
+        let mut adapter = scripted(vec![vec![call("complete_step", "{}")]]);
+        let result = ask_in_session(
+            &engine,
+            &repo,
+            &checked.session.id,
+            "Finish the check step",
+            &mut adapter,
+        );
+
+        assert_eq!(
+            result.task.status,
+            TaskStatus::Complete,
+            "declined={declined}: an unapplied patch does not invalidate the check"
+        );
+        let report = engine
+            .session_store
+            .read_completion_report(&checked.session.id, &result.task.id)
+            .unwrap()
+            .expect("the completed task carries its report");
+        assert!(report.eligible, "declined={declined}: {report:?}");
+    }
 }
 
 #[test]
