@@ -164,7 +164,9 @@ the model says so, and ending the turn is the model saying so.
    step still open — answered, a budget stop, the stop button, a failure — the
    evidence accrued for that step is attached to it with
    `append_step_evidence` before the task's final status is written. A pause
-   carries it instead (§5.3). The step stays open: attaching is not closing.
+   that saves a `PendingChatTurn` carries it instead; a patch proposal saves no
+   pending turn, so it attaches the buffer at the pause without counting as the
+   end (§5.3). The step stays open: attaching is not closing.
 5. **Nothing is closed on the model's behalf.** No step changes status because
    the turn ended. #21 requirement 6 stands.
 6. **The panel does not say "running" about a turn that has ended.** An
@@ -320,14 +322,27 @@ pending turn instead of `Vec::new()` when it is resuming one. The comment at
 step that was running **unless** the turn was paused, because a paused turn now
 carries it.
 
-A pause carries, a true end settles. A command, patch, plan-review, question,
-provider-fallback or round-budget pause writes the buffer into the pending turn
-and the resumed loop seeds it; the step is not touched. A true end — answered,
-tool budget, token budget, the stop button, a provider failure, or a declined
-provider fallback — attaches the buffer to whichever step is still open with
-`append_step_evidence`, before the task's final status is written. The step stays
-open: attaching is not closing, and nothing recomputes its status. The
-in-memory plan is extended too, so the final panel event carries the evidence.
+A pause carries, a true end settles — except for a patch proposal, which
+attaches at the pause because it is the one pending approval with no pending
+turn. Every pause that writes a `PendingChatTurn` (command, plan review,
+question, fetch, MCP or web-diagnostic approval, check batch, context review,
+provider fallback, round budget) saves the buffer and the resumed loop seeds
+it; the step is not touched. A patch proposal — `propose_patch` or `edit_file`,
+the two stops that raise one — attaches the buffer to the still-open step
+before stopping, in observation order, so the failing command a repair turn ran
+just before proposing its fix is on the step before the patch's own
+`PatchApplied` lands. That attach is only an attach: no audit, no reminder, no
+status change, and no `PlanFinished` event, because the turn is pausing.
+
+A true end — answered, tool budget, token budget, the stop button, a provider
+failure, or a declined provider fallback — attaches the buffer to whichever
+step is still open with `append_step_evidence`, before the task's final status
+is written. The step stays open: attaching is not closing, and nothing
+recomputes its status. The in-memory plan is extended too, so the final panel
+event carries the evidence. A pause that does save a pending turn never
+attaches early, so the evidence a resume carries is attached exactly once when
+that resumed turn truly ends
+(`a_command_pause_does_not_duplicate_its_evidence_on_resume`).
 
 The resume after a command approval also attaches the approved command's own
 `CommandExit` (minted by `evidence_for` from its execution, with #63's
@@ -457,7 +472,8 @@ not stuck; how to read `plan_left_open` and `plan_reminder_sent`).
 | No reminder with no round or token room | `the_reminder_gate_needs_two_rounds_of_room`, `the_reminder_gate_needs_room_under_the_token_ceiling`, `a_hook_that_always_denies_never_gets_a_reminder` | Automated (pure gate) |
 | `complete_step` still closes steps from evidence after the reminder | `an_answer_with_open_steps_gets_one_reminder_and_closes_after_it` (two closed steps, read on step 1) | Automated |
 | Two-answers rule | Same test (`response` is the report, "Done." is the last message) and `a_second_answer_ends_the_turn_with_the_steps_still_open` (response is the first answer, second is last) | Automated |
-| Evidence before an approval is on the step after the resume, including the command's exit | `a_plan_review_pause_carries_the_evidence_and_the_reminder_flag`, `an_approved_command_reaches_the_open_step_as_evidence` | Automated |
+| Evidence before an approval is on the step after the resume, including the command's exit | `a_plan_review_pause_carries_the_evidence_and_the_reminder_flag`, `an_approved_command_reaches_the_open_step_as_evidence`, `a_command_pause_does_not_duplicate_its_evidence_on_resume` (each item attached once, not once at the pause and again at settlement) | Automated |
+| A patch proposal attaches the turn's evidence before it stops | `a_failing_command_before_a_patch_in_one_turn_reaches_the_open_step`; `closing_a_step_after_a_patch_without_rerunning_the_command_keeps_it_blocked` and `rerunning_the_failed_command_after_the_patch_completes_the_step`; a passing required check followed by a patch in the same turn reads `RequiredCheckStale`, not `RequiredCheckMissing` (`a_required_check_before_a_patch_in_one_turn_is_stale_not_missing`) | Automated |
 | A turn that ends open keeps it open with its evidence, for any reason | `a_turn_that_answers_with_a_step_open_keeps_it_open_with_its_evidence`, `a_stopped_turn_keeps_its_step_open_with_its_evidence`, `a_provider_failure_keeps_its_step_open`; the engine never calls `status_from_evidence` on attach. A token-budget stop uses the same `truly_completed` branch and was not exercised end to end | Automated except the token-budget variant |
 | An ended panel never says "running" | `an_ended_plan_summary_says_not_marked_done`, `an_ended_plan_with_a_blocked_step_still_names_it`, `an_ended_turn_s_plan_is_not_active`, `the_plan_event_carries_whether_the_turn_is_active`; the JS label reads `plan.active !== false`. **Checked in the real UI on 2026-10-25**: the panel read "Turn ended with 1 step not marked done, 1 finished.", labelled the open step "not finished" with no "running" label, and showed each step's evidence | Automated and manual, passed |
 | While the turn runs the panel is unchanged | `the_states_whose_turn_is_still_running_are_exactly_the_non_terminal_work_states`; `plan.active: true` from `TurnProgress::Plan` and `task_states_json` for a `RunningTool` task | Automated |
@@ -515,3 +531,15 @@ not stuck; how to read `plan_left_open` and `plan_reminder_sent`).
 - **The reminder itself is one measured model call.** On the live run it cost
   80,774 input (66,432 cached) and 249 output tokens; the entire 27-call turn
   cost 2,218,346 input (1,934,208 cached) and 17,662 output.
+- **A patch proposal is a pause that saves no paused turn (review fix,
+  2026-11-05).** Found while writing the spec 105 staleness tests (R4 of the
+  2026-11-04 review of specs 101–105): a pending patch made
+  `truly_completed` false, so `settle_plan_at_turn_end` never ran, and the
+  patch stop saved no `PendingChatTurn` either — every command exit the turn had
+  gathered was dropped. The commonest repair shape, run the failing check and
+  propose the fix in one turn, therefore could not block the step. The attach
+  half of settlement is now `attach_step_evidence`; the two stops that raise a
+  patch (`propose_patch` and `edit_file`) call it before stopping, with no
+  audit, reminder or status change. Turns that do save a paused turn still
+  carry the buffer and attach it only at their true end, so nothing is attached
+  twice. This is R13; the tests are named in §7.1.

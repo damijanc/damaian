@@ -226,6 +226,17 @@ that nothing observable confirms it. Steps like "understand the existing retry
 logic" legitimately have no evidence, and forcing a fake one would be worse than
 admitting it.
 
+Evidence is attached whenever the turn that gathered it stops, not only when the
+task ends. A turn that proposes a patch saves no paused turn
+([spec 66](../66_plan_left_open_at_turn_end/proposal.md) §5.3), so it attaches
+what it observed to the still-open step before stopping, in observation order.
+That does not close or re-judge the step; the patch's own `PatchApplied` is
+recorded later, when the patch is applied after the turn, so it lands after the
+exit it invalidates. Without this the commonest repair shape — run the failing
+check, propose the fix in the same turn — would drop the failure, and the step
+could close `Completed` after the patch without ever having seen it
+(2026-11-05 review fix, R13 of the 2026-11-04 review of specs 101–105).
+
 ### 5.4 The token ceiling
 
 `agent_max_task_tokens` in `Config`. Default: unset, meaning no ceiling, so this

@@ -1652,6 +1652,316 @@ fn a_patch_that_is_declined_or_never_applied_does_not_make_the_check_stale() {
     }
 }
 
+/// R13 regression from the 2026-11-04 review of specs 101–105: a turn that
+/// proposed a patch saved no paused turn, so the failing command it ran earlier
+/// in the same turn was dropped instead of reaching the open step. The commonest
+/// repair shape — run the check, it fails, propose the fix — then could not
+/// block the step, and after the patch it closed `Completed` without proof.
+fn engine_with_a_command_that_fails_until_the_patch_lands(repo: &Path) -> WorkspaceEngine {
+    fs::write(
+        repo.join("check"),
+        "#!/bin/sh\nif [ -f src/added.rs ]; then exit 0; fi\nexec ls no-such-directory\n",
+    )
+    .unwrap();
+    fs::set_permissions(repo.join("check"), fs::Permissions::from_mode(0o755)).unwrap();
+    WorkspaceEngine::new(Config {
+        command_allowlist: vec!["./check".to_string()],
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        ..Config::default()
+    })
+}
+
+/// Runs a failing command and proposes a patch in the same resumed turn, after
+/// its plan is approved. Returns the turn and the patch it left for review.
+fn failing_command_then_a_patch_in_one_turn(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+) -> (ChatTurnResult, String) {
+    let mut first = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Make the change"},{"title":"Run the check"}]}"#,
+        )],
+        // The mutation is what raises the plan review.
+        vec![patch_call("src/added.rs")],
+    ]);
+    let paused = ask(engine, repo, "Fix the check", &mut first);
+    let review = paused.plan_proposal.expect("the plan should be put up");
+
+    // Close the first step, then fail the check on the second and propose the
+    // fix — all in the one resumed turn.
+    let mut after = scripted(vec![
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"./check","reason":"Check the fix"}"#,
+        )],
+        vec![patch_call("src/added.rs")],
+    ]);
+    let proposed = decide(engine, &review.id, true, None, &mut after);
+    let patch = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("the patch is proposed while the step is open")
+        .patch_id
+        .clone();
+    (proposed, patch)
+}
+
+#[test]
+fn a_failing_command_before_a_patch_in_one_turn_reaches_the_open_step() {
+    let repo = temp_repo("patch-keeps-failed-exit");
+    let engine = engine_with_a_command_that_fails_until_the_patch_lands(&repo);
+    let (proposed, _patch) = failing_command_then_a_patch_in_one_turn(&engine, &repo);
+
+    let plan = plan_of(&engine, &proposed).expect("the plan should read back");
+    assert_eq!(
+        plan.steps[1].status,
+        StepStatus::InProgress,
+        "attaching is not closing: the step waits for complete_step"
+    );
+    let exit = plan.steps[1]
+        .evidence
+        .iter()
+        .find_map(|evidence| match evidence {
+            Evidence::CommandExit { exit_code, .. } => Some(*exit_code),
+            _ => None,
+        })
+        .expect("the failing exit reaches the open step before the patch proposal stops the turn");
+    assert_ne!(exit, Some(0), "the command failed: {:?}", plan.steps[1]);
+    assert!(
+        audit_events(&repo, "plan_left_open").is_empty(),
+        "a turn that only pauses for the patch is not a turn end"
+    );
+}
+
+#[test]
+fn closing_a_step_after_a_patch_without_rerunning_the_command_keeps_it_blocked() {
+    let repo = temp_repo("patch-without-rerun-blocked");
+    let engine = engine_with_a_command_that_fails_until_the_patch_lands(&repo);
+    let (proposed, patch) = failing_command_then_a_patch_in_one_turn(&engine, &repo);
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo, &patch, None, None, "tester", false)
+        .expect("the approved patch applies");
+    let verified = run_verification_due(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        &mut MockModelAdapter::new("Done."),
+    );
+
+    let mut adapter = scripted(vec![vec![call("complete_step", "{}")]]);
+    let result = continue_task(
+        &engine,
+        &repo,
+        &verified.session.id,
+        &verified.task.id,
+        &mut adapter,
+    );
+    let plan = plan_of(&engine, &result).expect("the plan should read back");
+    assert_eq!(
+        plan.steps[1].status,
+        StepStatus::Blocked,
+        "the failed command has not succeeded since: {:?}",
+        plan.steps[1]
+    );
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Incomplete,
+        "a blocked step is not finished work"
+    );
+    let report = engine
+        .session_store
+        .read_completion_report(&result.session.id, &result.task.id)
+        .unwrap()
+        .expect("the continued task settles through the gate");
+    assert!(
+        report
+            .reason_codes()
+            .contains(&CompletionReasonCode::BlockedPlanSteps),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn rerunning_the_failed_command_after_the_patch_completes_the_step() {
+    let repo = temp_repo("patch-rerun-clears");
+    let engine = engine_with_a_command_that_fails_until_the_patch_lands(&repo);
+    let (proposed, patch) = failing_command_then_a_patch_in_one_turn(&engine, &repo);
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo, &patch, None, None, "tester", false)
+        .expect("the approved patch applies");
+    let verified = run_verification_due(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        &mut MockModelAdapter::new("Done."),
+    );
+
+    let mut adapter = scripted(vec![
+        vec![call(
+            "run_command",
+            r#"{"command":"./check","reason":"Run the same check again"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+    let result = continue_task(
+        &engine,
+        &repo,
+        &verified.session.id,
+        &verified.task.id,
+        &mut adapter,
+    );
+    let plan = plan_of(&engine, &result).expect("the plan should read back");
+    assert_eq!(
+        plan.steps[1].status,
+        StepStatus::Completed,
+        "the same command passed after the patch: {:?}",
+        plan.steps[1]
+    );
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Complete,
+        "{:?}",
+        result.task
+    );
+}
+
+/// R4 plus R13: a passing deferred required check and the patch it validates in
+/// the same turn used to lose the check's exit at the patch pause, so the gate
+/// reported it missing. With the exit kept, the applied patch makes it stale —
+/// the safe direction, and the one that tells the worker to rerun it.
+#[test]
+fn a_required_check_before_a_patch_in_one_turn_is_stale_not_missing() {
+    let repo = temp_repo("check-then-patch-one-turn");
+    let engine = engine_for(&repo);
+    let mut first = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[
+                {"title":"Make the change"},
+                {"title":"Run the check","check":{"command":"ls","workingDirectory":"","purpose":"validates the final tree","required":true}}
+            ]}"#,
+        )],
+        vec![patch_call("src/added.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut first);
+    let review = paused.plan_proposal.expect("the plan should be put up");
+
+    let mut after = scripted(vec![
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"ls","reason":"Run the required check"}"#,
+        )],
+        vec![patch_call("src/added.rs")],
+    ]);
+    let proposed = decide(&engine, &review.id, true, None, &mut after);
+    let patch = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("the patch is proposed while the check step is open")
+        .patch_id
+        .clone();
+
+    let open_plan = plan_of(&engine, &proposed).expect("the open plan should read back");
+    assert_eq!(open_plan.steps[1].status, StepStatus::InProgress);
+    assert!(
+        open_plan.steps[1]
+            .evidence
+            .iter()
+            .any(|evidence| matches!(evidence, Evidence::CommandExit { .. })),
+        "the passing check reaches the open step before the patch proposal: {:?}",
+        open_plan.steps[1]
+    );
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo, &patch, None, None, "tester", false)
+        .expect("the approved patch applies");
+    let verified = run_verification_due(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        &mut MockModelAdapter::new("Done."),
+    );
+
+    let mut adapter = scripted(vec![vec![call("complete_step", "{}")]]);
+    let result = continue_task(
+        &engine,
+        &repo,
+        &verified.session.id,
+        &verified.task.id,
+        &mut adapter,
+    );
+    assert_eq!(result.task.status, TaskStatus::Incomplete);
+    let report = engine
+        .session_store
+        .read_completion_report(&result.session.id, &result.task.id)
+        .unwrap()
+        .expect("the continued task settles through the gate");
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckStale],
+        "{report:?}"
+    );
+}
+
+/// The other half of the fix: a turn that *does* save a paused turn carries its
+/// evidence in the pending file and attaches it only when it settles, so the new
+/// patch-pause attach must not also fire for it and duplicate the evidence.
+#[test]
+fn a_command_pause_does_not_duplicate_its_evidence_on_resume() {
+    let repo = temp_repo("pause-evidence-once");
+    let engine = engine_for(&repo);
+    let mut first = scripted(vec![
+        vec![plan_call(&["Read the source", "Write the report"])],
+        vec![call("read_file", r#"{"path":"src/a.rs"}"#)],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut first);
+    let review = paused.plan_proposal.expect("the plan should be put up");
+
+    let mut command_round = scripted(vec![vec![call(
+        "run_command",
+        r#"{"command":"sed -i '' 's/1/2/' src/a.rs","reason":"Bump the constant"}"#,
+    )]]);
+    let paused = approve_plan(&engine, &review.id, &mut command_round);
+    let command = paused
+        .command_proposal
+        .expect("the command is put up for approval");
+
+    let mut finish = scripted(vec![vec![call("complete_step", "{}")]]);
+    let result = approve_command(&engine, &command.id, &mut finish);
+    let plan = plan_of(&engine, &result).expect("the plan should read back");
+
+    assert_eq!(
+        plan.steps[0]
+            .evidence
+            .iter()
+            .filter(|evidence| matches!(evidence, Evidence::FileRead { .. }))
+            .count(),
+        1,
+        "the read carried across the pause is attached once: {:?}",
+        plan.steps[0].evidence
+    );
+    assert_eq!(
+        plan.steps[0]
+            .evidence
+            .iter()
+            .filter(|evidence| matches!(evidence, Evidence::CommandExit { .. }))
+            .count(),
+        1,
+        "the approved command's exit is attached once: {:?}",
+        plan.steps[0].evidence
+    );
+}
+
 #[test]
 fn a_revision_may_not_delete_a_step_that_already_ran() {
     // A completed step carries evidence tied to a state of the repository.

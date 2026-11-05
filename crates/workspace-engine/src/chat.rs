@@ -7480,24 +7480,30 @@ impl ChatOrchestrator {
     }
 
     /// Attaches the turn's accrued evidence to whichever step is still open,
-    /// and audits the plan left open (spec 66 §5.2, §5.3).
+    /// in the order it was observed.
     ///
-    /// Only a true end calls this. Attaching is not closing: the step keeps its
-    /// status, and `append_step_evidence` never recomputes one. Best-effort
-    /// writes — an unwritable log must not turn a finished turn into an error,
-    /// the same rule `edit.rs` follows.
-    fn settle_plan_at_turn_end(
+    /// Attaching is not closing: the step keeps its status, and
+    /// `append_step_evidence` never recomputes one. Best-effort writes — an
+    /// unwritable log must not turn a finished turn into an error, the same rule
+    /// `edit.rs` follows.
+    ///
+    /// Two kinds of stop attach through here. A true turn end does both this
+    /// and the audit of the plan it leaves open. A stop that saves no paused
+    /// turn — a patch proposal (`propose_patch` or `edit_file`), the only
+    /// pending approval with no pending turn — attaches only: it is a pause,
+    /// not an end, so it must not audit, remind or re-judge. The pending turn
+    /// that the other approvals save already carries this buffer, which is why
+    /// they must not call this too (spec 66 §5.3, R13).
+    fn attach_step_evidence(
         &self,
         session: &Session,
         task: &Task,
         plan: &mut Option<TaskPlan>,
         step_evidence: &mut Vec<crate::plan::Evidence>,
-        plan_reminder_sent: bool,
-        stop_reason: &str,
-    ) -> Result<()> {
+    ) {
         let accrued = std::mem::take(step_evidence);
         let Some(current) = plan.as_mut() else {
-            return Ok(());
+            return;
         };
         if !accrued.is_empty()
             && let Some(open) = current
@@ -7514,6 +7520,25 @@ impl ChatOrchestrator {
                     .append_step_evidence(&session.id, &task.id, item);
             }
         }
+    }
+
+    /// Attaches the turn's accrued evidence, then audits the plan left open
+    /// (spec 66 §5.2, §5.3).
+    ///
+    /// Only a true end calls this.
+    fn settle_plan_at_turn_end(
+        &self,
+        session: &Session,
+        task: &Task,
+        plan: &mut Option<TaskPlan>,
+        step_evidence: &mut Vec<crate::plan::Evidence>,
+        plan_reminder_sent: bool,
+        stop_reason: &str,
+    ) -> Result<()> {
+        self.attach_step_evidence(session, task, plan, step_evidence);
+        let Some(current) = plan.as_mut() else {
+            return Ok(());
+        };
         let open_steps = current.open_steps().len();
         if open_steps > 0 {
             self.audit_log.record(
@@ -11679,6 +11704,19 @@ impl ChatOrchestrator {
             )?;
             if let Some(current) = plan.as_ref() {
                 sink.plan_finished(current);
+            }
+        } else if proposals.patch.is_some() {
+            // A patch proposal is the only pending approval that saves no
+            // paused turn: both stops that raise one — `propose_patch` and
+            // `edit_file` — break with a patch in `proposals`. The turn is
+            // pausing, so attach what it observed before the patch's own
+            // `PatchApplied` can land, and attach only: no audit, no reminder,
+            // no status change. Without this the failing command a repair turn
+            // ran just before proposing its fix is lost, and the step closes
+            // on evidence it never saw.
+            self.attach_step_evidence(&session, &task, &mut plan, &mut step_evidence);
+            if let Some(current) = plan.as_ref() {
+                sink.plan(current);
             }
         }
 
