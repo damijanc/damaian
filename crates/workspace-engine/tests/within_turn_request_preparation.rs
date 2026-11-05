@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1743,4 +1744,674 @@ fn a_reload_reconstructs_the_same_next_request_without_rewriting_the_transcript(
         Some(WithinTurnCompactionAttemptOutcome::Compacted),
         "the resumed request is compacted, not refused"
     );
+}
+
+/// An engine at the product's **default** `agent_max_turn_messages` (24).
+///
+/// R7 is specifically that safety pinning never ran at the default once the
+/// legacy count cut applied, so raising the limit here would hide the bug.
+/// The allowlisted `./check` lets a failing command run without its own
+/// approval pause, so one early round can carry a real failed result.
+fn default_limit_engine(data_dir: &Path, context_window: Option<u32>) -> WorkspaceEngine {
+    let mut config = Config {
+        data_dir: data_dir.to_path_buf(),
+        command_allowlist: vec!["./check".to_string()],
+        conversation_window_share: 10_000,
+        enable_index_watcher: false,
+        ..Config::default()
+    };
+    config
+        .model_providers
+        .push(native_tool_provider(context_window));
+    WorkspaceEngine::new(config)
+}
+
+/// Fifteen readable fixture files plus a command that fails with a marker.
+fn r7_fixture(repo: &Path) {
+    fs::write(
+        repo.join("check"),
+        "#!/bin/sh\necho R7-FAILED-COMMAND-OUTPUT\nexit 1\n",
+    )
+    .expect("the failing check should be written");
+    fs::set_permissions(repo.join("check"), std::fs::Permissions::from_mode(0o755))
+        .expect("the failing check should be executable");
+    for index in 0..15 {
+        fs::write(
+            repo.join(format!("r7_{index:02}.txt")),
+            format!("R7 READ {index:02} MARKER\n"),
+        )
+        .expect("the fixture file should be written");
+    }
+}
+
+/// A budgeted worker that makes one failing command call after plan approval,
+/// then fifteen unconnected reads, then answers. The extra rounds are what push
+/// the default 24-message window.
+fn long_worker_script() -> (Vec<String>, Vec<Vec<ToolCall>>) {
+    let mut responses = vec![
+        "Planning.".to_string(),
+        "Starting the work.".to_string(),
+        "Checking the fixture.".to_string(),
+    ];
+    let mut calls = vec![
+        vec![tool_call(
+            "plan",
+            "propose_plan",
+            r#"{"steps":[{"title":"Inspect the fixture set"},{"title":"Report the result"}]}"#,
+        )],
+        // The mutation is only what raises plan review; the deferred call is
+        // dropped and the resumed turn asks the model again.
+        vec![tool_call(
+            "review",
+            "propose_patch",
+            r#"{"summary":"review trigger","files":[{"path":"never.txt","content":"never\n"}]}"#,
+        )],
+        vec![tool_call(
+            "failed_command",
+            "run_command",
+            r#"{"command":"./check","reason":"Check the fixture"}"#,
+        )],
+    ];
+    for index in 0..15 {
+        responses.push(format!("Read {index}."));
+        calls.push(vec![read_call(
+            &format!("read_{index:02}"),
+            &format!("r7_{index:02}.txt"),
+        )]);
+    }
+    responses.push("Done.".to_string());
+    calls.push(Vec::new());
+    (responses, calls)
+}
+
+/// Runs the plan-review pause and approval shared by the R7 regressions.
+fn run_budgeted_worker(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    script: (Vec<String>, Vec<Vec<ToolCall>>),
+) -> (
+    MockModelAdapter,
+    ChatTurnResult,
+    workspace_engine::AgentPlanProposal,
+) {
+    let session = worker_session(engine, repo);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(script.0, script.1);
+    let (paused, _) = run_turn_for_session(
+        engine,
+        repo,
+        Some(&session.id),
+        "Inspect the fixture set.",
+        &mut adapter,
+    );
+    let paused = paused.expect("the worker should pause on its plan review");
+    let proposal = paused.plan_proposal.expect("the plan is reviewed");
+    let budget = proposal
+        .budget_review
+        .as_ref()
+        .expect("a worker review offers the task budget")
+        .budget;
+    let finished = approve_plan_with_budget(engine, &proposal, Some(&budget), &mut adapter);
+    (adapter, finished, proposal)
+}
+
+/// Every tool result in the selected request has the declaration it answers,
+/// and every declaration has its results. A cut by count must not split a
+/// round, even when some other round is pinned across it.
+fn assert_request_pairing(request: &ModelRequest, context: &str) {
+    let declared: BTreeSet<&str> = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.tool_calls)
+        .map(|call| call.id.as_str())
+        .collect();
+    for message in request
+        .messages
+        .iter()
+        .filter(|message| message.role == "tool")
+    {
+        let id = message
+            .tool_call_id
+            .as_deref()
+            .unwrap_or_else(|| panic!("{context}: a tool result has no call id"));
+        assert!(
+            declared.contains(id),
+            "{context}: `{id}` is an orphaned tool result"
+        );
+    }
+    for message in request
+        .messages
+        .iter()
+        .filter(|message| !message.tool_calls.is_empty())
+    {
+        for call in &message.tool_calls {
+            assert!(
+                request.messages.iter().any(|candidate| {
+                    candidate.role == "tool"
+                        && candidate.tool_call_id.as_deref() == Some(call.id.as_str())
+                }),
+                "{context}: `{}` has no tool result",
+                call.id
+            );
+        }
+    }
+}
+
+/// Runs R7's long scenario at the product default and returns the pieces each
+/// focused regression needs. The default limit is asserted here so a future
+/// config change cannot silently make these tests vacuous.
+fn long_worker_at_the_default_message_limit(
+    repo_name: &str,
+    context_window: Option<u32>,
+) -> (
+    WorkspaceEngine,
+    MockModelAdapter,
+    ChatTurnResult,
+    workspace_engine::AgentPlanProposal,
+) {
+    let repo = temp_repo(repo_name);
+    r7_fixture(&repo);
+    let engine = default_limit_engine(&repo.join(".damaian"), context_window);
+    assert_eq!(
+        engine.config.agent_max_turn_messages,
+        Config::default().agent_max_turn_messages,
+        "this regression must run at the product default, not a raised limit"
+    );
+    assert_eq!(
+        engine.config.agent_max_turn_messages, 24,
+        "the default this regression exists for changed; re-check the round count"
+    );
+    let (adapter, finished, proposal) = run_budgeted_worker(&engine, &repo, long_worker_script());
+    assert!(
+        adapter.requests.len() >= 17,
+        "the scenario must run at least 15 tool rounds after approval, got {} requests",
+        adapter.requests.len()
+    );
+    (engine, adapter, finished, proposal)
+}
+
+/// Asserts the exact reviewed plan and budget reach the final request once.
+fn assert_plan_approval_note(
+    adapter: &MockModelAdapter,
+    proposal: &workspace_engine::AgentPlanProposal,
+) {
+    let final_request = adapter
+        .requests
+        .last()
+        .expect("the resumed turn must call the model");
+    assert_request_pairing(final_request, "with the plan approval note");
+
+    // (a) The approved plan and all four budget values stay byte-identical.
+    let plan_lines = proposal
+        .plan
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| format!("{}. {}", index + 1, step.title))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let budget = proposal.budget_review.as_ref().unwrap().budget;
+    let expected_note = format!(
+        "The user reviewed the plan and approved it. The plan is now:\n{plan_lines}\nContinue with the current step. You were about to: {}.\n\n{}",
+        proposal.deferred_action,
+        budget.approval_note()
+    );
+    let notes: Vec<&ModelMessage> = final_request
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .starts_with("The user reviewed the plan and approved it.")
+        })
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "the plan-approval note must reach the final request exactly once"
+    );
+    assert_eq!(
+        notes[0].content, expected_note,
+        "the approved plan and budget must survive the legacy count cut byte for byte"
+    );
+}
+
+/// R7(a) at the product default: the legacy count cut used to drop the
+/// plan-approval note after about eleven tool rounds because safety pinning
+/// only ran after a window-threshold crossing.
+#[test]
+fn a_long_budgeted_worker_at_the_default_message_limit_keeps_the_plan_approval_note() {
+    let (_engine, adapter, _finished, proposal) =
+        long_worker_at_the_default_message_limit("r7-default-limit-plan-note", Some(1_000_000));
+    assert_plan_approval_note(&adapter, &proposal);
+}
+
+/// R7(a) also holds where no provider context window is configured: that was
+/// an even shorter path back to the legacy count cut.
+#[test]
+fn a_long_budgeted_worker_without_a_context_window_keeps_the_plan_approval_note() {
+    let (_engine, adapter, _finished, proposal) =
+        long_worker_at_the_default_message_limit("r7-default-limit-no-window", None);
+    assert_plan_approval_note(&adapter, &proposal);
+}
+
+/// R7(b): the failed command result from the first post-approval round is an
+/// early, non-read result, so the legacy count cut used to be free to drop it.
+#[test]
+fn a_long_budgeted_worker_at_the_default_message_limit_keeps_the_early_failed_command() {
+    let (_engine, adapter, _finished, _proposal) = long_worker_at_the_default_message_limit(
+        "r7-default-limit-failed-command",
+        Some(1_000_000),
+    );
+
+    let resumed = &adapter.requests[2..];
+    let final_request = resumed
+        .last()
+        .expect("the resumed turn must call the model");
+    assert_request_pairing(final_request, "with the early failed command");
+
+    let first_command = resumed
+        .iter()
+        .find_map(|request| tool_message(request, "failed_command"))
+        .expect("the failed command result must reach the model at least once");
+    let final_command = find_tool_message(final_request, "failed_command");
+    assert_eq!(
+        final_command.content, first_command.content,
+        "the early failed command result must stay byte-identical"
+    );
+    assert!(
+        final_command.content.contains("R7-FAILED-COMMAND-OUTPUT"),
+        "the failed command result is present but lost its output: {}",
+        final_command.content
+    );
+}
+
+/// R7(c)+(d): the latest result for the still-open step survives, while the
+/// pin set stays a safety allowance rather than removing the count bound.
+#[test]
+fn a_long_budgeted_worker_at_the_default_message_limit_keeps_the_open_step_result() {
+    let (engine, adapter, _finished, _proposal) =
+        long_worker_at_the_default_message_limit("r7-default-limit-open-step", Some(1_000_000));
+
+    let resumed = &adapter.requests[2..];
+    let final_request = resumed
+        .last()
+        .expect("the resumed turn must call the model");
+    assert_request_pairing(final_request, "with the open-step result");
+
+    // (c) The latest result for the still-open step stays too.
+    let first_last_read = resumed
+        .iter()
+        .find_map(|request| tool_message(request, "read_14"))
+        .expect("the newest read must reach the model");
+    let final_last_read = find_tool_message(final_request, "read_14");
+    assert_eq!(
+        final_last_read.content, first_last_read.content,
+        "the latest result for the open step must stay byte-identical"
+    );
+    assert!(
+        final_last_read.content.contains("R7 READ 14 MARKER"),
+        "the newest open-step read is present but not verbatim: {}",
+        final_last_read.content
+    );
+
+    // (d) Pinning is not unboundedness: early unpinned completed rounds are
+    // still cut by the message window.
+    let message_limit = engine.config.agent_max_turn_messages;
+    assert!(
+        final_request.messages.len() <= message_limit + 2,
+        "the request grew past the count bound plus the pinned blocks: {} > {}",
+        final_request.messages.len(),
+        message_limit + 2
+    );
+    assert!(
+        tool_message(final_request, "read_00").is_none(),
+        "the oldest unpinned completed round must still be cut"
+    );
+    let kept_reads = (0..15)
+        .filter(|index| tool_message(final_request, &format!("read_{index:02}")).is_some())
+        .count();
+    assert!(
+        kept_reads < 15,
+        "no unpinned round was cut, so the bound is not a bound"
+    );
+    assert!(kept_reads >= 1, "the newest unpinned round must remain");
+}
+
+/// The other half of R7: below the limit nothing changes. The same short turn
+/// at the default limit and at a limit that cannot cut it must produce the
+/// identical request.
+#[test]
+fn a_short_turn_is_byte_identical_at_the_default_message_limit() {
+    let repo = temp_repo("r7-short-turn");
+    r7_fixture(&repo);
+    let default_engine =
+        default_limit_engine(&repo.join(".damaian-default-limit"), Some(1_000_000));
+    let wide_engine =
+        engine_with_data_dir(&repo.join(".damaian-wide-limit"), Some(1_000_000), 1000);
+
+    let short_script = || {
+        (
+            vec![
+                "Planning.".to_string(),
+                "Starting.".to_string(),
+                "Read 0.".to_string(),
+                "Read 1.".to_string(),
+                "Read 2.".to_string(),
+                "Done.".to_string(),
+            ],
+            vec![
+                vec![tool_call(
+                    "plan",
+                    "propose_plan",
+                    r#"{"steps":[{"title":"Inspect the fixture set"},{"title":"Report the result"}]}"#,
+                )],
+                vec![tool_call(
+                    "review",
+                    "propose_patch",
+                    r#"{"summary":"review trigger","files":[{"path":"never.txt","content":"never\n"}]}"#,
+                )],
+                vec![read_call("read_00", "r7_00.txt")],
+                vec![read_call("read_01", "r7_01.txt")],
+                vec![read_call("read_02", "r7_02.txt")],
+                Vec::new(),
+            ],
+        )
+    };
+
+    let (default_adapter, default_result, _) =
+        run_budgeted_worker(&default_engine, &repo, short_script());
+    let (wide_adapter, wide_result, _) = run_budgeted_worker(&wide_engine, &repo, short_script());
+
+    let default_request = default_adapter.requests.last().expect("a default request");
+    let wide_request = wide_adapter.requests.last().expect("a wide request");
+    assert_eq!(
+        default_result.task.status, wide_result.task.status,
+        "the same short turn must settle the same way"
+    );
+    assert_eq!(
+        model_request_json(default_request),
+        model_request_json(wide_request),
+        "below the message limit the request must be byte-identical to the uncut one"
+    );
+    assert!(
+        !default_request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("elided")),
+        "a short turn must not gain an elision notice"
+    );
+    assert_request_pairing(default_request, "below the message limit");
+}
+
+/// A command-heavy fixture: `./check` succeeds and prints a line large enough
+/// that keeping every successful command result verbatim cannot fit a small
+/// but realistic context window, while the bounded selection can.
+fn command_heavy_fixture(repo: &Path, repeats: usize) {
+    let output = "R7-COMMAND-OUTPUT ".repeat(repeats);
+    fs::write(
+        repo.join("check"),
+        format!("#!/bin/sh\necho \"{output}\"\n"),
+    )
+    .expect("the command fixture should be written");
+    fs::set_permissions(repo.join("check"), std::fs::Permissions::from_mode(0o755))
+        .expect("the command fixture should be executable");
+}
+
+/// A budgeted worker that runs `commands_per_step` successful command rounds
+/// for each plan step and closes that step in the last of them. One command per
+/// model round, so the count and the action budget measure the same rounds.
+fn command_heavy_script(
+    steps: usize,
+    commands_per_step: usize,
+) -> (Vec<String>, Vec<Vec<ToolCall>>) {
+    let plan_steps: Vec<serde_json::Value> = (0..steps)
+        .map(|step| serde_json::json!({ "title": format!("Step {step}") }))
+        .collect();
+    let plan_json = serde_json::json!({ "steps": plan_steps }).to_string();
+    let mut responses = vec!["Planning.".to_string(), "Starting the work.".to_string()];
+    let mut calls = vec![
+        vec![tool_call("plan", "propose_plan", &plan_json)],
+        // The mutation only raises plan review; the deferred call is dropped
+        // and the resumed turn asks the model again.
+        vec![tool_call(
+            "review",
+            "propose_patch",
+            r#"{"summary":"review trigger","files":[{"path":"never.txt","content":"never\n"}]}"#,
+        )],
+    ];
+    for step in 0..steps {
+        for command in 0..commands_per_step {
+            responses.push(format!("Step {step}, command {command}."));
+            let mut round = vec![tool_call(
+                &format!("cmd_{step}_{command}"),
+                "run_command",
+                r#"{"command":"./check","reason":"Run the successful check"}"#,
+            )];
+            if command + 1 == commands_per_step {
+                round.push(tool_call(&format!("close_{step}"), "complete_step", "{}"));
+            }
+            calls.push(round);
+        }
+    }
+    responses.push("Done.".to_string());
+    calls.push(Vec::new());
+    (responses, calls)
+}
+
+/// A command that fails once, then succeeds on every later invocation.
+fn fail_then_succeed_fixture(repo: &Path) {
+    fs::write(
+        repo.join("check"),
+        "#!/bin/sh\nif [ -f .fixed ]; then echo R7-RESOLVED; exit 0; fi\n\
+         echo R7-UNRESOLVED-MARKER\ntouch .fixed\nexit 1\n",
+    )
+    .expect("the fail-then-succeed fixture should be written");
+    fs::set_permissions(repo.join("check"), std::fs::Permissions::from_mode(0o755))
+        .expect("the fail-then-succeed fixture should be executable");
+}
+
+/// R7 follow-up: a failed result is pinned only while it is unresolved. Once
+/// the same command succeeds, the old failure may leave the count window; it
+/// must not stay pinned forever.
+#[test]
+fn a_failed_command_stops_being_pinned_after_the_same_command_succeeds() {
+    let repo = temp_repo("r7-failed-then-resolved");
+    r7_fixture(&repo);
+    fail_then_succeed_fixture(&repo);
+    let engine = default_limit_engine(&repo.join(".damaian"), Some(1_000_000));
+
+    let mut responses = vec![
+        "Planning.".to_string(),
+        "Starting the work.".to_string(),
+        "Checking the fixture.".to_string(),
+    ];
+    let mut calls = vec![
+        vec![tool_call(
+            "plan",
+            "propose_plan",
+            r#"{"steps":[{"title":"Check the fixture"},{"title":"Report the result"}]}"#,
+        )],
+        vec![tool_call(
+            "review",
+            "propose_patch",
+            r#"{"summary":"review trigger","files":[{"path":"never.txt","content":"never\n"}]}"#,
+        )],
+        vec![tool_call(
+            "cmd_fail",
+            "run_command",
+            r#"{"command":"./check","reason":"Check the fixture"}"#,
+        )],
+    ];
+    for index in 0..10 {
+        responses.push(format!("Read {index}."));
+        calls.push(vec![read_call(
+            &format!("read_{index:02}"),
+            &format!("r7_{index:02}.txt"),
+        )]);
+    }
+    responses.push("Checking again.".to_string());
+    calls.push(vec![tool_call(
+        "cmd_success",
+        "run_command",
+        r#"{"command":"./check","reason":"Check the fixture again"}"#,
+    )]);
+    for index in 10..15 {
+        responses.push(format!("Read {index}."));
+        calls.push(vec![read_call(
+            &format!("read_{index:02}"),
+            &format!("r7_{index:02}.txt"),
+        )]);
+    }
+    responses.push("Done.".to_string());
+    calls.push(Vec::new());
+
+    let (adapter, _finished, _proposal) = run_budgeted_worker(&engine, &repo, (responses, calls));
+
+    let before_success = adapter
+        .requests
+        .iter()
+        .find(|request| {
+            request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Read 9."))
+        })
+        .expect("the request before the successful rerun must exist");
+    assert!(
+        tool_message(before_success, "cmd_fail").is_some(),
+        "an unresolved failure must survive the count cut"
+    );
+
+    let final_request = adapter
+        .requests
+        .last()
+        .expect("the resumed turn must call the model");
+    assert!(
+        tool_message(final_request, "cmd_fail").is_none(),
+        "once the same command succeeds, the old failure must stop being pinned"
+    );
+    assert!(
+        tool_message(final_request, "cmd_success").is_some(),
+        "the successful rerun is the newest completed round"
+    );
+    assert_request_pairing(final_request, "after resolving the failed command");
+}
+
+/// R7 follow-up: the pin set the legacy count cut now obeys must not keep every
+/// successful command forever. Forty successful command rounds across ten
+/// completed steps previously grew the request past the window and stopped the
+/// worker `CannotFit` — a new way to get stuck, which this work exists to remove.
+#[test]
+fn a_command_heavy_budgeted_worker_stays_bounded_at_the_default_message_limit() {
+    let repo = temp_repo("r7-command-heavy");
+    command_heavy_fixture(&repo, 60);
+    // A small but realistic window: keeping all 40 successful command results
+    // verbatim is about 12k tokens before fixed overhead, while the bounded
+    // selection is about 3k plus the approved plan note.
+    let engine = default_limit_engine(&repo.join(".damaian"), Some(8_000));
+    let (adapter, finished, _proposal) =
+        run_budgeted_worker(&engine, &repo, command_heavy_script(10, 4));
+
+    assert_ne!(
+        finished.task.status,
+        workspace_engine::TaskStatus::TaskCompactionCannotFit,
+        "the command-heavy worker must not stop because every command is pinned"
+    );
+    assert!(
+        finished.task_control.terminal_outcome.is_none(),
+        "the command-heavy worker must not settle a bounded stop: {:?}",
+        finished
+            .task_control
+            .terminal_outcome
+            .as_ref()
+            .map(|outcome| outcome.kind)
+    );
+    assert!(
+        adapter.requests.len() >= 40,
+        "the scenario must run 40 command rounds, got {} requests",
+        adapter.requests.len()
+    );
+
+    let final_request = adapter
+        .requests
+        .last()
+        .expect("the resumed turn must call the model");
+    assert_request_pairing(final_request, "with a command-heavy history");
+
+    // The bound is the 24-message count window (3 reserved for head/notices)
+    // plus the approved-plan user note and at most one generated warning block.
+    // It is deliberately much smaller than the pinned-every-command shape.
+    let message_limit = engine.config.agent_max_turn_messages;
+    assert!(
+        final_request.messages.len() <= message_limit + 3,
+        "the command-heavy request grew to {} messages, past the count bound plus \
+         requirement-6 state",
+        final_request.messages.len()
+    );
+    assert!(
+        tool_message(final_request, "cmd_0_0").is_none(),
+        "an old successful command round must be elided"
+    );
+    assert!(
+        tool_message(final_request, "cmd_9_3").is_some(),
+        "the newest completed round must remain"
+    );
+    assert!(
+        final_request.messages.iter().any(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .starts_with("The user reviewed the plan and approved it.")
+        }),
+        "the approved plan and budget must remain pinned"
+    );
+}
+
+/// R7 follow-up point 3: an unpinned, completed **non-read** round is compacted
+/// like any other eligible result. Before the pin set was narrowed every
+/// command was pinned, so the reducer never saw one and `CannotFit` was the
+/// only outcome once the window was small.
+#[test]
+fn an_unpinned_completed_command_round_is_elided_by_compaction() {
+    let repo = temp_repo("r7-command-compaction");
+    command_heavy_fixture(&repo, 150);
+    let engine = default_limit_engine(&repo.join(".damaian"), Some(8_000));
+    let (adapter, finished, _proposal) =
+        run_budgeted_worker(&engine, &repo, command_heavy_script(3, 4));
+
+    assert_ne!(
+        finished.task.status,
+        workspace_engine::TaskStatus::TaskCompactionCannotFit,
+        "an unpinned successful command must be reducible"
+    );
+
+    let attempts = engine
+        .session_store
+        .read_within_turn_compaction_attempts(&finished.session.id)
+        .expect("compaction attempts should read");
+    let compacted_command = attempts.iter().find_map(|attempt| {
+        attempt
+            .facts
+            .iter()
+            .find(|fact| fact.call_id.starts_with("cmd_"))
+            .map(|fact| (attempt, fact.call_id.clone()))
+    });
+    let (attempt, call_id) = compacted_command.expect(
+        "a successful, unpinned command must become a manifest rather than a permanent pin",
+    );
+    assert_eq!(
+        attempt.outcome,
+        WithinTurnCompactionAttemptOutcome::Compacted,
+        "the non-read reduction must be a successful compaction"
+    );
+
+    let reduced_request = adapter
+        .requests
+        .iter()
+        .find(|request| {
+            tool_message(request, &call_id).is_some_and(|message| is_manifest(&message.content))
+        })
+        .expect("the live request must send the command result as a manifest");
+    assert_request_pairing(reduced_request, "with a compacted command result");
 }
