@@ -16,7 +16,7 @@
 //! never become a repair target, because guessing that the task caused them is
 //! exactly the failure this specification exists to prevent.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -133,25 +133,34 @@ pub fn classify(
             Vec::new(),
         ),
         CheckBaseline::Failed {
-            fingerprint: baseline_fingerprint,
+            termination: baseline_termination,
             findings: baseline_findings,
             ..
         } => {
-            if &fingerprint == baseline_fingerprint {
-                // A previous *code* classification with the same fingerprint
+            // Compare the findings themselves, not the stored hash. That keeps
+            // a location shift from looking like a new failure and lets a
+            // baseline written with the previous fingerprint format classify
+            // from its durable evidence. Multiplicity is part of the
+            // comparison: one occurrence plus a new identical occurrence is a
+            // change even though the fingerprint's set is the same.
+            if result.termination == *baseline_termination
+                && same_findings(&result.findings, baseline_findings)
+            {
+                // A previous *code* classification with the same evidence
                 // means an earlier attempt already saw this failure. An
                 // unknown or environment record is not such a proof: now that
                 // a failed baseline exists, the first matching result is the
                 // pre-existing one.
                 let previous_matches = previous.is_some_and(|previous| {
-                    previous.fingerprint == fingerprint
-                        && matches!(
-                            previous.provenance,
-                            FailureProvenance::PreExisting
-                                | FailureProvenance::UnchangedFailure
-                                | FailureProvenance::Worsened
-                                | FailureProvenance::NewRegression
-                        )
+                    matches!(
+                        previous.provenance,
+                        FailureProvenance::PreExisting
+                            | FailureProvenance::UnchangedFailure
+                            | FailureProvenance::Worsened
+                            | FailureProvenance::NewRegression
+                    ) && (previous.fingerprint == fingerprint
+                        || (previous.termination == result.termination
+                            && same_findings(&previous.findings, &result.findings)))
                 });
                 let provenance = if previous_matches {
                     FailureProvenance::UnchangedFailure
@@ -195,23 +204,75 @@ fn classification(
     }
 }
 
-/// Evidence present now that the baseline did not have, de-duplicated in the
-/// fingerprint's canonical order.
+/// Whether two results contain the same findings with the same multiplicity.
+///
+/// The comparison key excludes line and column (spec 102 R5), so a finding that
+/// moved because the patch added lines above it is still the same finding.
+fn same_findings(current: &[FindingEvidence], baseline: &[FindingEvidence]) -> bool {
+    counts(current) == counts(baseline)
+}
+
+fn counts(findings: &[FindingEvidence]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for finding in findings {
+        *counts.entry(finding.canonical_key()).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Evidence present now that the baseline did not have.
+///
+/// Multiplicity matters: if the baseline had one occurrence and the result has
+/// two identical ones, exactly one occurrence is introduced. Occurrences that
+/// still sit at the same location are matched first, so the repaired finding is
+/// the one that actually moved or multiplied rather than an unchanged twin.
+///
+/// Only errors can be introduced repair evidence. A new warning or info line on
+/// a check that already failed is visible in the report but does not make the
+/// result `worsened` and is never handed to automatic repair.
 fn introduced_findings(
     current: &[FindingEvidence],
     baseline: &[FindingEvidence],
 ) -> Vec<FindingEvidence> {
-    let existing = baseline
-        .iter()
-        .map(FindingEvidence::canonical_key)
-        .collect::<BTreeSet<_>>();
-    let mut seen = BTreeSet::new();
+    let mut baseline_by_key = counts(baseline);
+    let mut baseline_by_location = BTreeMap::<String, usize>::new();
+    for finding in baseline {
+        *baseline_by_location
+            .entry(finding.location_key())
+            .or_insert(0) += 1;
+    }
+
+    let mut matched = vec![false; current.len()];
+    for (index, finding) in current.iter().enumerate() {
+        let location = finding.location_key();
+        if let Some(remaining) = baseline_by_location.get_mut(&location)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            matched[index] = true;
+            if let Some(remaining) = baseline_by_key.get_mut(&finding.canonical_key()) {
+                *remaining -= 1;
+            }
+        }
+    }
+    for (index, finding) in current.iter().enumerate() {
+        if matched[index] {
+            continue;
+        }
+        if let Some(remaining) = baseline_by_key.get_mut(&finding.canonical_key())
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            matched[index] = true;
+        }
+    }
+
     current
         .iter()
-        .filter(|evidence| {
-            let key = evidence.canonical_key();
-            !existing.contains(&key) && seen.insert(key)
-        })
+        .enumerate()
+        .filter(|(index, _)| !matched[*index])
+        .map(|(_, finding)| finding)
+        .filter(|finding| finding.severity() == Severity::Error)
         .cloned()
         .collect()
 }

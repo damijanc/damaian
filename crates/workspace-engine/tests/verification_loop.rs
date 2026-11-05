@@ -1599,6 +1599,49 @@ fn applied_change(
     applied_change_with_baselines(engine, root, files, true)
 }
 
+/// Apply a change and keep the baseline the real pre-apply path recorded,
+/// approving a baseline that needs its own decision instead of overwriting it
+/// with a fixture value. A failed baseline therefore carries the real findings
+/// and line numbers the check reported before the patch.
+fn applied_change_keeping_baseline(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    files: &[(&str, &str, &str)],
+) -> (String, String) {
+    for (path, before, _) in files {
+        write(root, path, before);
+    }
+    let changes: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, _, after)| (*path, *after))
+        .collect();
+    let proposal = propose(engine, root, &edit_response(&changes));
+    let mut outcome = engine
+        .edit_orchestrator
+        .apply_stored_patch_with_baseline(root, &proposal.patch.id, None, None, "tester", false)
+        .expect("the patch should apply");
+    while let workspace_engine::PatchApplyOutcome::BaselineRequired(batch) = outcome {
+        let decisions = batch
+            .checks
+            .iter()
+            .map(|check| (check.proposal_id.clone(), true))
+            .collect::<Vec<_>>();
+        engine
+            .edit_orchestrator
+            .resume_stored_patch_baseline(root, &batch.id, &decisions, &[], "tester")
+            .expect("the baseline decisions should record");
+        outcome = engine
+            .edit_orchestrator
+            .apply_stored_patch_with_baseline(root, &proposal.patch.id, None, None, "tester", false)
+            .expect("the patch should apply");
+    }
+    assert!(matches!(
+        outcome,
+        workspace_engine::PatchApplyOutcome::Applied(_)
+    ));
+    (proposal.session.id, proposal.task.id)
+}
+
 /// The same fixture with a declined baseline for every check. The approval
 /// path records the same `Declined` baseline when the user skips the baseline
 /// card; this writes it directly so the test stays about Task 3's
@@ -3000,6 +3043,92 @@ fn a_repeated_ineffective_repair_stalls_before_the_numeric_limit() {
     let _ = fs::remove_dir_all(&data_dir);
 }
 
+/// R5 (spec 102): an ineffective repair that only moves the failing line is
+/// still the same failure. The second attempt stops as `repeated_failure`
+/// instead of spending the remaining attempts because the fingerprint used to
+/// include the location.
+#[test]
+fn a_repair_that_only_moves_the_failing_line_stalls_as_repeated_failure() {
+    let root = temp_dir("repair-stall-shift");
+    let data_dir = temp_dir("repair-stall-shift-data");
+    cargofile(&root);
+    let shell = shifting_line_shell(&root);
+    let engine = verify_engine_with_retry(
+        &root,
+        &data_dir,
+        &shell.to_string_lossy(),
+        &["cargo test"],
+        &[],
+        16,
+    );
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 1;\nbroken();\n")],
+    );
+
+    // Attempt 0 fails at line 2 and proposes a repair that inserts a line
+    // above the failure, moving it to line 3.
+    let mut first_repair = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call(
+            "src/a.rs",
+            "// pad\nlet a = 1;\nbroken();\n",
+        )]],
+    );
+    let first = run_verification(&engine, &root, &session, &mut first_repair);
+    let patch = first
+        .patch_proposal
+        .as_ref()
+        .expect("the first attempt is progress and asks for a repair");
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.patch_id, None, None, "tester", false)
+        .expect("the first repair applies");
+
+    // Attempt 1 fails at line 3 with the same error, and the model proposes
+    // another patch that only moves the line again. That is a repeated
+    // failure, not progress.
+    let mut repeated = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![patch_call(
+            "src/a.rs",
+            "// pad\n// pad\nlet a = 1;\nbroken();\n",
+        )]],
+    );
+    let stalled = run_verification(&engine, &root, &session, &mut repeated);
+
+    assert!(
+        stalled.patch_proposal.is_none(),
+        "a stalled repair must not expose its line-moving patch"
+    );
+    let report = stalled
+        .verification_report
+        .as_ref()
+        .expect("the stall is a terminal report");
+    assert_eq!(report.outcome, Some(VerificationOutcome::RepairStalled));
+    assert_eq!(
+        report.repair_stall.as_ref().map(|stall| stall.reason),
+        Some(RepairStallReason::RepeatedFailure)
+    );
+    assert!(report.repair_targets.is_empty());
+    assert_eq!(report.repair_request(), None);
+    assert_eq!(stalled.task.status, TaskStatus::Failed);
+    assert!(
+        stalled.response.contains("Repair stalled"),
+        "{}",
+        stalled.response
+    );
+    assert_eq!(
+        started_attempts(&outcome_events(&engine, &session)),
+        vec![0, 1],
+        "a line shift is not a new failure and does not spend the numeric limit"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
 #[test]
 fn a_worker_stops_on_the_same_typed_repair_stall() {
     let root = temp_dir("repair-stall-worker");
@@ -3131,6 +3260,25 @@ fn progress_shell(root: &std::path::Path) -> PathBuf {
     fs::write(
         &path,
         "#!/bin/sh\nvalue=$(cat src/a.rs 2>/dev/null | tr -d '\\n')\necho \"error: value $value is wrong\" >&2\necho ' --> src/a.rs:1:1' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+/// A shell that emits the same compiler error from whatever line holds
+/// `broken()` in `src/a.rs`, and passes when there is no such line. Inserting
+/// a line above the failure moves the reported location without changing the
+/// error's identity.
+fn shifting_line_shell(root: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("bin").join("shifting-line-check.sh");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        "#!/bin/sh\nline=$(grep -n 'broken()' src/a.rs 2>/dev/null | head -n 1 | cut -d: -f1)\nif [ -z \"$line\" ]; then\n  exit 0\nfi\necho 'error[E0308]: mismatched types' >&2\necho \" --> src/a.rs:${line}:1\" >&2\nexit 1\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -4777,6 +4925,81 @@ fn a_matching_failed_baseline_is_pre_existing_and_starts_no_repair() {
     assert!(report.repair_targets.is_empty());
     let group = provenance_group(report, FailureProvenance::PreExisting)
         .expect("the matching failed baseline is pre-existing");
+    assert_eq!(group.checks.len(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// R5 (spec 102): a pre-existing failure whose line moved because the patch
+/// added lines above it is still the same failure. Finding location is not part
+/// of provenance identity, so no repair turn starts.
+#[test]
+fn a_pre_existing_error_that_shifts_lines_stays_pre_existing() {
+    let root = temp_dir("pre-existing-shift");
+    let data_dir = temp_dir("pre-existing-shift-data");
+    cargofile(&root);
+    let shell = shifting_line_shell(&root);
+    let engine = verify_engine_with_retry(
+        &root,
+        &data_dir,
+        &shell.to_string_lossy(),
+        &["cargo test"],
+        &[],
+        2,
+    );
+    let (session, _task) = applied_change_keeping_baseline(
+        &engine,
+        &root,
+        &[(
+            "src/a.rs",
+            "let first = 1;\nlet second = 2;\nlet third = 3;\nbroken();\n",
+            "// added one\n// added two\n// added three\nlet first = 1;\nlet second = 2;\nlet third = 3;\nbroken();\n",
+        )],
+    );
+
+    let mut adapter = MockModelAdapter::new("unused");
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    // Prove the line really moved: the real pre-patch baseline failed at line
+    // 4 and the post-patch result reports line 7.
+    let state = fold_verification(outcome_events(&engine, &session).iter());
+    let baseline_line = state
+        .baselines
+        .values()
+        .find_map(|baseline| match baseline {
+            CheckBaseline::Failed { findings, .. } => {
+                findings.first().and_then(|finding| finding.start_line())
+            }
+            _ => None,
+        })
+        .expect("the pre-apply baseline ran and failed");
+    let current_line = state
+        .provenance
+        .values()
+        .find_map(|record| {
+            record
+                .findings
+                .first()
+                .and_then(|finding| finding.start_line())
+        })
+        .expect("the post-patch result recorded its findings");
+    assert_eq!(baseline_line, 4);
+    assert_eq!(current_line, 7);
+
+    let report = result
+        .verification_report
+        .as_ref()
+        .expect("a pre-existing failure still reports");
+    assert_eq!(report.outcome, Some(VerificationOutcome::Failed));
+    assert!(result.patch_proposal.is_none());
+    assert!(
+        adapter.requests.is_empty(),
+        "a shifted pre-existing failure must never start a code repair"
+    );
+    assert!(report.repair_targets.is_empty());
+    let group = provenance_group(report, FailureProvenance::PreExisting)
+        .expect("a shifted line is still the same pre-existing failure");
     assert_eq!(group.checks.len(), 1);
 
     let _ = fs::remove_dir_all(&root);

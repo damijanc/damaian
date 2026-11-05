@@ -67,16 +67,82 @@ fn fingerprint_is_order_and_duplicate_insensitive() {
 }
 
 #[test]
-fn fingerprint_changes_with_material_evidence() {
+fn fingerprint_changes_with_material_evidence_but_not_location() {
     let original = evidence("mismatched types", Some("src/a.rs"), Some(8));
     let different_summary = evidence("missing field", Some("src/a.rs"), Some(8));
-    let different_location = evidence("mismatched types", Some("src/a.rs"), Some(9));
+    let shifted_location = evidence("mismatched types", Some("src/a.rs"), Some(11));
+    let shifted_column = FindingEvidence::from_finding(&Finding::new(
+        FindingDraft {
+            source: FindingSource::Test,
+            severity: Severity::Error,
+            summary: "mismatched types".to_string(),
+            details: Some("raw output that must not be fingerprinted".to_string()),
+            range: Some(SourceRange {
+                path: "src/a.rs".to_string(),
+                start_line: 8,
+                start_column: Some(19),
+                end_line: None,
+                end_column: None,
+            }),
+            code: Some("E0308".to_string()),
+        },
+        &SecretScanner::default(),
+    ));
     let different_path = evidence("mismatched types", Some("src/b.rs"), Some(8));
 
     let base = fingerprint(std::slice::from_ref(&original), &exited(1));
     assert_ne!(base, fingerprint(&[different_summary], &exited(1)));
-    assert_ne!(base, fingerprint(&[different_location], &exited(1)));
     assert_ne!(base, fingerprint(&[different_path], &exited(1)));
+    assert_eq!(
+        base,
+        fingerprint(&[shifted_location], &exited(1)),
+        "a patch that adds lines above a finding does not create a new failure"
+    );
+    assert_eq!(
+        base,
+        fingerprint(&[shifted_column], &exited(1)),
+        "a moved column is not a new failure"
+    );
+}
+
+#[test]
+fn fingerprint_uses_code_and_severity_but_not_location() {
+    fn draft(code: &str, severity: Severity, line: u32) -> FindingEvidence {
+        let finding = Finding::new(
+            FindingDraft {
+                source: FindingSource::Compiler,
+                severity,
+                summary: "mismatched types".to_string(),
+                details: None,
+                range: Some(SourceRange {
+                    path: "src/a.rs".to_string(),
+                    start_line: line,
+                    start_column: Some(1),
+                    end_line: None,
+                    end_column: None,
+                }),
+                code: Some(code.to_string()),
+            },
+            &SecretScanner::default(),
+        );
+        FindingEvidence::from_finding(&finding)
+    }
+
+    let base = fingerprint(&[draft("E0308", Severity::Error, 8)], &exited(1));
+    assert_eq!(
+        base,
+        fingerprint(&[draft("E0308", Severity::Error, 40)], &exited(1))
+    );
+    assert_ne!(
+        base,
+        fingerprint(&[draft("E0425", Severity::Error, 8)], &exited(1)),
+        "a different code is different evidence"
+    );
+    assert_ne!(
+        base,
+        fingerprint(&[draft("E0308", Severity::Warning, 8)], &exited(1)),
+        "severity is part of the comparison key"
+    );
 }
 
 #[test]
@@ -355,6 +421,36 @@ fn historical_verification_events_replay_without_inventing_provenance() {
     assert!(state.baselines.is_empty());
     assert!(state.provenance.is_empty());
     assert!(state.repair_history.is_empty());
+}
+
+#[test]
+fn a_legacy_fingerprint_value_still_loads_from_a_baseline_event() {
+    let found = evidence("mismatched types", Some("src/a.rs"), Some(8));
+    let event = VerificationEvent::Baseline {
+        task_id: "task".to_string(),
+        check: check(),
+        baseline: CheckBaseline::Failed {
+            termination: exited(1),
+            fingerprint: serde_json::from_value(json!("sha256:legacy-v1")).unwrap(),
+            findings: vec![found],
+        },
+    };
+
+    let encoded = serde_json::to_value(&event).unwrap();
+    assert_eq!(
+        encoded["baseline"]["fingerprint"], "sha256:legacy-v1",
+        "a stored version 1 value is still loadable as an opaque fingerprint"
+    );
+    let decoded: VerificationEvent = serde_json::from_value(encoded).unwrap();
+    let state = fold_verification([decoded].iter());
+    assert_eq!(
+        state
+            .baselines
+            .get(&check())
+            .and_then(CheckBaseline::failure_fingerprint)
+            .map(FailureFingerprint::as_str),
+        Some("sha256:legacy-v1")
+    );
 }
 
 #[test]

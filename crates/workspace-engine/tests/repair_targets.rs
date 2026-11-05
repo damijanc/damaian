@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use serde_json::json;
 use workspace_engine::finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange};
 use workspace_engine::plan::TaskPlan;
 use workspace_engine::{
@@ -23,11 +24,17 @@ fn exited(code: i32) -> CheckTermination {
     CheckTermination::Exited { exit_code: code }
 }
 
-fn evidence(summary: &str, path: &str, line: u32) -> FindingEvidence {
+fn evidence_with(
+    severity: Severity,
+    code: &str,
+    summary: &str,
+    path: &str,
+    line: u32,
+) -> FindingEvidence {
     let finding = Finding::new(
         FindingDraft {
             source: FindingSource::Compiler,
-            severity: Severity::Error,
+            severity,
             summary: summary.to_string(),
             details: None,
             range: Some(SourceRange {
@@ -37,11 +44,15 @@ fn evidence(summary: &str, path: &str, line: u32) -> FindingEvidence {
                 end_line: None,
                 end_column: None,
             }),
-            code: Some("E0308".to_string()),
+            code: Some(code.to_string()),
         },
         &SecretScanner::new(Vec::new()),
     );
     FindingEvidence::from_finding(&finding)
+}
+
+fn evidence(summary: &str, path: &str, line: u32) -> FindingEvidence {
+    evidence_with(Severity::Error, "E0308", summary, path, line)
 }
 
 fn failed_baseline(
@@ -104,6 +115,176 @@ fn a_matching_failed_baseline_is_pre_existing_and_has_no_repair_target() {
     assert!(!classification.repair_eligible());
     assert!(classification.introduced.is_empty());
     assert!(repair_targets(&[entry(&classification)]).is_empty());
+}
+
+/// R5 (spec 102): the patch added lines above an existing error, so its line
+/// moved. Same source, severity, code, path and summary is the same failure.
+#[test]
+fn a_pre_existing_error_that_shifts_lines_is_still_pre_existing() {
+    let check = check("", "cargo test");
+    let before = evidence("mismatched types", "src/a.rs", 4);
+    let after = evidence("mismatched types", "src/a.rs", 7);
+    let baseline = failed_baseline(&check, exited(1), std::slice::from_ref(&before));
+    let result = PostPatchResult::new(check, exited(1), vec![after]);
+
+    let classification = classify(&result, Some(&baseline), None);
+
+    assert_eq!(classification.provenance, FailureProvenance::PreExisting);
+    assert!(!classification.repair_eligible());
+    assert!(classification.introduced.is_empty());
+    assert!(repair_targets(&[entry(&classification)]).is_empty());
+}
+
+/// R5 guard: the comparison key still includes the normalized path. A new
+/// failure with the same code and summary in another file was introduced.
+#[test]
+fn a_new_identical_error_in_a_different_file_is_introduced() {
+    let check = check("", "cargo test");
+    let old = evidence("mismatched types", "src/a.rs", 4);
+    let new = evidence("mismatched types", "src/b.rs", 4);
+    let baseline = failed_baseline(&check, exited(1), std::slice::from_ref(&old));
+    let result = PostPatchResult::new(check, exited(1), vec![old, new.clone()]);
+
+    let classification = classify(&result, Some(&baseline), None);
+
+    assert_eq!(classification.provenance, FailureProvenance::Worsened);
+    assert_eq!(classification.introduced, vec![new.clone()]);
+    let targets = repair_targets(&[entry(&classification)]);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].evidence, vec![new]);
+}
+
+/// R5 guard: a second, genuinely different error in the same file is still
+/// introduced. Both a different summary under the same code and a different
+/// code must count.
+#[test]
+fn a_second_different_error_in_the_same_file_is_introduced() {
+    let check = check("", "cargo test");
+    let old = evidence("mismatched types", "src/a.rs", 4);
+    let different_summary = evidence("cannot find value `x`", "src/a.rs", 9);
+    let different_code =
+        evidence_with(Severity::Error, "E0425", "mismatched types", "src/a.rs", 12);
+    let baseline = failed_baseline(&check, exited(1), std::slice::from_ref(&old));
+    let result = PostPatchResult::new(
+        check,
+        exited(1),
+        vec![old, different_summary.clone(), different_code.clone()],
+    );
+
+    let classification = classify(&result, Some(&baseline), None);
+
+    assert_eq!(classification.provenance, FailureProvenance::Worsened);
+    assert_eq!(
+        classification.introduced,
+        vec![different_summary, different_code],
+        "a different summary or code is new evidence"
+    );
+}
+
+/// R5 decision (spec 102): a check that already failed is not made worse by a
+/// new warning. Warnings remain in the full report but never become a repair
+/// target, so the result is an unchanged failure rather than `worsened`.
+#[test]
+fn a_new_warning_on_a_failed_baseline_is_not_worsened_or_a_repair_target() {
+    let check = check("", "cargo test");
+    let old = evidence("mismatched types", "src/a.rs", 4);
+    let warning = evidence_with(
+        Severity::Warning,
+        "unused_variables",
+        "unused variable `x`",
+        "src/a.rs",
+        9,
+    );
+    let baseline = failed_baseline(&check, exited(1), std::slice::from_ref(&old));
+    let result = PostPatchResult::new(check, exited(1), vec![old, warning.clone()]);
+
+    let classification = classify(&result, Some(&baseline), None);
+
+    assert_eq!(
+        classification.provenance,
+        FailureProvenance::UnchangedFailure
+    );
+    assert!(!classification.repair_eligible());
+    assert!(classification.introduced.is_empty());
+    assert!(
+        classification.findings.contains(&warning),
+        "the report still shows the warning"
+    );
+    assert!(repair_targets(&[entry(&classification)]).is_empty());
+}
+
+/// R5 duplicate accounting: one pre-existing occurrence plus one newly
+/// introduced identical occurrence (same path/code/summary at another line) is
+/// exactly one introduced finding, not zero and not two.
+#[test]
+fn an_extra_identical_occurrence_beyond_the_baseline_is_introduced() {
+    let check = check("", "cargo test");
+    let old = evidence("mismatched types", "src/a.rs", 4);
+    let duplicate = evidence("mismatched types", "src/a.rs", 40);
+    let baseline = failed_baseline(&check, exited(1), std::slice::from_ref(&old));
+    let result = PostPatchResult::new(check, exited(1), vec![old.clone(), duplicate.clone()]);
+
+    let classification = classify(&result, Some(&baseline), None);
+
+    assert_eq!(classification.provenance, FailureProvenance::Worsened);
+    assert_eq!(
+        classification.introduced,
+        vec![duplicate],
+        "the occurrence that already existed is not a repair target"
+    );
+    assert_eq!(
+        repair_targets(&[entry(&classification)])[0].evidence.len(),
+        1
+    );
+}
+
+/// R5 duplicate accounting: if every occurrence moved but the count did not
+/// grow, nothing was introduced.
+#[test]
+fn shifted_duplicates_that_do_not_grow_the_count_are_not_introduced() {
+    let check = check("", "cargo test");
+    let baseline_findings = vec![
+        evidence("mismatched types", "src/a.rs", 4),
+        evidence("mismatched types", "src/a.rs", 40),
+    ];
+    let baseline = failed_baseline(&check, exited(1), &baseline_findings);
+    let result = PostPatchResult::new(
+        check,
+        exited(1),
+        vec![
+            evidence("mismatched types", "src/a.rs", 7),
+            evidence("mismatched types", "src/a.rs", 43),
+        ],
+    );
+
+    let classification = classify(&result, Some(&baseline), None);
+
+    assert_eq!(classification.provenance, FailureProvenance::PreExisting);
+    assert!(classification.introduced.is_empty());
+}
+
+/// R5 compatibility: a baseline written with the previous fingerprint format
+/// still classifies from its durable findings. The stored hash cannot be
+/// recomputed, but the findings can be compared.
+#[test]
+fn a_baseline_written_with_a_v1_fingerprint_still_classifies_by_its_findings() {
+    let check = check("", "cargo test");
+    let before = evidence("mismatched types", "src/a.rs", 4);
+    let baseline = CheckBaseline::Failed {
+        termination: exited(1),
+        fingerprint: serde_json::from_value(json!("sha256:legacy-v1")).unwrap(),
+        findings: vec![before],
+    };
+    let result = PostPatchResult::new(
+        check,
+        exited(1),
+        vec![evidence("mismatched types", "src/a.rs", 7)],
+    );
+
+    let classification = classify(&result, Some(&baseline), None);
+
+    assert_eq!(classification.provenance, FailureProvenance::PreExisting);
+    assert!(classification.introduced.is_empty());
 }
 
 #[test]

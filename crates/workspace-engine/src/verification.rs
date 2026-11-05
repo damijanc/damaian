@@ -349,11 +349,29 @@ impl FindingEvidence {
         &self.summary
     }
 
-    /// Used only to sort and de-duplicate evidence before hashing, and by the
-    /// provenance classifier to compute a stable introduced delta. JSON is an
-    /// unambiguous encoding of every field, and the same evidence always
-    /// produces the same key.
+    /// The stable comparison key for provenance and stagnation (spec 102).
+    ///
+    /// It deliberately omits `start_line` and `start_column`: a patch that
+    /// adds or removes lines above a finding moves its location without
+    /// creating a new failure. The location stays on the evidence, so the
+    /// report and the repair request still show it. Checks that genuinely
+    /// differ in source, severity, code, normalised path or normalised summary
+    /// still produce different keys.
     pub(crate) fn canonical_key(&self) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "source": self.source,
+            "severity": self.severity,
+            "code": self.code,
+            "path": self.path,
+            "summary": self.summary,
+        }))
+        .expect("finding evidence is serializable")
+    }
+
+    /// The location-inclusive key. It is used only to recognise the occurrence
+    /// that stayed put when the same finding also moved or multiplied, so the
+    /// newly introduced occurrence is the one reported to repair.
+    pub(crate) fn location_key(&self) -> String {
         serde_json::to_string(self).expect("finding evidence is serializable")
     }
 }
@@ -364,9 +382,18 @@ impl FindingEvidence {
 /// [`CheckTermination`]. Raw output, secrets, marker ids, timestamps and
 /// machine-local paths are not inputs, so an equivalent result produces the
 /// same value regardless of the order the findings arrived in.
+///
+/// Version 2 excludes a finding's line and column from the hashed comparison
+/// key. Version 1 values remain loadable as opaque strings; a stored baseline
+/// or provenance record still classifies from its own durable findings, while a
+/// version 1 repair-history entry cannot be re-derived and simply does not
+/// compare equal to a version 2 value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct FailureFingerprint(String);
+
+/// The canonical fingerprint schema version written by [`FailureFingerprint::compute`].
+pub const FAILURE_FINGERPRINT_VERSION: u32 = 2;
 
 impl FailureFingerprint {
     /// The canonical fingerprint of one failed check result.
@@ -375,11 +402,16 @@ impl FailureFingerprint {
         findings: &[FindingEvidence],
         termination: &CheckTermination,
     ) -> Self {
-        let mut canonical_findings = findings.to_vec();
-        canonical_findings.sort_by_key(FindingEvidence::canonical_key);
-        canonical_findings.dedup_by(|a, b| a.canonical_key() == b.canonical_key());
+        // Set semantics: a duplicate report of the same finding is not a new
+        // failure. Provenance separately compares multiplicity, so one
+        // pre-existing occurrence plus a newly introduced identical occurrence
+        // is still a new repair target.
+        let canonical_findings = findings
+            .iter()
+            .map(FindingEvidence::canonical_key)
+            .collect::<BTreeSet<_>>();
         let canonical = serde_json::json!({
-            "version": 1,
+            "version": FAILURE_FINGERPRINT_VERSION,
             "check": {
                 "workingDirectory": normalized_repository_path(&check.working_directory),
                 "command": check.command,
@@ -422,7 +454,7 @@ impl FailureFingerprint {
             })
             .collect::<Vec<_>>();
         let canonical = serde_json::json!({
-            "version": 1,
+            "version": FAILURE_FINGERPRINT_VERSION,
             "failures": failures,
         });
         let bytes = serde_json::to_vec(&canonical).expect("fingerprint input is serializable");

@@ -33,12 +33,19 @@ provenance, scope and stagnation checks increase the damage window.
    does not approve a baseline check, and declining the baseline does not
    decline the patch.
 3. Every check result has a stable failure fingerprint derived from check
-   identity, normalized findings and termination kind. Raw output and secrets
-   are not part of the fingerprint.
+   identity, normalized findings and termination kind. A finding's comparison
+   key is its source, severity, code, normalized path and normalized summary;
+   line and column are excluded, so an edit above a finding does not create a
+   new identity. The location stays in the evidence shown to the model and the
+   user. The fingerprint has set semantics, but provenance compares findings as
+   a multiset, so a new identical occurrence is not hidden by an existing one.
+   Raw output and secrets are not part of the fingerprint.
 4. Post-patch comparison classifies a result as `new_regression`,
    `pre_existing`, `worsened`, `unchanged_failure`, `environment_failure` or
    `unknown_provenance`. Only `new_regression` and the new portion of
-   `worsened` enter automatic repair.
+   `worsened` enter automatic repair. A new warning or informational finding on
+   a check that already failed is reported but does not make it `worsened` and
+   never becomes a repair target.
 5. Spawn failures, missing executables, policy refusals and unavailable test
    infrastructure are environment failures. They are reported with an action
    for the user; they are never given to a code-repair turn.
@@ -85,6 +92,20 @@ repair results. It maintains a bounded history of `(failure_fingerprint,
 patch_digest, task_diff_digest)`. Two identical consecutive states or an
 alternating state within that window settles `repair_stalled`; it does not
 spend the remaining attempts.
+
+The finding comparison key excludes `start_line` and `start_column`; those
+fields stay on the evidence rendered to the model and in the report, but they
+are not identity. Provenance compares findings as a multiset: one pre-existing
+occurrence plus one newly introduced identical occurrence is exactly one new
+finding, while two occurrences that both moved without growing the count are
+unchanged. Introduced repair evidence is restricted to errors, so a new warning
+on an already failing check is visible without marking the result `worsened`.
+Failure fingerprints are versioned: version 2 hashes the location-free
+comparison key. A stored version 1 baseline or provenance record remains
+loadable and still classifies from its durable findings; a version 1
+repair-history entry remains loadable but does not compare equal to a version 2
+value, so the first attempt after an upgrade starts a fresh stagnation window
+and the numeric limit still bounds repair.
 
 ## 5. Acceptance
 
@@ -226,23 +247,23 @@ marks the spec Done. Workspace-wide Clippy and tests remain for CI.
 |---|---|---|---|
 | 1 | Baseline a selected check before the first patch that selects it applies. | `workspace-engine/src/baseline.rs` (`BaselineCoordinator::prepare`) runs from `EditOrchestrator::apply_stored_patch_with_baseline` after the protected-path/mode refusals and before hooks, the action marker, the checkpoint and every write. A later patch baselines a newly selected check first. | `repair_baseline`: `a_safe_check_runs_as_a_passing_baseline_before_the_patch_writes`, `a_check_selected_by_a_later_patch_is_baselined_before_it_applies`, `a_partial_selection_baselines_only_the_roots_it_selects`, `a_partial_hunk_apply_still_passes_the_baseline_gate`, `a_fresh_engine_reuses_the_durable_baseline_without_running_it_again`, `a_worker_session_baseline_replays_after_the_worker_restarts`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_environment_failure`. |
 | 2 | Baseline commands keep ordinary approval; patch approval does not approve them, and declining a baseline does not decline the patch. | `baseline.rs` pauses on a `BaselineBatch` and validates every resume decision before running or granting anything; `PatchApplyOutcome::BaselineRequired` is returned instead of an error, and the patch can then apply. | `repair_baseline`: `a_declined_baseline_does_not_decline_the_patch`, `an_approved_baseline_runs_and_the_patch_applies_afterwards`, `malformed_resume_decisions_have_no_side_effects`, `always_grants_must_belong_to_the_pending_batch_and_be_approved_and_eligible`. Eval: `verification_declined_baseline`. |
-| 3 | A stable failure fingerprint from check identity, normalized findings and termination; no raw output or secrets. | `FailureFingerprint::compute` and `FindingEvidence::from_finding` in `verification.rs` canonicalise the `CheckId`, sorted de-duplicated redacted evidence and termination. Transient ids, timestamps, origin refs, details, machine-local absolute paths and raw output are excluded. | `repair_provenance`: `fingerprint_is_order_and_duplicate_insensitive`, `fingerprint_changes_with_material_evidence`, `fingerprint_changes_with_termination_and_check_identity`, `fingerprint_ignores_transient_finding_fields`, `fingerprint_does_not_depend_on_an_absolute_checkout_path`, `fingerprint_normalises_absolute_paths_in_text_and_check_identity`. `repair_baseline`: `a_failed_baseline_records_redacted_normalized_findings_and_a_fingerprint`. |
-| 4 | Classify as `new_regression`, `pre_existing`, `worsened`, `unchanged_failure`, `environment_failure` or `unknown_provenance`; repair only new regressions and the new part of worsened. | `workspace-engine/src/provenance.rs` (`classify`, `repair_targets`) and `ChatOrchestrator::finish_verification`: repair starts only when `repair_targets` is non-empty, and a repaired result carries only the introduced delta. | `verification_loop`: `a_matching_failed_baseline_is_pre_existing_and_starts_no_repair`, `a_declined_baseline_makes_the_failure_unknown_and_starts_no_repair`, `a_repair_that_breaks_a_previously_passing_check_is_a_regression`, `the_repair_request_carries_normalized_evidence_not_the_raw_log`, `provenance_and_repair_targets_survive_a_fresh_store`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_repair_stalled_repeated`. |
+| 3 | A stable failure fingerprint from check identity, normalized findings and termination; no raw output or secrets. | `FailureFingerprint::compute` and `FindingEvidence::from_finding` in `verification.rs` canonicalise the `CheckId`, the location-free finding comparison key (source, severity, code, normalized path, normalized summary) and termination. Transient ids, timestamps, origin refs, details, machine-local absolute paths, raw output and finding location are excluded. The format is version 2; version 1 values remain loadable. | `repair_provenance`: `fingerprint_is_order_and_duplicate_insensitive`, `fingerprint_changes_with_material_evidence_but_not_location`, `fingerprint_uses_code_and_severity_but_not_location`, `fingerprint_changes_with_termination_and_check_identity`, `fingerprint_ignores_transient_finding_fields`, `fingerprint_does_not_depend_on_an_absolute_checkout_path`, `fingerprint_normalises_absolute_paths_in_text_and_check_identity`. `repair_baseline`: `a_failed_baseline_records_redacted_normalized_findings_and_a_fingerprint`. |
+| 4 | Classify as `new_regression`, `pre_existing`, `worsened`, `unchanged_failure`, `environment_failure` or `unknown_provenance`; repair only new regressions and the new part of worsened. | `workspace-engine/src/provenance.rs` (`classify`, `same_findings`, `introduced_findings`, `repair_targets`) and `ChatOrchestrator::finish_verification`: classification compares the durable findings as a multiset without line or column, repair starts only when `repair_targets` is non-empty, only errors become introduced evidence, and a repaired result carries only the introduced delta. | `repair_targets`: `a_pre_existing_error_that_shifts_lines_is_still_pre_existing`, `a_new_identical_error_in_a_different_file_is_introduced`, `a_second_different_error_in_the_same_file_is_introduced`, `a_new_warning_on_a_failed_baseline_is_not_worsened_or_a_repair_target`, `an_extra_identical_occurrence_beyond_the_baseline_is_introduced`, `shifted_duplicates_that_do_not_grow_the_count_are_not_introduced`, `a_baseline_written_with_a_v1_fingerprint_still_classifies_by_its_findings`. `verification_loop`: `a_matching_failed_baseline_is_pre_existing_and_starts_no_repair`, `a_pre_existing_error_that_shifts_lines_stays_pre_existing`, `a_declined_baseline_makes_the_failure_unknown_and_starts_no_repair`, `a_repair_that_breaks_a_previously_passing_check_is_a_regression`, `the_repair_request_carries_normalized_evidence_not_the_raw_log`, `provenance_and_repair_targets_survive_a_fresh_store`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_repair_stalled_repeated`. |
 | 5 | Spawn failure, missing executable, policy refusal and unavailable infrastructure are environment failures with a user action, never code repair. | `CheckTermination::is_environment_failure`, `environment_termination`, `CheckOutcome::Environment`; `build_partitions` gives each environment group one `FixEnvironment` action. Only the process-spawn error is `SpawnFailed`; other errors propagate. | `verification_loop`: `a_spawn_failure_is_an_environment_failure_and_starts_no_repair`, `a_missing_executable_is_an_environment_failure_and_starts_no_repair`, `a_policy_refused_check_is_reported_as_environment_and_starts_no_repair`, `an_execution_store_failure_propagates_instead_of_becoming_environment`. `repair_baseline`: `policy_refusal_is_an_unavailable_baseline_and_the_patch_still_applies`, `a_spawn_failure_and_a_missing_executable_are_unavailable_baselines`. Eval: `verification_environment_failure`. |
 | 6 | A declined or unusable baseline makes a later failure unknown, not task-caused; it may fail completion but starts no automatic repair. | `classify` maps `Declined` and `Unavailable` baselines to `UnknownProvenance`; `finish_verification` settles `Failed` with no repair targets. | `repair_baseline`: `a_declined_baseline_does_not_decline_the_patch`, `policy_refusal_is_an_unavailable_baseline_and_the_patch_still_applies`. `verification_loop`: `a_declined_baseline_makes_the_failure_unknown_and_starts_no_repair`, `a_worker_session_does_not_repair_an_unknown_failure`. Eval: `verification_declined_baseline`. |
-| 7 | Stop before the numeric limit on a repeated fingerprint, equivalent patch, unchanged task diff or oscillation. | `workspace-engine/src/stagnation.rs` (`proposed_patch_digest`, `task_diff_digest`, `repair_state_entry`, `detect_repair_stall`), `record_repair_state_or_stall` and `finish_verification_stalled`. The fixed precedence is `identical_state` → `repeated_failure` → `equivalent_patch` → `unchanged_task_diff` → `oscillation`. | `repair_stagnation`: `each_stop_cause_is_detected_independently`, `reason_precedence_is_fixed`, `an_a_to_b_to_a_state_oscillates`, `the_first_progressing_attempt_never_stalls`, `repair_stall_is_one_terminal_event_that_replays_as_a_stop`. `verification_loop`: `a_repeated_ineffective_repair_stalls_before_the_numeric_limit`, `an_a_to_b_to_a_repair_oscillation_stalls`, `a_worker_stops_on_the_same_typed_repair_stall`. Eval: `verification_repair_stalled_repeated` (limit 16, stops at `repeated_failure`), `verification_repair_oscillation` (limit 16, stops at `oscillation`). |
+| 7 | Stop before the numeric limit on a repeated fingerprint, equivalent patch, unchanged task diff or oscillation. | `workspace-engine/src/stagnation.rs` (`proposed_patch_digest`, `task_diff_digest`, `repair_state_entry`, `detect_repair_stall`), `record_repair_state_or_stall` and `finish_verification_stalled`. The fixed precedence is `identical_state` → `repeated_failure` → `equivalent_patch` → `unchanged_task_diff` → `oscillation`. The attempt fingerprint uses the location-free comparison key, so an ineffective repair that only moves the failing line still repeats. | `repair_stagnation`: `each_stop_cause_is_detected_independently`, `reason_precedence_is_fixed`, `an_a_to_b_to_a_state_oscillates`, `the_first_progressing_attempt_never_stalls`, `repair_stall_is_one_terminal_event_that_replays_as_a_stop`. `verification_loop`: `a_repeated_ineffective_repair_stalls_before_the_numeric_limit`, `a_repair_that_only_moves_the_failing_line_stalls_as_repeated_failure`, `an_a_to_b_to_a_repair_oscillation_stalls`, `a_worker_stops_on_the_same_typed_repair_stall`. Eval: `verification_repair_stalled_repeated` (limit 16, stops at `repeated_failure`), `verification_repair_oscillation` (limit 16, stops at `oscillation`). |
 | 8 | A repair patch is checked against #98's protected paths; any other new path is a visible one-shot scope expansion, approved only once and not inferred. | `workspace-engine/src/repair_scope.rs` computes `RepairScopeReview` from task-changed paths plus normalized finding locations. Spec 98 still refuses a protected path as a whole proposal, and apply rechecks a stale card. The review is persisted in stored-patch V4 and carried live; the shell and CLI print only its labels, groups, paths and actions. | `verification_loop`: `a_repair_inside_the_task_scope_has_no_scope_review`, `a_new_unprotected_repair_path_is_a_typed_one_shot_expansion`, `a_protected_repair_path_is_refused_without_a_patch`, `a_worker_and_a_reload_preserve_the_same_scope_review`, `a_stale_expansion_card_newly_protected_is_refused_at_apply`, `a_repair_may_touch_a_finding_path_outside_the_task_changed_paths`. |
 | 9 | The report separates introduced, pre-existing, environmental and stalled repairs; none collapses into one failed sentence. | `VerificationReport` carries `provenance`, `repair_targets`, flattened `actions` and `repair_stall`; `summary`/`render` name each group in engine-owned words, and a stall replaces the repair action with its own. The web UI renders the supplied facts and classifies nothing. | `verification_loop`: `the_summary_never_says_complete_when_anything_is_wrong`, `every_selected_check_is_in_exactly_one_section`, `provenance_and_repair_targets_survive_a_fresh_store`. `repair_stagnation`: `a_stall_has_engine_owned_presentation_and_no_continue_action`, `a_stall_summary_does_not_double_the_explanation_period`. Eval asserts `verification_provenances`, `verification_action_kinds` and `repair_stall_reason` on all five new scenarios. |
-| 10 | Fingerprints, classifications and stop reasons survive reload and worker restart without storing unredacted output in a new location. | `SessionStore` writes/reads `verification_baseline`, `verification_provenance`, `verification_repair_state` and `verification_repair_stalled`; replay folds them into `VerificationState`. Historical logs replay with no inferred baseline or classification. | `repair_provenance`: `baseline_provenance_and_repair_state_round_trip`, `historical_verification_events_replay_without_inventing_provenance`, `new_verification_events_round_trip_through_a_fresh_store`, `repair_history_keeps_only_the_bounded_window`. `repair_stagnation`: `repair_history_survives_a_fresh_store_and_repair_continuations`, `repair_stall_is_one_terminal_event_that_replays_as_a_stop`. `verification_loop`: `provenance_and_repair_targets_survive_a_fresh_store`, `a_worker_session_does_not_repair_an_unknown_failure`, `a_worker_and_a_reload_preserve_the_same_scope_review`. Eval asserts a durable report and durable baselines. |
+| 10 | Fingerprints, classifications and stop reasons survive reload and worker restart without storing unredacted output in a new location. | `SessionStore` writes/reads `verification_baseline`, `verification_provenance`, `verification_repair_state` and `verification_repair_stalled`; replay folds them into `VerificationState`. Historical logs replay with no inferred baseline or classification. | `repair_provenance`: `baseline_provenance_and_repair_state_round_trip`, `historical_verification_events_replay_without_inventing_provenance`, `new_verification_events_round_trip_through_a_fresh_store`, `repair_history_keeps_only_the_bounded_window`, `a_legacy_fingerprint_value_still_loads_from_a_baseline_event`; `repair_targets`: `a_baseline_written_with_a_v1_fingerprint_still_classifies_by_its_findings` (a version 1 baseline still compares from its durable findings). `repair_stagnation`: `repair_history_survives_a_fresh_store_and_repair_continuations`, `repair_stall_is_one_terminal_event_that_replays_as_a_stop`. `verification_loop`: `provenance_and_repair_targets_survive_a_fresh_store`, `a_worker_session_does_not_repair_an_unknown_failure`, `a_worker_and_a_reload_preserve_the_same_scope_review`. Eval asserts a durable report and durable baselines. |
 
 ### 7.2 Acceptance criteria
 
 | Criterion | Evidence |
 |---|---|
-| A check failing identically before and after a patch records `pre_existing` and starts no repair turn. | `verification_loop::a_matching_failed_baseline_is_pre_existing_and_starts_no_repair`; eval `verification_pre_existing_failure` (failed baseline, `pre_existing`, zero repair targets, at most two model calls). |
+| A check failing identically before and after a patch records `pre_existing` and starts no repair turn. | `verification_loop::a_matching_failed_baseline_is_pre_existing_and_starts_no_repair`, `a_pre_existing_error_that_shifts_lines_stays_pre_existing` (the real pre-patch baseline fails at line 4, the post-patch check at line 7, and still starts no repair); `repair_targets::a_pre_existing_error_that_shifts_lines_is_still_pre_existing`; eval `verification_pre_existing_failure` (failed baseline, `pre_existing`, zero repair targets, at most two model calls). |
 | A passing baseline followed by a failure starts repair with only the new findings. | `verification_loop::a_failed_check_is_repaired_and_the_rerun_passes`, `the_repair_request_carries_normalized_evidence_not_the_raw_log`; eval `verified_repair`, plus the new stalled scenarios' passing baselines. |
 | Missing `cargo`, exit-by-policy and a command spawn error never start repair. | `verification_loop::a_missing_executable_is_an_environment_failure_and_starts_no_repair`, `a_policy_refused_check_is_reported_as_environment_and_starts_no_repair`, `a_spawn_failure_is_an_environment_failure_and_starts_no_repair`; eval `verification_environment_failure` (`fix_environment`, zero repair targets). |
-| A repeated ineffective repair stops after the second identical result even when the limit is sixteen. | `verification_loop::a_repeated_ineffective_repair_stalls_before_the_numeric_limit`; eval `verification_repair_stalled_repeated` (`agent_tool_retry_limit=16`, `repair_stalled`, `repeated_failure`, four model calls). |
+| A repeated ineffective repair stops after the second identical result even when the limit is sixteen. | `verification_loop::a_repeated_ineffective_repair_stalls_before_the_numeric_limit`, `a_repair_that_only_moves_the_failing_line_stalls_as_repeated_failure` (each attempt moves the reported line, still `repeated_failure` at the second attempt with limit 16); eval `verification_repair_stalled_repeated` (`agent_tool_retry_limit=16`, `repair_stalled`, `repeated_failure`, four model calls). |
 | An A→B→A failure/diff oscillation stops with `repair_stalled`. | `repair_stagnation::an_a_to_b_to_a_state_oscillates`, `verification_loop::an_a_to_b_to_a_repair_oscillation_stalls`; eval `verification_repair_oscillation` (limit 16, `repair_stalled`, `oscillation`, five model calls). |
 | A declined baseline makes the later failure unknown, not task-caused. | `verification_loop::a_declined_baseline_makes_the_failure_unknown_and_starts_no_repair`; eval `verification_declined_baseline` (durable baseline `declined`, `unknown_provenance`, `provide_baseline`, zero repair targets). |
 | A repair proposal for a protected path is refused by #98; a new unprotected path is clearly marked as a one-shot scope expansion. | `verification_loop::a_protected_repair_path_is_refused_without_a_patch`, `a_new_unprotected_repair_path_is_a_typed_one_shot_expansion`, `a_stale_expansion_card_newly_protected_is_refused_at_apply`. |
@@ -267,7 +288,9 @@ asserts what the script assumed happened.
   first repair changes the file without changing the compiler error; the second
   proposal repeats the fingerprint and is stopped as `repeated_failure` before
   it is applied.
-- `verification_repair_oscillation` applies A, then B, then restores A. The next
+- `verification_repair_oscillation` applies A, then B, then restores A. B
+  differs from A by error code and summary; a change of line or column alone
+  would be the same failure under requirement 3, not an oscillation. The next
   proposal repeats the first failure/diff pair and is stopped as `oscillation`
   before the limit.
 
@@ -288,3 +311,52 @@ Workspace-wide `cargo clippy --workspace` and `cargo nextest run --workspace`
 were deliberately not run locally, per `AGENTS.md`; the full seven-check gate
 remains for CI. The deterministic tier proves the engine transitions, not that a
 real model chooses the right tools or patches; that is spec 106's live gate.
+
+### 7.5 Review-fix note (2026-11-05)
+
+The 2026-11-04 review of specs 101–105 found that the finding comparison key
+included `start_line` and `start_column` (`verification.rs`), and that
+`provenance::introduced_findings` and the stagnation `repeated_failure` check
+compared on it. A patch that added lines above an existing error therefore
+turned a pre-existing failure into an introduced one and started repair, and
+an ineffective repair that only moved the failing line never reached the
+repeated-failure stop. Both are now fixed by the location-free comparison key
+in requirement 3.
+
+Decisions recorded with the fix:
+
+- **Severity.** A new warning or informational finding on a check that already
+  failed stays in the report but does not make the result `worsened` and is not
+  handed to automatic repair. Only errors are introduced repair evidence for
+  the `worsened` delta.
+- **Duplicates.** Provenance compares multiplicity, not a set. One pre-existing
+  occurrence plus one newly introduced identical occurrence is exactly one
+  introduced finding; occurrences that stayed at the same location are matched
+  first so the moved or multiplied one is the repair target. The failure
+  fingerprint itself keeps set semantics, so a duplicate report within one
+  result is still not a new failure.
+- **Versioning.** `FailureFingerprint` is now version 2 and hashes the
+  location-free key. Version 1 values still deserialize. A stored version 1
+  baseline or provenance record classifies from its durable findings, so a
+  pre-existing failure recorded before the change still reads as
+  `pre_existing`. A version 1 repair-history entry has no findings to
+  re-derive, so it does not compare equal to a version 2 value; the next
+  attempt starts a fresh stagnation window and the numeric limit still bounds
+  repair.
+
+Regression tests were written first and failed for these reasons:
+`repair_targets::a_pre_existing_error_that_shifts_lines_is_still_pre_existing`
+and `repair_provenance::fingerprint_changes_with_material_evidence_but_not_location`
+reported a different hash / `Worsened` instead of `PreExisting`;
+`verification_loop::a_pre_existing_error_that_shifts_lines_stays_pre_existing`
+reached the repair path (`NoRepairApplied` instead of `Failed`);
+`verification_loop::a_repair_that_only_moves_the_failing_line_stalls_as_repeated_failure`
+exposed a second line-moving patch instead of stalling;
+`repair_targets::a_new_warning_on_a_failed_baseline_is_not_worsened_or_a_repair_target`
+classified `Worsened`; and
+`repair_targets::a_baseline_written_with_a_v1_fingerprint_still_classifies_by_its_findings`
+classified `Worsened` instead of `PreExisting`. The existing
+`fingerprint_changes_with_material_evidence` assertion that a different line
+changes the fingerprint contradicted this requirement and was replaced by
+`fingerprint_changes_with_material_evidence_but_not_location`; that is a
+corrected expectation, not a loosened assertion.

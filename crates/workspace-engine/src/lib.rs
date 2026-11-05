@@ -308,10 +308,11 @@ pub use validation::{
 };
 pub use verification::{
     BROWSER_CHECK_PREFIX, CheckBaseline, CheckId, CheckOutcome, CheckProvenanceRecord, CheckRun,
-    CheckTermination, FailedCheck, FailureFingerprint, FailureProvenance, FindingEvidence,
-    MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, Selection, SkipReason, SkippedCheck,
-    VerificationDue, VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
-    fold_verification, is_documentation, propose_checks, select_roots,
+    CheckTermination, FAILURE_FINGERPRINT_VERSION, FailedCheck, FailureFingerprint,
+    FailureProvenance, FindingEvidence, MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, Selection,
+    SkipReason, SkippedCheck, VerificationDue, VerificationEvent, VerificationOutcome,
+    VerificationReport, VerificationState, fold_verification, is_documentation, propose_checks,
+    select_roots,
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,

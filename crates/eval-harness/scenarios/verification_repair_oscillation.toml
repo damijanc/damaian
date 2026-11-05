@@ -39,10 +39,12 @@ pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
   ] } },
 ]
 
+# B must differ from A by code or summary, not merely a line or column: spec
+# 102's comparison key deliberately ignores finding location.
 [[turn]]
-content = "I tried a different type here."
+content = "I tried a different error here."
 tool_calls = [
-  { name = "propose_patch", arguments = { summary = "Use a bool instead", files = [
+  { name = "propose_patch", arguments = { summary = "Use a missing value instead", files = [
     { path = "src/upload.rs", status = "modified", content = """
 pub fn upload(payload: &str) -> Result<(), String> {
     if payload.is_empty() {
@@ -52,7 +54,7 @@ pub fn upload(payload: &str) -> Result<(), String> {
 }
 
 pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
-    let _value: bool = 42;
+    let _value = missing_value;
     Ok(())
 }
 """ },
