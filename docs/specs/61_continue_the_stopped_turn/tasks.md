@@ -449,3 +449,11 @@ check applies to `recovery.rs:311`).
 - [x] **Step 3: Checks.** Fast checks and scoped clippy/tests locally; the full
       gate on CI. Record the CI result here when it is green, the way spec 58
       did.
+
+**R17 note (2026-11-05).** Spec 103 R17 gives a worker a bounded pre-plan
+exploration phase, so the worker host test named in Task 4 no longer reaches a
+round-budget pause before a plan exists. It was renamed to
+`a_worker_crosses_the_preplan_round_budget_without_pausing` and now pins that
+crossing; the worker's round-budget resume path remains the same for a task
+whose plan already exists. The engine's round-budget pause and resume tests are
+unchanged.

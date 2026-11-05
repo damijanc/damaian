@@ -30,6 +30,15 @@ pub const ABSOLUTE_TASK_INPUT_TOKEN_CEILING: u64 = 64_000_000;
 /// Absolute product ceiling for output tokens charged to one task.
 pub const ABSOLUTE_TASK_OUTPUT_TOKEN_CEILING: u64 = 4_000_000;
 
+/// Default exploration-round budget for a worker's segment before it proposes
+/// a plan (spec 103 R17).
+///
+/// Three ordinary exploration segments at the default 24-round allowance. The
+/// motivating measurement behind spec 103 (observation 42) recorded up to 72
+/// read rounds before an implementation task was understood, so this covers a
+/// real discovery pass without granting an open-ended pre-plan phase.
+pub const DEFAULT_WORKER_PREPLAN_EXPLORATION_ROUNDS: u32 = 72;
+
 /// One worker task's approved execution allowance.
 ///
 /// Every value is non-zero: a zero would describe a task that cannot start,

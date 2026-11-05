@@ -8397,6 +8397,37 @@ impl ChatOrchestrator {
         }
     }
 
+    /// The terminal outcome for a pre-plan exploration budget that was spent
+    /// without the worker proposing a plan when asked (spec 103 R17).
+    #[allow(clippy::too_many_arguments)]
+    fn preplan_exhausted_outcome(
+        &self,
+        session: &Session,
+        task: &Task,
+        budget: &TaskExecutionBudget,
+        totals: SegmentTotals,
+        usage: Option<&TaskUsage>,
+        last_segment: Option<TaskSegmentSnapshot>,
+    ) -> Result<TaskTerminalOutcome> {
+        let approved = approved_exploration_round_cap(budget);
+        let used = u64::from(totals.exploration_rounds);
+        self.task_terminal_outcome(
+            session,
+            task,
+            TaskTerminalOutcomeKind::PrePlanExplorationExhausted,
+            Some(TaskBudgetDimension::ExplorationRounds),
+            Some(TaskOutcomeFigures {
+                approved,
+                used,
+                required: None,
+                remaining: Some(approved.saturating_sub(used)),
+            }),
+            None,
+            usage,
+            last_segment,
+        )
+    }
+
     /// The terminal outcome for a request whose pinned/fixed minimum cannot
     /// fit the configured window share.
     fn cannot_fit_outcome(
@@ -8482,12 +8513,49 @@ impl ChatOrchestrator {
         normal_exploration_rounds: u32,
         resume_state: Option<&TaskSegmentPauseState>,
     ) -> Result<Option<(SegmentRunState, bool)>> {
-        let Some(budget) = self.session_store.read_task_budget(&session.id, &task.id)? else {
-            return Ok(None);
-        };
+        let approved_budget = self.session_store.read_task_budget(&session.id, &task.id)?;
         if self.session_store.worker_record(&session.id)?.is_none() {
             return Ok(None);
         }
+        let Some(budget) = approved_budget else {
+            // Spec 103 R17: before a plan exists a worker gets the bounded
+            // pre-plan phase. It reuses the segment machinery, but there is no
+            // approved task budget yet, so it only resumes a durable segment a
+            // paused pre-plan turn left open. A new pre-plan segment starts
+            // lazily at its first boundary, keeping a worker that proposes a
+            // plan immediately on today's plan-review path with no extra
+            // records.
+            if plan.is_some() {
+                return Ok(None);
+            }
+            let Some(resume) = resume_state else {
+                return Ok(None);
+            };
+            let budget = self.preplan_budget();
+            let segments = self
+                .session_store
+                .read_task_segments(&session.id, &task.id)?;
+            let Some(crate::task_segments::StoredTaskSegment {
+                event: crate::task_segments::TaskSegmentEvent::Started(started),
+                ..
+            }) = segments.last()
+            else {
+                return Err(ClientError::InvalidInput(
+                    "a paused task segment has no durable segment_started record".to_string(),
+                ));
+            };
+            validate_segment_resume(resume, started, action_rounds, exploration_rounds)?;
+            return Ok(Some((
+                SegmentRunState::resumed(
+                    &budget,
+                    started,
+                    normal_action_rounds,
+                    normal_exploration_rounds,
+                    true,
+                ),
+                false,
+            )));
+        };
         let mut usage_by_task = self.session_store.read_task_usage(&session.id)?;
         let usage = usage_by_task.remove(&task.id);
         let tokens = SegmentTokenTotals::from_usage(usage.as_ref());
@@ -8514,6 +8582,7 @@ impl ChatOrchestrator {
                     started,
                     normal_action_rounds,
                     normal_exploration_rounds,
+                    false,
                 ),
                 false,
             )));
@@ -8562,9 +8631,92 @@ impl ChatOrchestrator {
                 &started,
                 normal_action_rounds,
                 normal_exploration_rounds,
+                false,
             ),
             true,
         )))
+    }
+
+    /// The bounded pre-plan allowance a worker gets before it proposes a plan.
+    ///
+    /// The exploration total is the configured proposal bounded by the worker
+    /// task-exploration ceiling and the product ceiling. The action total
+    /// covers the read rounds that stop counting as exploration once a
+    /// segment's allowance is spent; it is never smaller than one ordinary
+    /// action segment. Token totals use the product ceilings because there is
+    /// no approved task budget yet, while `agent_max_task_tokens` still bounds
+    /// the turn exactly as it does today.
+    fn preplan_budget(&self) -> TaskExecutionBudget {
+        let exploration_rounds = self.config.preplan_exploration_rounds();
+        TaskExecutionBudget {
+            action_rounds: exploration_rounds.max(self.tool_round_limit(false)),
+            exploration_rounds,
+            input_tokens: crate::task_budget::ABSOLUTE_TASK_INPUT_TOKEN_CEILING,
+            output_tokens: crate::task_budget::ABSOLUTE_TASK_OUTPUT_TOKEN_CEILING,
+        }
+    }
+
+    /// Starts the first pre-plan segment at its first round boundary.
+    ///
+    /// The rounds already spent are the new segment's baseline, exactly as the
+    /// post-approval first segment treats the planning rounds. That keeps the
+    /// durable totals monotonic without inventing a start digest for rounds
+    /// whose observation state was never recorded.
+    #[allow(clippy::too_many_arguments)]
+    fn start_preplan_segment(
+        &self,
+        session: &Session,
+        task: &Task,
+        action_rounds: u32,
+        exploration_rounds: u32,
+        plan: Option<&TaskPlan>,
+        step_evidence: &[Evidence],
+        completed_tool_rounds: &CompletedToolTracker,
+        turn_notes: &TurnNotesState,
+        normal_action_rounds: u32,
+        normal_exploration_rounds: u32,
+    ) -> Result<SegmentRunState> {
+        let budget = self.preplan_budget();
+        let mut usage_by_task = self.session_store.read_task_usage(&session.id)?;
+        let usage = usage_by_task.remove(&task.id);
+        let tokens = SegmentTokenTotals::from_usage(usage.as_ref());
+        let segments = self
+            .session_store
+            .read_task_segments(&session.id, &task.id)?;
+        let (prior_action, prior_exploration) = segments
+            .last()
+            .map(|segment| segment.totals())
+            .unwrap_or((0, 0));
+        let total_action_rounds = prior_action.saturating_add(action_rounds);
+        let total_exploration_rounds = prior_exploration.saturating_add(exploration_rounds);
+        let digest =
+            self.segment_progress_digest(plan, step_evidence, completed_tool_rounds, turn_notes);
+        let started = TaskSegmentStarted {
+            format_version: TASK_SEGMENT_FORMAT_VERSION,
+            session_id: session.id.clone(),
+            task_id: task.id.clone(),
+            segment: segments
+                .last()
+                .map(|segment| segment.segment() + 1)
+                .unwrap_or(1),
+            segment_action_rounds: 0,
+            segment_exploration_rounds: 0,
+            total_action_rounds,
+            total_exploration_rounds,
+            tokens,
+            start_digest: digest.clone(),
+        };
+        self.session_store
+            .append_task_segment_started(&session.id, &started)?;
+        self.audit_log
+            .record("segment_started", &started.audit_fields())?;
+        Ok(SegmentRunState::resumed(
+            &budget,
+            &started,
+            normal_action_rounds,
+            normal_exploration_rounds,
+            true,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8876,6 +9028,27 @@ impl ChatOrchestrator {
             .session_store
             .read_plan_approved(&session.id, &task.id)
             .unwrap_or(false);
+        // Spec 103 R17: a worker without an approved task budget still gets the
+        // bounded pre-plan phase. Worker identity is durable, never a prompt or
+        // a UI label. An inline session keeps today's round/Continue behaviour
+        // exactly, because this flag is false for it.
+        let worker_session = self.session_store.worker_record(&session.id)?.is_some();
+        let preplan_plan_required = if worker_session {
+            self.session_store
+                .read_messages(&session.id)
+                .unwrap_or_default()
+                .iter()
+                .any(|message| {
+                    message.task_id.as_deref() == Some(task.id.as_str())
+                        && message.kind.as_deref() == Some(PREPLAN_PLAN_REQUIRED_MESSAGE_KIND)
+                })
+        } else {
+            false
+        };
+        // A turn resumed after the instruction was written gets exactly one more
+        // model call, not another exploration pass. A turn that sends it now
+        // sets this for the call that follows.
+        let mut preplan_final_attempt = preplan_plan_required;
 
         // Extra rounds a turn may take past its configured segment: granted by
         // a token ceiling (requirement 6) or by a round-budget *Continue*
@@ -9097,6 +9270,44 @@ impl ChatOrchestrator {
             // segment is committed only after that request is prepared, so one
             // threshold crossing records one compaction attempt.
             if force_final && !turn_options.round_budget_answer_now {
+                // A pre-plan tracker has no approved task budget to spend once
+                // a plan exists. The pre-plan phase is over at that point, so
+                // it cannot decide the boundary: fall back to the ordinary
+                // unbudgeted path (spec 103 requirement 4) rather than charge
+                // the spent pre-plan total as an approved-budget stop.
+                if plan.is_some()
+                    && segment_tracker
+                        .as_ref()
+                        .is_some_and(|tracker| tracker.preplan)
+                {
+                    segment_tracker = None;
+                }
+                // Spec 103 R17: a worker with no plan and no approved budget
+                // starts its bounded pre-plan phase at its first round
+                // boundary. Starting lazily keeps a worker that proposes a plan
+                // immediately on today's path, with no extra segment record.
+                if segment_tracker.is_none() && worker_session && plan.is_none() {
+                    let tracker = self.start_preplan_segment(
+                        &session,
+                        &task,
+                        action_rounds,
+                        exploration_rounds,
+                        plan.as_ref(),
+                        &step_evidence,
+                        &completed_tool_rounds,
+                        &turn_notes,
+                        self.tool_round_limit(web_debug_mode) + round_budget_extension,
+                        self.default_exploration_round_limit(),
+                    )?;
+                    max_exploration_rounds = self
+                        .default_exploration_round_limit()
+                        .min(tracker.exploration_allowance);
+                    action_rounds = 0;
+                    exploration_rounds = 0;
+                    round_budget_extension = 0;
+                    segment_tracker = Some(tracker);
+                    continue;
+                }
                 if let Some(tracker) = segment_tracker.as_mut() {
                     let totals = SegmentTotals {
                         action_rounds: tracker.total_action_rounds(action_rounds),
@@ -9109,6 +9320,76 @@ impl ChatOrchestrator {
                         &completed_tool_rounds,
                         &turn_notes,
                     );
+                    // Pre-plan exhaustion is not an approved-budget stop: it
+                    // asks for the plan the phase exists to produce. The
+                    // instruction is durable and the next model call is the
+                    // final chance; a worker that still has no plan settles the
+                    // typed outcome below.
+                    if tracker.preplan && plan.is_none() {
+                        let exhausted = totals.exploration_rounds
+                            >= tracker.budget.exploration_rounds
+                            || totals.action_rounds >= tracker.budget.action_rounds;
+                        if exhausted {
+                            let last_segment = self.live_segment_snapshot(
+                                tracker,
+                                action_rounds,
+                                exploration_rounds,
+                                usage,
+                                digest.clone(),
+                            );
+                            if preplan_final_attempt {
+                                let outcome = self.preplan_exhausted_outcome(
+                                    &session,
+                                    &task,
+                                    &tracker.budget,
+                                    totals,
+                                    usage,
+                                    Some(last_segment),
+                                )?;
+                                let (run, response, stop) = self.task_terminal_stop(outcome)?;
+                                break (run, response, TurnProposals::default(), stop);
+                            }
+                            self.session_store.append_message_with_kind(
+                                &session.id,
+                                Some(&task.id),
+                                "user",
+                                PREPLAN_PLAN_REQUIRED_NOTE,
+                                Some(PREPLAN_PLAN_REQUIRED_MESSAGE_KIND),
+                            )?;
+                            messages
+                                .push(ModelMessage::user(PREPLAN_PLAN_REQUIRED_NOTE.to_string()));
+                            self.audit_log.record(
+                                "preplan_plan_required",
+                                &[
+                                    ("actor", "system".to_string()),
+                                    ("sessionId", session.id.clone()),
+                                    ("taskId", task.id.clone()),
+                                    ("segment", tracker.segment.to_string()),
+                                    ("totalActionRounds", totals.action_rounds.to_string()),
+                                    (
+                                        "totalExplorationRounds",
+                                        totals.exploration_rounds.to_string(),
+                                    ),
+                                    (
+                                        "explorationLimit",
+                                        tracker.budget.exploration_rounds.to_string(),
+                                    ),
+                                ],
+                            )?;
+                            preplan_final_attempt = true;
+                            // One ordinary segment is enough to call
+                            // `propose_plan`, which asks for no approval and
+                            // runs no tool. The tracker's own allowance was
+                            // sized for the old segment and would otherwise keep
+                            // `force_final` true, stopping before the chance to
+                            // answer.
+                            round_budget_extension += self.default_tool_round_limit();
+                            tracker.action_allowance = tracker
+                                .action_allowance
+                                .max(action_rounds.saturating_add(self.default_tool_round_limit()));
+                            continue;
+                        }
+                    }
                     let decision = decide_segment_continuation(&SegmentContinuationInput {
                         budget: &tracker.budget,
                         totals,
@@ -9927,6 +10208,45 @@ impl ChatOrchestrator {
 
             let (mut calls_this_round, undecodable_calls) =
                 decodable_tool_actions(&model_run.tool_calls, model_run.truncated);
+            // Spec 103 R17: after the pre-plan instruction, the model either
+            // proposes the plan it was asked for or the task stops. A tool call
+            // made instead is deliberately not dispatched, and an ordinary text
+            // answer does not become a completion: both are the same failure to
+            // produce the plan, and neither may become a generic Continue.
+            if preplan_final_attempt
+                && plan.is_none()
+                && !calls_this_round
+                    .iter()
+                    .any(|(_, action)| matches!(action, ToolAction::ProposePlan(_)))
+                && let Some(tracker) = segment_tracker.as_ref()
+            {
+                let totals = SegmentTotals {
+                    action_rounds: tracker.total_action_rounds(action_rounds),
+                    exploration_rounds: tracker.total_exploration_rounds(exploration_rounds),
+                };
+                let last_segment = self.live_segment_snapshot(
+                    tracker,
+                    action_rounds,
+                    exploration_rounds,
+                    task_usage.as_ref(),
+                    self.segment_progress_digest(
+                        plan.as_ref(),
+                        &step_evidence,
+                        &completed_tool_rounds,
+                        &turn_notes,
+                    ),
+                );
+                let outcome = self.preplan_exhausted_outcome(
+                    &session,
+                    &task,
+                    &tracker.budget,
+                    totals,
+                    task_usage.as_ref(),
+                    Some(last_segment),
+                )?;
+                let (run, response, stop) = self.task_terminal_stop(outcome)?;
+                break (run, response, TurnProposals::default(), stop);
+            }
             // The text envelope is the fallback only when no native call
             // decoded, exactly as before: one native call and the envelope is
             // ignored.
@@ -13840,6 +14160,10 @@ struct SegmentRunState {
     action_allowance: u32,
     exploration_allowance: u32,
     budget: TaskExecutionBudget,
+    /// Whether this is the bounded pre-plan phase (spec 103 R17) rather than an
+    /// approved task budget. The segment machinery is the same; only what
+    /// exhaustion means differs.
+    preplan: bool,
 }
 
 impl SegmentRunState {
@@ -13848,6 +14172,7 @@ impl SegmentRunState {
         started: &TaskSegmentStarted,
         normal_action_rounds: u32,
         normal_exploration_rounds: u32,
+        preplan: bool,
     ) -> Self {
         // Task totals are bounded by the approved budget and Task 1's absolute
         // task ceilings. The legacy one-turn caps bound one ordinary turn and
@@ -13868,6 +14193,7 @@ impl SegmentRunState {
             exploration_allowance: normal_exploration_rounds
                 .min(exploration_cap.saturating_sub(started.total_exploration_rounds)),
             budget: *budget,
+            preplan,
         }
     }
 
@@ -14739,6 +15065,16 @@ const ABSOLUTE_EXPLORATION_ROUND_CAP: u32 = 32;
 /// bounds a single configured segment — and #47's token-ceiling continuation,
 /// which the manual *Continue* is not tied to.
 const ABSOLUTE_TURN_ROUND_CAP: u32 = 64;
+
+/// The engine's instruction when a worker has spent its pre-plan exploration
+/// budget (spec 103 R17). Exhaustion asks for a plan; it never offers the
+/// generic **Continue** against a bound that is already spent.
+const PREPLAN_PLAN_REQUIRED_NOTE: &str = "Your pre-plan exploration budget is spent. Call propose_plan now with the steps you intend to take. Do not continue exploring. If you cannot propose a plan, stop and say what is blocking you; do not ask to continue exploring.";
+
+/// The durable kind of [`PREPLAN_PLAN_REQUIRED_NOTE`], so a crash between the
+/// instruction and the next model call cannot make the engine hand out another
+/// exploration pass.
+const PREPLAN_PLAN_REQUIRED_MESSAGE_KIND: &str = "preplan_plan_required";
 
 /// Damaian's own handoff instruction, verbatim from spec 57 §5.0. It is what
 /// makes *Start worker* appear without any repository's `AGENTS.md` teaching

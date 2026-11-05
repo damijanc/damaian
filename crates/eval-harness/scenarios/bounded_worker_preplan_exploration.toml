@@ -1,0 +1,92 @@
+name = "bounded_worker_preplan_exploration"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Implement retry handling across the crate, one bounded step at a time."
+worker_record = true
+
+# Spec 103 R17: a worker with no plan explores in bounded pre-plan segments and,
+# when the budget is spent, is told to propose a plan instead of being offered
+# the generic Continue. Nine distinct reads cross two segment boundaries at a
+# two-action/one-exploration segment; the third boundary spends the six-round
+# pre-plan action total and writes the plan instruction. The scripted model then
+# proposes a two-step plan, so the turn continues to a plan proposal and no
+# round-budget pause is ever recorded.
+config_overlay = """
+agent_max_tool_rounds=2
+agent_max_exploration_rounds=1
+worker_preplan_exploration_rounds=6
+"""
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 1 } },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 2 } },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/checkout.rs", start_line = 1, end_line = 1 } },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/checkout.rs", start_line = 1, end_line = 2 } },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/lib.rs", start_line = 1, end_line = 1 } },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/lib.rs", start_line = 1, end_line = 2 } },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/http_client.rs", start_line = 1, end_line = 1 } },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/http_client.rs", start_line = 1, end_line = 2 } },
+]
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/logging.rs", start_line = 1, end_line = 1 } },
+]
+
+# The pre-plan budget is spent; the engine's instruction asked for a plan rather
+# than a continuation, and the model supplies one.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_plan", arguments = { steps = [ { title = "Read the upload client" }, { title = "Add retry handling" } ] } },
+]
+[[turn]]
+content = "The retry plan is proposed and waiting to be worked through."
+
+[assert]
+continuations = 0
+task_count = 1
+final_task_status = "incomplete"
+round_budget_pauses = 0
+segments_started = 2
+segments_finished = 1
+terminal_outcome_kind = "none"
+deterministic_only = [
+  "continuations",
+  "task_count",
+  "final_task_status",
+  "round_budget_pauses",
+  "segments_started",
+  "segments_finished",
+  "terminal_outcome_kind",
+]

@@ -1578,9 +1578,57 @@ fn repository_config_may_lower_the_turn_notes_bound_but_not_raise_it() {
     raised.cleanup();
 }
 
-/// Spec 59 §5.4. The exploration allowance is restrict-only: a repository may
-/// lower it, because a restriction is always safe, but raising it spends the
-/// user's money on the repository's say-so.
+/// Spec 103 R17. The pre-plan exploration budget is restrict-only: a repository
+/// may shorten a worker's discovery pass, never lengthen it.
+#[test]
+fn repository_config_may_lower_the_preplan_budget_but_not_raise_it() {
+    let lowered = fixture(
+        "preplan-lower",
+        "worker_preplan_exploration_rounds=24\n",
+        "worker_preplan_exploration_rounds=8\n",
+    );
+    assert_eq!(
+        lowered.load().worker_preplan_exploration_rounds,
+        8,
+        "a repository lowering the pre-plan budget is a restriction and must be honoured"
+    );
+
+    let raised = fixture(
+        "preplan-raise",
+        "worker_preplan_exploration_rounds=24\n",
+        "worker_preplan_exploration_rounds=48\n",
+    );
+    let config = raised.load();
+    assert_eq!(
+        config.worker_preplan_exploration_rounds, 24,
+        "a repository raising the pre-plan budget must be refused and the user's value kept"
+    );
+    assert_eq!(
+        config.preplan_exploration_rounds(),
+        24,
+        "the effective pre-plan allowance must use the user's value"
+    );
+
+    let engine = WorkspaceEngine::new(raised.base());
+    let (_, report) = raised.load_reporting();
+    assert_eq!(
+        report
+            .rejected_keys
+            .iter()
+            .find(|rejected| rejected.key == "worker_preplan_exploration_rounds")
+            .map(|rejected| rejected.class),
+        Some(RepositoryKeyClass::RestrictOnly)
+    );
+    engine
+        .repository_trust
+        .review(&report, &engine.audit_log)
+        .unwrap()
+        .expect("a restrict-only weakening should produce a notice");
+
+    lowered.cleanup();
+    raised.cleanup();
+}
+
 #[test]
 fn repository_config_may_lower_the_exploration_allowance_but_not_raise_it() {
     let lowered = fixture(

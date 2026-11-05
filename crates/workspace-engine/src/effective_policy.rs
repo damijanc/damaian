@@ -184,6 +184,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "enable_worker_sessions" => "Worker sessions",
         "agent_max_tool_rounds" => "Tool rounds per turn",
         "agent_max_exploration_rounds" => "Read-only rounds per turn",
+        "worker_preplan_exploration_rounds" => "Worker pre-plan exploration rounds",
         "worker_task_budget_action_rounds" => "Worker task action rounds",
         "worker_task_budget_exploration_rounds" => "Worker task read-only rounds",
         "worker_task_budget_input_tokens" => "Worker task input tokens",

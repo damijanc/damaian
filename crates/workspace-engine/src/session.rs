@@ -411,6 +411,11 @@ pub enum TaskStatus {
     /// Stopped because the engine-owned segment progress state repeated
     /// (spec 103 Task 6, spec 102's progress rule).
     TaskNoProgress,
+    /// Stopped because a worker spent its pre-plan exploration budget and did
+    /// not propose a plan when asked (spec 103 R17). Non-success and terminal:
+    /// the bounded pre-plan phase is over, and the user restarts with a
+    /// narrower prompt rather than typing the generic **Continue**.
+    TaskPrePlanExplorationExhausted,
     Interrupted,
     UnknownExternalOutcome,
 }
@@ -438,6 +443,7 @@ impl TaskStatus {
             Self::TaskBudgetExhausted,
             Self::TaskCompactionCannotFit,
             Self::TaskNoProgress,
+            Self::TaskPrePlanExplorationExhausted,
             Self::Interrupted,
             Self::UnknownExternalOutcome,
         ]
@@ -462,6 +468,7 @@ impl TaskStatus {
             Self::TaskBudgetExhausted => "task_budget_exhausted",
             Self::TaskCompactionCannotFit => "task_compaction_cannot_fit",
             Self::TaskNoProgress => "task_no_progress",
+            Self::TaskPrePlanExplorationExhausted => "task_preplan_exploration_exhausted",
             Self::Interrupted => "interrupted",
             Self::UnknownExternalOutcome => "unknown_external_outcome",
         }
@@ -493,6 +500,7 @@ impl TaskStatus {
                 | Self::TaskBudgetExhausted
                 | Self::TaskCompactionCannotFit
                 | Self::TaskNoProgress
+                | Self::TaskPrePlanExplorationExhausted
         )
     }
 
@@ -530,6 +538,7 @@ impl TaskStatus {
             | Self::TaskBudgetExhausted
             | Self::TaskCompactionCannotFit
             | Self::TaskNoProgress
+            | Self::TaskPrePlanExplorationExhausted
             | Self::Interrupted
             | Self::UnknownExternalOutcome => false,
         }

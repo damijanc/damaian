@@ -37,8 +37,12 @@ useful. #55 explicitly left within-turn tool-result compaction out of scope.
    checks, browser access, MCP tools or questions. Every existing safety pause
    remains.
 4. Repository configuration may lower a task budget but cannot raise a user or
-   administrator ceiling. A worker with no approved task budget keeps today's
-   explicit **Continue** behaviour.
+   administrator ceiling. Before a plan exists, a worker has a separate
+   pre-plan exploration budget under the same restrict-only rule: it may span
+   several ordinary checkpoints, spent exploration requires a `propose_plan`
+   rather than a pause, and a worker that still does not propose one stops with
+   a typed outcome. After a plan exists, a worker with no approved task budget
+   keeps today's explicit **Continue** behaviour.
 5. Before a request would exceed a configurable share of the provider context
    window, completed within-turn tool history is compacted. Full tool calls and
    results remain in the session/audit stores; only the next model request is
@@ -66,8 +70,10 @@ useful. #55 explicitly left within-turn tool-result compaction out of scope.
 9. Each compaction and segment boundary is durable and auditable, including
    counts and token estimates but no new unredacted content.
 10. The task stops with a specific outcome when the approved task budget is
-    exhausted, compaction cannot fit the required state, or #102 detects no
-    progress. It never silently falls back to `complete`.
+    exhausted, compaction cannot fit the required state, #102 detects no
+    progress, or a worker's pre-plan exploration budget is spent without the
+    plan that phase exists to produce. It never silently falls back to
+    `complete`.
 
 ## 3. Non-goals
 
@@ -85,6 +91,21 @@ Add a durable `TaskExecutionBudget` approved alongside a worker plan and a
 `segment_started`/`segment_finished` event pair. Segment limits remain small
 checkpoints inside the task budget; the worker host resumes the same task and
 plan without a synthetic user message when continuation is pre-authorized.
+
+Before a plan exists there is no approved task budget, so a worker gets a
+**pre-plan exploration budget** instead (`worker_preplan_exploration_rounds`,
+bounded by the worker task-exploration ceiling and the product ceiling). It
+reuses the same segment records, progress digest, request preparation and
+pause-state machinery, and starts its first segment lazily at the first
+ordinary checkpoint so a worker that proposes a plan immediately keeps today's
+plan-review path. Exhausting the pre-plan rounds writes one durable
+`preplan_plan_required` instruction (`propose_plan`, not **Continue**) and
+allows one ordinary segment for the model to answer; a model that does not
+propose a plan then settles `preplan_exploration_exhausted` /
+`task_preplan_exploration_exhausted`. That instruction survives a restart, so a
+crash after it can never resurrect the generic round pause. Interactive
+sessions never take this path: `worker_session` is read from the durable worker
+record, not from a prompt or UI state.
 
 A deterministic request compactor walks completed tool rounds oldest-first.
 It replaces eligible results with structured manifests until the next request
@@ -105,6 +126,11 @@ what it was before the pin set existed.
 
 - A scripted worker requiring more than sixteen action rounds completes across
   at least three internal segments after one task-budget approval.
+- A worker with no plan explores past the ordinary sixteen/twenty-four
+  checkpoints in pre-plan segments without a **Continue**; when that budget is
+  spent it is asked for a plan, and a worker that still does not propose one
+  stops with `preplan_exploration_exhausted`. An interactive session keeps the
+  ordinary round pause and writes no pre-plan segment.
 - The same script without a task budget pauses at the existing round boundary.
 - A patch and a command still pause for their own decisions inside an approved
   task budget.
@@ -134,9 +160,9 @@ what it was before the pin set existed.
 - The session and audit stores remain the complete append-only record. Request
   compaction changes only the messages sent to the model and never rewrites or
   deletes stored calls, results or approvals.
-- Repository configuration is untrusted. Every task-budget setting is
-  restrict-only at repository scope, and every new config field must be
-  classified explicitly in the overlay policy.
+- Repository configuration is untrusted. Every task-budget setting and the
+  pre-plan exploration proposal are restrict-only at repository scope, and every
+  new config field must be classified explicitly in the overlay policy.
 - Compaction stores only redacted structured facts, hashes, counts and bounded
   excerpts. It must not create a second unredacted tool-output store or promote
   tool output into instructions.
@@ -418,3 +444,43 @@ the resolution half: the failed result is present in the request before the
 identical rerun, the rerun succeeds, and the old failure then leaves the count
 window. The earlier R7 tests, the default-limit eval twin and the pairing
 checks all still pass.
+
+**R17 review repair (2026-11-05).** The 2026-11-04 review (D3) found that long
+autonomous runs only existed after a plan was approved: before plan review a
+worker still reached the ordinary sixteen-action/twenty-four-read checkpoint
+and paused on generic **Continue**, which spec 106 forbids. Workers now get a
+bounded pre-plan exploration budget from `worker_preplan_exploration_rounds`
+(72 by default: three ordinary exploration segments, matching the up-to-72 read
+rounds observation 42 measured). It reuses spec 103's segment records, progress
+digest, request preparation and pause state; the first segment starts lazily at
+the first checkpoint, so a worker that proposes a plan immediately keeps the
+old plan-review path. Exhaustion writes the durable `preplan_plan_required`
+instruction asking for `propose_plan` and grants one ordinary segment to answer;
+a response that still does not propose a plan settles the new typed
+`PrePlanExplorationExhausted` kind and `TaskPrePlanExplorationExhausted` status,
+never the generic round pause. The instruction is durable, so a restart after
+it cannot hand out another exploration pass. An interactive session is unchanged:
+worker identity is read from the durable worker record, and the existing
+round-budget tests still pin its Continue path.
+
+The new config key is explicitly classified `Capability`/restrict-only in the
+exhaustive overlay policy, and its effective value is additionally bounded by
+`worker_task_budget_max_exploration_rounds`, so a repository or profile can only
+lower it. A command that needs approval inside a pre-plan segment still pauses
+for that approval, and a restart resumes the durable pre-plan phase rather than
+reviving the generic round pause. Regression tests were written first and run with the
+pre-plan path disabled, failing for the stated reasons:
+`a_worker_exploring_past_the_old_limits_continues_in_segments_without_continue`
+got `Some(AgentRoundBudgetProposal { rounds_used: 2, rounds_total: 2, ... })`;
+`spending_the_preplan_budget_asks_for_a_plan_and_the_turn_continues_to_one`
+failed the same way instead of reaching a plan;
+`a_worker_that_still_does_not_propose_a_plan_stops_with_a_typed_outcome` got
+`WaitingForApproval` instead of `TaskPrePlanExplorationExhausted`; and
+`a_command_that_needs_approval_still_pauses_inside_the_preplan_segment` failed
+`an approval pause is not a round-budget pause`. The repository config test
+asserts a lower value is honoured and a raise is refused as `RestrictOnly`.
+Evaluation adds `bounded_worker_preplan_exploration`, which crosses two pre-plan
+segments, spends the budget, receives the plan instruction and proposes a plan
+with zero round-budget pauses. The interactive guard keeps today's limits and
+Continue, and the scenario bookkeeping moved to 63 files / 62 deterministic
+records.

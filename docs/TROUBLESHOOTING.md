@@ -269,7 +269,7 @@ remove one
 | `mcp_enabled`, `mcp_server.<id>.enabled` | May be turned off, never on |
 | `mcp_server_allowlist` | May be narrowed, never widened |
 | `mcp_server.<id>.*` for a server the user already configured | Ignored: it would redirect a process the user trusts |
-| `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, `agent_max_turn_notes_chars` | May be lowered, never raised |
+| `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, `worker_preplan_exploration_rounds`, `agent_max_turn_notes_chars`, `worker_task_budget_action_rounds`, `worker_task_budget_exploration_rounds`, `worker_task_budget_input_tokens`, `worker_task_budget_output_tokens`, `worker_task_budget_max_action_rounds`, `worker_task_budget_max_exploration_rounds`, `worker_task_budget_max_input_tokens`, `worker_task_budget_max_output_tokens` | May be lowered, never raised |
 | Everything else (`max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, `agent_web_debug_max_tool_rounds`, `agent_tool_retry_limit`, `agent_max_questions_per_turn`, `project_roots_added`, `project_roots_removed`) | Applied as written |
 
 Ask which keys a repository asked for and did not get — this also records them
@@ -1696,9 +1696,11 @@ charged to `agent_max_tool_rounds`.
 
 A worker whose plan was approved with a task budget follows the same totals
 across internal segments ([spec 103](specs/103_bounded_worker_continuation.md)).
-When its task stops, the session log's `task_status_updated` payload carries
+Before a plan exists it explores under the separate pre-plan budget, so the
+ordinary round-budget **Continue** card is not written for a worker in that
+phase. When its task stops, the session log's `task_status_updated` payload carries
 both the terminal status and a typed `terminalOutcome`; the audit log repeats
-the same facts as `task_terminal_outcome`. The three ordinary stops are:
+the same facts as `task_terminal_outcome`. The ordinary stops are:
 
 - `task_budget_exhausted` / `approved_budget_exhausted`: a reviewed total was
   spent. `terminalOutcome.dimension` names `action_rounds`,
@@ -1713,6 +1715,13 @@ the same facts as `task_terminal_outcome`. The three ordinary stops are:
 - `task_no_progress` / `no_progress`: the next segment repeated the same plan
   state and typed tool results, so the engine declined to spend more of the
   budget.
+- `task_preplan_exploration_exhausted` / `preplan_exploration_exhausted`: a
+  worker with no plan spent the pre-plan exploration budget
+  (`worker_preplan_exploration_rounds`, 72 by default) and did not propose a
+  plan after the engine asked it to. The audit log also carries
+  `preplan_plan_required` for that instruction. A repository may lower the
+  pre-plan value but cannot raise it; if a cloned repository could lengthen the
+  discovery pass it would spend the user's money on its own say-so.
 
 None of these is `complete`, and none offers **Continue** against the same
 approved bound. The outcome, the last open segment and the durable usage are

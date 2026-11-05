@@ -48,6 +48,9 @@ pub enum TaskTerminalOutcomeKind {
     CompactionCannotFit,
     /// The engine-owned segment progress state repeated.
     NoProgress,
+    /// A worker spent its pre-plan exploration budget and did not propose a
+    /// plan when asked to (spec 103 R17).
+    PrePlanExplorationExhausted,
     /// Durable usage is missing or unreadable, so no budget decision is safe.
     UsageUnavailable,
 }
@@ -58,6 +61,7 @@ impl TaskTerminalOutcomeKind {
             Self::ApprovedBudgetExhausted => "approved_budget_exhausted",
             Self::CompactionCannotFit => "compaction_cannot_fit",
             Self::NoProgress => "no_progress",
+            Self::PrePlanExplorationExhausted => "preplan_exploration_exhausted",
             Self::UsageUnavailable => "usage_unavailable",
         }
     }
@@ -73,6 +77,7 @@ impl TaskTerminalOutcomeKind {
             Self::ApprovedBudgetExhausted => TaskStatus::TaskBudgetExhausted,
             Self::CompactionCannotFit => TaskStatus::TaskCompactionCannotFit,
             Self::NoProgress => TaskStatus::TaskNoProgress,
+            Self::PrePlanExplorationExhausted => TaskStatus::TaskPrePlanExplorationExhausted,
             // The abnormal path is an ordinary named failure, but it still
             // carries this typed outcome so a surface can say *why* it failed.
             Self::UsageUnavailable => TaskStatus::Failed,
@@ -282,6 +287,9 @@ impl TaskTerminalOutcome {
             },
             TaskTerminalOutcomeKind::CompactionCannotFit => "Request cannot fit".to_string(),
             TaskTerminalOutcomeKind::NoProgress => "Task made no progress".to_string(),
+            TaskTerminalOutcomeKind::PrePlanExplorationExhausted => {
+                "Pre-plan exploration exhausted".to_string()
+            }
             TaskTerminalOutcomeKind::UsageUnavailable => "Task usage unavailable".to_string(),
         }
     }
@@ -345,6 +353,7 @@ impl TaskTerminalOutcome {
                 )
             }
             TaskTerminalOutcomeKind::NoProgress => "The task stopped because its latest segment made no measurable progress: the same plan state and typed tool results were observed again.".to_string(),
+            TaskTerminalOutcomeKind::PrePlanExplorationExhausted => "The worker spent its pre-plan exploration budget and did not propose a plan when asked to. It stopped instead of offering a generic Continue; restart it with a narrower task, or give it a plan-oriented prompt.".to_string(),
             TaskTerminalOutcomeKind::UsageUnavailable => "The task stopped because its durable token usage could not be proven, so the engine could not safely spend more of the approved budget.".to_string(),
         }
     }
@@ -488,6 +497,7 @@ mod tests {
             TaskTerminalOutcomeKind::ApprovedBudgetExhausted,
             TaskTerminalOutcomeKind::CompactionCannotFit,
             TaskTerminalOutcomeKind::NoProgress,
+            TaskTerminalOutcomeKind::PrePlanExplorationExhausted,
             TaskTerminalOutcomeKind::UsageUnavailable,
         ];
         let mut statuses = Vec::new();
@@ -504,7 +514,7 @@ mod tests {
         }
         statuses.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         statuses.dedup();
-        assert_eq!(statuses.len(), 4);
+        assert_eq!(statuses.len(), 5);
     }
 
     #[test]

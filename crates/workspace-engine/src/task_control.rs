@@ -47,6 +47,9 @@ pub enum TaskOutcomeKind {
     CannotFit,
     /// The engine-owned segment progress state repeated (spec 103 Task 6).
     NoProgress,
+    /// A worker spent its pre-plan exploration budget and did not propose a
+    /// plan when asked (spec 103 R17).
+    PrePlanExplorationExhausted,
     Ended,
 }
 
@@ -67,6 +70,7 @@ impl TaskOutcomeKind {
             Self::BudgetExhausted => "budget_exhausted",
             Self::CannotFit => "cannot_fit",
             Self::NoProgress => "no_progress",
+            Self::PrePlanExplorationExhausted => "preplan_exploration_exhausted",
             Self::Ended => "ended",
         }
     }
@@ -414,7 +418,8 @@ impl TaskControl {
         match &task.status {
             TaskStatus::TaskBudgetExhausted
             | TaskStatus::TaskCompactionCannotFit
-            | TaskStatus::TaskNoProgress => {
+            | TaskStatus::TaskNoProgress
+            | TaskStatus::TaskPrePlanExplorationExhausted => {
                 let (outcome_kind, headline, detail) =
                     bounded_stop_presentation(&task.status, outcome);
                 Self::terminal(
@@ -588,6 +593,7 @@ impl TaskControl {
                 TaskStatus::TaskBudgetExhausted
                     | TaskStatus::TaskCompactionCannotFit
                     | TaskStatus::TaskNoProgress
+                    | TaskStatus::TaskPrePlanExplorationExhausted
             ) || (matches!(status, TaskStatus::Failed)
                 && outcome.is_some_and(usage_unavailable)))
         {
@@ -1275,7 +1281,8 @@ pub fn turn_presentation_with_outcome(
         },
         TaskStatus::TaskBudgetExhausted
         | TaskStatus::TaskCompactionCannotFit
-        | TaskStatus::TaskNoProgress => {
+        | TaskStatus::TaskNoProgress
+        | TaskStatus::TaskPrePlanExplorationExhausted => {
             let (_, headline, detail) = bounded_stop_presentation(status, outcome);
             TurnPresentation {
                 indicator_state: TurnIndicatorState::Incomplete,
@@ -1563,6 +1570,7 @@ fn bounded_stop_presentation(
         TaskStatus::TaskBudgetExhausted => TaskOutcomeKind::BudgetExhausted,
         TaskStatus::TaskCompactionCannotFit => TaskOutcomeKind::CannotFit,
         TaskStatus::TaskNoProgress => TaskOutcomeKind::NoProgress,
+        TaskStatus::TaskPrePlanExplorationExhausted => TaskOutcomeKind::PrePlanExplorationExhausted,
         _ => TaskOutcomeKind::Failed,
     };
     match outcome {
@@ -1583,6 +1591,12 @@ fn bounded_stop_presentation(
                 kind,
                 "Task made no progress".to_string(),
                 "The task repeated its recent state without advancing, so the engine stopped it."
+                    .to_string(),
+            ),
+            TaskStatus::TaskPrePlanExplorationExhausted => (
+                kind,
+                "Pre-plan exploration exhausted".to_string(),
+                "The worker spent its pre-plan exploration budget and did not propose a plan when asked."
                     .to_string(),
             ),
             _ => (

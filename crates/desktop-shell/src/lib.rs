@@ -15700,15 +15700,18 @@ mod tests {
             );
         }
 
-        /// Spec 61 §5.5: a turn paused at its round budget is answered in the
-        /// worker's own process through `resume_round_budget`, never by the
-        /// shell reading the pending file. `approve` means *Continue*, so the
-        /// turn re-enters with more rounds and completes as the same task.
+        /// Spec 103 R17: a worker in its pre-plan phase crosses the ordinary
+        /// round budget in an internal segment instead of pausing for
+        /// **Continue**. The in-process host still runs the resumed work as the
+        /// same task, and no round-budget card is written. The explicit
+        /// round-budget resume path remains for a worker whose plan already
+        /// exists but whose task budget was not approved.
         #[test]
-        fn a_worker_answers_a_round_budget_pause_in_process() {
+        fn a_worker_crosses_the_preplan_round_budget_without_pausing() {
             let repo = fixture("rb");
-            // Read-only rounds up to the default budget hit it; the next
-            // response answers after *Continue* re-enters the turn.
+            // One more response than the ordinary action-round budget: the
+            // boundary starts the next pre-plan segment and the last response
+            // answers.
             let budget = Config::default().agent_max_tool_rounds;
             let responses: Vec<String> = (0..budget)
                 .map(|_| read_only_round())
@@ -15718,35 +15721,22 @@ mod tests {
             let (host, session) = hosted(&repo, script);
 
             assert_eq!(send(&host, message("Look at the files."))["ok"], true);
-            let waiting = settle(&host);
-            assert_eq!(waiting["state"], "waiting_for_approval", "{waiting}");
-            let proposal_id = waiting["proposalId"].as_str().unwrap().to_string();
+            let done = settle(&host);
+            assert_eq!(
+                done["state"], "idle",
+                "the pre-plan phase must not wait for a round-budget decision: {done}"
+            );
 
             let approvals = payloads(&progress(&session), "approval");
-            assert_eq!(approvals.len(), 1, "{approvals:?}");
-            assert_eq!(approvals[0]["kind"], "round_budget");
-            assert_eq!(approvals[0]["proposal"]["proposalId"], proposal_id.as_str());
-
-            assert_eq!(
-                send(
-                    &host,
-                    ControlCommand::Approve {
-                        proposal_id,
-                        budget: None,
-                    }
-                )["ok"],
-                true
-            );
-            let done = settle(&host);
-            assert_eq!(done["state"], "idle", "{done}");
-            assert_eq!(
-                done["pid"],
-                std::process::id(),
-                "the same process resumed it"
+            assert!(
+                !approvals
+                    .iter()
+                    .any(|approval| approval["kind"] == "round_budget"),
+                "a worker must not be offered generic Continue before a plan: {approvals:?}"
             );
 
             let tasks = store().read_tasks(&session).unwrap();
-            assert_eq!(tasks.len(), 1, "one turn, resumed, not a second one");
+            assert_eq!(tasks.len(), 1, "one turn, continued internally");
             assert_eq!(tasks[0].status, TaskStatus::Complete);
         }
 

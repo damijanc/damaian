@@ -689,46 +689,45 @@ fn a_smaller_budget_caps_the_allowance_before_the_ordinary_segment() {
 }
 
 #[test]
-fn an_unbudgeted_worker_and_an_inline_task_keep_the_round_budget_pause() {
-    for (label, worker) in [("worker", true), ("inline", false)] {
-        let repo = temp_repo(label);
-        let engine = engine_for(&repo, |config| {
-            config.agent_max_tool_rounds = 1;
-            config.agent_max_exploration_rounds = 5;
-        });
-        let session = worker.then(|| worker_session(&engine, &repo));
-        let mut adapter = MockModelAdapter::new_sequence(vec![
-            "DAMAIAN_COMMAND_V1\nCOMMAND: ls src\nREASON: Look.\nEND_COMMAND\n".to_string(),
-            "DAMAIAN_COMMAND_V1\nCOMMAND: ls src\nREASON: Look.\nEND_COMMAND\n".to_string(),
-        ]);
-        let result = ask_with_options(
-            &engine,
-            &repo,
-            session.as_ref().map(|session| session.id.as_str()),
-            &mut adapter,
-            ChatTurnOptions::default(),
-        )
-        .expect("the turn should pause");
-        assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
-        assert!(
-            result.round_budget_proposal.is_some(),
-            "{label}: the explicit round budget stays"
-        );
-        let events = segment_events(
-            &engine,
-            session.as_ref().map_or(&result.session.id, |s| &s.id),
-        );
-        assert!(
-            events.is_empty(),
-            "{label}: no segment events without a budget"
-        );
-        let proposal = result.round_budget_proposal.unwrap();
-        let pending = pending_json(&engine, &proposal.id);
-        assert!(
-            pending.get("segment").is_none(),
-            "{label}: a budgetless pending turn keeps its old shape"
-        );
-    }
+fn an_inline_task_keeps_the_round_budget_pause_without_a_preplan_segment() {
+    // The worker half of this test used to assert the same generic Continue.
+    // Spec 103 R17 (D3) supersedes it: a worker's pre-plan exploration is
+    // bounded by its own segment budget, so a worker no longer lands here.
+    // `preplan_exploration.rs` owns that behaviour; this guard keeps the
+    // interactive session's limits exactly as they were.
+    let repo = temp_repo("inline-round-budget");
+    let engine = engine_for(&repo, |config| {
+        config.agent_max_tool_rounds = 1;
+        config.agent_max_exploration_rounds = 5;
+    });
+    let mut adapter = MockModelAdapter::new_sequence(vec![
+        "DAMAIAN_COMMAND_V1\nCOMMAND: ls src\nREASON: Look.\nEND_COMMAND\n".to_string(),
+        "DAMAIAN_COMMAND_V1\nCOMMAND: ls src\nREASON: Look.\nEND_COMMAND\n".to_string(),
+    ]);
+    let result = ask_with_options(
+        &engine,
+        &repo,
+        None,
+        &mut adapter,
+        ChatTurnOptions::default(),
+    )
+    .expect("the turn should pause");
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+    assert!(
+        result.round_budget_proposal.is_some(),
+        "the explicit round budget stays for an interactive session"
+    );
+    let events = segment_events(&engine, &result.session.id);
+    assert!(
+        events.is_empty(),
+        "an interactive session has no pre-plan or task segment"
+    );
+    let proposal = result.round_budget_proposal.unwrap();
+    let pending = pending_json(&engine, &proposal.id);
+    assert!(
+        pending.get("segment").is_none(),
+        "a budgetless interactive pending turn keeps its old shape"
+    );
 }
 
 #[test]

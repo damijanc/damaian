@@ -385,6 +385,15 @@ pub struct Config {
     /// user's money on the repository's say-so. `0` restores today's behaviour,
     /// where every read counts as an action round.
     pub agent_max_exploration_rounds: u32,
+    /// Exploration rounds a worker may spend before it must propose a plan
+    /// (spec 103 R17).
+    ///
+    /// This is the bounded pre-plan phase: it may span several ordinary
+    /// exploration segments, and exhausting it requires a `propose_plan`, not a
+    /// generic **Continue**. Restrict-only, lower wins, and the effective value
+    /// is also bounded by [`Self::worker_task_budget_max_exploration_rounds`],
+    /// so neither a repository nor a profile can buy a longer discovery pass.
+    pub worker_preplan_exploration_rounds: u32,
     /// The total action-round allowance a worker plan review proposes (spec 103
     /// Task 1). This is a task-wide budget, not a per-segment limit:
     /// [`Self::agent_max_tool_rounds`] remains the checkpoint inside it.
@@ -1297,6 +1306,7 @@ impl Config {
             agent_max_turn_messages,
             agent_max_turn_notes_chars,
             agent_max_exploration_rounds,
+            worker_preplan_exploration_rounds,
             worker_task_budget_action_rounds,
             worker_task_budget_exploration_rounds,
             worker_task_budget_input_tokens,
@@ -1830,6 +1840,21 @@ impl Config {
             outcome.record(scope, "agent_max_exploration_rounds", None, loosened);
         }
 
+        // Spec 103 R17: the pre-plan exploration budget is a capability for the
+        // same reason. A repository may shorten a worker's discovery pass, never
+        // lengthen it.
+        if let Some(value) = worker_preplan_exploration_rounds
+            && let Some(loosened) = restrict_only_u32(
+                &mut self.worker_preplan_exploration_rounds,
+                value,
+                "worker_preplan_exploration_rounds",
+                trusted,
+                rejected,
+            )
+        {
+            outcome.record(scope, "worker_preplan_exploration_rounds", None, loosened);
+        }
+
         // Spec 103 Task 1: every worker-task budget proposal and ceiling is a
         // capability, not a preference. Raising one spends more of the user's
         // money on the repository's or profile's say-so, so an untrusted scope
@@ -2310,6 +2335,20 @@ impl Config {
     /// configuration error. Remote endpoints keep failing loudly.
     pub fn model_endpoint_is_loopback(&self) -> bool {
         crate::web_diagnostics::is_loopback_url(&self.model_base_url)
+    }
+
+    /// The effective pre-plan exploration allowance for a worker (spec 103
+    /// R17).
+    ///
+    /// The configured proposal is bounded by the worker task-exploration
+    /// ceiling and the absolute product ceiling, so lowering either bound
+    /// always lowers the pre-plan phase. It is never a separate store: no plan
+    /// exists yet to approve one, and the budget exists only to make the
+    /// pre-plan phase finite and to require a plan at its end.
+    pub fn preplan_exploration_rounds(&self) -> u32 {
+        self.worker_preplan_exploration_rounds
+            .min(self.worker_task_budget_max_exploration_rounds)
+            .min(crate::task_budget::ABSOLUTE_TASK_EXPLORATION_ROUND_CEILING)
     }
 
     /// The effective worker-task budget policy (spec 103 Task 1).
@@ -3198,6 +3237,11 @@ impl Config {
         );
         push_line(
             &mut output,
+            "worker_preplan_exploration_rounds",
+            &self.worker_preplan_exploration_rounds.to_string(),
+        );
+        push_line(
+            &mut output,
             "worker_task_budget_action_rounds",
             &self.worker_task_budget_action_rounds.to_string(),
         );
@@ -3407,6 +3451,11 @@ impl Default for Config {
             // (spec 59 §5.4). The number is a starting point; the long-task
             // scenario is what checks it.
             agent_max_exploration_rounds: 24,
+            // Spec 103 R17: three ordinary exploration segments (3 × 24). The
+            // motivating measurement behind spec 103 saw up to 72 read rounds
+            // before an implementation task was understood.
+            worker_preplan_exploration_rounds:
+                crate::task_budget::DEFAULT_WORKER_PREPLAN_EXPLORATION_ROUNDS,
             // Spec 103 Task 1: six ordinary segments at the default per-segment
             // limits (6 × 16 actions, 6 × 24 reads). Observation 42 measured
             // delegated specification tasks at up to 78 action and 72 read
@@ -3552,6 +3601,9 @@ pub struct ConfigOverlay {
     pub agent_max_turn_messages: Option<usize>,
     pub agent_max_turn_notes_chars: Option<usize>,
     pub agent_max_exploration_rounds: Option<u32>,
+    /// Spec 103 R17: the bounded pre-plan exploration allowance. Restrict-only
+    /// at repository and profile scope, like every other spend decision.
+    pub worker_preplan_exploration_rounds: Option<u32>,
     /// Spec 103 Task 1: the worker-task budget a plan review proposes, and the
     /// ceilings that bound it. Every field is restrict-only at repository and
     /// profile scope, so an untrusted checkout can lower a proposal but never
@@ -3762,6 +3814,8 @@ classify_overlay_fields! {
     // Spec 59: restrict-only, so a capability — a repository may lower the
     // read allowance, never raise it (§5.4).
     agent_max_exploration_rounds => Capability,
+    // Spec 103 R17: same direction and reason, for the bounded pre-plan pass.
+    worker_preplan_exploration_rounds => Capability,
     // Spec 103 Task 1: the worker-task budget proposal and its ceilings all
     // decide how much of the user's money one task may spend, so every field is
     // restrict-only at repository and profile scope.
@@ -4089,6 +4143,13 @@ impl ConfigOverlay {
             }
             "agent_max_exploration_rounds" => {
                 self.agent_max_exploration_rounds = Some(parse_exploration_round_count(key, value)?)
+            }
+            "worker_preplan_exploration_rounds" => {
+                self.worker_preplan_exploration_rounds = Some(parse_task_budget_rounds(
+                    key,
+                    value,
+                    crate::task_budget::ABSOLUTE_TASK_EXPLORATION_ROUND_CEILING,
+                )?)
             }
             "worker_task_budget_action_rounds" => {
                 self.worker_task_budget_action_rounds = Some(parse_task_budget_rounds(
@@ -4547,6 +4608,7 @@ impl ConfigOverlay {
             agent_max_turn_messages,
             agent_max_turn_notes_chars,
             agent_max_exploration_rounds,
+            worker_preplan_exploration_rounds,
             worker_task_budget_action_rounds,
             worker_task_budget_exploration_rounds,
             worker_task_budget_input_tokens,
@@ -4791,6 +4853,13 @@ impl ConfigOverlay {
             push_line(
                 &mut output,
                 "agent_max_exploration_rounds",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = worker_preplan_exploration_rounds {
+            push_line(
+                &mut output,
+                "worker_preplan_exploration_rounds",
                 &value.to_string(),
             );
         }

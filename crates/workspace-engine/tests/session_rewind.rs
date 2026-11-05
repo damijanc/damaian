@@ -609,7 +609,10 @@ fn terminal_states_are_exactly_these() {
             // that could not fit, one repeated progress.
             "task_budget_exhausted",
             "task_compaction_cannot_fit",
-            "task_no_progress"
+            "task_no_progress",
+            // Spec 103 R17. The pre-plan phase is over and the worker did not
+            // propose a plan; the user restarts with a narrower prompt.
+            "task_preplan_exploration_exhausted"
         ]
     );
 }

@@ -398,6 +398,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         agent_max_turn_messages,
         agent_max_turn_notes_chars,
         agent_max_exploration_rounds,
+        worker_preplan_exploration_rounds,
         worker_task_budget_action_rounds,
         worker_task_budget_exploration_rounds,
         worker_task_budget_input_tokens,
@@ -666,6 +667,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         agent_max_turn_messages,
         agent_max_turn_notes_chars,
         agent_max_exploration_rounds,
+        worker_preplan_exploration_rounds,
         worker_task_budget_action_rounds,
         worker_task_budget_exploration_rounds,
         worker_task_budget_input_tokens,
@@ -816,6 +818,10 @@ fn equals_base_limit(key: &str, carried: &ConfigOverlay, base: &Config) -> bool 
         }
         "agent_max_exploration_rounds" => {
             carried.agent_max_exploration_rounds == Some(base.agent_max_exploration_rounds)
+        }
+        "worker_preplan_exploration_rounds" => {
+            carried.worker_preplan_exploration_rounds
+                == Some(base.worker_preplan_exploration_rounds)
         }
         "worker_task_budget_action_rounds" => {
             carried.worker_task_budget_action_rounds == Some(base.worker_task_budget_action_rounds)
