@@ -585,8 +585,36 @@ pub fn repair_targets(entries: &[(FailureProvenance, ProvenanceCheck)]) -> Vec<R
     targets
 }
 
+/// The most detail bytes one finding may contribute to a repair request.
+///
+/// A [`Finding`](crate::finding::Finding) already bounds its redacted details
+/// at [`MAX_DETAILS_BYTES`](crate::finding::MAX_DETAILS_BYTES); the repair
+/// request keeps a smaller per-finding budget so one verbose compiler block
+/// cannot crowd out the other introduced findings.
+pub const MAX_REPAIR_FINDING_DETAILS_BYTES: usize = 1_200;
+
+/// The most detail bytes all findings together may contribute to one repair
+/// request. The summary and location line for every finding is always kept;
+/// only the `details()` bodies share this budget.
+pub const MAX_REPAIR_TOTAL_DETAILS_BYTES: usize = 4_000;
+
+/// Marks a finding whose own details were cut by the per-finding budget.
+pub const REPAIR_FINDING_DETAILS_TRUNCATED: &str = "… [finding details truncated]";
+
+/// Marks the point where the request's total details budget was exhausted.
+pub const REPAIR_TOTAL_DETAILS_TRUNCATED: &str = "… [remaining repair details omitted]";
+
 /// Render the normalized evidence a repair turn may receive. Raw command output
 /// is never part of a target, so it cannot reach the model through here.
+///
+/// A finding's summary and location always stay. Its already-redacted
+/// `details` are rendered below it, bounded by
+/// [`MAX_REPAIR_FINDING_DETAILS_BYTES`] per finding and
+/// [`MAX_REPAIR_TOTAL_DETAILS_BYTES`] across the request. When a cut happens
+/// the request says so with [`REPAIR_FINDING_DETAILS_TRUNCATED`] or
+/// [`REPAIR_TOTAL_DETAILS_TRUNCATED`], so the model never treats a partial
+/// block as complete. The scope line and every finding summary are never
+/// dropped to make room.
 pub fn render_repair_request(targets: &[RepairTarget]) -> Option<String> {
     if targets.is_empty() {
         return None;
@@ -595,13 +623,75 @@ pub fn render_repair_request(targets: &[RepairTarget]) -> Option<String> {
         "Repair only the failures this patch introduced. Do not try to fix failures that \
          predate the patch.\n\n",
     );
+    let mut remaining_details = MAX_REPAIR_TOTAL_DETAILS_BYTES;
+    let mut total_truncated = false;
     for target in targets {
         text.push_str(&format!("- {} — {}\n", target.label, target.reason));
         for evidence in &target.evidence {
             text.push_str(&format!("  - {}\n", evidence_line(evidence)));
+            let Some(details) = evidence.details() else {
+                continue;
+            };
+            if details.is_empty() {
+                continue;
+            }
+            if remaining_details == 0 {
+                if !total_truncated {
+                    push_repair_detail(&mut text, REPAIR_TOTAL_DETAILS_TRUNCATED);
+                    total_truncated = true;
+                }
+                continue;
+            }
+            let per_finding = MAX_REPAIR_FINDING_DETAILS_BYTES.min(remaining_details);
+            if details.len() <= per_finding {
+                push_repair_detail(&mut text, details);
+                remaining_details -= details.len();
+                continue;
+            }
+            // The smaller remaining budget decides which marker is honest:
+            // this finding was cut by its own cap, or the request ran out.
+            let total_bound = remaining_details <= MAX_REPAIR_FINDING_DETAILS_BYTES;
+            let marker = if total_bound {
+                REPAIR_TOTAL_DETAILS_TRUNCATED
+            } else {
+                REPAIR_FINDING_DETAILS_TRUNCATED
+            };
+            let marker_bytes = marker.len().min(per_finding);
+            let body_limit = per_finding - marker_bytes;
+            let body = details_prefix(details, body_limit);
+            if !body.is_empty() {
+                push_repair_detail(&mut text, body);
+            }
+            push_repair_detail(&mut text, marker);
+            if total_bound {
+                total_truncated = true;
+                remaining_details = 0;
+            } else {
+                remaining_details = remaining_details.saturating_sub(body.len() + marker_bytes);
+            }
         }
     }
     Some(text.trim_end().to_string())
+}
+
+/// Append one detail block below its finding, indented so it is visibly part of
+/// that finding rather than another finding's summary line.
+fn push_repair_detail(text: &mut String, detail: &str) {
+    for line in detail.lines() {
+        text.push_str("      ");
+        text.push_str(line);
+        text.push('\n');
+    }
+}
+
+/// The longest prefix of `details` that fits `limit` bytes without splitting a
+/// character. `Finding::new` bounds details on the same boundary rule.
+fn details_prefix(details: &str, limit: usize) -> &str {
+    let mut end = limit.min(details.len());
+    while !details.is_char_boundary(end) {
+        end -= 1;
+    }
+    &details[..end]
 }
 
 /// One finding as the repair request states it, without output or ids that

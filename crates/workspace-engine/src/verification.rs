@@ -279,14 +279,16 @@ pub(crate) fn environment_termination(error: &ClientError) -> Option<CheckTermin
     }
 }
 
-/// A redacted, canonical finding for fingerprinting (spec 102 requirement 3).
+/// A redacted, canonical finding for fingerprinting and repair evidence
+/// (spec 102 requirements 3 and 10).
 ///
 /// Fields are private so [`FindingEvidence::from_finding`] is the normal
 /// constructor. It copies only the stable, already-redacted parts of a
-/// [`Finding`]: the transient id, creation time, origin reference, status and
-/// details are deliberately absent, so a log reload cannot change a
-/// fingerprint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// [`Finding`]: the transient id, creation time, origin reference and status
+/// are deliberately absent, so a log reload cannot change a fingerprint.
+/// `details` is kept for the model's repair evidence but is excluded from the
+/// fingerprint and the comparison keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FindingEvidence {
     source: FindingSource,
@@ -300,6 +302,11 @@ pub struct FindingEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     start_column: Option<u32>,
     summary: String,
+    /// The finding's redacted [`Finding::details`], if any. Recorded so a
+    /// reload and a worker restart render the same repair evidence; it is not
+    /// part of a failure's identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
 }
 
 impl FindingEvidence {
@@ -318,6 +325,9 @@ impl FindingEvidence {
             start_line: range.map(|range| range.start_line),
             start_column: range.and_then(|range| range.start_column),
             summary: normalized_text(finding.summary()),
+            // Already redacted and bounded by `Finding::new`; whitespace is
+            // meaningful in a compiler block, so it is kept verbatim.
+            details: finding.details().map(str::to_string),
         }
     }
 
@@ -349,6 +359,12 @@ impl FindingEvidence {
         &self.summary
     }
 
+    /// The finding's redacted, bounded details as the repair request may show
+    /// them. Not an input to the failure fingerprint or comparison keys.
+    pub fn details(&self) -> Option<&str> {
+        self.details.as_deref()
+    }
+
     /// The stable comparison key for provenance and stagnation (spec 102).
     ///
     /// It deliberately omits `start_line` and `start_column`: a patch that
@@ -371,10 +387,41 @@ impl FindingEvidence {
     /// The location-inclusive key. It is used only to recognise the occurrence
     /// that stayed put when the same finding also moved or multiplied, so the
     /// newly introduced occurrence is the one reported to repair.
+    ///
+    /// It is deliberately built from the same fields as [`Self::canonical_key`]
+    /// plus the location. `details` is excluded: the repair text a model sees
+    /// must not decide which occurrence is pre-existing.
     pub(crate) fn location_key(&self) -> String {
-        serde_json::to_string(self).expect("finding evidence is serializable")
+        serde_json::to_string(&serde_json::json!({
+            "source": self.source,
+            "severity": self.severity,
+            "code": self.code,
+            "path": self.path,
+            "startLine": self.start_line,
+            "startColumn": self.start_column,
+            "summary": self.summary,
+        }))
+        .expect("finding evidence is serializable")
     }
 }
+
+impl PartialEq for FindingEvidence {
+    /// Equality is the finding's identity, not its display: `details` is
+    /// transient output and is excluded exactly as it is from the fingerprint.
+    /// Keeping it on the value lets a repair request render it without making
+    /// two runs of the same failure unequal.
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.severity == other.severity
+            && self.code == other.code
+            && self.path == other.path
+            && self.start_line == other.start_line
+            && self.start_column == other.start_column
+            && self.summary == other.summary
+    }
+}
+
+impl Eq for FindingEvidence {}
 
 /// A stable digest of a failed check result (spec 102 requirement 3).
 ///

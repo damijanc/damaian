@@ -2698,6 +2698,40 @@ fn repaired_shell(root: &std::path::Path) -> PathBuf {
     path
 }
 
+/// A `cargo test` shell whose whole stdout and stderr are fixed files. The
+/// repair-request tests need the exact bytes a parser reads, without relying
+/// on how a compiler or test runner formats them today.
+fn scripted_cargo_shell(
+    root: &std::path::Path,
+    data_dir: &std::path::Path,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("bin").join("scripted-cargo-shell.sh");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Keep the captured streams outside the repository. Context assembly
+    // retrieves repository files, and a fixture's raw output must not reach the
+    // request except through the finding under test.
+    let stdout_path = data_dir.join("scripted-stdout.txt");
+    let stderr_path = data_dir.join("scripted-stderr.txt");
+    fs::write(&stdout_path, stdout).unwrap();
+    fs::write(&stderr_path, stderr).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$2\" in\n  *\"cargo test\"*)\n    cat '{}'\n    cat '{}' >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
+            stdout_path.display(),
+            stderr_path.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path.to_string_lossy().to_string()
+}
+
 fn started_attempts(events: &[VerificationEvent]) -> Vec<u32> {
     events
         .iter()
@@ -3745,11 +3779,26 @@ fn a_repair_that_breaks_a_previously_passing_check_is_a_regression() {
 
 #[test]
 fn the_repair_request_carries_normalized_evidence_not_the_raw_log() {
+    const SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
     let root = temp_dir("repair-request");
     let data_dir = temp_dir("repair-request-data");
     cargofile(&root);
-    let shell = repaired_shell(&root).to_string_lossy().to_string();
-    fs::write(root.join("cargo-fail"), "fail\n").unwrap();
+    // A real `cargo test` failure: the test's assertion carries the left and
+    // right values, and the output also leaks a secret-looking value. Only the
+    // normalized finding, its location and its redacted details may reach the
+    // model.
+    let stdout = format!(
+        "---- repro stdout ----\n\
+         thread 'repro' panicked at src/a.rs:1:1:\n\
+         assertion `left == right` failed\n\
+         \x20 left: 41\n\
+         \x20 right: 42\n\
+         leaked credential {SECRET}\n\
+         \n\
+         failures:\n\
+         \x20   repro\n"
+    );
+    let shell = scripted_cargo_shell(&root, &data_dir, &stdout, "");
     let engine = verify_engine_with_retry(&root, &data_dir, &shell, &["cargo test"], &[], 2);
     let (session, _task) = applied_change(
         &engine,
@@ -3791,6 +3840,133 @@ fn the_repair_request_carries_normalized_evidence_not_the_raw_log() {
         user.content
             .contains("Repair only the failures this patch introduced"),
         "the repair request states its scope: {}",
+        user.content
+    );
+    // R6 (spec 102): a finding's already-redacted details are part of the
+    // repair evidence. An `assert_eq` failure's left and right values are the
+    // action the worker needs, and they were lost when the request switched to
+    // the normalized summary line.
+    assert!(
+        user.content.contains("left: 41") && user.content.contains("right: 42"),
+        "the repair request carries the assertion's left and right values: {}",
+        user.content
+    );
+    // The secret in the raw output must not reach the model, even though the
+    // surrounding details do.
+    assert!(
+        !user.content.contains(SECRET),
+        "a raw-output secret reached the repair request: {}",
+        user.content
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// R6 (spec 102): a rustc type error's `expected`/`found` lines live in the
+/// finding's details, not its summary. They must reach the repair request
+/// while the normalized summary and location stay intact.
+#[test]
+fn the_repair_request_carries_a_rustc_type_error_expected_and_found() {
+    let root = temp_dir("repair-request-rustc-details");
+    let data_dir = temp_dir("repair-request-rustc-details-data");
+    cargofile(&root);
+    let stderr = "error[E0308]: mismatched types\n\
+                  \x20--> src/a.rs:1:1\n\
+                  \x20 |\n\
+                  \x201 | let a: u8 = \"text\";\n\
+                  \x20 |              ^^^^^^ expected `u8`, found `&str`\n\
+                  \n\
+                  error: could not compile `fixture` (bin \"fixture\") due to 1 previous error\n";
+    let shell = scripted_cargo_shell(&root, &data_dir, "", stderr);
+    let engine = verify_engine_with_retry(&root, &data_dir, &shell, &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut repair = MockModelAdapter::new("I cannot fix this.");
+
+    run_verification(&engine, &root, &session, &mut repair);
+
+    let request = repair
+        .requests
+        .first()
+        .expect("the repair turn called the model");
+    let user = request
+        .messages
+        .iter()
+        .find(|message| message.role == "user")
+        .expect("a user message carries the request");
+    assert!(
+        user.content.contains("mismatched types") && user.content.contains("src/a.rs:1:1"),
+        "the normalized summary and location stay: {}",
+        user.content
+    );
+    assert!(
+        user.content.contains("expected `u8`, found `&str`"),
+        "the repair request carries rustc's expected and found detail: {}",
+        user.content
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// R6 (spec 102): an unparsed check falls back to one generic finding whose
+/// details are a bounded stderr tail. The repair request carries that tail and
+/// still leaves out the lines the finding itself dropped.
+#[test]
+fn the_repair_request_carries_a_generic_checks_bounded_stderr_tail() {
+    let root = temp_dir("repair-request-generic-details");
+    let data_dir = temp_dir("repair-request-generic-details-data");
+    cargofile(&root);
+    let mut lines = vec!["BEGIN UNPARSED CHECK".to_string()];
+    for index in 1..=44 {
+        lines.push(format!("line {index:02}"));
+    }
+    let stderr = format!("{}\n", lines.join("\n"));
+    let shell = scripted_cargo_shell(&root, &data_dir, "", &stderr);
+    let engine = verify_engine_with_retry(&root, &data_dir, &shell, &["cargo test"], &[], 2);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut repair = MockModelAdapter::new("I cannot fix this.");
+
+    run_verification(&engine, &root, &session, &mut repair);
+
+    let findings = engine.session_store.read_findings(&session, &root).unwrap();
+    let finding = findings
+        .first()
+        .expect("the generic fallback recorded a finding");
+    assert_eq!(
+        finding.source(),
+        workspace_engine::finding::FindingSource::Command
+    );
+    let details = finding.details().expect("a generic finding keeps a tail");
+    assert!(
+        details.contains("line 44") && !details.contains("line 01"),
+        "the finding itself keeps only the bounded tail: {details}"
+    );
+    let request = repair
+        .requests
+        .first()
+        .expect("the repair turn called the model");
+    let user = request
+        .messages
+        .iter()
+        .find(|message| message.role == "user")
+        .expect("a user message carries the request");
+    assert!(
+        user.content.contains("line 44"),
+        "the repair request carries the generic stderr tail: {}",
+        user.content
+    );
+    assert!(
+        !user.content.contains("line 01"),
+        "the repair request does not carry lines the finding dropped: {}",
         user.content
     );
 
@@ -5224,6 +5400,16 @@ fn provenance_and_repair_targets_survive_a_fresh_store() {
     assert!(!report.repair_targets.is_empty());
     assert!(!report.repair_targets[0].evidence.is_empty());
     assert!(report.render().contains("Introduced regressions"));
+    // R6 (spec 102): redacted details are durable on the evidence, so the
+    // reloaded repair request is not poorer than the live one.
+    assert!(
+        report
+            .repair_request()
+            .expect("the reloaded report still repairs")
+            .contains("--> src/a.rs:1:1"),
+        "the reloaded repair request keeps the finding's details: {}",
+        report.repair_request().unwrap()
+    );
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);

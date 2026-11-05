@@ -228,7 +228,9 @@ pub use protected_paths::{
     parse_protected_path_prompt, protected_path_update_outcome, resolve_active_protected_path,
 };
 pub use provenance::{
-    PostPatchResult, ProvenanceCheck, ProvenanceClassification, ProvenancePartition, RepairTarget,
+    MAX_REPAIR_FINDING_DETAILS_BYTES, MAX_REPAIR_TOTAL_DETAILS_BYTES, PostPatchResult,
+    ProvenanceCheck, ProvenanceClassification, ProvenancePartition,
+    REPAIR_FINDING_DETAILS_TRUNCATED, REPAIR_TOTAL_DETAILS_TRUNCATED, RepairTarget,
     VerificationAction, VerificationActionKind, build_partitions, classify, provenance_action,
     provenance_count, provenance_label, provenance_reason, provenance_summary,
     render_repair_request, repair_targets,

@@ -11,9 +11,11 @@ use workspace_engine::finding::{Finding, FindingDraft, FindingSource, Severity, 
 use workspace_engine::plan::TaskPlan;
 use workspace_engine::{
     CheckBaseline, CheckId, CheckOutcome, CheckProvenanceRecord, CheckTermination,
-    FailureFingerprint, FailureProvenance, FindingEvidence, PostPatchResult, ProvenanceCheck,
-    ProvenanceClassification, SecretScanner, VerificationEvent, VerificationReport, classify,
-    fold_verification, provenance_reason, repair_targets,
+    FailureFingerprint, FailureProvenance, FindingEvidence, MAX_REPAIR_FINDING_DETAILS_BYTES,
+    MAX_REPAIR_TOTAL_DETAILS_BYTES, PostPatchResult, ProvenanceCheck, ProvenanceClassification,
+    REPAIR_FINDING_DETAILS_TRUNCATED, REPAIR_TOTAL_DETAILS_TRUNCATED, SecretScanner,
+    VerificationEvent, VerificationReport, classify, fold_verification, provenance_reason,
+    repair_targets,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -53,6 +55,27 @@ fn evidence_with(
 
 fn evidence(summary: &str, path: &str, line: u32) -> FindingEvidence {
     evidence_with(Severity::Error, "E0308", summary, path, line)
+}
+
+fn evidence_with_details(summary: &str, path: &str, details: &str) -> FindingEvidence {
+    let finding = Finding::new(
+        FindingDraft {
+            source: FindingSource::Compiler,
+            severity: Severity::Error,
+            summary: summary.to_string(),
+            details: Some(details.to_string()),
+            range: Some(SourceRange {
+                path: path.to_string(),
+                start_line: 1,
+                start_column: Some(1),
+                end_line: None,
+                end_column: None,
+            }),
+            code: Some("E0308".to_string()),
+        },
+        &SecretScanner::new(Vec::new()),
+    );
+    FindingEvidence::from_finding(&finding)
 }
 
 fn failed_baseline(
@@ -675,4 +698,83 @@ fn a_historical_failure_without_recorded_termination_is_unknown_not_environment(
     );
     assert!(report.repair_targets.is_empty());
     assert!(report.repair_request().is_none());
+}
+
+/// R6 (spec 102): one verbose finding cannot spend the whole repair request.
+/// Its `details()` is cut to the per-finding budget and the request says so.
+#[test]
+fn a_repair_request_bounds_one_findings_details() {
+    let check = check("", "cargo test");
+    let long = "x".repeat(workspace_engine::finding::MAX_DETAILS_BYTES);
+    let found = evidence_with_details("verbose compiler error", "src/a.rs", &long);
+    let result = PostPatchResult::new(check, exited(1), vec![found]);
+    let classification = classify(&result, Some(&CheckBaseline::Passed), None);
+    let targets = repair_targets(&[entry(&classification)]);
+    let request = workspace_engine::render_repair_request(&targets).unwrap();
+
+    let detail_bytes: usize = request
+        .lines()
+        .filter_map(|line| line.strip_prefix("      "))
+        .map(str::len)
+        .sum();
+    assert!(
+        detail_bytes <= MAX_REPAIR_FINDING_DETAILS_BYTES,
+        "one finding's details exceeded the per-finding budget: {detail_bytes} bytes"
+    );
+    assert!(
+        request.contains(REPAIR_FINDING_DETAILS_TRUNCATED),
+        "the request must say the finding's details were cut: {request}"
+    );
+    assert!(
+        !request.contains(REPAIR_TOTAL_DETAILS_TRUNCATED),
+        "one finding did not exhaust the request budget: {request}"
+    );
+}
+
+/// R6 (spec 102): a check with many introduced findings shares one bounded
+/// details budget. The request marks where later details were omitted, and
+/// still carries every finding's summary line.
+#[test]
+fn a_repair_request_bounds_total_details_across_many_findings() {
+    let check = check("", "cargo test");
+    let long = "y".repeat(workspace_engine::finding::MAX_DETAILS_BYTES);
+    let findings = (0..10)
+        .map(|index| {
+            evidence_with_details(
+                &format!("failure {index}"),
+                &format!("src/f{index}.rs"),
+                &long,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = PostPatchResult::new(check, exited(1), findings.clone());
+    let classification = classify(&result, Some(&CheckBaseline::Passed), None);
+    let targets = repair_targets(&[entry(&classification)]);
+    let request = workspace_engine::render_repair_request(&targets).unwrap();
+
+    let detail_lines = request
+        .lines()
+        .filter_map(|line| line.strip_prefix("      "))
+        .collect::<Vec<_>>();
+    let detail_bytes: usize = detail_lines.iter().map(|line| line.len()).sum();
+    assert!(
+        detail_bytes <= MAX_REPAIR_TOTAL_DETAILS_BYTES,
+        "the request's details exceeded the total budget: {detail_bytes} bytes"
+    );
+    assert!(
+        detail_lines
+            .iter()
+            .all(|line| line.len() <= MAX_REPAIR_FINDING_DETAILS_BYTES),
+        "no finding may exceed the per-finding budget"
+    );
+    assert!(
+        request.contains(REPAIR_TOTAL_DETAILS_TRUNCATED),
+        "the request must say the total details budget was reached: {request}"
+    );
+    for index in 0..10 {
+        assert!(
+            request.contains(&format!("failure {index}")),
+            "finding {index}'s summary line is never dropped: {request}"
+        );
+    }
 }
