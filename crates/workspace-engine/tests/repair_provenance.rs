@@ -424,6 +424,46 @@ fn historical_verification_events_replay_without_inventing_provenance() {
 }
 
 #[test]
+fn a_log_without_the_uncertain_value_still_loads() {
+    // A durable log written before `uncertain` existed names only the older
+    // values. Both the declined baseline and the unknown provenance record
+    // must still parse and fold without inventing the new classification.
+    let baseline: VerificationEvent = serde_json::from_value(json!({
+        "kind": "verification_baseline",
+        "taskId": "task",
+        "check": {"workingDirectory": "crates/engine", "command": "cargo test"},
+        "baseline": {"result": "declined"},
+    }))
+    .expect("a pre-uncertain baseline event loads");
+    let provenance: VerificationEvent = serde_json::from_value(json!({
+        "kind": "verification_provenance",
+        "taskId": "task",
+        "record": {
+            "check": {"workingDirectory": "crates/engine", "command": "cargo test"},
+            "provenance": "unknown_provenance",
+            "termination": {"kind": "exited", "exitCode": 1},
+            "fingerprint": "sha256:old",
+            "findings": [],
+        },
+    }))
+    .expect("a pre-uncertain provenance event loads");
+
+    let state = fold_verification([baseline, provenance].iter());
+    assert_eq!(
+        state.baselines.get(&check()),
+        Some(&CheckBaseline::Declined)
+    );
+    assert_eq!(
+        state
+            .provenance
+            .get(&check())
+            .map(|record| record.provenance.as_str()),
+        Some("unknown_provenance"),
+        "an old unknown record stays unknown; it is not promoted to uncertain"
+    );
+}
+
+#[test]
 fn a_legacy_fingerprint_value_still_loads_from_a_baseline_event() {
     let found = evidence("mismatched types", Some("src/a.rs"), Some(8));
     let event = VerificationEvent::Baseline {

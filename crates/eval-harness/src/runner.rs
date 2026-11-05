@@ -237,6 +237,7 @@ fn durable_baselines(
             workspace_engine::CheckBaseline::Passed => "passed",
             workspace_engine::CheckBaseline::Failed { .. } => "failed",
             workspace_engine::CheckBaseline::Declined => "declined",
+            workspace_engine::CheckBaseline::Uncertain => "uncertain",
             workspace_engine::CheckBaseline::Unavailable { .. } => "unavailable",
         };
         baselines.insert(check.command, state.to_string());

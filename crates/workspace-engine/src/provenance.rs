@@ -126,6 +126,16 @@ pub fn classify(
             fingerprint,
             result.findings.clone(),
         ),
+        // A required check that became required after the task had already
+        // changed files has no task-start baseline. It is distinct from an
+        // absent or declined baseline: the engine knows the check was required
+        // by the time it failed, but cannot prove this task caused the change.
+        CheckBaseline::Uncertain => classification(
+            FailureProvenance::Uncertain,
+            result,
+            fingerprint,
+            Vec::new(),
+        ),
         CheckBaseline::Declined | CheckBaseline::Unavailable { .. } => classification(
             FailureProvenance::UnknownProvenance,
             result,
@@ -286,6 +296,7 @@ pub fn provenance_label(provenance: FailureProvenance) -> &'static str {
         FailureProvenance::PreExisting => "Pre-existing failures",
         FailureProvenance::UnchangedFailure => "Unchanged failures",
         FailureProvenance::EnvironmentFailure => "Environment failures",
+        FailureProvenance::Uncertain => "Uncertain provenance",
         FailureProvenance::UnknownProvenance => "Unknown provenance",
     }
 }
@@ -308,6 +319,9 @@ pub fn provenance_summary(provenance: FailureProvenance) -> &'static str {
         }
         FailureProvenance::EnvironmentFailure => {
             "These checks could not run for an environment reason. No code repair was attempted."
+        }
+        FailureProvenance::Uncertain => {
+            "These required checks became required after the task had already changed files, so there is no task-start baseline. Damaian reported them instead of assuming the task caused them; repair waits for your decision."
         }
         FailureProvenance::UnknownProvenance => {
             "There is no usable pre-patch baseline, so Damaian cannot tell whether the patch caused these failures. No repair was attempted."
@@ -351,6 +365,11 @@ pub fn provenance_action(
             "Fix the environment",
             "Make the command available, restore the refused policy, or provide the missing test infrastructure, then run verification again.",
         ),
+        FailureProvenance::Uncertain => (
+            VerificationActionKind::DecideUncertainRepair,
+            "Decide whether to repair",
+            "The check became required after the task had already changed files, so Damaian cannot tell whether this task caused the failure. Answer the repair question to leave it unrepaired or start one repair turn.",
+        ),
         FailureProvenance::UnknownProvenance => (
             VerificationActionKind::ProvideBaseline,
             "Review the failure and provide a baseline",
@@ -373,6 +392,10 @@ pub fn provenance_count(provenance: FailureProvenance, count: usize) -> String {
         FailureProvenance::PreExisting => ("pre-existing failure", "pre-existing failures"),
         FailureProvenance::UnchangedFailure => ("unchanged failure", "unchanged failures"),
         FailureProvenance::EnvironmentFailure => ("environment failure", "environment failures"),
+        FailureProvenance::Uncertain => (
+            "failure with no task-start baseline",
+            "failures with no task-start baseline",
+        ),
         FailureProvenance::UnknownProvenance => (
             "failure of unknown provenance",
             "failures of unknown provenance",
@@ -477,6 +500,7 @@ pub enum VerificationActionKind {
     ReviewUnchangedFailure,
     FixEnvironment,
     ProvideBaseline,
+    DecideUncertainRepair,
     ReviewStalledRepair,
 }
 
@@ -491,6 +515,7 @@ impl VerificationActionKind {
             Self::ReviewUnchangedFailure => "review_unchanged_failure",
             Self::FixEnvironment => "fix_environment",
             Self::ProvideBaseline => "provide_baseline",
+            Self::DecideUncertainRepair => "decide_uncertain_repair",
             Self::ReviewStalledRepair => "review_stalled_repair",
         }
     }
@@ -518,12 +543,16 @@ pub struct RepairTarget {
 pub fn build_partitions(
     entries: Vec<(FailureProvenance, ProvenanceCheck)>,
 ) -> Vec<ProvenancePartition> {
-    const ORDER: [FailureProvenance; 6] = [
+    const ORDER: [FailureProvenance; 7] = [
         FailureProvenance::NewRegression,
         FailureProvenance::Worsened,
         FailureProvenance::PreExisting,
         FailureProvenance::UnchangedFailure,
         FailureProvenance::EnvironmentFailure,
+        // `uncertain` is more specific than the catch-all unknown group: the
+        // engine knows the check was required, only the task-start baseline is
+        // missing. It therefore sits immediately before unknown.
+        FailureProvenance::Uncertain,
         FailureProvenance::UnknownProvenance,
     ];
     let mut partitions = Vec::new();

@@ -525,6 +525,10 @@ pub enum CheckBaseline {
     /// The user declined the baseline. A later failure is unknown provenance,
     /// never assumed to be caused by the task.
     Declined,
+    /// The check became required after the task had already changed files, so
+    /// it has no task-start baseline. A later failure is `uncertain`: it is
+    /// reported and may be repaired only after the user says so (spec 102 D2).
+    Uncertain,
     /// The baseline could not run. Also unknown provenance, with the
     /// environment fact recorded for the user.
     #[serde(rename_all = "camelCase")]
@@ -538,7 +542,7 @@ impl CheckBaseline {
     /// The failure evidence, when the baseline ran and failed.
     pub fn failure_fingerprint(&self) -> Option<&FailureFingerprint> {
         match self {
-            Self::Passed | Self::Declined => None,
+            Self::Passed | Self::Declined | Self::Uncertain => None,
             Self::Failed { fingerprint, .. } | Self::Unavailable { fingerprint, .. } => {
                 Some(fingerprint)
             }
@@ -546,9 +550,9 @@ impl CheckBaseline {
     }
 }
 
-/// The six post-patch classifications (spec 102 requirement 4). Only
-/// `new_regression` and the new portion of `worsened` may enter automatic
-/// repair; this type only names the classification.
+/// The post-patch classifications (spec 102 requirement 4, plus D2's
+/// `uncertain`). Only `new_regression` and the new portion of `worsened` may
+/// enter automatic repair; this type only names the classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureProvenance {
@@ -557,6 +561,11 @@ pub enum FailureProvenance {
     Worsened,
     UnchangedFailure,
     EnvironmentFailure,
+    /// A required check that first became required after the task had already
+    /// changed files, so it has no task-start baseline. It is reported and may
+    /// be repaired only after the user answers a question; it is never
+    /// silently pre-existing or automatically repaired (spec 102 D2).
+    Uncertain,
     UnknownProvenance,
 }
 
@@ -568,6 +577,7 @@ impl FailureProvenance {
             Self::Worsened => "worsened",
             Self::UnchangedFailure => "unchanged_failure",
             Self::EnvironmentFailure => "environment_failure",
+            Self::Uncertain => "uncertain",
             Self::UnknownProvenance => "unknown_provenance",
         }
     }

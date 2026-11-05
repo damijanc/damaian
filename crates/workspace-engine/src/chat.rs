@@ -60,7 +60,7 @@ use crate::protected_paths::{
     ProtectedPathAction, ProtectedPathSource, TaskProtectedPaths, ensure_patch_paths_allowed,
     protected_paths_reminder, record_task_protected_paths_from_prompt,
 };
-use crate::provenance::{PostPatchResult, classify};
+use crate::provenance::{PostPatchResult, RepairTarget, classify};
 use crate::repair_scope::RepairScopeReview;
 use crate::repository_map::RepositoryMapStore;
 use crate::request_preparation::{
@@ -97,9 +97,9 @@ use crate::validation::{
 };
 use crate::vector_index::VectorIndexCache;
 use crate::verification::{
-    CheckId, CheckOutcome, CheckTermination, FindingEvidence, Selection, SkipReason,
-    VerificationEvent, VerificationOutcome, VerificationReport, environment_termination,
-    fold_verification, propose_checks,
+    CheckId, CheckOutcome, CheckTermination, FailureProvenance, FindingEvidence, Selection,
+    SkipReason, VerificationEvent, VerificationOutcome, VerificationReport,
+    environment_termination, fold_verification, propose_checks,
 };
 use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
@@ -3524,6 +3524,7 @@ impl ChatOrchestrator {
         session: &Session,
         task: &Task,
         state: &crate::verification::VerificationState,
+        plan: &TaskPlan,
     ) -> Result<()> {
         let baselines = self
             .session_store
@@ -3531,6 +3532,22 @@ impl ChatOrchestrator {
         let previous = self
             .session_store
             .task_verification_provenance(&session.id, &task.id)?;
+        // A required check with no recorded baseline has no task-start
+        // baseline: the pre-apply gate establishes every required check on the
+        // task's first patch. This fallback covers a check that became
+        // required after the last patch, or a historical log whose first patch
+        // predates required-check baselining. A declined baseline is still
+        // `Some(Declined)` and stays unknown, never uncertain.
+        let required = plan
+            .steps
+            .iter()
+            .filter(|step| !step.id.starts_with("verify_"))
+            .filter_map(|step| step.check.as_ref())
+            .filter(|planned| planned.required)
+            .map(|planned| {
+                CheckId::new(planned.working_directory.as_str(), planned.command.as_str())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
         let findings = self
             .session_store
             .read_findings(&session.id, repository_root)?;
@@ -3558,7 +3575,12 @@ impl ChatOrchestrator {
                 _ => Vec::new(),
             };
             let result = PostPatchResult::new(check.clone(), termination, evidence);
-            let classification = classify(&result, baselines.get(check), previous.get(check));
+            let classification = if !baselines.contains_key(check) && required.contains(check) {
+                let marker = crate::verification::CheckBaseline::Uncertain;
+                classify(&result, Some(&marker), previous.get(check))
+            } else {
+                classify(&result, baselines.get(check), previous.get(check))
+            };
             self.session_store.append_verification_event(
                 &session.id,
                 &VerificationEvent::Provenance {
@@ -3600,7 +3622,7 @@ impl ChatOrchestrator {
             .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
         // Spec 102 Task 3: fingerprint and classify every live result against
         // the task-local baseline before anything decides whether to repair.
-        self.record_post_patch_provenance(repository_root, &session, &task, &state)?;
+        self.record_post_patch_provenance(repository_root, &session, &task, &state, &plan)?;
         let events = self
             .session_store
             .read_verification_events(&session.id, &[])?;
@@ -3621,7 +3643,28 @@ impl ChatOrchestrator {
                 file_hashes,
             );
         }
+        let has_uncertain = preliminary
+            .provenance
+            .iter()
+            .any(|partition| partition.provenance == FailureProvenance::Uncertain);
         if preliminary.repair_targets.is_empty() {
+            // Spec 102 D2: an uncertain failure is never silently pre-existing
+            // and never an automatic repair. A worker asks the user; the
+            // answer decides whether one ordinary repair turn runs. A
+            // non-worker session keeps the report and starts no repair.
+            if has_uncertain
+                && attempt < self.config.agent_tool_retry_limit
+                && self.session_store.worker_record(&session.id)?.is_some()
+            {
+                return self.pause_for_uncertain_repair(
+                    repository_root,
+                    session,
+                    task,
+                    &preliminary,
+                    &plan,
+                    changed,
+                );
+            }
             // Pre-existing, unchanged, environment and unknown failures are
             // reported and may fail completion, but no code-repair turn is
             // started from evidence the patch did not introduce.
@@ -3654,6 +3697,168 @@ impl ChatOrchestrator {
             session,
             task,
             &preliminary,
+            &plan,
+            changed,
+            file_hashes,
+            model_adapter,
+            sink,
+        )
+    }
+
+    /// Parks a worker verification on the engine's own question: the required
+    /// check has no task-start baseline, so Damaian reports the failure and
+    /// lets the user decide whether one repair turn should run (spec 102 D2).
+    ///
+    /// The question is a durable question, not an approval. The answer cannot
+    /// approve a patch or command, and a repair patch it produces still goes
+    /// through its ordinary approval.
+    #[allow(clippy::too_many_arguments)]
+    fn pause_for_uncertain_repair(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        report: &VerificationReport,
+        plan: &TaskPlan,
+        changed: Vec<String>,
+    ) -> Result<ChatTurnResult> {
+        let question = PendingQuestionRef::new();
+        let checks = report
+            .provenance
+            .iter()
+            .filter(|partition| partition.provenance == FailureProvenance::Uncertain)
+            .flat_map(|partition| partition.checks.iter())
+            .map(|check| check.label.clone())
+            .collect::<Vec<_>>();
+        let input = AskUserInput {
+            question: format!(
+                "The required {} became required after this task had already changed files, so there is no task-start baseline. Damaian cannot tell whether this task caused the failure. Do you want one repair turn for it?",
+                checks.join(", ")
+            ),
+            options: vec!["Repair it".to_string(), "Leave it unrepaired".to_string()],
+            allow_free_text: false,
+        };
+        self.session_store
+            .record_question_asked(&session.id, &task.id, &question, &input)?;
+        let response = format!("{}\n\n{}", report.summary(&plan.report()), report.render());
+        self.pending_commands.save(&PendingChatTurn {
+            proposal_id: question.question_id().to_string(),
+            session: session.clone(),
+            task: task.clone(),
+            repository_root: repository_root.to_string_lossy().to_string(),
+            context_files: changed.clone(),
+            round: 0,
+            exploration_rounds: 0,
+            turn_notes: String::new(),
+            turn_notes_carried: false,
+            calls: Vec::new(),
+            completed_tool_rounds: Vec::new(),
+            step_evidence: Vec::new(),
+            plan_reminder_sent: false,
+            messages: Vec::new(),
+            matched_tool_call: None,
+            last_content: String::new(),
+            turn_options: ChatTurnOptions::default(),
+            reasoning_content: None,
+            round_calls_fed_back: false,
+            mcp_call: None,
+            web_diagnostic_call: None,
+            plan_review: None,
+            provider_fallback: None,
+            round_budget: None,
+            segment: None,
+            question: Some(PendingQuestion {
+                question_id: question.question_id().to_string(),
+                kind: PendingQuestionKind::RepairDecision,
+            }),
+            check_batch: None,
+            fetch_call: None,
+            context_review: None,
+        })?;
+        self.note_pending_approvals(&session, &task, Vec::new());
+        let task = self.session_store.await_answer(&task, &question)?;
+        self.audit_log.record(
+            "verification_uncertain_repair_question",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
+                ("questionId", question.question_id().to_string()),
+            ],
+        )?;
+        let mut result = self.verification_turn_result(
+            session,
+            task,
+            response,
+            None,
+            Some(report.clone()),
+            changed,
+        )?;
+        result.question_proposal = Some(AgentQuestionProposal {
+            question_id: question.question_id().to_string(),
+            question: input.question,
+            options: input.options,
+            allow_free_text: input.allow_free_text,
+        });
+        Ok(result)
+    }
+
+    /// Answers the engine's uncertain-repair question: one ordinary repair
+    /// turn for the uncertain evidence, or the same failure reported without a
+    /// repair. Neither choice approves a patch or a command.
+    fn resume_repair_decision(
+        &self,
+        pending: &PendingChatTurn,
+        answer: &str,
+        selected_option: Option<usize>,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let session = pending.session.clone();
+        let task = pending.task.clone();
+        let events = self
+            .session_store
+            .read_verification_events(&session.id, &[])?;
+        let state = fold_verification(events.iter());
+        let plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)?
+            .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
+        let changed = self.verification_changed_files(&session.id, &task.id, state.due.as_ref())?;
+        let file_hashes = hash_existing_files(&repository_root, &changed);
+        let mut report = VerificationReport::build(&state, &plan, &changed, &file_hashes);
+        let repair = selected_option == Some(0) || answer == "Repair it";
+        if !repair {
+            return self.finish_verification_with_outcome(
+                &repository_root,
+                session,
+                task,
+                VerificationOutcome::Failed,
+                changed,
+                file_hashes,
+            );
+        }
+        let targets = uncertain_repair_targets(&report);
+        if targets.is_empty() {
+            return Err(ClientError::InvalidInput(
+                "The uncertain failure is no longer available to repair".to_string(),
+            ));
+        }
+        report.repair_targets = targets;
+        self.audit_log.record(
+            "verification_uncertain_repair_approved",
+            &[
+                ("actor", "user".to_string()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
+            ],
+        )?;
+        self.run_repair_turn(
+            &repository_root,
+            session,
+            task,
+            &report,
             &plan,
             changed,
             file_hashes,
@@ -5694,6 +5899,21 @@ impl ChatOrchestrator {
             "tool",
             &tool_result,
         )?;
+
+        // The engine's own uncertain-repair question is answered through the
+        // same durable route as a model question, but its answer starts one
+        // ordinary repair turn (or leaves the failure reported) instead of
+        // continuing the paused model turn. The answer itself authorises
+        // nothing: the repair patch it produces still needs its own approval.
+        if question.kind == PendingQuestionKind::RepairDecision {
+            return self.resume_repair_decision(
+                &pending,
+                &answer,
+                selected_option,
+                model_adapter,
+                sink,
+            );
+        }
 
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
@@ -11382,6 +11602,7 @@ impl ChatOrchestrator {
                                         }),
                                         question: Some(PendingQuestion {
                                             question_id: question.question_id().to_string(),
+                                            kind: PendingQuestionKind::Agent,
                                         }),
                                         check_batch: None,
                                         fetch_call: None,
@@ -13454,6 +13675,20 @@ impl PausedFor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PendingQuestion {
     question_id: String,
+    /// Whether this is an ordinary model question or the engine's own
+    /// uncertain-repair question (spec 102 D2). The answer route reads it to
+    /// decide between continuing the model turn and running one repair turn.
+    /// Defaulted so a pending question written before this field still loads.
+    #[serde(default)]
+    kind: PendingQuestionKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PendingQuestionKind {
+    #[default]
+    Agent,
+    RepairDecision,
 }
 
 /// What a fetch pause is waiting for (spec 51 §5.3).
@@ -17496,6 +17731,30 @@ fn patch_proposal_response(patch: &ProposedPatch) -> String {
         patch.files.len(),
         if patch.files.len() == 1 { "" } else { "s" }
     )
+}
+
+/// The user-approved repair targets for an `uncertain` failure.
+///
+/// These are not automatic targets: `VerificationReport::build` deliberately
+/// leaves them out. The answer to the engine's repair question is what turns
+/// them into one repair attempt, and the patch that attempt proposes still
+/// needs its ordinary approval.
+fn uncertain_repair_targets(report: &VerificationReport) -> Vec<RepairTarget> {
+    report
+        .provenance
+        .iter()
+        .filter(|partition| partition.provenance == FailureProvenance::Uncertain)
+        .flat_map(|partition| partition.checks.iter())
+        .map(|check| RepairTarget {
+            check: check.check.clone(),
+            label: check.label.clone(),
+            provenance: FailureProvenance::Uncertain,
+            termination: check.termination.clone(),
+            fingerprint: check.fingerprint.clone(),
+            evidence: check.evidence.clone(),
+            reason: check.reason.clone(),
+        })
+        .collect()
 }
 
 /// Every normalized finding location in the active verification report.

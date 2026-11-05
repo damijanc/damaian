@@ -16,10 +16,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::plan::{Evidence, StepStatus, TaskPlan};
 use workspace_engine::{
-    CancelToken, ChatTurnResult, CommandPurpose, CompletionFacts, CompletionGateReport,
-    CompletionReasonCode, Config, MockModelAdapter, ModelAdapter, ModelRun, PLANNED_CHECK_VERSION,
-    PlanRevisionCheck, PlanRevisionStep, PlannedCheck, TaskStatus, TokenUsage, ToolCall,
-    TurnProgress, TurnSink, VerificationEvent, WorkspaceEngine, fold_verification,
+    CancelToken, ChatTurnResult, CheckBaseline, CheckId, CommandPurpose, CompletionFacts,
+    CompletionGateReport, CompletionReasonCode, Config, FailureProvenance, MockModelAdapter,
+    ModelAdapter, ModelRun, PLANNED_CHECK_VERSION, PatchApplyOutcome, PlanRevisionCheck,
+    PlanRevisionStep, PlannedCheck, TaskStatus, TokenUsage, ToolCall, TurnProgress, TurnSink,
+    VerificationEvent, WorkerRecord, WorkspaceEngine, fold_verification,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -259,6 +260,48 @@ fn run_verification_due(
         .chat_orchestrator
         .verify_due(repo, session_id, adapter, &mut sink)
         .expect("the due verification should run")
+}
+
+fn resume_checks(
+    engine: &WorkspaceEngine,
+    batch_id: &str,
+    decisions: &[(String, bool)],
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_check_decision(batch_id, decisions, "tester", adapter, &mut sink)
+        .expect("the check batch should resume")
+}
+
+/// Runs a due verification, approving every check the ordinary check card
+/// offers. Some fixtures exercise commands the policy still asks about; the
+/// card is not the behaviour under test.
+fn run_verification_and_approve_checks(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let mut result = run_verification_due(engine, repo, session_id, adapter);
+    while let Some(batch) = result.check_batch.clone() {
+        let decisions = batch
+            .checks
+            .iter()
+            .map(|check| (check.id.clone(), true))
+            .collect::<Vec<_>>();
+        result = resume_checks(engine, &batch.id, &decisions, adapter);
+    }
+    result
 }
 
 /// Continues the newest incomplete task through the engine's own continuation
@@ -3097,5 +3140,706 @@ fn a_plan_under_review_is_handed_to_a_worker() {
             .hand_plan_to_worker(&proposal.id, "session_worker", "tester")
             .is_err(),
         "the pause is answered once"
+    );
+}
+
+// --- R14: required-check baselines and uncertain provenance (spec 102) ------
+//
+// A required check is baselined before the first patch the task writes, on the
+// untouched tree. A required check that first becomes required only after the
+// task has changed files has no task-start baseline; its failure is
+// `uncertain`, is reported, and asks the user whether to repair instead of
+// silently treating the failure as pre-existing or repairing it automatically.
+// Per-change checks keep their existing pre-patch baseline (spec 102 D2 piece
+// 1).
+
+const REQUIRED_FOO_PLAN: &str = r#"{"steps":[
+    {"title":"Change the shared value"},
+    {"title":"Validate","check":{"command":"cargo test","workingDirectory":"crates/foo","purpose":"validates the shared value","required":true}},
+    {"title":"Change the foo crate"}
+]}"#;
+
+const PLAIN_FOO_PLAN: &str = r#"{"steps":[
+    {"title":"Change the shared value"},
+    {"title":"Validate the shared value"},
+    {"title":"Change the foo crate"}
+]}"#;
+
+/// A fixture with two project roots. The fake shell makes `cargo test` in
+/// `crates/foo` depend on the repository-root `shared.txt`, while the root's
+/// own `cargo test` always passes. `write-broken` changes the shared value
+/// without a patch, which is how a check can become required after the task has
+/// already changed files.
+fn required_check_fixture(name: &str) -> (PathBuf, PathBuf) {
+    let repo = temp_repo(name);
+    fs::create_dir_all(repo.join("crates/foo/src")).expect("the second root should exist");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"root\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("the root manifest");
+    fs::write(
+        repo.join("crates/foo/Cargo.toml"),
+        "[package]\nname = \"foo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("the member manifest");
+    fs::write(
+        repo.join("crates/foo/src/lib.rs"),
+        "pub fn value() -> u8 { 1 }\n",
+    )
+    .expect("the member source");
+    fs::write(repo.join("shared.txt"), "ok\n").expect("the shared value");
+    let shell = repo.join("check-shell.sh");
+    let script = format!(
+        "#!/bin/sh\n\
+         command=\"$2\"\n\
+         case \"$command\" in\n\
+           *write-broken*) printf 'broken\\n' > '{}/shared.txt' ;;\n\
+           *\"cargo test\"*)\n\
+             case \"$PWD\" in\n\
+               */crates/foo) grep -q '^ok$' \"$PWD/../../shared.txt\" || exit 1 ;;\n\
+             esac\n\
+             ;;\n\
+           *) exit 0 ;;\n\
+         esac\n\
+         exit 0\n",
+        repo.display()
+    );
+    fs::write(&shell, script).expect("the fake shell");
+    let mut permissions = fs::metadata(&shell)
+        .expect("the fake shell metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&shell, permissions).expect("the fake shell is executable");
+    (repo, shell)
+}
+
+fn check_engine(repo: &Path, shell: &Path, allow: &[&str]) -> WorkspaceEngine {
+    WorkspaceEngine::new(Config {
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        shell: shell.to_string_lossy().to_string(),
+        command_allowlist: allow.iter().map(|entry| (*entry).to_string()).collect(),
+        ..Config::default()
+    })
+}
+
+fn patch_call_with(path: &str, content: &str) -> ToolCall {
+    call(
+        "propose_patch",
+        &serde_json::json!({
+            "summary": format!("Change {path}"),
+            "files": [{"path": path, "content": content}],
+        })
+        .to_string(),
+    )
+}
+
+/// Applies a stored patch through the ordinary pre-apply baseline gate,
+/// answering every offered baseline with one decision.
+fn apply_patch_with_baselines(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    patch_id: &str,
+    approve_baselines: bool,
+) {
+    let mut outcome = engine
+        .edit_orchestrator
+        .apply_stored_patch_with_baseline(repo, patch_id, None, None, "tester", false)
+        .expect("the patch should apply");
+    while let PatchApplyOutcome::BaselineRequired(batch) = outcome {
+        let decisions = batch
+            .checks
+            .iter()
+            .map(|check| (check.proposal_id.clone(), approve_baselines))
+            .collect::<Vec<_>>();
+        engine
+            .edit_orchestrator
+            .resume_stored_patch_baseline(repo, &batch.id, &decisions, &[], "tester")
+            .expect("the baseline decisions should record");
+        outcome = engine
+            .edit_orchestrator
+            .apply_stored_patch_with_baseline(repo, patch_id, None, None, "tester", false)
+            .expect("the patch should apply after the baselines settle");
+    }
+    assert!(
+        matches!(outcome, PatchApplyOutcome::Applied(_)),
+        "the patch should be applied: {outcome:?}"
+    );
+}
+
+fn mark_worker_session(engine: &WorkspaceEngine, session_id: &str, root: &Path) {
+    engine
+        .session_store
+        .record_worker_spawned(
+            session_id,
+            &WorkerRecord {
+                parent_session_id: None,
+                parent_task_id: None,
+                inherited_protected_paths: Vec::new(),
+                source_repository: root.to_path_buf(),
+                worktree_path: root.to_path_buf(),
+                branch: "damaian/fixture".to_string(),
+                base_commit: "HEAD".to_string(),
+                included_uncommitted: false,
+                git_commands: Vec::new(),
+            },
+        )
+        .expect("the worker record is written");
+}
+
+fn try_approve_command(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.resume_after_command_decision(
+        proposal_id,
+        true,
+        "tester",
+        adapter,
+        &mut sink,
+    )
+}
+
+fn answer_question(
+    engine: &WorkspaceEngine,
+    question_id: &str,
+    answer: &str,
+    selected_option: Option<usize>,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    try_answer_question(engine, question_id, answer, selected_option, adapter)
+        .expect("the answer should resume the turn")
+}
+
+fn try_answer_question(
+    engine: &WorkspaceEngine,
+    question_id: &str,
+    answer: &str,
+    selected_option: Option<usize>,
+    adapter: &mut dyn ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.resume_after_answer(
+        question_id,
+        answer,
+        selected_option,
+        adapter,
+        &mut sink,
+    )
+}
+
+fn request_text(adapter: &MockModelAdapter) -> String {
+    adapter
+        .requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .map(|message| message.content.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// (a) The required check is baselined before patch 1, on the untouched tree.
+/// A regression first observed after a later patch is therefore `introduced`
+/// and starts an ordinary repair turn.
+#[test]
+fn a_required_check_is_baselined_at_task_start_and_a_later_regression_is_repaired() {
+    let (repo, shell) = required_check_fixture("r14-task-start");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let patch1 = patch_call_with("shared.txt", "broken\n");
+    let mut first = scripted(vec![
+        vec![call("propose_plan", REQUIRED_FOO_PLAN)],
+        vec![patch1.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the shared value", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+
+    let mut resumed = scripted(vec![vec![patch1]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let patch1_id = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("patch one is proposed")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch1_id, true);
+
+    let foo = CheckId::new("crates/foo", "cargo test");
+    let baselines = engine
+        .session_store
+        .task_verification_baselines(&proposed.session.id, &proposed.task.id)
+        .expect("the baselines should read");
+    assert!(
+        matches!(baselines.get(&foo), Some(CheckBaseline::Passed)),
+        "the required check is baselined before patch 1 on the untouched tree: {baselines:?}"
+    );
+
+    // No verification runs between the two patches, so patch 1's regression is
+    // first observed after patch 2. Complete the first two steps in a later
+    // turn and propose the second patch.
+    let patch2 = patch_call_with("crates/foo/src/lib.rs", "pub fn value() -> u8 { 2 }\n");
+    let mut after_first = scripted(vec![
+        vec![call("complete_step", "{}"), call("complete_step", "{}")],
+        vec![patch2],
+    ]);
+    let continued = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Continue with the foo crate",
+        &mut after_first,
+    );
+    let patch2_id = continued
+        .patch_proposal
+        .as_ref()
+        .expect("patch two is proposed in the later turn")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch2_id, true);
+
+    let mut repair_adapter = MockModelAdapter::new("Done.");
+    let verified = run_verification_and_approve_checks(
+        &engine,
+        &repo,
+        &continued.session.id,
+        &mut repair_adapter,
+    );
+    let report = verified
+        .verification_report
+        .expect("the second verification has a report");
+    let introduced = report
+        .provenance
+        .iter()
+        .find(|partition| partition.provenance == FailureProvenance::NewRegression)
+        .unwrap_or_else(|| {
+            panic!("the later regression is introduced by the task-start baseline: {report:?}")
+        });
+    assert!(
+        introduced.checks.iter().any(|check| check.check == foo),
+        "the required check is the introduced failure: {introduced:?}"
+    );
+    assert!(
+        request_text(&repair_adapter).contains("Repair only the failures this patch introduced"),
+        "the introduced failure starts an ordinary repair turn"
+    );
+}
+
+/// Applies the uncertain scenario: a command changes a file before the plan
+/// exists, the plan then declares a required check, and the next patch lands.
+/// The check has no task-start baseline, so its later failure is `uncertain` and
+/// the worker asks whether to repair. Returns the engine, repository, the
+/// verification task, the question id and the report.
+fn uncertain_repair_fixture(
+    name: &str,
+) -> (
+    WorkspaceEngine,
+    PathBuf,
+    ChatTurnResult,
+    String,
+    workspace_engine::VerificationReport,
+) {
+    let (repo, shell) = required_check_fixture(name);
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let patch1 = patch_call_with("shared.txt", "broken\n");
+    let mut adapter = scripted(vec![
+        vec![call("propose_plan", PLAIN_FOO_PLAN)],
+        vec![patch1.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the shared value", &mut adapter);
+    let review = paused.plan_proposal.expect("the plan is put up");
+
+    let mut resumed = scripted(vec![vec![patch1]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let patch1_id = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("patch one is proposed")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch1_id, true);
+
+    // The check becomes required only after patch 1 landed: this is the
+    // durable plan-revision step, not a check the task started with.
+    let mut plan = engine
+        .session_store
+        .read_task_plan(&proposed.session.id, &proposed.task.id)
+        .expect("the plan should read")
+        .expect("patch one's task carries the plan");
+    plan.steps[1].check = Some(PlannedCheck {
+        version: PLANNED_CHECK_VERSION,
+        command: "cargo test".to_string(),
+        working_directory: "crates/foo".to_string(),
+        purpose: "validates the shared value".to_string(),
+        required: true,
+    });
+    engine
+        .session_store
+        .revise_plan(&proposed.task, &plan)
+        .expect("the plan revision records");
+
+    let patch2 = patch_call_with("crates/foo/src/lib.rs", "pub fn value() -> u8 { 2 }\n");
+    let mut after_first = scripted(vec![
+        vec![call("complete_step", "{}"), call("complete_step", "{}")],
+        vec![patch2],
+    ]);
+    let continued = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Continue with the foo crate",
+        &mut after_first,
+    );
+    let patch2_id = continued
+        .patch_proposal
+        .as_ref()
+        .expect("patch two is proposed in the later turn")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch2_id, true);
+    mark_worker_session(&engine, &continued.session.id, &repo);
+
+    let mut verification_adapter = MockModelAdapter::new("Done.");
+    let verified = run_verification_and_approve_checks(
+        &engine,
+        &repo,
+        &continued.session.id,
+        &mut verification_adapter,
+    );
+    assert!(
+        verification_adapter.requests.is_empty(),
+        "an uncertain failure starts no automatic repair turn"
+    );
+    let question_id = verified
+        .question_proposal
+        .as_ref()
+        .expect("the worker asks whether to repair the uncertain failure")
+        .question_id
+        .clone();
+    let report = verified
+        .verification_report
+        .clone()
+        .expect("the uncertain verification has a report");
+    (engine, repo, verified, question_id, report)
+}
+
+/// (b) A required check first declared after the task already changed files has
+/// no task-start baseline. Its failure is `uncertain`, named in the report,
+/// starts no repair turn, and raises a question.
+#[test]
+fn a_required_check_first_required_after_changes_is_uncertain_and_asks_before_repair() {
+    let (_engine, repo, verified, _question_id, report) = uncertain_repair_fixture("r14-uncertain");
+    assert!(
+        report
+            .provenance
+            .iter()
+            .any(|partition| partition.provenance.as_str() == "uncertain"),
+        "the required check's failure is uncertain, not pre-existing: {report:?}"
+    );
+    assert!(
+        report.repair_targets.is_empty(),
+        "an uncertain failure is never an automatic repair target: {report:?}"
+    );
+    assert_eq!(
+        verified.task.status,
+        TaskStatus::WaitingForApproval,
+        "the worker waits for the user's repair decision"
+    );
+    assert!(
+        !fs::read_to_string(repo.join("crates/foo/src/lib.rs"))
+            .unwrap()
+            .contains("value() -> u8 { 3 }"),
+        "nothing is repaired before the user answers"
+    );
+}
+
+/// (c) Answering the question with repair runs an ordinary repair turn; its
+/// patch still needs the ordinary patch approval. A question answer is never a
+/// patch or command approval, in either direction.
+#[test]
+fn answering_the_uncertain_repair_question_with_repair_runs_one_repair_turn_that_still_needs_approval()
+ {
+    let (engine, repo, _verified, question_id, report) =
+        uncertain_repair_fixture("r14-answer-repair");
+    let foo = CheckId::new("crates/foo", "cargo test");
+    let uncertain = report
+        .provenance
+        .iter()
+        .find(|partition| partition.provenance.as_str() == "uncertain")
+        .expect("the report names the uncertain failure");
+    assert!(
+        uncertain.checks.iter().any(|check| check.check == foo),
+        "{uncertain:?}"
+    );
+
+    // A command approval route cannot answer a question.
+    let refusal = try_approve_command(&engine, &question_id, &mut MockModelAdapter::new("Done."))
+        .expect_err("a question is not a command approval");
+    assert!(
+        refusal.to_string().contains("question"),
+        "the refusal names the pause it actually is: {refusal}"
+    );
+
+    let repair_patch = patch_call_with("crates/foo/src/lib.rs", "pub fn value() -> u8 { 3 }\n");
+    let mut repair_adapter = scripted(vec![vec![repair_patch]]);
+    let result = answer_question(
+        &engine,
+        &question_id,
+        "Repair it",
+        Some(0),
+        &mut repair_adapter,
+    );
+    let patch = result
+        .patch_proposal
+        .as_ref()
+        .expect("the repair turn proposes a patch");
+    assert_eq!(
+        result.task.status,
+        TaskStatus::WaitingForApproval,
+        "the repair patch still waits for its own approval"
+    );
+    assert!(
+        request_text(&repair_adapter).contains("Repair only the failures this patch introduced"),
+        "answering repair runs an ordinary repair turn"
+    );
+    assert!(
+        !fs::read_to_string(repo.join("crates/foo/src/lib.rs"))
+            .unwrap()
+            .contains("value() -> u8 { 3 }"),
+        "the repair patch is not applied by its proposal"
+    );
+
+    // The other direction: a command approval cannot be answered as a
+    // question. The command pause is created through the ordinary turn path.
+    let mut command_adapter = scripted(vec![vec![call(
+        "run_command",
+        r#"{"command":"touch needs-approval.txt","reason":"Write a marker"}"#,
+    )]]);
+    let command_pause = ask_in_session(
+        &engine,
+        &repo,
+        &result.session.id,
+        "Write a marker",
+        &mut command_adapter,
+    );
+    let command_id = command_pause
+        .command_proposal
+        .as_ref()
+        .expect("the command waits for approval")
+        .id
+        .clone();
+    let refusal = try_answer_question(
+        &engine,
+        &command_id,
+        "Repair it",
+        Some(0),
+        &mut MockModelAdapter::new("Done."),
+    )
+    .expect_err("a command approval is not a question answer");
+    assert!(
+        refusal.to_string().contains("approval"),
+        "the refusal names the pause it actually is: {refusal}"
+    );
+    assert!(
+        patch.patch_id.starts_with("patch_"),
+        "the repair turn proposed a real patch waiting for its own approval"
+    );
+}
+
+/// (c) Answering the question with no leaves the failure reported and does not
+/// repair it.
+#[test]
+fn answering_the_uncertain_repair_question_with_no_leaves_it_reported_and_unrepaired() {
+    let (engine, repo, _verified, question_id, _report) = uncertain_repair_fixture("r14-answer-no");
+    let mut adapter = MockModelAdapter::new("Done.");
+    let result = answer_question(
+        &engine,
+        &question_id,
+        "Leave it unrepaired",
+        Some(1),
+        &mut adapter,
+    );
+    assert!(
+        result.patch_proposal.is_none(),
+        "no repair patch is proposed when the user declines"
+    );
+    let report = result
+        .verification_report
+        .expect("the declined question still reports the failure");
+    assert!(
+        report
+            .provenance
+            .iter()
+            .any(|partition| partition.provenance.as_str() == "uncertain"),
+        "the failure stays reported as uncertain: {report:?}"
+    );
+    assert!(
+        fs::read_to_string(repo.join("crates/foo/src/lib.rs"))
+            .unwrap()
+            .contains("value() -> u8 { 2 }"),
+        "the tree is unchanged when the user declines"
+    );
+}
+
+/// (d) A per-change check keeps its existing pre-patch baseline. It fails
+/// before the later patch, so the later failure is `pre_existing` and is never
+/// promoted to `uncertain` or repaired.
+#[test]
+fn a_per_change_check_keeps_its_pre_patch_baseline_and_pre_existing_classification() {
+    let (repo, shell) = required_check_fixture("r14-per-change");
+    let engine = check_engine(&repo, &shell, &["cargo test", "write-broken"]);
+    let patch1 = patch_call_with("shared.txt", "broken\n");
+    let mut first = scripted(vec![
+        vec![call("propose_plan", PLAIN_FOO_PLAN)],
+        vec![patch1.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the shared value", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+
+    let mut resumed = scripted(vec![vec![patch1]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let patch1_id = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("patch one is proposed")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch1_id, true);
+
+    let patch2 = patch_call_with("crates/foo/src/lib.rs", "pub fn value() -> u8 { 2 }\n");
+    let mut after_first = scripted(vec![
+        vec![call("complete_step", "{}"), call("complete_step", "{}")],
+        vec![patch2],
+    ]);
+    let continued = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Continue with the foo crate",
+        &mut after_first,
+    );
+    let patch2_id = continued
+        .patch_proposal
+        .as_ref()
+        .expect("patch two is proposed in the later turn")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch2_id, true);
+
+    let foo = CheckId::new("crates/foo", "cargo test");
+    let baselines = engine
+        .session_store
+        .task_verification_baselines(&continued.session.id, &continued.task.id)
+        .expect("the baselines should read");
+    assert!(
+        matches!(baselines.get(&foo), Some(CheckBaseline::Failed { .. })),
+        "the per-change check keeps its pre-patch baseline, taken with patch 1 applied: {baselines:?}"
+    );
+
+    mark_worker_session(&engine, &continued.session.id, &repo);
+    let mut verification_adapter = MockModelAdapter::new("Done.");
+    let verified = run_verification_and_approve_checks(
+        &engine,
+        &repo,
+        &continued.session.id,
+        &mut verification_adapter,
+    );
+    let report = verified
+        .verification_report
+        .expect("the verification has a report");
+    let pre_existing = report
+        .provenance
+        .iter()
+        .find(|partition| partition.provenance == FailureProvenance::PreExisting)
+        .unwrap_or_else(|| panic!("the per-change failure is pre-existing: {report:?}"));
+    assert!(
+        pre_existing.checks.iter().any(|check| check.check == foo),
+        "{pre_existing:?}"
+    );
+    assert!(report.repair_targets.is_empty(), "{report:?}");
+    assert!(
+        verified.question_proposal.is_none(),
+        "a pre-existing failure is not an uncertain repair question"
+    );
+}
+
+/// (e) A required check that needs approval is offered on the existing baseline
+/// card before the first patch. Declining it records `Declined`, not
+/// `Uncertain`.
+#[test]
+fn a_declined_required_baseline_is_recorded_declined_not_uncertain() {
+    let (repo, shell) = required_check_fixture("r14-declined-required");
+    // Every command needs approval, so the required check reaches the ordinary
+    // baseline card instead of running as a safe detected check.
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        shell: shell.to_string_lossy().to_string(),
+        require_approval_for_all_commands: true,
+        ..Config::default()
+    });
+    let patch = patch_call_with("shared.txt", "broken\n");
+    let mut first = scripted(vec![
+        vec![call("propose_plan", REQUIRED_FOO_PLAN)],
+        vec![patch.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the shared value", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+
+    let mut resumed = scripted(vec![vec![patch]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let patch_id = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("the patch is proposed")
+        .patch_id
+        .clone();
+
+    let outcome = engine
+        .edit_orchestrator
+        .apply_stored_patch_with_baseline(&repo, &patch_id, None, None, "tester", false)
+        .expect("the patch should reach the baseline gate");
+    let PatchApplyOutcome::BaselineRequired(batch) = outcome else {
+        panic!("a required check that needs approval pauses before the first patch: {outcome:?}");
+    };
+    let foo = CheckId::new("crates/foo", "cargo test");
+    assert!(
+        batch.checks.iter().any(|check| check.check == foo),
+        "the required check is on the existing baseline card: {batch:?}"
+    );
+    let decisions = batch
+        .checks
+        .iter()
+        .map(|check| (check.proposal_id.clone(), false))
+        .collect::<Vec<_>>();
+    engine
+        .edit_orchestrator
+        .resume_stored_patch_baseline(&repo, &batch.id, &decisions, &[], "tester")
+        .expect("declining every baseline records the decision");
+
+    let baselines = engine
+        .session_store
+        .task_verification_baselines(&proposed.session.id, &proposed.task.id)
+        .expect("the baselines should read");
+    assert!(
+        matches!(baselines.get(&foo), Some(CheckBaseline::Declined)),
+        "a declined required baseline is Declined, not uncertain: {baselines:?}"
     );
 }
