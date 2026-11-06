@@ -2093,6 +2093,7 @@ mod tests {
                     task_id: patch_task.id.clone(),
                     patch_id: String::new(),
                     paths: vec!["src/nested/b.rs".to_string()],
+                    checks: Vec::new(),
                 },
             )
             .unwrap();
@@ -2131,6 +2132,7 @@ mod tests {
                     task_id: clean_patch_task.id.clone(),
                     patch_id: String::new(),
                     paths: vec!["docs.md".to_string()],
+                    checks: Vec::new(),
                 },
             )
             .unwrap();

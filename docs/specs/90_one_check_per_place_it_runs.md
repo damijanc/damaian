@@ -11,8 +11,8 @@ Depends on: [#23](23_verification_loop/proposal.md) and
 
 On 2026-10-31 a change in `crates/workspace-engine` raised a check card with
 two identical rows, `cargo test` and `cargo test`. One ran at the repository
-root and one in the member, because #23 §5.2 selects the owning root and every
-enclosing root. The card showed only the command. The root is a virtual
+root and one in the member, because #23 §5.2 then selected the owning root and
+every enclosing root. The card showed only the command. The root is a virtual
 workspace, so its `cargo test` already runs the member's tests, and the second
 run only repeated work, on a machine where `cargo test` is the slow part.
 
@@ -29,7 +29,10 @@ run only repeated work, on a machine where `cargo test` is the slow part.
 3. In every other case both checks are kept, as before. The rule can drop a
    repeated check, never a needed one.
 4. A dropped check is neither proposed nor stored (#23 §5.2: nothing is
-   stored that will not run). Both roots are still selected.
+   stored that will not run). Both roots were selected at the time; review
+   fix R16 (2026-11-06) later narrowed per-change selection to the owning root,
+   so this de-duplication now applies to the completion floor.
+
 
 ## 3. Non-goals
 
@@ -51,10 +54,12 @@ run only repeated work, on a machine where `cargo test` is the slow part.
 ## 5. Acceptance
 
 All in `tests/verification_loop.rs`:
-- `a_member_change_selects_its_own_root_and_every_enclosing_root` now proves
-  the member's `cargo test` is dropped under a virtual workspace;
-- `a_member_check_is_kept_when_the_root_does_not_run_it` proves that a root
-  that is also a package keeps both;
+- `a_member_change_selects_only_its_owning_root` (formerly
+  `a_member_change_selects_its_own_root_and_every_enclosing_root`) proves the
+  member's `cargo test` is dropped from the completion floor under a virtual
+  workspace;
+- `a_member_check_is_kept_in_the_completion_floor_when_the_root_does_not_run_it`
+  proves that a root that is also a package keeps both;
 - `only_the_selected_roots_proposals_are_stored` stores one proposal.
 
 ## 6. Verification

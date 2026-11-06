@@ -143,6 +143,12 @@ spec. Record it in `OBSERVATIONS.md` when Task 2 lands.
 
 **Decision: select by owning root and its enclosing roots.**
 
+*Superseded in part 2026-11-06 (review fix R16, decision D2 piece 2):*
+per-change selection is the owning root only (proposal §5.2). The owning and
+enclosing roots remain the task-completion floor (spec 101/105 R15), and the
+completion verification runs them through the ordinary policy and approval
+path. The de-duplication below still applies to the floor.
+
 - A changed path is **documentation** when its extension is `md`, `txt`,
   `rst` or `adoc`. It selects nothing. `detect_language` (`language.rs:616`)
   is not used for this: it maps every unknown extension to `text`, which would

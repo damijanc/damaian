@@ -343,6 +343,7 @@ fn repair_history_survives_a_fresh_store_and_repair_continuations() {
                     task_id: first.id.clone(),
                     patch_id: "patch".to_string(),
                     paths: Vec::new(),
+                    checks: Vec::new(),
                 },
             )
             .unwrap();
@@ -427,6 +428,7 @@ fn repair_stall_is_one_terminal_event_that_replays_as_a_stop() {
             task_id: "task".to_string(),
             patch_id: "patch".to_string(),
             paths: Vec::new(),
+            checks: Vec::new(),
         },
         VerificationEvent::Started {
             task_id: "task".to_string(),

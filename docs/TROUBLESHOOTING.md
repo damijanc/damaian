@@ -1798,11 +1798,15 @@ report, so "failed" and "incomplete" stay distinct. Declining a required check
 can close a task, but only as a named waiver; it never turns the check into
 evidence that passed.
 
-**A required check reads as stale or missing.** Required checks are the approved
-plan's `required` checks plus the detected checks of the project roots the task
-touched (the owning root and every enclosing root, such as a Cargo workspace).
-The gate names each check's disposition in the completion report
-(`required_check_*` reason codes, and the check itself in `waivers`):
+**A required check reads as stale or missing.** Per-change verification runs
+only the owning root's checks. The completion obligation is the approved plan's
+`required` checks plus the detected checks of the project roots the task touched
+(the owning root and every enclosing root, such as a Cargo workspace); the
+enclosing roots run when the task completes. A plan-declared check does not
+suppress a missing floor check, and a floor check the agent ran itself with the
+exact command and directory counts as current evidence. The gate names each
+check's disposition in the completion report (`required_check_*` reason codes,
+and the check itself in `waivers`):
 
 - **stale** — the check ran, but the files it covered changed afterwards. Two
   things make a check stale: a later mutation batch began (a newer primary plan

@@ -456,7 +456,7 @@ could change source files, run nothing, and settle `complete`. Review fix R15
 - the approved plan's `required: true` checks, in plan order, and
 - the detected checks of the owning and enclosing roots of every file the task
   touched — applied patch paths and command-changed paths from its continuation
-  chain — selected with spec 23 §5.2's existing root rule.
+  chain — selected with spec 23 §5.2's enclosing-root rule.
 
 The two sets are merged by `CheckId`: the same identity is one obligation, and
 the plan's checks are added to the floor rather than replacing it. A
@@ -465,8 +465,12 @@ the persisted repository map through `RepositoryMapStore::load_stored_map`; a
 gate report stores no proposal and runs nothing, so command policy and the
 ordinary approval route are untouched. Declining a floor check that needs
 approval is the existing `DeclinedByUser` waiver; an auto-runnable floor check
-simply runs. Per-change selection (owning root only) is R16's separate change,
-not part of this floor.
+simply runs. Review fix R16 (2026-11-06) split selection: per-change
+verification uses the owning root only, while this floor keeps the owning and
+enclosing roots. The gate evaluates the floor only when no primary plan step is
+open or blocked, and a completion verification — or an answered turn blocked
+only by a missing or stale required check — runs it through the ordinary check
+policy before settlement. The gate itself still runs nothing.
 
 The floor also feeds R14's task-start baseline: `BaselineCoordinator::prepare`
 merges the plan's required checks with the floor for the first patch's touched
@@ -509,3 +513,72 @@ is not a root-detected command, so it remains a verification-report fact rather
 than a floor reason. `a_failed_verification_is_not_continued` again requires
 `RequiredCheckFailed` alongside the open plan step. The crash-settlement test now
 uses the floor instead of the plan check Task 5 added to it.
+
+### Review fix 2026-11-06: the floor is a completion obligation (R16)
+
+Review fix R16 (decision D2 piece 2) implements the split the R15 note left
+open. Per-change verification selects only the owning root; the floor above is
+unchanged and still uses the owning and enclosing roots. Because the floor is a
+task-completion obligation, the gate adds its checks only when no primary plan
+step is open or blocked — while plan work remains the task is ineligible anyway.
+A verification whose plan has no open or blocked primary step is the completion
+run and selects the floor through the ordinary approval and command policy.
+When an answered turn is at completion, the engine asks which floor checks are
+missing or stale and are not plan-declared; if any, it records a completion
+`verification_due` carrying those exact identities and runs only those before
+the answer becomes final, regardless of any other completion reason. A
+plan-declared check never suppresses the floor and is never auto-run; it stays
+the model's responsibility. The floor check may be satisfied by a current
+`CheckRun` from the loop or by a current `CommandExit` of the identical command
+and directory anywhere in the plan (the same matcher and R4 currentness rule the
+deferred path uses); a current exit also supersedes a stale earlier `CheckRun`.
+The gate itself still executes nothing.
+
+This supersedes three R15 expectations. `verification_loop::a_failed_verification_is_not_continued`
+now sees only `OpenPlanSteps` in its mid-plan gate report (the task status is
+still `Failed`, set by the verification settlement), because the failed check is
+not a floor obligation until completion. `plan_turn::a_trivial_plan_check_does_not_replace_the_discovered_floor`
+closes its plan before asking the completion question, so the floor is still
+required beside the plan's `ls`. `verification_loop::a_member_check_is_kept_when_the_root_does_not_run_it`
+became `a_member_check_is_kept_in_the_completion_floor_when_the_root_does_not_run_it`
+and asserts the completion set, because a per-change run now has no enclosing
+root to compare against.
+
+The regression tests written first for R16 are
+`verification_loop::a_member_change_selects_only_its_owning_root`,
+`a_member_change_runs_only_the_members_check_per_change` and
+`a_member_change_baselines_its_own_and_enclosing_root_at_task_start` (all failed
+on the old enclosing-root selection), plus
+`plan_turn::a_member_change_runs_only_the_members_check_per_change_and_the_root_check_at_completion`,
+which drives the member check per change, the workspace-root floor check at
+completion, the `new_regression` classification from the task-start baseline,
+the repair turn and the passing rerun. `a_root_owned_change_still_runs_the_root_check_per_change`
+and the documentation-only case are guards.
+
+### R16 follow-up 2026-11-06: the floor is always satisfiable
+
+The first R16 shape had one defect: a plan that declared any required check
+suppressed the answer-time floor run, so an enclosing-root floor check could be
+`RequiredCheckMissing` forever — the model had no way to satisfy it and
+**Continue** could not either. The trigger now asks
+`CompletionGateService::floor_checks_needing_verification` for the floor checks
+that are missing or stale and are **not** plan-declared, at completion, and
+records those exact identities on the `verification_due`. The run is limited to
+them, so a plan-declared check is neither suppressed nor auto-run. The
+`approved_plan_required_check` evaluation scenario keeps its meaning: a planned
+check the model never ran still settles `incomplete`.
+
+Floor evidence also accepts a current `CommandExit` of the identical identity
+anywhere in the plan. The deferred path and this floor lookup share one matcher
+(`matching_exit_code`) and R4's `deferred_evidence_is_current`; there is no
+second currentness rule. A current exit supersedes a stale earlier `CheckRun`.
+
+Regression tests written first and recorded failing in `plan_turn`:
+`a_plan_declared_member_check_does_not_hide_the_missing_workspace_root_floor`
+failed `left: Incomplete, right: Complete` with only
+`Required check cargo test (repository root) has no recorded result.`;
+`a_missing_floor_check_runs_even_when_a_plan_check_is_also_missing` failed
+`the floor check still runs`; and
+`a_model_run_floor_command_satisfies_the_floor_without_an_automatic_run` failed
+because the loop started an extra completion run for the already-satisfied
+floor. All pass now.

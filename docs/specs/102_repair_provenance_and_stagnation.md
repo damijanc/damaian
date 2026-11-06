@@ -552,3 +552,16 @@ failed with the later root recorded as `Failed { termination: Exited { exit_code
 1 }, .. }` from a post-patch baseline. Both pass now. The first test also proves
 the later root is `Uncertain` and its verification failure is reported as
 `uncertain`, not `pre_existing`.
+
+### Review fix 2026-11-06: per-change check selection narrows, baselines do not (R16)
+
+Review fix R16 (decision D2 piece 2) narrows per-change *check* selection to the
+owning root (spec 23 §5.2 now records the split). This baseline rule is
+unchanged: the first patch still baselines the plan's required checks and the
+completion floor for every root the patch and its earlier changes touch,
+including an enclosing root, and a check the owning root selects still takes its
+pre-patch baseline. `verification_loop::a_member_change_baselines_its_own_and_enclosing_root_at_task_start`
+pins the split's effect on the baseline: a member change now has the member's
+per-change check and the workspace root's floor check recorded before the patch
+writes. A completion verification refreshes those checks through the ordinary
+policy path; it does not take a new baseline.

@@ -120,6 +120,7 @@ fn due() -> VerificationEvent {
         task_id: "task".to_string(),
         patch_id: "patch".to_string(),
         paths: Vec::new(),
+        checks: Vec::new(),
     }
 }
 
@@ -428,6 +429,7 @@ fn events_serialise_in_the_shape_the_log_holds() {
             task_id: "t".to_string(),
             patch_id: "p".to_string(),
             paths: Vec::new(),
+            checks: Vec::new(),
         })
         .unwrap(),
         json!({"kind": "verification_due", "taskId": "t", "patchId": "p"})
@@ -739,8 +741,11 @@ impl Drop for Monorepo {
     }
 }
 
+/// Review fix R16 (spec 23 D2 piece 2): a change selects its owning root only.
+/// The enclosing roots belong to the task-completion floor, not to every
+/// change, so a member edit no longer runs the whole workspace suite.
 #[test]
-fn a_member_change_selects_its_own_root_and_every_enclosing_root() {
+fn a_member_change_selects_only_its_owning_root() {
     let repo = Monorepo::new("member");
     let engine = repo.engine();
     let map = repo.map(&engine);
@@ -748,7 +753,8 @@ fn a_member_change_selects_its_own_root_and_every_enclosing_root() {
 
     assert_eq!(
         select_roots(&map, &changed),
-        vec!["".to_string(), "crates/engine".to_string()]
+        vec!["crates/engine".to_string()],
+        "per-change selection is the owning root only"
     );
 
     let selection =
@@ -760,18 +766,153 @@ fn a_member_change_selects_its_own_root_and_every_enclosing_root() {
         .iter()
         .map(|(check, _)| check.working_directory.as_str())
         .collect();
-    // Both roots are selected, but the member's `cargo test` is dropped: the
-    // virtual workspace root's `cargo test` runs it already (spec 90).
-    assert!(directories.contains(&""));
-    assert!(!directories.contains(&"crates/engine"), "{directories:?}");
+    // Only the member's own root is proposed. Its `cargo test` is kept because
+    // the workspace root is no longer in the restricted map (spec 90's
+    // de-duplication applies only when both roots are selected).
+    assert_eq!(directories, vec!["crates/engine"], "{directories:?}");
+    assert!(!directories.contains(&""));
     assert!(!directories.contains(&"crates/cli"));
     assert!(!directories.contains(&"packages/web"));
 }
 
-/// Spec 90: a root that is a package as well as a workspace runs only its own
-/// package's tests, so a member's `cargo test` is kept beside it.
+/// Review fix R16: the per-change verification turn runs the owning root's
+/// check and not the enclosing workspace root's. The floor still holds the
+/// enclosing root for task completion (see the R15 tests below).
 #[test]
-fn a_member_check_is_kept_when_the_root_does_not_run_it() {
+fn a_member_change_runs_only_the_members_check_per_change() {
+    let repo = Monorepo::new("r16-member-per-change");
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: repo.data_dir.clone(),
+        enable_index_watcher: false,
+        shell: "/usr/bin/true".to_string(),
+        command_allowlist: vec!["cargo test".to_string()],
+        ..Config::default()
+    });
+    let (session, task) = applied_change(
+        &engine,
+        &repo.root,
+        &[(
+            "crates/engine/src/lib.rs",
+            "pub fn engine() {}\n",
+            "pub fn engine() { let _ = 1; }\n",
+        )],
+    );
+    // An open step keeps this a mid-task per-change verification, not the
+    // completion run the floor owns.
+    open_plan(&engine, &session, &task, &["Keep working"]);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let _ = run_verification(&engine, &repo.root, &session, &mut adapter);
+
+    let events = engine
+        .session_store
+        .read_verification_events(&session, &[])
+        .expect("the log should read");
+    let selected = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            VerificationEvent::Started { checks, .. } => Some(checks.clone()),
+            _ => None,
+        })
+        .expect("a verification started");
+    assert_eq!(
+        selected,
+        vec![check("crates/engine", "cargo test")],
+        "per change only the member's own check runs"
+    );
+}
+
+/// Review fix R16 (f): the enclosing roots are still baselined at task start.
+/// A member's first patch records both the member's per-change check and the
+/// workspace root's floor check before the patch applies.
+#[test]
+fn a_member_change_baselines_its_own_and_enclosing_root_at_task_start() {
+    let repo = Monorepo::new("r16-member-baseline");
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: repo.data_dir.clone(),
+        enable_index_watcher: false,
+        shell: "/usr/bin/true".to_string(),
+        command_allowlist: vec!["cargo test".to_string()],
+        ..Config::default()
+    });
+    let (session, task) = applied_change(
+        &engine,
+        &repo.root,
+        &[(
+            "crates/engine/src/lib.rs",
+            "pub fn engine() {}\n",
+            "pub fn engine() { let _ = 1; }\n",
+        )],
+    );
+
+    let baselines = engine
+        .session_store
+        .task_verification_baselines(&session, &task)
+        .expect("the baselines should read");
+    assert!(
+        matches!(
+            baselines.get(&check("crates/engine", "cargo test")),
+            Some(CheckBaseline::Passed)
+        ),
+        "the member's per-change check is baselined: {baselines:?}"
+    );
+    assert!(
+        matches!(
+            baselines.get(&check("", "cargo test")),
+            Some(CheckBaseline::Passed)
+        ),
+        "the enclosing workspace root's floor check is still baselined: {baselines:?}"
+    );
+}
+
+/// Review fix R16 (c): a file owned directly by the root still runs the root
+/// check per change. Only the enclosing-root part of selection is removed.
+#[test]
+fn a_root_owned_change_still_runs_the_root_check_per_change() {
+    let repo = Monorepo::new("r16-root-per-change");
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: repo.data_dir.clone(),
+        enable_index_watcher: false,
+        shell: "/usr/bin/true".to_string(),
+        command_allowlist: vec!["cargo test".to_string()],
+        ..Config::default()
+    });
+    let (session, task) = applied_change(
+        &engine,
+        &repo.root,
+        &[("Makefile", "all:\n\ttrue\n", "all:\n\tfalse\n")],
+    );
+    open_plan(&engine, &session, &task, &["Keep working"]);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let _ = run_verification(&engine, &repo.root, &session, &mut adapter);
+
+    let events = engine
+        .session_store
+        .read_verification_events(&session, &[])
+        .expect("the log should read");
+    let selected = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            VerificationEvent::Started { checks, .. } => Some(checks.clone()),
+            _ => None,
+        })
+        .expect("a verification started");
+    assert_eq!(
+        selected,
+        vec![check("", "cargo test")],
+        "a root-owned change still runs the root check per change"
+    );
+}
+
+/// Spec 90 + R16: a root that is a package as well as a workspace runs only
+/// its own package's tests, so the member's `cargo test` is kept in the
+/// completion floor beside the root's. Per change, R16 selects the owning
+/// member root only.
+#[test]
+fn a_member_check_is_kept_in_the_completion_floor_when_the_root_does_not_run_it() {
     let repo = Monorepo::new("member-kept");
     fs::write(
         repo.root.join("Cargo.toml"),
@@ -782,8 +923,15 @@ fn a_member_check_is_kept_when_the_root_does_not_run_it() {
     let map = repo.map(&engine);
     let changed = vec!["crates/engine/src/lib.rs".to_string()];
 
-    let selection =
-        propose_checks(&engine.validation_orchestrator, &repo.root, &map, &changed).unwrap();
+    assert_eq!(select_roots(&map, &changed), vec!["crates/engine"]);
+
+    let selection = workspace_engine::verification::propose_completion_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &changed,
+    )
+    .unwrap();
     let Selection::Proposed(checks) = selection else {
         panic!("expected proposed checks, got {selection:?}");
     };
@@ -802,9 +950,11 @@ fn a_web_change_does_not_duplicate_the_test_script() {
     let map = repo.map(&engine);
     let changed = vec!["packages/web/src/index.ts".to_string()];
 
+    // R16: the owning root only per change; the enclosing root stays in the
+    // completion floor below.
     assert_eq!(
         select_roots(&map, &changed),
-        vec!["".to_string(), "packages/web".to_string()]
+        vec!["packages/web".to_string()]
     );
 
     let selection =
@@ -812,6 +962,11 @@ fn a_web_change_does_not_duplicate_the_test_script() {
     let Selection::Proposed(checks) = selection else {
         panic!("expected proposed checks, got {selection:?}");
     };
+    let directories: Vec<&str> = checks
+        .iter()
+        .map(|(check, _)| check.working_directory.as_str())
+        .collect();
+    assert_eq!(directories, vec!["packages/web"], "{directories:?}");
     let web_commands: Vec<&str> = checks
         .iter()
         .filter(|(check, _)| check.working_directory == "packages/web")
@@ -824,6 +979,15 @@ fn a_web_change_does_not_duplicate_the_test_script() {
     assert!(
         !web_commands.contains(&"npm test"),
         "test-shortcut runs the same script and is dropped within the root: {web_commands:?}"
+    );
+
+    // The floor still keeps the enclosing root: the workspace's `cargo test`
+    // and the web root's npm script are both task-completion obligations.
+    let floor = workspace_engine::verification::floor_checks(&repo.root, &map, &changed);
+    assert!(floor.contains(&check("", "cargo test")), "{floor:?}");
+    assert!(
+        floor.contains(&check("packages/web", "npm run test")),
+        "{floor:?}"
     );
 
     let restricted = map.restricted_to(&["packages/web".to_string()]);
@@ -853,6 +1017,15 @@ fn only_documentation_changes_select_nothing() {
         Selection::OnlyDocumentation
     );
     assert!(select_roots(&map, &["docs/guide.md".to_string()]).is_empty());
+    // R16 (d): the completion floor also selects nothing for documentation.
+    assert!(
+        workspace_engine::verification::floor_checks(
+            &repo.root,
+            &map,
+            &["docs/guide.md".to_string()]
+        )
+        .is_empty()
+    );
 
     assert!(is_documentation("docs/guide.md"));
     assert!(is_documentation("NOTES.MD"));
@@ -1434,6 +1607,7 @@ fn verification_events_round_trip_through_a_fresh_store() {
                     task_id: "task".to_string(),
                     patch_id: "patch".to_string(),
                     paths: Vec::new(),
+                    checks: Vec::new(),
                 },
             )
             .unwrap();
@@ -4753,15 +4927,14 @@ fn a_failed_verification_is_not_continued() {
         .unwrap()
         .expect("a failed verification still carries the gate report");
     assert!(!settled.eligible);
-    // Spec 101/105 as amended by review fix R15: the failed `cargo test` is a
-    // discovered check for the root the task touched, so it is a completion
-    // obligation again. The failed status still comes from the verification
-    // settlement; the report now names the floor check as well as the open plan
-    // work.
+    // R16: the discovered floor is a task-completion obligation, so while this
+    // plan still has an open step the report names that work, not the failed
+    // discovered check. The failed status still comes from the verification
+    // settlement, so a failed check can never be continued as success.
     assert!(
         settled
             .reason_codes()
-            .contains(&CompletionReasonCode::RequiredCheckFailed),
+            .contains(&CompletionReasonCode::OpenPlanSteps),
         "{settled:?}"
     );
 
@@ -5085,6 +5258,7 @@ fn a_matching_failed_baseline_is_pre_existing_and_starts_no_repair() {
                 task_id: patch_task,
                 patch_id,
                 paths: Vec::new(),
+                checks: Vec::new(),
             },
         )
         .unwrap();

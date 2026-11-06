@@ -120,9 +120,17 @@ and enclosing roots of every file the task touched, selected with spec 23
 floor with the plan's `required: true` checks by `CheckId`, so the same identity
 is one obligation and a plan check never replaces a floor check. The floor reads
 the persisted repository map and stores no proposal; each check still follows
-command policy and the ordinary approval route. R16 later narrows per-change
-verification to the owning root; the floor keeps the enclosing roots at task
-completion, which is what catches cross-root breakage.
+command policy and the ordinary approval route. Review fix R16 (2026-11-06)
+narrows per-change verification to the owning root, as spec 23 §5.2 now
+records; the floor keeps the enclosing roots at task completion, which is what
+catches cross-root breakage. A completion verification (no open or blocked
+primary plan step) runs the floor through the same command-policy path. An
+answered turn at completion records a due for the floor checks that are missing
+or stale and are not plan-declared, regardless of any other reason, and runs
+only those before the answer becomes final. A floor check is satisfied by a
+current `CheckRun` or by a current `CommandExit` of the identical command and
+directory anywhere in the plan, using the deferred path's matcher and R4
+currentness rule.
 
 ## 5. Acceptance
 
@@ -308,3 +316,33 @@ report named only the plan's `ls`; `floor_checks_are_baselined_at_task_start_and
 failed with empty baselines; `a_floor_check_for_a_root_first_touched_later_is_uncertain_not_pre_existing`
 failed with the later root recorded as `Failed`. All pass now. The
 identical-identity, documentation-only and auto-run cases are guards.
+
+### Review fix 2026-11-06: per-change checks are the owning root (R16)
+
+Review fix R16 (decision D2 piece 2) split spec 23 §5.2's selection. Per-change
+verification now selects only `RepositoryMap::root_for_path`; the completion
+floor here is unchanged and still uses the owning **and enclosing** roots. The
+split is structural, not a shared path: `verification::select_roots` is the
+per-change set, `select_floor_roots` and `floor_checks` are the wider floor, and
+`BaselineCoordinator::prepare` still merges the plan's required checks with the
+floor, so R14's task-start baselines keep covering an enclosing root.
+
+A verification whose plan has no open or blocked primary step is a completion
+run: it selects the floor roots and records their checks through the ordinary
+approval and command-policy path. At completion, an answered turn records a due
+for the floor checks that are missing or stale and are not plan-declared,
+regardless of any other reason, and runs only those before the answer becomes
+final; a plan-declared check is never auto-run and never suppresses the floor.
+A floor check is also satisfied by a current `CommandExit` of the identical
+command and directory anywhere in the plan, using the same matcher and R4
+currentness rule as the deferred path. The gate still runs nothing itself. R16's
+orchestrator test
+`plan_turn::a_member_change_runs_only_the_members_check_per_change_and_the_root_check_at_completion`
+drives a member patch (member check per change), the workspace root at
+completion (`new_regression` from the task-start baseline), the repair turn and
+the passing rerun. The follow-up tests
+`a_plan_declared_member_check_does_not_hide_the_missing_workspace_root_floor`,
+`a_missing_floor_check_runs_even_when_a_plan_check_is_also_missing` and
+`a_model_run_floor_command_satisfies_the_floor_without_an_automatic_run` pin that
+the floor is always satisfiable and that a model-run floor command avoids a
+second automatic run.

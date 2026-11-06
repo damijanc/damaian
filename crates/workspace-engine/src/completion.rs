@@ -313,6 +313,14 @@ impl CompletionGateReport {
             }
         }
         for check in facts.floor_checks {
+            // The floor is a task-completion obligation, not a per-change one
+            // (review fix R16). While primary plan work is still open or
+            // blocked the task is ineligible anyway, so requiring the floor
+            // there would only add noise and, worse, would stop a mid-task
+            // meeting its own open steps.
+            if !open.is_empty() || !blocked.is_empty() {
+                continue;
+            }
             if required_ids.insert(check.clone()) {
                 required.push((check.clone(), None));
             }
@@ -323,9 +331,31 @@ impl CompletionGateReport {
             // that ran through the verification loop has a `CheckRun` keyed by
             // identity; a check deferred to its own plan step was run by the
             // worker as an ordinary command, which records a `CommandExit` on
-            // the step instead. The `CheckRun` is authoritative when present.
+            // the step instead. A current `CheckRun` is authoritative; for a
+            // floor check a current `CommandExit` may also satisfy it, including
+            // after an older run went stale (review follow-up to R16).
             if let Some(run) = facts.verification.checks.get(&check) {
                 if run.is_stale(facts.current_hashes, current_generation) {
+                    // A floor check may also be satisfied by the model's own
+                    // current command of the identical identity, even when an
+                    // older loop run is stale (review follow-up to R16).
+                    if step.is_none()
+                        && let Some((exit_step, index, exit_code)) =
+                            latest_matching_exit_in_plan(plan, &check)
+                        && deferred_evidence_is_current(plan, exit_step, index)
+                    {
+                        if exit_code != Some(0) {
+                            reasons.push(CompletionReason {
+                                code: CompletionReasonCode::RequiredCheckFailed,
+                                explanation: format!(
+                                    "Required check {} failed: {}.",
+                                    check.label(),
+                                    command_failure_reason(exit_code)
+                                ),
+                            });
+                        }
+                        continue;
+                    }
                     reasons.push(CompletionReason {
                         code: CompletionReasonCode::RequiredCheckStale,
                         explanation: format!(
@@ -380,53 +410,48 @@ impl CompletionGateReport {
                 continue;
             }
 
-            // A floor check that no plan step carries can only have run through
-            // the verification loop, so with no `CheckRun` it has no evidence
-            // at all. There is no deferred path to read.
-            let Some(step) = step else {
-                reasons.push(CompletionReason {
-                    code: CompletionReasonCode::RequiredCheckMissing,
-                    explanation: format!(
-                        "Required check {} has no recorded result.",
-                        check.label()
-                    ),
-                });
-                continue;
+            // A floor check that no plan step carries may be satisfied by a
+            // command the model ran itself, as well as by a `CheckRun` from the
+            // verification loop (review follow-up to R16). A plan-declared check
+            // reads only its own step; a floor check reads the latest matching
+            // exit anywhere in the plan. Both use the same identity matcher and
+            // the same R4 currentness rule, never a second mechanism.
+            let (evidence_step, evidence_index, exit_code) = match step {
+                Some(step) => {
+                    let Some((evidence_index, exit_code)) =
+                        latest_matching_exit_on_step(step, &check)
+                    else {
+                        reasons.push(CompletionReason {
+                            code: CompletionReasonCode::RequiredCheckMissing,
+                            explanation: format!(
+                                "Required check {} has no recorded result.",
+                                check.label()
+                            ),
+                        });
+                        continue;
+                    };
+                    (step, evidence_index, exit_code)
+                }
+                None => {
+                    let Some((step, evidence_index, exit_code)) =
+                        latest_matching_exit_in_plan(plan, &check)
+                    else {
+                        reasons.push(CompletionReason {
+                            code: CompletionReasonCode::RequiredCheckMissing,
+                            explanation: format!(
+                                "Required check {} has no recorded result.",
+                                check.label()
+                            ),
+                        });
+                        continue;
+                    };
+                    (step, evidence_index, exit_code)
+                }
             };
-
-            // Deferred path: the latest run of the exact command in the exact
-            // directory on the step is the evidence. Identity is the full
-            // `CheckId` — command *and* working directory — not the command
-            // alone. The exit records no generation, so currentness is read
-            // from the durable plan record: the batch boundary and any mutation
-            // recorded after this exit (spec 105 requirement 5).
-            let Some((evidence_index, Evidence::CommandExit { exit_code, .. })) = step
-                .evidence
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, evidence)| {
-                    matches!(
-                        evidence,
-                        Evidence::CommandExit {
-                            command_hash: Some(hash),
-                            working_directory,
-                            ..
-                        } if hash == &sha256(&check.command)
-                            && working_directory == &check.working_directory
-                    )
-                })
-            else {
-                reasons.push(CompletionReason {
-                    code: CompletionReasonCode::RequiredCheckMissing,
-                    explanation: format!(
-                        "Required check {} has no recorded result.",
-                        check.label()
-                    ),
-                });
-                continue;
-            };
-            if !deferred_evidence_is_current(plan, step, evidence_index) {
+            // The exit records no generation, so currentness is read from the
+            // durable plan record: the batch boundary and any mutation recorded
+            // after this exit (spec 105 requirement 5).
+            if !deferred_evidence_is_current(plan, evidence_step, evidence_index) {
                 reasons.push(CompletionReason {
                     code: CompletionReasonCode::RequiredCheckStale,
                     explanation: format!(
@@ -436,13 +461,13 @@ impl CompletionGateReport {
                 });
                 continue;
             }
-            if *exit_code != Some(0) {
+            if exit_code != Some(0) {
                 reasons.push(CompletionReason {
                     code: CompletionReasonCode::RequiredCheckFailed,
                     explanation: format!(
                         "Required check {} failed: {}.",
                         check.label(),
-                        command_failure_reason(*exit_code)
+                        command_failure_reason(exit_code)
                     ),
                 });
             }
@@ -475,6 +500,50 @@ fn command_failure_reason(exit_code: Option<i32>) -> String {
         Some(code) => format!("exit code {code}"),
         None => "killed or signalled".to_string(),
     }
+}
+
+/// The exit code of an [`Evidence::CommandExit`] with this check's identity.
+///
+/// Identity is the full [`CheckId`] — command hash and normalized working
+/// directory — exactly as the deferred path has always matched it. One matcher
+/// serves both the plan-declared step and the anywhere-in-plan floor lookup.
+fn matching_exit_code(evidence: &Evidence, check: &CheckId) -> Option<Option<i32>> {
+    match evidence {
+        Evidence::CommandExit {
+            exit_code,
+            command_hash: Some(hash),
+            working_directory,
+            ..
+        } if hash == &sha256(&check.command) && working_directory == &check.working_directory => {
+            Some(*exit_code)
+        }
+        _ => None,
+    }
+}
+
+/// The latest matching exit on one plan step.
+fn latest_matching_exit_on_step(step: &PlanStep, check: &CheckId) -> Option<(usize, Option<i32>)> {
+    step.evidence
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, evidence)| {
+            matching_exit_code(evidence, check).map(|exit_code| (index, exit_code))
+        })
+}
+
+/// The latest matching exit anywhere in the plan, in durable plan order.
+///
+/// A floor check has no single plan step to read, so a current command exit the
+/// model ran itself can satisfy it wherever it appears (review follow-up to
+/// R16).
+fn latest_matching_exit_in_plan<'a>(
+    plan: &'a TaskPlan,
+    check: &CheckId,
+) -> Option<(&'a PlanStep, usize, Option<i32>)> {
+    plan.steps.iter().rev().find_map(|step| {
+        latest_matching_exit_on_step(step, check).map(|(index, exit_code)| (step, index, exit_code))
+    })
 }
 
 /// Whether a deferred check's evidence at `evidence_index` is current.
@@ -663,6 +732,100 @@ impl<'a> CompletionGateService<'a> {
             .session_store
             .task_touched_paths(&session.id, task_id)?;
         Ok(floor_checks(self.repository_root, &map, &touched))
+    }
+
+    /// The floor checks a completion verification must run now.
+    ///
+    /// Review follow-up to R16: a plan-declared required check must not suppress
+    /// the completion run for the detected floor. This returns the floor checks
+    /// that are missing or stale and are **not** plan-declared; the answer-time
+    /// caller runs exactly these through the ordinary approval and command
+    /// policy. Plan-declared checks remain the model's responsibility. A floor
+    /// check is not missing when the model already ran its exact command in the
+    /// exact directory and that exit is current under R4's rule.
+    ///
+    /// This executes nothing and stores no proposal; it reads the same facts the
+    /// gate report reads.
+    pub fn floor_checks_needing_verification(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<CheckId>> {
+        let Some(session) = self.session_store.read_session(session_id)? else {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown session: {session_id}"
+            )));
+        };
+        if repository_id_for_root(self.repository_root) != session.repository_id {
+            return Err(ClientError::AccessDenied(format!(
+                "Session {session_id} does not belong to repository {}",
+                self.repository_root.display()
+            )));
+        }
+        self.session_store.task(session_id, task_id)?;
+
+        let plan = self.session_store.read_task_plan(session_id, task_id)?;
+        let chain = self
+            .session_store
+            .task_continuation_chain(session_id, task_id)?;
+        let ids = chain.iter().map(String::as_str).collect::<Vec<_>>();
+        let events = self
+            .session_store
+            .read_verification_events(session_id, &ids)?;
+        let verification = fold_verification(events.iter());
+        let current_hashes = current_hashes(self.repository_root, &verification);
+        let floor = self.floor_checks(&session, task_id)?;
+        let empty_plan;
+        let plan = match plan.as_ref() {
+            Some(plan) => plan,
+            None => {
+                empty_plan = TaskPlan::new(task_id, 0);
+                &empty_plan
+            }
+        };
+        let generation = plan.mutation_generation();
+        // Only a task at completion asks this question. While primary plan work
+        // is open or blocked the everyday gate already stops the task, and the
+        // completion floor is not yet an obligation (spec 101/105 R15/R16).
+        let at_completion = plan.steps.iter().all(|step| {
+            step.id.starts_with(VERIFICATION_STEP_PREFIX)
+                || (step.status.is_terminal() && step.status != StepStatus::Blocked)
+        });
+        if !at_completion {
+            return Ok(Vec::new());
+        }
+        let plan_required: BTreeSet<CheckId> = plan
+            .steps
+            .iter()
+            .filter(|step| !step.id.starts_with(VERIFICATION_STEP_PREFIX))
+            .filter_map(|step| step.check.as_ref())
+            .filter(|check| check.required)
+            .map(|check| CheckId::new(check.working_directory.as_str(), check.command.as_str()))
+            .collect();
+
+        let mut needed = Vec::new();
+        for check in floor {
+            if plan_required.contains(&check) {
+                continue;
+            }
+            if let Some(run) = verification.checks.get(&check) {
+                if run.is_stale(&current_hashes, generation) {
+                    let current_exit = latest_matching_exit_in_plan(plan, &check).is_some_and(
+                        |(step, index, _)| deferred_evidence_is_current(plan, step, index),
+                    );
+                    if !current_exit {
+                        needed.push(check);
+                    }
+                }
+                continue;
+            }
+            let current_exit = latest_matching_exit_in_plan(plan, &check)
+                .is_some_and(|(step, index, _)| deferred_evidence_is_current(plan, step, index));
+            if !current_exit {
+                needed.push(check);
+            }
+        }
+        Ok(needed)
     }
 
     /// Settle a task through the gate, recording the verdict beside its status.

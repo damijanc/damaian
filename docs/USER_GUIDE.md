@@ -1018,14 +1018,18 @@ for the files that command created, modified or deleted. A command that changed
 nothing Git tracks or reports, such as one that only made an empty folder,
 starts no verification.
 
-**Which checks run.** Detection is per project root. A change selects the root
-that owns each changed file plus every root that encloses it, because a member
-change is a workspace change. When the enclosing root is a Cargo workspace
-whose own `cargo test` already runs the member's tests (a workspace manifest
-with no `[package]`, `default-members` or `exclude`, listing the member), the
-member's `cargo test` is left out: on this repository, changing
-`crates/workspace-engine` runs `cargo test` once, at the repository root. In
-any other case both run. Each row of the check card says where its check runs. A
+**Which checks run.** Detection is per project root. A change selects only the
+root that owns each changed file: changing `crates/workspace-engine` runs that
+crate's `cargo test`, not the whole workspace suite after every patch. The
+enclosing roots are still completion obligations. When the task is ready to
+finish, Damaian runs the detected checks of the owning and enclosing roots of
+every file the task changed, so the repository-root `cargo test` runs then and
+catches a member change that breaks a sibling crate. If the enclosing root is a
+Cargo workspace whose own `cargo test` already runs the member's tests (a
+workspace manifest with no `[package]`, `default-members` or `exclude`, listing
+the member), the member's `cargo test` is left out of the completion obligation;
+the completion run may still rerun it so a repair does not leave the check it
+selected earlier stale. Each row of the check card says where its check runs. A
 documentation-only change (`.md`, `.txt`, `.rst`, `.adoc`) selects nothing and
 says so. A Cargo root currently detects one check, `cargo test`; detection finds
 no separate clippy or build command, so the report cannot claim one ran.
@@ -1312,10 +1316,16 @@ approved plan and from the files the task changed. When an approved plan step
 carries a required check, or the task touched a file whose project root (or an
 enclosing root, such as a Cargo workspace) detects a check, the task may not
 complete until that exact command has a current passing result in its directory,
-or you have explicitly waived it. Plan-declared checks are added to the detected
-checks; a plan with no check does not remove them. A documentation-only task has
-no detected floor. The completion report names each required check with one of
-four dispositions:
+or you have explicitly waived it. The detected floor is checked when the task
+completes: per-change runs use only the owning root, and an answer that would
+otherwise finish with only a missing or stale required check runs that check
+first. A plan that declares its own required check does not suppress the
+detected floor, and a plan-declared check the model has not run remains the
+model's job. A check the agent runs itself with the exact command in the exact
+directory at the end counts as the same evidence. Plan-declared checks are
+added to the detected checks; a plan with no check does not remove them. A
+documentation-only task has no detected floor. The completion report names each
+required check with one of four dispositions:
 
 - **Passed** — the check ran, exited zero, and the files it covered have not
   changed since.

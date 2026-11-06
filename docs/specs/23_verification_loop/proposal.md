@@ -216,19 +216,46 @@ its root's working directory. The loop runs the ones relevant to what changed,
 where "relevant" is deliberately coarse and decided by **root**, not by
 language:
 
-| Changed path | Roots whose checks run |
+| Changed path | Roots whose checks run per change |
 |---|---|
 | Documentation (`.md`, `.txt`, `.rst`, `.adoc`) | None from this path |
-| Anything else | The root that owns it (`RepositoryMap::root_for_path`), and every root that encloses that one |
+| Anything else | The root that owns it (`RepositoryMap::root_for_path`) only |
 | Only documentation changed | None. Reported as skipped with the reason |
 
-The enclosing roots are included because a change to a member is a change to
-its workspace. A Cargo workspace's `cargo test` at the repository root is the
-check that would catch a member change breaking a sibling. Roots overlap as a
-result: a Cargo workspace root and each member all propose `cargo test`. Both
-run. One de-duplication is safe: `npm test` (`test-shortcut`) is dropped when
-the same root also proposes `npm run test`, because the two run the same
-script.
+Since review fix R16 (decision D2's second piece, 2026-11-06), the enclosing
+roots are **not** selected per change. They remain task-completion obligations:
+the discovered-check floor from spec 101/105 review fix R15 is the detected
+checks of the owning **and enclosing** roots of every file the task touched.
+The loop runs that floor when the task completes — a verification with no open
+or blocked primary plan step — through the same command-policy and approval
+path. That is D2's check-level principle: per change, only the owning root's
+checks; at task completion, the required checks (plan-declared or the floor);
+at spec close-out, the scoped gate locally and the full gate on CI. Cross-root
+breakage that a member's own check cannot see is therefore caught at task
+completion, not by running the workspace suite after every patch.
+
+An answered turn at completion runs the floor checks that are missing or stale
+and are **not plan-declared**, regardless of any other completion reason. A
+plan that declares its own required check does not suppress that run, and the
+run does not execute a plan-declared check the model owns. The run is restricted
+to those check identities, so no other detected command from the same root is
+proposed or stored. A floor check is satisfied by a current `CheckRun` from the
+loop **or** by a current `CommandExit` of the identical command and directory
+anywhere in the plan: if the model ran the exact floor command after the last
+mutation, the model's own result counts and no second automatic run starts. The
+same identity matcher and R4 currentness rule (`step_is_current` plus no
+`PatchApplied` after the exit) decide both, so plan-declared and floor evidence
+cannot drift apart.
+
+The floor keeps every root that encloses a touched path, so a Cargo workspace
+root's `cargo test` is the check that catches a member change breaking a
+sibling. Roots overlap in the floor; a member's `cargo test` is dropped from the
+gate's floor obligation when the virtual workspace root is known to run it
+(spec 90). The completion verification still keeps the member check beside the
+root so a repair patch cannot leave the check it selected earlier stale. One
+de-duplication is always safe and remains per root: `npm test`
+(`test-shortcut`) is dropped when the same root also proposes `npm run test`,
+because the two run the same script.
 
 The loop does not call `propose_detected_validations` for every root and
 discard most of the results. Each proposal is persisted and audited, so the
@@ -239,7 +266,8 @@ Targeting is by owning root, not by dependency analysis. A precise
 from Phase 3 WP3, and approximating it here with heuristics would produce a loop
 that silently skips the test that mattered. Coarse and complete beats precise and
 wrong; the cost is running more checks than strictly needed, which is the correct
-trade at this stage.
+trade at this stage. At completion the floor deliberately runs the task's full
+set once, which is the level where that cost belongs.
 
 Where the selected roots have no detected checks at all, the loop says so in the
 report. "No checks were available" is a materially different statement from
@@ -403,8 +431,9 @@ is the assertion that fails if someone later makes the loop optimistic.
 ### 5.9 Documentation
 
 `docs/USER_GUIDE.md`: what the loop does after a change, why some checks are
-skipped, which roots' checks run for a change, what the report's sections mean,
-and that "no checks available" is not "checks passed". `docs/TROUBLESHOOTING.md`:
+skipped, which root's checks run for a change and which enclosing roots return
+at task completion, what the report's sections mean, and that "no checks
+available" is not "checks passed". `docs/TROUBLESHOOTING.md`:
 how to see which checks ran, where full output lives (`origin_ref` →
 `stdout.log`), what `stale` means, and how to allowlist a check so the loop
 stops asking.
@@ -428,8 +457,9 @@ stops asking.
   stale — asserted by comparing the union against the proposed set.
 - A project with no detected checks produces a report saying so, distinct from
   checks passing.
-- A change in a sub-root runs that root's checks and its enclosing roots'
-  checks, each in its own working directory, and no other root's.
+- A change in a sub-root runs only that root's checks per change; its enclosing
+  roots' checks run at task completion as the completion floor, each in its own
+  working directory, and no unrelated root's.
 - A change to documentation only runs no checks and says so.
 - A web verification with no running target is skipped with reason
   `no_running_target`, never inferred as verified.
@@ -466,7 +496,7 @@ To be completed during implementation. Record:
 
 **Root selection (Tasks 1–2, 2026-10-25).** `select_roots` takes
 `RepositoryMap::root_for_path` and every enclosing non-removed root, exactly as
-§5.2 proposes; documentation is the extension list `md`, `txt`, `rst`, `adoc`.
+§5.2 proposed; documentation is the extension list `md`, `txt`, `rst`, `adoc`.
 The map is restricted before `propose_detected_validations`, so only selected
 roots' proposals are stored and audited. The one observed case where selection
 found nothing for a change that needed a check is a root with no manifest at
@@ -474,6 +504,39 @@ all: the report says `NoChecksAvailable` rather than pretending it passed. The
 Cargo detection gap (no clippy or build command, `lint:web` missed) is
 `OBSERVATIONS.md` #48; the loop lists no such check rather than claiming one
 passed.
+
+**Review fix R16 (2026-11-06): per-change selection is the owning root only.**
+Decision D2's second piece narrowed the rule above. `select_roots` now returns
+`RepositoryMap::root_for_path(path)` for each changed file and nothing else;
+`select_floor_roots` is the separate owning-plus-enclosing selection. The
+completion floor still uses the wider set: `verification::floor_checks` and
+`BaselineCoordinator::prepare` were left on it, so R15's obligations and R14's
+task-start baselines (including an enclosing root) are unchanged. When a
+verification has no open or blocked primary plan step, `propose_completion_checks`
+selects the floor roots without the Cargo member de-duplication, so the task's
+completion run records the workspace root's check and refreshes a member check
+that an earlier per-change run selected. An answered turn at completion records
+a completion `verification_due` for every floor check that is missing or stale
+and is not plan-declared, regardless of any other completion reason, with the
+exact identities in `checks`; `verify_due` proposes only those through the
+ordinary approval and command policy before the answer becomes final. A current
+`CommandExit` of the same identity anywhere in the plan satisfies a floor check
+without another run. Tests: `verification_loop::a_member_change_selects_only_its_owning_root`,
+`a_member_change_runs_only_the_members_check_per_change`,
+`a_root_owned_change_still_runs_the_root_check_per_change`,
+`a_web_change_does_not_duplicate_the_test_script`,
+`a_member_change_baselines_its_own_and_enclosing_root_at_task_start`,
+`a_member_check_is_kept_in_the_completion_floor_when_the_root_does_not_run_it`,
+`a_member_change_puts_the_workspace_root_check_in_the_floor`,
+`plan_turn::a_member_change_runs_only_the_members_check_per_change_and_the_root_check_at_completion`
+(the last drives the real orchestrator: member check per change, workspace-root
+check at completion, `new_regression`, repair, pass), and the R16 follow-up
+tests `a_plan_declared_member_check_does_not_hide_the_missing_workspace_root_floor`,
+`a_missing_floor_check_runs_even_when_a_plan_check_is_also_missing` and
+`a_model_run_floor_command_satisfies_the_floor_without_an_automatic_run`. The
+trade-off is the one D2 chose: a cross-root break is reported when the task
+tries to complete rather than after the first patch, and the workspace suite no
+longer runs on every change.
 
 **Repair within the limit (Task 5).** The deterministic `verified_repair`
 scenario repairs a compile error on the first attempt; that is one run, not a
@@ -485,9 +548,10 @@ answered with an invented number. The "no changed file" stop is what ends the
 **Cost of overlapping roots and the regression rerun (Tasks 5, 9).** The
 `rust-workspace` fixture's `cargo test` measured **1.24s cold and 0.05s warm**
 with a shared `CARGO_TARGET_DIR`, so a verification of that fixture is cheap;
-that is the only measurement taken. No live repository was run with the loop
-enabled, so the proposal §7 question about material slowdown in real projects
-is not answered here.
+that is the only measurement taken. Since review fix R16 the overlapping-root
+cost is paid once at task completion, not after every change; no live repository
+was run with the loop enabled, so the proposal §7 question about material
+slowdown in real projects is not answered here.
 
 ### Acceptance criteria, and what shows each
 
@@ -503,7 +567,7 @@ is not answered here.
 | Every proposed check appears once across passed/failed/skipped/stale | `every_selected_check_is_in_exactly_one_section` |
 | Every check skipped is distinct from passing ([#78](../78_skipped_checks_are_not_passed.md)) | `declining_every_check_is_nothing_verified_not_passed`; shell `resume_checks_endpoint_records_declined_checks` |
 | No detected checks is distinct from passing | `no_checks_available_is_not_checks_passed`; `verify_due_with_no_detected_checks_says_so`; shell `verify_endpoint_reports_no_checks_available` |
-| A sub-root change runs its root's and enclosing roots' checks only | `a_member_change_selects_its_own_root_and_every_enclosing_root` |
+| A sub-root change runs only its own root's checks per change, and the enclosing roots' checks at task completion | `a_member_change_selects_only_its_owning_root`; `a_member_change_runs_only_the_members_check_per_change`; `a_root_owned_change_still_runs_the_root_check_per_change`; `a_web_change_does_not_duplicate_the_test_script`; `a_member_change_baselines_its_own_and_enclosing_root_at_task_start`; `a_member_check_is_kept_in_the_completion_floor_when_the_root_does_not_run_it`; `a_member_change_puts_the_workspace_root_check_in_the_floor`; `plan_turn::a_member_change_runs_only_the_members_check_per_change_and_the_root_check_at_completion`; `plan_turn::a_plan_declared_member_check_does_not_hide_the_missing_workspace_root_floor`; `plan_turn::a_missing_floor_check_runs_even_when_a_plan_check_is_also_missing`; `plan_turn::a_model_run_floor_command_satisfies_the_floor_without_an_automatic_run` |
 | A docs-only change runs no checks and says so | `only_documentation_changes_select_nothing`; `a_documentation_only_patch_verifies_nothing_and_says_so` |
 | A web check with no running target is skipped, never verified | `an_unreachable_page_is_skipped_with_no_running_target`; `a_web_change_with_no_stored_target_is_skipped_with_no_running_target` |
 | A rollback or later edit marks affected checks `stale` | `a_check_whose_files_changed_is_stale_not_passed` |

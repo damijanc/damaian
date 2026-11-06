@@ -99,7 +99,8 @@ use crate::vector_index::VectorIndexCache;
 use crate::verification::{
     CheckId, CheckOutcome, CheckTermination, FailureProvenance, FindingEvidence, Selection,
     SkipReason, VerificationEvent, VerificationOutcome, VerificationReport,
-    environment_termination, fold_verification, propose_checks,
+    environment_termination, fold_verification, propose_checks, propose_checks_exactly,
+    propose_completion_checks,
 };
 use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
@@ -2672,12 +2673,43 @@ impl ChatOrchestrator {
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
         let (map, _) = RepositoryMapStore::new(&self.config.data_dir, self.audit_log.clone())
             .load_or_build(&index, self.validation_orchestrator.command_policy())?;
-        let selection = propose_checks(
-            &self.validation_orchestrator,
-            repository_root,
-            &map,
-            &changed,
-        )?;
+        // Review fix R16: the per-change run selects the owning root only. At
+        // task completion the enclosing roots must still run, because R15's
+        // floor keeps them as completion obligations. The plan is the signal:
+        // while primary work remains this is a per-change run; with no open or
+        // blocked primary step it is the completion run.
+        let plan = self.session_store.read_task_plan(session_id, &task.id)?;
+        let at_completion = plan.as_ref().is_none_or(|plan| {
+            plan.steps
+                .iter()
+                .filter(|step| !step.id.starts_with("verify_"))
+                .all(|step| step.status.is_terminal() && step.status != StepStatus::Blocked)
+        });
+        let selection = if !due.checks.is_empty() {
+            // A completion due carries the exact floor checks the answer-time
+            // trigger found missing or stale. Run those and nothing else: a
+            // plan-declared check stays the model's responsibility.
+            propose_checks_exactly(
+                &self.validation_orchestrator,
+                repository_root,
+                &map,
+                &due.checks,
+            )?
+        } else if at_completion {
+            propose_completion_checks(
+                &self.validation_orchestrator,
+                repository_root,
+                &map,
+                &changed,
+            )?
+        } else {
+            propose_checks(
+                &self.validation_orchestrator,
+                repository_root,
+                &map,
+                &changed,
+            )?
+        };
         let browser = self.browser_check(session_id, &session, &task, &changed)?;
         if browser.is_none() {
             return match selection {
@@ -7007,6 +7039,7 @@ impl ChatOrchestrator {
                 task_id: task_id.to_string(),
                 patch_id: String::new(),
                 paths,
+                checks: Vec::new(),
             },
         )
     }
@@ -12326,6 +12359,7 @@ impl ChatOrchestrator {
             }
         }
 
+        let mut completion_verification = false;
         task = match (&pending, &pending_question) {
             (Some(pending), None) => self.session_store.await_approval(&task, pending)?,
             // A question link goes under its own status key through
@@ -12337,9 +12371,35 @@ impl ChatOrchestrator {
                     // `complete` cannot be asserted by the model or reached with
                     // open plan work, a due verification or pending evidence.
                     StopReason::Answered => {
-                        CompletionGateService::new(&self.session_store, repository_root)
-                            .settle(&task, CompletionSettlement::Gate)?
-                            .task
+                        let settled =
+                            CompletionGateService::new(&self.session_store, repository_root)
+                                .settle(&task, CompletionSettlement::Gate)?;
+                        // Review follow-up to R16: the task-completion floor's
+                        // enclosing roots are not run per change, and a plan
+                        // that declares any required check must not suppress
+                        // the floor. Ask the gate service which floor checks
+                        // are missing or stale and are not plan-declared; run
+                        // exactly those through the ordinary check policy. A
+                        // plan-declared check stays the model's job.
+                        let gate = CompletionGateService::new(&self.session_store, repository_root);
+                        let needed_floor_checks =
+                            gate.floor_checks_needing_verification(&session.id, &settled.task.id)?;
+                        if !needed_floor_checks.is_empty() {
+                            let paths = self
+                                .session_store
+                                .task_touched_paths(&session.id, &settled.task.id)?;
+                            self.session_store.append_verification_event(
+                                &session.id,
+                                &VerificationEvent::Due {
+                                    task_id: settled.task.id.clone(),
+                                    patch_id: String::new(),
+                                    paths,
+                                    checks: needed_floor_checks,
+                                },
+                            )?;
+                            completion_verification = true;
+                        }
+                        settled.task
                     }
                     StopReason::ToolBudget => self.session_store.update_task_status(
                         &task,
@@ -12430,6 +12490,20 @@ impl ChatOrchestrator {
             && proposals.fetch.is_none()
         {
             self.seal_turn_checkpoint(repository_root, &session, &task);
+        }
+        if completion_verification {
+            // The answer already settled `incomplete` for the missing floor
+            // check; this continuation is what runs it and records the real
+            // verdict. Keeping the answer in front of the verification's report
+            // preserves what the model said without letting it replace the
+            // evidence (the same shape as a command-made verification due).
+            let answer = response.clone();
+            let mut verified =
+                self.verify_due(repository_root, &session.id, model_adapter, sink)?;
+            if !answer.trim().is_empty() {
+                verified.response = format!("{answer}\n\n{}", verified.response);
+            }
+            return Ok(verified);
         }
         // From the log, not from a running total: the number the client shows
         // now must be the number it shows after a reload.

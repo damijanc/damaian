@@ -3884,6 +3884,21 @@ fn a_trivial_plan_check_does_not_replace_the_discovered_floor() {
         .clone();
     apply_patch_with_baselines(&engine, &repo, &patch_id, true);
 
+    // R16 makes the discovered floor a task-completion obligation. Close the
+    // plan first so this test still asks the completion question.
+    let mut plan = engine
+        .session_store
+        .read_task_plan(&proposed.session.id, &proposed.task.id)
+        .expect("the plan should read")
+        .expect("the task carries the plan");
+    for step in &mut plan.steps {
+        step.status = StepStatus::Completed;
+    }
+    engine
+        .session_store
+        .revise_plan(&proposed.task, &plan)
+        .expect("the completed plan records");
+
     let report = engine
         .completion_report(&repo, &proposed.session.id, &proposed.task.id)
         .expect("the gate report should compute");
@@ -4024,5 +4039,475 @@ fn floor_checks_are_baselined_at_task_start_and_a_later_root_is_uncertain() {
                         .any(|check| check.check == member_check)
             ),
         "the floor check for a later root is never silently pre-existing: {report:?}"
+    );
+}
+
+// --- R16: the owning root per change, the enclosing roots at completion ----
+//
+// Review fix R16 (spec 23 D2 piece 2): a change runs only its owning root's
+// checks. The enclosing roots stay in R15's completion floor, so cross-root
+// breakage that the member's own check cannot see is caught when the task
+// completes. This fixture makes the virtual workspace root's `cargo test`
+// depend on the member's value, so changing the member breaks the sibling
+// crate's build without touching it.
+
+const R16_MEMBER_PLAN: &str = r#"{"steps":[
+    {"title":"Change the member"},
+    {"title":"Finish the task"}
+]}"#;
+
+fn r16_workspace_fixture(name: &str) -> (PathBuf, PathBuf) {
+    let repo = temp_repo(name);
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/member\", \"crates/sibling\"]\n",
+    )
+    .expect("the workspace manifest");
+    fs::create_dir_all(repo.join("crates/member/src")).expect("the member root");
+    fs::create_dir_all(repo.join("crates/sibling/src")).expect("the sibling root");
+    fs::write(
+        repo.join("crates/member/Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("the member manifest");
+    fs::write(
+        repo.join("crates/sibling/Cargo.toml"),
+        "[package]\nname = \"sibling\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("the sibling manifest");
+    let member = repo.join("crates/member/src/lib.rs");
+    fs::write(&member, "pub fn value() -> u8 { 1 }\n").expect("the member source");
+    fs::write(
+        repo.join("crates/sibling/src/lib.rs"),
+        "pub fn uses_member() -> u8 { member::value() }\n",
+    )
+    .expect("the sibling source");
+    let shell = repo.join("check-shell.sh");
+    // The member's own `cargo test` always passes. The workspace root's
+    // `cargo test` compiles the sibling against the member, so it fails once
+    // the member's value changes.
+    let script = "#!/bin/sh\n\
+         command=\"$2\"\n\
+         case \"$command\" in\n\
+           *\"cargo test\"*)\n\
+             if [ -f \"$PWD/Cargo.toml\" ] && grep -q '^\\[workspace\\]' \"$PWD/Cargo.toml\"; then\n\
+               grep -q 'value() -> u8 { 1 }' \"$PWD/crates/member/src/lib.rs\" || exit 1\n\
+             fi ;;\n\
+           *) exit 0 ;;\n\
+         esac\n\
+         exit 0\n";
+    fs::write(&shell, script).expect("the fake shell");
+    let mut permissions = fs::metadata(&shell)
+        .expect("the fake shell metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&shell, permissions).expect("the fake shell is executable");
+    (repo, shell)
+}
+
+/// Review fix R16 (b): a member change runs only the member's check per
+/// change; the workspace root check runs at task completion, catches the
+/// sibling break the member check could not see, and the task-start baseline
+/// makes that failure `new_regression` so an ordinary repair turn starts.
+#[test]
+fn a_member_change_runs_only_the_members_check_per_change_and_the_root_check_at_completion() {
+    let (repo, shell) = r16_workspace_fixture("r16-workspace-member");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let member_check = CheckId::new("crates/member", "cargo test");
+    let root_check = CheckId::new("", "cargo test");
+    let broken = "pub fn value() -> u8 { 2 }\n";
+    let repair = "pub fn value() -> u8 { 1 }\n";
+    let patch = patch_call_with("crates/member/src/lib.rs", broken);
+
+    let mut first = scripted(vec![
+        vec![call("propose_plan", R16_MEMBER_PLAN)],
+        vec![patch.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the member", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+    let mut resumed = scripted(vec![vec![patch]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let patch_id = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("the member patch is proposed")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch_id, true);
+
+    // Per change: only the owning member root's check runs. The workspace
+    // root's check is not selected while the plan is still open.
+    let mut per_change = MockModelAdapter::new("Done.");
+    let _ =
+        run_verification_and_approve_checks(&engine, &repo, &proposed.session.id, &mut per_change);
+    let events = engine
+        .session_store
+        .read_verification_events(&proposed.session.id, &[])
+        .expect("the log should read");
+    let per_change_checks = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            VerificationEvent::Started { checks, .. } => Some(checks.clone()),
+            _ => None,
+        })
+        .expect("a per-change verification started");
+    assert_eq!(
+        per_change_checks,
+        vec![member_check.clone()],
+        "per change only the member's own check runs"
+    );
+
+    // The task completes its plan in a later turn. At that point the floor
+    // requires the workspace-root check; it runs, fails on the sibling, and
+    // the repair turn proposes the fix.
+    let mut finish = scripted(vec![
+        vec![call("complete_step", "{}"), call("complete_step", "{}")],
+        Vec::new(),
+        vec![patch_call_with("crates/member/src/lib.rs", repair)],
+    ]);
+    let mut completed = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Finish the task",
+        &mut finish,
+    );
+    while let Some(batch) = completed.check_batch.clone() {
+        let decisions = batch
+            .checks
+            .iter()
+            .map(|check| (check.id.clone(), true))
+            .collect::<Vec<_>>();
+        completed = resume_checks(&engine, &batch.id, &decisions, &mut finish);
+    }
+    let repair_patch = completed
+        .patch_proposal
+        .as_ref()
+        .expect("the completion floor's failure starts a repair turn")
+        .patch_id
+        .clone();
+
+    let events = engine
+        .session_store
+        .read_verification_events(&proposed.session.id, &[])
+        .expect("the log should read");
+    let completion_checks = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            VerificationEvent::Started { checks, .. } => Some(checks.clone()),
+            _ => None,
+        })
+        .expect("a completion verification started");
+    assert!(
+        completion_checks.contains(&root_check),
+        "completion runs the enclosing workspace root's floor check: {completion_checks:?}"
+    );
+    assert!(
+        !completion_checks.contains(&CheckId::new("crates/sibling", "cargo test")),
+        "a root the task did not touch is not selected: {completion_checks:?}"
+    );
+    let provenance = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            VerificationEvent::Provenance { record, .. } if record.check == root_check => {
+                Some(record.clone())
+            }
+            _ => None,
+        })
+        .expect("the root failure has a provenance record");
+    assert_eq!(
+        provenance.provenance,
+        FailureProvenance::NewRegression,
+        "the task-start baseline makes the root failure introduced, not pre-existing"
+    );
+
+    apply_patch_with_baselines(&engine, &repo, &repair_patch, true);
+    let mut final_adapter = MockModelAdapter::new("Done.");
+    let verified = run_verification_and_approve_checks(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        &mut final_adapter,
+    );
+    assert_eq!(
+        verified.task.status,
+        TaskStatus::Complete,
+        "the repaired workspace passes the floor and completes: {verified:?}"
+    );
+}
+
+// --- R16 follow-up: the completion floor must be satisfiable -------------
+//
+// Review follow-up: R16 moved the enclosing-root floor check off the
+// per-change run, so the answer-time completion verification is the only
+// automatic path that runs it. A plan that declares any required check must
+// not suppress that run, and a model-run command of the exact floor identity
+// must satisfy the floor without a second automatic run.
+
+const R16_MEMBER_CHECK_PLAN: &str = r#"{"steps":[
+    {"title":"Change the member"},
+    {"title":"Finish the task"},
+    {"title":"Validate the member","check":{"command":"cargo test","workingDirectory":"crates/member","purpose":"validates the member","required":true}}
+]}"#;
+
+/// Propose the plan, approve it, propose the patch and apply it with the
+/// ordinary baseline gate. Returns the turn that proposed the patch.
+fn r16_proposed_member_change(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    plan_json: &str,
+    patch: ToolCall,
+) -> ChatTurnResult {
+    let mut first = scripted(vec![
+        vec![call("propose_plan", plan_json)],
+        vec![patch.clone()],
+    ]);
+    let paused = ask(engine, repo, "Change the member", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+    let mut resumed = scripted(vec![vec![patch]]);
+    let proposed = decide(engine, &review.id, true, None, &mut resumed);
+    let patch_id = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("the member patch is proposed")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(engine, repo, &patch_id, true);
+    proposed
+}
+
+/// The checks of the newest `verification_started`, or an empty list when no
+/// verification has started.
+fn latest_started_checks(engine: &WorkspaceEngine, session_id: &str) -> Vec<CheckId> {
+    engine
+        .session_store
+        .read_verification_events(session_id, &[])
+        .expect("the log should read")
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            VerificationEvent::Started { checks, .. } => Some(checks.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn a_check_passed(engine: &WorkspaceEngine, session_id: &str, check: &CheckId) -> bool {
+    engine
+        .session_store
+        .read_verification_events(session_id, &[])
+        .expect("the log should read")
+        .iter()
+        .rev()
+        .any(|event| {
+            matches!(
+                event,
+                VerificationEvent::Check {
+                    check: recorded,
+                    outcome: workspace_engine::CheckOutcome::Ran {
+                        exit_code: Some(0),
+                        ..
+                    },
+                    ..
+                } if recorded == check
+            )
+        })
+}
+
+/// Answer every command approval and check card on the way to the turn's end.
+fn approve_until_finished(
+    engine: &WorkspaceEngine,
+    result: &mut ChatTurnResult,
+    adapter: &mut dyn ModelAdapter,
+) {
+    loop {
+        if let Some(proposal) = result.command_proposal.clone() {
+            *result = approve_command(engine, &proposal.id, adapter);
+            continue;
+        }
+        if let Some(batch) = result.check_batch.clone() {
+            let decisions = batch
+                .checks
+                .iter()
+                .map(|check| (check.id.clone(), true))
+                .collect::<Vec<_>>();
+            *result = resume_checks(engine, &batch.id, &decisions, adapter);
+            continue;
+        }
+        break;
+    }
+}
+
+/// (a) A plan that declares its own required member check must not suppress
+/// the completion floor. The member check passes on its planned step; the
+/// answer-time completion run still runs the enclosing workspace root check,
+/// and the task completes.
+#[test]
+fn a_plan_declared_member_check_does_not_hide_the_missing_workspace_root_floor() {
+    let (repo, shell) = r16_workspace_fixture("r16-floor-with-plan-check");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let root_check = CheckId::new("", "cargo test");
+    let member_check = CheckId::new("crates/member", "cargo test");
+    let patch = patch_call_with(
+        "crates/member/src/helper.rs",
+        "pub fn helper() -> u8 { 1 }\n",
+    );
+    let proposed = r16_proposed_member_change(&engine, &repo, R16_MEMBER_CHECK_PLAN, patch);
+
+    // The patch's own due verification has an open plan, so the member check is
+    // deferred to its planned step.
+    let mut due = MockModelAdapter::new("Done.");
+    let _ = run_verification_and_approve_checks(&engine, &repo, &proposed.session.id, &mut due);
+
+    // Work the plan: close the first two steps, run the planned member check on
+    // the last step, close it, then answer.
+    let mut adapter = scripted(vec![
+        vec![call("complete_step", "{}")],
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"cargo test","working_directory":"crates/member","reason":"Run the required check"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        Vec::new(),
+    ]);
+    let mut result = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Finish the task",
+        &mut adapter,
+    );
+    approve_until_finished(&engine, &mut result, &mut adapter);
+
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Complete,
+        "the plan's own check and the workspace root floor must both pass: {result:?}"
+    );
+    assert!(
+        latest_started_checks(&engine, &proposed.session.id).contains(&root_check),
+        "the completion run still runs the workspace root floor"
+    );
+    assert!(
+        !latest_started_checks(&engine, &proposed.session.id).contains(&member_check),
+        "the plan-declared member check is not auto-run by the completion floor"
+    );
+}
+
+/// (b) A mixed gate: the plan's required member check was never run and the
+/// floor's workspace root check is missing. The answer-time run covers only the
+/// floor; the task stays incomplete for the plan-declared check, which remains
+/// the model's job.
+#[test]
+fn a_missing_floor_check_runs_even_when_a_plan_check_is_also_missing() {
+    let (repo, shell) = r16_workspace_fixture("r16-mixed-floor-and-plan");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let root_check = CheckId::new("", "cargo test");
+    let member_check = CheckId::new("crates/member", "cargo test");
+    let patch = patch_call_with(
+        "crates/member/src/helper.rs",
+        "pub fn helper() -> u8 { 1 }\n",
+    );
+    let proposed = r16_proposed_member_change(&engine, &repo, R16_MEMBER_CHECK_PLAN, patch);
+
+    let mut due = MockModelAdapter::new("Done.");
+    let _ = run_verification_and_approve_checks(&engine, &repo, &proposed.session.id, &mut due);
+
+    // Close every step without running the planned member check, then answer.
+    let mut adapter = scripted(vec![
+        vec![call("complete_step", "{}")],
+        vec![call("complete_step", "{}")],
+        vec![call("complete_step", "{}")],
+        Vec::new(),
+    ]);
+    let mut result = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Finish the task",
+        &mut adapter,
+    );
+    approve_until_finished(&engine, &mut result, &mut adapter);
+
+    assert_eq!(result.task.status, TaskStatus::Incomplete, "{result:?}");
+    assert!(
+        a_check_passed(&engine, &proposed.session.id, &root_check),
+        "the floor check still runs"
+    );
+    assert!(
+        !a_check_passed(&engine, &proposed.session.id, &member_check),
+        "the plan-declared check is not auto-run"
+    );
+    let report = engine
+        .session_store
+        .read_completion_report(&proposed.session.id, &result.task.id)
+        .expect("the report should read")
+        .expect("the settlement carries a report");
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckMissing],
+        "{report:?}"
+    );
+    assert!(
+        report.reasons[0]
+            .explanation
+            .contains("cargo test (crates/member)"),
+        "the remaining obligation is the plan's member check: {report:?}"
+    );
+    assert!(
+        !report.reasons[0].explanation.contains("repository root"),
+        "the floor check is not the remaining blocker: {report:?}"
+    );
+}
+
+/// (c) The model itself runs the exact floor command in the exact directory
+/// after the last mutation. That CommandExit satisfies the floor, so no extra
+/// automatic completion run is started.
+#[test]
+fn a_model_run_floor_command_satisfies_the_floor_without_an_automatic_run() {
+    let (repo, shell) = r16_workspace_fixture("r16-model-run-floor");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let root_check = CheckId::new("", "cargo test");
+    let patch = patch_call_with(
+        "crates/member/src/helper.rs",
+        "pub fn helper() -> u8 { 1 }\n",
+    );
+    let proposed = r16_proposed_member_change(&engine, &repo, R16_MEMBER_PLAN, patch);
+
+    let mut due = MockModelAdapter::new("Done.");
+    let _ = run_verification_and_approve_checks(&engine, &repo, &proposed.session.id, &mut due);
+
+    // Run the exact floor command at the repository root on the final step,
+    // after the patch, then close the plan and answer.
+    let mut adapter = scripted(vec![
+        vec![call("complete_step", "{}")],
+        vec![call(
+            "run_command",
+            r#"{"command":"cargo test","reason":"Run the workspace check"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        Vec::new(),
+    ]);
+    let mut result = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Finish the task",
+        &mut adapter,
+    );
+    approve_until_finished(&engine, &mut result, &mut adapter);
+
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Complete,
+        "the model's own root command satisfies the floor: {result:?}"
+    );
+    assert!(
+        !latest_started_checks(&engine, &proposed.session.id).contains(&root_check),
+        "no extra automatic completion run is started for a satisfied floor"
     );
 }

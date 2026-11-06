@@ -1274,6 +1274,7 @@ impl EditOrchestrator {
                 task_id: task_id.to_string(),
                 patch_id: patch.id.clone(),
                 paths: Vec::new(),
+                checks: Vec::new(),
             },
         )
     }

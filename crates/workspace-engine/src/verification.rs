@@ -744,6 +744,12 @@ pub enum VerificationEvent {
         /// are read from its decisions instead, so a patch's `Due` has none.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         paths: Vec<String>,
+        /// The exact checks a completion verification must run (review follow-up
+        /// to R16). Empty for an ordinary patch or command due, which selects
+        /// its checks normally. A non-empty list is what keeps an answer-time
+        /// floor run from also auto-running a plan-declared check.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<CheckId>,
     },
     #[serde(rename = "verification_started", rename_all = "camelCase")]
     Started {
@@ -830,6 +836,11 @@ pub struct VerificationDue {
     /// Set when an approved command made the run due (spec 85).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    /// The exact checks this due must run. Empty means select by the normal
+    /// per-change or completion rule; non-empty is a completion floor's own
+    /// list (review follow-up to R16).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<CheckId>,
 }
 
 impl VerificationDue {
@@ -886,11 +897,13 @@ impl VerificationState {
                 task_id,
                 patch_id,
                 paths,
+                checks,
             } => {
                 self.due = Some(VerificationDue {
                     task_id: task_id.clone(),
                     patch_id: patch_id.clone(),
                     paths: paths.clone(),
+                    checks: checks.clone(),
                 });
             }
             VerificationEvent::Started {
@@ -1546,12 +1559,32 @@ pub fn is_documentation(path: &str) -> bool {
 
 /// The roots whose checks a change selects.
 ///
-/// Selection is by owning root and every non-removed root that encloses it, not
-/// by file category: a member change is a workspace change, and a workspace
-/// root's check is what catches a member breaking a sibling (proposal §5.2).
-/// Documentation selects nothing. Sorted and de-duplicated, so the caller can
-/// compare selections directly.
+/// Since review fix R16 (spec 23 decision D2 piece 2), per-change selection is
+/// the **owning root only** (`RepositoryMap::root_for_path`). The enclosing
+/// roots are no longer run after every change: full checks belong at task
+/// completion, where [`floor_checks`] keeps them, and at spec/CI level. Making
+/// a member edit run the workspace suite on every patch was the behaviour this
+/// split removes. Documentation selects nothing. Sorted and de-duplicated, so
+/// the caller can compare selections directly.
 pub fn select_roots(map: &RepositoryMap, changed: &[String]) -> Vec<String> {
+    let mut selected = BTreeSet::new();
+    for path in changed {
+        if is_documentation(path) {
+            continue;
+        }
+        selected.insert(map.root_for_path(path).to_string());
+    }
+    selected.into_iter().collect()
+}
+
+/// The roots whose checks the task-completion floor requires.
+///
+/// The floor keeps the owning root **and every enclosing root**: a change to a
+/// member is a change to its workspace, and the workspace root's check is what
+/// catches a member breaking a sibling (spec 23 §5.2, spec 101/105 R15). This
+/// is deliberately separate from [`select_roots`] so narrowing per-change
+/// selection cannot shrink the floor. Documentation selects nothing.
+pub fn select_floor_roots(map: &RepositoryMap, changed: &[String]) -> Vec<String> {
     let mut selected = BTreeSet::new();
     for path in changed {
         if is_documentation(path) {
@@ -1568,17 +1601,17 @@ pub fn select_roots(map: &RepositoryMap, changed: &[String]) -> Vec<String> {
 ///
 /// The completion gate's floor (spec 101/105 review fix R15): a task that
 /// changed files has required checks even when its plan declares none. This is
-/// the same root selection [`propose_checks`] uses — owning root plus every
-/// enclosing root, with documentation selecting nothing — but it only reads the
-/// persisted map, so a gate report stores no command proposal and executes
-/// nothing. The result is sorted by [`CheckId`], so merging it with the plan's
-/// required checks is deterministic.
+/// the owning root plus every enclosing root ([`select_floor_roots`]), with
+/// documentation selecting nothing, but it only reads the persisted map, so a
+/// gate report stores no command proposal and executes nothing. The result is
+/// sorted by [`CheckId`], so merging it with the plan's required checks is
+/// deterministic.
 pub fn floor_checks(
     repository_root: &Path,
     map: &RepositoryMap,
     touched_paths: &[String],
 ) -> Vec<CheckId> {
-    let roots = select_roots(map, touched_paths);
+    let roots = select_floor_roots(map, touched_paths);
     if roots.is_empty() {
         return Vec::new();
     }
@@ -1611,26 +1644,117 @@ pub enum Selection {
 /// Select the roots a change touched and ask the validation orchestrator for
 /// their detected checks.
 ///
-/// `propose_detected_validations` is the only discovery path: this function
-/// restricts the map first, so nothing is stored and audited that will not run,
-/// and then calls it unchanged (proposal §5.2, `context.md` §2).
+/// Per-change selection is the owning root only since review fix R16; the
+/// task-completion floor uses [`propose_completion_checks`]. `propose_detected_validations`
+/// is the only discovery path: this function restricts the map first, so
+/// nothing is stored and audited that will not run, and then calls it
+/// unchanged (proposal §5.2, `context.md` §2).
 pub fn propose_checks(
     orchestrator: &ValidationOrchestrator,
     repository_root: &Path,
     map: &RepositoryMap,
     changed: &[String],
 ) -> Result<Selection> {
-    let roots = select_roots(map, changed);
+    propose_checks_for_roots(
+        orchestrator,
+        repository_root,
+        map,
+        &select_roots(map, changed),
+        true,
+    )
+}
+
+/// Select the task-completion floor's roots and ask for their detected checks.
+///
+/// This is the same set [`floor_checks`] reports, kept as proposals so a
+/// completion verification can run it through the ordinary approval and
+/// command-policy path. Per-change selection uses [`propose_checks`] instead;
+/// the split is what lets a member change run only the member's check while the
+/// enclosing roots still gate completion (review fix R16).
+///
+/// The completion run does not drop a member's `cargo test` as covered by its
+/// workspace root. That de-duplication is safe for a one-off obligation, but a
+/// completion run also refreshes checks the task already selected: a repair
+/// patch that changed a member after its per-change check passed would
+/// otherwise leave that check stale with nothing left to rerun it.
+pub fn propose_completion_checks(
+    orchestrator: &ValidationOrchestrator,
+    repository_root: &Path,
+    map: &RepositoryMap,
+    changed: &[String],
+) -> Result<Selection> {
+    propose_checks_for_roots(
+        orchestrator,
+        repository_root,
+        map,
+        &select_floor_roots(map, changed),
+        false,
+    )
+}
+
+fn propose_checks_for_roots(
+    orchestrator: &ValidationOrchestrator,
+    repository_root: &Path,
+    map: &RepositoryMap,
+    roots: &[String],
+    drop_covered: bool,
+) -> Result<Selection> {
     if roots.is_empty() {
         return Ok(Selection::OnlyDocumentation);
     }
-    let mut restricted = map.restricted_to(&roots);
-    drop_covered_member_checks(repository_root, &mut restricted);
-    let proposals = orchestrator.propose_detected_validations(repository_root, &restricted)?;
-    if proposals.is_empty() {
-        return Ok(Selection::NoChecksAvailable { roots });
+    let mut restricted = map.restricted_to(roots);
+    if drop_covered {
+        drop_covered_member_checks(repository_root, &mut restricted);
     }
-    Ok(Selection::Proposed(
+    let proposals = orchestrator.propose_detected_validations(repository_root, &restricted)?;
+    Ok(selection_from_proposals(repository_root, roots, proposals))
+}
+
+/// Propose exactly the requested checks, with no other command from their
+/// roots.
+///
+/// Review follow-up to R16: an answer-time completion run must run only the
+/// floor checks that are missing or stale, never a plan-declared check the
+/// model owns. Restricting the map to the identity's root and then retaining
+/// only the requested commands means nothing is stored that will not run.
+pub fn propose_checks_exactly(
+    orchestrator: &ValidationOrchestrator,
+    repository_root: &Path,
+    map: &RepositoryMap,
+    checks: &[CheckId],
+) -> Result<Selection> {
+    if checks.is_empty() {
+        return Ok(Selection::OnlyDocumentation);
+    }
+    let roots: Vec<String> = checks
+        .iter()
+        .map(|check| check.working_directory.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut restricted = map.restricted_to(&roots);
+    for root in &mut restricted.roots {
+        root.commands.retain(|command| {
+            checks.iter().any(|check| {
+                check.working_directory == root.path && check.command == command.command
+            })
+        });
+    }
+    let proposals = orchestrator.propose_detected_validations(repository_root, &restricted)?;
+    Ok(selection_from_proposals(repository_root, &roots, proposals))
+}
+
+fn selection_from_proposals(
+    repository_root: &Path,
+    roots: &[String],
+    proposals: Vec<CommandProposal>,
+) -> Selection {
+    if proposals.is_empty() {
+        return Selection::NoChecksAvailable {
+            roots: roots.to_vec(),
+        };
+    }
+    Selection::Proposed(
         proposals
             .into_iter()
             .map(|proposal| {
@@ -1646,7 +1770,7 @@ pub fn propose_checks(
                 (check, proposal)
             })
             .collect(),
-    ))
+    )
 }
 
 /// A member's `cargo test` repeats what its workspace root's `cargo test`

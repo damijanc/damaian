@@ -119,6 +119,7 @@ fn due(task_id: &str) -> VerificationEvent {
         task_id: task_id.to_string(),
         patch_id: "patch".to_string(),
         paths: Vec::new(),
+        checks: Vec::new(),
     }
 }
 

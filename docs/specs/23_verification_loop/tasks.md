@@ -766,3 +766,22 @@ files, `docs/specs/README.md`, `CHANGELOG.md`.
   naming #23 (#35 waits on #23 and #31; #31 is Done, so #35 is promoted),
   "What to build next", and the `CHANGELOG.md` `Unreleased` entry.
 - [x] Show the change and the check results and ask before committing.
+
+## Review fix 2026-11-06: per-change selection is the owning root (R16)
+
+Task 2 shipped the owning root plus every enclosing root. Review fix R16
+(decision D2 piece 2) narrowed per-change selection to the owning root only;
+the enclosing roots remain the task-completion floor (proposal §5.2, spec
+101/105 R15). The Task 2 test was renamed
+`a_member_change_selects_only_its_owning_root`, and the enclosing-root cases now
+live in the completion-floor tests. The "select only the owning root" mutation
+recorded under Task 2 is therefore the shipped rule, not a mutation to keep
+out.
+
+The R16 follow-up (same date) made the floor satisfiable: an answer-time
+completion due carries the exact missing/stale floor checks that are not
+plan-declared, and a current `CommandExit` of the identical identity anywhere in
+the plan satisfies a floor check. The new tests are
+`a_plan_declared_member_check_does_not_hide_the_missing_workspace_root_floor`,
+`a_missing_floor_check_runs_even_when_a_plan_check_is_also_missing` and
+`a_model_run_floor_command_satisfies_the_floor_without_an_automatic_run`.
