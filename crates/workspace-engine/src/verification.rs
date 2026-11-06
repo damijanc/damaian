@@ -287,7 +287,10 @@ pub(crate) fn environment_termination(error: &ClientError) -> Option<CheckTermin
 /// [`Finding`]: the transient id, creation time, origin reference and status
 /// are deliberately absent, so a log reload cannot change a fingerprint.
 /// `details` is kept for the model's repair evidence but is excluded from the
-/// fingerprint and the comparison keys.
+/// fingerprint and the comparison keys. `identity_tail` is the normalized,
+/// bounded, redacted tail of an unparsed check's output; unlike `details` it is
+/// part of the comparison key, because a generic finding has no other way to
+/// distinguish a new failing test or a repair that removed one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FindingEvidence {
@@ -307,6 +310,13 @@ pub struct FindingEvidence {
     /// part of a failure's identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     details: Option<String>,
+    /// A normalized, bounded, already-redacted tail of a generic (unparsed)
+    /// check's output. It is identity, not display: R10 added it because a
+    /// generic finding's summary is only the first output line. Absent for a
+    /// parsed finding and for records written before the fingerprint format
+    /// version 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_tail: Option<String>,
 }
 
 impl FindingEvidence {
@@ -328,6 +338,15 @@ impl FindingEvidence {
             // Already redacted and bounded by `Finding::new`; whitespace is
             // meaningful in a compiler block, so it is kept verbatim.
             details: finding.details().map(str::to_string),
+            // `Finding::new` redacted the details before they reached here.
+            // Normalizing after redaction is what keeps a secret out of the
+            // identity tail even when it sits inside an otherwise volatile
+            // token.
+            identity_tail: if finding.source() == FindingSource::Command {
+                finding.details().and_then(generic_identity_tail)
+            } else {
+                None
+            },
         }
     }
 
@@ -365,6 +384,24 @@ impl FindingEvidence {
         self.details.as_deref()
     }
 
+    /// The normalized generic-output tail that is part of this finding's
+    /// identity, when it has one. Absent for parsed findings and for records
+    /// written before fingerprint format version 3.
+    pub fn identity_tail(&self) -> Option<&str> {
+        self.identity_tail.as_deref()
+    }
+
+    /// The summary as identity sees it. A generic summary embeds the check's
+    /// first output line, which can contain the same volatile tokens as the
+    /// tail; display keeps the original line.
+    fn comparison_summary(&self) -> String {
+        if self.source == FindingSource::Command {
+            normalized_generic_text(&self.summary)
+        } else {
+            self.summary.clone()
+        }
+    }
+
     /// The stable comparison key for provenance and stagnation (spec 102).
     ///
     /// It deliberately omits `start_line` and `start_column`: a patch that
@@ -372,14 +409,32 @@ impl FindingEvidence {
     /// creating a new failure. The location stays on the evidence, so the
     /// report and the repair request still show it. Checks that genuinely
     /// differ in source, severity, code, normalised path or normalised summary
-    /// still produce different keys.
+    /// still produce different keys. A generic finding also contributes its
+    /// normalized, bounded, redacted identity tail (R10), because its summary
+    /// is only the first output line.
     pub(crate) fn canonical_key(&self) -> String {
+        self.canonical_key_including_identity_tail(true)
+    }
+
+    /// The comparison key as it was for a record written before R10's identity
+    /// tail existed. Provenance uses it only when the baseline has no tail at
+    /// all, so an old baseline still classifies from its durable findings
+    /// instead of treating every generic failure as new.
+    pub(crate) fn legacy_canonical_key(&self) -> String {
+        self.canonical_key_including_identity_tail(false)
+    }
+
+    fn canonical_key_including_identity_tail(&self, include_identity_tail: bool) -> String {
+        let identity_tail = include_identity_tail
+            .then_some(self.identity_tail.as_deref())
+            .flatten();
         serde_json::to_string(&serde_json::json!({
             "source": self.source,
             "severity": self.severity,
             "code": self.code,
             "path": self.path,
-            "summary": self.summary,
+            "summary": self.comparison_summary(),
+            "identityTail": identity_tail,
         }))
         .expect("finding evidence is serializable")
     }
@@ -392,6 +447,17 @@ impl FindingEvidence {
     /// plus the location. `details` is excluded: the repair text a model sees
     /// must not decide which occurrence is pre-existing.
     pub(crate) fn location_key(&self) -> String {
+        self.location_key_including_identity_tail(true)
+    }
+
+    pub(crate) fn legacy_location_key(&self) -> String {
+        self.location_key_including_identity_tail(false)
+    }
+
+    fn location_key_including_identity_tail(&self, include_identity_tail: bool) -> String {
+        let identity_tail = include_identity_tail
+            .then_some(self.identity_tail.as_deref())
+            .flatten();
         serde_json::to_string(&serde_json::json!({
             "source": self.source,
             "severity": self.severity,
@@ -399,7 +465,8 @@ impl FindingEvidence {
             "path": self.path,
             "startLine": self.start_line,
             "startColumn": self.start_column,
-            "summary": self.summary,
+            "summary": self.comparison_summary(),
+            "identityTail": identity_tail,
         }))
         .expect("finding evidence is serializable")
     }
@@ -418,6 +485,7 @@ impl PartialEq for FindingEvidence {
             && self.start_line == other.start_line
             && self.start_column == other.start_column
             && self.summary == other.summary
+            && self.identity_tail == other.identity_tail
     }
 }
 
@@ -430,17 +498,21 @@ impl Eq for FindingEvidence {}
 /// machine-local paths are not inputs, so an equivalent result produces the
 /// same value regardless of the order the findings arrived in.
 ///
-/// Version 2 excludes a finding's line and column from the hashed comparison
-/// key. Version 1 values remain loadable as opaque strings; a stored baseline
-/// or provenance record still classifies from its own durable findings, while a
-/// version 1 repair-history entry cannot be re-derived and simply does not
-/// compare equal to a version 2 value.
+/// Version 3 adds a generic finding's normalized identity tail to the hashed
+/// comparison key. Version 2 excluded a finding's line and column from it;
+/// version 1 also hashed them. All older values remain loadable as opaque
+/// strings. A stored baseline or provenance record still classifies from its
+/// own durable findings: a version 1 or 2 generic baseline has no identity
+/// tail, so comparison falls back to the pre-R10 key for that record instead of
+/// reading every generic failure as new. A version 1 or 2 repair-history entry
+/// cannot be re-derived, so it does not compare equal to a version 3 value and
+/// the next attempt starts a fresh stagnation window.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct FailureFingerprint(String);
 
 /// The canonical fingerprint schema version written by [`FailureFingerprint::compute`].
-pub const FAILURE_FINGERPRINT_VERSION: u32 = 2;
+pub const FAILURE_FINGERPRINT_VERSION: u32 = 3;
 
 impl FailureFingerprint {
     /// The canonical fingerprint of one failed check result.
@@ -653,23 +725,145 @@ impl CheckRun {
     }
 }
 
+/// The most bytes of a generic check's normalized output tail that are part of
+/// its failure identity (review fix R10, spec 102 requirement 3).
+///
+/// A generic finding is one finding for a whole unparsed check, so its summary
+/// is only the first output line. The tail is what distinguishes "test A
+/// failed" from "tests A and B failed" and what lets a repair that removes one
+/// failing test look like progress rather than a repeated failure. It is
+/// deliberately bounded: an unbounded tail would make identity depend on log
+/// length.
+pub const MAX_GENERIC_IDENTITY_TAIL_BYTES: usize = 4_000;
+
+/// Prefix on a generic identity tail cut at
+/// [`MAX_GENERIC_IDENTITY_TAIL_BYTES`].
+pub const GENERIC_IDENTITY_TAIL_TRUNCATED: &str = "… [identity tail truncated]";
+
 fn normalized_text(text: &str) -> String {
-    // An absolute POSIX path is machine-local: the same result under another
-    // checkout must fingerprint identically. Keep the final component (which
-    // is repository content) and any `:line:column` suffix that follows it.
+    let text = replace_absolute_paths(text);
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Reduce an absolute POSIX path to its final component.
+///
+/// An absolute path is machine-local: the same result under another checkout
+/// must fingerprint identically. The final component is repository content;
+/// any `:line:column` suffix that follows it is preserved for the display
+/// normaliser and removed separately for a generic identity tail, where R5
+/// says location is not identity.
+fn replace_absolute_paths(text: &str) -> String {
     static ABSOLUTE_PATH: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(^|[\s(\[{<'"=])(/[^\s:()\[\]{}<>,'"]+)"#)
             .expect("the absolute-path normaliser is valid")
     });
-    let text = ABSOLUTE_PATH.replace_all(text, |captures: &regex::Captures<'_>| {
-        let path = &captures[2];
-        let basename = path
-            .rsplit('/')
-            .find(|segment| !segment.is_empty())
-            .unwrap_or(path);
-        format!("{}{basename}", &captures[1])
+    ABSOLUTE_PATH
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            let path = &captures[2];
+            let basename = path
+                .rsplit('/')
+                .find(|segment| !segment.is_empty())
+                .unwrap_or(path);
+            format!("{}{basename}", &captures[1])
+        })
+        .into_owned()
+}
+
+/// Normalize a generic check's text for identity comparison (spec 102 R10).
+///
+/// The shipped parsers explain `cargo`/`rustc`/`biome` failures; every other
+/// check (`pytest`, `npm test`, `go test`, a shell script) becomes one generic
+/// finding whose summary is only the command, the first non-empty output line
+/// and the exit code. These rules make the rest of the redacted output stable
+/// enough to be identity, in this order:
+///
+/// 1. ANSI colour/CSI and OSC escape sequences are removed.
+/// 2. CRLF and lone CR line endings become LF.
+/// 3. A `:line` / `:line:column` suffix on a file-like token is removed, so a
+///    finding that moves because lines were added above it is not new (R5).
+/// 4. A path under a temporary root (`/tmp`, `/private/tmp`, `/var/tmp`,
+///    `/var/folders`, `/private/var/folders`) becomes `<TMPPATH>`, including a
+///    line/column suffix.
+/// 5. Every other absolute path is reduced to its final component, so a
+///    different checkout root is the same failure.
+/// 6. ISO 8601 timestamps become `<TIMESTAMP>` and `HH:MM:SS` clock values
+///    become `<TIME>`.
+/// 7. A number with a duration unit (`ns`, `ms`, `s`, `sec`, `min`, ...)
+///    becomes `<DURATION>`.
+/// 8. `pid 1234`, `pid=1234` and `process id: 1234` become `<PID>`.
+/// 9. Per-line whitespace is collapsed, blank lines are dropped, and lines are
+///    re-joined with `\n`.
+///
+/// Callers pass text that `Finding::new` already redacted. Nothing here can
+/// reintroduce a secret, and the result is not the raw output.
+fn normalized_generic_text(text: &str) -> String {
+    static ANSI_CSI: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\x1B\[[0-9;?]*[ -/]*[@-~]").expect("the ANSI CSI normaliser is valid")
     });
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    static ANSI_OSC: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)").expect("the ANSI OSC normaliser is valid")
+    });
+    static LINE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?P<file>[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+):\d{1,6}(?::\d{1,6})?")
+            .expect("the location normaliser is valid")
+    });
+    static TEMP_PATH: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?:/private)?/(?:tmp|var/tmp|var/folders)/[^\s:()\[\]{}<>,'"]*(?::\d{1,6}){0,2}"#,
+        )
+        .expect("the temporary-path normaliser is valid")
+    });
+    static TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b")
+            .expect("the timestamp normaliser is valid")
+    });
+    static TIME: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b").expect("the clock normaliser is valid")
+    });
+    static DURATION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\b\d+(?:\.\d+)?\s?(?:ns|µs|us|ms|s|sec|secs|seconds?|min|mins|minutes?|h|hr|hrs|hours?)\b",
+        )
+        .expect("the duration normaliser is valid")
+    });
+    static PID: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:pid|process id)\s*[:=#]?\s*\d+\b")
+            .expect("the pid normaliser is valid")
+    });
+
+    let text = ANSI_CSI.replace_all(text, "");
+    let text = ANSI_OSC.replace_all(&text, "");
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = LINE_SUFFIX.replace_all(&text, "${file}");
+    let text = TEMP_PATH.replace_all(&text, "<TMPPATH>");
+    let text = replace_absolute_paths(&text);
+    let text = TIMESTAMP.replace_all(&text, "<TIMESTAMP>");
+    let text = TIME.replace_all(&text, "<TIME>");
+    let text = DURATION.replace_all(&text, "<DURATION>");
+    let text = PID.replace_all(&text, "<PID>");
+    text.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn generic_identity_tail(text: &str) -> Option<String> {
+    let normalized = normalized_generic_text(text);
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.len() <= MAX_GENERIC_IDENTITY_TAIL_BYTES {
+        return Some(normalized);
+    }
+    let mut start = normalized.len() - MAX_GENERIC_IDENTITY_TAIL_BYTES;
+    while !normalized.is_char_boundary(start) {
+        start += 1;
+    }
+    Some(format!(
+        "{GENERIC_IDENTITY_TAIL_TRUNCATED}\n{}",
+        &normalized[start..]
+    ))
 }
 
 pub(crate) fn normalized_repository_path(path: &str) -> String {

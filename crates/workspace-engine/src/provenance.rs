@@ -219,13 +219,47 @@ fn classification(
 /// The comparison key excludes line and column (spec 102 R5), so a finding that
 /// moved because the patch added lines above it is still the same finding.
 fn same_findings(current: &[FindingEvidence], baseline: &[FindingEvidence]) -> bool {
-    counts(current) == counts(baseline)
+    let include_identity_tail = baseline_has_identity_tail(baseline);
+    identity_counts(current, include_identity_tail)
+        == identity_counts(baseline, include_identity_tail)
 }
 
-fn counts(findings: &[FindingEvidence]) -> BTreeMap<String, usize> {
+/// A baseline written before fingerprint format version 3 has no generic
+/// identity tail. Comparing it with R10's key would make every pre-existing
+/// generic failure look new, so that record keeps the earlier comparison: its
+/// durable findings still classify, just without the tail. A new baseline with
+/// no generic finding also has no tail, and the choice changes nothing there.
+fn baseline_has_identity_tail(findings: &[FindingEvidence]) -> bool {
+    findings
+        .iter()
+        .any(|finding| finding.identity_tail().is_some())
+}
+
+fn identity_key(finding: &FindingEvidence, include_identity_tail: bool) -> String {
+    if include_identity_tail {
+        finding.canonical_key()
+    } else {
+        finding.legacy_canonical_key()
+    }
+}
+
+fn location_key(finding: &FindingEvidence, include_identity_tail: bool) -> String {
+    if include_identity_tail {
+        finding.location_key()
+    } else {
+        finding.legacy_location_key()
+    }
+}
+
+fn identity_counts(
+    findings: &[FindingEvidence],
+    include_identity_tail: bool,
+) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for finding in findings {
-        *counts.entry(finding.canonical_key()).or_insert(0) += 1;
+        *counts
+            .entry(identity_key(finding, include_identity_tail))
+            .or_insert(0) += 1;
     }
     counts
 }
@@ -244,23 +278,26 @@ fn introduced_findings(
     current: &[FindingEvidence],
     baseline: &[FindingEvidence],
 ) -> Vec<FindingEvidence> {
-    let mut baseline_by_key = counts(baseline);
+    let include_identity_tail = baseline_has_identity_tail(baseline);
+    let mut baseline_by_key = identity_counts(baseline, include_identity_tail);
     let mut baseline_by_location = BTreeMap::<String, usize>::new();
     for finding in baseline {
         *baseline_by_location
-            .entry(finding.location_key())
+            .entry(location_key(finding, include_identity_tail))
             .or_insert(0) += 1;
     }
 
     let mut matched = vec![false; current.len()];
     for (index, finding) in current.iter().enumerate() {
-        let location = finding.location_key();
+        let location = location_key(finding, include_identity_tail);
         if let Some(remaining) = baseline_by_location.get_mut(&location)
             && *remaining > 0
         {
             *remaining -= 1;
             matched[index] = true;
-            if let Some(remaining) = baseline_by_key.get_mut(&finding.canonical_key()) {
+            if let Some(remaining) =
+                baseline_by_key.get_mut(&identity_key(finding, include_identity_tail))
+            {
                 *remaining -= 1;
             }
         }
@@ -269,7 +306,8 @@ fn introduced_findings(
         if matched[index] {
             continue;
         }
-        if let Some(remaining) = baseline_by_key.get_mut(&finding.canonical_key())
+        if let Some(remaining) =
+            baseline_by_key.get_mut(&identity_key(finding, include_identity_tail))
             && *remaining > 0
         {
             *remaining -= 1;

@@ -42,8 +42,16 @@ provenance, scope and stagnation checks increase the damage window.
    key is its source, severity, code, normalized path and normalized summary;
    line and column are excluded, so an edit above a finding does not create a
    new identity. The location stays in the evidence shown to the model and the
-   user. The fingerprint has set semantics, but provenance compares findings as
-   a multiset, so a new identical occurrence is not hidden by an existing one.
+   user. A check with no parser is one generic finding, so its comparison key
+   also includes a normalized, bounded, redacted tail of the check output: the
+   last `MAX_GENERIC_IDENTITY_TAIL_BYTES` (4,000) bytes after ANSI escapes,
+   line/column suffixes, temporary paths, absolute checkout paths,
+   timestamps, clock values, durations and PIDs are normalized. The tail makes
+   a newly failing test and a repair that removes one failing test different
+   identities. It is derived from the finding's already-redacted details but is
+   not the details text verbatim, so display changes cannot change identity.
+   The fingerprint has set semantics, but provenance compares findings as a
+   multiset, so a new identical occurrence is not hidden by an existing one.
    Raw output and secrets are not part of the fingerprint.
 4. Post-patch comparison classifies a result as `new_regression`,
    `pre_existing`, `worsened`, `unchanged_failure`, `environment_failure`,
@@ -54,8 +62,10 @@ provenance, scope and stagnation checks increase the damage window.
    never becomes a repair target. A repair request carries each introduced
    finding's normalized summary and location plus its already-redacted
    details — assertion left/right values, rustc's expected/found lines, a
-   parser's bounded output tail — under an explicit per-finding and total
-   detail budget. When a budget cuts details, the request says so. Pre-existing,
+   generic check's bounded output tail — under an explicit per-finding and total
+   detail budget. When a budget cuts details, the request says so. The generic
+   identity tail is normalized input to classification; the repair request
+   shows the redacted details, not the normalized identity form. Pre-existing,
    environment and unknown findings contribute no repair evidence.
 5. Spawn failures, missing executables, policy refusals and unavailable test
    infrastructure are environment failures. They are reported with an action
@@ -146,10 +156,34 @@ occurrence plus one newly introduced identical occurrence is exactly one new
 finding, while two occurrences that both moved without growing the count are
 unchanged. Introduced repair evidence is restricted to errors, so a new warning
 on an already failing check is visible without marking the result `worsened`.
-Failure fingerprints are versioned: version 2 hashes the location-free
-comparison key. A stored version 1 baseline or provenance record remains
-loadable and still classifies from its durable findings; a version 1
-repair-history entry remains loadable but does not compare equal to a version 2
+
+A check with no parser yields one generic finding whose summary is the command,
+the first non-empty output line and the exit code. That is not enough identity:
+on a failed baseline a newly failing test is invisible, and a repair that fixes
+one test at a time looks identical after every attempt. `FindingEvidence` now
+carries an `identity_tail` for a `FindingSource::Command` finding, derived from
+the finding's already-redacted details and included in `canonical_key` and
+`location_key`. The normalization rules are exact and deterministic, applied in
+this order: remove ANSI CSI/OSC escapes; normalize CRLF/CR to LF; remove a
+`:line`/`:line:column` suffix from a file-like token (R5's no-location rule);
+replace a path under `/tmp`, `/private/tmp`, `/var/tmp`, `/var/folders` or
+`/private/var/folders` with `<TMPPATH>`; reduce every other absolute path to its
+final component; replace ISO 8601 timestamps with `<TIMESTAMP>` and `HH:MM:SS`
+with `<TIME>`; replace a number with a duration unit with `<DURATION>`;
+replace `pid`/`process id` plus a number with `<PID>`; collapse per-line
+whitespace, drop blank lines and rejoin with `\n`. Redaction happens first
+because `Finding::new` redacts the details; the tail is then cut to the last
+`MAX_GENERIC_IDENTITY_TAIL_BYTES` (4,000) bytes on a character boundary and a
+cut is marked with `GENERIC_IDENTITY_TAIL_TRUNCATED`. The identity form is not
+rendered as evidence; the repair request still shows the redacted details.
+
+Failure fingerprints are versioned: version 3 adds the generic identity tail to
+version 2's location-free comparison key. A stored version 1 or 2 baseline or
+provenance record remains loadable and still classifies from its durable
+findings. Such a generic record has no identity tail, so provenance compares it
+with the pre-R10 key (instead of reading every generic failure as new); a
+parsed record has no tail either way and is unaffected. A version 1 or 2
+repair-history entry remains loadable but does not compare equal to a version 3
 value, so the first attempt after an upgrade starts a fresh stagnation window
 and the numeric limit still bounds repair.
 
@@ -308,8 +342,8 @@ marks the spec Done. Workspace-wide Clippy and tests remain for CI.
 |---|---|---|---|
 | 1 | Baseline every required check on the untouched tree before the first patch, and any other check before the patch that first selects it. A required check that becomes required later has no task-start baseline. | `workspace-engine/src/baseline.rs` (`BaselineCoordinator::prepare`, `required_checks`, `task_touched_paths`, `task_has_changed_files`) runs from `EditOrchestrator::apply_stored_patch_with_baseline` after the protected-path/mode refusals and before hooks, the action marker, the checkpoint and every write. The first patch a task applies merges the approved plan's required checks with the completion floor for every root the patch and earlier changes touch, plus the detected per-change checks; a later patch reuses task-start baselines and records `CheckBaseline::Uncertain` for a required check that has none because files already changed. | `plan_turn`: `a_required_check_is_baselined_at_task_start_and_a_later_regression_is_repaired`, `a_required_check_first_required_after_changes_is_uncertain_and_asks_before_repair`, `a_declined_required_baseline_is_recorded_declined_not_uncertain`, `floor_checks_are_baselined_at_task_start_and_a_later_root_is_uncertain`, `a_floor_check_for_a_root_first_touched_later_is_uncertain_not_pre_existing`. `repair_baseline`: `a_safe_check_runs_as_a_passing_baseline_before_the_patch_writes`, `a_check_selected_by_a_later_patch_is_baselined_before_it_applies`, `a_partial_selection_baselines_only_the_roots_it_selects`, `a_partial_hunk_apply_still_passes_the_baseline_gate`, `a_fresh_engine_reuses_the_durable_baseline_without_running_it_again`, `a_worker_session_baseline_replays_after_the_worker_restarts`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_environment_failure`. |
 | 2 | Baseline commands keep ordinary approval; patch approval does not approve them, and declining a baseline does not decline the patch. | `baseline.rs` pauses on a `BaselineBatch` and validates every resume decision before running or granting anything; `PatchApplyOutcome::BaselineRequired` is returned instead of an error, and the patch can then apply. | `repair_baseline`: `a_declined_baseline_does_not_decline_the_patch`, `an_approved_baseline_runs_and_the_patch_applies_afterwards`, `malformed_resume_decisions_have_no_side_effects`, `always_grants_must_belong_to_the_pending_batch_and_be_approved_and_eligible`. Eval: `verification_declined_baseline`. |
-| 3 | A stable failure fingerprint from check identity, normalized findings and termination; no raw output or secrets. | `FailureFingerprint::compute` and `FindingEvidence::from_finding` in `verification.rs` canonicalise the `CheckId`, the location-free finding comparison key (source, severity, code, normalized path, normalized summary) and termination. Transient ids, timestamps, origin refs, machine-local absolute paths, raw output and finding location are excluded from identity. The redacted, bounded `details` are carried for the repair request but excluded from `canonical_key`, `location_key`, equality and the fingerprint. The format is version 2; version 1 values remain loadable. | `repair_provenance`: `fingerprint_is_order_and_duplicate_insensitive`, `fingerprint_changes_with_material_evidence_but_not_location`, `fingerprint_uses_code_and_severity_but_not_location`, `fingerprint_changes_with_termination_and_check_identity`, `fingerprint_ignores_transient_finding_fields`, `fingerprint_does_not_depend_on_an_absolute_checkout_path`, `fingerprint_normalises_absolute_paths_in_text_and_check_identity`. `repair_baseline`: `a_failed_baseline_records_redacted_normalized_findings_and_a_fingerprint`. |
-| 4 | Classify as `new_regression`, `pre_existing`, `worsened`, `unchanged_failure`, `environment_failure`, `uncertain` or `unknown_provenance`; repair only new regressions and the new part of worsened, with the introduced finding's redacted details under named budgets. | `workspace-engine/src/provenance.rs` (`classify`, `same_findings`, `introduced_findings`, `repair_targets`, `render_repair_request`) and `ChatOrchestrator::finish_verification`: classification compares the durable findings as a multiset without line or column, an explicit `CheckBaseline::Uncertain` maps to `uncertain` before the unknown groups, repair starts only when `repair_targets` is non-empty, only errors become introduced evidence, and a repaired result carries only the introduced delta. `render_repair_request` prints each finding's summary/location and its redacted details, with `MAX_REPAIR_FINDING_DETAILS_BYTES` / `MAX_REPAIR_TOTAL_DETAILS_BYTES` and explicit truncation markers. | `repair_targets`: `a_pre_existing_error_that_shifts_lines_is_still_pre_existing`, `a_new_identical_error_in_a_different_file_is_introduced`, `a_second_different_error_in_the_same_file_is_introduced`, `a_new_warning_on_a_failed_baseline_is_not_worsened_or_a_repair_target`, `an_extra_identical_occurrence_beyond_the_baseline_is_introduced`, `shifted_duplicates_that_do_not_grow_the_count_are_not_introduced`, `a_baseline_written_with_a_v1_fingerprint_still_classifies_by_its_findings`, `a_repair_request_bounds_one_findings_details`, `a_repair_request_bounds_total_details_across_many_findings`. `verification_loop`: `a_matching_failed_baseline_is_pre_existing_and_starts_no_repair`, `a_pre_existing_error_that_shifts_lines_stays_pre_existing`, `a_declined_baseline_makes_the_failure_unknown_and_starts_no_repair`, `a_repair_that_breaks_a_previously_passing_check_is_a_regression`, `the_repair_request_carries_normalized_evidence_not_the_raw_log`, `the_repair_request_carries_a_rustc_type_error_expected_and_found`, `the_repair_request_carries_a_generic_checks_bounded_stderr_tail`, `provenance_and_repair_targets_survive_a_fresh_store`. `plan_turn`: `a_required_check_first_required_after_changes_is_uncertain_and_asks_before_repair`, `answering_the_uncertain_repair_question_with_repair_runs_one_repair_turn_that_still_needs_approval`, `answering_the_uncertain_repair_question_with_no_leaves_it_reported_and_unrepaired`, `a_per_change_check_keeps_its_pre_patch_baseline_and_pre_existing_classification`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_repair_stalled_repeated`. |
+| 3 | A stable failure fingerprint from check identity, normalized findings and termination; no raw output or secrets. | `FailureFingerprint::compute` and `FindingEvidence::from_finding` in `verification.rs` canonicalise the `CheckId`, the location-free finding comparison key (source, severity, code, normalized path, normalized summary) and termination. A generic (unparsed) finding also contributes its redacted `identity_tail`, normalized by `normalized_generic_text` and bounded by `MAX_GENERIC_IDENTITY_TAIL_BYTES`; the exact rules are in §4. Transient ids, timestamps, origin refs, machine-local absolute paths, raw output and finding location are excluded from identity. The redacted, bounded `details` are carried for the repair request but excluded from `canonical_key`, `location_key`, equality and the fingerprint; the identity tail is a separate normalized value. The format is version 3; version 1 and 2 values remain loadable, and a legacy baseline without a tail compares with the pre-R10 key. | `repair_provenance`: `fingerprint_is_order_and_duplicate_insensitive`, `fingerprint_changes_with_material_evidence_but_not_location`, `fingerprint_uses_code_and_severity_but_not_location`, `fingerprint_changes_with_termination_and_check_identity`, `fingerprint_ignores_transient_finding_fields`, `fingerprint_does_not_depend_on_an_absolute_checkout_path`, `fingerprint_normalises_absolute_paths_in_text_and_check_identity`. `generic_failure_identity`: `volatile_generic_output_values_are_not_identity`, `identical_generic_output_twice_is_still_a_repeated_failure`, `a_secret_in_generic_output_never_reaches_its_identity_report_or_repair_request`. `repair_baseline`: `a_failed_baseline_records_redacted_normalized_findings_and_a_fingerprint`. |
+| 4 | Classify as `new_regression`, `pre_existing`, `worsened`, `unchanged_failure`, `environment_failure`, `uncertain` or `unknown_provenance`; repair only new regressions and the new part of worsened, with the introduced finding's redacted details under named budgets. | `workspace-engine/src/provenance.rs` (`classify`, `same_findings`, `introduced_findings`, `repair_targets`, `render_repair_request`) and `ChatOrchestrator::finish_verification`: classification compares the durable findings as a multiset without line or column and includes a generic finding's normalized identity tail, an explicit `CheckBaseline::Uncertain` maps to `uncertain` before the unknown groups, repair starts only when `repair_targets` is non-empty, only errors become introduced evidence, and a repaired result carries only the introduced delta. A legacy baseline without any identity tail falls back to the pre-R10 comparison. `render_repair_request` prints each finding's summary/location and its redacted details, with `MAX_REPAIR_FINDING_DETAILS_BYTES` / `MAX_REPAIR_TOTAL_DETAILS_BYTES` and explicit truncation markers. | `repair_targets`: `a_pre_existing_error_that_shifts_lines_is_still_pre_existing`, `a_new_identical_error_in_a_different_file_is_introduced`, `a_second_different_error_in_the_same_file_is_introduced`, `a_new_warning_on_a_failed_baseline_is_not_worsened_or_a_repair_target`, `an_extra_identical_occurrence_beyond_the_baseline_is_introduced`, `shifted_duplicates_that_do_not_grow_the_count_are_not_introduced`, `a_baseline_written_with_a_v1_fingerprint_still_classifies_by_its_findings`, `a_repair_request_bounds_one_findings_details`, `a_repair_request_bounds_total_details_across_many_findings`. `verification_loop`: `a_matching_failed_baseline_is_pre_existing_and_starts_no_repair`, `a_pre_existing_error_that_shifts_lines_stays_pre_existing`, `a_declined_baseline_makes_the_failure_unknown_and_starts_no_repair`, `a_repair_that_breaks_a_previously_passing_check_is_a_regression`, `the_repair_request_carries_normalized_evidence_not_the_raw_log`, `the_repair_request_carries_a_rustc_type_error_expected_and_found`, `the_repair_request_carries_a_generic_checks_bounded_stderr_tail`, `provenance_and_repair_targets_survive_a_fresh_store`. `generic_failure_identity`: `a_new_failing_test_over_a_failed_generic_baseline_is_introduced`, `progressing_generic_repairs_are_not_a_repeated_failure_stall`, `identical_generic_output_twice_is_still_a_repeated_failure`, `a_secret_in_generic_output_never_reaches_its_identity_report_or_repair_request`. `plan_turn`: `a_required_check_first_required_after_changes_is_uncertain_and_asks_before_repair`, `answering_the_uncertain_repair_question_with_repair_runs_one_repair_turn_that_still_needs_approval`, `answering_the_uncertain_repair_question_with_no_leaves_it_reported_and_unrepaired`, `a_per_change_check_keeps_its_pre_patch_baseline_and_pre_existing_classification`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_repair_stalled_repeated`. |
 | 5 | Spawn failure, missing executable, policy refusal and unavailable infrastructure are environment failures with a user action, never code repair. | `CheckTermination::is_environment_failure`, `environment_termination`, `CheckOutcome::Environment`; `build_partitions` gives each environment group one `FixEnvironment` action. Only the process-spawn error is `SpawnFailed`; other errors propagate. | `verification_loop`: `a_spawn_failure_is_an_environment_failure_and_starts_no_repair`, `a_missing_executable_is_an_environment_failure_and_starts_no_repair`, `a_policy_refused_check_is_reported_as_environment_and_starts_no_repair`, `an_execution_store_failure_propagates_instead_of_becoming_environment`. `repair_baseline`: `policy_refusal_is_an_unavailable_baseline_and_the_patch_still_applies`, `a_spawn_failure_and_a_missing_executable_are_unavailable_baselines`. Eval: `verification_environment_failure`. |
 | 6 | A declined or unusable baseline makes a later failure unknown, not task-caused; a required check with no task-start baseline is `uncertain`. Both may fail completion but neither starts automatic repair; a worker asks about `uncertain` and the answer is never an approval. | `classify` maps `Declined` and `Unavailable` baselines to `UnknownProvenance` and `Uncertain` to `Uncertain`; `finish_verification` settles `Failed` with no repair targets for a non-worker, and a worker pauses on the engine's repair question. `resume_repair_decision` runs one ordinary repair turn for "Repair it" and otherwise settles `Failed`; both routes still require ordinary patch/command approval. | `repair_baseline`: `a_declined_baseline_does_not_decline_the_patch`, `policy_refusal_is_an_unavailable_baseline_and_the_patch_still_applies`. `verification_loop`: `a_declined_baseline_makes_the_failure_unknown_and_starts_no_repair`, `a_worker_session_does_not_repair_an_unknown_failure`. `plan_turn`: `a_declined_required_baseline_is_recorded_declined_not_uncertain`, `a_required_check_first_required_after_changes_is_uncertain_and_asks_before_repair`, `answering_the_uncertain_repair_question_with_repair_runs_one_repair_turn_that_still_needs_approval`, `answering_the_uncertain_repair_question_with_no_leaves_it_reported_and_unrepaired`. Eval: `verification_declined_baseline`. |
 | 7 | Stop before the numeric limit on a repeated fingerprint, equivalent patch, unchanged task diff or oscillation. | `workspace-engine/src/stagnation.rs` (`proposed_patch_digest`, `task_diff_digest`, `repair_state_entry`, `detect_repair_stall`), `record_repair_state_or_stall` and `finish_verification_stalled`. The fixed precedence is `identical_state` → `repeated_failure` → `equivalent_patch` → `unchanged_task_diff` → `oscillation`. The attempt fingerprint uses the location-free comparison key, so an ineffective repair that only moves the failing line still repeats. | `repair_stagnation`: `each_stop_cause_is_detected_independently`, `reason_precedence_is_fixed`, `an_a_to_b_to_a_state_oscillates`, `the_first_progressing_attempt_never_stalls`, `repair_stall_is_one_terminal_event_that_replays_as_a_stop`. `verification_loop`: `a_repeated_ineffective_repair_stalls_before_the_numeric_limit`, `a_repair_that_only_moves_the_failing_line_stalls_as_repeated_failure`, `an_a_to_b_to_a_repair_oscillation_stalls`, `a_worker_stops_on_the_same_typed_repair_stall`. Eval: `verification_repair_stalled_repeated` (limit 16, stops at `repeated_failure`), `verification_repair_oscillation` (limit 16, stops at `oscillation`). |
@@ -521,6 +555,47 @@ the patch applied without offering the required check's baseline. The guard
 pinned the unchanged per-change rule; review fix R15 later re-pointed the
 root-first-touched-later case to `uncertain` (see the R15 note below). All now
 pass.
+
+### 7.8 Review-fix note: generic finding identity (2026-11-06)
+
+The 2026-11-04 review found that a check with no parser is one generic finding,
+and that R5's location-free key still consisted of only the command, the first
+output line and the exit code. Two consequences followed. A failed baseline that
+already had test A failing read a new test B failure as the same finding and
+classified it `pre_existing`, so B was never repaired. Separately, a repair that
+fixed tests C, then B, then A kept the same identity because the first line did
+not change, so the second attempt was stopped as `repeated_failure` even though
+it made progress.
+
+`FindingEvidence` now carries `identity_tail` for `FindingSource::Command`
+findings. It is derived from the finding's already-redacted details, normalized
+by `normalized_generic_text` with the exact rules in §4, cut to the last
+`MAX_GENERIC_IDENTITY_TAIL_BYTES` (4,000) bytes on a character boundary and
+marked with `GENERIC_IDENTITY_TAIL_TRUNCATED` when cut. `canonical_key` and
+`location_key` include it; `details` remains display-only and excluded from
+identity. A generic summary is also normalized for identity, so a timestamp in
+the first output line does not split one failure into two. The repair request
+still renders the redacted details, not the normalized identity form.
+
+`FAILURE_FINGERPRINT_VERSION` is now 3. Version 1 and 2 values still load. A
+version 1 or 2 baseline or provenance record classifies from its durable
+findings; because such a generic record has no identity tail, provenance
+compares it with the pre-R10 key rather than treating every generic failure as
+new. A parsed record has no tail either way. A version 1 or 2 repair-history
+entry does not compare equal to a version 3 value, so the next repair attempt
+starts a fresh stagnation window and the numeric limit still bounds it.
+
+Regression tests were written first and failed for these reasons:
+`generic_failure_identity::a_new_failing_test_over_a_failed_generic_baseline_is_introduced`
+classified `PreExisting` instead of `Worsened`;
+`progressing_generic_repairs_are_not_a_repeated_failure_stall` returned
+`Some(RepeatedFailure)` for the attempt that removed test C; and
+`volatile_generic_output_values_are_not_identity` produced two different
+fingerprints for output that differed only in timestamp, duration, temporary
+path, PID, ANSI colour and absolute checkout path. The guards
+`identical_generic_output_twice_is_still_a_repeated_failure` and
+`a_secret_in_generic_output_never_reaches_its_identity_report_or_repair_request`
+passed before and still pass.
 
 ### Review fix 2026-11-06: floor checks take the task-start baseline (R15)
 
