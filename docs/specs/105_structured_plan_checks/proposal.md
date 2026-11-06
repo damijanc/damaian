@@ -59,8 +59,13 @@ engine-owned statement that all requested checks had passed on the final tree.
 8. Checks named by the task instructions or repository agent instructions are
    proposed by the model for review, not silently trusted from repository
    configuration. Repository text cannot auto-approve a command.
-9. Verification runs once per relevant mutation batch or final plan step, not
-   once merely because the model emitted another patch in the same step.
+9. A mutation batch is verified as it happens, not deferred to the step's
+   close: an applied patch records a verification due immediately, so repair
+   feedback is never delayed. Within one primary plan step, a check that already
+   passed in the current batch and whose validated files still hash the same is
+   not run again merely because another patch landed. A later patch that changes
+   a file the check validated makes the evidence stale, so the check runs again;
+   a check is never reported current for a file changed after it ran.
 10. Recovery and continuation retain structured identities and evidence
     without reinterpreting old prose plans. Historical plans remain supported
     with no required structured checks unless a user explicitly adds them.
@@ -86,6 +91,15 @@ commands increment it at the boundary of a primary plan step, while several
 patches within that step remain one batch until the step closes. Required-check
 evidence names the generation and changed-file digest; later mutations mark it
 stale without deleting history.
+
+The generation is the batch boundary, not the verification schedule. A patch
+records a verification due as soon as it is applied, so repair feedback is not
+delayed until the step closes. Within one primary step a check that already
+passed in the current batch and whose validated files still hash the same is not
+run again for a later patch; a later patch that changes a validated file makes
+the run stale and it runs again. "Once per batch" therefore never means
+reporting evidence that no longer matches the tree (review fix R11,
+2026-11-06).
 
 A check's directory is normalized where a `PlannedCheck` is created from model
 or user input: `propose_plan` and the plan-revision path. One normalizer, built
@@ -150,8 +164,11 @@ currentness rule.
 - A plan with `cargo nextest run -p workspace-engine` at the repository root
   defers exactly that check without matching another directory or command.
 - Plan approval does not run the command; command approval is still required.
-- Two patches in one implementation step trigger one batch verification, while
-  closing the final check step records current evidence.
+- Two patches in one implementation step that leave a check's validated files
+  unchanged run that check once (one batch verification), while closing the
+  final check step records current evidence. A second patch to a file the check
+  validated reruns the check, so its evidence is never current for content it
+  did not see.
 - Mutating a validated file makes the required check stale and prevents
   `complete` until it reruns or the user explicitly waives it.
 - A patch applied after the deferred check in its own step makes that check
@@ -411,3 +428,45 @@ answer-time run. All pass now.
 `a_later_approved_run_decides_instead_of_the_decline_when_it_fails` are the
 guards; the two identity counters already passed before the fix because a
 missing waiver and a missing result share one outcome.
+
+## Review fix 2026-11-06: two patches in one step (R11)
+
+Review fix R11 found that "two patches in one implementation step produce one
+verification" was only covered by a unit test of
+`TaskPlan::mutation_generation`. The end-to-end behaviour is two things, and the
+old requirement 9 conflated them:
+
+1. **When verification runs.** Each applied patch records a `verification_due`
+   immediately; the step's close is not when verification starts. Deferring it
+   to the step's last mutation would withhold the repair feedback the loop
+   depends on, so the behaviour is deliberately per applied mutation.
+2. **When a check is skipped.** Within a primary step, `run_verification_checks`
+   skips a check that already passed at the current generation and whose
+   recorded validated files still hash the same. A second patch to a *different*
+   file therefore runs the check once for the batch. A second patch to the
+   *same* file makes the earlier run stale, so the check runs again.
+
+The review's same-file finding is correct, but the re-run is required, not a
+bug: requirement 5 forbids reporting evidence current for a file that changed
+after it ran. The chosen fix is therefore (B), correcting requirement 9 and the
+acceptance text rather than changing the code. Deferring verification to the
+step's close (option A) would delay repair feedback and would still have to
+rerun a check whenever a later patch touched a validated file.
+
+The end-to-end tests were written first, driven through the orchestrator with
+`MockModelAdapter`, the ordinary plan/command approvals and the pre-apply
+baseline gate, and `complete_step`: one implementation step (the final primary
+step, so closing it does not advance the generation), two applied patches, a
+verification after each, then `complete_step`.
+
+- `plan_turn::two_patches_to_different_files_in_one_step_run_each_selected_check_once`
+  passed with one `verification_check` run; the second patch left the check's
+  recorded file unchanged, so the batch was not re-verified.
+- `plan_turn::two_patches_to_the_same_file_in_one_step_run_the_check_once`
+  was written first against the old "one verification for the whole step"
+  wording and failed with `left: 2, right: 1`. It now asserts the correct
+  behaviour as
+  `two_patches_to_the_same_file_in_one_step_rerun_the_check`: the first run is
+  stale after the second patch (asserted directly with `CheckRun::is_stale`
+  over the new file hash), the check runs a second time, the second run records
+  the new hash, and the task still completes.

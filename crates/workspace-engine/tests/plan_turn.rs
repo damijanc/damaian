@@ -4511,3 +4511,257 @@ fn a_model_run_floor_command_satisfies_the_floor_without_an_automatic_run() {
         "no extra automatic completion run is started for a satisfied floor"
     );
 }
+
+// --- R11: two patches in one implementation step (spec 105 requirement 9) ---
+//
+// Review fix R11 (2026-11-06): the only coverage for "two patches in one
+// implementation step produce one verification" was a unit test of
+// `TaskPlan::mutation_generation`. These tests drive the claim end to end
+// through the orchestrator: one implementation step, two applied patches, a
+// verification after each apply, then `complete_step`. The check count comes
+// from the durable `verification_check` events, not from the plan.
+
+/// Two steps only because a one-step plan is not a plan (spec 21 §5.1). Both
+/// patches land in the second and final step: closing that step does not
+/// advance the mutation generation, so the test counts only the patches'
+/// verifications, not a completion-boundary rerun.
+const TWO_PATCH_PLAN: &str = r#"{"steps":[
+    {"title":"Set up the change"},
+    {"title":"Implement the change"}
+]}"#;
+
+/// A repository whose only detected check is the root's `cargo test`, so two
+/// patches under `src/` both select the same check. The fake shell always
+/// passes: this task is about how often the check runs, not its result.
+fn two_patch_fixture(name: &str) -> (PathBuf, PathBuf) {
+    let repo = temp_repo(name);
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("the root manifest");
+    let shell = repo.join("check-shell.sh");
+    fs::write(&shell, "#!/bin/sh\nexit 0\n").expect("the fake shell");
+    let mut permissions = fs::metadata(&shell)
+        .expect("the fake shell metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&shell, permissions).expect("the fake shell is executable");
+    (repo, shell)
+}
+
+/// Propose the plan, approve it, close the setup step, propose the first patch
+/// in the final step, and apply it through the ordinary pre-apply baseline
+/// gate.
+fn propose_two_patch_plan_and_first_patch(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    patch: ToolCall,
+) -> ChatTurnResult {
+    let mut first = scripted(vec![
+        vec![call("propose_plan", TWO_PATCH_PLAN)],
+        vec![patch.clone()],
+    ]);
+    let paused = ask(engine, repo, "Implement the change", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+    let mut resumed = scripted(vec![vec![call("complete_step", "{}"), patch]]);
+    let proposed = decide(engine, &review.id, true, None, &mut resumed);
+    let patch_id = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("the first patch is proposed")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(engine, repo, &patch_id, true);
+    proposed
+}
+
+/// Propose one more patch while the implementation step is still open, apply
+/// it, and return the turn that proposed it.
+fn propose_and_apply_next_patch(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: &str,
+    patch: ToolCall,
+) -> ChatTurnResult {
+    let mut adapter = scripted(vec![vec![patch]]);
+    let proposed = ask_in_session(
+        engine,
+        repo,
+        session_id,
+        "Continue with the same step",
+        &mut adapter,
+    );
+    let patch_id = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("the next patch is proposed")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(engine, repo, &patch_id, true);
+    proposed
+}
+
+/// Run the verification the patch made due and approve every check card.
+fn verify_after_patch(engine: &WorkspaceEngine, repo: &Path, session_id: &str) {
+    let mut adapter = MockModelAdapter::new("Done.");
+    let _ = run_verification_and_approve_checks(engine, repo, session_id, &mut adapter);
+}
+
+/// How many times the durable log records this check as actually run. A
+/// skipped or declined check is not a run; baselines are separate events.
+fn check_run_count(engine: &WorkspaceEngine, session_id: &str, check: &CheckId) -> usize {
+    engine
+        .session_store
+        .read_verification_events(session_id, &[])
+        .expect("the log should read")
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                VerificationEvent::Check {
+                    check: recorded,
+                    outcome: workspace_engine::CheckOutcome::Ran { .. },
+                    ..
+                } if recorded == check
+            )
+        })
+        .count()
+}
+
+/// The last recorded run's file hashes for `path`, if any.
+fn last_run_hash(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    check: &CheckId,
+    path: &str,
+) -> Option<String> {
+    engine
+        .session_store
+        .read_verification_events(session_id, &[])
+        .expect("the log should read")
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            VerificationEvent::Check {
+                check: recorded,
+                outcome: workspace_engine::CheckOutcome::Ran { .. },
+                file_hashes,
+                ..
+            } if recorded == check => file_hashes.get(path).cloned(),
+            _ => None,
+        })
+}
+
+#[test]
+fn two_patches_to_different_files_in_one_step_run_each_selected_check_once() {
+    let (repo, shell) = two_patch_fixture("r11-different-files");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let root_check = CheckId::new("", "cargo test");
+    let proposed = propose_two_patch_plan_and_first_patch(
+        &engine,
+        &repo,
+        patch_call_with("src/one.rs", "pub fn one() -> u8 { 1 }\n"),
+    );
+    verify_after_patch(&engine, &repo, &proposed.session.id);
+    assert_eq!(
+        check_run_count(&engine, &proposed.session.id, &root_check),
+        1,
+        "the first patch's verification runs the selected check"
+    );
+
+    propose_and_apply_next_patch(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        patch_call_with("src/two.rs", "pub fn two() -> u8 { 2 }\n"),
+    );
+    verify_after_patch(&engine, &repo, &proposed.session.id);
+    assert_eq!(
+        check_run_count(&engine, &proposed.session.id, &root_check),
+        1,
+        "the second patch left the check's validated file unchanged, so the batch verification is not repeated"
+    );
+
+    let mut finish = scripted(vec![vec![call("complete_step", "{}")]]);
+    let done = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Finish the step",
+        &mut finish,
+    );
+    assert_eq!(
+        done.task.status,
+        TaskStatus::Complete,
+        "the batch's one passing run still covers the step: {done:?}"
+    );
+}
+
+#[test]
+fn two_patches_to_the_same_file_in_one_step_rerun_the_check() {
+    let (repo, shell) = two_patch_fixture("r11-same-file");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let root_check = CheckId::new("", "cargo test");
+    let proposed = propose_two_patch_plan_and_first_patch(
+        &engine,
+        &repo,
+        patch_call_with("src/one.rs", "pub fn one() -> u8 { 1 }\n"),
+    );
+    verify_after_patch(&engine, &repo, &proposed.session.id);
+    let first_hash = last_run_hash(&engine, &proposed.session.id, &root_check, "src/one.rs")
+        .expect("the first run recorded the changed file");
+
+    propose_and_apply_next_patch(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        patch_call_with("src/one.rs", "pub fn one() -> u8 { 3 }\n"),
+    );
+
+    // The invariant that outranks the batch rule: a check is never current for
+    // a file that changed after it ran. The first run validated the old bytes.
+    let events = engine
+        .session_store
+        .read_verification_events(&proposed.session.id, &[])
+        .expect("the log should read");
+    let state = fold_verification(events.iter());
+    let first_run = state
+        .checks
+        .get(&root_check)
+        .expect("the first run is recorded");
+    let plan = plan_of(&engine, &proposed).expect("the plan should read");
+    let mut current = BTreeMap::new();
+    current.insert(
+        "src/one.rs".to_string(),
+        workspace_engine::hash::file_hash(repo.join("src/one.rs"))
+            .expect("the patched file hashes"),
+    );
+    assert!(
+        first_run.is_stale(&current, plan.mutation_generation()),
+        "the first run must not be reported current for the file the second patch changed"
+    );
+
+    verify_after_patch(&engine, &repo, &proposed.session.id);
+    assert_eq!(
+        check_run_count(&engine, &proposed.session.id, &root_check),
+        2,
+        "the second patch changed a file the first run validated, so the check reruns instead of being reported current"
+    );
+    let second_hash = last_run_hash(&engine, &proposed.session.id, &root_check, "src/one.rs")
+        .expect("the run recorded the changed file");
+    assert_ne!(
+        first_hash, second_hash,
+        "the last run validates the file the second patch wrote"
+    );
+
+    let mut finish = scripted(vec![vec![call("complete_step", "{}")]]);
+    let done = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Finish the step",
+        &mut finish,
+    );
+    assert_eq!(done.task.status, TaskStatus::Complete, "{done:?}");
+}
