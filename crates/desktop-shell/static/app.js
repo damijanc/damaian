@@ -10679,6 +10679,9 @@ function describeEvidence(entry) {
     const names = files.map((file) => file.path).join(", ");
     return files.length ? `a patch was applied to ${names}` : "a patch was applied";
   }
+  if (entry.kind === "commandDeclined") {
+    return "you declined a command request";
+  }
   if (entry.kind === "fileRead") {
     return `${entry.path} was read`;
   }

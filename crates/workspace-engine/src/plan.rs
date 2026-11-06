@@ -102,6 +102,33 @@ pub enum Evidence {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         working_directory: String,
     },
+    /// The user declined a command the model proposed.
+    ///
+    /// Recorded since the spec 105 review fix R8 so a required check deferred
+    /// to its plan step can be waived: the declined command runs as an ordinary
+    /// `run_command`, so it produces no `CheckRun` with
+    /// [`crate::verification::SkipReason::DeclinedByUser`]. The identity is the
+    /// same as [`Self::CommandExit`] — command hash plus repository-relative
+    /// directory — and only an explicit user decline creates it. A policy
+    /// refusal, a timeout or the model choosing not to run the command is not a
+    /// waiver and records nothing here.
+    ///
+    /// The variant is neutral for step status: declining a check does not make
+    /// the step's work fail. The completion gate reads it as a named waiver.
+    #[serde(rename_all = "camelCase")]
+    CommandDeclined {
+        /// The stored command proposal the user declined, for tracing.
+        #[serde(default)]
+        proposal_id: String,
+        /// SHA-256 of the proposed command text, exactly as
+        /// [`Self::CommandExit`] records it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_hash: Option<String>,
+        /// The repository-relative directory the proposal would have run in,
+        /// normalized like a [`crate::verification::CheckId`] directory.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        working_directory: String,
+    },
     /// A patch was applied, with the hash actually written per file.
     #[serde(rename_all = "camelCase")]
     PatchApplied {
@@ -297,10 +324,12 @@ pub fn status_from_evidence(evidence: &[Evidence]) -> StepStatus {
         // did not apply returns an error and produces no evidence, and a file
         // that could not be read produces none either. Findings link a step to
         // what a check found, but the exit code beside them decides (spec 22
-        // `context.md` §13.3).
-        Evidence::PatchApplied { .. } | Evidence::FileRead { .. } | Evidence::Findings { .. } => {
-            false
-        }
+        // `context.md` §13.3). A declined command says the user chose not to
+        // run it; it neither succeeded nor failed the step (spec 105 R8).
+        Evidence::PatchApplied { .. }
+        | Evidence::FileRead { .. }
+        | Evidence::Findings { .. }
+        | Evidence::CommandDeclined { .. } => false,
     });
     if blocked {
         StepStatus::Blocked
@@ -432,7 +461,11 @@ impl TaskPlan {
             .flat_map(|step| step.evidence.iter())
             .next_back()
         {
-            Some(Evidence::CommandExit { .. } | Evidence::Findings { .. }) => TaskPhase::Validating,
+            Some(
+                Evidence::CommandExit { .. }
+                | Evidence::CommandDeclined { .. }
+                | Evidence::Findings { .. },
+            ) => TaskPhase::Validating,
             Some(Evidence::PatchApplied { .. }) => TaskPhase::Editing,
             Some(Evidence::FileRead { .. }) | None => TaskPhase::Understanding,
         }

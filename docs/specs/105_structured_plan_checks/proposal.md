@@ -49,7 +49,10 @@ engine-owned statement that all requested checks had passed on the final tree.
    the discovered-check floor: the detected checks of the owning and enclosing
    roots of every file the task touched. Passed evidence satisfies it; failed or
    missing evidence does not. A declined check satisfies only an explicit waiver
-   and is named in the final disposition.
+   and is named in the final disposition: whether the user declines it on the
+   verification check card or declines the exact deferred command at its plan
+   step. A policy refusal, a timeout or the model not running the command is
+   never a waiver.
 7. The plan review card clearly lists required checks and their directories.
    The user may remove or change a proposed check before approval; that edit is
    recorded as part of the approved plan.
@@ -113,6 +116,16 @@ of the exact command in the exact directory after the patch is the newest
 matching exit and is current again. This reuses spec 21's applied-patch evidence
 and spec 105 Task 4's batch boundary rather than adding another counter.
 
+An explicit user decline of that exact command is durable plan evidence too
+(`Evidence::CommandDeclined`, review fix R8), carrying the same command hash and
+normalized directory as the exit. The gate matches declines and exits with the
+same identity function and lets the latest matching command evidence decide: a
+later approved run supersedes an earlier decline, while a decline with no later
+run is a named waiver, never a pass. Only the explicit decline records it; a
+policy refusal, a timeout or a model that never runs the check does not. The R16
+floor uses the same matcher over the whole plan, so declining a floor check the
+model ran itself is the same named waiver.
+
 The completion obligation is not plan-only. Spec 101/105 review fix R15
 (decision D1) adds the **completion floor**: the detected checks of the owning
 and enclosing roots of every file the task touched, selected with spec 23
@@ -156,6 +169,10 @@ currentness rule.
   outside the repository is dropped from a proposal or rejected in a revision.
 - The completion report lists every required check as passed, failed, stale or
   waived with its working directory.
+- Declining the exact deferred command of a plan-declared check or a floor check
+  the model ran itself is a named waiver and lets the task complete; declining an
+  unrelated command or the same command in another directory is not. A later
+  approved run of the same check decides instead of an earlier decline.
 - A task that changed source files has the detected checks of their owning and
   enclosing roots as required checks even when its plan declares none; a
   documentation-only task has none.
@@ -346,3 +363,51 @@ the passing rerun. The follow-up tests
 `a_model_run_floor_command_satisfies_the_floor_without_an_automatic_run` pin that
 the floor is always satisfiable and that a model-run floor command avoids a
 second automatic run.
+
+### Review fix 2026-11-06: a declined deferred check is a named waiver (R8)
+
+The review of specs 101–105 found that the deferred path above had no waiver.
+A required check deferred to its plan step runs as an ordinary `run_command`, so
+it produces no `CheckRun`; the gate's only waiver source was
+`SkipReason::DeclinedByUser` on a `CheckRun`. When the user declined the
+command, nothing the gate read changed and the task stayed `RequiredCheckMissing`
+forever — the user could not complete the task or remove the check after
+approval.
+
+The explicit decline is now durable plan evidence. `Evidence::CommandDeclined`
+(on the in-progress plan step, attached in observation order like any other
+evidence) carries the proposal id, the command hash and the repository-relative
+working directory, normalized exactly as `CommandExit` records it. Only the
+decline branch of the command-approval route writes it: a policy refusal or an
+approval refusal, a timeout, and a model that never requests the command record
+nothing. It is neutral for step status; declining a check neither fails the step
+nor claims it passed.
+
+The gate reads both kinds with one function, `matching_command_evidence`, which
+keeps the full `CheckId` identity (command hash plus normalized directory). The
+latest matching command evidence decides: a later approved run of the same check
+supersedes an earlier decline (pass completes, fail reports
+`RequiredCheckFailed`), and a decline with no later run is the named
+`CompletionWaiver` shown with the check's label. A plan-declared check reads its
+own step; the R16 floor reads anywhere in the plan, so declining a floor check
+the model ran itself is the same waiver. `floor_checks_needing_verification`
+treats a current decline as handled, so the answer-time completion run does not
+ask again for a check the user just waived.
+
+Regression tests were written first in
+`crates/workspace-engine/tests/deferred_check_waiver.rs`.
+`declining_the_deferred_required_check_is_a_named_waiver_and_completes` failed
+with `left: Incomplete, right: Complete` and the report
+`CompletionGateReport { eligible: false, reasons: [RequiredCheckMissing], waivers: [] }`;
+`a_declined_check_waiver_names_the_check_and_is_never_a_pass` failed with
+`left: 0, right: 1` waivers; `the_decline_is_durable_plan_evidence` found the
+closed step's evidence empty; and
+`declining_a_model_run_floor_check_is_a_named_waiver_and_completes` left the
+task `WaitingForApproval` because the missing floor check started another
+answer-time run. All pass now.
+`declining_an_unrelated_command_is_not_a_waiver`,
+`declining_the_same_command_in_another_directory_is_not_a_waiver`,
+`a_later_approved_run_decides_instead_of_the_decline_when_it_passes` and
+`a_later_approved_run_decides_instead_of_the_decline_when_it_fails` are the
+guards; the two identity counters already passed before the fix because a
+missing waiver and a missing result share one outcome.

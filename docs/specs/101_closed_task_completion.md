@@ -37,7 +37,10 @@ finished task.
    enclosing roots of every file the task touched. A documentation-only task
    has no floor.
 3. A skipped or declined check counts only as an explicit user waiver. It is
-   never represented as passed, and the completion report names the waiver.
+   never represented as passed, and the completion report names the waiver. An
+   explicit decline of the exact deferred command a required check would run is
+   the same waiver (spec 105 review fix R8); a policy refusal, a timeout or a
+   model that never runs the command is not.
 4. When the model answers after #66's reminder while work remains, the task
    becomes a new durable `incomplete` status rather than `complete`. The open
    plan and the reasons from the completion gate remain attached.
@@ -90,6 +93,9 @@ selects no root and has no floor. The floor only reads the persisted repository
 map; it never stores a command proposal or runs anything, so every check still
 follows command policy and its ordinary approval route. A check the user
 declines is the named waiver below; an auto-runnable floor check simply runs.
+Since spec 105 review fix R8, declining the exact command a deferred required
+check runs is also the named waiver: the decline is durable plan evidence and
+the gate matches it by the same `CheckId` identity as the check's exit.
 
 The final `StopReason::Answered` settlement calls the gate. Eligible work keeps
 today's `complete`; ineligible work writes `incomplete` and stores the reason
@@ -113,7 +119,10 @@ plan rather than claiming that no step is open.
   `incomplete`, with the plan unchanged.
 - Completing the remaining steps and current required checks changes the next
   run to `complete`.
-- A declined required check produces a named waiver, never pass evidence.
+- A declined required check — on its check card or by declining the exact
+  deferred command — produces a named waiver, never pass evidence. Declining an
+  unrelated command or the same command in another directory is not a waiver,
+  and a later approved run decides instead of an earlier decline.
 - A due verification, pending patch, pending question or open required step
   prevents `complete` in ordinary and worker sessions.
 - Reloading an incomplete worker shows **Incomplete — Continue task** and
@@ -268,8 +277,9 @@ deterministic evaluation and spec close-out belong to Task 4.
   shell, CLI, worker host and JavaScript may transport or render its typed
   result but may not select facts, infer success, translate reason codes, or
   decide whether a task may complete.
-- A question answer is not an approval or a check waiver. Only the existing
-  explicit declined-check record can produce a waiver.
+- A question answer is not an approval or a check waiver. Only an explicit
+  user decline — the check card's `DeclinedByUser` or the exact deferred
+  command's `CommandDeclined` (spec 105 R8) — can produce a waiver.
 - Do not rewrite historical `complete` tasks or infer reports for them during
   schema migration. The stricter verdict begins with new settlements.
 - Keep #102 and #105 boundaries intact: this spec consumes current verification
@@ -288,7 +298,7 @@ criterion depends on #102, #103, #104, #105 or #106.
 |---|---|
 | 1 · `complete` only through the engine gate | `completion.rs::CompletionGateService::settle` is the only path from a newly settled planned task to `TaskStatus::Complete`; answered turns, successful verification and the plan-review hand-off all settle through it. `completion_settlement` tests cover the answered and verification paths; `plan_turn` proves the hand-off records an eligible report. Synthetic commit/branch tasks carry no plan and keep their own action outcome. |
 | 2 · every plan step, verification, pending decision and selected check is closed, and no step is blocked | `CompletionGateReport::evaluate` reads the active plan, folded verification state, newest pending decision and current file hashes. `closed_task_completion` pins the full reason matrix, including due, started-but-unfinished, missing, failed, stale and policy-skipped checks. `a_blocked_plan_step_blocks_the_gate_with_its_own_reason` and `the_service_settles_a_blocked_step_incomplete_and_a_skipped_step_complete` pin a blocked step as outstanding (`blocked_plan_steps`) while a skipped step stays closed. The required set merges the plan's required checks with the R15 floor: `CompletionGateService::report` reads the persisted repository map and `SessionStore::task_touched_paths`, and `verification_loop` tests `a_changed_source_without_a_plan_check_requires_the_discovered_floor_check`, `a_plan_check_identical_to_a_floor_check_is_one_obligation`, `a_documentation_only_change_has_no_floor_and_completes`, `declining_a_floor_check_is_a_named_waiver_and_the_task_completes`, `an_auto_runnable_floor_check_runs_without_a_waiver`, `a_member_change_puts_the_workspace_root_check_in_the_floor`, `two_checks_needing_approval_produce_one_batch_and_one_resume` and `a_failed_verification_is_not_continued` pin it. |
-| 3 · declined checks are named waivers, never passes | `CompletionReasonCode` has no waiver variant; `CompletionWaiver` is produced only for `SkipReason::DeclinedByUser`, and the check still never enters `passed`. A policy-skipped check is `required_check_skipped` and blocks. |
+| 3 · declined checks are named waivers, never passes | `CompletionReasonCode` has no waiver variant; `CompletionWaiver` is produced for `SkipReason::DeclinedByUser` on a `CheckRun` and, since spec 105 review fix R8, for `Evidence::CommandDeclined` matching the check's `CheckId`. The check still never enters `passed`. A policy-skipped check is `required_check_skipped` and blocks; a policy refusal, timeout or a model that never ran the command records no decline. |
 | 4 · an answer with work left is `incomplete` | `run_agentic_turn` settles `StopReason::Answered` through the gate; `two_answers_with_an_open_plan_settle_incomplete_and_keep_the_plan` proves the single #66 reminder, unchanged plan and two transcript answers. `plan_left_open_at_end` is the deterministic scenario for the same outcome. |
 | 5 · terminal but resumable, in an ordinary session and a worker | `TaskStatus::Incomplete` is terminal and not successful. `TaskControl::for_session` and `TaskControl::for_worker` offer **Continue task** with the exact `taskId`; `SessionStore::continue_incomplete_task` writes the new task and `plan_resumed` edge in one locked batch and compares the whole report. `ChatOrchestrator::continue_incomplete_task` builds the prompt from the durable reasons and the source plan. Engine, route and worker tests cover carry, refusal, stale click, wrong repository and the next run settling `complete`. `continuing_a_task_with_only_a_missing_required_check_keeps_the_check` and `continuing_a_task_stopped_by_a_blocked_step_carries_the_blocked_plan` pin that a plan is carried even when every step is terminal or a step is blocked, and `a_continuation_prompt_names_the_carried_plan_even_when_no_step_is_open` pins the prompt. |
 | 6 · worker progress and #100 preserve the truthful outcome | The worker progress status carries `TaskStatus::as_str()` and `/api/worker-progress` returns the engine `control`; the board row and result card draw its headline/detail. `returned_task_control` labels an incomplete return **Task incomplete** and never success, while #100's **Continue with result** remains a separate action. Source tests prove `app.js` has no task-status outcome table. |
@@ -301,7 +311,7 @@ criterion depends on #102, #103, #104, #105 or #106.
 |---|---|
 | Two answers with an open plan get one reminder and end `incomplete`, plan unchanged | `completion_settlement::two_answers_with_an_open_plan_settle_incomplete_and_keep_the_plan`; deterministic `plan_left_open_at_end`. |
 | Completing the remaining steps and checks changes the next run to `complete` | `task_control::completing_the_carried_plan_on_the_next_run_settles_complete`; `completion_settlement::a_closed_plan_settles_complete_with_an_eligible_report`. |
-| A declined required check is a named waiver, never pass evidence | `closed_task_completion::a_declined_check_is_a_named_waiver_and_never_a_pass`; the full reason-matrix test. |
+| A declined required check is a named waiver, never pass evidence | `closed_task_completion::a_declined_check_is_a_named_waiver_and_never_a_pass`; the full reason-matrix test. The deferred-command form is pinned by `deferred_check_waiver::declining_the_deferred_required_check_is_a_named_waiver_and_completes`, `a_declined_check_waiver_names_the_check_and_is_never_a_pass`, `declining_an_unrelated_command_is_not_a_waiver`, `declining_the_same_command_in_another_directory_is_not_a_waiver`, the later-run guards and `declining_a_model_run_floor_check_is_a_named_waiver_and_completes`. |
 | Due verification, pending patch/question, blocked step or open required step prevents `complete` | `closed_task_completion::every_blocking_fact_produces_its_stable_reason_code`; `closed_task_completion::a_blocked_plan_step_blocks_the_gate_with_its_own_reason` and `the_service_settles_a_blocked_step_incomplete_and_a_skipped_step_complete`; the shell route test where an answered command task with a due verification settles `incomplete`; the worker progress/outcome tests. |
 | Reloading an incomplete worker shows **Incomplete — Continue task** and carries the same plan | `worker_supervisor::worker_outcomes_use_engine_control_and_preserve_incomplete`; `worker_turns::continuing_an_incomplete_task_through_the_route_carries_plan_and_reasons`; `worker_turns::a_worker_continues_only_the_exact_task_its_control_named`; engine `task_control` carry test. |
 | Historical `complete` events are not rewritten | `closed_task_completion::a_historical_status_event_has_no_report_and_stays_valid`; reports are additive siblings and the stricter rule applies only to new settlements. |
@@ -570,8 +580,10 @@ check the model never ran still settles `incomplete`.
 
 Floor evidence also accepts a current `CommandExit` of the identical identity
 anywhere in the plan. The deferred path and this floor lookup share one matcher
-(`matching_exit_code`) and R4's `deferred_evidence_is_current`; there is no
-second currentness rule. A current exit supersedes a stale earlier `CheckRun`.
+(`matching_command_evidence`; named `matching_exit_code` before review fix R8
+added declines to it) and R4's `deferred_evidence_is_current`; there is no
+second currentness rule. A current exit supersedes a stale earlier `CheckRun`,
+and review fix R8's declined command is the same named-waiver disposition.
 
 Regression tests written first and recorded failing in `plan_turn`:
 `a_plan_declared_member_check_does_not_hide_the_missing_workspace_root_floor`
@@ -582,3 +594,19 @@ failed `left: Incomplete, right: Complete` with only
 `a_model_run_floor_command_satisfies_the_floor_without_an_automatic_run` failed
 because the loop started an extra completion run for the already-satisfied
 floor. All pass now.
+
+### Review fix 2026-11-06: a declined deferred command is a named waiver (R8)
+
+Spec 105's deferred required check runs as an ordinary `run_command` at its plan
+step, so it produces no `CheckRun`. This spec's rule that only
+`SkipReason::DeclinedByUser` produces a waiver therefore left such a check with
+no waiver: declining the command changed nothing the gate read, and the task
+stayed `required_check_missing` for good.
+
+The explicit decline is now durable plan evidence, and this gate reads it with
+the same `CheckId` matcher as the check's exit. `CompletionWaiver` is still not a
+pass and is still named with the check's label. The latest matching command
+evidence decides, so a later approved run of the same check supersedes the
+decline. A policy refusal, a timeout and a model that never requests the command
+are unchanged: none is a waiver. The owning design and its tests live in spec
+105 (`Evidence::CommandDeclined`); this spec consumes the disposition.

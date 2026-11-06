@@ -615,6 +615,10 @@ fn evidence_fact(scanner: &SecretScanner, evidence: &Evidence) -> String {
             purpose.as_str(),
             command_hash.as_deref().unwrap_or("-")
         ),
+        Evidence::CommandDeclined { command_hash, .. } => format!(
+            "command-declined\t{}",
+            command_hash.as_deref().unwrap_or("-")
+        ),
         Evidence::PatchApplied { files, .. } => {
             let mut fact = String::from("patch-applied");
             let mut files: Vec<_> = files.iter().collect();

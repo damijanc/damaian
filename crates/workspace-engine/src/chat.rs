@@ -5259,6 +5259,20 @@ impl ChatOrchestrator {
                     "rejected",
                     Some(&command_request.command),
                 )?;
+                // Spec 105 review fix R8: the explicit decline is durable plan
+                // evidence so the completion gate can match it by `CheckId`.
+                // Only this branch records it: a policy refusal above, a
+                // timeout, or the model never requesting the command is not a
+                // waiver. The directory comes from the proposal, which is where
+                // the command would have run, normalized like a `CheckId`.
+                let decline_directory =
+                    relative_location(&repository_root, Path::new(&proposal.working_directory))
+                        .unwrap_or_else(|| proposal.working_directory.clone());
+                step_evidence.push(Evidence::CommandDeclined {
+                    proposal_id: proposal.id.clone(),
+                    command_hash: Some(command_hash(&proposal.command)),
+                    working_directory: decline_directory,
+                });
                 format!(
                     "The user declined to run `{}`. Do not request it again; answer using what you already know, noting the limitation if it matters.",
                     command_request.command
@@ -15990,7 +16004,9 @@ fn collect_safety_path(evidence: &Evidence, paths: &mut BTreeSet<String>) {
                 paths.insert(file.path.clone());
             }
         }
-        Evidence::CommandExit { .. } | Evidence::Findings { .. } => {}
+        Evidence::CommandExit { .. }
+        | Evidence::CommandDeclined { .. }
+        | Evidence::Findings { .. } => {}
     }
 }
 

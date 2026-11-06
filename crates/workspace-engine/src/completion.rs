@@ -14,9 +14,12 @@
 //! is required because the plan marks it `required: true`, and a failure is
 //! reported as a failure without assigning provenance.
 //!
-//! The only waiver is an explicit user decision. A check the user declined is
-//! named in [`CompletionWaiver`] and is still never represented as passed. A
-//! question answer, a model statement or an absent result is never a waiver.
+//! The only waiver is an explicit user decision: a check declined on its card
+//! (`SkipReason::DeclinedByUser`), or the user declining the exact command a
+//! deferred required check would run (`Evidence::CommandDeclined`, spec 105
+//! review fix R8). A waiver is named in [`CompletionWaiver`] and is still never
+//! represented as passed. A policy refusal, a question answer, a model
+//! statement, a timeout or an absent result is never a waiver.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -111,7 +114,10 @@ pub struct CompletionReason {
 /// A required check the user explicitly declined.
 ///
 /// A waiver is a named exception, not a pass: it says the check did not run and
-/// that the user chose that. Only [`SkipReason::DeclinedByUser`] produces one.
+/// that the user chose that. Only an explicit user decline produces one:
+/// [`SkipReason::DeclinedByUser`] on a check card, or a matching
+/// [`Evidence::CommandDeclined`] for a deferred check run as an ordinary
+/// command (spec 105 review fix R8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionWaiver {
@@ -331,29 +337,23 @@ impl CompletionGateReport {
             // that ran through the verification loop has a `CheckRun` keyed by
             // identity; a check deferred to its own plan step was run by the
             // worker as an ordinary command, which records a `CommandExit` on
-            // the step instead. A current `CheckRun` is authoritative; for a
-            // floor check a current `CommandExit` may also satisfy it, including
-            // after an older run went stale (review follow-up to R16).
+            // the step instead — or, when the user declines that exact command,
+            // a `CommandDeclined` (spec 105 review fix R8). A current `CheckRun`
+            // is authoritative; for a floor check current command evidence may
+            // also satisfy it, including after an older run went stale (review
+            // follow-up to R16).
             if let Some(run) = facts.verification.checks.get(&check) {
                 if run.is_stale(facts.current_hashes, current_generation) {
                     // A floor check may also be satisfied by the model's own
-                    // current command of the identical identity, even when an
-                    // older loop run is stale (review follow-up to R16).
+                    // current command of the identical identity, or waived by
+                    // the user's decline of it, even when an older loop run is
+                    // stale (review follow-up to R16 + review fix R8).
                     if step.is_none()
-                        && let Some((exit_step, index, exit_code)) =
-                            latest_matching_exit_in_plan(plan, &check)
-                        && deferred_evidence_is_current(plan, exit_step, index)
+                        && let Some((evidence_step, index, evidence)) =
+                            latest_matching_evidence_in_plan(plan, &check)
+                        && deferred_evidence_is_current(plan, evidence_step, index)
                     {
-                        if exit_code != Some(0) {
-                            reasons.push(CompletionReason {
-                                code: CompletionReasonCode::RequiredCheckFailed,
-                                explanation: format!(
-                                    "Required check {} failed: {}.",
-                                    check.label(),
-                                    command_failure_reason(exit_code)
-                                ),
-                            });
-                        }
+                        record_command_evidence(&check, evidence, &mut reasons, &mut waivers);
                         continue;
                     }
                     reasons.push(CompletionReason {
@@ -412,45 +412,29 @@ impl CompletionGateReport {
 
             // A floor check that no plan step carries may be satisfied by a
             // command the model ran itself, as well as by a `CheckRun` from the
-            // verification loop (review follow-up to R16). A plan-declared check
-            // reads only its own step; a floor check reads the latest matching
-            // exit anywhere in the plan. Both use the same identity matcher and
-            // the same R4 currentness rule, never a second mechanism.
-            let (evidence_step, evidence_index, exit_code) = match step {
-                Some(step) => {
-                    let Some((evidence_index, exit_code)) =
-                        latest_matching_exit_on_step(step, &check)
-                    else {
-                        reasons.push(CompletionReason {
-                            code: CompletionReasonCode::RequiredCheckMissing,
-                            explanation: format!(
-                                "Required check {} has no recorded result.",
-                                check.label()
-                            ),
-                        });
-                        continue;
-                    };
-                    (step, evidence_index, exit_code)
-                }
-                None => {
-                    let Some((step, evidence_index, exit_code)) =
-                        latest_matching_exit_in_plan(plan, &check)
-                    else {
-                        reasons.push(CompletionReason {
-                            code: CompletionReasonCode::RequiredCheckMissing,
-                            explanation: format!(
-                                "Required check {} has no recorded result.",
-                                check.label()
-                            ),
-                        });
-                        continue;
-                    };
-                    (step, evidence_index, exit_code)
-                }
+            // verification loop (review follow-up to R16); a plan-declared
+            // check reads only its own step. Both use the same identity matcher
+            // and the same R4 currentness rule, never a second mechanism. The
+            // latest matching evidence decides: a later approved run supersedes
+            // an earlier decline of the same command (review fix R8).
+            let evidence = match step {
+                Some(step) => latest_matching_evidence_on_step(step, &check)
+                    .map(|(index, evidence)| (step, index, evidence)),
+                None => latest_matching_evidence_in_plan(plan, &check),
             };
-            // The exit records no generation, so currentness is read from the
-            // durable plan record: the batch boundary and any mutation recorded
-            // after this exit (spec 105 requirement 5).
+            let Some((evidence_step, evidence_index, evidence)) = evidence else {
+                reasons.push(CompletionReason {
+                    code: CompletionReasonCode::RequiredCheckMissing,
+                    explanation: format!(
+                        "Required check {} has no recorded result.",
+                        check.label()
+                    ),
+                });
+                continue;
+            };
+            // Command evidence records no generation, so currentness is read
+            // from the durable plan record: the batch boundary and any mutation
+            // recorded after this evidence (spec 105 requirement 5).
             if !deferred_evidence_is_current(plan, evidence_step, evidence_index) {
                 reasons.push(CompletionReason {
                     code: CompletionReasonCode::RequiredCheckStale,
@@ -461,16 +445,7 @@ impl CompletionGateReport {
                 });
                 continue;
             }
-            if exit_code != Some(0) {
-                reasons.push(CompletionReason {
-                    code: CompletionReasonCode::RequiredCheckFailed,
-                    explanation: format!(
-                        "Required check {} failed: {}.",
-                        check.label(),
-                        command_failure_reason(exit_code)
-                    ),
-                });
-            }
+            record_command_evidence(&check, evidence, &mut reasons, &mut waivers);
         }
 
         Self {
@@ -502,64 +477,124 @@ fn command_failure_reason(exit_code: Option<i32>) -> String {
     }
 }
 
-/// The exit code of an [`Evidence::CommandExit`] with this check's identity.
+/// The command evidence a plan step carries for one check identity.
+///
+/// A required check deferred to its step runs as an ordinary command, so its
+/// evidence is the step's `CommandExit` — or, since review fix R8, the user's
+/// explicit `CommandDeclined` of that same command. One identity matcher serves
+/// both the plan-declared step and the anywhere-in-plan floor lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandEvidence {
+    Exit(Option<i32>),
+    Declined,
+}
+
+/// The command evidence with this check's identity.
 ///
 /// Identity is the full [`CheckId`] — command hash and normalized working
-/// directory — exactly as the deferred path has always matched it. One matcher
-/// serves both the plan-declared step and the anywhere-in-plan floor lookup.
-fn matching_exit_code(evidence: &Evidence, check: &CheckId) -> Option<Option<i32>> {
-    match evidence {
+/// directory — exactly as the deferred path has always matched it. The decline
+/// and the exit are matched by the same function so they cannot disagree about
+/// what "the same check" means (spec 105 review fix R8; no second matcher).
+fn matching_command_evidence(evidence: &Evidence, check: &CheckId) -> Option<CommandEvidence> {
+    let (command_hash, working_directory) = match evidence {
         Evidence::CommandExit {
-            exit_code,
-            command_hash: Some(hash),
+            command_hash,
             working_directory,
             ..
-        } if hash == &sha256(&check.command) && working_directory == &check.working_directory => {
-            Some(*exit_code)
         }
+        | Evidence::CommandDeclined {
+            command_hash,
+            working_directory,
+            ..
+        } => (command_hash.as_ref()?, working_directory),
+        _ => return None,
+    };
+    if command_hash != &sha256(&check.command) || working_directory != &check.working_directory {
+        return None;
+    }
+    match evidence {
+        Evidence::CommandExit { exit_code, .. } => Some(CommandEvidence::Exit(*exit_code)),
+        Evidence::CommandDeclined { .. } => Some(CommandEvidence::Declined),
         _ => None,
     }
 }
 
-/// The latest matching exit on one plan step.
-fn latest_matching_exit_on_step(step: &PlanStep, check: &CheckId) -> Option<(usize, Option<i32>)> {
+/// The latest matching command evidence on one plan step.
+fn latest_matching_evidence_on_step(
+    step: &PlanStep,
+    check: &CheckId,
+) -> Option<(usize, CommandEvidence)> {
     step.evidence
         .iter()
         .enumerate()
         .rev()
         .find_map(|(index, evidence)| {
-            matching_exit_code(evidence, check).map(|exit_code| (index, exit_code))
+            matching_command_evidence(evidence, check)
+                .map(|command_evidence| (index, command_evidence))
         })
 }
 
-/// The latest matching exit anywhere in the plan, in durable plan order.
+/// The latest matching command evidence anywhere in the plan, in durable plan
+/// order.
 ///
 /// A floor check has no single plan step to read, so a current command exit the
 /// model ran itself can satisfy it wherever it appears (review follow-up to
-/// R16).
-fn latest_matching_exit_in_plan<'a>(
+/// R16); the same lookup now also finds the user's decline of that command.
+fn latest_matching_evidence_in_plan<'a>(
     plan: &'a TaskPlan,
     check: &CheckId,
-) -> Option<(&'a PlanStep, usize, Option<i32>)> {
+) -> Option<(&'a PlanStep, usize, CommandEvidence)> {
     plan.steps.iter().rev().find_map(|step| {
-        latest_matching_exit_on_step(step, check).map(|(index, exit_code)| (step, index, exit_code))
+        latest_matching_evidence_on_step(step, check)
+            .map(|(index, evidence)| (step, index, evidence))
     })
+}
+
+/// Record what the latest matching command evidence means for the gate.
+///
+/// A passing exit satisfies the check, a non-zero exit fails it, and an explicit
+/// decline is the named waiver — never a pass (spec 105 requirement 6).
+fn record_command_evidence(
+    check: &CheckId,
+    evidence: CommandEvidence,
+    reasons: &mut Vec<CompletionReason>,
+    waivers: &mut Vec<CompletionWaiver>,
+) {
+    match evidence {
+        CommandEvidence::Declined => waivers.push(CompletionWaiver {
+            check: check.clone(),
+            explanation: format!(
+                "{} was declined by you, so it is waived for this task.",
+                check.label()
+            ),
+        }),
+        CommandEvidence::Exit(Some(0)) => {}
+        CommandEvidence::Exit(exit_code) => reasons.push(CompletionReason {
+            code: CompletionReasonCode::RequiredCheckFailed,
+            explanation: format!(
+                "Required check {} failed: {}.",
+                check.label(),
+                command_failure_reason(exit_code)
+            ),
+        }),
+    }
 }
 
 /// Whether a deferred check's evidence at `evidence_index` is current.
 ///
 /// A deferred required check runs as an ordinary command at its plan step, so
-/// its evidence is the step's [`Evidence::CommandExit`] rather than a
-/// [`CheckRun`]. Unlike a `CheckRun`, that evidence records no generation, so
-/// currentness is read from two durable plan facts:
+/// its evidence is the step's [`Evidence::CommandExit`] or the explicit
+/// [`Evidence::CommandDeclined`] of that command, rather than a [`CheckRun`].
+/// Unlike a `CheckRun`, that evidence records no generation, so currentness is
+/// read from two durable plan facts:
 ///
 /// 1. [`step_is_current`] — the evidence still belongs to the current mutation
 ///    batch. A later primary step beginning is the boundary
 ///    [`TaskPlan::mutation_generation`] counts, so a check from an earlier
 ///    batch is stale even before the later step mutates anything.
-/// 2. no [`Evidence::PatchApplied`] follows the exit in the plan's own order —
-///    not in wall-clock order, which can tie, and not only in a later step: a
-///    patch can land after the check and before the same step closes
+/// 2. no [`Evidence::PatchApplied`] follows the evidence in the plan's own
+///    order — not in wall-clock order, which can tie, and not only in a later
+///    step: a patch can land after the check and before the same step closes
 ///    (spec 105 requirement 5).
 fn deferred_evidence_is_current(plan: &TaskPlan, step: &PlanStep, evidence_index: usize) -> bool {
     step_is_current(plan, step) && !mutation_after(plan, step, evidence_index)
@@ -810,18 +845,21 @@ impl<'a> CompletionGateService<'a> {
             }
             if let Some(run) = verification.checks.get(&check) {
                 if run.is_stale(&current_hashes, generation) {
-                    let current_exit = latest_matching_exit_in_plan(plan, &check).is_some_and(
+                    let handled = latest_matching_evidence_in_plan(plan, &check).is_some_and(
                         |(step, index, _)| deferred_evidence_is_current(plan, step, index),
                     );
-                    if !current_exit {
+                    if !handled {
                         needed.push(check);
                     }
                 }
                 continue;
             }
-            let current_exit = latest_matching_exit_in_plan(plan, &check)
+            // A current command exit or the user's explicit decline of that
+            // exact command both dispose of the floor check here; the gate
+            // reports a decline as a waiver rather than a pass (review fix R8).
+            let handled = latest_matching_evidence_in_plan(plan, &check)
                 .is_some_and(|(step, index, _)| deferred_evidence_is_current(plan, step, index));
-            if !current_exit {
+            if !handled {
                 needed.push(check);
             }
         }
