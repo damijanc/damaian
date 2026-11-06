@@ -1798,10 +1798,11 @@ report, so "failed" and "incomplete" stay distinct. Declining a required check
 can close a task, but only as a named waiver; it never turns the check into
 evidence that passed.
 
-**A required check reads as stale or missing.** When an approved plan step
-carries a `required` check, the gate names that check's disposition in the
-completion report (`required_check_*` reason codes, and the check itself in
-`waivers`):
+**A required check reads as stale or missing.** Required checks are the approved
+plan's `required` checks plus the detected checks of the project roots the task
+touched (the owning root and every enclosing root, such as a Cargo workspace).
+The gate names each check's disposition in the completion report
+(`required_check_*` reason codes, and the check itself in `waivers`):
 
 - **stale** — the check ran, but the files it covered changed afterwards. Two
   things make a check stale: a later mutation batch began (a newer primary plan
@@ -1810,12 +1811,14 @@ completion report (`required_check_*` reason codes, and the check itself in
 - **missing** — the exact command never left a result. A check deferred to its
   own plan step leaves a `commandExit` on that step; a check the loop ran
   leaves a `verification_check` event. If neither is present, the reason is
-  `required_check_missing`.
+  `required_check_missing`. This is the common case when a task changed a source
+  file with no plan check and stopped before its detected root check ran.
 
 A check named only in the plan's prose — a step whose title or detail says "Run
-`cargo test`" but carries no `check` field — is **not** a required check: it
-never appears in the completion report, and a historical plan keeps loading
-without inventing one.
+`cargo test`" but carries no `check` field — is not a plan-required check: it
+never appears from the plan. It can still be a floor check if the task touched a
+file in a root that detects that command. A historical plan keeps loading
+without inventing a plan check.
 
 The durable evidence to inspect:
 

@@ -2239,10 +2239,11 @@ fn two_checks_needing_approval_produce_one_batch_and_one_resume() {
         .find(|item| item.check.command == "npm run test")
         .expect("the declined check is reported as skipped");
     assert_eq!(declined.reason, SkipReason::DeclinedByUser);
-    // Spec 105: only a `required: true` structured check on the approved plan
-    // is a completion obligation. These are discovered checks — the declined
-    // `npm run test` and the browser check skipped for want of a running target
-    // — so they do not gate completion; the task settles complete.
+    // Spec 101/105 as amended by review fix R15: the discovered checks of the
+    // roots the task touched are the completion floor. The declined
+    // `npm run test` is therefore a named waiver, not simply an ignored
+    // discovered check. The browser check is not a root-detected command, so it
+    // stays a verification report fact rather than a floor obligation.
     let settled = engine
         .session_store
         .read_completion_report(&session, &resumed.task.id)
@@ -2251,7 +2252,8 @@ fn two_checks_needing_approval_produce_one_batch_and_one_resume() {
     assert_eq!(resumed.task.status, TaskStatus::Complete);
     assert!(settled.eligible, "{settled:?}");
     assert!(settled.reasons.is_empty());
-    assert!(settled.waivers.is_empty());
+    assert_eq!(settled.waivers.len(), 1, "{settled:?}");
+    assert_eq!(settled.waivers[0].check, declined.check.clone());
 
     let plan = engine
         .session_store
@@ -4751,13 +4753,15 @@ fn a_failed_verification_is_not_continued() {
         .unwrap()
         .expect("a failed verification still carries the gate report");
     assert!(!settled.eligible);
-    // Spec 105: the failed `cargo test` is a discovered check, not a
-    // `required: true` structured check on the plan, so it is not a gate
-    // obligation; the report names the open plan work instead. The failed
-    // status comes from the verification settlement, not from the gate.
-    assert_eq!(
-        settled.reason_codes(),
-        vec![CompletionReasonCode::OpenPlanSteps],
+    // Spec 101/105 as amended by review fix R15: the failed `cargo test` is a
+    // discovered check for the root the task touched, so it is a completion
+    // obligation again. The failed status still comes from the verification
+    // settlement; the report now names the floor check as well as the open plan
+    // work.
+    assert!(
+        settled
+            .reason_codes()
+            .contains(&CompletionReasonCode::RequiredCheckFailed),
         "{settled:?}"
     );
 
@@ -5702,6 +5706,280 @@ fn a_stale_expansion_card_newly_protected_is_refused_at_apply() {
         fs::read_to_string(root.join("src/new.rs")).unwrap(),
         "fn someone_else() {}\n",
         "a refused apply writes nothing"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+// --- R15: the discovered-check floor at the completion gate ----------------
+//
+// Spec 101/105 as amended by review fix R15 (decision D1): a task that changed
+// files has required checks even when its plan declares none. The floor is the
+// detected checks of the owning and enclosing roots of every file the task
+// touched. Plan-declared required checks are added to it, merged by `CheckId`;
+// they never replace it.
+
+/// (a) A plan with no check does not excuse the source change it validates.
+/// The root's discovered `cargo test` is required, so a blocked (skipped) run
+/// settles the task incomplete with the skip reason.
+#[test]
+fn a_changed_source_without_a_plan_check_requires_the_discovered_floor_check() {
+    let root = temp_dir("floor-no-plan-check");
+    let data_dir = temp_dir("floor-no-plan-check-data");
+    cargofile(&root);
+    // `cargo test` is refused by policy, so the run records a skip rather than
+    // a pass. The floor must still treat it as an unmet obligation.
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &["cargo test"]);
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    // A closed plan that carries no structured check at all.
+    open_plan(&engine, &session, &task, &[]);
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Incomplete,
+        "a skipped floor check must not close the task: {result:?}"
+    );
+    let settled = engine
+        .session_store
+        .read_completion_report(&session, &result.task.id)
+        .unwrap()
+        .expect("the settlement carries the gate report");
+    assert_eq!(
+        settled.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckSkipped],
+        "{settled:?}"
+    );
+    assert!(
+        settled.reasons[0].explanation.contains("cargo test"),
+        "{}",
+        settled.reasons[0].explanation
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// (c) A plan check identical to a floor check is one obligation, not two.
+/// The gate merges by `CheckId`, so the blocked check produces one reason.
+#[test]
+fn a_plan_check_identical_to_a_floor_check_is_one_obligation() {
+    let root = temp_dir("floor-plan-duplicate");
+    let data_dir = temp_dir("floor-plan-duplicate-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &["cargo test"]);
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut plan = complete_plan();
+    plan.task_id = task.clone();
+    plan.steps[0].check = Some(PlannedCheck {
+        version: PLANNED_CHECK_VERSION,
+        command: "cargo test".to_string(),
+        working_directory: String::new(),
+        purpose: "validates the final tree".to_string(),
+        required: true,
+    });
+    let stored_task = engine
+        .session_store
+        .read_tasks(&session)
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == task)
+        .expect("the patch task");
+    engine
+        .session_store
+        .create_plan(&stored_task, &plan)
+        .unwrap();
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let settled = engine
+        .session_store
+        .read_completion_report(&session, &result.task.id)
+        .unwrap()
+        .expect("the settlement carries the gate report");
+    assert_eq!(
+        settled
+            .reason_codes()
+            .iter()
+            .filter(|code| **code == CompletionReasonCode::RequiredCheckSkipped)
+            .count(),
+        1,
+        "the same CheckId is one obligation: {settled:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// (d) Documentation-only work selects no root, so it has no floor and still
+/// completes normally even though `cargo test` would need approval.
+#[test]
+fn a_documentation_only_change_has_no_floor_and_completes() {
+    let root = temp_dir("floor-docs-only");
+    let data_dir = temp_dir("floor-docs-only-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    let (session, task) = applied_change(&engine, &root, &[("docs/readme.md", "old\n", "new\n")]);
+    open_plan(&engine, &session, &task, &[]);
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert_eq!(result.task.status, TaskStatus::Complete, "{result:?}");
+    let settled = engine
+        .session_store
+        .read_completion_report(&session, &result.task.id)
+        .unwrap()
+        .expect("the settlement carries the gate report");
+    assert!(settled.eligible, "{settled:?}");
+    assert!(settled.reasons.is_empty(), "{settled:?}");
+    assert!(settled.waivers.is_empty(), "{settled:?}");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// (e) Declining a floor check that needs approval is the named waiver, and
+/// the task can still complete. The user's decision is never represented as a
+/// pass.
+#[test]
+fn declining_a_floor_check_is_a_named_waiver_and_the_task_completes() {
+    let root = temp_dir("floor-declined");
+    let data_dir = temp_dir("floor-declined-data");
+    cargofile(&root);
+    // No allowlist: the floor's `cargo test` reaches the ordinary check card.
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &[]);
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    open_plan(&engine, &session, &task, &[]);
+    let mut adapter = MockModelAdapter::new("");
+
+    let paused = run_verification(&engine, &root, &session, &mut adapter);
+    let batch = paused.check_batch.expect("the floor check needs approval");
+    assert_eq!(
+        batch.checks.len(),
+        1,
+        "only the root floor check is offered: {batch:?}"
+    );
+    assert_eq!(batch.checks[0].command, "cargo test");
+    let decisions = batch
+        .checks
+        .iter()
+        .map(|check| (check.id.clone(), false))
+        .collect::<Vec<_>>();
+    let result = resume_checks(&engine, &batch.id, &decisions, &mut adapter);
+
+    assert_eq!(result.task.status, TaskStatus::Complete, "{result:?}");
+    let settled = engine
+        .session_store
+        .read_completion_report(&session, &result.task.id)
+        .unwrap()
+        .expect("the settlement carries the gate report");
+    assert!(settled.eligible, "{settled:?}");
+    assert!(settled.reasons.is_empty(), "{settled:?}");
+    assert_eq!(settled.waivers.len(), 1, "{settled:?}");
+    assert_eq!(
+        settled.waivers[0].check,
+        CheckId::new("", "cargo test"),
+        "the waiver names the declined floor check"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// (e) A floor check the policy can auto-run simply runs; no card, no waiver.
+#[test]
+fn an_auto_runnable_floor_check_runs_without_a_waiver() {
+    let root = temp_dir("floor-auto-run");
+    let data_dir = temp_dir("floor-auto-run-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    open_plan(&engine, &session, &task, &[]);
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert!(
+        result.check_batch.is_none(),
+        "an auto-run check needs no card"
+    );
+    assert_eq!(result.task.status, TaskStatus::Complete, "{result:?}");
+    let settled = engine
+        .session_store
+        .read_completion_report(&session, &result.task.id)
+        .unwrap()
+        .expect("the settlement carries the gate report");
+    assert!(settled.eligible, "{settled:?}");
+    assert!(settled.waivers.is_empty(), "{settled:?}");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// (f) In a Cargo workspace, changing a member selects its enclosing workspace
+/// root too, so that root's `cargo test` is part of the floor.
+#[test]
+fn a_member_change_puts_the_workspace_root_check_in_the_floor() {
+    let root = temp_dir("floor-workspace-member");
+    let data_dir = temp_dir("floor-workspace-member-data");
+    write(
+        &root,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/member\"]\n",
+    );
+    write(
+        &root,
+        "crates/member/Cargo.toml",
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &[], &["cargo test"]);
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[(
+            "crates/member/src/lib.rs",
+            "pub fn value() -> u8 { 1 }\n",
+            "pub fn value() -> u8 { 2 }\n",
+        )],
+    );
+    open_plan(&engine, &session, &task, &[]);
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert_eq!(result.task.status, TaskStatus::Incomplete, "{result:?}");
+    let settled = engine
+        .session_store
+        .read_completion_report(&session, &result.task.id)
+        .unwrap()
+        .expect("the settlement carries the gate report");
+    assert!(
+        settled
+            .reasons
+            .iter()
+            .any(|reason| reason.explanation.contains("cargo test (repository root)")),
+        "the workspace root check is a floor obligation: {settled:?}"
     );
 
     let _ = fs::remove_dir_all(&root);

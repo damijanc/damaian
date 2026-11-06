@@ -16,10 +16,9 @@ use workspace_engine::plan::StepStatus;
 use workspace_engine::{
     AuditLog, COMPLETION_SETTLEMENT_ACTION, CancelToken, ChatTurnResult, CheckId, CheckOutcome,
     CompletionGateReport, CompletionReason, CompletionReasonCode, CompletionSettlement,
-    CompletionSettlementMarker, Config, MockModelAdapter, ModelAdapter, PLANNED_CHECK_VERSION,
-    PlanStep, PlannedCheck, SecretScanner, SessionStore, TaskPlan, TaskStatus, ToolCall,
-    TurnProgress, TurnSink, VerificationEvent, WorkspaceEngine, classify_session,
-    repository_id_for_root,
+    CompletionSettlementMarker, Config, MockModelAdapter, ModelAdapter, PlanStep, SecretScanner,
+    SessionStore, TaskPlan, TaskStatus, ToolCall, TurnProgress, TurnSink, VerificationEvent,
+    WorkspaceEngine, classify_session, repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -35,6 +34,10 @@ fn temp_repo(name: &str) -> PathBuf {
     ));
     fs::create_dir_all(repo.join("src")).expect("repository should be created");
     fs::write(repo.join("src/a.rs"), "fn main() {}\n").expect("a file to read");
+    // The completion floor reads the detected checks of the roots the task
+    // touched; the crashed-verification fixture below is a Cargo root.
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n")
+        .expect("the workspace manifest");
     repo
 }
 
@@ -478,18 +481,28 @@ fn a_crashed_failed_verification_settles_failed_with_its_report() {
         &fixture.root,
         CompletionSettlement::VerificationFailed,
     );
-    // The gate sources required checks from the plan, not from the verification
-    // selection, so the crashed task must carry the `cargo test` check the
-    // verification failed on.
-    let mut plan = plan_with(&task.id, StepStatus::Completed);
-    plan.steps[0].check = Some(PlannedCheck {
-        version: PLANNED_CHECK_VERSION,
-        command: "cargo test".to_string(),
-        working_directory: String::new(),
-        purpose: "validates the final tree".to_string(),
-        required: true,
-    });
-    fixture.store.create_plan(&task, &plan).unwrap();
+    // Review fix R15 restored the discovered-check obligation spec 105 Task 5
+    // removed: the root the task touched has a detected `cargo test`, so the
+    // floor makes the failed check a gate obligation without a plan-declared
+    // check. Record the applied path and persist the repository map the gate
+    // reads, then keep the crashed verification's failure evidence.
+    fixture
+        .store
+        .append_patch_file_decision(
+            &fixture.session_id,
+            &workspace_engine::PatchFileDecision {
+                task_id: task.id.clone(),
+                patch_id: "patch".to_string(),
+                paths: vec!["src/a.rs".to_string()],
+                applied: true,
+                applied_hashes: BTreeMap::new(),
+                accepted_hunks: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+    engine_for(&fixture.root)
+        .repository_map(&fixture.root)
+        .expect("the repository map should build");
     let check = CheckId::new("", "cargo test");
     for event in [
         VerificationEvent::Started {

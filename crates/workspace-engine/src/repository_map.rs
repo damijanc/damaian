@@ -888,6 +888,29 @@ impl RepositoryMapStore {
     }
 }
 
+/// Reads the persisted map for `repository_id` without rebuilding it.
+///
+/// The completion gate runs while a task settles and must not write a map or
+/// store command proposals. A missing map means the repository has not been
+/// indexed in a way that produced one, so there is no floor to apply; an
+/// unreadable map is an error rather than a silent empty floor, because an
+/// empty floor would let a changed task complete without its checks.
+pub fn load_stored_map(data_dir: &Path, repository_id: &str) -> Result<Option<RepositoryMap>> {
+    let path = RepositoryMapStore::path(data_dir, repository_id);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    match stored_map(&bytes, repository_id) {
+        Ok(map) => Ok(Some(map)),
+        Err(reason) => Err(ClientError::InvalidInput(format!(
+            "Repository map for {repository_id} is not readable: {}",
+            reason.as_str()
+        ))),
+    }
+}
+
 /// Parses a stored map, or says why it cannot be used. The version is read
 /// before the shape, so a map from another schema is reported as that rather
 /// than as corrupt.

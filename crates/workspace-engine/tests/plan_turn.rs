@@ -236,6 +236,7 @@ fn gate_report(engine: &WorkspaceEngine, result: &ChatTurnResult) -> CompletionG
         verification: &verification,
         pending: None,
         current_hashes: &BTreeMap::new(),
+        floor_checks: &[],
     })
 }
 
@@ -3698,11 +3699,13 @@ fn answering_the_uncertain_repair_question_with_no_leaves_it_reported_and_unrepa
     );
 }
 
-/// (d) A per-change check keeps its existing pre-patch baseline. It fails
-/// before the later patch, so the later failure is `pre_existing` and is never
-/// promoted to `uncertain` or repaired.
+/// (d) A per-change check for a root first touched by a later patch is a floor
+/// check, and D1 detail 4 gives it no task-start baseline. Its failure is
+/// therefore `uncertain`, not a post-patch `pre_existing` classification. This
+/// supersedes R14's per-change baseline expectation for that case: the floor
+/// check's task-start baseline is what makes a later regression trustworthy.
 #[test]
-fn a_per_change_check_keeps_its_pre_patch_baseline_and_pre_existing_classification() {
+fn a_floor_check_for_a_root_first_touched_later_is_uncertain_not_pre_existing() {
     let (repo, shell) = required_check_fixture("r14-per-change");
     let engine = check_engine(&repo, &shell, &["cargo test", "write-broken"]);
     let patch1 = patch_call_with("shared.txt", "broken\n");
@@ -3749,8 +3752,8 @@ fn a_per_change_check_keeps_its_pre_patch_baseline_and_pre_existing_classificati
         .task_verification_baselines(&continued.session.id, &continued.task.id)
         .expect("the baselines should read");
     assert!(
-        matches!(baselines.get(&foo), Some(CheckBaseline::Failed { .. })),
-        "the per-change check keeps its pre-patch baseline, taken with patch 1 applied: {baselines:?}"
+        matches!(baselines.get(&foo), Some(CheckBaseline::Uncertain)),
+        "the root first touched later has no task-start baseline: {baselines:?}"
     );
 
     mark_worker_session(&engine, &continued.session.id, &repo);
@@ -3764,20 +3767,16 @@ fn a_per_change_check_keeps_its_pre_patch_baseline_and_pre_existing_classificati
     let report = verified
         .verification_report
         .expect("the verification has a report");
-    let pre_existing = report
+    let uncertain = report
         .provenance
         .iter()
-        .find(|partition| partition.provenance == FailureProvenance::PreExisting)
-        .unwrap_or_else(|| panic!("the per-change failure is pre-existing: {report:?}"));
+        .find(|partition| partition.provenance == FailureProvenance::Uncertain)
+        .unwrap_or_else(|| panic!("the later root's failure is uncertain: {report:?}"));
     assert!(
-        pre_existing.checks.iter().any(|check| check.check == foo),
-        "{pre_existing:?}"
+        uncertain.checks.iter().any(|check| check.check == foo),
+        "{uncertain:?}"
     );
     assert!(report.repair_targets.is_empty(), "{report:?}");
-    assert!(
-        verified.question_proposal.is_none(),
-        "a pre-existing failure is not an uncertain repair question"
-    );
 }
 
 /// (e) A required check that needs approval is offered on the existing baseline
@@ -3841,5 +3840,189 @@ fn a_declined_required_baseline_is_recorded_declined_not_uncertain() {
     assert!(
         matches!(baselines.get(&foo), Some(CheckBaseline::Declined)),
         "a declined required baseline is Declined, not uncertain: {baselines:?}"
+    );
+}
+
+// --- R15: the discovered-check floor and its baselines ---------------------
+//
+// Review fix R15 (decision D1) makes the discovered checks of every root the
+// task touched a completion obligation. Review fix R14's task-start baseline is
+// therefore taken for those floor checks too: a root touched by the first patch
+// is baselined before it applies, while a root first touched by a later patch
+// has no task-start baseline and falls back to `uncertain` (D1 detail 4).
+
+/// (b) A plan whose only declared check is a trivial command does not replace
+/// the floor. The plan's `ls` is required and the root's discovered
+/// `cargo test` is required as well; neither has run, so both are missing.
+#[test]
+fn a_trivial_plan_check_does_not_replace_the_discovered_floor() {
+    let repo = temp_repo("r15-trivial-plan");
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("the manifest");
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        shell: "/usr/bin/true".to_string(),
+        command_blocklist: vec!["cargo test".to_string()],
+        ..Config::default()
+    });
+    let mut first = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Implement","check":{"command":"ls","workingDirectory":"","purpose":"trivial","required":true}},{"title":"Add the file"}]}"#,
+        )],
+        vec![patch_call("src/added.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Implement the change", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+    let mut resumed = scripted(vec![vec![patch_call("src/added.rs")]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let patch_id = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("the patch is proposed")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch_id, true);
+
+    let report = engine
+        .completion_report(&repo, &proposed.session.id, &proposed.task.id)
+        .expect("the gate report should compute");
+
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|reason| reason.explanation.contains("cargo test")),
+        "the discovered floor check is still required: {report:?}"
+    );
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|reason| reason.explanation.contains("ls")),
+        "the plan's own check is required too: {report:?}"
+    );
+}
+
+/// (g) The floor check of a root touched by the first patch is baselined at
+/// task start. A root first touched by a later patch has no task-start
+/// baseline, so its failure is `uncertain`, never silently `pre_existing`.
+#[test]
+fn floor_checks_are_baselined_at_task_start_and_a_later_root_is_uncertain() {
+    let (repo, shell) = required_check_fixture("r15-floor-baseline");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let root_check = CheckId::new("", "cargo test");
+    let member_check = CheckId::new("crates/foo", "cargo test");
+
+    let patch1 = patch_call_with("src/root.rs", "pub fn root() {}\n");
+    let mut first = scripted(vec![
+        vec![call("propose_plan", PLAIN_FOO_PLAN)],
+        vec![patch1.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the shared value", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+    let mut resumed = scripted(vec![vec![patch1]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let patch1_id = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("patch one is proposed")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch1_id, true);
+    // The member's check fails when the shared value is not `ok`. Break it
+    // outside a second patch so the later member root is the only thing patch
+    // two touches.
+    fs::write(repo.join("shared.txt"), "broken\n").expect("the shared value");
+
+    // The first patch touched the repository root, so the root's discovered
+    // check is part of R14's required set at that gate and runs on the
+    // untouched tree. The member root has not been touched yet.
+    let baselines = engine
+        .session_store
+        .task_verification_baselines(&proposed.session.id, &proposed.task.id)
+        .expect("the baselines should read");
+    assert!(
+        matches!(baselines.get(&root_check), Some(CheckBaseline::Passed)),
+        "the first patch's floor check has a task-start baseline: {baselines:?}"
+    );
+    assert!(
+        !baselines.contains_key(&member_check),
+        "a root not touched yet has no baseline: {baselines:?}"
+    );
+
+    let patch2 = patch_call_with("crates/foo/src/lib.rs", "pub fn value() -> u8 { 2 }\n");
+    let mut after_first = scripted(vec![
+        vec![call("complete_step", "{}"), call("complete_step", "{}")],
+        vec![patch2],
+    ]);
+    let continued = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Continue with the foo crate",
+        &mut after_first,
+    );
+    let patch2_id = continued
+        .patch_proposal
+        .as_ref()
+        .expect("patch two is proposed in the later turn")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch2_id, true);
+
+    let baselines = engine
+        .session_store
+        .task_verification_baselines(&continued.session.id, &continued.task.id)
+        .expect("the baselines should read");
+    assert!(
+        matches!(baselines.get(&member_check), Some(CheckBaseline::Uncertain)),
+        "a root first touched later has no task-start baseline: {baselines:?}"
+    );
+    assert!(
+        !matches!(
+            baselines.get(&member_check),
+            Some(CheckBaseline::Failed { .. })
+        ),
+        "the later root is not given a post-patch baseline: {baselines:?}"
+    );
+
+    mark_worker_session(&engine, &continued.session.id, &repo);
+    let mut verification_adapter = MockModelAdapter::new("Done.");
+    let verified = run_verification_and_approve_checks(
+        &engine,
+        &repo,
+        &continued.session.id,
+        &mut verification_adapter,
+    );
+    let report = verified
+        .verification_report
+        .expect("the verification has a report");
+    let uncertain = report
+        .provenance
+        .iter()
+        .find(|partition| partition.provenance == FailureProvenance::Uncertain)
+        .unwrap_or_else(|| {
+            panic!("the later root's failure is uncertain, not pre-existing: {report:?}")
+        });
+    assert!(
+        uncertain
+            .checks
+            .iter()
+            .any(|check| check.check == member_check),
+        "{uncertain:?}"
+    );
+    assert!(
+        !report
+            .provenance
+            .iter()
+            .any(
+                |partition| partition.provenance == FailureProvenance::PreExisting
+                    && partition
+                        .checks
+                        .iter()
+                        .any(|check| check.check == member_check)
+            ),
+        "the floor check for a later root is never silently pre-existing: {report:?}"
     );
 }

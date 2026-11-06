@@ -17,7 +17,7 @@ use crate::protected_paths::{
 use crate::secret_scanner::SecretScanner;
 use crate::task_budget::TaskExecutionBudget;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
@@ -759,6 +759,15 @@ impl SessionStore {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),
         }
+    }
+
+    /// The application-data directory this log belongs to.
+    ///
+    /// Readers that need another durable engine artifact for the same
+    /// repository (the persisted repository map, for example) resolve it here
+    /// rather than reaching into configuration again.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     pub fn create_session(&self, repository_id: &str, title: &str) -> Result<Session> {
@@ -3576,6 +3585,36 @@ impl SessionStore {
             decisions.push(decision);
         }
         Ok(decisions)
+    }
+
+    /// Every path the task touched, whether through an applied patch or an
+    /// approved command that changed files, across its continuation chain.
+    ///
+    /// This is the input to the completion floor (spec 101/105 review fix R15):
+    /// the detected checks of the roots that own these paths are required even
+    /// when the plan declares none. Paths are repository-relative and sorted, so
+    /// the caller's root selection is deterministic.
+    pub fn task_touched_paths(&self, session_id: &str, task_id: &str) -> Result<Vec<String>> {
+        let chain = self.task_continuation_chain(session_id, task_id)?;
+        let mut paths = BTreeSet::new();
+        for decision in self.read_all_patch_file_decisions(session_id)? {
+            if decision.applied && chain.contains(&decision.task_id) {
+                paths.extend(decision.paths);
+            }
+        }
+        for event in self.read_verification_events(session_id, &[])? {
+            if let crate::verification::VerificationEvent::Due {
+                task_id: due_task,
+                paths: changed,
+                ..
+            } = event
+                && !changed.is_empty()
+                && chain.contains(&due_task)
+            {
+                paths.extend(changed);
+            }
+        }
+        Ok(paths.into_iter().collect())
     }
 
     /// Appends one verification event (spec 23 §5.1). One session-event kind

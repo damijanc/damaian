@@ -32,7 +32,10 @@ finished task.
    either completed or skipped — a blocked step is outstanding, not closed —
    when no verification is due or running, no proposal or question is pending,
    and every required check known to the task has a current terminal
-   disposition.
+   disposition. Required checks are the approved plan's structured required
+   checks plus the completion floor: the detected checks of the owning and
+   enclosing roots of every file the task touched. A documentation-only task
+   has no floor.
 3. A skipped or declined check counts only as an explicit user waiver. It is
    never represented as passed, and the completion report names the waiver.
 4. When the model answers after #66's reminder while work remains, the task
@@ -76,6 +79,17 @@ reports a blocked step as `blocked_plan_steps` rather than folding it into
 spec 66's reminder set; that reminder deliberately stays quiet about a blocked
 step because the model has already been told, while completion must not treat
 it as done.
+
+The required set is the plan's structured required checks plus the **completion
+floor**: the detected checks of the owning and enclosing roots of every file the
+task touched, selected with spec 23 §5.2's root rule. The two sets are merged by
+`CheckId`, so a plan check identical to a floor check is one obligation, and a
+plan's own checks never replace the floor: a trivial declared check cannot
+escape the root checks the task's changes selected. A documentation-only task
+selects no root and has no floor. The floor only reads the persisted repository
+map; it never stores a command proposal or runs anything, so every check still
+follows command policy and its ordinary approval route. A check the user
+declines is the named waiver below; an auto-runnable floor check simply runs.
 
 The final `StopReason::Answered` settlement calls the gate. Eligible work keeps
 today's `complete`; ineligible work writes `incomplete` and stores the reason
@@ -273,7 +287,7 @@ criterion depends on #102, #103, #104, #105 or #106.
 | Requirement | Evidence |
 |---|---|
 | 1 · `complete` only through the engine gate | `completion.rs::CompletionGateService::settle` is the only path from a newly settled planned task to `TaskStatus::Complete`; answered turns, successful verification and the plan-review hand-off all settle through it. `completion_settlement` tests cover the answered and verification paths; `plan_turn` proves the hand-off records an eligible report. Synthetic commit/branch tasks carry no plan and keep their own action outcome. |
-| 2 · every plan step, verification, pending decision and selected check is closed, and no step is blocked | `CompletionGateReport::evaluate` reads the active plan, folded verification state, newest pending decision and current file hashes. `closed_task_completion` pins the full reason matrix, including due, started-but-unfinished, missing, failed, stale and policy-skipped checks. `a_blocked_plan_step_blocks_the_gate_with_its_own_reason` and `the_service_settles_a_blocked_step_incomplete_and_a_skipped_step_complete` pin a blocked step as outstanding (`blocked_plan_steps`) while a skipped step stays closed. |
+| 2 · every plan step, verification, pending decision and selected check is closed, and no step is blocked | `CompletionGateReport::evaluate` reads the active plan, folded verification state, newest pending decision and current file hashes. `closed_task_completion` pins the full reason matrix, including due, started-but-unfinished, missing, failed, stale and policy-skipped checks. `a_blocked_plan_step_blocks_the_gate_with_its_own_reason` and `the_service_settles_a_blocked_step_incomplete_and_a_skipped_step_complete` pin a blocked step as outstanding (`blocked_plan_steps`) while a skipped step stays closed. The required set merges the plan's required checks with the R15 floor: `CompletionGateService::report` reads the persisted repository map and `SessionStore::task_touched_paths`, and `verification_loop` tests `a_changed_source_without_a_plan_check_requires_the_discovered_floor_check`, `a_plan_check_identical_to_a_floor_check_is_one_obligation`, `a_documentation_only_change_has_no_floor_and_completes`, `declining_a_floor_check_is_a_named_waiver_and_the_task_completes`, `an_auto_runnable_floor_check_runs_without_a_waiver`, `a_member_change_puts_the_workspace_root_check_in_the_floor`, `two_checks_needing_approval_produce_one_batch_and_one_resume` and `a_failed_verification_is_not_continued` pin it. |
 | 3 · declined checks are named waivers, never passes | `CompletionReasonCode` has no waiver variant; `CompletionWaiver` is produced only for `SkipReason::DeclinedByUser`, and the check still never enters `passed`. A policy-skipped check is `required_check_skipped` and blocks. |
 | 4 · an answer with work left is `incomplete` | `run_agentic_turn` settles `StopReason::Answered` through the gate; `two_answers_with_an_open_plan_settle_incomplete_and_keep_the_plan` proves the single #66 reminder, unchanged plan and two transcript answers. `plan_left_open_at_end` is the deterministic scenario for the same outcome. |
 | 5 · terminal but resumable, in an ordinary session and a worker | `TaskStatus::Incomplete` is terminal and not successful. `TaskControl::for_session` and `TaskControl::for_worker` offer **Continue task** with the exact `taskId`; `SessionStore::continue_incomplete_task` writes the new task and `plan_resumed` edge in one locked batch and compares the whole report. `ChatOrchestrator::continue_incomplete_task` builds the prompt from the durable reasons and the source plan. Engine, route and worker tests cover carry, refusal, stale click, wrong repository and the next run settling `complete`. `continuing_a_task_with_only_a_missing_required_check_keeps_the_check` and `continuing_a_task_stopped_by_a_blocked_step_carries_the_blocked_plan` pin that a plan is carried even when every step is terminal or a step is blocked, and `a_continuation_prompt_names_the_carried_plan_even_when_no_step_is_open` pins the prompt. |
@@ -431,3 +445,67 @@ Checks run locally on 2026-11-04:
   it passed when rerun alone. No loopback-port test failed.
 
 Workspace clippy and the other crates' suites are left to CI.
+
+### Review fix 2026-11-06: the discovered-check floor (R15)
+
+Spec 105 Task 5 made only plan-declared structured checks completion
+obligations. The review of specs 101–105 found the gap: a plan with no `check`
+could change source files, run nothing, and settle `complete`. Review fix R15
+(decision D1) restores an engine-owned floor. The gate's required set is now:
+
+- the approved plan's `required: true` checks, in plan order, and
+- the detected checks of the owning and enclosing roots of every file the task
+  touched — applied patch paths and command-changed paths from its continuation
+  chain — selected with spec 23 §5.2's existing root rule.
+
+The two sets are merged by `CheckId`: the same identity is one obligation, and
+the plan's checks are added to the floor rather than replacing it. A
+documentation-only task selects no root and gets no floor. The floor only reads
+the persisted repository map through `RepositoryMapStore::load_stored_map`; a
+gate report stores no proposal and runs nothing, so command policy and the
+ordinary approval route are untouched. Declining a floor check that needs
+approval is the existing `DeclinedByUser` waiver; an auto-runnable floor check
+simply runs. Per-change selection (owning root only) is R16's separate change,
+not part of this floor.
+
+The floor also feeds R14's task-start baseline: `BaselineCoordinator::prepare`
+merges the plan's required checks with the floor for the first patch's touched
+paths, so a root the first patch touches is baselined on the untouched tree. A
+root first touched by a later patch has no task-start baseline and is
+`uncertain`, never silently `pre_existing` (spec 102's R15 note).
+
+Regression tests were written first and recorded failing:
+
+- `verification_loop::a_changed_source_without_a_plan_check_requires_the_discovered_floor_check`
+  failed `left: Complete, right: Incomplete`.
+- `verification_loop::declining_a_floor_check_is_a_named_waiver_and_the_task_completes`
+  failed with `CompletionGateReport { eligible: true, reasons: [], waivers: [] }`,
+  `left: 0, right: 1`.
+- `verification_loop::two_checks_needing_approval_produce_one_batch_and_one_resume`
+  failed the restored waiver assertion with `eligible: true` and no waiver.
+- `verification_loop::a_failed_verification_is_not_continued` failed the restored
+  `RequiredCheckFailed` assertion; the report held only `OpenPlanSteps`.
+- `verification_loop::a_member_change_puts_the_workspace_root_check_in_the_floor`
+  failed `left: Complete, right: Incomplete`.
+- `plan_turn::a_trivial_plan_check_does_not_replace_the_discovered_floor` failed
+  because the report named only the plan's `ls`, not the root's `cargo test`.
+- `plan_turn::floor_checks_are_baselined_at_task_start_and_a_later_root_is_uncertain`
+  failed with `the first patch's floor check has a task-start baseline: {}`.
+- `plan_turn::a_floor_check_for_a_root_first_touched_later_is_uncertain_not_pre_existing`
+  failed with the later root recorded as `Failed { .. }` from a post-patch
+  baseline.
+- `completion_settlement::a_crashed_failed_verification_settles_failed_with_its_report`
+  failed `assertion failed: !report.eligible` when the failed discovered check
+  was not a plan check.
+
+All pass now. `a_plan_check_identical_to_a_floor_check_is_one_obligation`, the
+documentation-only case and the auto-run case are guards: they passed before the
+change and keep a duplicate-merge or over-broad floor from regressing.
+
+The two reviewed assertions spec 105 Task 5 had re-pointed are restored where D1
+makes them true again. `two_checks_needing_approval_produce_one_batch_and_one_resume`
+again asserts the declined discovered check is a named waiver; the browser check
+is not a root-detected command, so it remains a verification-report fact rather
+than a floor reason. `a_failed_verification_is_not_continued` again requires
+`RequiredCheckFailed` alongside the open plan step. The crash-settlement test now
+uses the floor instead of the plan check Task 5 added to it.

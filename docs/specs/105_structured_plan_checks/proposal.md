@@ -45,9 +45,11 @@ engine-owned statement that all requested checks had passed on the final tree.
    applied after the check in the same step; rerunning the same check in the
    same directory after the mutation makes it current again.
 6. #101's completion gate requires current terminal evidence for every
-   required check. Passed evidence satisfies it; failed or missing evidence
-   does not. A declined check satisfies only an explicit waiver and is named in
-   the final disposition.
+   required check. Required checks are the plan's `required: true` checks plus
+   the discovered-check floor: the detected checks of the owning and enclosing
+   roots of every file the task touched. Passed evidence satisfies it; failed or
+   missing evidence does not. A declined check satisfies only an explicit waiver
+   and is named in the final disposition.
 7. The plan review card clearly lists required checks and their directories.
    The user may remove or change a proposed check before approval; that edit is
    recorded as part of the approved plan.
@@ -64,8 +66,9 @@ engine-owned statement that all requested checks had passed on the final tree.
 
 - Parsing arbitrary `AGENTS.md` prose into trusted commands in the engine.
 - Automatically approving a check because the plan was approved.
-- Replacing automatic check discovery. Discovered targeted checks may augment
-  the plan; structured required checks define the completion obligation.
+- Replacing automatic check discovery. Discovered checks are the completion
+  floor (spec 101/105 review fix R15), while plan-declared checks are added to
+  it; neither replaces the other.
 - Claiming a skipped check passed.
 
 ## 4. Design
@@ -110,6 +113,17 @@ of the exact command in the exact directory after the patch is the newest
 matching exit and is current again. This reuses spec 21's applied-patch evidence
 and spec 105 Task 4's batch boundary rather than adding another counter.
 
+The completion obligation is not plan-only. Spec 101/105 review fix R15
+(decision D1) adds the **completion floor**: the detected checks of the owning
+and enclosing roots of every file the task touched, selected with spec 23
+§5.2's root rule and excluding documentation-only work. The gate merges the
+floor with the plan's `required: true` checks by `CheckId`, so the same identity
+is one obligation and a plan check never replaces a floor check. The floor reads
+the persisted repository map and stores no proposal; each check still follows
+command policy and the ordinary approval route. R16 later narrows per-change
+verification to the owning root; the floor keeps the enclosing roots at task
+completion, which is what catches cross-root breakage.
+
 ## 5. Acceptance
 
 - A plan with `cargo nextest run -p workspace-engine` at the repository root
@@ -134,6 +148,14 @@ and spec 105 Task 4's batch boundary rather than adding another counter.
   outside the repository is dropped from a proposal or rejected in a revision.
 - The completion report lists every required check as passed, failed, stale or
   waived with its working directory.
+- A task that changed source files has the detected checks of their owning and
+  enclosing roots as required checks even when its plan declares none; a
+  documentation-only task has none.
+- A plan's only check may be a trivial command; the floor is still required.
+  A plan check with the same identity as a floor check is one obligation, and
+  declining a floor check that needs approval is a named waiver.
+- In a Cargo workspace, a member change puts the workspace root's check in the
+  floor.
 
 ## Review fix 2026-11-04: deferred check evidence carries its directory (R3)
 
@@ -237,3 +259,52 @@ still invalidates it), and
 (a pending or declined card records no mutation). The later-step guards already
 passed before the fix because `step_is_current` covered that position; they keep
 the behaviour from regressing when staleness starts reading mutations.
+
+## Review fix 2026-11-06: the discovered-check floor (R15)
+
+Task 5 made the plan's structured `required: true` checks the only completion
+obligation. The review of specs 101–105 found that this let a plan with no
+`check` change source files, run nothing and settle `complete`. Decision D1 and
+review fix R15 restore the discovered checks as a floor without giving up the
+structured-checks model:
+
+1. A task that changed files has required checks even when its plan declares
+   none.
+2. The floor is the detected checks of the owning and enclosing roots of every
+   file the task touched. Documentation-only tasks get no floor (spec 23 §5.2).
+3. Plan-declared required checks are added to the floor, merged by `CheckId`;
+   they never replace it, so a trivial declared check cannot escape it.
+4. The floor's baseline is R14's pre-patch baseline for the roots the first
+   patch touches. A root first touched by a later patch falls back to
+   `uncertain` (spec 102's R15 note).
+5. Declining a floor check that needs approval is the existing `DeclinedByUser`
+   waiver; an auto-runnable floor check simply runs. No new UI.
+
+`CompletionGateReport::evaluate` receives the floor from
+`CompletionGateService::report`, which reads `SessionStore::task_touched_paths`
+(applied patch decisions plus command-changed `Due` paths over the continuation
+chain) and `RepositoryMapStore::load_stored_map`, then calls
+`verification::floor_checks`. The merge is by `CheckId`, so a plan check identical
+to a floor check produces one reason or waiver. A floor check with no `CheckRun`
+and no plan step to defer on is `RequiredCheckMissing`; a failed or skipped
+`CheckRun` keeps the existing reason codes.
+
+This reverses Task 5's note that discovered checks are not gate obligations. The
+evidence lives in the same two stores: a loop-run check is a `CheckRun` keyed by
+`CheckId`, and a deferred plan check is the step's `CommandExit`. The floor adds
+no third store and runs no command.
+
+Regression tests were written first and recorded failing in
+`verification_loop`: `a_changed_source_without_a_plan_check_requires_the_discovered_floor_check`
+(`left: Complete, right: Incomplete`),
+`a_member_change_puts_the_workspace_root_check_in_the_floor` (same),
+`declining_a_floor_check_is_a_named_waiver_and_the_task_completes`
+(`waivers: []`, `left: 0, right: 1`),
+`two_checks_needing_approval_produce_one_batch_and_one_resume` (restored waiver,
+same failure) and `a_failed_verification_is_not_continued` (restored
+`RequiredCheckFailed`, report held only `OpenPlanSteps`). `plan_turn`
+`a_trivial_plan_check_does_not_replace_the_discovered_floor` failed because the
+report named only the plan's `ls`; `floor_checks_are_baselined_at_task_start_and_a_later_root_is_uncertain`
+failed with empty baselines; `a_floor_check_for_a_root_first_touched_later_is_uncertain_not_pre_existing`
+failed with the later root recorded as `Failed`. All pass now. The
+identical-identity, documentation-only and auto-run cases are guards.

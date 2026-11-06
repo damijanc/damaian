@@ -27,9 +27,10 @@ use crate::clarification::PendingDecision;
 use crate::error::{ClientError, Result};
 use crate::hash::{file_hash, repository_id_for_root, sha256};
 use crate::plan::{Evidence, PlanStep, StepStatus, TaskPlan};
-use crate::session::{SessionStore, Task, TaskStatus};
+use crate::repository_map::load_stored_map;
+use crate::session::{Session, SessionStore, Task, TaskStatus};
 use crate::verification::{
-    CheckId, CheckOutcome, CheckRun, SkipReason, VerificationState, fold_verification,
+    CheckId, CheckOutcome, CheckRun, SkipReason, VerificationState, floor_checks, fold_verification,
 };
 
 /// A plan step whose id starts with this is the verification loop's own step,
@@ -210,6 +211,10 @@ pub struct CompletionFacts<'a> {
     /// Content hashes of every file a check run recorded, as the checkout holds
     /// them now. A missing entry means the file was deleted, which is stale.
     pub current_hashes: &'a BTreeMap<String, String>,
+    /// The discovered-check floor: the detected checks of the roots the task
+    /// touched (spec 101/105 review fix R15). It is added to the plan's
+    /// required checks and merged by [`CheckId`]; it never replaces them.
+    pub floor_checks: &'a [CheckId],
 }
 
 impl CompletionGateReport {
@@ -283,6 +288,14 @@ impl CompletionGateReport {
             });
         }
 
+        // The gate's required set is the plan's required checks plus the
+        // discovered-check floor (spec 101/105 review fix R15, decision D1).
+        // They are merged by `CheckId`: a plan check identical to a floor check
+        // is one obligation, and a plan's own checks are added to the floor
+        // rather than replacing it, so a trivial declared check cannot escape
+        // the root checks the task's changes selected.
+        let mut required: Vec<(CheckId, Option<&PlanStep>)> = Vec::new();
+        let mut required_ids = BTreeSet::new();
         for step in plan
             .steps
             .iter()
@@ -295,6 +308,17 @@ impl CompletionGateReport {
                 continue;
             }
             let check = CheckId::new(planned.working_directory.as_str(), planned.command.as_str());
+            if required_ids.insert(check.clone()) {
+                required.push((check, Some(step)));
+            }
+        }
+        for check in facts.floor_checks {
+            if required_ids.insert(check.clone()) {
+                required.push((check.clone(), None));
+            }
+        }
+
+        for (check, step) in required {
             // The evidence for a required check is one of two things. A check
             // that ran through the verification loop has a `CheckRun` keyed by
             // identity; a check deferred to its own plan step was run by the
@@ -355,6 +379,20 @@ impl CompletionGateReport {
                 }
                 continue;
             }
+
+            // A floor check that no plan step carries can only have run through
+            // the verification loop, so with no `CheckRun` it has no evidence
+            // at all. There is no deferred path to read.
+            let Some(step) = step else {
+                reasons.push(CompletionReason {
+                    code: CompletionReasonCode::RequiredCheckMissing,
+                    explanation: format!(
+                        "Required check {} has no recorded result.",
+                        check.label()
+                    ),
+                });
+                continue;
+            };
 
             // Deferred path: the latest run of the exact command in the exact
             // directory on the step is the evidence. Identity is the full
@@ -598,6 +636,7 @@ impl<'a> CompletionGateService<'a> {
             .session_store
             .pending_decision_for(session_id, task_id)?;
         let current_hashes = current_hashes(self.repository_root, &verification);
+        let floor = self.floor_checks(&session, task_id)?;
 
         Ok(CompletionGateReport::evaluate(CompletionFacts {
             task_id,
@@ -605,7 +644,25 @@ impl<'a> CompletionGateService<'a> {
             verification: &verification,
             pending: pending.as_ref(),
             current_hashes: &current_hashes,
+            floor_checks: &floor,
         }))
+    }
+
+    /// The discovered checks of the roots this task's files touched.
+    ///
+    /// The persisted repository map is read, never rebuilt: a gate report must
+    /// not write a map or store command proposals. A repository with no map has
+    /// no detected checks to require, so the floor is empty; an unreadable map
+    /// is an error rather than a silent empty floor.
+    fn floor_checks(&self, session: &Session, task_id: &str) -> Result<Vec<CheckId>> {
+        let Some(map) = load_stored_map(self.session_store.data_dir(), &session.repository_id)?
+        else {
+            return Ok(Vec::new());
+        };
+        let touched = self
+            .session_store
+            .task_touched_paths(&session.id, task_id)?;
+        Ok(floor_checks(self.repository_root, &map, &touched))
     }
 
     /// Settle a task through the gate, recording the verdict beside its status.

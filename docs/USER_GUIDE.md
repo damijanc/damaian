@@ -1307,10 +1307,15 @@ are, and a **Task incomplete** card names the reasons, such as "Verification is
 due and has not run." A check you declined is named as a waiver and never
 counted as a passed check; a check skipped by policy is still a blocker.
 
-**A required check is a completion obligation.** When an approved plan step
-carries a required check, the task may not complete until that exact command has
-a current passing result in its directory, or you have explicitly waived it. The
-completion report names each required check with one of four dispositions:
+**A required check is a completion obligation.** Required checks come from the
+approved plan and from the files the task changed. When an approved plan step
+carries a required check, or the task touched a file whose project root (or an
+enclosing root, such as a Cargo workspace) detects a check, the task may not
+complete until that exact command has a current passing result in its directory,
+or you have explicitly waived it. Plan-declared checks are added to the detected
+checks; a plan with no check does not remove them. A documentation-only task has
+no detected floor. The completion report names each required check with one of
+four dispositions:
 
 - **Passed** — the check ran, exited zero, and the files it covered have not
   changed since.
@@ -1321,10 +1326,12 @@ completion report names each required check with one of four dispositions:
 - **Waived** — you declined the check; it is named in the report and never
   counted as passed.
 
-A required check whose result is missing blocks completion as well. A check the
-model *named* but that is not on the approved plan, or one on a step you marked
-optional, is not an obligation: it may run as ordinary feedback, but it does not
-gate the task.
+A required check whose result is missing blocks completion as well. A detected
+check the policy can auto-run simply runs; one that needs approval appears on
+the ordinary check card, and declining it is the named waiver. A check the model
+*named* but that is neither on the approved plan nor detected for a root the task
+touched, or one on a step you marked optional, is not an obligation: it may run
+as ordinary feedback, but it does not gate the task.
 
 **Continue task** on that card starts a new run with the same plan and the same
 completion reasons, without typing "continue". You can add a note, which is

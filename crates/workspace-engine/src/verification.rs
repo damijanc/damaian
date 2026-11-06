@@ -1564,6 +1564,35 @@ pub fn select_roots(map: &RepositoryMap, changed: &[String]) -> Vec<String> {
     selected.into_iter().collect()
 }
 
+/// The detected checks of the roots a set of touched paths selects.
+///
+/// The completion gate's floor (spec 101/105 review fix R15): a task that
+/// changed files has required checks even when its plan declares none. This is
+/// the same root selection [`propose_checks`] uses — owning root plus every
+/// enclosing root, with documentation selecting nothing — but it only reads the
+/// persisted map, so a gate report stores no command proposal and executes
+/// nothing. The result is sorted by [`CheckId`], so merging it with the plan's
+/// required checks is deterministic.
+pub fn floor_checks(
+    repository_root: &Path,
+    map: &RepositoryMap,
+    touched_paths: &[String],
+) -> Vec<CheckId> {
+    let roots = select_roots(map, touched_paths);
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    let mut restricted = map.restricted_to(&roots);
+    drop_covered_member_checks(repository_root, &mut restricted);
+    let mut checks = BTreeSet::new();
+    for root in &restricted.roots {
+        for command in &root.commands {
+            checks.insert(CheckId::new(root.path.as_str(), command.command.as_str()));
+        }
+    }
+    checks.into_iter().collect()
+}
+
 /// What [`propose_checks`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {

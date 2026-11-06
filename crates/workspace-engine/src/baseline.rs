@@ -31,7 +31,7 @@ use crate::session::SessionStore;
 use crate::validation::{CommandProposal, ValidationOrchestrator};
 use crate::verification::{
     CheckBaseline, CheckId, CheckTermination, FailureFingerprint, FindingEvidence, Selection,
-    VerificationEvent, environment_termination, propose_checks,
+    VerificationEvent, environment_termination, floor_checks, propose_checks,
 };
 
 /// One command the user must decide about before the patch can apply.
@@ -161,27 +161,50 @@ impl BaselineCoordinator {
             });
         }
         let selected_paths = self.selected_paths(patch, approved_paths)?;
-        let mut checks = if selected_paths.is_empty() {
-            BTreeMap::new()
+        // The repository map answers two questions here: which checks the
+        // patch's own paths select for their per-change baseline, and which
+        // checks the completion floor requires for every root the task has
+        // touched (spec 101/105 review fix R15). It is loaded once.
+        let map = if selected_paths.is_empty() {
+            None
         } else {
             let index = IndexCache::get_or_build(&self.indexer, repository_root)?;
             let map_store = RepositoryMapStore::new(&self.config.data_dir, self.audit_log.clone());
             let (map, _) = map_store.load_or_build(&index, self.validation.command_policy())?;
-            match propose_checks(&self.validation, repository_root, &map, &selected_paths)? {
-                Selection::Proposed(checks) => checks.into_iter().collect(),
-                Selection::OnlyDocumentation | Selection::NoChecksAvailable { .. } => {
-                    BTreeMap::new()
+            Some(map)
+        };
+        let mut checks = match &map {
+            Some(map) => {
+                match propose_checks(&self.validation, repository_root, map, &selected_paths)? {
+                    Selection::Proposed(checks) => checks.into_iter().collect(),
+                    Selection::OnlyDocumentation | Selection::NoChecksAvailable { .. } => {
+                        BTreeMap::new()
+                    }
                 }
             }
+            None => BTreeMap::new(),
         };
-        // Spec 102 D2 piece 1: required checks are baselined before the first
-        // patch the task writes, on the untouched tree, even when that patch's
-        // paths do not select them. A required check with no task-start
-        // baseline (it became required only after the task had already changed
-        // files) is never given a post-patch baseline: it is recorded
-        // `Uncertain`, so its later failure is reported and asks the user
-        // rather than looking pre-existing.
-        let required = self.required_checks(session_id, task_id)?;
+        // Spec 102 D2 piece 1 and spec 101/105 R15: required checks are
+        // baselined before the first patch the task writes, on the untouched
+        // tree, even when that patch's paths do not select them. That set is
+        // the plan's required checks merged with the completion floor for every
+        // file the task will have touched after this patch. A required check
+        // with no task-start baseline (it became required only after the task
+        // had already changed files) is never given a post-patch baseline: it
+        // is recorded `Uncertain`, so its later failure is reported and asks the
+        // user rather than looking pre-existing.
+        let mut required: BTreeMap<CheckId, String> = self
+            .required_checks(session_id, task_id)?
+            .into_iter()
+            .collect();
+        if let Some(map) = &map {
+            let touched = self.task_touched_paths(session_id, task_id, &selected_paths)?;
+            for check in floor_checks(repository_root, map, &touched) {
+                required
+                    .entry(check)
+                    .or_insert_with(|| "required by the changed files".to_string());
+            }
+        }
         if checks.is_empty() && required.is_empty() {
             return Ok(BaselinePreparation::Complete {
                 recorded: Vec::new(),
@@ -525,6 +548,25 @@ impl BaselineCoordinator {
                 .or_insert_with(|| planned.purpose.clone());
         }
         Ok(checks.into_iter().collect())
+    }
+
+    /// Every path the task will have touched after this patch: the durable
+    /// patches and command changes already recorded, plus the patch being
+    /// applied now. The completion floor is computed over this set, so the
+    /// first patch of a task baselines every root its changes will select.
+    fn task_touched_paths(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        patch_paths: &[String],
+    ) -> Result<Vec<String>> {
+        let mut paths: BTreeSet<String> = self
+            .session_store
+            .task_touched_paths(session_id, task_id)?
+            .into_iter()
+            .collect();
+        paths.extend(patch_paths.iter().cloned());
+        Ok(paths.into_iter().collect())
     }
 
     /// Whether the task has already changed files, through any task in its

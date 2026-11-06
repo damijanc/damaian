@@ -192,6 +192,7 @@ fn evaluate(
         verification,
         pending,
         current_hashes,
+        floor_checks: &[],
     })
 }
 

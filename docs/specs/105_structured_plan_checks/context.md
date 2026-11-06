@@ -110,12 +110,14 @@ primary steps, maps each `required: true` `PlannedCheck` to
 The `CheckRun` is authoritative when both exist (a check deferred and run as a
 command can later be re-run by the loop after a continuation, and the `CheckRun`
 is the more recent evidence); the `CommandExit` is the fallback. A discovered
-check that is not on the plan is **not** a gate obligation at all — its pass,
-failure or skip is reported by the verification loop, not by the completion
-gate, so a discovered `cargo test` failure settles the task `failed` through
-the verification settlement while the gate report itself names only the open
-plan work. This is the deliberate consequence of requirement 6 and non-goal 3
-("structured required checks define the completion obligation").
+check that is not on the plan used to be **not** a gate obligation at all under
+Task 5. Review fix R15 (decision D1) restores it as the completion floor: the
+detected checks of the owning and enclosing roots of every file the task touched
+are required even when the plan declares none, and plan checks are merged into
+that set by `CheckId`. The floor reads the persisted repository map; it stores
+no proposal and runs nothing. A discovered check outside the touched roots (for
+example a check the loop selected for a path the task did not touch) is still
+reported by the verification loop rather than by the gate.
 
 
 ## 6. Mutation-batch generation sits beside the existing file-hash staleness

@@ -26,12 +26,14 @@ provenance, scope and stagnation checks increase the damage window.
 ## 2. Requirements
 
 1. Before the first approved patch a task applies, Damaian offers to run the
-   checks the approved plan declares required against the untouched task-start
-   tree. That is their task-local baseline, one run per required check per task.
-   A check the plan does not require is baselined before the patch that first
-   selects it, as before. A required check that becomes required only after the
-   task has already changed files has no task-start baseline and is never given
-   a post-patch baseline.
+   checks the approved plan declares required, together with the completion
+   floor's detected checks for the roots that patch touches, against the
+   untouched task-start tree. That is their task-local baseline, one run per
+   required check per task. A check that is neither plan-required nor in that
+   floor is baselined before the patch that first selects it, as before. A
+   required check that becomes required only after the task has already changed
+   files — a plan revision, or a floor check for a root first touched by a later
+   patch — has no task-start baseline and is never given a post-patch baseline.
 2. Baseline commands keep their ordinary approval requirements. Patch approval
    does not approve a baseline check, and declining the baseline does not
    decline the patch.
@@ -89,7 +91,8 @@ provenance, scope and stagnation checks increase the damage window.
   related to a patch. An unstable fingerprint is reported as unknown unless a
   later specification adds repeat-based flake classification.
 - Running a whole quality gate before every patch. Per-change baseline
-  selection stays as it was; only the plan's required checks run at task start.
+  selection stays as it was; only the plan's required checks and the completion
+  floor for the roots the first patch touches run at task start.
 - Rebuilding the task-start tree in a temporary worktree to take a late
   baseline. A required check that became required late is `uncertain` instead.
 - Automatically reverting a patch that introduces a failure. The user reviewed
@@ -106,19 +109,20 @@ name the bytes that were reviewed. If a check changes a tracked source file,
 the ordinary patch hash check makes the approved patch stale and requires a new
 preview.
 
-Required checks are selected from the approved plan as well as from the
-proposed paths. On the first patch a task applies, before any write, every
-required check without a baseline runs against the untouched tree through the
-existing batch and command-policy path. A required check that is also selected
-for a later patch reuses that task-start baseline rather than taking a new
-pre-patch one. A required check that first appears after the task has already
-changed files (a plan revision or, after the floor is added, a root first touched
-later) is recorded as `CheckBaseline::Uncertain` instead of being run: there is
-no task-start tree to compare against. That marker is durable and is what makes
-the later failure `uncertain`; the per-change baseline rule is unchanged for
-checks the plan does not require. Classification also treats a required check
-with no recorded baseline as `uncertain`, which covers a revision after the last
-patch and a historical log whose first patch predates this rule. A declined or
+Required checks are selected from the approved plan and from the completion
+floor (spec 101/105 as amended by review fix R15), as well as from the proposed
+paths. On the first patch a task applies, before any write, every required check
+without a baseline runs against the untouched tree through the existing batch
+and command-policy path. A required check that is also selected for a later
+patch reuses that task-start baseline rather than taking a new pre-patch one. A
+required check that first appears after the task has already changed files (a
+plan revision or a floor check for a root first touched by a later patch) is
+recorded as `CheckBaseline::Uncertain` instead of being run: there is no
+task-start tree to compare against. That marker is durable and is what makes the
+later failure `uncertain`; the per-change baseline rule is unchanged for checks
+outside the required set. Classification also treats a required check with no
+recorded baseline as `uncertain`, which covers a revision after the last patch
+and a historical log whose first patch predates this rule. A declined or
 unavailable baseline is recorded, so it still classifies as unknown.
 
 Classification precedence is: a live environment failure first; then an
@@ -302,7 +306,7 @@ marks the spec Done. Workspace-wide Clippy and tests remain for CI.
 
 | # | Requirement | Implementation | Evidence |
 |---|---|---|---|
-| 1 | Baseline every required check on the untouched tree before the first patch, and any other check before the patch that first selects it. A required check that becomes required later has no task-start baseline. | `workspace-engine/src/baseline.rs` (`BaselineCoordinator::prepare`, `required_checks`, `task_has_changed_files`) runs from `EditOrchestrator::apply_stored_patch_with_baseline` after the protected-path/mode refusals and before hooks, the action marker, the checkpoint and every write. The first patch a task applies merges the approved plan's required checks with the detected per-change checks; a later patch reuses task-start baselines and records `CheckBaseline::Uncertain` for a required check that has none because files already changed. | `plan_turn`: `a_required_check_is_baselined_at_task_start_and_a_later_regression_is_repaired`, `a_required_check_first_required_after_changes_is_uncertain_and_asks_before_repair`, `a_declined_required_baseline_is_recorded_declined_not_uncertain`. `repair_baseline`: `a_safe_check_runs_as_a_passing_baseline_before_the_patch_writes`, `a_check_selected_by_a_later_patch_is_baselined_before_it_applies`, `a_partial_selection_baselines_only_the_roots_it_selects`, `a_partial_hunk_apply_still_passes_the_baseline_gate`, `a_fresh_engine_reuses_the_durable_baseline_without_running_it_again`, `a_worker_session_baseline_replays_after_the_worker_restarts`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_environment_failure`. |
+| 1 | Baseline every required check on the untouched tree before the first patch, and any other check before the patch that first selects it. A required check that becomes required later has no task-start baseline. | `workspace-engine/src/baseline.rs` (`BaselineCoordinator::prepare`, `required_checks`, `task_touched_paths`, `task_has_changed_files`) runs from `EditOrchestrator::apply_stored_patch_with_baseline` after the protected-path/mode refusals and before hooks, the action marker, the checkpoint and every write. The first patch a task applies merges the approved plan's required checks with the completion floor for every root the patch and earlier changes touch, plus the detected per-change checks; a later patch reuses task-start baselines and records `CheckBaseline::Uncertain` for a required check that has none because files already changed. | `plan_turn`: `a_required_check_is_baselined_at_task_start_and_a_later_regression_is_repaired`, `a_required_check_first_required_after_changes_is_uncertain_and_asks_before_repair`, `a_declined_required_baseline_is_recorded_declined_not_uncertain`, `floor_checks_are_baselined_at_task_start_and_a_later_root_is_uncertain`, `a_floor_check_for_a_root_first_touched_later_is_uncertain_not_pre_existing`. `repair_baseline`: `a_safe_check_runs_as_a_passing_baseline_before_the_patch_writes`, `a_check_selected_by_a_later_patch_is_baselined_before_it_applies`, `a_partial_selection_baselines_only_the_roots_it_selects`, `a_partial_hunk_apply_still_passes_the_baseline_gate`, `a_fresh_engine_reuses_the_durable_baseline_without_running_it_again`, `a_worker_session_baseline_replays_after_the_worker_restarts`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_environment_failure`. |
 | 2 | Baseline commands keep ordinary approval; patch approval does not approve them, and declining a baseline does not decline the patch. | `baseline.rs` pauses on a `BaselineBatch` and validates every resume decision before running or granting anything; `PatchApplyOutcome::BaselineRequired` is returned instead of an error, and the patch can then apply. | `repair_baseline`: `a_declined_baseline_does_not_decline_the_patch`, `an_approved_baseline_runs_and_the_patch_applies_afterwards`, `malformed_resume_decisions_have_no_side_effects`, `always_grants_must_belong_to_the_pending_batch_and_be_approved_and_eligible`. Eval: `verification_declined_baseline`. |
 | 3 | A stable failure fingerprint from check identity, normalized findings and termination; no raw output or secrets. | `FailureFingerprint::compute` and `FindingEvidence::from_finding` in `verification.rs` canonicalise the `CheckId`, the location-free finding comparison key (source, severity, code, normalized path, normalized summary) and termination. Transient ids, timestamps, origin refs, machine-local absolute paths, raw output and finding location are excluded from identity. The redacted, bounded `details` are carried for the repair request but excluded from `canonical_key`, `location_key`, equality and the fingerprint. The format is version 2; version 1 values remain loadable. | `repair_provenance`: `fingerprint_is_order_and_duplicate_insensitive`, `fingerprint_changes_with_material_evidence_but_not_location`, `fingerprint_uses_code_and_severity_but_not_location`, `fingerprint_changes_with_termination_and_check_identity`, `fingerprint_ignores_transient_finding_fields`, `fingerprint_does_not_depend_on_an_absolute_checkout_path`, `fingerprint_normalises_absolute_paths_in_text_and_check_identity`. `repair_baseline`: `a_failed_baseline_records_redacted_normalized_findings_and_a_fingerprint`. |
 | 4 | Classify as `new_regression`, `pre_existing`, `worsened`, `unchanged_failure`, `environment_failure`, `uncertain` or `unknown_provenance`; repair only new regressions and the new part of worsened, with the introduced finding's redacted details under named budgets. | `workspace-engine/src/provenance.rs` (`classify`, `same_findings`, `introduced_findings`, `repair_targets`, `render_repair_request`) and `ChatOrchestrator::finish_verification`: classification compares the durable findings as a multiset without line or column, an explicit `CheckBaseline::Uncertain` maps to `uncertain` before the unknown groups, repair starts only when `repair_targets` is non-empty, only errors become introduced evidence, and a repaired result carries only the introduced delta. `render_repair_request` prints each finding's summary/location and its redacted details, with `MAX_REPAIR_FINDING_DETAILS_BYTES` / `MAX_REPAIR_TOTAL_DETAILS_BYTES` and explicit truncation markers. | `repair_targets`: `a_pre_existing_error_that_shifts_lines_is_still_pre_existing`, `a_new_identical_error_in_a_different_file_is_introduced`, `a_second_different_error_in_the_same_file_is_introduced`, `a_new_warning_on_a_failed_baseline_is_not_worsened_or_a_repair_target`, `an_extra_identical_occurrence_beyond_the_baseline_is_introduced`, `shifted_duplicates_that_do_not_grow_the_count_are_not_introduced`, `a_baseline_written_with_a_v1_fingerprint_still_classifies_by_its_findings`, `a_repair_request_bounds_one_findings_details`, `a_repair_request_bounds_total_details_across_many_findings`. `verification_loop`: `a_matching_failed_baseline_is_pre_existing_and_starts_no_repair`, `a_pre_existing_error_that_shifts_lines_stays_pre_existing`, `a_declined_baseline_makes_the_failure_unknown_and_starts_no_repair`, `a_repair_that_breaks_a_previously_passing_check_is_a_regression`, `the_repair_request_carries_normalized_evidence_not_the_raw_log`, `the_repair_request_carries_a_rustc_type_error_expected_and_found`, `the_repair_request_carries_a_generic_checks_bounded_stderr_tail`, `provenance_and_repair_targets_survive_a_fresh_store`. `plan_turn`: `a_required_check_first_required_after_changes_is_uncertain_and_asks_before_repair`, `answering_the_uncertain_repair_question_with_repair_runs_one_repair_turn_that_still_needs_approval`, `answering_the_uncertain_repair_question_with_no_leaves_it_reported_and_unrepaired`, `a_per_change_check_keeps_its_pre_patch_baseline_and_pre_existing_classification`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_repair_stalled_repeated`. |
@@ -514,4 +518,37 @@ failed with `the worker asks whether to repair the uncertain failure`;
 `a_declined_required_baseline_is_recorded_declined_not_uncertain` failed because
 the patch applied without offering the required check's baseline. The guard
 `a_per_change_check_keeps_its_pre_patch_baseline_and_pre_existing_classification`
-passes and pins the unchanged per-change rule. All now pass.
+pinned the unchanged per-change rule; review fix R15 later re-pointed the
+root-first-touched-later case to `uncertain` (see the R15 note below). All now
+pass.
+
+### Review fix 2026-11-06: floor checks take the task-start baseline (R15)
+
+Review fix R15 (decision D1) makes the detected checks of every root a task
+touched a completion obligation. R14's baseline rule therefore covers two
+required sets, not one: the approved plan's `required: true` checks **and** the
+completion floor for the roots the first patch and its earlier changes touch.
+`BaselineCoordinator::prepare` merges them by `CheckId` before deciding what to
+run, so a floor check for the first patch's owning or enclosing root is
+baselined on the untouched tree through the ordinary policy path.
+
+A root first touched by a later patch has no task-start baseline. Its floor check
+is recorded as `CheckBaseline::Uncertain` rather than being run post-patch, so
+its later failure is `uncertain`, is named before the unknown group, and never
+reads as silently `pre_existing`. That supersedes R14's per-change surprise for
+this case: the check is now required, and a post-patch baseline would compare
+against a tree the task had already changed. The per-change baseline rule is
+unchanged for a check outside the required set.
+
+This does not change the R14 provenance precedence or the uncertain repair
+question: environment failure first, then `Uncertain`, then unknown, then
+passed/failed. It only changes which checks have a task-start baseline.
+
+Tests written first and recorded failing:
+`plan_turn::floor_checks_are_baselined_at_task_start_and_a_later_root_is_uncertain`
+failed with `the first patch's floor check has a task-start baseline: {}`;
+`plan_turn::a_floor_check_for_a_root_first_touched_later_is_uncertain_not_pre_existing`
+failed with the later root recorded as `Failed { termination: Exited { exit_code:
+1 }, .. }` from a post-patch baseline. Both pass now. The first test also proves
+the later root is `Uncertain` and its verification failure is reported as
+`uncertain`, not `pre_existing`.
