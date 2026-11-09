@@ -29,14 +29,29 @@ provenance, scope and stagnation checks increase the damage window.
    checks the approved plan declares required, together with the completion
    floor's detected checks for the roots that patch touches, against the
    untouched task-start tree. That is their task-local baseline, one run per
-   required check per task. A check that is neither plan-required nor in that
-   floor is baselined before the patch that first selects it, as before. A
-   required check that becomes required only after the task has already changed
-   files — a plan revision, or a floor check for a root first touched by a later
-   patch — has no task-start baseline and is never given a post-patch baseline.
+   required check per task. The same gate runs before the first approved command
+   that can plausibly change files: after the command's approval and before it
+   executes, scoped to the plan's required checks and the completion floor of
+   every root the command's working directory could write. A command that
+   cannot plausibly change source files takes no baseline: an admitted read-only
+   command, a shell pipeline whose every simple command is read-only by the same
+   tokenizer, a validation command, or a command the engine assigns
+   `CommandPurpose::Check` or `Exploration`. Formatters, fixers and generators
+   keep the baseline even when a validation list calls them a check; scripts,
+   package managers and every unknown command stay on the safe side. A skipped
+   command that changes files after all is still detected by spec 85, and its
+   required checks fall back to `uncertain`. A task that has already changed
+   files does not take a second task-start one. A check that is neither
+   plan-required nor in that floor is baselined before the patch that first
+   selects it, as before. A required check that becomes required only after the
+   task has already changed files — a plan revision, or a floor check for a root
+   first touched by a later patch — has no task-start baseline and is never
+   given a post-patch baseline.
 2. Baseline commands keep their ordinary approval requirements. Patch approval
-   does not approve a baseline check, and declining the baseline does not
-   decline the patch.
+   does not approve a baseline check, command approval does not approve one
+   either, and a baseline that itself needs approval pauses on the existing
+   check card before the command runs. Declining the baseline does not decline
+   the patch or the command.
 3. Every check result has a stable failure fingerprint derived from check
    identity, normalized findings and termination kind. A finding's comparison
    key is its source, severity, code, normalized path and normalized summary;
@@ -102,7 +117,9 @@ provenance, scope and stagnation checks increase the damage window.
   later specification adds repeat-based flake classification.
 - Running a whole quality gate before every patch. Per-change baseline
   selection stays as it was; only the plan's required checks and the completion
-  floor for the roots the first patch touches run at task start.
+  floor for the roots the first patch touches run at task start. The command
+  path takes the same one task-start run before its first mutating command; it
+  does not run a gate before every command.
 - Rebuilding the task-start tree in a temporary worktree to take a late
   baseline. A required check that became required late is `uncertain` instead.
 - Automatically reverting a patch that introduces a failure. The user reviewed
@@ -134,6 +151,40 @@ outside the required set. Classification also treats a required check with no
 recorded baseline as `uncertain`, which covers a revision after the last patch
 and a historical log whose first patch predates this rule. A declined or
 unavailable baseline is recorded, so it still classifies as unknown.
+
+The command path takes the same task-start gate because a task's first file
+change may come from an approved command (spec 85: a formatter, a code
+generator). A command's effects are unknown until it runs, so its scope is
+deliberate: the approved plan's required checks plus the completion floor of
+every root the command's working directory could write.
+`RepositoryMap::roots_for_command` returns the roots that own or enclose that
+directory — the same floor a changed file at that path would have — plus every
+root beneath it, so a command at the repository root covers every root, and a
+command in a member covers that member and its enclosing roots. `command_floor_checks` turns those
+roots into detected checks with the same coverage rule the completion floor
+uses. The gate runs after the command's approval and before its census and
+execution, through the same batch and command-policy path; approving the
+command does not approve a baseline. A baseline that needs approval pauses on
+the existing check card, the command stays paused behind it, and declining the
+baseline records `CheckBaseline::Declined` without declining the command.
+
+The trigger is deliberately narrow, because a full-repository baseline before
+an exploration command is friction with no provenance benefit.
+`ChatOrchestrator::command_needs_task_start_baseline` runs the gate only when
+the command can plausibly change files. It skips an admitted read-only command
+(`is_low_risk_read_only`), a shell pipeline whose every simple command is
+read-only (`is_read_only_pipeline`, which reuses the same shell tokenizer and
+program/filter lists as the read-only boundary but is used only for this
+decision), a validation command (`is_validation_command`), and any command the
+engine assigns `CommandPurpose::Check` or `Exploration`. It keeps the gate for a
+formatter, fixer or generator (`is_source_writing_command`), even when a
+validation list calls it a check; for scripts, package managers and every
+`CommandPurpose::Other` / unknown command. A skipped command that does change
+files is still seen by spec 85, and its required checks have no task-start
+baseline and report `uncertain`; the skip is fail-safe, not a claim that the
+command cannot write. The gate runs only while the task has not changed files:
+once any patch or command has changed the task's tree, the task-start tree is
+gone and the `Uncertain` rule above applies instead.
 
 Classification precedence is: a live environment failure first; then an
 explicit `Uncertain` baseline; then declined, unavailable or absent baselines
@@ -340,8 +391,8 @@ marks the spec Done. Workspace-wide Clippy and tests remain for CI.
 
 | # | Requirement | Implementation | Evidence |
 |---|---|---|---|
-| 1 | Baseline every required check on the untouched tree before the first patch, and any other check before the patch that first selects it. A required check that becomes required later has no task-start baseline. | `workspace-engine/src/baseline.rs` (`BaselineCoordinator::prepare`, `required_checks`, `task_touched_paths`, `task_has_changed_files`) runs from `EditOrchestrator::apply_stored_patch_with_baseline` after the protected-path/mode refusals and before hooks, the action marker, the checkpoint and every write. The first patch a task applies merges the approved plan's required checks with the completion floor for every root the patch and earlier changes touch, plus the detected per-change checks; a later patch reuses task-start baselines and records `CheckBaseline::Uncertain` for a required check that has none because files already changed. | `plan_turn`: `a_required_check_is_baselined_at_task_start_and_a_later_regression_is_repaired`, `a_required_check_first_required_after_changes_is_uncertain_and_asks_before_repair`, `a_declined_required_baseline_is_recorded_declined_not_uncertain`, `floor_checks_are_baselined_at_task_start_and_a_later_root_is_uncertain`, `a_floor_check_for_a_root_first_touched_later_is_uncertain_not_pre_existing`. `repair_baseline`: `a_safe_check_runs_as_a_passing_baseline_before_the_patch_writes`, `a_check_selected_by_a_later_patch_is_baselined_before_it_applies`, `a_partial_selection_baselines_only_the_roots_it_selects`, `a_partial_hunk_apply_still_passes_the_baseline_gate`, `a_fresh_engine_reuses_the_durable_baseline_without_running_it_again`, `a_worker_session_baseline_replays_after_the_worker_restarts`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_environment_failure`. |
-| 2 | Baseline commands keep ordinary approval; patch approval does not approve them, and declining a baseline does not decline the patch. | `baseline.rs` pauses on a `BaselineBatch` and validates every resume decision before running or granting anything; `PatchApplyOutcome::BaselineRequired` is returned instead of an error, and the patch can then apply. | `repair_baseline`: `a_declined_baseline_does_not_decline_the_patch`, `an_approved_baseline_runs_and_the_patch_applies_afterwards`, `malformed_resume_decisions_have_no_side_effects`, `always_grants_must_belong_to_the_pending_batch_and_be_approved_and_eligible`. Eval: `verification_declined_baseline`. |
+| 1 | Baseline every required check on the untouched tree before the first patch or approved command that can change files, and any other check before the patch that first selects it. A required check that becomes required later has no task-start baseline. | `workspace-engine/src/baseline.rs` (`BaselineCoordinator::prepare`, `prepare_for_command`, `settle`, `required_checks`, `task_touched_paths`, `task_has_changed_files`) runs for a patch from `EditOrchestrator::apply_stored_patch_with_baseline` after the protected-path/mode refusals and before hooks, the action marker, the checkpoint and every write, and for a command from `ChatOrchestrator::resume_after_command_decision_with_options` after the approval and before the census and execution. The first patch a task applies merges the approved plan's required checks with the completion floor for every root the patch and earlier changes touch, plus the detected per-change checks; a later patch reuses task-start baselines and records `CheckBaseline::Uncertain` for a required check that has none because files already changed. The command gate merges the plan's required checks with `verification::command_floor_checks` over `RepositoryMap::roots_for_command`, runs only when `ChatOrchestrator::command_needs_task_start_baseline` says the command can plausibly change files (formatters/fixers/generators and unknown commands yes; admitted read-only commands, read-only pipelines, validation commands and `CommandPurpose::Check`/`Exploration` no), and returns a baseline card through the existing check batch when a check needs approval. | `plan_turn`: `a_required_check_is_baselined_at_task_start_and_a_later_regression_is_repaired`, `a_required_check_first_required_after_changes_is_uncertain_and_asks_before_repair`, `a_declined_required_baseline_is_recorded_declined_not_uncertain`, `floor_checks_are_baselined_at_task_start_and_a_later_root_is_uncertain`, `a_floor_check_for_a_root_first_touched_later_is_uncertain_not_pre_existing`, `a_command_first_task_baselines_before_the_command_and_repairs_its_regression`, `a_patch_first_task_still_takes_its_task_start_baseline_before_its_first_patch`, `a_read_only_command_that_needs_approval_takes_no_baseline`, `a_shell_control_read_only_pipeline_as_the_first_approved_command_takes_no_baseline`, `a_validation_command_as_the_first_approved_command_takes_no_baseline`, `a_formatter_as_the_first_approved_command_takes_the_task_start_baseline`, `a_script_as_the_first_approved_command_takes_the_task_start_baseline`, `an_unknown_command_as_the_first_approved_command_takes_the_task_start_baseline`, `a_command_baseline_runs_after_approval_and_before_the_command`, `a_command_baseline_that_needs_approval_pauses_and_a_decline_is_recorded`. `command_policy`: `is_read_only_pipeline_accepts_reads_but_not_output_options`. `repair_baseline`: `a_safe_check_runs_as_a_passing_baseline_before_the_patch_writes`, `a_check_selected_by_a_later_patch_is_baselined_before_it_applies`, `a_partial_selection_baselines_only_the_roots_it_selects`, `a_partial_hunk_apply_still_passes_the_baseline_gate`, `a_fresh_engine_reuses_the_durable_baseline_without_running_it_again`, `a_worker_session_baseline_replays_after_the_worker_restarts`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_environment_failure`. |
+| 2 | Baseline commands keep ordinary approval; patch or command approval does not approve them, and declining a baseline does not decline the patch or command. | `baseline.rs` pauses on a `BaselineBatch` and validates every resume decision before running or granting anything; `PatchApplyOutcome::BaselineRequired` is returned instead of an error, and the patch can then apply. The command path pauses on the same batch through the existing check card (`ChatOrchestrator::pause_for_command_baseline` / `resume_command_baseline`), records the decisions, and only then resumes the still-approved command. | `repair_baseline`: `a_declined_baseline_does_not_decline_the_patch`, `an_approved_baseline_runs_and_the_patch_applies_afterwards`, `malformed_resume_decisions_have_no_side_effects`, `always_grants_must_belong_to_the_pending_batch_and_be_approved_and_eligible`. `plan_turn`: `a_command_baseline_that_needs_approval_pauses_and_a_decline_is_recorded`, `a_command_baseline_runs_after_approval_and_before_the_command`. Eval: `verification_declined_baseline`. |
 | 3 | A stable failure fingerprint from check identity, normalized findings and termination; no raw output or secrets. | `FailureFingerprint::compute` and `FindingEvidence::from_finding` in `verification.rs` canonicalise the `CheckId`, the location-free finding comparison key (source, severity, code, normalized path, normalized summary) and termination. A generic (unparsed) finding also contributes its redacted `identity_tail`, normalized by `normalized_generic_text` and bounded by `MAX_GENERIC_IDENTITY_TAIL_BYTES`; the exact rules are in §4. Transient ids, timestamps, origin refs, machine-local absolute paths, raw output and finding location are excluded from identity. The redacted, bounded `details` are carried for the repair request but excluded from `canonical_key`, `location_key`, equality and the fingerprint; the identity tail is a separate normalized value. The format is version 3; version 1 and 2 values remain loadable, and a legacy baseline without a tail compares with the pre-R10 key. | `repair_provenance`: `fingerprint_is_order_and_duplicate_insensitive`, `fingerprint_changes_with_material_evidence_but_not_location`, `fingerprint_uses_code_and_severity_but_not_location`, `fingerprint_changes_with_termination_and_check_identity`, `fingerprint_ignores_transient_finding_fields`, `fingerprint_does_not_depend_on_an_absolute_checkout_path`, `fingerprint_normalises_absolute_paths_in_text_and_check_identity`. `generic_failure_identity`: `volatile_generic_output_values_are_not_identity`, `identical_generic_output_twice_is_still_a_repeated_failure`, `a_secret_in_generic_output_never_reaches_its_identity_report_or_repair_request`. `repair_baseline`: `a_failed_baseline_records_redacted_normalized_findings_and_a_fingerprint`. |
 | 4 | Classify as `new_regression`, `pre_existing`, `worsened`, `unchanged_failure`, `environment_failure`, `uncertain` or `unknown_provenance`; repair only new regressions and the new part of worsened, with the introduced finding's redacted details under named budgets. | `workspace-engine/src/provenance.rs` (`classify`, `same_findings`, `introduced_findings`, `repair_targets`, `render_repair_request`) and `ChatOrchestrator::finish_verification`: classification compares the durable findings as a multiset without line or column and includes a generic finding's normalized identity tail, an explicit `CheckBaseline::Uncertain` maps to `uncertain` before the unknown groups, repair starts only when `repair_targets` is non-empty, only errors become introduced evidence, and a repaired result carries only the introduced delta. A legacy baseline without any identity tail falls back to the pre-R10 comparison. `render_repair_request` prints each finding's summary/location and its redacted details, with `MAX_REPAIR_FINDING_DETAILS_BYTES` / `MAX_REPAIR_TOTAL_DETAILS_BYTES` and explicit truncation markers. | `repair_targets`: `a_pre_existing_error_that_shifts_lines_is_still_pre_existing`, `a_new_identical_error_in_a_different_file_is_introduced`, `a_second_different_error_in_the_same_file_is_introduced`, `a_new_warning_on_a_failed_baseline_is_not_worsened_or_a_repair_target`, `an_extra_identical_occurrence_beyond_the_baseline_is_introduced`, `shifted_duplicates_that_do_not_grow_the_count_are_not_introduced`, `a_baseline_written_with_a_v1_fingerprint_still_classifies_by_its_findings`, `a_repair_request_bounds_one_findings_details`, `a_repair_request_bounds_total_details_across_many_findings`. `verification_loop`: `a_matching_failed_baseline_is_pre_existing_and_starts_no_repair`, `a_pre_existing_error_that_shifts_lines_stays_pre_existing`, `a_declined_baseline_makes_the_failure_unknown_and_starts_no_repair`, `a_repair_that_breaks_a_previously_passing_check_is_a_regression`, `the_repair_request_carries_normalized_evidence_not_the_raw_log`, `the_repair_request_carries_a_rustc_type_error_expected_and_found`, `the_repair_request_carries_a_generic_checks_bounded_stderr_tail`, `provenance_and_repair_targets_survive_a_fresh_store`. `generic_failure_identity`: `a_new_failing_test_over_a_failed_generic_baseline_is_introduced`, `progressing_generic_repairs_are_not_a_repeated_failure_stall`, `identical_generic_output_twice_is_still_a_repeated_failure`, `a_secret_in_generic_output_never_reaches_its_identity_report_or_repair_request`. `plan_turn`: `a_required_check_first_required_after_changes_is_uncertain_and_asks_before_repair`, `answering_the_uncertain_repair_question_with_repair_runs_one_repair_turn_that_still_needs_approval`, `answering_the_uncertain_repair_question_with_no_leaves_it_reported_and_unrepaired`, `a_per_change_check_keeps_its_pre_patch_baseline_and_pre_existing_classification`. Eval: `verification_pre_existing_failure`, `verification_declined_baseline`, `verification_repair_stalled_repeated`. |
 | 5 | Spawn failure, missing executable, policy refusal and unavailable infrastructure are environment failures with a user action, never code repair. | `CheckTermination::is_environment_failure`, `environment_termination`, `CheckOutcome::Environment`; `build_partitions` gives each environment group one `FixEnvironment` action. Only the process-spawn error is `SpawnFailed`; other errors propagate. | `verification_loop`: `a_spawn_failure_is_an_environment_failure_and_starts_no_repair`, `a_missing_executable_is_an_environment_failure_and_starts_no_repair`, `a_policy_refused_check_is_reported_as_environment_and_starts_no_repair`, `an_execution_store_failure_propagates_instead_of_becoming_environment`. `repair_baseline`: `policy_refusal_is_an_unavailable_baseline_and_the_patch_still_applies`, `a_spawn_failure_and_a_missing_executable_are_unavailable_baselines`. Eval: `verification_environment_failure`. |
@@ -640,3 +691,101 @@ pins the split's effect on the baseline: a member change now has the member's
 per-change check and the workspace root's floor check recorded before the patch
 writes. A completion verification refreshes those checks through the ordinary
 policy path; it does not take a new baseline.
+
+### Review fix 2026-11-06: command-first task-start baselines (R18)
+
+The 2026-11-04 review found that R14/R15 take the required-check baseline only
+at the first patch's pre-apply gate: `edit.rs` was the only caller of
+`BaselineCoordinator::prepare`. A task whose first file change came from an
+approved command (spec 85: `cargo fmt`, a code generator) never passed that
+gate, so every required and floor check had no task-start baseline. The result
+failed safe — a later failure read `uncertain` and asked the worker's repair
+question — but it asked the user about work that the task itself had broken.
+
+The command path now takes the same task-start baseline, after the command's
+approval and before its census and execution. A command's effects are unknown
+before it runs, so the scope is explicit: `command_floor_checks` covers the
+completion floor of every root the command's working directory could write
+(`RepositoryMap::roots_for_command`: the roots that own or enclose that
+directory plus every root beneath it) merged with the approved plan's required
+checks. A command at the repository root therefore covers every root; a command
+in a member covers the member and its enclosing roots. The gate is skipped for
+a task that has already changed files, where the task-start tree no longer
+exists and the `Uncertain` rule above applies.
+
+A required check whose baseline itself needs approval pauses on the existing
+check card, before the command runs and without approving the command's own
+baseline. The command stays paused; answering the card records
+`CheckBaseline::Declined` (or the approved result) and then resumes the still
+approved command, so declining a baseline does not decline the command. The
+batch and policy path is shared with the patch gate
+(`BaselineCoordinator::settle`), so no check runs outside command policy.
+
+Regression tests were written first. Before the change,
+`plan_turn::a_command_first_task_baselines_before_the_command_and_repairs_its_regression`
+failed with `the member check is baselined on the untouched tree before the
+command runs: {}`;
+`plan_turn::a_command_baseline_runs_after_approval_and_before_the_command`
+failed with `the baseline ran before the command broke the shared value: {}`;
+and
+`plan_turn::a_command_baseline_that_needs_approval_pauses_and_a_decline_is_recorded`
+failed with `a required baseline that needs approval pauses on the existing
+check card`. The guards `a_patch_first_task_still_takes_its_task_start_baseline_before_its_first_patch`
+and `a_read_only_command_that_needs_approval_takes_no_baseline` passed before
+and still pass. The full `plan_turn` suite passes (78 tests). Local checks:
+`scripts/quality-gate.sh fmt node lint typos deny` after `npm ci`; scoped
+`cargo clippy` for workspace-engine, desktop-shell, damaian-cli and
+eval-harness; `cargo nextest run -p` for those four crates (workspace-engine
+2585 tests, with only the known local `shell_path` 500 ms timing flake failing
+under load and passing alone; desktop-shell 285, damaian-cli 17, eval-harness
+123); `cargo run -p eval-harness -- run --tier deterministic` exit 0. The
+workspace clippy and test suite remain for CI.
+
+### R18 follow-up 2026-11-06: the command-baseline trigger narrows
+
+The first R18 implementation ran the command gate for every approved command
+that was not `is_low_risk_read_only`. That was too broad: a read-only
+exploration pipeline that needs approval only because of shell syntax (for
+example `cd src && git diff | head -20`, where `git diff` is refused the
+read-only boundary for printing file contents), or a validation the model runs
+to see the current state (`cargo test`, `npm test`, `pytest`), started a
+full-repository baseline at the beginning of a task. That is friction exactly
+where a worker needs none.
+
+The trigger is now `ChatOrchestrator::command_needs_task_start_baseline`. It
+keeps the gate for a formatter, fixer or generator (`is_source_writing_command`,
+which also treats `npm run format` and `npm run build` as writes even though
+`is_validation_command` lists them), for scripts, package managers and every
+`CommandPurpose::Other` / unknown command. It skips an admitted read-only
+command (`is_low_risk_read_only`), a shell pipeline whose every simple command
+is read-only (`is_read_only_pipeline`, using the read-only boundary's own
+tokenizer and program/filter lists but never widening its approval boundary; it
+also refuses `git diff --output`, `--ext-diff` and `--textconv`), a validation
+command (`is_validation_command`), and a command the engine assigns
+`CommandPurpose::Check` or `Exploration`. A skipped command that changes files
+after all is still detected by spec 85, and its required checks have no
+task-start baseline and report `uncertain`; the skip is fail-safe.
+
+Regression tests were written first. Before the narrowing,
+`plan_turn::a_shell_control_read_only_pipeline_as_the_first_approved_command_takes_no_baseline`
+failed with `a read-only shell pipeline takes no task-start baseline:
+{CheckId { working_directory: "", command: "cargo test" }: Passed, CheckId {
+working_directory: "crates/foo", command: "cargo test" }: Passed}`, and
+`plan_turn::a_validation_command_as_the_first_approved_command_takes_no_baseline`
+failed with `a validation command raises no baseline card: ChatTurnResult { …
+check_batch: Some(AgentCheckBatch { … cargo test … }) }`. The guards
+`a_formatter_as_the_first_approved_command_takes_the_task_start_baseline`
+(`npm run format`), `a_script_as_the_first_approved_command_takes_the_task_start_baseline`
+(`python3 ../script.py`) and
+`an_unknown_command_as_the_first_approved_command_takes_the_task_start_baseline`
+(`./generate.sh`) passed before and still pass; the formatter guard is what
+keeps the validation skip from swallowing `npm run format`. The approval-causes
+scenario was restored to `rust-workspace`; with the narrower trigger its first
+command is a read-only pipeline and its second (script) command is never
+approved, so the scenario still produces exactly its two model-command prompts
+and its assertions did not need to change. Local checks after the follow-up:
+`cargo fmt --all`, `scripts/quality-gate.sh fmt node lint typos deny`, scoped
+`cargo clippy` for workspace-engine, desktop-shell and eval-harness, and the
+scoped crate test runs; the deterministic tier could not complete because the
+development Mac stalled launching the scenario processes, and the R18 row
+records the exact runs, flaky tests and timeouts.

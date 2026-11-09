@@ -977,6 +977,56 @@ fn root_for_path_is_the_longest_root_that_is_a_segment_prefix() {
 }
 
 #[test]
+fn command_baseline_scope_covers_enclosing_roots_and_beneath_the_working_directory() {
+    let repo = IndexedMonorepo::new("command-roots");
+    let map = repo.build();
+
+    // A command at the repository root can write anywhere, so every root is in
+    // its scope.
+    let root_scope = map.roots_for_command("");
+    assert!(root_scope.contains(&String::new()), "{root_scope:?}");
+    assert!(
+        root_scope.contains(&"crates/engine".to_string()),
+        "{root_scope:?}"
+    );
+    assert!(
+        root_scope.contains(&"packages/api".to_string()),
+        "{root_scope:?}"
+    );
+
+    // A command in a member covers the member and its enclosing roots, but not
+    // a sibling package: its relative writes cannot reach there.
+    let member_scope = map.roots_for_command("crates/engine/src");
+    assert!(
+        member_scope.contains(&"crates/engine".to_string()),
+        "{member_scope:?}"
+    );
+    assert!(
+        member_scope.contains(&String::new()),
+        "the enclosing workspace root is in its floor: {member_scope:?}"
+    );
+    assert!(
+        !member_scope.contains(&"packages/api".to_string()),
+        "a sibling root is outside the command's subtree: {member_scope:?}"
+    );
+
+    // A directory that contains several roots covers each of them.
+    let grouped_scope = map.roots_for_command("crates");
+    assert!(
+        grouped_scope.contains(&"crates/engine".to_string()),
+        "{grouped_scope:?}"
+    );
+    assert!(
+        grouped_scope.contains(&"crates/cli".to_string()),
+        "{grouped_scope:?}"
+    );
+    assert!(
+        !grouped_scope.contains(&"packages/api".to_string()),
+        "{grouped_scope:?}"
+    );
+}
+
+#[test]
 fn the_fingerprint_tracks_manifest_content_and_not_modification_times() {
     let repo = IndexedMonorepo::new("fingerprint");
     let before = repo.build().fingerprint;
@@ -2090,10 +2140,34 @@ fn approve(engine: &WorkspaceEngine, proposal_id: &str) -> ChatTurnResult {
         cancel: &cancel,
         steering: None,
     };
-    engine
+    let mut result = engine
         .chat_orchestrator
         .resume_after_command_decision(proposal_id, true, "tester", &mut after, &mut sink)
-        .expect("the resumed turn should run")
+        .expect("the resumed turn should run");
+    // Spec 102 R18: an approved command takes its task-start baseline first. A
+    // baseline that needs approval pauses on the same card, so answer it and
+    // let the command resume.
+    while let Some(batch) = result.check_batch.clone() {
+        let decisions = batch
+            .checks
+            .iter()
+            .map(|check| (check.id.clone(), true))
+            .collect::<Vec<_>>();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let cancel = CancelToken::new();
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        result = engine
+            .chat_orchestrator
+            .resume_after_check_decision(&batch.id, &decisions, "tester", &mut after, &mut sink)
+            .expect("the baseline card should resume the command");
+    }
+    result
 }
 
 fn tool_messages(engine: &WorkspaceEngine, session_id: &str) -> Vec<String> {

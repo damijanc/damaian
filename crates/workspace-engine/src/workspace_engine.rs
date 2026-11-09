@@ -194,6 +194,7 @@ impl WorkspaceEngine {
             memory_store.clone(),
             validation_orchestrator.clone(),
             command_store.clone(),
+            baselines.clone(),
             file_access.clone(),
             navigation,
             path_policy.clone(),

@@ -18,9 +18,9 @@ use workspace_engine::plan::{Evidence, StepStatus, TaskPlan};
 use workspace_engine::{
     CancelToken, ChatTurnResult, CheckBaseline, CheckId, CommandPurpose, CompletionFacts,
     CompletionGateReport, CompletionReasonCode, Config, FailureProvenance, MockModelAdapter,
-    ModelAdapter, ModelRun, PLANNED_CHECK_VERSION, PatchApplyOutcome, PlanRevisionCheck,
-    PlanRevisionStep, PlannedCheck, TaskStatus, TokenUsage, ToolCall, TurnProgress, TurnSink,
-    VerificationEvent, WorkerRecord, WorkspaceEngine, fold_verification,
+    ModelAdapter, ModelRun, PLANNED_CHECK_VERSION, PatchApplyOutcome, PausedTurns,
+    PlanRevisionCheck, PlanRevisionStep, PlannedCheck, TaskStatus, TokenUsage, ToolCall,
+    TurnProgress, TurnSink, VerificationEvent, WorkerRecord, WorkspaceEngine, fold_verification,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -3196,14 +3196,18 @@ fn required_check_fixture(name: &str) -> (PathBuf, PathBuf) {
          command=\"$2\"\n\
          case \"$command\" in\n\
            *write-broken*) printf 'broken\\n' > '{}/shared.txt' ;;\n\
+           *break-foo*) printf 'broken\\n' > '{}/crates/foo/src/broken.rs' ;;\n\
            *\"cargo test\"*)\n\
              case \"$PWD\" in\n\
-               */crates/foo) grep -q '^ok$' \"$PWD/../../shared.txt\" || exit 1 ;;\n\
+               */crates/foo)\n\
+                 grep -q '^ok$' \"$PWD/../../shared.txt\" || exit 1\n\
+                 [ ! -f \"$PWD/src/broken.rs\" ] || exit 1 ;;\n\
              esac\n\
              ;;\n\
            *) exit 0 ;;\n\
          esac\n\
          exit 0\n",
+        repo.display(),
         repo.display()
     );
     fs::write(&shell, script).expect("the fake shell");
@@ -3213,6 +3217,26 @@ fn required_check_fixture(name: &str) -> (PathBuf, PathBuf) {
     permissions.set_mode(0o755);
     fs::set_permissions(&shell, permissions).expect("the fake shell is executable");
     (repo, shell)
+}
+
+/// A command census reads `git status`, so an R18 scenario whose command
+/// changes a file needs a real repository even though nothing is committed.
+fn git_init(root: &Path) {
+    for args in [
+        &["init", "--quiet"][..],
+        &["config", "user.email", "test@damaian.local"],
+        &["config", "user.name", "Damaian Test"],
+        &["config", "gc.auto", "0"],
+        &["config", "maintenance.auto", "false"],
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(output.status.success(), "git {args:?} failed");
+    }
 }
 
 fn check_engine(repo: &Path, shell: &Path, allow: &[&str]) -> WorkspaceEngine {
@@ -4509,6 +4533,449 @@ fn a_model_run_floor_command_satisfies_the_floor_without_an_automatic_run() {
     assert!(
         !latest_started_checks(&engine, &proposed.session.id).contains(&root_check),
         "no extra automatic completion run is started for a satisfied floor"
+    );
+}
+
+// --- R18: required-check baselines before a command's first mutation --------
+//
+// Review fix R18 (spec 102/85): R14/R15 take the task-start baseline at the
+// first *patch's* pre-apply gate. A task whose first file change comes from an
+// approved command never passes that gate, so every required check had no
+// baseline and its later failure read `uncertain`. The command path now takes
+// the same baseline after the command's approval and before it runs, for the
+// plan's required checks and the completion floor of every root the command's
+// working directory can write.
+
+/// The same engine as `check_engine` but every command needs approval, so a
+/// baseline check reaches the existing check card instead of running at once.
+fn approval_check_engine(repo: &Path, shell: &Path, allow: &[&str]) -> WorkspaceEngine {
+    WorkspaceEngine::new(Config {
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        shell: shell.to_string_lossy().to_string(),
+        command_allowlist: allow.iter().map(|entry| (*entry).to_string()).collect(),
+        require_approval_for_all_commands: true,
+        ..Config::default()
+    })
+}
+
+fn stored_baselines(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    task_id: &str,
+) -> BTreeMap<CheckId, CheckBaseline> {
+    engine
+        .session_store
+        .task_verification_baselines(session_id, task_id)
+        .expect("the baselines should read")
+}
+
+fn run_command_call(command: &str) -> ToolCall {
+    call(
+        "run_command",
+        &serde_json::json!({"command": command, "reason": "Change the tree"}).to_string(),
+    )
+}
+
+/// Propose the required-check plan, approve it, and leave the turn paused on
+/// `command`. Returns the paused turn and the command proposal id.
+fn plan_then_command(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    command: &ToolCall,
+) -> (ChatTurnResult, String) {
+    let mut first = scripted(vec![
+        vec![call("propose_plan", REQUIRED_FOO_PLAN)],
+        vec![command.clone()],
+    ]);
+    let paused = ask(engine, repo, "Change the shared value", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+    let mut resumed = scripted(vec![vec![command.clone()]]);
+    let proposed = decide(engine, &review.id, true, None, &mut resumed);
+    let command_id = proposed
+        .command_proposal
+        .as_ref()
+        .expect("the command is proposed")
+        .id
+        .clone();
+    (proposed, command_id)
+}
+
+/// (a) The first mutation is an approved command that changes a source file.
+/// The plan's required check is baselined on the untouched tree before the
+/// command runs, so the regression the command introduces is `new_regression`
+/// and starts an ordinary repair turn instead of reading `uncertain`.
+#[test]
+fn a_command_first_task_baselines_before_the_command_and_repairs_its_regression() {
+    let (repo, shell) = required_check_fixture("r18-command-first");
+    git_init(&repo);
+    let engine = check_engine(
+        &repo,
+        &shell,
+        &["cargo test", "cd crates/foo && cargo test"],
+    );
+    let command = run_command_call("break-foo");
+    let mut first = scripted(vec![
+        vec![call("propose_plan", PLAIN_FOO_PLAN)],
+        vec![command.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the shared value", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+
+    let mut resumed = scripted(vec![vec![command]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let command_id = proposed
+        .command_proposal
+        .as_ref()
+        .expect("the command is proposed")
+        .id
+        .clone();
+    let before = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        before.is_empty(),
+        "no check runs before the command is approved: {before:?}"
+    );
+
+    let mut after = MockModelAdapter::new("Done.");
+    let result =
+        try_approve_command(&engine, &command_id, &mut after).expect("the approved command runs");
+
+    let foo = CheckId::new("crates/foo", "cargo test");
+    let baselines = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        matches!(baselines.get(&foo), Some(CheckBaseline::Passed)),
+        "the member check is baselined on the untouched tree before the command runs: {baselines:?}"
+    );
+    assert!(
+        repo.join("crates/foo/src/broken.rs").exists(),
+        "the approved command changed the source tree"
+    );
+
+    let report = result
+        .verification_report
+        .clone()
+        .unwrap_or_else(|| panic!("the command's due verification has a report: {result:?}"));
+    let introduced = report
+        .provenance
+        .iter()
+        .find(|partition| partition.provenance == FailureProvenance::NewRegression)
+        .unwrap_or_else(|| {
+            panic!("the command's regression is introduced by the task-start baseline: {report:?}")
+        });
+    assert!(
+        introduced.checks.iter().any(|check| check.check == foo),
+        "the baselined member check is the introduced failure: {introduced:?}"
+    );
+    assert!(
+        request_text(&after).contains("Repair only the failures this patch introduced"),
+        "the introduced failure starts an ordinary repair turn"
+    );
+}
+
+/// (b) A patch-first task is unchanged: its baseline is still taken at the
+/// patch's pre-apply gate, before that patch writes.
+#[test]
+fn a_patch_first_task_still_takes_its_task_start_baseline_before_its_first_patch() {
+    let (repo, shell) = required_check_fixture("r18-patch-first");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let patch = patch_call_with("shared.txt", "broken\n");
+    let mut first = scripted(vec![
+        vec![call("propose_plan", REQUIRED_FOO_PLAN)],
+        vec![patch.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the shared value", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+    let mut resumed = scripted(vec![vec![patch]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let patch_id = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("the patch is proposed")
+        .patch_id
+        .clone();
+    let before = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        before.is_empty(),
+        "a patch-first task has no baseline before its patch reaches the gate: {before:?}"
+    );
+
+    apply_patch_with_baselines(&engine, &repo, &patch_id, true);
+    let foo = CheckId::new("crates/foo", "cargo test");
+    let baselines = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        matches!(baselines.get(&foo), Some(CheckBaseline::Passed)),
+        "the patch's pre-apply gate still takes the task-start baseline: {baselines:?}"
+    );
+}
+
+/// (c) A read-only command that happens to need approval (the fixture asks
+/// about every command) changes nothing, so it starts no baseline run.
+#[test]
+fn a_read_only_command_that_needs_approval_takes_no_baseline() {
+    let (repo, shell) = required_check_fixture("r18-read-only");
+    let engine = approval_check_engine(&repo, &shell, &[]);
+    let command = run_command_call("ls .");
+    let mut first = scripted(vec![
+        vec![call("propose_plan", REQUIRED_FOO_PLAN)],
+        vec![command.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the shared value", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+    let mut resumed = scripted(vec![vec![command]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let command_id = proposed
+        .command_proposal
+        .as_ref()
+        .expect("the read-only command is proposed")
+        .id
+        .clone();
+
+    let _ = try_approve_command(&engine, &command_id, &mut MockModelAdapter::new("Done."))
+        .expect("the approved read-only command runs");
+
+    let baselines = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        baselines.is_empty(),
+        "a read-only command changes no file, so it takes no baseline: {baselines:?}"
+    );
+}
+
+/// (d) The baseline runs after the command's approval and before the command
+/// executes. `write-broken` makes the required member check fail, so a
+/// `Passed` baseline here is only possible when the check ran first.
+#[test]
+fn a_command_baseline_runs_after_approval_and_before_the_command() {
+    let (repo, shell) = required_check_fixture("r18-after-approval");
+    let engine = check_engine(
+        &repo,
+        &shell,
+        &["cargo test", "cd crates/foo && cargo test"],
+    );
+    let command = run_command_call("write-broken");
+    let mut first = scripted(vec![
+        vec![call("propose_plan", REQUIRED_FOO_PLAN)],
+        vec![command.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the shared value", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+    let mut resumed = scripted(vec![vec![command]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let command_id = proposed
+        .command_proposal
+        .as_ref()
+        .expect("the command is proposed")
+        .id
+        .clone();
+    let before = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        before.is_empty(),
+        "the baseline has not run while the command waits for approval: {before:?}"
+    );
+
+    let _ = try_approve_command(&engine, &command_id, &mut MockModelAdapter::new("Done."))
+        .expect("the approved command runs");
+
+    let foo = CheckId::new("crates/foo", "cargo test");
+    let baselines = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        matches!(baselines.get(&foo), Some(CheckBaseline::Passed)),
+        "the baseline ran before the command broke the shared value: {baselines:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("shared.txt")).expect("the shared value should read"),
+        "broken\n",
+        "the approved command still ran after its baseline"
+    );
+}
+
+/// (e) A required baseline that itself needs approval pauses on the existing
+/// check card before the command runs. Declining it records `Declined`, exactly
+/// as for a patch, and does not decline the command.
+#[test]
+fn a_command_baseline_that_needs_approval_pauses_and_a_decline_is_recorded() {
+    let (repo, shell) = required_check_fixture("r18-baseline-approval");
+    let engine = approval_check_engine(&repo, &shell, &[]);
+    let command = run_command_call("write-broken");
+    let mut first = scripted(vec![
+        vec![call("propose_plan", REQUIRED_FOO_PLAN)],
+        vec![command.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the shared value", &mut first);
+    let review = paused.plan_proposal.expect("the plan is put up");
+    let mut resumed = scripted(vec![vec![command]]);
+    let proposed = decide(&engine, &review.id, true, None, &mut resumed);
+    let command_id = proposed
+        .command_proposal
+        .as_ref()
+        .expect("the command is proposed")
+        .id
+        .clone();
+
+    let paused = try_approve_command(&engine, &command_id, &mut MockModelAdapter::new("Done."))
+        .expect("the approved command reaches its baseline");
+    let batch = paused
+        .check_batch
+        .as_ref()
+        .expect("a required baseline that needs approval pauses on the existing check card");
+    assert!(
+        batch
+            .checks
+            .iter()
+            .any(|check| check.command == "cargo test" && check.directory == "crates/foo"),
+        "the required member check is on the card: {batch:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("shared.txt")).expect("the shared value should read"),
+        "ok\n",
+        "the command does not run before its baseline is decided"
+    );
+    let recoverable = PausedTurns::new(&engine.config.data_dir)
+        .check_batch_proposals(&batch.id)
+        .expect("the paused command baseline is recoverable after a reload");
+    assert_eq!(
+        recoverable.len(),
+        batch.checks.len(),
+        "recovery reattaches every baseline proposal: {recoverable:?}"
+    );
+    let baselines = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        baselines.is_empty(),
+        "nothing is baselined before the card is answered: {baselines:?}"
+    );
+
+    let decisions = batch
+        .checks
+        .iter()
+        .map(|check| (check.id.clone(), false))
+        .collect::<Vec<_>>();
+    let mut resumed = MockModelAdapter::new("Done.");
+    let result = resume_checks(&engine, &batch.id, &decisions, &mut resumed);
+
+    let foo = CheckId::new("crates/foo", "cargo test");
+    let baselines = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        matches!(baselines.get(&foo), Some(CheckBaseline::Declined)),
+        "declining a required baseline records Declined, not uncertain: {baselines:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("shared.txt")).expect("the shared value should read"),
+        "broken\n",
+        "declining the baseline does not decline the command: {result:?}"
+    );
+}
+
+/// (f) A shell-control pipeline that only reads takes no baseline. It needs
+/// approval because of the shell syntax, not because it can change a file.
+#[test]
+fn a_shell_control_read_only_pipeline_as_the_first_approved_command_takes_no_baseline() {
+    let (repo, shell) = required_check_fixture("r18-skip-pipeline");
+    let engine = check_engine(
+        &repo,
+        &shell,
+        &["cargo test", "cd crates/foo && cargo test"],
+    );
+    let (proposed, command_id) = plan_then_command(
+        &engine,
+        &repo,
+        &run_command_call("cd src && git diff | head -20"),
+    );
+
+    let _ = try_approve_command(&engine, &command_id, &mut MockModelAdapter::new("Done."))
+        .expect("the approved read-only pipeline runs");
+
+    let baselines = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        baselines.is_empty(),
+        "a read-only shell pipeline takes no task-start baseline: {baselines:?}"
+    );
+}
+
+/// (g) A validation command the model runs to see the current state takes no
+/// baseline. It is a check, not a mutation.
+#[test]
+fn a_validation_command_as_the_first_approved_command_takes_no_baseline() {
+    let (repo, shell) = required_check_fixture("r18-skip-validation");
+    let engine = approval_check_engine(&repo, &shell, &[]);
+    let (proposed, command_id) = plan_then_command(&engine, &repo, &run_command_call("cargo test"));
+
+    let result = try_approve_command(&engine, &command_id, &mut MockModelAdapter::new("Done."))
+        .expect("the approved validation command runs");
+    assert!(
+        result.check_batch.is_none(),
+        "a validation command raises no baseline card: {result:?}"
+    );
+
+    let baselines = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        baselines.is_empty(),
+        "a validation command takes no task-start baseline: {baselines:?}"
+    );
+}
+
+/// (h) A formatter can change source files, so it keeps the baseline even when
+/// a validation list would otherwise call `npm run format` a check.
+#[test]
+fn a_formatter_as_the_first_approved_command_takes_the_task_start_baseline() {
+    let (repo, shell) = required_check_fixture("r18-keep-formatter");
+    let engine = check_engine(
+        &repo,
+        &shell,
+        &["cargo test", "cd crates/foo && cargo test"],
+    );
+    let (proposed, command_id) =
+        plan_then_command(&engine, &repo, &run_command_call("npm run format"));
+
+    let _ = try_approve_command(&engine, &command_id, &mut MockModelAdapter::new("Done."))
+        .expect("the approved formatter runs");
+
+    let baselines = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        !baselines.is_empty(),
+        "a formatter can change files and keeps the task-start baseline"
+    );
+}
+
+/// (i) A script can do anything, so it keeps the baseline.
+#[test]
+fn a_script_as_the_first_approved_command_takes_the_task_start_baseline() {
+    let (repo, shell) = required_check_fixture("r18-keep-script");
+    let engine = check_engine(
+        &repo,
+        &shell,
+        &["cargo test", "cd crates/foo && cargo test"],
+    );
+    let (proposed, command_id) =
+        plan_then_command(&engine, &repo, &run_command_call("python3 ../script.py"));
+
+    let _ = try_approve_command(&engine, &command_id, &mut MockModelAdapter::new("Done."))
+        .expect("the approved script runs");
+
+    let baselines = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        !baselines.is_empty(),
+        "a script can change files and keeps the task-start baseline"
+    );
+}
+
+/// (j) An unknown command stays on the safe side and keeps the baseline.
+#[test]
+fn an_unknown_command_as_the_first_approved_command_takes_the_task_start_baseline() {
+    let (repo, shell) = required_check_fixture("r18-keep-unknown");
+    let engine = check_engine(
+        &repo,
+        &shell,
+        &["cargo test", "cd crates/foo && cargo test"],
+    );
+    let (proposed, command_id) =
+        plan_then_command(&engine, &repo, &run_command_call("./generate.sh"));
+
+    let _ = try_approve_command(&engine, &command_id, &mut MockModelAdapter::new("Done."))
+        .expect("the approved unknown command runs");
+
+    let baselines = stored_baselines(&engine, &proposed.session.id, &proposed.task.id);
+    assert!(
+        !baselines.is_empty(),
+        "an unknown command stays on the safe side and keeps the task-start baseline"
     );
 }
 

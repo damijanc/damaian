@@ -159,6 +159,26 @@ fn resume_checks(
     })
 }
 
+/// Approves a command and answers any task-start baseline card it raises. The
+/// baseline checks run before the command (spec 102 R18), so a command that is
+/// itself a required check now has to be baselined first.
+fn approve_command_through_baselines(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let mut result = decide_command(engine, proposal_id, true, adapter);
+    while let Some(batch) = result.check_batch.clone() {
+        let decisions = batch
+            .checks
+            .iter()
+            .map(|check| (check.id.clone(), true))
+            .collect::<Vec<_>>();
+        result = resume_checks(engine, &batch.id, &decisions, adapter);
+    }
+    result
+}
+
 fn run_verification_and_approve_checks(
     engine: &WorkspaceEngine,
     repo: &Path,
@@ -331,7 +351,7 @@ fn a_later_approved_run_decides_instead_of_the_decline_when_it_passes() {
         .command_proposal
         .expect("the rerun still needs command approval");
     let mut finish = scripted(vec![vec![call("complete_step", "{}")]]);
-    let result = decide_command(&engine, &second_command.id, true, &mut finish);
+    let result = approve_command_through_baselines(&engine, &second_command.id, &mut finish);
 
     assert_eq!(
         result.task.status,
@@ -359,7 +379,7 @@ fn a_later_approved_run_decides_instead_of_the_decline_when_it_fails() {
         .command_proposal
         .expect("the rerun still needs command approval");
     let mut finish = scripted(vec![vec![call("complete_step", "{}")]]);
-    let result = decide_command(&engine, &second_command.id, true, &mut finish);
+    let result = approve_command_through_baselines(&engine, &second_command.id, &mut finish);
 
     assert_eq!(
         result.task.status,

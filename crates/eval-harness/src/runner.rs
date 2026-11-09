@@ -1425,6 +1425,45 @@ fn drive(
         ));
     }
 
+    // Spec 102 R18: an approved command takes its task-start baseline before it
+    // runs. A baseline that needs approval pauses on the same check card, so
+    // answer it with the scenario's own check decisions (an unmentioned
+    // baseline is declined) and let the still-approved command resume.
+    while let Some(batch) = resumed
+        .as_ref()
+        .and_then(|turn| turn.as_ref().ok())
+        .and_then(|turn| turn.check_batch.clone())
+    {
+        let decisions = batch
+            .checks
+            .iter()
+            .map(|check| {
+                let approved = scenario
+                    .check_decisions
+                    .iter()
+                    .find(|decision| decision.command == check.command)
+                    .is_some_and(|decision| decision.approved);
+                (check.id.clone(), approved)
+            })
+            .collect::<Vec<_>>();
+        let cancel = CancelToken::new();
+        let mut on_resume_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_resume_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        resumed = Some(engine.chat_orchestrator.resume_after_check_decision(
+            &batch.id,
+            &decisions,
+            "eval-harness",
+            adapter,
+            &mut sink,
+        ));
+    }
+
     // Spec 61 §5.8: a scenario that answers a round-budget pause resumes it with
     // the decision it names, so the continued turn (or the forced final call)
     // is exercised end to end. The pause is on the original outcome, which is

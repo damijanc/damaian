@@ -1820,6 +1820,35 @@ pub fn floor_checks(
     checks.into_iter().collect()
 }
 
+/// The detected checks of the roots a command run in `working_directory` could
+/// touch (spec 102 review fix R18).
+///
+/// A command's effects are only known after it runs, so the command baseline
+/// covers the floor of every root that owns or encloses its working directory
+/// plus every root beneath it ([`RepositoryMap::roots_for_command`]). That is
+/// the same detected-check set the completion gate would require for a file
+/// written anywhere in that subtree. The plan's required checks are merged
+/// separately; this function reads only the persisted map and runs nothing.
+pub fn command_floor_checks(
+    repository_root: &Path,
+    map: &RepositoryMap,
+    working_directory: &str,
+) -> Vec<CheckId> {
+    let roots = map.roots_for_command(working_directory);
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    let mut restricted = map.restricted_to(&roots);
+    drop_covered_member_checks(repository_root, &mut restricted);
+    let mut checks = BTreeSet::new();
+    for root in &restricted.roots {
+        for command in &root.commands {
+            checks.insert(CheckId::new(root.path.as_str(), command.command.as_str()));
+        }
+    }
+    checks.into_iter().collect()
+}
+
 /// What [`propose_checks`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {

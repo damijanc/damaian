@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
-use crate::command_policy::allow_always_eligible;
+use crate::command_policy::{allow_always_eligible, relative_location};
 use crate::config::Config;
 use crate::error::{ClientError, Result};
 use crate::finding::{default_parsers, findings_from_execution};
@@ -31,7 +31,7 @@ use crate::session::SessionStore;
 use crate::validation::{CommandProposal, ValidationOrchestrator};
 use crate::verification::{
     CheckBaseline, CheckId, CheckTermination, FailureFingerprint, FindingEvidence, Selection,
-    VerificationEvent, environment_termination, floor_checks, propose_checks,
+    VerificationEvent, command_floor_checks, environment_termination, floor_checks, propose_checks,
 };
 
 /// One command the user must decide about before the patch can apply.
@@ -173,7 +173,7 @@ impl BaselineCoordinator {
             let (map, _) = map_store.load_or_build(&index, self.validation.command_policy())?;
             Some(map)
         };
-        let mut checks = match &map {
+        let checks = match &map {
             Some(map) => {
                 match propose_checks(&self.validation, repository_root, map, &selected_paths)? {
                     Selection::Proposed(checks) => checks.into_iter().collect(),
@@ -210,9 +210,97 @@ impl BaselineCoordinator {
                 recorded: Vec::new(),
             });
         }
-        // A baseline belongs to the patch's durable task. Look through its
-        // continuation chain so a repair or worker continuation reuses the
-        // source task's baseline instead of taking a post-failure one.
+        self.settle(
+            repository_root,
+            session_id,
+            task_id,
+            &patch.id,
+            required,
+            checks,
+            "This patch has not been applied. Run these checks against the current, \
+             pre-patch files, or skip them. Skipping a baseline does not skip the patch.",
+        )
+    }
+
+    /// Establish the task-start baselines before the first mutating-capable
+    /// command of a task runs (spec 102 review fix R18).
+    ///
+    /// The command path cannot know which files a command will change before it
+    /// runs, so the scope is the plan's required checks plus the completion
+    /// floor of every root the command's working directory could write
+    /// ([`command_floor_checks`]). This runs only while the task has not changed
+    /// any files yet: once it has, the task-start tree is gone and the patch
+    /// gate's existing `Uncertain` rule owns any check that becomes required
+    /// later. A read-only command is filtered by the caller, because it cannot
+    /// change a file.
+    pub fn prepare_for_command(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        task_id: &str,
+        proposal: &CommandProposal,
+    ) -> Result<BaselinePreparation> {
+        if session_id.is_empty() || task_id.is_empty() {
+            return Ok(BaselinePreparation::Complete {
+                recorded: Vec::new(),
+            });
+        }
+        if self.task_has_changed_files(session_id, task_id)? {
+            return Ok(BaselinePreparation::Complete {
+                recorded: Vec::new(),
+            });
+        }
+        let mut required: BTreeMap<CheckId, String> = self
+            .required_checks(session_id, task_id)?
+            .into_iter()
+            .collect();
+        let working_directory =
+            relative_location(repository_root, Path::new(&proposal.working_directory))
+                .unwrap_or_default();
+        let index = IndexCache::get_or_build(&self.indexer, repository_root)?;
+        let map_store = RepositoryMapStore::new(&self.config.data_dir, self.audit_log.clone());
+        let (map, _) = map_store.load_or_build(&index, self.validation.command_policy())?;
+        for check in command_floor_checks(repository_root, &map, &working_directory) {
+            required
+                .entry(check)
+                .or_insert_with(|| "required by the command's working directory".to_string());
+        }
+        if required.is_empty() {
+            return Ok(BaselinePreparation::Complete {
+                recorded: Vec::new(),
+            });
+        }
+        self.settle(
+            repository_root,
+            session_id,
+            task_id,
+            &proposal.id,
+            required,
+            BTreeMap::new(),
+            "This command has not run. Run these checks against the current files, \
+             or skip them. Skipping a baseline does not skip the command.",
+        )
+    }
+
+    /// Record every required check that has no current task-local baseline, and
+    /// return the ones that still need the user's approval as one batch.
+    ///
+    /// Shared by the patch gate and the command gate so both take the task-start
+    /// baseline through exactly the same policy, reuse and `Uncertain` rules.
+    #[allow(clippy::too_many_arguments)]
+    fn settle(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        task_id: &str,
+        batch_key: &str,
+        required: BTreeMap<CheckId, String>,
+        mut checks: BTreeMap<CheckId, CommandProposal>,
+        note: &str,
+    ) -> Result<BaselinePreparation> {
+        // A baseline belongs to the task. Look through its continuation chain
+        // so a repair or worker continuation reuses the source task's baseline
+        // instead of taking a post-failure one.
         let current = self
             .session_store
             .task_verification_baselines(session_id, task_id)?;
@@ -275,30 +363,28 @@ impl BaselineCoordinator {
             // Every check now has a terminal baseline, so a batch left by an
             // earlier reload or a competing apply would only re-offer work the
             // engine has already settled.
-            self.remove_pending_for_patch(&patch.id)?;
+            self.remove_pending_for_patch(batch_key)?;
             return Ok(BaselinePreparation::Complete { recorded });
         }
         let batch = BaselineBatch {
-            // Deterministic in the patch and the checks it still needs, so a
-            // reload or a repeated apply re-offers the same batch instead of
+            // Deterministic in the source and the checks it still needs, so a
+            // reload or a repeated request re-offers the same batch instead of
             // orphaning a duplicate file with a fresh proposal id set.
-            id: batch_id_for(&patch.id, &awaiting),
-            patch_id: patch.id.clone(),
+            id: batch_id_for(batch_key, &awaiting),
+            patch_id: batch_key.to_string(),
             task_id: task_id.to_string(),
             title: "Checks need a baseline".to_string(),
-            note: "This patch has not been applied. Run these checks against the current, \
-                   pre-patch files, or skip them. Skipping a baseline does not skip the patch."
-                .to_string(),
+            note: note.to_string(),
             run_label: "Run selected baselines".to_string(),
             skip_label: "Skip baselines".to_string(),
             run_all_label: "Run all".to_string(),
             checks: awaiting,
         };
-        // A different selection for the same patch must not leave the previous
-        // card resumable beside this one. The new card is written after the
-        // old one is removed, so the store never holds two pending decisions
-        // for the same patch.
-        self.remove_pending_for_patch(&patch.id)?;
+        // A different selection for the same source must not leave the previous
+        // card resumable beside this one. The new card is written after the old
+        // one is removed, so the store never holds two pending decisions for the
+        // same source.
+        self.remove_pending_for_patch(batch_key)?;
         self.save_pending(PendingBaseline {
             batch: batch.clone(),
             repository_root: canonical_root(repository_root)
@@ -313,7 +399,7 @@ impl BaselineCoordinator {
                 ("actor", "system".to_string()),
                 ("sessionId", session_id.to_string()),
                 ("taskId", task_id.to_string()),
-                ("patchId", patch.id.clone()),
+                ("patchId", batch_key.to_string()),
                 ("proposalId", batch.id.clone()),
                 ("checks", batch.checks.len().to_string()),
             ],

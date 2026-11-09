@@ -73,6 +73,15 @@ edit either.
   - In `resume_after_command_decision_with_options`, after the approved
     command runs, `record_command_effects` returns the changed paths and
     `record_command_verification_due` appends the `Due`.
+  - Before the approved command runs, the same resume takes spec 102 R18's
+    task-start required-check baseline: after the approval, before the census
+    and execution, and through the ordinary baseline batch. A command that
+    cannot plausibly change source files takes none (an admitted read-only
+    command, a read-only shell pipeline, a validation command, or a
+    `Check`/`Exploration` purpose); a formatter, fixer, generator, script,
+    package manager or unknown command takes it. If a skipped command changes
+    files, this spec's census still detects it and its required checks have no
+    task-start baseline, so they report `uncertain`.
   - When the resumed turn has run, `verify_after_command_turn` checks
     whether the turn finished (no proposal, not cancelled, status
     `complete`) and a command's `Due` is pending. If so, it calls
@@ -99,6 +108,17 @@ All in `tests/verification_loop.rs`:
 - `an_approved_command_that_changes_nothing_is_not_verified`: `mkdir -p
   empty` records no `Due` and returns no report.
 - `an_unavailable_census_reports_no_changed_paths`.
+
+Spec 102 review fix R18 adds the command-first baseline coverage in
+`tests/plan_turn.rs`: `a_command_first_task_baselines_before_the_command_and_repairs_its_regression`,
+`a_command_baseline_runs_after_approval_and_before_the_command`,
+`a_read_only_command_that_needs_approval_takes_no_baseline`,
+`a_shell_control_read_only_pipeline_as_the_first_approved_command_takes_no_baseline`,
+`a_validation_command_as_the_first_approved_command_takes_no_baseline`,
+`a_formatter_as_the_first_approved_command_takes_the_task_start_baseline`,
+`a_script_as_the_first_approved_command_takes_the_task_start_baseline`,
+`an_unknown_command_as_the_first_approved_command_takes_the_task_start_baseline`,
+and `a_command_baseline_that_needs_approval_pauses_and_a_decline_is_recorded`.
 
 ## 6. Verification
 

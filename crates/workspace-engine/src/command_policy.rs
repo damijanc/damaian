@@ -952,6 +952,68 @@ pub(crate) fn is_low_risk_read_only(command: &str) -> bool {
     matches!(read_only_verdict(command), ReadOnlyVerdict::Admitted(_))
 }
 
+/// Whether every simple command in a shell line only reads, even when the
+/// read-only boundary refuses the form for another reason (for example
+/// `git diff` prints file contents, so it needs approval but cannot change a
+/// file).
+///
+/// Used only to decide whether an approved command can plausibly change files
+/// before it runs (spec 102 review fix R18). It is deliberately separate from
+/// [`is_low_risk_read_only`], which also decides what may run without approval:
+/// this check must never widen that boundary. The shell tokenizer and the
+/// program/filter lists are the same ones the boundary uses.
+pub(crate) fn is_read_only_pipeline(command: &str) -> bool {
+    let Some(line) = shell_line(command.trim()) else {
+        return false;
+    };
+    if line.expansion.is_some() {
+        return false;
+    }
+    let commands: Vec<Vec<&str>> = line
+        .commands
+        .iter()
+        .map(|words| words.iter().map(String::as_str).collect())
+        .collect();
+    if commands.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    if commands[0].first() == Some(&"cd") && !line.operators.is_empty() {
+        match commands[0].as_slice() {
+            ["cd", directory] if !directory.is_empty() && !directory.starts_with('-') => {}
+            _ => return false,
+        }
+        if line.operators[0] != Operator::And || line.operators.contains(&Operator::Sequence) {
+            return false;
+        }
+        start = 1;
+    }
+    for (index, words) in commands.iter().enumerate().skip(start) {
+        if words.is_empty() {
+            return false;
+        }
+        // `git diff`/`git show` are read-only for a baseline, but these options
+        // write a file or run an external program, so they are not.
+        if words.first() == Some(&"git")
+            && words.iter().any(|word| {
+                matches!(*word, "-o" | "--output" | "--ext-diff" | "--textconv")
+                    || word.starts_with("--output=")
+            })
+        {
+            return false;
+        }
+        let after_pipe = index > 0 && line.operators[index - 1] == Operator::Pipe;
+        if after_pipe {
+            if !is_stdin_filter(words) {
+                return false;
+            }
+        } else if !names_read_only_program(words) {
+            return false;
+        }
+    }
+    true
+}
+
 /// What the read-only boundary decides about a command's text (spec 64).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReadOnlyVerdict {
@@ -2047,6 +2109,40 @@ pub(crate) fn is_validation_command(command: &str) -> bool {
         || command.starts_with("cargo test")
 }
 
+/// Whether `command` is a formatter, fixer or generator known to write source
+/// files even though another classifier calls it a check or exploration
+/// command.
+///
+/// Used only to decide whether an approved command takes a task-start baseline
+/// before it runs (spec 102 review fix R18). A check-only formatter invocation
+/// (`--check`, `--dry-run`) writes nothing and stays a validation.
+pub(crate) fn is_source_writing_command(command: &str) -> bool {
+    let normalized = command.trim().to_ascii_lowercase();
+    if normalized.contains("--check") || normalized.contains("--dry-run") {
+        return false;
+    }
+    let starts =
+        |prefix: &str| normalized == prefix || normalized.starts_with(&format!("{prefix} "));
+    starts("cargo fmt")
+        || starts("rustfmt")
+        || starts("gofmt")
+        || starts("goimports")
+        || starts("prettier")
+        || starts("biome format")
+        || starts("black")
+        || starts("isort")
+        || starts("clang-format")
+        || starts("swiftformat")
+        || starts("dart format")
+        || starts("npm run format")
+        || starts("npm run fmt")
+        || starts("npm run build")
+        || starts("yarn format")
+        || starts("pnpm format")
+        || normalized.contains(" --fix")
+        || normalized.contains(" --write")
+}
+
 fn is_docker_command(command: &str) -> bool {
     command == "docker"
         || command.starts_with("docker ")
@@ -2248,7 +2344,8 @@ mod tests {
     mod read_only_boundary {
         use super::super::{
             ApprovalCause, CommandClassification, CommandPolicy, CommandRisk, Operator,
-            ReadOnlyVerdict, ShellLine, is_low_risk_read_only, read_only_verdict, shell_line,
+            ReadOnlyVerdict, ShellLine, is_low_risk_read_only, is_read_only_pipeline,
+            read_only_verdict, shell_line,
         };
         use crate::config::Config;
         use std::fs;
@@ -2934,6 +3031,19 @@ mod tests {
             assert!(is_low_risk_read_only("git status | head -n 1"));
             assert!(is_low_risk_read_only("cd crates && ls"));
             assert!(!is_low_risk_read_only("git status | head -n 1 && rm x"));
+        }
+
+        #[test]
+        fn is_read_only_pipeline_accepts_reads_but_not_output_options() {
+            assert!(is_read_only_pipeline("cd src && git diff | head -20"));
+            assert!(is_read_only_pipeline("git diff"));
+            assert!(is_read_only_pipeline("cat src/lib.rs | grep fn | head"));
+            assert!(!is_read_only_pipeline("git diff --output=src/lib.rs"));
+            assert!(!is_read_only_pipeline(
+                "cd src && git diff --ext-diff | head"
+            ));
+            assert!(!is_read_only_pipeline("sed -i 's/a/b/' src/lib.rs"));
+            assert!(!is_read_only_pipeline("git status && rm x"));
         }
     }
 
