@@ -1,6 +1,6 @@
 # Spec 105 planning context
 
-Status: planned 2026-11-03, not started. This file records the decisions and
+Status: Done 2026-11-04 (planned 2026-11-03). This file records the decisions and
 corrections planning found against the code, not the design again; read
 [`proposal.md`](proposal.md) first.
 
@@ -191,5 +191,5 @@ carried plan's required checks, not a rebuilt prose interpretation.
 
 ## 11. Checks run locally
 
-None yet — this is the planning pass. The implementation tasks record their
-scoped checks in `tasks.md`.
+The implementation tasks record their scoped checks in `tasks.md`; the
+review-fix notes there record the later check runs.
