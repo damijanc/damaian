@@ -1623,6 +1623,18 @@ pub(crate) fn host_in_process(
     Ok(host)
 }
 
+/// One control-socket request line, parsed by the socket's own parser and
+/// dispatched, as `serve_connection` does. Spec 106's deterministic tier sends
+/// the same text the live tier writes to a real socket.
+#[cfg(test)]
+pub(crate) fn dispatch_line(host: &WorkerHost, line: &str, token: &str) -> Value {
+    match parse_request(line.as_bytes(), token) {
+        ParsedRequest::Command(command) => host.dispatch(command).0,
+        ParsedRequest::Invalid(error) => refusal(error),
+        ParsedRequest::Unauthorized => refusal("unauthorized"),
+    }
+}
+
 /// The progress file is a view, and the audit log is the record (§5.5), so a
 /// failed write does not stop the turn.
 fn append_progress(writer: &mut ProgressWriter, kind: ProgressKind, payload: Value) {

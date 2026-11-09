@@ -482,3 +482,21 @@ checks the verification loop runs and classifies (floor checks and loop runs of
 plan checks). A plan check the model runs itself as an ordinary command is still
 judged by its exit code alone (observation 70). See spec 101's matching note for
 the rule and the tests.
+
+## Spec 106 Task 4, 2026-11-09: a deferred check is not missing while its step is open
+
+The deterministic acceptance run found that after a worker's first verified
+patch the gate reported `required_check_missing` for a required check deferred
+to a later step that had not started. The worker's automatic continuation
+continues only when open plan work is the sole reason, so the worker stopped
+and only **Continue task** could move it on — for every plan that declares a
+required check on a later step.
+
+The rule is now: a plan-declared required check with no evidence is reported
+missing only once its own step is terminal. While that step is `pending` or
+`in_progress`, the open step is the reason (`open_plan_steps`). A step that
+closed or was skipped without running its check, and a blocked step, still
+report it missing. Tests:
+`closed_task_completion::deferred_not_yet_due::*` (the two open-step cases
+failed before the change with `["open_plan_steps", "required_check_missing"]`;
+the closed and blocked guards passed before and after).

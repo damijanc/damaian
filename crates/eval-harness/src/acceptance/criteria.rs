@@ -316,6 +316,7 @@ pub fn evaluate(input: &CriteriaInput<'_>) -> Result<Vec<Criterion>> {
             Some(
                 FailureReason::NeedsForbiddenIntervention(_)
                     | FailureReason::TooManyDecisions(_)
+                    | FailureReason::UnrecognisedDecision(_)
                     | FailureReason::Transport(_)
             )
         ),

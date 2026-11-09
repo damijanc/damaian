@@ -762,3 +762,145 @@ fn the_stored_approval_carries_only_numbers_and_identities() {
     let plain_value = serde_json::to_value(&plain).unwrap();
     assert!(plain_value.get("budget").is_none());
 }
+
+// --- Spec 106 Task 4: budget usage spans the continuation chain --------------
+//
+// Found by the deterministic acceptance run: a verification, repair or
+// continuation runs as a new task carrying the approved budget, and the
+// budgeted request path read usage for that task id alone. Its first model
+// call found none, failed closed with "Task usage unavailable", and stopped
+// the worker the first time it continued after a verified patch.
+
+mod budget_usage_chain {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use workspace_engine::plan::{PlanStep, StepStatus, TaskPlan};
+    use workspace_engine::{SessionStore, TokenUsage, UsageSource, repository_id_for_root};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn store() -> (std::path::PathBuf, SessionStore) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "damaian-budget-chain-{now}-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SessionStore::new(root.join(".damaian"));
+        (root, store)
+    }
+
+    fn usage(input: u64, output: u64, source: UsageSource) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: None,
+            source,
+        }
+    }
+
+    fn plan_for(task_id: &str) -> TaskPlan {
+        let mut plan = TaskPlan::new(task_id, 0);
+        plan.steps = vec![PlanStep {
+            id: "step_1".to_string(),
+            title: "work".to_string(),
+            detail: None,
+            status: StepStatus::InProgress,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+            check: None,
+        }];
+        plan
+    }
+
+    #[test]
+    fn a_continuation_task_reads_the_usage_of_its_whole_chain() {
+        let (root, store) = store();
+        let session = store
+            .create_session(&repository_id_for_root(&root), "chain")
+            .unwrap();
+        let first = store
+            .create_task(&session.id, "work", "mock", "mock-model")
+            .unwrap();
+        store.create_plan(&first, &plan_for(&first.id)).unwrap();
+        store
+            .record_task_usage(
+                &first,
+                "run_1",
+                None,
+                usage(100, 10, UsageSource::Measured),
+                None,
+                None,
+            )
+            .unwrap();
+        let continued = store
+            .create_task(&session.id, "verify", "mock", "mock-model")
+            .unwrap();
+        store.resume_plan(&continued, &first.id).unwrap();
+
+        let total = store
+            .read_budget_usage(&session.id, &continued.id)
+            .unwrap()
+            .expect("the chain's usage is known before the continuation's first call");
+        assert_eq!((total.input_tokens, total.output_tokens), (100, 10));
+
+        store
+            .record_task_usage(
+                &continued,
+                "run_2",
+                None,
+                usage(50, 5, UsageSource::Estimated),
+                None,
+                None,
+            )
+            .unwrap();
+        let total = store
+            .read_budget_usage(&session.id, &continued.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!((total.input_tokens, total.output_tokens), (150, 15));
+        assert_eq!(total.run_count, 2);
+        assert_eq!(
+            total.source,
+            UsageSource::Estimated,
+            "a chain total is only as trustworthy as its weakest term"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unrelated_task_in_the_same_session_is_not_counted() {
+        let (root, store) = store();
+        let session = store
+            .create_session(&repository_id_for_root(&root), "chain")
+            .unwrap();
+        let other = store
+            .create_task(&session.id, "other", "mock", "mock-model")
+            .unwrap();
+        store
+            .record_task_usage(
+                &other,
+                "run_1",
+                None,
+                usage(999, 99, UsageSource::Measured),
+                None,
+                None,
+            )
+            .unwrap();
+        let task = store
+            .create_task(&session.id, "work", "mock", "mock-model")
+            .unwrap();
+
+        assert_eq!(
+            store.read_budget_usage(&session.id, &task.id).unwrap(),
+            None,
+            "no record in the chain still fails closed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

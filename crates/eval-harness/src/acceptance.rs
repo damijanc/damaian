@@ -11,6 +11,7 @@ pub mod criteria;
 pub mod driver;
 pub mod policy;
 pub mod report;
+pub mod worker;
 
 use std::fs;
 use std::path::{Path, PathBuf};

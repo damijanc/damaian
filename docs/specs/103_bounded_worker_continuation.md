@@ -484,3 +484,20 @@ segments, spends the budget, receives the plan instruction and proposes a plan
 with zero round-budget pauses. The interactive guard keeps today's limits and
 Continue, and the scenario bookkeeping moved to 63 files / 62 deterministic
 records.
+
+### Spec 106 Task 4, 2026-11-09: an approved budget spends across the continuation chain
+
+The deterministic acceptance run found that a budgeted worker stopped with
+`usage_unavailable` ("Task usage unavailable") the first time it continued after
+a verified patch. A verification, repair or continuation runs as a new task that
+carries the approved plan and budget, but the budgeted request path read usage
+for that task id alone; before the new task's first model call there was none,
+and the request failed closed.
+
+`SessionStore::read_budget_usage(session, task)` now sums usage over the task's
+continuation chain (`task_continuation_chain`), with `read_task_usage`'s rules
+(estimated when any term is, a cost only when every term reported one), and the
+budgeted request path uses it. It still returns `None` when no task in the chain
+has a usage record, so a request with no provable spend fails closed as before.
+Tests: `task_budget::budget_usage_chain::*` (the chain case failed before the
+reader existed; an unrelated task in the same session is not counted).

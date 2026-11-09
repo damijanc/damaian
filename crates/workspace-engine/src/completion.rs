@@ -451,6 +451,16 @@ impl CompletionGateReport {
                 None => latest_matching_evidence_in_plan(plan, &check),
             };
             let Some((evidence_step, evidence_index, evidence)) = evidence else {
+                // A deferred check is due once its own step has run. While that
+                // step is still pending or running, the open step is what keeps
+                // the task from completing; reporting the check as missing too
+                // would make plain open plan work look like a missing result,
+                // and stop a worker's automatic continuation (spec 106 Task 4).
+                if step.is_some_and(|step| {
+                    matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
+                }) {
+                    continue;
+                }
                 reasons.push(CompletionReason {
                     code: CompletionReasonCode::RequiredCheckMissing,
                     explanation: format!(

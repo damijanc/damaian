@@ -7676,6 +7676,9 @@ fn escape_json(value: &str) -> String {
 }
 
 #[cfg(test)]
+mod acceptance_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         Request, ShellOptions, TurnEvent, allowed_cors_origin, api_request_requires_token,

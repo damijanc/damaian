@@ -2947,6 +2947,59 @@ impl SessionStore {
         Ok(totals)
     }
 
+    /// The usage an approved task budget has spent: the sum over `task_id`'s
+    /// continuation chain (spec 106 Task 4).
+    ///
+    /// A verification, repair or continuation runs as a new task that carries
+    /// the same plan and budget, so its spend is the chain's, not its own. The
+    /// totals follow [`Self::read_task_usage`]'s rules: estimated when any term
+    /// is, a cost only when every term reported one, a cache split only from
+    /// the runs that reported one. `None` when no task in the chain has a usage
+    /// record, so a request with no provable spend still fails closed.
+    pub fn read_budget_usage(&self, session_id: &str, task_id: &str) -> Result<Option<TaskUsage>> {
+        // The chain includes `task_id` itself; a set, so each task counts once.
+        let mut chain = self.task_continuation_chain(session_id, task_id)?;
+        chain.insert(task_id.to_string());
+        let usage = self.read_task_usage(session_id)?;
+        let mut total: Option<TaskUsage> = None;
+        let mut every_cost = true;
+        for member in &chain {
+            let Some(part) = usage.get(member) else {
+                continue;
+            };
+            every_cost &= part.reported_cost.is_some();
+            let sum = total.get_or_insert(TaskUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                source: UsageSource::Measured,
+                reported_cost: Some(0.0),
+                run_count: 0,
+                cached_input_tokens: None,
+                cache_reported_input_tokens: 0,
+                runs_without_cache_report: 0,
+            });
+            sum.input_tokens += part.input_tokens;
+            sum.output_tokens += part.output_tokens;
+            sum.run_count += part.run_count;
+            if part.source == UsageSource::Estimated {
+                sum.source = UsageSource::Estimated;
+            }
+            sum.reported_cost =
+                Some(sum.reported_cost.unwrap_or(0.0) + part.reported_cost.unwrap_or(0.0));
+            if let Some(cached) = part.cached_input_tokens {
+                sum.cached_input_tokens = Some(sum.cached_input_tokens.unwrap_or(0) + cached);
+            }
+            sum.cache_reported_input_tokens += part.cache_reported_input_tokens;
+            sum.runs_without_cache_report += part.runs_without_cache_report;
+        }
+        if let Some(sum) = total.as_mut()
+            && !every_cost
+        {
+            sum.reported_cost = None;
+        }
+        Ok(total)
+    }
+
     /// Records `action_started` and returns the marker that must be finished.
     ///
     /// Requirement 2: a durable marker before a consequential action starts and

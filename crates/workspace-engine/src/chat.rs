@@ -9463,8 +9463,11 @@ impl ChatOrchestrator {
             // shape the adapter will send; the post-preparation check then
             // measures that same object without changing it.
             let task_usage = if segment_tracker.is_some() {
-                let mut usage_by_task = self.session_store.read_task_usage(&session.id)?;
-                usage_by_task.remove(&task.id)
+                // The approved budget covers the whole continuation chain:
+                // a verification, repair or continuation is a new task that
+                // carries it (spec 106 Task 4).
+                self.session_store
+                    .read_budget_usage(&session.id, &task.id)?
             } else {
                 None
             };

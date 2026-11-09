@@ -838,6 +838,7 @@ dependencies = [
 name = "desktop-shell"
 version = "0.1.0"
 dependencies = [
+ "eval-harness",
  "getrandom 0.3.4",
  "portable-pty",
  "serde_json",

@@ -53,6 +53,9 @@ pub enum Pending {
     /// The task ended with this status (`complete`, `incomplete`, `failed`,
     /// a bounded stop …).
     Ended { status: String },
+    /// A decision the acceptance does not know how to answer (for example a
+    /// provider-fallback card). The run stops rather than guess.
+    Unrecognised { detail: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +152,8 @@ pub enum FailureReason {
     NeedsForbiddenIntervention(String),
     /// The decision cap was reached; the worker did not finish.
     TooManyDecisions(usize),
+    /// The worker asked for a decision the acceptance cannot answer.
+    UnrecognisedDecision(String),
     /// The transport failed.
     Transport(String),
 }
@@ -162,6 +167,9 @@ impl FailureReason {
             }
             Self::TooManyDecisions(count) => {
                 format!("stopped after {count} decisions without the task ending")
+            }
+            Self::UnrecognisedDecision(detail) => {
+                format!("the worker asked for a decision the acceptance cannot answer: {detail}")
             }
             Self::Transport(detail) => format!("transport failed: {detail}"),
         }
@@ -228,6 +236,10 @@ fn drive_inner(
                     )));
                 }
                 outcome.ended_status = Some(status);
+                return Ok(());
+            }
+            Pending::Unrecognised { detail } => {
+                outcome.failure = Some(FailureReason::UnrecognisedDecision(detail));
                 return Ok(());
             }
             Pending::RoundBudget { proposal_id } => {

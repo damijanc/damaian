@@ -1198,3 +1198,101 @@ mod pre_existing {
         );
     }
 }
+
+// --- Spec 106 Task 4: a deferred check is not missing while its step is open --
+//
+// Found by the deterministic acceptance run: after the first verified patch the
+// gate reported `required_check_missing` for a check deferred to a later, still
+// pending step, so the worker's automatic continuation (which continues only
+// on open plan work) stopped and only Continue task could move it on.
+
+mod deferred_not_yet_due {
+    use super::*;
+
+    const TASK: &str = "task_1";
+
+    #[test]
+    fn a_required_check_on_a_pending_step_is_not_missing_yet() {
+        let plan = plan(
+            TASK,
+            vec![
+                step("work", StepStatus::Completed),
+                checked_step("validate", "cargo test -p pricing", StepStatus::Pending),
+            ],
+        );
+        let report = evaluate(TASK, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+        assert!(!report.eligible, "the open step still blocks: {report:?}");
+        assert_eq!(
+            report
+                .reason_codes()
+                .iter()
+                .map(|code| code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["open_plan_steps"],
+            "the check is due only once its step has run: {report:?}"
+        );
+    }
+
+    #[test]
+    fn a_required_check_on_a_running_step_is_not_missing_yet() {
+        let plan = plan(
+            TASK,
+            vec![checked_step(
+                "validate",
+                "cargo test -p pricing",
+                StepStatus::InProgress,
+            )],
+        );
+        let report = evaluate(TASK, Some(&plan), &state(&[]), None, &BTreeMap::new());
+
+        assert_eq!(
+            report
+                .reason_codes()
+                .iter()
+                .map(|code| code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["open_plan_steps"]
+        );
+    }
+
+    #[test]
+    fn a_closed_step_that_never_ran_its_check_still_reports_it_missing() {
+        for status in [StepStatus::Completed, StepStatus::Skipped] {
+            let plan = plan(
+                TASK,
+                vec![checked_step("validate", "cargo test -p pricing", status)],
+            );
+            let report = evaluate(TASK, Some(&plan), &state(&[]), None, &BTreeMap::new());
+            assert_eq!(
+                report
+                    .reason_codes()
+                    .iter()
+                    .map(|code| code.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["required_check_missing"],
+                "{status:?}: {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blocked_step_that_never_ran_its_check_reports_both() {
+        let plan = plan(
+            TASK,
+            vec![checked_step(
+                "validate",
+                "cargo test -p pricing",
+                StepStatus::Blocked,
+            )],
+        );
+        let report = evaluate(TASK, Some(&plan), &state(&[]), None, &BTreeMap::new());
+        let codes: Vec<&str> = report
+            .reason_codes()
+            .iter()
+            .map(|code| code.as_str())
+            .collect();
+        assert!(codes.contains(&"blocked_plan_steps"), "{codes:?}");
+        assert!(codes.contains(&"required_check_missing"), "{codes:?}");
+    }
+}
