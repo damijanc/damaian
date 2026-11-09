@@ -11100,7 +11100,22 @@ impl ChatOrchestrator {
                             // user may have moved on to other work, and nothing
                             // this turn observed is tied to it yet. It stays
                             // recorded under the task that made it.
+                            //
+                            // A continuation is different (spec 101 review fix
+                            // R9). The user asked to continue this exact
+                            // incomplete task, and its carried plan is what
+                            // still keeps it from completing. Replacing it here
+                            // would drop those open or blocked steps, or its
+                            // required check, without the user ever seeing the
+                            // replacement, so the proposal is refused while any
+                            // remain. A carried plan with nothing outstanding has
+                            // no such work to lose and may still be replaced,
+                            // which the ordinary review gate covers before its
+                            // first mutating action.
+                            let continue_protected = turn_options.plan_already_carried
+                                && plan.as_ref().is_some_and(carried_plan_has_outstanding_work);
                             let replaceable = plan.is_some()
+                                && !continue_protected
                                 && self
                                     .session_store
                                     .carried_plan_untouched(&session.id, &task.id)
@@ -11111,11 +11126,16 @@ impl ChatOrchestrator {
                                 // rewriting the plan underneath that evidence produces
                                 // a history that no longer describes what happened —
                                 // the same reason §5.5 rules out mid-execution edits.
+                                let guidance = if continue_protected {
+                                    "This task is continuing a plan carried from the task you were asked to continue, and that plan still has open or blocked work or a required check. Work through the carried steps with complete_step and satisfy the check. Only the user can change which carried steps survive, through plan review. This proposal was not recorded.".to_string()
+                                } else {
+                                    "This turn already has a plan. Work through its remaining steps with complete_step, or stop and start a new turn if the plan is wrong.".to_string()
+                                };
                                 (
-                            "Attempted to propose a second plan.".to_string(),
-                            "This turn already has a plan. Work through its remaining steps with complete_step, or stop and start a new turn if the plan is wrong.".to_string(),
-                            ActionOutcome::Failed,
-                        )
+                                    "Attempted to propose a second plan.".to_string(),
+                                    guidance,
+                                    ActionOutcome::Failed,
+                                )
                             } else {
                                 let now = now_millis();
                                 let mut proposed = crate::plan::TaskPlan::new(&task.id, now);
@@ -16787,6 +16807,25 @@ fn tool_action_marker_unscoped(
             side_effecting,
         ),
     }
+}
+
+/// Whether a plan still carries work or a completion obligation that the user
+/// has not discharged: an open (`Pending` or `InProgress`) step, a `Blocked`
+/// one, or a required check.
+///
+/// This is the completion gate's outstanding set (spec 101), extended with the
+/// plan's required checks because carrying them is what keeps an `incomplete`
+/// task's unmet check visible to the next run (review fix R2). The
+/// `propose_plan` refusal for a continuation uses it so a replacement cannot
+/// discard either before the user has reviewed the change. A plan with no open
+/// or blocked step and no required check has nothing outstanding and may still
+/// be replaced (spec 101 review fix R9).
+fn carried_plan_has_outstanding_work(plan: &TaskPlan) -> bool {
+    !plan.open_steps().is_empty()
+        || plan.steps.iter().any(|step| {
+            step.status == crate::plan::StepStatus::Blocked
+                || step.check.as_ref().is_some_and(|check| check.required)
+        })
 }
 
 /// Whether taking this action would change something outside the session log,

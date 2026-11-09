@@ -15,9 +15,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
     CancelToken, ChatTurnResult, CompletionGateReport, CompletionGateService, CompletionReason,
-    CompletionReasonCode, Config, MockModelAdapter, ModelAdapter, PLANNED_CHECK_VERSION, PlanStep,
-    PlannedCheck, TaskPlan, TaskStatus, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
-    hash::repository_id_for_root,
+    CompletionReasonCode, Config, MockModelAdapter, ModelAdapter, PLANNED_CHECK_VERSION,
+    PatchFileDecision, PlanStep, PlannedCheck, TaskPlan, TaskStatus, ToolCall, TurnProgress,
+    TurnSink, WorkerRecord, WorkspaceEngine, hash::repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -205,6 +205,14 @@ fn check_call() -> ToolCall {
 
 fn complete_step_call() -> ToolCall {
     call("complete_step", "{}")
+}
+
+fn complete_step_call_with_id(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        name: "complete_step".to_string(),
+        arguments_json: "{}".to_string(),
+    }
 }
 
 fn approve_plan(
@@ -863,6 +871,312 @@ fn a_continued_blocked_step_stays_blocked_without_rerunning_the_command() {
             .reason_codes()
             .contains(&CompletionReasonCode::BlockedPlanSteps),
         "{report:?}"
+    );
+}
+
+fn patch_call(path: &str) -> ToolCall {
+    call(
+        "propose_patch",
+        &format!(
+            r#"{{"summary":"Add {path}","files":[{{"path":"{path}","content":"pub fn added() {{}}\n"}}]}}"#
+        ),
+    )
+}
+
+fn mark_as_worker(engine: &WorkspaceEngine, repo: &Path, session_id: &str) {
+    engine
+        .session_store
+        .record_worker_spawned(
+            session_id,
+            &WorkerRecord {
+                parent_session_id: None,
+                parent_task_id: None,
+                inherited_protected_paths: Vec::new(),
+                source_repository: repo.to_path_buf(),
+                worktree_path: repo.to_path_buf(),
+                branch: "main".to_string(),
+                base_commit: "0000000".to_string(),
+                included_uncommitted: false,
+                git_commands: Vec::new(),
+            },
+        )
+        .expect("the worker record should be written");
+}
+
+fn tool_results(engine: &WorkspaceEngine, session_id: &str) -> Vec<String> {
+    engine
+        .session_store
+        .read_messages(session_id)
+        .expect("the transcript reads")
+        .into_iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.content)
+        .collect()
+}
+
+/// R9 regression: a continuation carries an incomplete task's open plan. A
+/// model `propose_plan` in that run used to replace it because
+/// `carried_plan_untouched` was true, silently dropping the work the user
+/// asked to continue. The replacement is now refused; the model is told to
+/// work through the carried plan, and the user owns any change to its steps.
+#[test]
+fn a_continued_task_cannot_replace_its_carried_open_plan() {
+    let repo = temp_repo("continue-replace-open");
+    let engine = engine_for(&repo);
+    let (session_id, source_task_id) = seed_incomplete(&engine, &repo, "Carried plan");
+
+    let mut adapter = scripted(vec![
+        vec![plan_call(&["Summarize", "Report"])],
+        vec![complete_step_call_with_id("call_complete_first")],
+        vec![complete_step_call_with_id("call_complete_second")],
+    ]);
+    let result = continue_task(
+        &engine,
+        &repo,
+        &session_id,
+        &source_task_id,
+        None,
+        &mut adapter,
+    )
+    .expect("the engine authorizes the continuation");
+
+    let plan = engine
+        .session_store
+        .read_task_plan(&session_id, &result.task.id)
+        .unwrap()
+        .expect("the carried plan stays attached");
+    assert_eq!(
+        plan.steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["read", "write"],
+        "the model's smaller plan must not replace the carried one"
+    );
+    assert!(
+        tool_results(&engine, &session_id)
+            .iter()
+            .any(|content| content.contains("carried") && content.contains("complete_step")),
+        "the model is told to work from the carried plan: {:?}",
+        tool_results(&engine, &session_id)
+    );
+    assert!(
+        !engine
+            .session_store
+            .read_plan_approved(&session_id, &result.task.id)
+            .unwrap(),
+        "Continue grants no approval"
+    );
+}
+
+/// R9 regression for the blocked case: the replacement used to lose the
+/// blocked step, so `complete_step` closed the new one and the task settled
+/// `complete`. The refusal keeps the blocked step, and the gate keeps the task
+/// incomplete.
+#[test]
+fn a_continued_task_cannot_replace_its_carried_blocked_plan() {
+    let repo = temp_repo("continue-replace-blocked");
+    write_recovering_check(&repo);
+    let engine = engine_for(&repo);
+    let (session_id, source_task_id) = seed_incomplete_with_a_blocked_command(&engine, &repo);
+
+    let mut adapter = scripted(vec![
+        vec![plan_call(&["Summarize", "Report"])],
+        vec![complete_step_call_with_id("call_complete_first")],
+        vec![complete_step_call_with_id("call_complete_second")],
+    ]);
+    let result = continue_task(
+        &engine,
+        &repo,
+        &session_id,
+        &source_task_id,
+        None,
+        &mut adapter,
+    )
+    .expect("the engine authorizes the continuation");
+
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Incomplete,
+        "the blocked step is still outstanding"
+    );
+    let plan = engine
+        .session_store
+        .read_task_plan(&session_id, &result.task.id)
+        .unwrap()
+        .expect("the carried plan stays attached");
+    assert_eq!(plan.steps.len(), 2, "the carried plan keeps both steps");
+    assert_eq!(plan.steps[0].title, "Run the check");
+    assert_eq!(plan.steps[0].status, StepStatus::Blocked);
+    assert_eq!(plan.steps[1].status, StepStatus::Pending);
+    let report = engine
+        .session_store
+        .read_completion_report(&session_id, &result.task.id)
+        .unwrap()
+        .expect("the continued task settles through the gate");
+    assert!(
+        report
+            .reason_codes()
+            .contains(&CompletionReasonCode::BlockedPlanSteps),
+        "{report:?}"
+    );
+}
+
+/// The same regression in the mode a worker uses. A worker continuation gets
+/// `ChatTurnOptions::worker()`, not an interactive turn, and must be protected
+/// identically.
+#[test]
+fn a_worker_continued_task_cannot_replace_its_carried_blocked_plan() {
+    let repo = temp_repo("continue-replace-blocked-worker");
+    write_recovering_check(&repo);
+    let engine = engine_for(&repo);
+    let (session_id, source_task_id) = seed_incomplete_with_a_blocked_command(&engine, &repo);
+    mark_as_worker(&engine, &repo, &session_id);
+
+    let mut adapter = scripted(vec![
+        vec![plan_call(&["Summarize", "Report"])],
+        vec![complete_step_call_with_id("call_complete_first")],
+        vec![complete_step_call_with_id("call_complete_second")],
+    ]);
+    let result = continue_task(
+        &engine,
+        &repo,
+        &session_id,
+        &source_task_id,
+        None,
+        &mut adapter,
+    )
+    .expect("the engine authorizes the continuation");
+
+    assert_eq!(result.task.status, TaskStatus::Incomplete);
+    let plan = engine
+        .session_store
+        .read_task_plan(&session_id, &result.task.id)
+        .unwrap()
+        .expect("the carried plan stays attached");
+    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.steps[0].title, "Run the check");
+    assert_eq!(plan.steps[0].status, StepStatus::Blocked);
+    assert!(
+        tool_results(&engine, &session_id)
+            .iter()
+            .any(|content| content.contains("carried") && content.contains("complete_step")),
+        "the worker is told to work from the carried plan"
+    );
+}
+
+/// Guard: the refusal is about dropping carried work or an unmet check, not
+/// about forbidding new work. A continued task whose carried plan has nothing
+/// outstanding may still propose the next plan, and that plan goes through the
+/// ordinary review before its first mutating action.
+#[test]
+fn a_continued_task_without_open_work_can_propose_a_plan_that_is_reviewed() {
+    let repo = temp_repo("continue-add-steps");
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n")
+        .expect("the repository manifest should be written");
+    let engine = engine_for(&repo);
+    let store = &engine.session_store;
+    let session = store
+        .create_session(&repository_id_for_root(&repo), "Add steps")
+        .unwrap();
+    let task = store
+        .create_task(&session.id, "Run the check", "mock", "mock")
+        .unwrap();
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps = vec![step("done", StepStatus::Completed)];
+    store.create_plan(&task, &plan).unwrap();
+    // The task changed a file, so the completion floor requires the detected
+    // check. Nothing about that obligation lives in the plan, and the floor
+    // follows the continuation chain, so a replacement plan may not hide it.
+    store
+        .append_patch_file_decision(
+            &session.id,
+            &PatchFileDecision {
+                task_id: task.id.clone(),
+                patch_id: "patch_applied".to_string(),
+                paths: vec!["src/a.rs".to_string()],
+                applied: true,
+                applied_hashes: Default::default(),
+                accepted_hunks: Default::default(),
+            },
+        )
+        .unwrap();
+    // The gate reads only the persisted map; it never builds one. Build it here
+    // the way indexing does, so the fixture has a real floor.
+    let index = engine
+        .indexer
+        .index_repository(&repo)
+        .expect("the fixture indexes");
+    workspace_engine::RepositoryMapStore::new(&engine.config.data_dir, engine.audit_log.clone())
+        .load_or_build(&index, &engine.command_policy)
+        .expect("the repository map builds");
+    let report = CompletionGateService::new(store, &repo)
+        .report(&session.id, &task.id)
+        .unwrap();
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::RequiredCheckMissing],
+        "the source task is incomplete on the floor check alone: {report:?}"
+    );
+    store
+        .update_task_status_with_completion(&task, TaskStatus::Incomplete, &report)
+        .unwrap();
+
+    let mut adapter = scripted(vec![
+        vec![plan_call(&["Add docs", "Check docs"])],
+        vec![patch_call("src/docs.rs")],
+    ]);
+    let result = continue_task(&engine, &repo, &session.id, &task.id, None, &mut adapter)
+        .expect("the engine authorizes the continuation");
+
+    let replaced = store
+        .read_task_plan(&session.id, &result.task.id)
+        .unwrap()
+        .expect("the new plan is recorded");
+    assert_eq!(
+        replaced
+            .steps
+            .iter()
+            .map(|step| step.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Add docs", "Check docs"],
+        "nothing outstanding was dropped, so the model may add the next steps"
+    );
+    assert!(
+        result.plan_proposal.is_some(),
+        "the new plan still needs the user's review before its first change"
+    );
+    assert!(
+        result.patch_proposal.is_none(),
+        "the patch waits behind the plan review"
+    );
+}
+
+/// Guard: the restriction is specific to a continuation's carried plan. A
+/// fresh task's first `propose_plan` is unchanged, and proposing it is not an
+/// approval.
+#[test]
+fn a_fresh_tasks_first_propose_plan_is_unchanged() {
+    let repo = temp_repo("fresh-first-plan");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![vec![plan_call(&["Read", "Write"])]]);
+
+    let result = ask(&engine, &repo, "Plan the work", &mut adapter);
+
+    let plan = engine
+        .session_store
+        .read_task_plan(&result.session.id, &result.task.id)
+        .unwrap()
+        .expect("the fresh plan is recorded");
+    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.steps[0].status, StepStatus::InProgress);
+    assert_eq!(plan.steps[1].status, StepStatus::Pending);
+    assert!(
+        !engine
+            .session_store
+            .read_plan_approved(&result.session.id, &result.task.id)
+            .unwrap(),
+        "proposing a plan never approves it"
     );
 }
 

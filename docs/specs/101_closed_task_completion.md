@@ -48,7 +48,9 @@ finished task.
    session and a worker both offer **Continue task**; continuing carries the
    same approved plan — including when every step is already terminal or a step
    is blocked — and the source task's unmet completion reasons into the next
-   run.
+   run. The model cannot replace that carried plan while it still has open or
+   blocked steps or a required check; only a user-reviewed plan revision may
+   drop or replace them.
 6. A worker progress record and #99's outcome renderer distinguish
    **Complete** from **Incomplete**. A result returned through #100 carries the
    truthful status; #100 does not translate `incomplete` into success.
@@ -112,6 +114,24 @@ step is terminal, or on blocked steps whose outcome is settled but whose work
 is not finished. Carrying the plan is what keeps those completion obligations
 visible to the continued task's gate; the continuation prompt names the carried
 plan rather than claiming that no step is open.
+
+Because that carried plan is also the record of what the continuation still
+owes, the model may not replace it while it has open or blocked steps or a
+plan-declared required check (review fix R9, 2026-11-06). A `propose_plan` on
+such a continuation is refused with a tool result that tells the model to work
+through the carried steps; dropping or replacing one of those obligations is
+the user's decision, taken through the ordinary plan-review revision path. A
+carried plan with nothing outstanding — every step completed or skipped and no
+required check — has no work to lose and may still be replaced; that
+replacement then goes through the ordinary plan review before its first
+mutating action. The refusal is specific to the engine's **Continue task**
+operation: a fresh task's first `propose_plan` and spec 83's typed-turn carry
+keep their existing behaviour.
+
+The required check is part of this guard for the R2 reason: continuing carries
+the plan precisely so an unmet check stays visible. A replacement that dropped
+the check while every step was already terminal would otherwise let the
+continued run answer `complete` with the check still unmet.
 
 ## 5. Acceptance
 
@@ -300,7 +320,7 @@ criterion depends on #102, #103, #104, #105 or #106.
 | 2 · every plan step, verification, pending decision and selected check is closed, and no step is blocked | `CompletionGateReport::evaluate` reads the active plan, folded verification state, newest pending decision and current file hashes. `closed_task_completion` pins the full reason matrix, including due, started-but-unfinished, missing, failed, stale and policy-skipped checks. `a_blocked_plan_step_blocks_the_gate_with_its_own_reason` and `the_service_settles_a_blocked_step_incomplete_and_a_skipped_step_complete` pin a blocked step as outstanding (`blocked_plan_steps`) while a skipped step stays closed. The required set merges the plan's required checks with the R15 floor: `CompletionGateService::report` reads the persisted repository map and `SessionStore::task_touched_paths`, and `verification_loop` tests `a_changed_source_without_a_plan_check_requires_the_discovered_floor_check`, `a_plan_check_identical_to_a_floor_check_is_one_obligation`, `a_documentation_only_change_has_no_floor_and_completes`, `declining_a_floor_check_is_a_named_waiver_and_the_task_completes`, `an_auto_runnable_floor_check_runs_without_a_waiver`, `a_member_change_puts_the_workspace_root_check_in_the_floor`, `two_checks_needing_approval_produce_one_batch_and_one_resume` and `a_failed_verification_is_not_continued` pin it. |
 | 3 · declined checks are named waivers, never passes | `CompletionReasonCode` has no waiver variant; `CompletionWaiver` is produced for `SkipReason::DeclinedByUser` on a `CheckRun` and, since spec 105 review fix R8, for `Evidence::CommandDeclined` matching the check's `CheckId`. The check still never enters `passed`. A policy-skipped check is `required_check_skipped` and blocks; a policy refusal, timeout or a model that never ran the command records no decline. |
 | 4 · an answer with work left is `incomplete` | `run_agentic_turn` settles `StopReason::Answered` through the gate; `two_answers_with_an_open_plan_settle_incomplete_and_keep_the_plan` proves the single #66 reminder, unchanged plan and two transcript answers. `plan_left_open_at_end` is the deterministic scenario for the same outcome. |
-| 5 · terminal but resumable, in an ordinary session and a worker | `TaskStatus::Incomplete` is terminal and not successful. `TaskControl::for_session` and `TaskControl::for_worker` offer **Continue task** with the exact `taskId`; `SessionStore::continue_incomplete_task` writes the new task and `plan_resumed` edge in one locked batch and compares the whole report. `ChatOrchestrator::continue_incomplete_task` builds the prompt from the durable reasons and the source plan. Engine, route and worker tests cover carry, refusal, stale click, wrong repository and the next run settling `complete`. `continuing_a_task_with_only_a_missing_required_check_keeps_the_check` and `continuing_a_task_stopped_by_a_blocked_step_carries_the_blocked_plan` pin that a plan is carried even when every step is terminal or a step is blocked, and `a_continuation_prompt_names_the_carried_plan_even_when_no_step_is_open` pins the prompt. |
+| 5 · terminal but resumable, in an ordinary session and a worker | `TaskStatus::Incomplete` is terminal and not successful. `TaskControl::for_session` and `TaskControl::for_worker` offer **Continue task** with the exact `taskId`; `SessionStore::continue_incomplete_task` writes the new task and `plan_resumed` edge in one locked batch and compares the whole report. `ChatOrchestrator::continue_incomplete_task` builds the prompt from the durable reasons and the source plan. Engine, route and worker tests cover carry, refusal, stale click, wrong repository and the next run settling `complete`. `continuing_a_task_with_only_a_missing_required_check_keeps_the_check` and `continuing_a_task_stopped_by_a_blocked_step_carries_the_blocked_plan` pin that a plan is carried even when every step is terminal or a step is blocked, and `a_continuation_prompt_names_the_carried_plan_even_when_no_step_is_open` pins the prompt. `a_continued_task_cannot_replace_its_carried_open_plan`, `a_continued_task_cannot_replace_its_carried_blocked_plan` and `a_worker_continued_task_cannot_replace_its_carried_blocked_plan` pin that a continuation's model cannot replace the carried plan while it has open or blocked steps or a required check; `a_continued_task_without_open_work_can_propose_a_plan_that_is_reviewed` keeps the replacement path when nothing in the plan is outstanding, and `a_fresh_tasks_first_propose_plan_is_unchanged` pins the fresh-task boundary. |
 | 6 · worker progress and #100 preserve the truthful outcome | The worker progress status carries `TaskStatus::as_str()` and `/api/worker-progress` returns the engine `control`; the board row and result card draw its headline/detail. `returned_task_control` labels an incomplete return **Task incomplete** and never success, while #100's **Continue with result** remains a separate action. Source tests prove `app.js` has no task-status outcome table. |
 | 7 · recovery recomputes the gate | `recovery::settle_crashed_completions` validates the marker's root, session and task, recomputes the report from the checkout and writes the status through the same service; it never reads a stored `eligible` boolean. Tests cover a crash window settling `incomplete`, `complete` and `failed`, an unusable root staying `interrupted`, an unknown future status being left alone, a dangling side effect outranking the marker, and a marker whose status already landed being closed without a rewrite. |
 | 8 · approval boundaries unchanged | Continuing grants no patch, command, check, question or fallback approval. The prompt says so, the route carries only the target id and optional note, and the worker host refuses the command while a turn is running or waiting. A question answer remains neither an approval nor a waiver. |
@@ -610,3 +630,90 @@ evidence decides, so a later approved run of the same check supersedes the
 decline. A policy refusal, a timeout and a model that never requests the command
 are unchanged: none is a waiver. The owning design and its tests live in spec
 105 (`Evidence::CommandDeclined`); this spec consumes the disposition.
+
+### Review fix 2026-11-06: a continuation cannot replace its carried plan (R9)
+
+The review of specs 101–105 suspected that `carried_plan_untouched` let a
+continuation's `propose_plan` replace the plan it had just carried. The
+regression tests confirmed it. A source task settled `incomplete` with open or
+blocked steps; **Continue task** carried the plan; in the continued run the
+model proposed a different, smaller plan, called `complete_step` on it, and
+answered. Because the replacement was the turn's own `plan_created`, the gate
+read the new plan, found no open or blocked step, and settled `complete`. The
+original work was gone without the user ever seeing the replacement, in both an
+ordinary session and a worker session.
+
+The tool schema requires `minItems: 2`, so a one-step replacement is rejected
+before dispatch; the reproduction uses a two-step replacement and two
+`complete_step` calls, which is the smallest valid shape.
+
+A continuation now refuses `propose_plan` while its carried plan still has an
+open (`Pending`/`InProgress`) or `Blocked` step, or a plan-declared required
+check. The tool result tells the model to work through the carried steps and
+that only the user can change which of them survive, through plan review. The
+required check is included for R2's reason: continuing carries the plan so an
+unmet check stays visible, and a replacement that dropped it while every step
+was completed would let the continued run answer `complete` with the check
+unmet. A carried plan with nothing outstanding — every step completed or
+skipped and no required check — may still be replaced; that replacement then
+takes the ordinary plan-review pause before its first mutating action. The
+refusal is specific to the engine's Continue operation
+(`ChatTurnOptions::plan_already_carried`): a fresh task's first `propose_plan`
+and spec 83's typed-turn carry are unchanged.
+
+Refusal was chosen over routing the replacement into plan review because the
+existing review shows the plan currently in force and resumes by asking the
+model again; it has no representation for a proposed replacement, so reviewing
+the old plan while approving a new one would misdescribe what the user is
+approving. The existing second-plan refusal already tells a model with a plan
+to work through its steps, and `apply_plan_revision` remains the user-owned way
+to drop steps, so extending that refusal is the smallest change that preserves
+the review boundary.
+
+Regression tests were written first and recorded failing in `task_control`:
+
+- `a_continued_task_cannot_replace_its_carried_open_plan` failed with
+  `assertion left == right failed: the model's smaller plan must not replace
+  the carried one`, left `["step_1", "step_2"]`, right `["read", "write"]`.
+- `a_continued_task_cannot_replace_its_carried_blocked_plan` failed with
+  `assertion left == right failed: the blocked step is still outstanding`,
+  left `Complete`, right `Incomplete`.
+- `a_worker_continued_task_cannot_replace_its_carried_blocked_plan` failed with
+  `assertion left == right failed`, left `Complete`, right `Incomplete`.
+
+All three pass now. `a_continued_task_without_open_work_can_propose_a_plan_that_is_reviewed`
+is the guard that the replacement path survives when nothing in the plan is
+outstanding: its source task is incomplete on a discovered floor check, which
+follows the continuation chain and cannot be hidden by the replacement, and the
+new plan still pauses for review before its patch. `a_fresh_tasks_first_propose_plan_is_unchanged`
+pins the fresh-task boundary. Both passed before the change and keep it from
+becoming a blanket refusal.
+
+Checks run locally on 2026-11-06:
+
+- `scripts/quality-gate.sh fmt node lint typos deny`: all five passed after
+  `npm ci` (the first `lint` run exited 127 because `node_modules` was absent).
+- `cargo clippy -p workspace-engine -p desktop-shell -p damaian-cli -p
+  eval-harness --all-targets --locked -- -D warnings`: passed.
+- `cargo nextest run -p workspace-engine`: 2583 passed, 30 skipped, one failure —
+  `shell_path::a_shell_that_does_not_answer_is_killed_at_the_timeout` panicked
+  at `shell_path.rs:160` with `called Result::unwrap() on an Err value: Os {
+  code: 2, kind: NotFound, message: "No such file or directory" }` (the fake
+  shell did not write its pid file inside the 500 ms timeout). That is the
+  known local-machine timing failure recorded in R0 and R2; the file is
+  unchanged by this fix, and the test is not related to plan handling. An
+  earlier full run also failed
+  `verification_loop::an_explicit_continue_runs_one_more_repair_after_the_limit`
+  at `verification_loop.rs:1690` with
+  `Io("process 44420 has no readable identity to record")`, which passed alone
+  and did not recur. In the first run before the required-check extension,
+  `repository_map::a_resumed_proposal_is_re_classified_at_its_own_directory`
+  failed, then passed alone, in three runs of its file, and in every later
+  full run. No test in `task_control` or `plan_carry_over` failed.
+- `cargo nextest run -p desktop-shell`: 285 passed, 18 skipped.
+  `cargo nextest run -p damaian-cli`: 17 passed.
+  `cargo nextest run -p eval-harness`: 123 passed, 2 skipped.
+- `cargo run -p eval-harness -- run --tier deterministic`: all 63 scenarios
+  passed.
+
+Workspace clippy and the other crates' suites beyond those four are left to CI.
