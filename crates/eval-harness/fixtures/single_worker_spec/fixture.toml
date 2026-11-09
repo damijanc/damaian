@@ -1,0 +1,16 @@
+version = "1"
+description = """
+Spec 106's single-worker acceptance fixture: a three-crate Rust workspace with
+documentation and a folder-style spec record.
+
+`pricing` is the crate the task changes (rounding money to whole cents).
+`invoice` depends on it and pins today's truncating behaviour in a test, so a
+correct change breaks it: that is the regression the worker must repair.
+`legacy` is unrelated, protected by the worker prompt, and has one test that
+already fails, so the workspace-root `cargo test` fails before the task starts:
+that is the pre-existing failure the worker must report and leave alone.
+
+The spec leaves the tie rule open on purpose; the answer lives outside this
+fixture (`crates/eval-harness/acceptance/single_worker_spec/`), so the worker
+can only learn it by asking.
+"""

@@ -1,0 +1,52 @@
+# Spec 106 acceptance data for the `single_worker_spec` fixture.
+#
+# This file and prompt.md live outside the fixture on purpose: the fixture is
+# copied into the repository the worker works in, and the worker must not be
+# able to read the clarification's answer or the expected values.
+
+fixture = "single_worker_spec"
+prompt_file = "prompt.md"
+protected_paths = ["crates/legacy/"]
+# Command families a cooperative user would expect for this task. Anything
+# else is approved if policy allows it, but recorded as a deviation (D6).
+expected_command_families = [
+  "cargo test",
+  "cargo check",
+  "cargo build",
+  "cargo fmt",
+  "cargo clippy",
+]
+
+# The material clarification (requirement 4). The spec leaves the tie rule
+# open; the answer changes the expected value for a tie.
+[clarification]
+keywords = ["tie", "halfway", "half-way", "midpoint", "half way", "exactly half", "2.345"]
+answer = "Round an amount that is exactly halfway to the nearest even cent: 2.345 becomes 2.34, and 2.355 becomes 2.36."
+# Phrases that would reveal the answer if they appeared in the fixture.
+answer_markers = ["nearest even", "half to even", "half-even", "half even", "banker"]
+
+[expected]
+tie_input_mills = 2345
+tie_cents = 234
+# What a worker that guessed half-up instead of asking would produce.
+tie_cents_if_half_up = 235
+
+[scoped_check]
+working_directory = ""
+command = "cargo test -p pricing -p invoice"
+
+# The workspace-root floor check fails on this test before the task starts.
+[pre_existing_failure]
+working_directory = ""
+command = "cargo test"
+test = "tests::parses_prefixed_legacy_codes"
+
+# The invoice test a correct change breaks: the regression to repair.
+[regression]
+crate_name = "invoice"
+test = "tests::a_line_of_three_items_in_cents"
+
+[progress_record]
+path = "docs/specs/01_rounding/tasks.md"
+row_prefix = "| 1 · "
+done_state = "Done"

@@ -158,6 +158,8 @@ the proposal. Each live run's numbers are copied into the Task 6 row by hand.
 
 ## 3. Fixture design (Task 2 refines it)
 
+As built (Task 2, 2026-11-09): the fixture is `crates/eval-harness/fixtures/single_worker_spec/`; its acceptance data and the worker prompt are in `crates/eval-harness/acceptance/single_worker_spec/`, outside the fixture, because the fixture is copied into the repository the worker can read. The tie answer is half-to-even (2.345 becomes 2.34); a half-up guess would produce 2.35.
+
 A small Rust workspace with a documentation tree and a folder-style spec
 record:
 

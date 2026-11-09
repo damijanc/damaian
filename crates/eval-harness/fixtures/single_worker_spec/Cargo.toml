@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/pricing", "crates/invoice", "crates/legacy"]
+resolver = "2"
