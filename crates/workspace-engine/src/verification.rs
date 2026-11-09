@@ -903,6 +903,12 @@ pub enum VerificationOutcome {
     NoRepairApplied,
     NoChecksAvailable,
     OnlyDocumentationChanged,
+    /// Checks still fail, but every failure is one the task started with and
+    /// did not change: classified `pre_existing` or `unchanged_failure`
+    /// against a real task-start baseline, with nothing introduced (spec 106
+    /// requirement 11). Never a pass; it settles through the completion gate,
+    /// which names each such check in `accepted_failures`.
+    OnlyPreExistingFailures,
 }
 
 impl VerificationOutcome {
@@ -917,6 +923,7 @@ impl VerificationOutcome {
             Self::NoRepairApplied => "no_repair_applied",
             Self::NoChecksAvailable => "no_checks_available",
             Self::OnlyDocumentationChanged => "only_documentation_changed",
+            Self::OnlyPreExistingFailures => "only_pre_existing_failures",
         }
     }
 }
@@ -1080,9 +1087,24 @@ pub struct VerificationState {
     /// Private so the state cannot be constructed by hand into a shape the
     /// events do not support; the report's honesty rests on the fold.
     passed_before: BTreeSet<CheckId>,
+    /// Checks whose `provenance` record was written after their latest run.
+    /// A newer `Check` with no classification of its own (an interrupted
+    /// verification) leaves the older verdict in `provenance` but not here, so
+    /// it can never vouch for a run it did not see (spec 106 Task 1).
+    provenance_current: BTreeSet<CheckId>,
 }
 
 impl VerificationState {
+    /// The provenance record classifying `check`'s latest run, or `None` when
+    /// the check has no classification or ran again after its latest one.
+    pub fn current_provenance(&self, check: &CheckId) -> Option<&CheckProvenanceRecord> {
+        if self.provenance_current.contains(check) {
+            self.provenance.get(check)
+        } else {
+            None
+        }
+    }
+
     /// Apply one event. Public so a reader that replays a log in batches gets
     /// exactly the state a single fold produces.
     pub fn apply(&mut self, event: &VerificationEvent) {
@@ -1123,6 +1145,7 @@ impl VerificationState {
                 if passing(outcome) {
                     self.passed_before.insert(check.clone());
                 }
+                self.provenance_current.remove(check);
                 self.checks.insert(
                     check.clone(),
                     CheckRun {
@@ -1145,6 +1168,7 @@ impl VerificationState {
             }
             VerificationEvent::Provenance { record, .. } => {
                 self.provenance.insert(record.check.clone(), record.clone());
+                self.provenance_current.insert(record.check.clone());
             }
             VerificationEvent::RepairState { entry, .. }
             | VerificationEvent::RepairStalled { entry, .. } => {
@@ -1468,6 +1492,12 @@ impl VerificationReport {
         if let Some(VerificationOutcome::NoRepairApplied) = self.outcome {
             return format!(
                 "Verification stopped because no repair patch was applied and {}. {plan_note}",
+                self.failure_phrase()
+            );
+        }
+        if let Some(VerificationOutcome::OnlyPreExistingFailures) = self.outcome {
+            return format!(
+                "Only failures that were already there before this task remain: {}. The task did not cause or change them. {plan_note}",
                 self.failure_phrase()
             );
         }

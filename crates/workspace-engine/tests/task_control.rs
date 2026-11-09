@@ -79,6 +79,7 @@ fn report(task_id: &str) -> CompletionGateReport {
             explanation: "1 planned step is still open: \"Finish the parser\".".to_string(),
         }],
         waivers: Vec::new(),
+        accepted_failures: Vec::new(),
     }
 }
 

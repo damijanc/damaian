@@ -483,7 +483,7 @@ impl TaskControl {
                 TaskOutcomeKind::Complete,
                 WorkerDot::Finished,
                 "Task complete",
-                "The task finished its work.".to_string(),
+                completion_detail(report, "The task finished its work."),
                 reasons,
                 waivers,
                 None,
@@ -965,7 +965,10 @@ impl TaskControl {
                 TaskOutcomeKind::Complete,
                 WorkerDot::Finished,
                 "Task complete",
-                "The worker finished this task. Send a follow-up to start another one.".to_string(),
+                completion_detail(
+                    report,
+                    "The worker finished this task. Send a follow-up to start another one.",
+                ),
                 TaskAction::new(
                     TaskCommand::SendFollowUp,
                     "Send follow-up",
@@ -1185,6 +1188,14 @@ pub fn continuation_prompt(
     }
     for waiver in &report.waivers {
         prompt.push_str(&format!("- {}\n", waiver.explanation));
+    }
+    // A failure the task started with is stated as such, so a continuation
+    // does not spend itself "repairing" something it did not break.
+    for acceptance in &report.accepted_failures {
+        prompt.push_str(&format!(
+            "- {} Do not try to fix it as part of this task.\n",
+            acceptance.explanation
+        ));
     }
     if report.reasons.is_empty() && report.waivers.is_empty() {
         prompt.push_str("- The task was not closed.\n");
@@ -1662,6 +1673,11 @@ fn completion_detail(report: Option<&CompletionGateReport>, prefix: &str) -> Str
     for waiver in &report.waivers {
         parts.push(waiver.explanation.clone());
     }
+    // Named, never folded into a pass: the user should see which known failure
+    // a finished task completed beside (spec 106 requirement 11).
+    for acceptance in &report.accepted_failures {
+        parts.push(acceptance.explanation.clone());
+    }
     if parts.is_empty() {
         prefix.to_string()
     } else {
@@ -1731,6 +1747,7 @@ mod tests {
                 explanation: "1 planned step is still open: \"Write it\".".to_string(),
             }],
             waivers: Vec::new(),
+            accepted_failures: Vec::new(),
         }
     }
 
@@ -1762,6 +1779,7 @@ mod tests {
             eligible: true,
             reasons: Vec::new(),
             waivers: Vec::new(),
+            accepted_failures: Vec::new(),
         };
         let control = TaskControl::for_session(Some(&task), Some(&report));
         assert_eq!(control.outcome, TaskOutcomeKind::Complete);
@@ -2037,6 +2055,42 @@ mod tests {
         assert_ne!(control.outcome, TaskOutcomeKind::Complete);
     }
 
+    /// Spec 106 requirement 11: a completed task names the known failure it
+    /// finished beside, and a continuation is told not to "repair" it.
+    #[test]
+    fn an_accepted_pre_existing_failure_is_named_on_the_card_and_in_a_continuation() {
+        let acceptance = crate::completion::CompletionAcceptance {
+            check: crate::verification::CheckId::new("", "cargo test"),
+            provenance: crate::verification::FailureProvenance::PreExisting,
+            explanation: "cargo test (repository root) still fails, but only as it did before this task started; the task did not cause it and did not change it.".to_string(),
+        };
+        let complete = CompletionGateReport {
+            task_id: "task_1".to_string(),
+            eligible: true,
+            reasons: Vec::new(),
+            waivers: Vec::new(),
+            accepted_failures: vec![acceptance.clone()],
+        };
+        let detail = completion_detail(Some(&complete), "The task finished its work.");
+        assert!(
+            detail.starts_with("The task finished its work."),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("only as it did before this task started"),
+            "{detail}"
+        );
+
+        let mut incomplete = incomplete_report();
+        incomplete.accepted_failures.push(acceptance);
+        let prompt = continuation_prompt(&incomplete, None, None);
+        assert!(
+            prompt.contains("only as it did before this task started")
+                && prompt.contains("Do not try to fix it as part of this task."),
+            "{prompt}"
+        );
+    }
+
     #[test]
     fn a_continuation_prompt_names_the_carried_plan_even_when_no_step_is_open() {
         let planned = continuation_prompt(
@@ -2058,6 +2112,7 @@ mod tests {
                 explanation: "1 planned step is blocked: \"Run tests\".".to_string(),
             }],
             waivers: Vec::new(),
+            accepted_failures: Vec::new(),
         };
         let mut blocked_plan = TaskPlan::new("task_1", 0);
         blocked_plan.steps.push(PlanStep {
@@ -2088,6 +2143,7 @@ mod tests {
                 explanation: "Verification is due and has not run.".to_string(),
             }],
             waivers: Vec::new(),
+            accepted_failures: Vec::new(),
         };
         let prompt = continuation_prompt(&verification_only, None, Some("Run the checks."));
         assert!(prompt.contains("carries no plan"), "{prompt}");

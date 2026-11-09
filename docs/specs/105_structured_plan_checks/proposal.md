@@ -470,3 +470,15 @@ verification after each, then `complete_step`.
   stale after the second patch (asserted directly with `CheckRun::is_stale`
   over the new file hash), the check runs a second time, the second run records
   the new hash, and the task still completes.
+
+## Spec 106 Task 1, 2026-11-09: a required check may end as an accepted failure
+
+A required check now has a fourth disposition beside passed, failed and waived:
+**accepted pre-existing failure**. A check whose latest classified run fails only
+with the failure the task started with, measured against a real task-start
+baseline and with nothing introduced, does not block completion. The completion
+report names it in `accepted_failures`; it is never a pass. This applies to
+checks the verification loop runs and classifies (floor checks and loop runs of
+plan checks). A plan check the model runs itself as an ordinary command is still
+judged by its exit code alone (observation 70). See spec 101's matching note for
+the rule and the tests.

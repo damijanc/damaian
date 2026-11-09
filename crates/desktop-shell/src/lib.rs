@@ -15904,6 +15904,7 @@ mod tests {
                                 explanation: "1 planned step is still open.".to_string(),
                             }],
                             waivers: Vec::new(),
+                            accepted_failures: Vec::new(),
                         },
                     )
                     .unwrap();
@@ -16256,6 +16257,7 @@ mod tests {
                                 .to_string(),
                         }],
                         waivers: Vec::new(),
+                        accepted_failures: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -17711,6 +17713,7 @@ exec /bin/cat > /dev/null
                     explanation: "1 planned step is still open: \"Finish the work\".".to_string(),
                 }],
                 waivers: Vec::new(),
+                accepted_failures: Vec::new(),
             };
             store
                 .update_task_status_with_completion(&task, TaskStatus::Incomplete, &report)

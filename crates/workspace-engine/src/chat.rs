@@ -3832,13 +3832,28 @@ impl ChatOrchestrator {
                 );
             }
             // Pre-existing, unchanged, environment and unknown failures are
-            // reported and may fail completion, but no code-repair turn is
-            // started from evidence the patch did not introduce.
+            // reported, but no code-repair turn is started from evidence the
+            // patch did not introduce. When every failure is one the task
+            // started with and did not change, the run is not a failure of
+            // this task: it settles through the completion gate, which names
+            // each such check instead of passing it (spec 106 requirement 11).
+            // An environment, unknown or uncertain failure still fails.
+            // Staleness is not decided here: this outcome settles through the
+            // gate, which reports a stale required check as such.
+            let only_pre_existing = !preliminary.failed.is_empty()
+                && preliminary.failed.iter().all(|failed| {
+                    crate::completion::accepted_pre_existing_failure(&failed.check, &state)
+                        .is_some()
+                });
             return self.finish_verification_with_outcome(
                 repository_root,
                 session,
                 task,
-                VerificationOutcome::Failed,
+                if only_pre_existing {
+                    VerificationOutcome::OnlyPreExistingFailures
+                } else {
+                    VerificationOutcome::Failed
+                },
                 changed,
                 file_hashes,
             );
@@ -4663,7 +4678,8 @@ impl ChatOrchestrator {
             VerificationOutcome::Passed
             | VerificationOutcome::NothingVerified
             | VerificationOutcome::NoChecksAvailable
-            | VerificationOutcome::OnlyDocumentationChanged => CompletionSettlement::Gate,
+            | VerificationOutcome::OnlyDocumentationChanged
+            | VerificationOutcome::OnlyPreExistingFailures => CompletionSettlement::Gate,
             VerificationOutcome::Failed
             | VerificationOutcome::RepairLimitExhausted
             | VerificationOutcome::RepairStalled

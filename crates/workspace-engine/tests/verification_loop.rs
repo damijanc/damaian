@@ -5270,7 +5270,13 @@ fn a_matching_failed_baseline_is_pre_existing_and_starts_no_repair() {
         .as_ref()
         .expect("a pre-existing failure still reports");
 
-    assert_eq!(report.outcome, Some(VerificationOutcome::Failed));
+    // Spec 106 requirement 11: when the only failure is the one the task
+    // started with, the run is not a failure of this task. It is still never
+    // `Passed`, and it still starts no repair.
+    assert_eq!(
+        report.outcome,
+        Some(VerificationOutcome::OnlyPreExistingFailures)
+    );
     assert!(result.patch_proposal.is_none());
     assert!(
         second.requests.is_empty(),
@@ -5345,7 +5351,12 @@ fn a_pre_existing_error_that_shifts_lines_stays_pre_existing() {
         .verification_report
         .as_ref()
         .expect("a pre-existing failure still reports");
-    assert_eq!(report.outcome, Some(VerificationOutcome::Failed));
+    // Spec 106 requirement 11: the only remaining failure is the task-start
+    // one, so the run finishes `only_pre_existing_failures`, never `Passed`.
+    assert_eq!(
+        report.outcome,
+        Some(VerificationOutcome::OnlyPreExistingFailures)
+    );
     assert!(result.patch_proposal.is_none());
     assert!(
         adapter.requests.is_empty(),

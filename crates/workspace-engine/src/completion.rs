@@ -33,7 +33,8 @@ use crate::plan::{Evidence, PlanStep, StepStatus, TaskPlan};
 use crate::repository_map::load_stored_map;
 use crate::session::{Session, SessionStore, Task, TaskStatus};
 use crate::verification::{
-    CheckId, CheckOutcome, CheckRun, SkipReason, VerificationState, floor_checks, fold_verification,
+    CheckBaseline, CheckId, CheckOutcome, CheckRun, FailureProvenance, SkipReason,
+    VerificationState, floor_checks, fold_verification,
 };
 
 /// A plan step whose id starts with this is the verification loop's own step,
@@ -125,12 +126,29 @@ pub struct CompletionWaiver {
     pub explanation: String,
 }
 
+/// A required check that failed only with the failure the task started with
+/// (spec 106 requirement 11, context D1).
+///
+/// The engine, not the user, accepts it: the latest run is classified
+/// `pre_existing` or `unchanged_failure` against a real task-start `Failed`
+/// baseline, and nothing in it was introduced. It is never a pass and never a
+/// waiver; it is listed so the user sees exactly which known failure the task
+/// completed beside.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionAcceptance {
+    pub check: CheckId,
+    pub provenance: FailureProvenance,
+    pub explanation: String,
+}
+
 /// The engine's verdict on whether a task is closed (spec 101 §4).
 ///
 /// `eligible` is the whole verdict. `reasons` explains every fact that kept it
-/// false, and `waivers` names declined checks the user has already accepted.
-/// Both are computed here so a shell, CLI or worker never has to interpret a
-/// plan or a verification report itself.
+/// false, `waivers` names declined checks the user has already accepted, and
+/// `accepted_failures` names required checks that still fail only as they did
+/// before the task started. All are computed here so a shell, CLI or worker
+/// never has to interpret a plan or a verification report itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionGateReport {
@@ -138,6 +156,9 @@ pub struct CompletionGateReport {
     pub eligible: bool,
     pub reasons: Vec<CompletionReason>,
     pub waivers: Vec<CompletionWaiver>,
+    /// Absent from every report written before spec 106; reads as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_failures: Vec<CompletionAcceptance>,
 }
 
 /// Which status the shared settlement operation is allowed to write.
@@ -235,6 +256,7 @@ impl CompletionGateReport {
 
         let mut reasons = Vec::new();
         let mut waivers = Vec::new();
+        let mut accepted_failures = Vec::new();
 
         // `open_steps` is the reminder's set: `Pending` or `InProgress`
         // (spec 66 §5.1). Using it here keeps the gate's `OpenPlanSteps` and
@@ -397,14 +419,20 @@ impl CompletionGateReport {
                         });
                     }
                     CheckOutcome::Ran { exit_code, .. } => {
-                        reasons.push(CompletionReason {
-                            code: CompletionReasonCode::RequiredCheckFailed,
-                            explanation: format!(
-                                "Required check {} failed: {}.",
-                                check.label(),
-                                command_failure_reason(*exit_code)
-                            ),
-                        });
+                        if let Some(acceptance) =
+                            accepted_pre_existing_failure(&check, facts.verification)
+                        {
+                            accepted_failures.push(acceptance);
+                        } else {
+                            reasons.push(CompletionReason {
+                                code: CompletionReasonCode::RequiredCheckFailed,
+                                explanation: format!(
+                                    "Required check {} failed: {}.",
+                                    check.label(),
+                                    command_failure_reason(*exit_code)
+                                ),
+                            });
+                        }
                     }
                 }
                 continue;
@@ -453,6 +481,7 @@ impl CompletionGateReport {
             eligible: reasons.is_empty(),
             reasons,
             waivers,
+            accepted_failures,
         }
     }
 
@@ -470,6 +499,43 @@ fn passing(run: &CheckRun) -> bool {
 
 /// The report's wording for a failed run's exit: an exit code, or that the
 /// command was killed or signalled (which is unknown, never a zero).
+/// Whether a required check's failing run is only the failure the task started
+/// with (spec 106 requirement 11, context D1).
+///
+/// All three must hold: the classification is the one written after the
+/// check's latest run (an older verdict never vouches for a newer run), it is
+/// `pre_existing` or `unchanged_failure` with nothing introduced, and the
+/// task-start baseline actually ran and failed. A declined, unavailable or
+/// `uncertain` baseline never qualifies: without a real starting point the
+/// engine cannot know the task did not cause the failure.
+pub(crate) fn accepted_pre_existing_failure(
+    check: &CheckId,
+    verification: &VerificationState,
+) -> Option<CompletionAcceptance> {
+    let record = verification.current_provenance(check)?;
+    if !matches!(
+        record.provenance,
+        FailureProvenance::PreExisting | FailureProvenance::UnchangedFailure
+    ) || !record.introduced.is_empty()
+    {
+        return None;
+    }
+    if !matches!(
+        verification.baselines.get(check),
+        Some(CheckBaseline::Failed { .. })
+    ) {
+        return None;
+    }
+    Some(CompletionAcceptance {
+        check: check.clone(),
+        provenance: record.provenance,
+        explanation: format!(
+            "{} still fails, but only as it did before this task started; the task did not cause it and did not change it.",
+            check.label()
+        ),
+    })
+}
+
 fn command_failure_reason(exit_code: Option<i32>) -> String {
     match exit_code {
         Some(code) => format!("exit code {code}"),

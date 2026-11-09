@@ -20,7 +20,8 @@ use workspace_engine::{
     CompletionGateReport, CompletionReasonCode, Config, FailureProvenance, MockModelAdapter,
     ModelAdapter, ModelRun, PLANNED_CHECK_VERSION, PatchApplyOutcome, PausedTurns,
     PlanRevisionCheck, PlanRevisionStep, PlannedCheck, TaskStatus, TokenUsage, ToolCall,
-    TurnProgress, TurnSink, VerificationEvent, WorkerRecord, WorkspaceEngine, fold_verification,
+    TurnProgress, TurnSink, VerificationEvent, VerificationOutcome, WorkerRecord, WorkspaceEngine,
+    fold_verification,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -5231,4 +5232,177 @@ fn two_patches_to_the_same_file_in_one_step_rerun_the_check() {
         &mut finish,
     );
     assert_eq!(done.task.status, TaskStatus::Complete, "{done:?}");
+}
+
+// --- Spec 106 Task 1: an unchanged pre-existing failure (context D1) --------
+//
+// The workspace root's `cargo test` already fails at task start on an
+// unrelated crate. That failure must neither be repaired nor stop the task
+// from completing; a failure the task adds on top of it is still repaired.
+
+fn s106_pre_existing_fixture(name: &str) -> (PathBuf, PathBuf) {
+    let (repo, shell) = r16_workspace_fixture(name);
+    // Same workspace as R16, but the root check also reports a legacy test
+    // that fails before the task starts. Its output is what the generic
+    // finding's identity compares (review fix R10).
+    let script = "#!/bin/sh\n\
+         command=\"$2\"\n\
+         case \"$command\" in\n\
+           *\"cargo test\"*)\n\
+             if [ -f \"$PWD/Cargo.toml\" ] && grep -q '^\\[workspace\\]' \"$PWD/Cargo.toml\"; then\n\
+               echo 'test legacy::tests::broken ... FAILED'\n\
+               grep -q 'value() -> u8 { 1 }' \"$PWD/crates/member/src/lib.rs\" \
+                 || echo 'test sibling::tests::uses_member ... FAILED'\n\
+               exit 1\n\
+             fi ;;\n\
+           *) exit 0 ;;\n\
+         esac\n\
+         exit 0\n";
+    fs::write(&shell, script).expect("the fake shell");
+    (repo, shell)
+}
+
+fn completion_report(engine: &WorkspaceEngine, result: &ChatTurnResult) -> CompletionGateReport {
+    engine
+        .session_store
+        .read_completion_report(&result.session.id, &result.task.id)
+        .expect("the completion report should read")
+        .expect("the task settled with a report")
+}
+
+/// The root failure is pre-existing and unchanged: no repair, and the task
+/// completes.
+#[test]
+fn an_unchanged_pre_existing_workspace_failure_does_not_stop_a_finished_task() {
+    let (repo, shell) = s106_pre_existing_fixture("s106-pre-existing-unchanged");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let root_check = CheckId::new("", "cargo test");
+    let patch = patch_call_with(
+        "crates/member/src/helper.rs",
+        "pub fn helper() -> u8 { 1 }\n",
+    );
+    let proposed = r16_proposed_member_change(&engine, &repo, R16_MEMBER_PLAN, patch);
+    let mut due = MockModelAdapter::new("Done.");
+    let _ = run_verification_and_approve_checks(&engine, &repo, &proposed.session.id, &mut due);
+
+    let mut adapter = scripted(vec![
+        vec![call("complete_step", "{}"), call("complete_step", "{}")],
+        Vec::new(),
+    ]);
+    let mut result = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Finish the task",
+        &mut adapter,
+    );
+    approve_until_finished(&engine, &mut result, &mut adapter);
+
+    assert!(
+        result.patch_proposal.is_none(),
+        "a pre-existing failure must not start a repair: {result:?}"
+    );
+    let events = engine
+        .session_store
+        .read_verification_events(&proposed.session.id, &[])
+        .expect("the log should read");
+    let provenance = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            VerificationEvent::Provenance { record, .. } if record.check == root_check => {
+                Some(record.provenance)
+            }
+            _ => None,
+        })
+        .expect("the root failure is classified");
+    assert!(
+        matches!(
+            provenance,
+            FailureProvenance::PreExisting | FailureProvenance::UnchangedFailure
+        ),
+        "the root failure is the task-start failure: {provenance:?}"
+    );
+    let verification = result
+        .verification_report
+        .as_ref()
+        .expect("the completion verification reported");
+    assert_eq!(
+        verification.outcome,
+        Some(VerificationOutcome::OnlyPreExistingFailures),
+        "{verification:?}"
+    );
+    let summary = result.response.lines().next().unwrap_or_default();
+    assert!(
+        summary.contains("already there before this task") && !summary.contains("passed"),
+        "the summary names the pre-existing failure and never calls it passed: {summary}"
+    );
+    let report = completion_report(&engine, &result);
+    assert_eq!(report.accepted_failures.len(), 1, "{report:?}");
+    assert_eq!(report.accepted_failures[0].check, root_check);
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Complete,
+        "an unchanged pre-existing failure must not keep the task open: status {:?}, outcome {:?}, {:?}",
+        result.task.status,
+        result
+            .verification_report
+            .as_ref()
+            .and_then(|report| report.outcome),
+        completion_report(&engine, &result)
+    );
+}
+
+/// A regression the task adds on top of the pre-existing failure is repaired;
+/// once only the pre-existing failure remains, the task completes.
+#[test]
+fn a_regression_over_a_pre_existing_failure_is_repaired_then_the_task_completes() {
+    let (repo, shell) = s106_pre_existing_fixture("s106-pre-existing-regression");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let broken = "pub fn value() -> u8 { 2 }\n";
+    let repair = "pub fn value() -> u8 { 1 }\n";
+    let proposed = r16_proposed_member_change(
+        &engine,
+        &repo,
+        R16_MEMBER_PLAN,
+        patch_call_with("crates/member/src/lib.rs", broken),
+    );
+    let mut due = MockModelAdapter::new("Done.");
+    let _ = run_verification_and_approve_checks(&engine, &repo, &proposed.session.id, &mut due);
+
+    let mut finish = scripted(vec![
+        vec![call("complete_step", "{}"), call("complete_step", "{}")],
+        Vec::new(),
+        vec![patch_call_with("crates/member/src/lib.rs", repair)],
+    ]);
+    let mut completed = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Finish the task",
+        &mut finish,
+    );
+    approve_until_finished(&engine, &mut completed, &mut finish);
+    let repair_patch = completed
+        .patch_proposal
+        .as_ref()
+        .expect("the introduced sibling failure starts a repair turn")
+        .patch_id
+        .clone();
+    assert_ne!(completed.task.status, TaskStatus::Complete);
+
+    apply_patch_with_baselines(&engine, &repo, &repair_patch, true);
+    let mut final_adapter = MockModelAdapter::new("Done.");
+    let verified = run_verification_and_approve_checks(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        &mut final_adapter,
+    );
+    assert_eq!(
+        verified.task.status,
+        TaskStatus::Complete,
+        "after the repair only the pre-existing failure remains: {:?}",
+        completion_report(&engine, &verified)
+    );
 }

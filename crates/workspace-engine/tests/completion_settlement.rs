@@ -433,6 +433,7 @@ fn a_crash_after_the_settlement_status_only_closes_the_marker() {
             explanation: "1 planned step is still open.".to_string(),
         }],
         waivers: Vec::new(),
+        accepted_failures: Vec::new(),
     };
     fixture
         .store

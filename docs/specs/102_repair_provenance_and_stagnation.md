@@ -103,7 +103,11 @@ provenance, scope and stagnation checks increase the damage window.
 9. The verification report separates introduced regressions, pre-existing
    failures, environmental failures, uncertain failures with no task-start
    baseline and stalled repairs. None is collapsed into a generic `failed`
-   sentence.
+   sentence. When every remaining failure is `pre_existing` or
+   `unchanged_failure` against a real task-start `Failed` baseline with nothing
+   introduced, the verification finishes `only_pre_existing_failures` and settles
+   through #101's gate, which names each such check as accepted (spec 106
+   requirement 11). It is never reported as passed.
 10. Fingerprints, classifications and stop reasons survive reload and worker
     restart without storing unredacted output in a new location. Redacted
     finding details are stored on the durable evidence so a reload renders the
@@ -789,3 +793,22 @@ and its assertions did not need to change. Local checks after the follow-up:
 scoped crate test runs; the deterministic tier could not complete because the
 development Mac stalled launching the scenario processes, and the R18 row
 records the exact runs, flaky tests and timeouts.
+
+### Spec 106 Task 1, 2026-11-09: what provenance now decides at completion
+
+Provenance used to decide only whether a repair turn could start; #101's gate
+ignored it, so a pre-existing failure in a required check kept a task
+incomplete forever. Two things now read it (spec 106 `context.md` D1):
+
+- `finish_verification`: when no repair target exists and every failed check is
+  an accepted pre-existing failure (`completion::accepted_pre_existing_failure`),
+  the outcome is the new `VerificationOutcome::OnlyPreExistingFailures`
+  (`only_pre_existing_failures`) and settlement goes through the gate. An
+  environment, unknown or `uncertain` failure still finishes `failed`.
+- #101's gate: such a check is listed in `accepted_failures`.
+
+Only a classification written after the check's latest run counts
+(`VerificationState::current_provenance`); a newer run that an interrupted
+verification never classified cannot borrow an older verdict. `uncertain` (D2)
+is unchanged: it is never accepted and still asks the user. The tests are
+listed in spec 101's matching note.

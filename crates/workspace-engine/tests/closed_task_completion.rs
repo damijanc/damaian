@@ -932,3 +932,269 @@ fn a_verification_step_does_not_keep_the_plan_open() {
 
     assert!(report.eligible, "{report:?}");
 }
+
+// --- Spec 106 Task 1: an unchanged pre-existing failure (context D1) --------
+//
+// A required check whose post-change result is the same failure the task
+// started with is a named disposition, never a pass. Only a real task-start
+// baseline qualifies, only the classification written after the latest run
+// counts, and any introduced finding still blocks.
+
+mod pre_existing {
+    use super::*;
+    use workspace_engine::finding::{Finding, FindingDraft, FindingSource, Severity};
+    use workspace_engine::{
+        CheckBaseline, CheckTermination, FailureFingerprint, FailureProvenance, FindingEvidence,
+        PostPatchResult, SecretScanner, classify,
+    };
+
+    const TASK: &str = "task_1";
+
+    fn root() -> CheckId {
+        check("", "cargo test")
+    }
+
+    /// The generic finding an unparsed check produces from its output.
+    fn output(details: &str) -> FindingEvidence {
+        let finding = Finding::new(
+            FindingDraft {
+                source: FindingSource::Command,
+                severity: Severity::Error,
+                summary: "cargo test failed".to_string(),
+                details: Some(details.to_string()),
+                range: None,
+                code: None,
+            },
+            &SecretScanner::new(Vec::new()),
+        );
+        FindingEvidence::from_finding(&finding)
+    }
+
+    fn legacy() -> FindingEvidence {
+        output("test legacy::tests::broken ... FAILED\n")
+    }
+
+    fn legacy_and_sibling() -> FindingEvidence {
+        output(
+            "test legacy::tests::broken ... FAILED\ntest sibling::tests::uses_member ... FAILED\n",
+        )
+    }
+
+    fn exited() -> CheckTermination {
+        CheckTermination::Exited { exit_code: 1 }
+    }
+
+    fn failed_baseline(findings: &[FindingEvidence]) -> CheckBaseline {
+        CheckBaseline::Failed {
+            fingerprint: FailureFingerprint::compute(&root(), findings, &exited()),
+            termination: exited(),
+            findings: findings.to_vec(),
+        }
+    }
+
+    fn baseline_event(baseline: CheckBaseline) -> VerificationEvent {
+        VerificationEvent::Baseline {
+            task_id: TASK.to_string(),
+            check: root(),
+            baseline,
+        }
+    }
+
+    fn provenance_event(
+        baseline: &CheckBaseline,
+        findings: Vec<FindingEvidence>,
+        previous: Option<&workspace_engine::CheckProvenanceRecord>,
+    ) -> (VerificationEvent, workspace_engine::CheckProvenanceRecord) {
+        let result = PostPatchResult::new(root(), exited(), findings);
+        let record = classify(&result, Some(baseline), previous).record();
+        (
+            VerificationEvent::Provenance {
+                task_id: TASK.to_string(),
+                record: record.clone(),
+            },
+            record,
+        )
+    }
+
+    fn finished_plan() -> TaskPlan {
+        plan(TASK, vec![step("work", StepStatus::Completed)])
+    }
+
+    fn gate(events: &[VerificationEvent]) -> CompletionGateReport {
+        let plan = finished_plan();
+        let verification = state(events);
+        CompletionGateReport::evaluate(CompletionFacts {
+            task_id: TASK,
+            plan: Some(&plan),
+            verification: &verification,
+            pending: None,
+            current_hashes: &BTreeMap::new(),
+            floor_checks: &[root()],
+        })
+    }
+
+    fn codes(report: &CompletionGateReport) -> Vec<&'static str> {
+        report
+            .reason_codes()
+            .iter()
+            .map(|code| code.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_unchanged_pre_existing_floor_failure_lets_the_task_complete() {
+        let baseline = failed_baseline(&[legacy()]);
+        let (provenance, record) = provenance_event(&baseline, vec![legacy()], None);
+        assert_eq!(record.provenance, FailureProvenance::PreExisting);
+        let report = gate(&[
+            baseline_event(baseline),
+            due(TASK),
+            started(TASK, &[root()]),
+            ran(TASK, root(), Some(1), &[], 0),
+            provenance,
+            finished(TASK, VerificationOutcome::Failed),
+        ]);
+
+        assert!(
+            report.eligible,
+            "an unchanged pre-existing failure must not block completion: {report:?}"
+        );
+        assert!(report.reasons.is_empty(), "{report:?}");
+        assert!(
+            report.waivers.is_empty(),
+            "accepting a pre-existing failure is not a user waiver: {report:?}"
+        );
+        assert_eq!(report.accepted_failures.len(), 1, "{report:?}");
+        assert_eq!(report.accepted_failures[0].check, root());
+        assert_eq!(
+            report.accepted_failures[0].provenance,
+            FailureProvenance::PreExisting
+        );
+        assert!(
+            !report.accepted_failures[0].explanation.contains("passed"),
+            "an accepted failure is never described as passed: {report:?}"
+        );
+    }
+
+    #[test]
+    fn a_report_without_accepted_failures_keeps_its_old_wire_shape() {
+        let report = gate(&[]);
+        let json = serde_json::to_value(&report).expect("the report serializes");
+        assert!(
+            json.get("acceptedFailures").is_none(),
+            "an empty list is not written: {json}"
+        );
+        let old = serde_json::json!({
+            "taskId": TASK,
+            "eligible": true,
+            "reasons": [],
+            "waivers": [],
+        });
+        let loaded: CompletionGateReport =
+            serde_json::from_value(old).expect("a pre-spec-106 report loads");
+        assert!(loaded.accepted_failures.is_empty());
+    }
+
+    #[test]
+    fn an_unchanged_failure_after_an_earlier_classification_is_accepted_too() {
+        let baseline = failed_baseline(&[legacy()]);
+        let (first, first_record) = provenance_event(&baseline, vec![legacy()], None);
+        let (second, second_record) =
+            provenance_event(&baseline, vec![legacy()], Some(&first_record));
+        assert_eq!(
+            second_record.provenance,
+            FailureProvenance::UnchangedFailure
+        );
+        let report = gate(&[
+            baseline_event(baseline),
+            due(TASK),
+            started(TASK, &[root()]),
+            ran(TASK, root(), Some(1), &[], 0),
+            first,
+            ran(TASK, root(), Some(1), &[], 0),
+            second,
+            finished(TASK, VerificationOutcome::Failed),
+        ]);
+
+        assert!(report.eligible, "{report:?}");
+    }
+
+    #[test]
+    fn an_introduced_finding_on_top_of_a_pre_existing_failure_still_blocks() {
+        let baseline = failed_baseline(&[legacy()]);
+        let (provenance, record) = provenance_event(&baseline, vec![legacy_and_sibling()], None);
+        assert!(
+            !record.introduced.is_empty(),
+            "the sibling failure is introduced: {record:?}"
+        );
+        let report = gate(&[
+            baseline_event(baseline),
+            due(TASK),
+            started(TASK, &[root()]),
+            ran(TASK, root(), Some(1), &[], 0),
+            provenance,
+            finished(TASK, VerificationOutcome::Failed),
+        ]);
+
+        assert!(!report.eligible, "{report:?}");
+        assert_eq!(codes(&report), vec!["required_check_failed"]);
+    }
+
+    #[test]
+    fn an_uncertain_failure_is_never_accepted() {
+        let (provenance, record) =
+            provenance_event(&CheckBaseline::Uncertain, vec![legacy()], None);
+        assert_eq!(record.provenance, FailureProvenance::Uncertain);
+        let report = gate(&[
+            baseline_event(CheckBaseline::Uncertain),
+            due(TASK),
+            started(TASK, &[root()]),
+            ran(TASK, root(), Some(1), &[], 0),
+            provenance,
+            finished(TASK, VerificationOutcome::Failed),
+        ]);
+
+        assert!(!report.eligible, "{report:?}");
+        assert_eq!(codes(&report), vec!["required_check_failed"]);
+    }
+
+    #[test]
+    fn a_failure_after_a_declined_baseline_is_never_accepted() {
+        let (provenance, record) = provenance_event(&CheckBaseline::Declined, vec![legacy()], None);
+        assert_eq!(record.provenance, FailureProvenance::UnknownProvenance);
+        let report = gate(&[
+            baseline_event(CheckBaseline::Declined),
+            due(TASK),
+            started(TASK, &[root()]),
+            ran(TASK, root(), Some(1), &[], 0),
+            provenance,
+            finished(TASK, VerificationOutcome::Failed),
+        ]);
+
+        assert!(!report.eligible, "{report:?}");
+        assert_eq!(codes(&report), vec!["required_check_failed"]);
+    }
+
+    #[test]
+    fn a_classification_older_than_the_latest_run_is_not_accepted() {
+        let baseline = failed_baseline(&[legacy()]);
+        let (provenance, _) = provenance_event(&baseline, vec![legacy()], None);
+        // The check ran again after its classification and nothing classified
+        // the newer run (an interrupted verification). The old "pre-existing"
+        // verdict must not vouch for it.
+        let report = gate(&[
+            baseline_event(baseline),
+            due(TASK),
+            started(TASK, &[root()]),
+            ran(TASK, root(), Some(1), &[], 0),
+            provenance,
+            ran(TASK, root(), Some(1), &[], 0),
+        ]);
+
+        assert!(!report.eligible, "{report:?}");
+        assert!(
+            codes(&report).contains(&"required_check_failed"),
+            "{report:?}"
+        );
+    }
+}

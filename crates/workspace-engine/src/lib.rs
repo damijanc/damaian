@@ -115,9 +115,9 @@ pub use compaction::{
     ValidationDigest, bound_objective, narrative_prompt, parse_narrative, transcript_for_summary,
 };
 pub use completion::{
-    COMPLETION_SETTLEMENT_ACTION, CompletionFacts, CompletionGateReport, CompletionGateService,
-    CompletionReason, CompletionReasonCode, CompletionSettlement, CompletionSettlementMarker,
-    CompletionWaiver, SettledCompletion,
+    COMPLETION_SETTLEMENT_ACTION, CompletionAcceptance, CompletionFacts, CompletionGateReport,
+    CompletionGateService, CompletionReason, CompletionReasonCode, CompletionSettlement,
+    CompletionSettlementMarker, CompletionWaiver, SettledCompletion,
 };
 pub use config::{
     AppliedKey, CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, CostEstimate,

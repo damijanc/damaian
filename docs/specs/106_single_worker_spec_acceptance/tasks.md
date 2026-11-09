@@ -1,6 +1,6 @@
 # Spec 106 tasks
 
-**Started:** not yet — planned 2026-11-09
+**Started:** 2026-11-09
 
 Implementation plan for [`proposal.md`](proposal.md). The design decisions and
 the code survey they rest on are in [`context.md`](context.md).
@@ -23,7 +23,7 @@ the code survey they rest on are in [`context.md`](context.md).
 
 | Task | State | Durable result |
 |---|---|---|
-| 1 · Gate accepts an unchanged pre-existing failure (context D1) | Not started | |
+| 1 · Gate accepts an unchanged pre-existing failure (context D1) | Done 2026-11-09 | `CompletionGateReport` gains `accepted_failures: Vec<CompletionAcceptance>` (serde default, omitted when empty). `completion::accepted_pre_existing_failure` accepts a failed required `CheckRun` only when the classification was written after its latest run (new fold flag, `VerificationState::current_provenance`), is `pre_existing`/`unchanged_failure` with nothing introduced, and the task-start baseline is `Failed`; `uncertain`, declined, unavailable and absent baselines never qualify. Discovery while implementing: the gate change alone was not enough, because `finish_verification` turned any unrepairable failure into `VerificationOutcome::Failed` and settled as `VerificationFailed`; a new `OnlyPreExistingFailures` outcome (`only_pre_existing_failures`, never `passed`) now settles through the gate when every remaining failure is accepted. The completed task card (`completion_detail`, interactive and worker) names the accepted failure, and the Continue prompt lists it with "Do not try to fix it". Tests written first and recorded failing: the two accepting gate tests and both orchestrator tests failed with `RequiredCheckFailed: "Required check cargo test (repository root) failed: exit code 1."` (`closed_task_completion::pre_existing::*`, `plan_turn::an_unchanged_pre_existing_workspace_failure_does_not_stop_a_finished_task`, `plan_turn::a_regression_over_a_pre_existing_failure_is_repaired_then_the_task_completes`); guards for introduced findings, `uncertain`, declined baselines, a stale classification and the old wire shape; `task_control::tests::an_accepted_pre_existing_failure_is_named_on_the_card_and_in_a_continuation`. Three expectations changed on purpose, each pinning the old "pre-existing means failed" behaviour: `verification_loop::a_matching_failed_baseline_is_pre_existing_and_starts_no_repair` and `a_pre_existing_error_that_shifts_lines_stays_pre_existing` now expect `OnlyPreExistingFailures`; eval scenario `verification_pre_existing_failure` now expects `verification_outcome = only_pre_existing_failures` and `final_task_status = complete`. Their no-repair, provenance, repair-target and model-call assertions are unchanged. Not covered (observation 70): a plan-declared check the model runs itself records an unclassified `CommandExit`, so a pre-existing failure there still blocks its step; Task 2's fixture names scoped checks that avoid it. Specs 101, 102, 105 updated with dated notes. Local checks (2026-11-09): four-crate `cargo nextest` 3031 run, 3028 passed before the three expectation updates, then `verification_loop` + `harness` 217 passed; deterministic eval tier 62/62; scoped clippy (4 crates), fmt, typos, `node --check` clean. Workspace gate left to CI. |
 | 2 · `single_worker_spec` fixture | Not started | |
 | 3 · Acceptance driver, criteria and report (`eval-harness::acceptance`) | Not started | |
 | 4 · Deterministic tier through the in-process worker host | Not started | |
@@ -36,19 +36,19 @@ the code survey they rest on are in [`context.md`](context.md).
 Requirement 11, context D1. Engine only (`completion.rs`, reading the
 provenance records spec 102 already writes).
 
-- [ ] Failing tests first, through the orchestrator: (a) a required floor check
+- [x] Failing tests first, through the orchestrator: (a) a required floor check
       fails at task start and after the change with the same failure → the task
       completes with a named "pre-existing failure, unchanged" disposition in the
       completion report, not a pass; (b) the same check with an extra introduced
       finding → still blocks (repair first); after the repair → accepted;
       (c) `uncertain` (no task-start baseline) → never accepted; (d) a declined
       baseline → not accepted; (e) generic (unparsed) checks use R10's identity.
-- [ ] Add the disposition to `CompletionGateReport` (serde default, so old
+- [x] Add the disposition to `CompletionGateReport` (serde default, so old
       reports load) and render it wherever waivers are rendered (desktop task
       control, CLI, recovery audit).
-- [ ] Update specs 101 (the gate and its waiver text), 102 (what provenance now
+- [x] Update specs 101 (the gate and its waiver text), 102 (what provenance now
       decides) and 105 (the completion obligation), each with a dated note.
-- [ ] Scoped checks for workspace-engine, desktop-shell, damaian-cli,
+- [x] Scoped checks for workspace-engine, desktop-shell, damaian-cli,
       eval-harness; the deterministic eval tier.
 
 ## Task 2 · `single_worker_spec` fixture

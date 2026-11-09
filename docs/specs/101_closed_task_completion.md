@@ -40,7 +40,12 @@ finished task.
    never represented as passed, and the completion report names the waiver. An
    explicit decline of the exact deferred command a required check would run is
    the same waiver (spec 105 review fix R8); a policy refusal, a timeout or a
-   model that never runs the command is not.
+   model that never runs the command is not. Separately, a required check whose
+   latest run fails only with the failure the task started with — classified
+   `pre_existing` or `unchanged_failure` against a real task-start `Failed`
+   baseline, nothing introduced — is a named **accepted failure** in the report
+   (`accepted_failures`), never a pass and never a waiver (spec 106
+   requirement 11).
 4. When the model answers after #66's reminder while work remains, the task
    becomes a new durable `incomplete` status rather than `complete`. The open
    plan and the reasons from the completion gate remain attached.
@@ -717,3 +722,51 @@ Checks run locally on 2026-11-06:
   passed.
 
 Workspace clippy and the other crates' suites beyond those four are left to CI.
+
+### Spec 106 Task 1, 2026-11-09: an unchanged pre-existing failure is accepted
+
+Planning spec 106 found that requirement 8 of that spec could not be met.
+This gate assigned no provenance, and its only waiver is declining a check
+before it runs. Since R15 the floor makes the touched roots' checks required, so
+a floor check that already failed on a known problem could never be satisfied:
+any task touching a root with one broken check could not complete. Damijan
+decided (spec 106 `context.md` D1) that such a check is accepted, named, and
+never passed.
+
+What changed:
+
+- `CompletionGateReport` gains `accepted_failures: Vec<CompletionAcceptance>`
+  (`check`, `provenance`, `explanation`), `#[serde(default)]` and omitted when
+  empty, so earlier reports load and keep their wire shape.
+- `CompletionGateReport::evaluate`: a failed `CheckRun` for a required check is
+  accepted when `accepted_pre_existing_failure` holds. All three conditions are
+  required: the check's classification was written after its latest run
+  (`VerificationState::current_provenance`, a new fold flag cleared by every
+  `Check` event and set by `Provenance`), it is `pre_existing` or
+  `unchanged_failure` with nothing introduced, and the task-start baseline is
+  `Failed`. `uncertain`, `declined`, `unavailable` and an absent baseline never
+  qualify.
+- Settlement: a verification whose remaining failures are all accepted now
+  finishes `only_pre_existing_failures` instead of `failed`, and settles through
+  this gate. It is never `passed`; its summary reads "Only failures that were
+  already there before this task remain …".
+- The task card names the accepted failure on a completed task
+  (`completion_detail`), and the Continue prompt lists it with "Do not try to fix
+  it as part of this task."
+
+Not covered, recorded as observation 70: a plan-declared required check that the
+model runs itself as an ordinary command records a `CommandExit`, not a
+classified run. If it fails only on a pre-existing problem, its step is blocked
+(R1) and the task still cannot complete. Spec 106's fixture names scoped checks
+that exclude the broken crate.
+
+Tests: `closed_task_completion::pre_existing::*` (unchanged failure accepted,
+`unchanged_failure` accepted, introduced finding still blocks, `uncertain`
+never accepted, declined baseline never accepted, a classification older than
+the latest run never accepted, the report's old wire shape),
+`plan_turn::an_unchanged_pre_existing_workspace_failure_does_not_stop_a_finished_task`,
+`plan_turn::a_regression_over_a_pre_existing_failure_is_repaired_then_the_task_completes`
+and `task_control::tests::an_accepted_pre_existing_failure_is_named_on_the_card_and_in_a_continuation`.
+The two accepting gate tests and both orchestrator tests failed before the
+change with `RequiredCheckFailed: "Required check cargo test (repository root)
+failed: exit code 1."`.
