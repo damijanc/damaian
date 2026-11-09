@@ -7,6 +7,11 @@
 //! paths the run is scored on — stays out of it. The fixture test asserts that
 //! no answer marker leaks into the fixture.
 
+pub mod criteria;
+pub mod driver;
+pub mod policy;
+pub mod report;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
