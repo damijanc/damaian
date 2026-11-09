@@ -3414,6 +3414,66 @@ that half is specified but blocked on a conversation-window redesign
 ([spec 49](specs/49_prompt_cache_accounting_and_reuse/proposal.md) §5.8), not
 on anything you configured.
 
+### A single-worker acceptance run failed
+
+The acceptance gate (spec 106) has two tiers. The deterministic tier runs inside
+the workspace test suite (`desktop-shell` `acceptance_tests`). It scripts the
+model, so a failure there is an engine or worker-host regression, not model
+behaviour. The live tier starts the real `damaian-desktop-shell --worker` binary
+against a real provider. It is ignored by default, never runs in CI, and costs
+real tokens. Run it from the repository root, reading the key inline for that
+one command. For DeepSeek, whose key is the Keychain item `deepseek-api-key`:
+
+```sh
+DAMAIAN_EVAL_PROVIDER=deepseek DAMAIAN_EVAL_MODEL=deepseek-v4-flash \
+  DEEPSEEK_API_KEY="$(security find-generic-password -s deepseek-api-key -w)" \
+  cargo test -p desktop-shell --test single_worker_acceptance --locked \
+  -- --ignored --nocapture live_single_worker_acceptance
+```
+
+The key variable is the provider entry's `model_api_key_env`. Each run uses a
+freshly materialized fixture and a short temporary data directory
+(`$TMPDIR/dsa-<pid>-<n>`, short because the worker's socket path must fit in
+104 bytes). It never touches your real Damaian data. The run prints a summary
+and two paths:
+
+- `report:` — `report.md` and `report.json` for the run. The summary is also
+  appended to the run's parent session as an assistant message.
+- `data directory kept for inspection:` — the whole data directory. Delete it
+  when you are done.
+
+Read a failed report in this order:
+
+1. **`Stopped:`** names why the driver gave up. *would need a forbidden
+   intervention* means the task ended `incomplete` or waiting on something only
+   **Continue task** or **Continue repair** could move — the stall the gate
+   exists to catch. *protected path proposed*, *stopped after N decisions without
+   the task ending* and *the worker asked for a decision the acceptance cannot
+   answer* are the other driver stops. *transport failed* means
+   the worker's socket stopped answering: look for the worker's own error in the
+   test's stderr.
+2. **The failed criteria.** `required_checks_satisfied` names the gate's reason
+   codes. `plan_steps_finished` lists each step's status, so the open step shows
+   where the run stopped.
+3. **The worker's session log**, `sessions/<worker session id>.jsonl` under the
+   kept data directory. The `completionReport` on the last
+   `task_status_updated` explains each reason, and the `plan_step_updated`
+   events show which evidence each step closed on.
+
+**Deviations** list decisions the driver approved even though they fell
+outside what the fixture expects, such as a command outside the expected
+command families. They are recorded and reach the parent session, but they do
+not fail a run on their own.
+
+A failed live run resets the count of consecutive passes. Diagnose it from the
+report before running again: a product defect is fixed first, and the run is
+recorded in spec 106's `tasks.md`. The failures found on 2026-11-09 are
+recorded there, and the engine rules they changed are in spec 105's 2026-11-09
+notes:
+
+- a stale check on an earlier step that nothing could refresh;
+- a step closed without running its required check.
+
 ### The packaged app will not launch
 
 Release DMGs are Developer ID signed and notarized, so they open without a

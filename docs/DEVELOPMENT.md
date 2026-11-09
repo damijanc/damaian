@@ -72,6 +72,11 @@ DAMAIAN_EVAL_PROVIDER=deepseek DAMAIAN_EVAL_MODEL=deepseek-v4-flash \
   cargo test -p eval-harness --locked -- --ignored live_tier
 ```
 
+The single-worker acceptance gate (spec 106) has its own live command, which
+starts the real worker binary against a provider; it is in
+[Troubleshooting](TROUBLESHOOTING.md#a-single-worker-acceptance-run-failed),
+with how to read its report. Its deterministic tier runs in the workspace suite.
+
 ### Adding a scenario
 
 Add a `.toml` file under `crates/eval-harness/scenarios/`. Each declares a

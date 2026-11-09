@@ -1336,6 +1336,21 @@ required check with one of four dispositions:
 - **Waived** — you declined the check; it is named in the report and never
   counted as passed.
 
+**A plan step does not close before its check has run.** When a step carries a
+required check, the agent cannot mark that step finished until the exact command
+has run in its directory on that step, you have declined it, or verification has
+run it. Until then the step stays in progress and the agent is told which
+command to run. Without this, a step could close with its check never run, and
+the task would stop incomplete on a check nothing would ever run.
+
+**A finished step's check that went stale runs again by itself.** When a later
+step changes files after an earlier step's check passed, that check's result no
+longer describes the tree, and only a fresh run can clear it. The verification
+after the next patch runs it again, and so does the end of the task when no
+step is left open. It is proposed like any check and asks for approval when the
+policy says so. A stale check on a step that is still in progress is that
+step's own work, so it does not stop a worker from continuing.
+
 A required check whose result is missing blocks completion as well. A detected
 check the policy can auto-run simply runs; one that needs approval appears on
 the ordinary check card, and declining it is the named waiver. A check the model
@@ -1963,6 +1978,21 @@ A **worker** is a session that runs on its own: it gets a prompt, works in a new
 - **Approvals** look exactly as they do in your own sessions and continue in the same worker process without restarting it. A worker's command card has no *Allow Always*, and its plan steps cannot be edited before approval. Patch proposals and provider-switch offers end the turn as usual and are answered from the worker's session. Once you have applied or rejected every file of a worker's patch, the worker verifies it and carries on with its plan, as your own sessions do; a check card it raises is answered in the worker's session too, without Always allow.
 - **Restart worker.** A worker whose process ended shows *Interrupted* if it ended mid-turn, or *Ended*, and offers **Restart worker**. That starts a new, idle process for the same session and worktree, and the composer comes back. An approval the old process was waiting for ended with it, and its command did not run. An unanswered question is reattached instead, because its asked-and-unanswered state is durable; answer the same card to continue, and no model call runs until you do.
 - **A worker can ask.** When the answer would materially change scope, public behaviour, a destructive action or the acceptance criteria, a worker pauses on the same question card your own conversation uses. The board groups it under *Needs you* and labels it **Needs your answer**; **Review** opens the card. Answering it authorises nothing and resumes the same turn in the worker's process. Low-impact ambiguity is still handled by a stated assumption, and the two-question-per-turn limit still applies.
+
+**What has been shown about one worker.** Damaian's acceptance gate gives one
+worker a small specification task. The worker has to explore the repository,
+ask one clarifying question, plan, make changes in two batches, repair a
+regression it caused, leave a known pre-existing failure alone, keep away from
+a protected file, and update the task record. The only interventions allowed
+are the decisions the app always asks for: the plan, patches, commands, checks
+and the question. Pressing **Continue task** or editing files by hand fails the
+run. On 2026-11-09 the gate passed three runs in a row against one real
+provider and model (DeepSeek `deepseek-v4-flash`).
+
+That is evidence that one worker can finish one task-sized piece of a
+specification without being nudged along. It is not evidence that every
+provider or model will, that larger or vaguer specifications will finish, or
+that several workers can coordinate. Every safety decision still waits for you.
 
 **Nothing outlives Damaian.** When Damaian quits, crashes or is force-quit, every worker exits within seconds and takes every command it started with it. Deleting a session stops its workers, and a worker's own session too. Their worktrees, branches and session logs are kept.
 
