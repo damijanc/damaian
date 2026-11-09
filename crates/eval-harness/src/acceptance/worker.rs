@@ -77,6 +77,10 @@ pub struct WorkerTransport<C: WorkerControl> {
     /// decided twice.
     decided: HashSet<String>,
     last_task_status: Option<String>,
+    /// Whether the worker has started any work. A freshly spawned worker is
+    /// idle until its prompt arrives (the supervisor delivers it on a thread
+    /// of its own), and that idle must not read as "the task ended".
+    started: bool,
 }
 
 impl<C: WorkerControl> WorkerTransport<C> {
@@ -103,6 +107,7 @@ impl<C: WorkerControl> WorkerTransport<C> {
             patch_order: Vec::new(),
             decided: HashSet::new(),
             last_task_status: None,
+            started: false,
         })
     }
 
@@ -150,6 +155,9 @@ impl<C: WorkerControl> WorkerTransport<C> {
                 Some("status") => {
                     if let Some(status) = payload.get("taskStatus").and_then(Value::as_str) {
                         self.last_task_status = Some(status.to_string());
+                    }
+                    if payload.get("state").and_then(Value::as_str) == Some("running") {
+                        self.started = true;
                     }
                 }
                 _ => {}
@@ -204,14 +212,31 @@ impl<C: WorkerControl> Transport for WorkerTransport<C> {
     fn next(&mut self) -> Result<Pending> {
         let deadline = Instant::now() + self.timing.settle_timeout;
         loop {
-            let status = self.send(json!({"command": "status"}))?;
+            // A freshly spawned worker opens its control socket a moment after
+            // the process starts; until it has started work, no answer means
+            // "not up yet", not a failure. Once it has started, it is one.
+            let status = match self.send(json!({"command": "status"})) {
+                Ok(status) => status,
+                Err(error) if self.started || Instant::now() >= deadline => return Err(error),
+                Err(_) => {
+                    std::thread::sleep(self.timing.poll);
+                    continue;
+                }
+            };
             let state = status
                 .get("state")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
             self.read_progress()?;
+            if matches!(
+                state.as_str(),
+                "running" | "paused" | "waiting_for_approval"
+            ) {
+                self.started = true;
+            }
             match state.as_str() {
+                "idle" if !self.started => {}
                 "waiting_for_approval" => {
                     if let Some(question_id) = status.get("questionId").and_then(Value::as_str)
                         && !self.decided.contains(question_id)
