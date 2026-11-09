@@ -1,15 +1,16 @@
 # Feature Spec: Single-Worker Specification Acceptance Gate
 
-Status: Not started
+Status: Not started (planned 2026-11-09; Tasks 1–7 in [tasks.md](tasks.md))
 Order: 106 of 106
 Plan: none. This is the executable capability gate requested after one Damaian
-worker failed to finish the reserved spec 86 on 2026-10-31.
-Depends on: [#18](18_local_evaluation_harness/proposal.md) (evaluation
-harness), [#98](98_task_scoped_protected_patch_paths.md) (scope fence),
-[#101](101_closed_task_completion.md),
-[#102](102_repair_provenance_and_stagnation.md),
-[#103](103_bounded_worker_continuation.md), [#104](104_worker_questions/proposal.md),
-and [#105](105_structured_plan_checks/proposal.md) — #18, #98, #101, #102, #103,
+worker failed to finish the reserved spec 86 on 2026-10-31. The planning pass
+and its decisions are in [context.md](context.md).
+Depends on: [#18](../18_local_evaluation_harness/proposal.md) (evaluation
+harness), [#98](../98_task_scoped_protected_patch_paths.md) (scope fence),
+[#101](../101_closed_task_completion.md),
+[#102](../102_repair_provenance_and_stagnation.md),
+[#103](../103_bounded_worker_continuation.md), [#104](../104_worker_questions/proposal.md),
+and [#105](../105_structured_plan_checks/proposal.md) — #18, #98, #101, #102, #103,
 #104 and #105 are built; **nothing here is unbuilt, so this spec is ready to
 start**.
 
@@ -48,10 +49,11 @@ one worker finishes one spec without generic rescue prompts.
    Generic **Continue task**, **Continue repair**, task reset, manual source
    edits and out-of-band Git repair are forbidden interventions.
 8. Success requires: every approved plan step terminal; required checks current
-   and passed or explicitly waived; the introduced regression repaired; the
-   pre-existing failure unchanged and classified correctly; protected paths
-   untouched; task records truthful; no pending decision; and final
-   `TaskStatus::Complete` accepted by #101's gate.
+   and passed, explicitly waived, or failing only with a pre-existing failure
+   that is unchanged against a real task-start baseline (requirement 11); the
+   introduced regression repaired; the pre-existing failure unchanged and
+   classified correctly; protected paths untouched; task records truthful; no
+   pending decision; and final `TaskStatus::Complete` accepted by #101's gate.
 9. Run the live scenario successfully three consecutive times from fresh state
    before marking this specification Done. Record provider/model, duration,
    rounds, tokens, approval counts, repair attempts and compactions for each
@@ -59,6 +61,16 @@ one worker finishes one spec without generic rescue prompts.
 10. A quality-gate pass cannot substitute for the live acceptance, and live
     acceptance cannot substitute for CI. Both are recorded in this spec's task
     history when it is implemented.
+11. Added in planning (2026-11-09, [context.md](context.md) D1): the completion
+    gate accepts a required check whose only failure is pre-existing and
+    unchanged — provenance `pre_existing` or `unchanged_failure` measured
+    against a real task-start baseline — as a named completion disposition
+    shown in the report, never as passed. `uncertain` never qualifies, and any
+    introduced finding in the same check still blocks until repaired. Without
+    this, requirement 8 is unsatisfiable: #101's gate assigns no provenance, and
+    a floor check (spec 101/105 review fix R15) that already failed cannot be
+    declined, so any task touching a root with a known failing check could
+    never complete.
 
 ## 3. Non-goals
 
@@ -83,6 +95,13 @@ The live runner starts the same request through the desktop worker host rather
 than calling `run_agentic_turn` directly. Decisions are supplied by a fixture
 driver only where the UI would present an allowed decision; the driver refuses
 generic rescue actions and fails on any unexpected proposal.
+
+Both tiers share one fixture, one decision driver and one acceptance report
+(planning decisions D2–D9 in [context.md](context.md)). The deterministic tier
+hosts the worker in process with a scripted model; the live tier spawns the
+real worker binary through `workers::Supervisor`. Patches are applied the way
+the desktop shell applies them, followed by the same automatic `verify` the UI
+sends, so neither tier has a side door the product lacks.
 
 ## 5. Acceptance report
 
