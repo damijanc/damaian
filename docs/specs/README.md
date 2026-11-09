@@ -103,9 +103,9 @@ on 2026-10-31, #98, #101 and #102 on 2026-11-01, and #103 and #104 on
 41601326024); #104's scoped local checks passed and the full gate is left to CI.
 Several were evidence-driven or usability specs added outside the roadmap
 order; being finished, none of them changes what may be built next. #105–#106
-are the remaining single-worker reliability sequence added after the failed
-spec 86 attempt: structured checks (now Done, 2026-11-04), and the acceptance
-gate that proves the sequence works as one system (now unblocked and ready).
+completed the single-worker reliability sequence added after the failed
+spec 86 attempt: structured checks (Done, 2026-11-04), and the acceptance
+gate that proves the sequence works as one system (Done, 2026-11-09).
 
 - **Done:** #30 memory retrieval and lifecycle finished on
   2026-10-30, built on branch `spec-30-memory-recall` (Tasks 1–6 on
@@ -164,9 +164,9 @@ gate that proves the sequence works as one system (now unblocked and ready).
   validation) as unspecified, so it is not in the ready set.
 - **Ready:** #33 MCP management. It was serialised behind #30 on `chat.rs`;
   with #30 Done it is free to start, from a `main` that contains #30's turn
-  path so it does not rebase over it. #103, #104 and #105 are Done. In the
-  single-worker sequence, [#106](106_single_worker_spec_acceptance/proposal.md) is the
-  last item and is now unblocked.
+  path so it does not rebase over it. The single-worker sequence #101–#106 is
+  Done; [#106](106_single_worker_spec_acceptance/proposal.md) finished it on
+  2026-11-09, and nothing waited on it.
 - **Blocked:** #37 on #33; #52 on #33; #54 on Phase 1 WP3 (provider capability
   validation), which is unspecified.
 - **Retired:** specification numbers #38–#40 were deleted on 2026-11-01. Their
@@ -176,8 +176,7 @@ gate that proves the sequence works as one system (now unblocked and ready).
   `chat.rs`, and #49's reuse slice is a solo `chat.rs` track while it rewrites
   the request around `build_model_prompt`. #33 edits `chat.rs` through the MCP
   tool list and per-tool dispatch and owns that file while it is in flight.
-  #106 follows #105 and primarily owns the eval harness. Every Done spec,
-  including #98, #101, #102, #103, #104 and #105, no longer constrains
+  Every Done spec, including #98 and #101–#106, no longer constrains
   anything. See [Parallel work](#parallel-work).
 - **Open decision:** the priority table below predates #59–#80 and does not
   rank them; the text after it now calls #23 the priority with #65 done.
@@ -789,6 +788,13 @@ deterministic tier exercises pre-existing, environment, declined-baseline,
 repeated-failure and A→B→A oscillation cases through the real engine, and the
 scoped local checks are recorded in #102's §7.
 
+Re-derived on 2026-11-09, when
+[#106](106_single_worker_spec_acceptance/proposal.md) finished. No `Depends on:`
+line named #106, so nothing joins the ready set; #106 leaves the ready set and
+ends the single-worker sequence. Its live tier passed three consecutive fresh
+runs against DeepSeek `deepseek-v4-flash`. Two of the earlier, failed runs found
+engine stalls, and both are fixed in #105's 2026-11-09 notes. The full gate passed in CI.
+
 ### Parallel work
 
 Two specs may be built at once, which is a **deliberate exception to the
@@ -936,7 +942,7 @@ is ready.
 | 103 | [103_bounded_worker_continuation.md](103_bounded_worker_continuation.md) | **Done 2026-11-03.** Seven tasks: durable task-budget model and restrict-only policy; worker plan-review approval; pure within-turn compaction; safety-pinned request integration; bounded automatic worker segments; durable terminal outcomes and recovery; evaluation and close-out. Task 7 added eight deterministic eval scenarios covering three-segment completion after one budget approval, the genuine budgetless worker pause, independent command and patch approvals, planned-worker long-read compaction plus an ordered reread, byte-identical pinned safety state, and the three typed stops across a fresh engine, with exact segment counts. It also added focused engine regressions proving a planned budgeted worker compacts an older read while the latest open-step result, worker-record protected paths, `PatchApplied` base hashes and active error-finding pins stay verbatim. The user, troubleshooting, security, README and changelog records are updated. Scoped checks and the deterministic tier pass locally; the full seven-check gate passed in CI on 2026-11-03 (Quality run 41601326024). |
 | 104 | [104_worker_questions/](104_worker_questions/proposal.md) | **Done 2026-11-03** (converted to a folder and built that day; scoped checks in its [`tasks.md`](104_worker_questions/tasks.md), the full gate is left to CI). An app-managed worker can persist a real clarification, show **Needs your answer**, and resume through its control socket without treating an answer as an approval or guessing a material product decision. The offering test is split into a durable question route and a synchronous user; the worker prompt asks on material ambiguity while a headless turn stops as incomplete; a restart reattaches an open question without a model call. |
 | 105 | [105_structured_plan_checks/](105_structured_plan_checks/proposal.md) | **Done 2026-11-04.** Approved plan steps carry structured required checks with command, directory and current evidence, replacing #97's prose match and giving the completion gate an engine-owned verification obligation. Six tasks landed: the versioned `PlannedCheck` model and parse/replay, `CheckId`-identity deferral, authoritative approval with the review-card editor, the derived mutation-batch generation and staleness, the completion gate over structured required checks, and recovery/continuation, documentation and close-out. Requirements 3, 8 and 10 are pinned by focused tests; one deterministic scenario (`approved_plan_required_check`) exercises the completion obligation. Review fixes on 2026-11-06 added the discovered-check floor to the gate: its required set is the plan's required checks plus the owning and enclosing roots' detected checks for every touched file, merged by `CheckId`. |
-| 106 | [106_single_worker_spec_acceptance/proposal.md](106_single_worker_spec_acceptance/proposal.md) | **In progress; started 2026-11-09.** #18, #98, #101, #102, #103, #104 and #105 are built. Planned as a folder spec with seven tasks ([tasks.md](106_single_worker_spec_acceptance/tasks.md)); planning added requirement 11 (an unchanged pre-existing failure against a real task-start baseline satisfies a required check, as a named disposition), without which requirement 8 was unsatisfiable. Tasks 1–6 are done: the deterministic tier passes in the workspace suite, and on 2026-11-09 three consecutive fresh live runs (deepseek / `deepseek-v4-flash`, runs 4–6) passed every criterion with no forbidden intervention. Runs 1 and 3 found two engine stalls, now fixed and recorded in #105's 2026-11-09 notes: a finished step's stale check is rerun by the engine, and `complete_step` refuses a step whose required check has not run. Task 7 (documentation) is written; the spec becomes Done once CI is green on that state. |
+| 106 | [106_single_worker_spec_acceptance/proposal.md](106_single_worker_spec_acceptance/proposal.md) | **Done 2026-11-09** (planned and started 2026-11-09; seven tasks in [tasks.md](106_single_worker_spec_acceptance/tasks.md)). Planning added requirement 11: an unchanged pre-existing failure against a real task-start baseline satisfies a required check, as a named disposition. The deterministic tier runs in the workspace suite. On 2026-11-09, three consecutive fresh live runs (deepseek / `deepseek-v4-flash`, runs 4–6) passed every criterion with no forbidden intervention. Runs 1 and 3 found two engine stalls, fixed and recorded in #105's 2026-11-09 notes: a finished step's stale check is rerun by the engine, and `complete_step` refuses a step whose required check has not run. The full seven-check gate passed in CI on 2026-11-09. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:

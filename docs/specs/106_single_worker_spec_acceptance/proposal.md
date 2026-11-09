@@ -1,6 +1,6 @@
 # Feature Spec: Single-Worker Specification Acceptance Gate
 
-Status: In progress (started 2026-11-09; Tasks 1–7 in [tasks.md](tasks.md))
+Status: Done 2026-11-09 (started 2026-11-09; Tasks 1–7 in [tasks.md](tasks.md); three consecutive live passes and a green CI run)
 Order: 106 of 106
 Plan: none. This is the executable capability gate requested after one Damaian
 worker failed to finish the reserved spec 86 on 2026-10-31. The planning pass

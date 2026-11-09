@@ -1,6 +1,6 @@
 # Spec 106 context — planning decisions
 
-Status: In progress (planned and started 2026-11-09). This file records what the planning pass found in
+Status: Done 2026-11-09 (planned and started 2026-11-09). This file records what the planning pass found in
 the code and what was decided, so each task session can start from the
 repository instead of the planning conversation.
 
