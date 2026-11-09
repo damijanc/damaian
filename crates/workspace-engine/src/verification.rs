@@ -1997,6 +1997,40 @@ pub fn propose_checks_exactly(
     Ok(selection_from_proposals(repository_root, &roots, proposals))
 }
 
+/// Adds the plan-declared checks the gate says must run again to a selection.
+///
+/// Spec 106 Task 6: a finished step's required check can only be refreshed by
+/// the verification loop (see `CompletionGateService::plan_checks_needing_rerun`).
+/// A check the selection already proposes is not proposed twice. Each added
+/// check keeps the gate's identity, so its `CheckRun` is the one the gate
+/// reads, and is proposed through the ordinary command policy.
+pub fn with_plan_checks(
+    orchestrator: &ValidationOrchestrator,
+    repository_root: &Path,
+    selection: Selection,
+    checks: &[CheckId],
+) -> Result<Selection> {
+    let mut proposed = match selection {
+        Selection::Proposed(proposed) => proposed,
+        other if checks.is_empty() => return Ok(other),
+        _ => Vec::new(),
+    };
+    for check in checks {
+        if proposed.iter().any(|(existing, _)| existing == check) {
+            continue;
+        }
+        let working_directory = if check.working_directory.is_empty() {
+            repository_root.to_path_buf()
+        } else {
+            repository_root.join(&check.working_directory)
+        };
+        let proposal =
+            orchestrator.propose_plan_check(repository_root, &working_directory, &check.command)?;
+        proposed.push((check.clone(), proposal));
+    }
+    Ok(Selection::Proposed(proposed))
+}
+
 fn selection_from_proposals(
     repository_root: &Path,
     roots: &[String],

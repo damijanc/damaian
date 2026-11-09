@@ -102,7 +102,7 @@ use crate::verification::{
     CheckId, CheckOutcome, CheckTermination, FailureProvenance, FindingEvidence, Selection,
     SkipReason, VerificationEvent, VerificationOutcome, VerificationReport,
     environment_termination, fold_verification, propose_checks, propose_checks_exactly,
-    propose_completion_checks,
+    propose_completion_checks, with_plan_checks,
 };
 use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
@@ -2696,8 +2696,9 @@ impl ChatOrchestrator {
         });
         let selection = if !due.checks.is_empty() {
             // A completion due carries the exact floor checks the answer-time
-            // trigger found missing or stale. Run those and nothing else: a
-            // plan-declared check stays the model's responsibility.
+            // trigger found missing or stale. Run those and nothing else; the
+            // finished steps' stale plan checks are added below, as for any
+            // verification (spec 106 Task 6).
             propose_checks_exactly(
                 &self.validation_orchestrator,
                 repository_root,
@@ -2719,6 +2720,17 @@ impl ChatOrchestrator {
                 &changed,
             )?
         };
+        // Spec 106 Task 6: a finished step's required check that went stale
+        // can only be refreshed here; nothing the model runs on a later step
+        // counts for it. Rerun it with the change's own checks.
+        let plan_reruns = CompletionGateService::new(&self.session_store, repository_root)
+            .plan_checks_needing_rerun(session_id, &task.id)?;
+        let selection = with_plan_checks(
+            &self.validation_orchestrator,
+            repository_root,
+            selection,
+            &plan_reruns,
+        )?;
         let browser = self.browser_check(session_id, &session, &task, &changed)?;
         if browser.is_none() {
             return match selection {
@@ -4689,6 +4701,46 @@ impl ChatOrchestrator {
             .settle(&task, settlement)?
             .task;
         self.verification_turn_result(session, task, response, None, Some(report), changed)
+    }
+
+    /// The required check `step` declares, when nothing has answered it yet.
+    ///
+    /// Answered means a run or a decline of exactly that command in exactly
+    /// that directory on the step (including what this turn observed and has
+    /// not attached yet), or a verification-loop run of the same identity in
+    /// the task's chain. Stale evidence still answers it: a rerun is the
+    /// engine's job once the step has closed (spec 106 Task 6).
+    fn unrun_required_check(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        step: &PlanStep,
+        pending_evidence: &[crate::plan::Evidence],
+    ) -> Result<Option<CheckId>> {
+        let Some(planned) = step.check.as_ref().filter(|planned| planned.required) else {
+            return Ok(None);
+        };
+        let check = CheckId::new(planned.working_directory.as_str(), planned.command.as_str());
+        if step
+            .evidence
+            .iter()
+            .chain(pending_evidence)
+            .any(|evidence| crate::completion::evidence_answers_check(evidence, &check))
+        {
+            return Ok(None);
+        }
+        let chain = self
+            .session_store
+            .task_continuation_chain(session_id, task_id)?;
+        let ids = chain.iter().map(String::as_str).collect::<Vec<_>>();
+        let verified = self
+            .session_store
+            .read_verification_events(session_id, &ids)?
+            .iter()
+            .any(|event| {
+                matches!(event, VerificationEvent::Check { check: ran, .. } if ran == &check)
+            });
+        Ok((!verified).then_some(check))
     }
 
     /// Continues the task a verification interrupted (spec 77).
@@ -11396,6 +11448,41 @@ impl ChatOrchestrator {
                                     Some(open_index) => {
                                         let was_blocked = current.steps[open_index].status
                                             == crate::plan::StepStatus::Blocked;
+                                        // Spec 106 Task 6 (live run 3): a step that
+                                        // declares a required check does not close
+                                        // before that check has run on it, or been
+                                        // declined, or been run by the verification
+                                        // loop. Closing it anyway left the gate a
+                                        // missing check nothing would ever run (it is
+                                        // the model's job, review follow-up to R16),
+                                        // and the worker stopped. Refusing here is the
+                                        // one point where the model can still act.
+                                        let unrun_check = if was_blocked {
+                                            None
+                                        } else {
+                                            self.unrun_required_check(
+                                                &session.id,
+                                                &task.id,
+                                                &current.steps[open_index],
+                                                &step_evidence,
+                                            )?
+                                        };
+                                        if let Some(check) = unrun_check {
+                                            let title = current.steps[open_index].title.clone();
+                                            (
+                                                "Attempted to complete a step.".to_string(),
+                                                format!(
+                                                    "Step \"{title}\" declares the required check `{}` ({}), and it has not run on this step. Run exactly that command in that directory with run_command, then call complete_step again. The step stays in progress.",
+                                                    check.command,
+                                                    if check.working_directory.is_empty() {
+                                                        "repository root".to_string()
+                                                    } else {
+                                                        check.working_directory.clone()
+                                                    }
+                                                ),
+                                                ActionOutcome::Failed,
+                                            )
+                                        } else {
                                         // The model asked to move on; it does not get
                                         // to say how the step ended. §5.3: the status
                                         // is a function of the evidence, and this is
@@ -11490,6 +11577,7 @@ impl ChatOrchestrator {
                                                 result,
                                                 ActionOutcome::Ok,
                                             )
+                                        }
                                         }
                                     }
                                 }
@@ -12597,8 +12685,30 @@ impl ChatOrchestrator {
                         // exactly those through the ordinary check policy. A
                         // plan-declared check stays the model's job.
                         let gate = CompletionGateService::new(&self.session_store, repository_root);
-                        let needed_floor_checks =
+                        let mut needed_floor_checks =
                             gate.floor_checks_needing_verification(&session.id, &settled.task.id)?;
+                        // Spec 106 Task 6: once no plan work is open, a finished
+                        // step's stale required check is rerun the same way, or
+                        // the task would stop on evidence nothing the model can
+                        // run is able to refresh. Mid-plan, the next patch's
+                        // verification reruns it instead. A check that never ran
+                        // stays the model's job (review follow-up to R16).
+                        let plan_work_open = settled.report.reason_codes().iter().any(|code| {
+                            matches!(
+                                code,
+                                CompletionReasonCode::OpenPlanSteps
+                                    | CompletionReasonCode::BlockedPlanSteps
+                            )
+                        });
+                        if !plan_work_open {
+                            for check in
+                                gate.plan_checks_needing_rerun(&session.id, &settled.task.id)?
+                            {
+                                if !needed_floor_checks.contains(&check) {
+                                    needed_floor_checks.push(check);
+                                }
+                            }
+                        }
                         if !needed_floor_checks.is_empty() {
                             let paths = self
                                 .session_store

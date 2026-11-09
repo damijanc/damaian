@@ -355,6 +355,17 @@ impl CompletionGateReport {
         }
 
         for (check, step) in required {
+            // A check whose own step is still open is that step's unfinished
+            // work, which `OpenPlanSteps` already reports. Reporting it stale
+            // or missing as well adds no information, and a second reason stops
+            // a worker's automatic continuation, so the step could never be
+            // finished (spec 106 Task 4 for missing, Task 6 for stale). Once
+            // the step closes, the check is judged in full, and the engine
+            // reruns a stale one itself
+            // ([`CompletionGateService::plan_checks_needing_rerun`]).
+            let own_step_open = step.is_some_and(|step| {
+                matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
+            });
             // The evidence for a required check is one of two things. A check
             // that ran through the verification loop has a `CheckRun` keyed by
             // identity; a check deferred to its own plan step was run by the
@@ -376,6 +387,9 @@ impl CompletionGateReport {
                         && deferred_evidence_is_current(plan, evidence_step, index)
                     {
                         record_command_evidence(&check, evidence, &mut reasons, &mut waivers);
+                        continue;
+                    }
+                    if own_step_open {
                         continue;
                     }
                     reasons.push(CompletionReason {
@@ -451,14 +465,7 @@ impl CompletionGateReport {
                 None => latest_matching_evidence_in_plan(plan, &check),
             };
             let Some((evidence_step, evidence_index, evidence)) = evidence else {
-                // A deferred check is due once its own step has run. While that
-                // step is still pending or running, the open step is what keeps
-                // the task from completing; reporting the check as missing too
-                // would make plain open plan work look like a missing result,
-                // and stop a worker's automatic continuation (spec 106 Task 4).
-                if step.is_some_and(|step| {
-                    matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
-                }) {
+                if own_step_open {
                     continue;
                 }
                 reasons.push(CompletionReason {
@@ -474,6 +481,9 @@ impl CompletionGateReport {
             // from the durable plan record: the batch boundary and any mutation
             // recorded after this evidence (spec 105 requirement 5).
             if !deferred_evidence_is_current(plan, evidence_step, evidence_index) {
+                if own_step_open {
+                    continue;
+                }
                 reasons.push(CompletionReason {
                     code: CompletionReasonCode::RequiredCheckStale,
                     explanation: format!(
@@ -595,6 +605,12 @@ fn matching_command_evidence(evidence: &Evidence, check: &CheckId) -> Option<Com
     }
 }
 
+/// Whether `evidence` is a run or a decline of exactly `check`: the same
+/// identity matcher the gate uses for a deferred check.
+pub(crate) fn evidence_answers_check(evidence: &Evidence, check: &CheckId) -> bool {
+    matching_command_evidence(evidence, check).is_some()
+}
+
 /// The latest matching command evidence on one plan step.
 fn latest_matching_evidence_on_step(
     step: &PlanStep,
@@ -608,6 +624,45 @@ fn latest_matching_evidence_on_step(
             matching_command_evidence(evidence, check)
                 .map(|command_evidence| (index, command_evidence))
         })
+}
+
+/// The finished steps' required checks whose evidence is stale
+/// ([`CompletionGateService::plan_checks_needing_rerun`]).
+///
+/// The same evidence rules as the gate: a loop `CheckRun` is authoritative
+/// when present, otherwise the latest matching command evidence on the
+/// check's own step under R4's currentness rule.
+fn finished_plan_checks_needing_rerun(
+    plan: &TaskPlan,
+    verification: &VerificationState,
+    current_hashes: &BTreeMap<String, String>,
+) -> Vec<CheckId> {
+    let generation = plan.mutation_generation();
+    let mut needed = Vec::new();
+    let mut seen = BTreeSet::new();
+    for step in plan.steps.iter().filter(|step| {
+        !step.id.starts_with(VERIFICATION_STEP_PREFIX)
+            && matches!(step.status, StepStatus::Completed | StepStatus::Skipped)
+    }) {
+        let Some(planned) = step.check.as_ref().filter(|planned| planned.required) else {
+            continue;
+        };
+        let check = CheckId::new(planned.working_directory.as_str(), planned.command.as_str());
+        if !seen.insert(check.clone()) {
+            continue;
+        }
+        let rerun = match verification.checks.get(&check) {
+            Some(run) => run.is_stale(current_hashes, generation),
+            None => match latest_matching_evidence_on_step(step, &check) {
+                Some((index, _)) => !deferred_evidence_is_current(plan, step, index),
+                None => false,
+            },
+        };
+        if rerun {
+            needed.push(check);
+        }
+    }
+    needed
 }
 
 /// The latest matching command evidence anywhere in the plan, in durable plan
@@ -843,6 +898,46 @@ impl<'a> CompletionGateService<'a> {
             .session_store
             .task_touched_paths(&session.id, task_id)?;
         Ok(floor_checks(self.repository_root, &map, &touched))
+    }
+
+    /// The plan-declared required checks the engine must rerun itself.
+    ///
+    /// Spec 106 Task 6 (live run 1): a required check declared on a plan step
+    /// is read only from that step, so once a later step begins or a patch
+    /// lands, nothing the model runs afterwards can refresh it — a plan whose
+    /// last step updates the task record stopped `incomplete` on
+    /// `required_check_stale` every time. This returns each such check whose
+    /// step has finished (completed or skipped) and whose evidence is stale.
+    /// The verification loop runs them through the ordinary approval and
+    /// command policy; a fresh run is the only thing that clears them, never
+    /// the stale evidence itself. A check that never ran is not returned: it
+    /// stays the model's job (review follow-up to R16), as a failing or
+    /// declined one stays with repair and the waiver.
+    ///
+    /// This executes nothing and stores no proposal; it reads the same facts the
+    /// gate report reads.
+    pub fn plan_checks_needing_rerun(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<CheckId>> {
+        let Some(plan) = self.session_store.read_task_plan(session_id, task_id)? else {
+            return Ok(Vec::new());
+        };
+        let chain = self
+            .session_store
+            .task_continuation_chain(session_id, task_id)?;
+        let ids = chain.iter().map(String::as_str).collect::<Vec<_>>();
+        let events = self
+            .session_store
+            .read_verification_events(session_id, &ids)?;
+        let verification = fold_verification(events.iter());
+        let current_hashes = current_hashes(self.repository_root, &verification);
+        Ok(finished_plan_checks_needing_rerun(
+            &plan,
+            &verification,
+            &current_hashes,
+        ))
     }
 
     /// The floor checks a completion verification must run now.

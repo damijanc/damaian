@@ -283,6 +283,27 @@ impl ValidationOrchestrator {
         )
     }
 
+    /// Proposes a plan-declared required check for the verification loop to
+    /// rerun (spec 106 Task 6). The command is classified by the ordinary
+    /// policy exactly like any other proposal, so a rerun never needs less
+    /// approval than the model's own run of it did. Its purpose is `Check`,
+    /// as a detected validation's is: it is the check the plan declared.
+    pub fn propose_plan_check(
+        &self,
+        repository_root: impl AsRef<Path>,
+        working_directory: impl AsRef<Path>,
+        command: &str,
+    ) -> Result<CommandProposal> {
+        self.store_proposal(
+            repository_root,
+            working_directory,
+            command,
+            "Required check from the plan, run again because the files changed after it last ran",
+            true,
+            Vec::new(),
+        )
+    }
+
     /// `detected` marks a proposal from [`Self::propose_detected_validations`],
     /// whose purpose is `Check` whatever its text.
     fn store_proposal(

@@ -305,9 +305,12 @@ fn declining_an_unrelated_command_is_not_a_waiver() {
     );
     let report = report_for(&engine, &result);
     assert!(report.waivers.is_empty(), "{report:?}");
+    // Since spec 106 Task 6 `complete_step` refuses to close the step before
+    // its required check is answered, and this decline does not answer it: the
+    // step stays open rather than closing on a missing check.
     assert_eq!(
         report.reason_codes(),
-        vec![CompletionReasonCode::RequiredCheckMissing],
+        vec![CompletionReasonCode::OpenPlanSteps],
         "{report:?}"
     );
 }
@@ -330,9 +333,12 @@ fn declining_the_same_command_in_another_directory_is_not_a_waiver() {
     );
     let report = report_for(&engine, &result);
     assert!(report.waivers.is_empty(), "{report:?}");
+    // Since spec 106 Task 6 `complete_step` refuses to close the step before
+    // its required check is answered, and this decline does not answer it: the
+    // step stays open rather than closing on a missing check.
     assert_eq!(
         report.reason_codes(),
-        vec![CompletionReasonCode::RequiredCheckMissing],
+        vec![CompletionReasonCode::OpenPlanSteps],
         "{report:?}"
     );
 }

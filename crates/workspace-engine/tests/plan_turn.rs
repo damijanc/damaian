@@ -330,6 +330,21 @@ fn continue_task(
         .expect("the continuation should run")
 }
 
+/// How many times the verification loop ran the plan's `ls` check at the
+/// repository root, across every task of the session.
+fn loop_runs_of_the_plan_check(engine: &WorkspaceEngine, session_id: &str) -> usize {
+    engine
+        .session_store
+        .read_verification_events(session_id, &[])
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            matches!(event, VerificationEvent::Check { check, .. }
+                if check == &CheckId::new("", "ls"))
+        })
+        .count()
+}
+
 const CHECK_ON_SECOND_STEP: &str = r#"{"steps":[
     {"title":"Make the change"},
     {"title":"Run the check","check":{"command":"ls","workingDirectory":"","purpose":"validates the final tree","required":true}}
@@ -1213,7 +1228,14 @@ fn a_required_check_in_a_subdirectory_is_missing_when_the_command_ran_at_the_roo
     let result = decide(&engine, &proposal.id, true, None, &mut after);
 
     let plan = plan_of(&engine, &result).expect("the settled plan should read back");
-    assert_eq!(plan.steps[1].status, StepStatus::Completed);
+    // Since spec 106 Task 6 `complete_step` applies the same identity: the
+    // root run does not answer the `crates/foo` check, so the step does not
+    // close and the refusal names the directory the check needs.
+    assert_eq!(
+        plan.steps[1].status,
+        StepStatus::InProgress,
+        "the same command at the repository root is a different check"
+    );
     assert_eq!(
         plan.steps[1]
             .evidence
@@ -1227,10 +1249,16 @@ fn a_required_check_in_a_subdirectory_is_missing_when_the_command_ran_at_the_roo
         Some(""),
         "the run at the root records the repository root, not `crates/foo`"
     );
-    assert_eq!(
-        gate_report(&engine, &result).reason_codes(),
-        vec![CompletionReasonCode::RequiredCheckMissing],
-        "the same command at the repository root is a different check"
+    assert!(
+        engine
+            .session_store
+            .read_messages(&result.session.id)
+            .unwrap()
+            .iter()
+            .any(|message| message.role == "tool"
+                && message.content.contains("has not run")
+                && message.content.contains("(crates/foo)")),
+        "the refusal names the check's own directory"
     );
 }
 
@@ -1480,8 +1508,14 @@ fn a_plan_revision_with_a_directory_outside_the_repository_is_rejected() {
 /// and no later step had begun. A patch applied after the check, still in the
 /// same step, left the evidence stale in fact but current to the gate, so the
 /// task could close on a tree the check never saw.
+///
+/// Spec 106 Task 6 (live run 1): the task must still never close on that
+/// stale evidence, but it must not stall on it either. While the check's own
+/// step is open the stale check is that step's business, so it does not stop
+/// the continuation; once the step closes, the engine reruns the check itself
+/// before the task can complete.
 #[test]
-fn a_patch_applied_after_the_deferred_check_makes_its_evidence_stale() {
+fn a_patch_applied_after_the_deferred_check_is_rerun_when_its_step_closes() {
     let repo = temp_repo("check-stale-same-step");
     let engine = engine_for(&repo);
     let (checked, patch) =
@@ -1505,14 +1539,29 @@ fn a_patch_applied_after_the_deferred_check_makes_its_evidence_stale() {
         .apply_stored_patch(&repo, &patch, None, None, "tester", false)
         .expect("the approved patch applies");
 
-    // Clear the patch's verification due through its ordinary route. The
-    // verification turn carries the plan; the stale check stops it continuing.
     let verified = run_verification_due(
         &engine,
         &repo,
         &checked.session.id,
         &mut MockModelAdapter::new("Done."),
     );
+    let report = engine
+        .session_store
+        .read_completion_report(&checked.session.id, &verified.task.id)
+        .unwrap()
+        .expect("the verification settles through the gate");
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::OpenPlanSteps],
+        "a stale check on a still-open step is that step's work, not a second \
+         blocker that stops the continuation: {report:?}"
+    );
+    assert_eq!(
+        loop_runs_of_the_plan_check(&engine, &checked.session.id),
+        0,
+        "while its step is open, the check stays the model's to run"
+    );
+
     let mut adapter = scripted(vec![vec![call("complete_step", "{}")]]);
     let result = continue_task(
         &engine,
@@ -1523,20 +1572,22 @@ fn a_patch_applied_after_the_deferred_check_makes_its_evidence_stale() {
     );
 
     assert_eq!(
+        loop_runs_of_the_plan_check(&engine, &checked.session.id),
+        1,
+        "closing the step without a rerun makes the engine rerun the stale check"
+    );
+    assert_eq!(
         result.task.status,
-        TaskStatus::Incomplete,
-        "the check ran before the patch, so closing the step cannot complete the task"
+        TaskStatus::Complete,
+        "the rerun validated the patched tree: {:?}",
+        result.task
     );
     let report = engine
         .session_store
         .read_completion_report(&checked.session.id, &result.task.id)
         .unwrap()
-        .expect("the continued task settles through the gate");
-    assert_eq!(
-        report.reason_codes(),
-        vec![CompletionReasonCode::RequiredCheckStale],
-        "{report:?}"
-    );
+        .expect("the completed task carries its report");
+    assert!(report.eligible, "{report:?}");
 }
 
 /// The other side of the same rule: rerunning the exact check after the patch
@@ -1589,11 +1640,15 @@ fn rerunning_the_deferred_check_after_the_patch_makes_it_current() {
 }
 
 /// A patch applied in a later step also invalidates the earlier check's
-/// evidence. That case already read as stale before R4 because the later step
-/// had begun; the test keeps the rule from regressing when staleness starts
-/// tracking mutations rather than step position alone.
+/// evidence (R4), and the rule must not regress to step position alone.
+///
+/// Spec 106 Task 6 (live run 1): this is the shape of every plan that updates
+/// its task record last. Nothing the model runs later can refresh a check
+/// declared on an earlier step, so the verification after the later patch
+/// reruns the finished step's stale check itself. The task then continues and
+/// completes instead of stopping `incomplete` on `required_check_stale`.
 #[test]
-fn a_patch_applied_in_a_later_step_makes_the_check_step_stale() {
+fn a_check_made_stale_by_a_later_step_is_rerun_by_the_next_verification() {
     let repo = temp_repo("check-stale-later-step");
     let engine = engine_for(&repo);
     let mut adapter = scripted(vec![
@@ -1635,6 +1690,22 @@ fn a_patch_applied_in_a_later_step_makes_the_check_step_stale() {
         &result.session.id,
         &mut MockModelAdapter::new("Done."),
     );
+    assert_eq!(
+        loop_runs_of_the_plan_check(&engine, &result.session.id),
+        1,
+        "the verification after the later patch reran the finished step's check"
+    );
+    let report = engine
+        .session_store
+        .read_completion_report(&result.session.id, &verified.task.id)
+        .unwrap()
+        .expect("the verification settles through the gate");
+    assert_eq!(
+        report.reason_codes(),
+        vec![CompletionReasonCode::OpenPlanSteps],
+        "only the open later step remains: {report:?}"
+    );
+
     let mut adapter = scripted(vec![vec![call("complete_step", "{}")]]);
     let result = continue_task(
         &engine,
@@ -1644,16 +1715,11 @@ fn a_patch_applied_in_a_later_step_makes_the_check_step_stale() {
         &mut adapter,
     );
 
-    assert_eq!(result.task.status, TaskStatus::Incomplete);
-    let report = engine
-        .session_store
-        .read_completion_report(&result.session.id, &result.task.id)
-        .unwrap()
-        .expect("the continued task settles through the gate");
     assert_eq!(
-        report.reason_codes(),
-        vec![CompletionReasonCode::RequiredCheckStale],
-        "{report:?}"
+        result.task.status,
+        TaskStatus::Complete,
+        "{:?}",
+        result.task
     );
 }
 
@@ -1880,7 +1946,8 @@ fn rerunning_the_failed_command_after_the_patch_completes_the_step() {
 /// R4 plus R13: a passing deferred required check and the patch it validates in
 /// the same turn used to lose the check's exit at the patch pause, so the gate
 /// reported it missing. With the exit kept, the applied patch makes it stale —
-/// the safe direction, and the one that tells the worker to rerun it.
+/// the safe direction. Since spec 106 Task 6 the engine then reruns the stale
+/// check when the step closes, so the task completes on a fresh run.
 #[test]
 fn a_required_check_before_a_patch_in_one_turn_is_stale_not_missing() {
     let repo = temp_repo("check-then-patch-one-turn");
@@ -1944,16 +2011,38 @@ fn a_required_check_before_a_patch_in_one_turn_is_stale_not_missing() {
         &verified.task.id,
         &mut adapter,
     );
-    assert_eq!(result.task.status, TaskStatus::Incomplete);
-    let report = engine
+    // The answer that closed the step settled on the stale check (not a
+    // missing one) before the engine reran it.
+    let settled_reasons: Vec<Vec<CompletionReasonCode>> = engine
         .session_store
-        .read_completion_report(&result.session.id, &result.task.id)
+        .read_tasks(&result.session.id)
         .unwrap()
-        .expect("the continued task settles through the gate");
+        .iter()
+        .filter_map(|task| {
+            engine
+                .session_store
+                .read_completion_report(&result.session.id, &task.id)
+                .unwrap()
+        })
+        .map(|report| report.reason_codes())
+        .collect();
+    assert!(
+        settled_reasons.contains(&vec![CompletionReasonCode::RequiredCheckStale]),
+        "{settled_reasons:?}"
+    );
+    assert!(
+        !settled_reasons
+            .iter()
+            .flatten()
+            .any(|code| *code == CompletionReasonCode::RequiredCheckMissing),
+        "the kept exit is never reported missing: {settled_reasons:?}"
+    );
+    assert_eq!(loop_runs_of_the_plan_check(&engine, &result.session.id), 1);
     assert_eq!(
-        report.reason_codes(),
-        vec![CompletionReasonCode::RequiredCheckStale],
-        "{report:?}"
+        result.task.status,
+        TaskStatus::Complete,
+        "{:?}",
+        result.task
     );
 }
 
@@ -3419,13 +3508,11 @@ fn a_required_check_is_baselined_at_task_start_and_a_later_regression_is_repaire
     );
 
     // No verification runs between the two patches, so patch 1's regression is
-    // first observed after patch 2. Complete the first two steps in a later
-    // turn and propose the second patch.
+    // first observed after patch 2. The first two steps are closed and the
+    // second patch is proposed in a later turn.
+    close_first_two_steps(&engine, &proposed.task);
     let patch2 = patch_call_with("crates/foo/src/lib.rs", "pub fn value() -> u8 { 2 }\n");
-    let mut after_first = scripted(vec![
-        vec![call("complete_step", "{}"), call("complete_step", "{}")],
-        vec![patch2],
-    ]);
+    let mut after_first = scripted(vec![vec![patch2]]);
     let continued = ask_in_session(
         &engine,
         &repo,
@@ -3466,6 +3553,34 @@ fn a_required_check_is_baselined_at_task_start_and_a_later_regression_is_repaire
         request_text(&repair_adapter).contains("Repair only the failures this patch introduced"),
         "the introduced failure starts an ordinary repair turn"
     );
+}
+
+/// Closes the first two steps of `task`'s plan with no evidence and starts the
+/// third, written straight to the durable plan.
+///
+/// Before spec 106 Task 6 these fixtures had the model close the checked
+/// "Validate" step without running its check, so that the verification loop
+/// ran the check after patch 2. `complete_step` now refuses that, and while the
+/// step is open the loop leaves the check to it, so the state these baseline
+/// and provenance tests need can no longer come from the model. It is written
+/// here instead; what the tests check — how the loop's run of the required
+/// check is classified against its baseline — is unchanged.
+fn close_first_two_steps(engine: &WorkspaceEngine, task: &workspace_engine::Task) {
+    let mut plan = engine
+        .session_store
+        .read_task_plan(&task.session_id, &task.id)
+        .expect("the plan should read")
+        .expect("the task carries the plan");
+    for step in &mut plan.steps[..2] {
+        step.status = StepStatus::Completed;
+        step.completed_at_ms = Some(1);
+    }
+    plan.steps[2].status = StepStatus::InProgress;
+    plan.steps[2].started_at_ms = Some(1);
+    engine
+        .session_store
+        .revise_plan(task, &plan)
+        .expect("the plan revision records");
 }
 
 /// Applies the uncertain scenario: a command changes a file before the plan
@@ -3521,11 +3636,9 @@ fn uncertain_repair_fixture(
         .revise_plan(&proposed.task, &plan)
         .expect("the plan revision records");
 
+    close_first_two_steps(&engine, &proposed.task);
     let patch2 = patch_call_with("crates/foo/src/lib.rs", "pub fn value() -> u8 { 2 }\n");
-    let mut after_first = scripted(vec![
-        vec![call("complete_step", "{}"), call("complete_step", "{}")],
-        vec![patch2],
-    ]);
+    let mut after_first = scripted(vec![vec![patch2]]);
     let continued = ask_in_session(
         &engine,
         &repo,
@@ -4424,9 +4537,11 @@ fn a_plan_declared_member_check_does_not_hide_the_missing_workspace_root_floor()
 }
 
 /// (b) A mixed gate: the plan's required member check was never run and the
-/// floor's workspace root check is missing. The answer-time run covers only the
-/// floor; the task stays incomplete for the plan-declared check, which remains
-/// the model's job.
+/// floor's workspace root check is missing. The plan-declared check remains the
+/// model's job and is never auto-run. Since spec 106 Task 6 the model can no
+/// longer close that step without the check (`complete_step` refuses it), so
+/// the task stays incomplete on the open step rather than on a missing check,
+/// and the floor waits for the plan work to finish (R16).
 #[test]
 fn a_missing_floor_check_runs_even_when_a_plan_check_is_also_missing() {
     let (repo, shell) = r16_workspace_fixture("r16-mixed-floor-and-plan");
@@ -4460,12 +4575,18 @@ fn a_missing_floor_check_runs_even_when_a_plan_check_is_also_missing() {
 
     assert_eq!(result.task.status, TaskStatus::Incomplete, "{result:?}");
     assert!(
-        a_check_passed(&engine, &proposed.session.id, &root_check),
-        "the floor check still runs"
-    );
-    assert!(
         !a_check_passed(&engine, &proposed.session.id, &member_check),
         "the plan-declared check is not auto-run"
+    );
+    let plan = engine
+        .session_store
+        .read_task_plan(&proposed.session.id, &result.task.id)
+        .expect("the plan should read")
+        .expect("the task carries its plan");
+    assert_eq!(
+        plan.steps[2].status,
+        StepStatus::InProgress,
+        "the member check's step does not close without its check"
     );
     let report = engine
         .session_store
@@ -4474,19 +4595,10 @@ fn a_missing_floor_check_runs_even_when_a_plan_check_is_also_missing() {
         .expect("the settlement carries a report");
     assert_eq!(
         report.reason_codes(),
-        vec![CompletionReasonCode::RequiredCheckMissing],
+        vec![CompletionReasonCode::OpenPlanSteps],
         "{report:?}"
     );
-    assert!(
-        report.reasons[0]
-            .explanation
-            .contains("cargo test (crates/member)"),
-        "the remaining obligation is the plan's member check: {report:?}"
-    );
-    assert!(
-        !report.reasons[0].explanation.contains("repository root"),
-        "the floor check is not the remaining blocker: {report:?}"
-    );
+    let _ = root_check;
 }
 
 /// (c) The model itself runs the exact floor command in the exact directory
@@ -5404,5 +5516,68 @@ fn a_regression_over_a_pre_existing_failure_is_repaired_then_the_task_completes(
         TaskStatus::Complete,
         "after the repair only the pre-existing failure remains: {:?}",
         completion_report(&engine, &verified)
+    );
+}
+
+/// Spec 106 Task 6 (live run 3): the model closed a step with `complete_step`
+/// without running the step's declared required check. The step closed with
+/// no evidence for it, the gate reported `required_check_missing` beside the
+/// open steps, and the worker stopped. Running the check stays the model's job
+/// (review follow-up to R16), so `complete_step` now refuses to close the step
+/// until its check has run, naming the exact command; the model runs it and
+/// the step closes.
+#[test]
+fn complete_step_refuses_a_step_whose_required_check_has_not_run() {
+    let repo = temp_repo("complete-step-needs-check");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[
+                {"title":"Run the check","check":{"command":"ls","workingDirectory":"","purpose":"validates the tree","required":true}},
+                {"title":"Finish"}
+            ]}"#,
+        )],
+        // Closing the step before its check is refused...
+        vec![call("complete_step", "{}")],
+        // ...so the model runs it, and the step then closes.
+        vec![call(
+            "run_command",
+            r#"{"command":"ls","reason":"Run the step's required check"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        vec![call("complete_step", "{}")],
+    ]);
+    let result = ask(&engine, &repo, "Check the tree", &mut adapter);
+
+    let refusals: Vec<String> = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.role == "tool" && message.content.contains("has not run"))
+        .map(|message| message.content)
+        .collect();
+    assert_eq!(refusals.len(), 1, "the first complete_step is refused once");
+    assert!(
+        refusals[0].contains("`ls`"),
+        "the refusal names the exact command: {}",
+        refusals[0]
+    );
+    let plan = plan_of(&engine, &result).expect("the plan should read back");
+    assert_eq!(plan.steps[0].status, StepStatus::Completed);
+    assert!(
+        plan.steps[0]
+            .evidence
+            .iter()
+            .any(|evidence| matches!(evidence, Evidence::CommandExit { .. })),
+        "the check ran on its own step: {:?}",
+        plan.steps[0]
+    );
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Complete,
+        "{:?}",
+        result.task
     );
 }

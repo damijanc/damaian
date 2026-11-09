@@ -500,3 +500,92 @@ report it missing. Tests:
 `closed_task_completion::deferred_not_yet_due::*` (the two open-step cases
 failed before the change with `["open_plan_steps", "required_check_missing"]`;
 the closed and blocked guards passed before and after).
+
+## Spec 106 Task 6, 2026-11-09: a finished step's stale check is rerun by the engine
+
+The first live acceptance run (DeepSeek, `deepseek-v4-flash`) finished all
+the work and then stopped `incomplete` with its last step, "Update the Task 1
+record", still open. The gate gave two reasons, `open_plan_steps` and
+`required_check_stale`. The plan's step 4 declared `cargo test -p pricing -p
+invoice`, and the model ran it on step 4. Step 5 then began and patched
+`tasks.md`, so under R4 that evidence was stale. A plan-declared check reads
+evidence only from its own step, so nothing the model ran later could refresh
+it. The verification after the patch reran only the detected floor checks. The
+worker's automatic continuation requires `open_plan_steps` to be the only
+reason, so the worker stopped. Every plan that updates its task record last has
+this shape.
+
+Two rules changed. Neither lets stale evidence count as a pass:
+
+- **A stale check on a still-open step is that step's work.** Like a missing
+  one since Task 4, it is reported as `open_plan_steps` alone while its own
+  step is `pending` or `in_progress`. Once the step closes, it is judged in
+  full.
+- **The engine reruns a finished step's stale check.**
+  `CompletionGateService::plan_checks_needing_rerun` returns each required
+  plan check whose step is completed or skipped and whose evidence is stale. A
+  loop `CheckRun` is authoritative when present; otherwise R4's rule applies to
+  the evidence on the step. Those checks are rerun in two places:
+  - every post-apply verification adds them to its selection;
+  - the answer-time completion run adds them once no plan work is open.
+
+  Each one is proposed through the ordinary command policy
+  (`ValidationOrchestrator::propose_plan_check`), with the gate's own
+  identity, so its fresh `CheckRun` is the evidence the gate reads.
+
+  A check that never ran is not rerun: it stays the model's job, per the R16
+  follow-up. A failing check stays with repair, and a declined one stays a
+  waiver.
+
+Tests in `plan_turn`:
+
+- `a_check_made_stale_by_a_later_step_is_rerun_by_the_next_verification`
+  (the live run's shape) failed before the change with 0 loop runs of the
+  check;
+- `a_patch_applied_after_the_deferred_check_is_rerun_when_its_step_closes`
+  failed before the change with `["open_plan_steps", "required_check_stale"]`;
+- `a_required_check_before_a_patch_in_one_turn_is_stale_not_missing` now
+  asserts that the answer settles on `required_check_stale`, never on
+  `required_check_missing`, and that the rerun completes the task.
+
+The R16 tests that keep a missing plan check out of the automatic run pass
+unchanged.
+
+## Spec 106 Task 6, 2026-11-09: `complete_step` refuses a step whose required check has not run
+
+The third live acceptance run stopped `incomplete` after its second verified
+patch, with gate reasons `open_plan_steps` and `required_check_missing`.
+
+- The model declared `cargo test -p pricing` (repository root) as step 1's
+  required check, then closed step 1 with `complete_step` without running it.
+- The verification loop ran `cargo test` in `crates/pricing`, an equivalent
+  check under a different identity, so it did not count.
+- A plan check that never ran stays the model's job (R16 follow-up): the
+  engine does not run it.
+- Automatic continuation stops on any reason besides `open_plan_steps`.
+
+`complete_step` now refuses to close a step that declares a required check
+until that check is answered. A check is answered by:
+
+- a run of exactly that command in exactly that directory on the step,
+  including what the turn observed and has not attached yet;
+- a decline of that command by the user, which stays the named waiver;
+- a verification-loop run of the same identity in the task's chain.
+
+The refusal names the command and directory and leaves the step in progress.
+Stale evidence still answers the check: the engine reruns a finished step's
+stale check (the note above). A blocked step's re-judgement is unchanged.
+
+Tests:
+
+- `plan_turn::complete_step_refuses_a_step_whose_required_check_has_not_run`
+  failed before the change: the step closed without the check.
+- Tests whose scripts closed a checked step without its check now expect the
+  refusal:
+  - `a_required_check_in_a_subdirectory_is_missing_when_the_command_ran_at_the_root`;
+  - `a_missing_floor_check_runs_even_when_a_plan_check_is_also_missing`, which
+    now ends on `open_plan_steps`, with the member check still not auto-run;
+  - the two `deferred_check_waiver` "is not a waiver" tests.
+- The four baseline and provenance tests needed the checked step already
+  closed when the loop runs its check. The model can no longer produce that
+  state, so the shared helper `close_first_two_steps` writes it to the plan.
