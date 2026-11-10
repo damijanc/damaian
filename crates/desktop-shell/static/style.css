@@ -1449,6 +1449,69 @@ button:disabled {
   display: none;
 }
 
+/* Spec 107: names the decision a paused turn waits on, right above the box the
+   user would otherwise type into. */
+.composer-decision {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent-soft);
+  padding: 6px 8px 6px 12px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.composer-decision[hidden] {
+  display: none;
+}
+
+.composer-decision-label {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The pending card, last in the conversation. It keeps the card's own look;
+   the accent edge marks it as the one waiting, and goes once it is decided. */
+.pending-decision {
+  width: min(880px, 100%);
+  border-left: 3px solid transparent;
+  padding-left: 10px;
+}
+
+.pending-decision[data-waiting="true"] {
+  border-left-color: var(--accent);
+}
+
+.pending-decision:focus {
+  outline: none;
+}
+
+.pending-decision:focus-visible {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.pending-decision > .question-card:first-child {
+  margin-top: 0;
+}
+
+.pending-decision-pointer {
+  display: block;
+  margin-top: 10px;
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
 .pinned-context-files {
   min-height: 0;
   display: flex;

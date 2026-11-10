@@ -6099,6 +6099,7 @@ function clearSessionList() {
 function clearChat() {
   stopWorkerView();
   $("chat-log").innerHTML = "";
+  resetPendingDecision();
   protectedPathsControl = null;
   $("protected-paths-panel").hidden = true;
   showProtectedPathOutcome("");
@@ -6898,6 +6899,7 @@ function liveTurnDurationMs(payload, indicator) {
 // them afterwards.
 function renderMessages(messages, tasks = [], compactions = [], conversation = null) {
   $("chat-log").innerHTML = "";
+  resetPendingDecision();
   // Spec 55 §5.9: the boundary marker says where the model's view begins. The
   // original messages stay below it — nothing was deleted, only not sent.
   const boundary = conversationBoundaryMarker(compactions, conversation);
@@ -7467,7 +7469,13 @@ function renderMemoryProposals() {
     heading.textContent = "A memory to confirm";
     stack.append(heading, createMemoryProposalCard(memoryProposals[0]));
   }
-  log.append(stack);
+  // A pending decision stays the last thing above the composer (spec 107).
+  const pending = pendingDecision?.frame;
+  if (pending?.parentElement === log) {
+    log.insertBefore(stack, pending);
+  } else {
+    log.append(stack);
+  }
 }
 
 function createMemoryProposalCard(proposal) {
@@ -13168,21 +13176,36 @@ function createVerificationOfferCard(due) {
 // reviewed.
 function appendProposals(message, payload, repo) {
   noteContextPayload(payload);
+  // Spec 107: the card of the decision the turn waits on goes below the
+  // conversation, not into this bubble. Which proposal that is comes from the
+  // engine's `pendingDecision`, never from the card itself.
+  const decision = payload.turnPresentation?.pendingDecision || null;
+  const pendingField = decision ? PENDING_DECISION_FIELDS[decision.kind] : null;
+  let pendingCard = null;
+  const place = (field, card) => {
+    if (field === pendingField && !pendingCard) {
+      pendingCard = card;
+      return;
+    }
+    message.body.append(card);
+  };
   if (payload.commandProposal) {
-    message.body.append(createCommandApprovalPreview(payload.commandProposal, repo));
+    place("commandProposal", createCommandApprovalPreview(payload.commandProposal, repo));
   }
   if (payload.patchProposal) {
-    message.body.append(
-      createPatchPreview(payload.patchProposal, repo, {
-        // A patch is verified once every file of it is settled. The engine
-        // decides whether anything is due, so an unrelated or all-rejected
-        // patch is a no-op rather than a second run.
-        onResolved: () => startVerification(repo),
-      }),
-    );
+    const patchCard = createPatchPreview(payload.patchProposal, repo, {
+      // A patch is verified once every file of it is settled. The engine
+      // decides whether anything is due, so an unrelated or all-rejected
+      // patch is a no-op rather than a second run.
+      onResolved: () => {
+        settlePendingDecision(patchCard);
+        startVerification(repo);
+      },
+    });
+    place("patchProposal", patchCard);
   }
   if (payload.checkBatch) {
-    message.body.append(createCheckBatchCard(payload.checkBatch, repo));
+    place("checkBatch", createCheckBatchCard(payload.checkBatch, repo));
   }
   if (payload.verificationReport) {
     message.body.append(
@@ -13192,22 +13215,198 @@ function appendProposals(message, payload, repo) {
     );
   }
   if (payload.planProposal) {
-    message.body.append(createPlanReview(payload.planProposal, repo));
+    place("planProposal", createPlanReview(payload.planProposal, repo));
   }
   if (payload.fallbackProposal) {
-    message.body.append(createFallbackOffer(payload.fallbackProposal, repo));
+    place("fallbackProposal", createFallbackOffer(payload.fallbackProposal, repo));
   }
   if (payload.roundBudgetProposal) {
-    message.body.append(createRoundBudgetOffer(payload.roundBudgetProposal, repo));
+    place("roundBudgetProposal", createRoundBudgetOffer(payload.roundBudgetProposal, repo));
   }
   if (payload.questionProposal) {
-    message.body.append(createQuestionCard(payload.questionProposal, repo));
+    place("questionProposal", createQuestionCard(payload.questionProposal, repo));
   }
   if (payload.fetchProposal) {
-    message.body.append(createFetchApproval(payload.fetchProposal, repo));
+    place("fetchProposal", createFetchApproval(payload.fetchProposal, repo));
   }
   if (payload.contextReview) {
-    message.body.append(createContextReview(payload.contextReview, repo));
+    place("contextReview", createContextReview(payload.contextReview, repo));
+  }
+  // Every `done` passes through here, so a turn that ended with nothing
+  // pending also clears whatever the previous turn was waiting on.
+  setPendingDecision(message, pendingCard, decision);
+}
+
+// Spec 107: the decision a paused turn waits on, and the card that answers it.
+// The card is the last element of `#chat-log`, directly above the composer
+// (spec 93's rule for recovery cards), and the composer line names it. A
+// decided card stays where it is in the history (context D5).
+// `{ decision, baseDecision, card, frame }`; `baseDecision` is what a patch
+// card reverts to once its baseline card is decided.
+let pendingDecision = null;
+// The composer's own placeholder while a pending question has taken it over.
+let composerQuestionLock = null;
+
+// Which proposal of a turn's payload carries the card for each kind. A
+// baseline decision is a patch whose apply waits on the baseline card inside
+// the patch card, so the patch card is what moves.
+const PENDING_DECISION_FIELDS = {
+  question: "questionProposal",
+  patch: "patchProposal",
+  baseline: "patchProposal",
+  checks: "checkBatch",
+  command: "commandProposal",
+  round_budget: "roundBudgetProposal",
+  plan: "planProposal",
+  fallback: "fallbackProposal",
+  context_review: "contextReview",
+  fetch: "fetchProposal",
+};
+
+// `message` is the bubble that raised the decision; it keeps a one-line
+// pointer. `card` may be null (a reload that has no card for it): the composer
+// still names the decision, with nothing to focus.
+function setPendingDecision(message, card, decision) {
+  settlePendingDecision();
+  if (!decision) return;
+  let frame = null;
+  if (card) {
+    frame = document.createElement("section");
+    frame.className = "pending-decision";
+    frame.dataset.kind = decision.kind;
+    frame.dataset.cardId = decision.cardId || "";
+    frame.dataset.waiting = "true";
+    frame.tabIndex = -1;
+    frame.setAttribute("aria-label", decision.label);
+    // A reloaded question is its own `article.message.question`; it moves
+    // whole rather than leaving an empty article behind.
+    frame.append(card.closest(".message.question") || card);
+    $("chat-log").append(frame);
+    if (message?.body) appendPendingPointer(message.body, decision, frame);
+  }
+  pendingDecision = { decision, baseDecision: decision, card, frame };
+  syncComposerDecision();
+  frame?.scrollIntoView({ block: "nearest" });
+}
+
+function appendPendingPointer(body, decision, frame) {
+  const pointer = document.createElement("button");
+  pointer.type = "button";
+  pointer.className = "pending-decision-pointer";
+  pointer.textContent = `${decision.label} — the card is below.`;
+  pointer.addEventListener("click", () => {
+    frame.scrollIntoView({ block: "nearest" });
+    frame.focus({ preventScroll: true });
+  });
+  body.append(pointer);
+}
+
+// `card` limits this to one card: a patch reports its own settlement, and must
+// not clear a decision some later turn raised.
+function settlePendingDecision(card = null) {
+  if (!pendingDecision) return;
+  if (card && pendingDecision.card !== card) return;
+  if (pendingDecision.frame) pendingDecision.frame.dataset.waiting = "false";
+  pendingDecision = null;
+  syncComposerDecision();
+}
+
+// The DOM the state pointed into is gone (a session render or a cleared chat).
+function resetPendingDecision() {
+  pendingDecision = null;
+  syncComposerDecision();
+}
+
+// A patch card's apply can raise a baseline card outside any turn; the apply
+// and baseline routes return its `pendingDecision`. `null` means the baseline
+// is settled and the patch itself is pending again.
+function notePendingDecisionChange(card, decision) {
+  const current = pendingDecision;
+  if (!current || current.card !== card) return;
+  current.decision = decision || current.baseDecision;
+  if (current.frame) {
+    current.frame.dataset.kind = current.decision.kind;
+    current.frame.dataset.cardId = current.decision.cardId || "";
+    current.frame.setAttribute("aria-label", current.decision.label);
+    if (decision) current.frame.scrollIntoView({ block: "nearest" });
+  }
+  syncComposerDecision();
+}
+
+// Reload: the engine reports the decision in `/api/session`; the card is the
+// reloaded question or, after a restart, the reattached approval (spec 45).
+function restorePendingDecision(tasks) {
+  if (isWorkerSession(currentSessionId)) return;
+  const task = tasks.findLast((entry) => entry.turnPresentation?.pendingDecision);
+  if (!task) return;
+  const decision = task.turnPresentation.pendingDecision;
+  const log = $("chat-log");
+  // After a restart the sweep reattaches the decision as a recovery card,
+  // already below the conversation; that card is the pending one, and a
+  // transcript question stays where it was asked rather than joining it.
+  const recovered = [...log.querySelectorAll(".recovery-card")].find(
+    (entry) => entry.dataset.taskId === task.id,
+  );
+  const card =
+    recovered ||
+    (decision.kind === "question"
+      ? [...log.querySelectorAll(".question-card")].find(
+          (entry) => entry.dataset.questionId === decision.cardId,
+        )
+      : null);
+  const bubble = [...log.querySelectorAll(".message.assistant")].findLast(
+    (entry) => entry.dataset.taskId === task.id,
+  );
+  const body = bubble?.querySelector(".message-body");
+  setPendingDecision(body ? { body } : null, card || null, decision);
+}
+
+function focusPendingDecision() {
+  const frame = pendingDecision?.frame;
+  if (!frame?.isConnected) return;
+  frame.scrollIntoView({ block: "nearest" });
+  const kind = pendingDecision.decision.kind;
+  // D2: the question's own answer field, or its first option when it takes no
+  // free text. A baseline is decided on its own card inside the patch.
+  const target =
+    kind === "question"
+      ? frame.querySelector(".question-card-free-text input:not(:disabled)") ||
+        frame.querySelector(".question-card-options button:not(:disabled)")
+      : kind === "baseline"
+        ? frame.querySelector(".baseline-batch button:not(:disabled)")
+        : null;
+  (target || frame).focus({ preventScroll: true });
+}
+
+// The composer line, and D2's lock: while a question is pending the main
+// composer does not compete with the card's answer field, because a typed
+// message is not an answer. Hidden while a turn runs, and in a worker's view,
+// whose composer belongs to the worker (spec 57).
+function syncComposerDecision() {
+  const current = pendingDecision;
+  const inWorker = Boolean(workerView) || isWorkerSession(currentSessionId);
+  const visible = Boolean(current) && !chatSubmitting && !inWorker;
+  const line = $("composer-decision");
+  line.hidden = !visible;
+  if (visible) {
+    $("composer-decision-label").textContent = current.decision.label;
+    const go = $("composer-decision-btn");
+    go.hidden = !current.frame;
+    go.textContent = current.decision.kind === "question" ? "Answer" : "Show";
+  }
+  const field = $("chat-prompt");
+  const button = $("ask-btn");
+  const lock = visible && current.decision.kind === "question" && Boolean(current.frame);
+  if (lock) {
+    if (composerQuestionLock === null) composerQuestionLock = field.placeholder;
+    field.disabled = true;
+    field.placeholder = "Answer the question above";
+    button.disabled = true;
+  } else if (composerQuestionLock !== null) {
+    field.disabled = false;
+    field.placeholder = composerQuestionLock;
+    composerQuestionLock = null;
+    button.disabled = false;
   }
 }
 
@@ -14616,6 +14815,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
             state.baseline = {
               batch: result.baselineBatch,
               selection: pending.selection,
+              decision: result.pendingDecision || null,
             };
             render();
             return;
@@ -14629,6 +14829,8 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
     applyButton.disabled = !hasPending || Boolean(state.baseline);
     rejectButton.disabled = !hasPending || Boolean(state.baseline);
     $("chat-log").scrollTop = $("chat-log").scrollHeight;
+    // Spec 107: while the baseline card is up, the composer names it.
+    notePendingDecisionChange(wrapper, state.baseline?.decision || null);
   }
 
   async function runApply(selection) {
@@ -14650,6 +14852,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
         state.baseline = {
           batch: result.baselineBatch,
           selection,
+          decision: result.pendingDecision || null,
         };
         render();
         return;
@@ -15149,6 +15352,9 @@ async function loadSession(sessionId) {
   // The memory stack sits below the conversation and above nothing else, so it
   // is drawn after the messages it follows.
   await refreshMemoryProposals(currentSessionId);
+  // Spec 107: after everything else, so the decision the session waits on is
+  // the last card above the composer.
+  restorePendingDecision(payload.tasks || []);
   // Last: the strip and a worker's approval card follow what was just drawn.
   syncWorkerView();
 }
@@ -15707,10 +15913,23 @@ async function proposePatchFromChat(prompt, assistantMessage) {
     assistantMessage,
     `Prepared a patch preview for \`${payload.patchId}\`. Review the diff and apply selected files when ready.`,
   );
-  assistantMessage.body.append(createPatchPreview(payload, patchRepo));
   appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
   appendTurnNotes(assistantMessage.body, payload.turnNotes);
   markMessageUsage(assistantMessage, payload.usage, liveTurnDurationMs(payload, indicator));
+  // Spec 107: this one-shot route is not a turn and carries no turn
+  // presentation, but what it returns is always one patch to review.
+  const patchCard = createPatchPreview(payload, patchRepo, {
+    onResolved: () => settlePendingDecision(patchCard),
+  });
+  setPendingDecision(
+    assistantMessage,
+    patchCard,
+    payload.pendingDecision || {
+      kind: "patch",
+      label: "Review the patch",
+      cardId: payload.patchId || "",
+    },
+  );
 }
 
 // The turn currently in flight, so Stop (button or Escape) can reach its
@@ -15733,6 +15952,8 @@ function setComposerBusy(busy) {
   // "Fix selected" and the repo bar's action follow `chatSubmitting`, which
   // callers set before this.
   renderFindingsPanel();
+  // Last: a pending question takes the button back once nothing runs.
+  syncComposerDecision();
 }
 
 // Sizes the composer to its content. The floor and the cap both live in CSS
@@ -15993,6 +16214,8 @@ async function askAgainFromExhausted(sessionId, taskId) {
     void refreshRepoBar();
   }
 }
+
+$("composer-decision-btn").addEventListener("click", focusPendingDecision);
 
 $("ask-btn").addEventListener("click", () => {
   if (chatSubmitting) {

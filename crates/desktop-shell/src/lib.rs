@@ -9418,6 +9418,45 @@ mod tests {
         fs::remove_dir_all(&repo).ok();
     }
 
+    /// A turn paused on a model question, for looking at spec 107's reload
+    /// placement: the question card below everything else, the composer line
+    /// and the disabled composer.
+    fn pending_question_session(engine: &WorkspaceEngine, repository_id: &str) -> String {
+        let store = &engine.session_store;
+        let session = store
+            .create_session(repository_id, "Pick a retry policy")
+            .unwrap();
+        let task = store
+            .create_task(&session.id, "add a retry policy", "mock", "mock")
+            .unwrap();
+        store
+            .append_message(&session.id, Some(&task.id), "user", "add a retry policy")
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                "assistant",
+                "Before I add it I need one decision from you.",
+            )
+            .unwrap();
+        let question = PendingQuestionRef::new();
+        store
+            .record_question_asked(
+                &session.id,
+                &task.id,
+                &question,
+                &AskUserInput {
+                    question: "Exponential or fixed backoff?".to_string(),
+                    options: vec!["Exponential".to_string(), "Fixed".to_string()],
+                    allow_free_text: true,
+                },
+            )
+            .unwrap();
+        store.await_answer(&task, &question).unwrap();
+        session.id
+    }
+
     /// must not retry an incomplete resume response, and must not offer a
     /// second conflicting patch action while the baseline is pending.
     #[test]
@@ -9437,6 +9476,147 @@ mod tests {
         assert!(super::APP_JS.contains("Always allow"));
         assert!(super::APP_JS.contains("always,"));
         assert!(!super::APP_JS.contains("Checks need a baseline"));
+    }
+
+    /// The body of the top-level `function <name>(` in `app.js`, up to the
+    /// next top-level declaration.
+    fn app_js_function(name: &str) -> &'static str {
+        let app = super::APP_JS;
+        let start = app
+            .find(&format!("\nfunction {name}("))
+            .or_else(|| app.find(&format!("\nasync function {name}(")))
+            .unwrap_or_else(|| panic!("app.js has no function {name}"));
+        let rest = &app[start + 1..];
+        let end = rest.find("\n}\n").map_or(rest.len(), |end| end + 3);
+        &rest[..end]
+    }
+
+    /// Spec 107 Task 2, requirement 1, per kind: the card of every decision the
+    /// engine can report goes to the end of `#chat-log`, not into the bubble.
+    /// The match is exhaustive, so a new engine kind fails to compile here
+    /// until the UI says which proposal carries its card.
+    #[test]
+    fn app_js_places_every_pending_decision_kind_above_the_composer() {
+        use workspace_engine::PendingDecisionKind as Kind;
+        let kinds = [
+            Kind::Question,
+            Kind::Patch,
+            Kind::Checks,
+            Kind::Baseline,
+            Kind::Command,
+            Kind::RoundBudget,
+            Kind::Plan,
+            Kind::Fallback,
+            Kind::ContextReview,
+            Kind::Fetch,
+        ];
+        let append = app_js_function("appendProposals");
+        let fields = &super::APP_JS[super::APP_JS
+            .find("const PENDING_DECISION_FIELDS = {")
+            .expect("the kind-to-proposal map")..];
+        let fields = &fields[..fields.find("};").unwrap()];
+        for kind in kinds {
+            let (field, create) = match kind {
+                Kind::Question => ("questionProposal", "createQuestionCard"),
+                // A baseline card lives inside its patch card; the patch moves.
+                Kind::Patch | Kind::Baseline => ("patchProposal", "createPatchPreview"),
+                Kind::Checks => ("checkBatch", "createCheckBatchCard"),
+                Kind::Command => ("commandProposal", "createCommandApprovalPreview"),
+                Kind::RoundBudget => ("roundBudgetProposal", "createRoundBudgetOffer"),
+                Kind::Plan => ("planProposal", "createPlanReview"),
+                Kind::Fallback => ("fallbackProposal", "createFallbackOffer"),
+                Kind::ContextReview => ("contextReview", "createContextReview"),
+                Kind::Fetch => ("fetchProposal", "createFetchApproval"),
+            };
+            assert!(
+                fields.contains(&format!("  {}: \"{field}\",", kind.as_str())),
+                "{} maps to {field}",
+                kind.as_str()
+            );
+            assert!(
+                append.contains(&format!("place(\"{field}\"")),
+                "{field} is placed through the pending-decision rule"
+            );
+            assert!(
+                !append.contains(&format!("message.body.append({create}(")),
+                "{create} no longer goes straight into the bubble"
+            );
+        }
+        // The kind comes from the engine, and the call clears a stale one.
+        assert!(append.contains("payload.turnPresentation?.pendingDecision"));
+        assert!(append.contains("setPendingDecision(message, pendingCard, decision)"));
+        // A verification report is a result, not a decision: it stays put.
+        assert!(append.contains("message.body.append(\n      createVerificationReportCard("));
+
+        let set = app_js_function("setPendingDecision");
+        assert!(set.contains("$(\"chat-log\").append(frame)"));
+        assert!(set.contains("appendPendingPointer(message.body, decision, frame)"));
+        assert!(set.contains("scrollIntoView({ block: \"nearest\" })"));
+        assert!(app_js_function("appendPendingPointer").contains("the card is below."));
+        // The one-shot patch route has no turn, but its card follows the rule.
+        let one_shot = app_js_function("proposePatchFromChat");
+        assert!(one_shot.contains("setPendingDecision("));
+        assert!(!one_shot.contains("body.append(createPatchPreview"));
+        // A baseline card raised by an apply renames the pending decision.
+        assert!(super::APP_JS.contains("decision: result.pendingDecision || null"));
+        assert!(
+            super::APP_JS
+                .contains("notePendingDecisionChange(wrapper, state.baseline?.decision || null)")
+        );
+    }
+
+    /// Spec 107 Task 2: after a reload the decision comes from `/api/session`
+    /// and its card is moved below everything else the session draws; the
+    /// memory stack never lands under it.
+    #[test]
+    fn app_js_restores_the_pending_decision_last_on_reload() {
+        let load = app_js_function("loadSession");
+        let memory = load
+            .find("await refreshMemoryProposals(currentSessionId)")
+            .unwrap();
+        let restore = load
+            .find("restorePendingDecision(payload.tasks || [])")
+            .expect("loadSession restores the pending decision");
+        let recovery = load.find("await renderRecoveryPrompts(").unwrap();
+        assert!(recovery < restore && memory < restore);
+        let restore_fn = app_js_function("restorePendingDecision");
+        assert!(restore_fn.contains("entry.turnPresentation?.pendingDecision"));
+        assert!(restore_fn.contains("entry.dataset.questionId === decision.cardId"));
+        assert!(restore_fn.contains(".recovery-card"));
+        assert!(app_js_function("renderMessages").contains("resetPendingDecision()"));
+        assert!(app_js_function("clearChat").contains("resetPendingDecision()"));
+        assert!(
+            app_js_function("renderMemoryProposals").contains("log.insertBefore(stack, pending)")
+        );
+    }
+
+    /// Spec 107 Task 2, requirement 2 and D2: the composer names the decision
+    /// from the engine's label, its control focuses the card, and a pending
+    /// question disables the main composer instead of competing with the
+    /// card's answer field.
+    #[test]
+    fn app_js_composer_names_the_pending_decision_and_yields_to_a_question() {
+        for id in [
+            "id=\"composer-decision\"",
+            "id=\"composer-decision-label\"",
+            "id=\"composer-decision-btn\"",
+        ] {
+            assert!(super::INDEX_HTML.contains(id), "{id}");
+        }
+        let sync = app_js_function("syncComposerDecision");
+        assert!(sync.contains("current.decision.label"));
+        assert!(sync.contains("!chatSubmitting"));
+        assert!(sync.contains("current.decision.kind === \"question\""));
+        assert!(sync.contains("field.disabled = true"));
+        assert!(sync.contains("\"Answer the question above\""));
+        assert!(sync.contains("button.disabled = true"));
+        assert!(app_js_function("setComposerBusy").contains("syncComposerDecision()"));
+        let focus = app_js_function("focusPendingDecision");
+        assert!(focus.contains(".question-card-free-text input:not(:disabled)"));
+        assert!(focus.contains(".baseline-batch button"));
+        assert!(super::APP_JS.contains(
+            "$(\"composer-decision-btn\").addEventListener(\"click\", focusPendingDecision)"
+        ));
     }
 
     /// The done event of an SSE turn, whichever `data:` line carries it.
@@ -10662,6 +10842,7 @@ mod tests {
         let findings_session = findings_to_review_session(&engine, &repository_id, &repo);
         let activity_session = activity_and_plan_session(&engine, &repository_id);
         let command_activity_session = command_activity_session(&engine, &repository_id, &repo_arg);
+        let question_session = pending_question_session(&engine, &repository_id);
 
         let options = ShellOptions {
             port: 4899,
@@ -10684,6 +10865,9 @@ mod tests {
         );
         println!(
             "  command activity session (spec 68: command steps, approval requests, one usage row) = {command_activity_session}"
+        );
+        println!(
+            "  pending question session (spec 107: the card last, the composer disabled) = {question_session}"
         );
         println!("  data_dir = {}", data_dir.display());
         run_server(options).expect("serve the UI");
