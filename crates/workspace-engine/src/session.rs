@@ -36,7 +36,51 @@ pub struct Session {
     /// can filter on it without a second migration when 52 lands. See spec 53
     /// §5.6.
     pub origin: String,
+    /// Set by `session_archived`, cleared by `session_unarchived` (spec 108
+    /// D3). An archived session keeps its log, worktree and branch; it only
+    /// leaves the default session list. A log from before spec 108 reads as
+    /// not archived, and so does a serialised `Session` from before it (a
+    /// pending turn on disk, say).
+    #[serde(default)]
+    pub archived: bool,
 }
+
+/// Which sessions [`SessionStore::list_sessions_filtered`] returns (spec 108
+/// D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchivedFilter {
+    /// Archived and unarchived alike — what [`SessionStore::list_sessions`]
+    /// returns.
+    Include,
+    /// Only sessions that are not archived: the sidebar's default list.
+    Exclude,
+    /// Only archived sessions: the sidebar's Archived entry.
+    Only,
+}
+
+impl ArchivedFilter {
+    /// `"include"`, `"exclude"` or `"only"`; `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "include" => Some(Self::Include),
+            "exclude" => Some(Self::Exclude),
+            "only" => Some(Self::Only),
+            _ => None,
+        }
+    }
+
+    fn admits(self, session: &Session) -> bool {
+        match self {
+            Self::Include => true,
+            Self::Exclude => !session.archived,
+            Self::Only => session.archived,
+        }
+    }
+}
+
+/// The refusal when a session whose worker is still running is archived.
+pub const ARCHIVE_RUNNING_WORKER_REFUSAL: &str =
+    "Stop the worker first: a session whose worker is running cannot be archived.";
 
 /// A turn's notes as the session log holds them (spec 65 §5.6).
 ///
@@ -780,6 +824,7 @@ impl SessionStore {
             updated_at_ms: now,
             summary: String::new(),
             origin: "user".to_string(),
+            archived: false,
         };
         self.append_session_event(&session.id, "session_created", &session_json(&session))?;
         Ok(session)
@@ -1171,7 +1216,18 @@ impl SessionStore {
         Ok(message)
     }
 
+    /// Every session, archived or not; see [`Self::list_sessions_filtered`].
     pub fn list_sessions(&self, repository_id: Option<&str>) -> Result<Vec<Session>> {
+        self.list_sessions_filtered(repository_id, ArchivedFilter::Include)
+    }
+
+    /// The sessions of `repository_id` (all repositories for `None`) that
+    /// `archived` admits, most recently updated first.
+    pub fn list_sessions_filtered(
+        &self,
+        repository_id: Option<&str>,
+        archived: ArchivedFilter,
+    ) -> Result<Vec<Session>> {
         let sessions_dir = self.data_dir.join("sessions");
         let Ok(entries) = fs::read_dir(sessions_dir) else {
             return Ok(Vec::new());
@@ -1187,6 +1243,7 @@ impl SessionStore {
                 && repository_id
                     .map(|id| id == session.repository_id.as_str())
                     .unwrap_or(true)
+                && archived.admits(&session)
             {
                 sessions.push(session);
             }
@@ -1217,6 +1274,49 @@ impl SessionStore {
         session.title = title.to_string();
         session.updated_at_ms = now_millis();
         self.append_session_event(session_id, "session_renamed", &session_json(&session))?;
+        Ok(session)
+    }
+
+    /// Archives a session: it keeps its log, worktree and branch and leaves
+    /// the default session list (spec 108 D3). `worker_running` is whether the
+    /// session is a worker whose process is still alive — only the shell's
+    /// supervisor knows that — and archiving one is refused, so a worker
+    /// never keeps working out of sight. Archiving an archived session
+    /// writes nothing.
+    ///
+    /// `updated_at_ms` is left alone: archiving is not activity, and an
+    /// unarchived session returns to the place in the list it had.
+    pub fn archive_session(&self, session_id: &str, worker_running: bool) -> Result<Session> {
+        if worker_running {
+            return Err(crate::error::ClientError::InvalidInput(
+                ARCHIVE_RUNNING_WORKER_REFUSAL.to_string(),
+            ));
+        }
+        self.set_session_archived(session_id, true)
+    }
+
+    /// Returns an archived session to the default session list. Unarchiving
+    /// a session that is not archived writes nothing.
+    pub fn unarchive_session(&self, session_id: &str) -> Result<Session> {
+        self.set_session_archived(session_id, false)
+    }
+
+    fn set_session_archived(&self, session_id: &str, archived: bool) -> Result<Session> {
+        let Some(mut session) = self.read_session(session_id)? else {
+            return Err(crate::error::ClientError::InvalidInput(format!(
+                "Unknown session: {session_id}"
+            )));
+        };
+        if session.archived == archived {
+            return Ok(session);
+        }
+        session.archived = archived;
+        let event_type = if archived {
+            "session_archived"
+        } else {
+            "session_unarchived"
+        };
+        self.append_session_event(session_id, event_type, &session_json(&session))?;
         Ok(session)
     }
 
@@ -5007,14 +5107,15 @@ impl Drop for SessionLogLock {
 
 fn session_json(session: &Session) -> String {
     format!(
-        "{{\"id\":\"{}\",\"repositoryId\":\"{}\",\"title\":\"{}\",\"createdAtMs\":{},\"updatedAtMs\":{},\"summary\":\"{}\",\"origin\":\"{}\"}}",
+        "{{\"id\":\"{}\",\"repositoryId\":\"{}\",\"title\":\"{}\",\"createdAtMs\":{},\"updatedAtMs\":{},\"summary\":\"{}\",\"origin\":\"{}\",\"archived\":{}}}",
         escape_json(&session.id),
         escape_json(&session.repository_id),
         escape_json(&session.title),
         session.created_at_ms,
         session.updated_at_ms,
         escape_json(&session.summary),
-        escape_json(&session.origin)
+        escape_json(&session.origin),
+        session.archived
     )
 }
 
@@ -5369,14 +5470,29 @@ fn parse_session_log(content: &str) -> Option<Session> {
     events
         .iter()
         .filter(|event| {
-            event.event_type == "session_created" || event.event_type == "session_renamed"
+            matches!(
+                event.event_type.as_str(),
+                "session_created" | "session_renamed" | "session_archived" | "session_unarchived"
+            )
         })
         .filter_map(parse_session_event)
         .next_back()
 }
 
 fn parse_session_event(event: &SessionEvent) -> Option<Session> {
+    // The event type decides for the archive events, so a hand-edited or
+    // truncated payload cannot contradict what the event says happened.
+    let archived = match event.event_type.as_str() {
+        "session_archived" => true,
+        "session_unarchived" => false,
+        _ => event
+            .payload
+            .get("archived")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+    };
     Some(Session {
+        archived,
         id: event.text("id")?,
         repository_id: event.text("repositoryId")?,
         title: event.text("title")?,

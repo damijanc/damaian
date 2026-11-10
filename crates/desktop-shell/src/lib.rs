@@ -348,6 +348,8 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("GET", "/api/session") => handle_session(stream, &request),
         ("POST", "/api/session-create") => handle_session_create(stream, &request),
         ("POST", "/api/session-rename") => handle_session_rename(stream, &request),
+        ("POST", "/api/session-archive") => handle_session_archive(stream, &request, true),
+        ("POST", "/api/session-unarchive") => handle_session_archive(stream, &request, false),
         ("POST", "/api/session-mode") => handle_session_mode(stream, &request),
         // Spec 98 Task 4: the user's explicit protected-path control. Every
         // route is repository-bound, and writes go through the engine's
@@ -1551,6 +1553,51 @@ fn handle_worker_route(stream: &mut TcpStream, request: &Request) -> Result<(), 
             "application/json",
             &json_error(&refusal.message),
         ),
+    }
+}
+
+/// `POST /api/session-archive` and `/api/session-unarchive` (spec 108 D3).
+fn handle_session_archive(
+    stream: &mut TcpStream,
+    request: &Request,
+    archive: bool,
+) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let session_id = required_form(&form, "session_id")?;
+    let engine = default_engine()?;
+    // Only the supervisor knows whether a worker's process is still alive.
+    let worker_running = archive && workers::global().is_alive(&session_id);
+    let (status, body) = session_archive_answer(&engine, &session_id, archive, worker_running);
+    write_response(stream, request, status, "application/json", &body)
+}
+
+/// The status and body of an archive or unarchive request. Split from the
+/// route so the running-worker refusal is testable without a live worker.
+fn session_archive_answer(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    archive: bool,
+    worker_running: bool,
+) -> (u16, String) {
+    let result = if archive {
+        engine
+            .session_store
+            .archive_session(session_id, worker_running)
+    } else {
+        engine.session_store.unarchive_session(session_id)
+    };
+    match result {
+        Ok(session) => {
+            let mode = engine.session_store.session_mode(&session.id);
+            (
+                200,
+                format!("{{\"session\":{}}}", session_json(&session, mode)),
+            )
+        }
+        // A conflict, not a bad request: the same request succeeds once the
+        // worker has stopped.
+        Err(error) if worker_running => (409, json_error(&error.to_string())),
+        Err(error) => (400, json_error(&error.to_string())),
     }
 }
 
@@ -2773,9 +2820,16 @@ fn handle_sessions(stream: &mut TcpStream, request: &Request) -> Result<(), Stri
         .indexer
         .repository_id_for_path(&repo)
         .map_err(|error| error.to_string())?;
+    // `archived=exclude|only|include` (spec 108 D3); without it every session
+    // comes back, each carrying its `archived` flag.
+    let archived = match request.param("archived") {
+        Some(value) => workspace_engine::ArchivedFilter::parse(&value)
+            .ok_or_else(|| format!("archived must be include, exclude or only, not {value}"))?,
+        None => workspace_engine::ArchivedFilter::Include,
+    };
     let sessions = engine
         .session_store
-        .list_sessions(Some(&repository_id))
+        .list_sessions_filtered(Some(&repository_id), archived)
         .map_err(|error| error.to_string())?;
     write_response(
         stream,
@@ -7324,14 +7378,15 @@ fn session_json(session: &Session, mode: SessionMode) -> String {
 
 fn session_fields_json(session: &Session) -> String {
     format!(
-        "\"id\":\"{}\",\"repositoryId\":\"{}\",\"title\":\"{}\",\"createdAtMs\":{},\"updatedAtMs\":{},\"summary\":\"{}\",\"origin\":\"{}\"",
+        "\"id\":\"{}\",\"repositoryId\":\"{}\",\"title\":\"{}\",\"createdAtMs\":{},\"updatedAtMs\":{},\"summary\":\"{}\",\"origin\":\"{}\",\"archived\":{}",
         escape_json(&session.id),
         escape_json(&session.repository_id),
         escape_json(&session.title),
         session.created_at_ms,
         session.updated_at_ms,
         escape_json(&session.summary),
-        escape_json(&session.origin)
+        escape_json(&session.origin),
+        session.archived
     )
 }
 
@@ -12690,6 +12745,152 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    fn get_sessions_for_test(
+        port: u16,
+        token: &str,
+        repo: &std::path::Path,
+        archived: Option<&str>,
+    ) -> Vec<(String, bool)> {
+        let filter = archived
+            .map(|value| format!("&archived={value}"))
+            .unwrap_or_default();
+        let response = send_for_test(
+            port,
+            format!(
+                "GET /api/sessions?repo={}{filter} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n",
+                repo.display()
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let mut sessions: Vec<(String, bool)> = json_of(&response)["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .map(|session| {
+                (
+                    session["id"].as_str().unwrap().to_string(),
+                    session["archived"].as_bool().expect("an archived flag"),
+                )
+            })
+            .collect();
+        sessions.sort();
+        sessions
+    }
+
+    /// Spec 108 D3: archive and unarchive go through their routes, the
+    /// listing carries the flag and filters on it, and delete still deletes
+    /// an archived session.
+    #[test]
+    fn session_archive_routes_round_trip_and_filter_the_listing() {
+        let (repo, engine, archived_id) = findings_fixture("archive");
+        let repository_id = engine.indexer.repository_id_for_path(&repo).unwrap();
+        let kept_id = engine
+            .session_store
+            .create_session(&repository_id, "Kept")
+            .unwrap()
+            .id;
+        let (port, token) = serve_for_test();
+
+        let response = post_form_for_test(
+            port,
+            &token,
+            "/api/session-archive",
+            &format!("session_id={archived_id}"),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(json_of(&response)["session"]["archived"], true);
+
+        let mut both = vec![(archived_id.clone(), true), (kept_id.clone(), false)];
+        both.sort();
+        assert_eq!(get_sessions_for_test(port, &token, &repo, None), both);
+        assert_eq!(
+            get_sessions_for_test(port, &token, &repo, Some("include")),
+            both
+        );
+        assert_eq!(
+            get_sessions_for_test(port, &token, &repo, Some("exclude")),
+            vec![(kept_id.clone(), false)]
+        );
+        assert_eq!(
+            get_sessions_for_test(port, &token, &repo, Some("only")),
+            vec![(archived_id.clone(), true)]
+        );
+
+        let response = post_form_for_test(
+            port,
+            &token,
+            "/api/session-unarchive",
+            &format!("session_id={archived_id}"),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(json_of(&response)["session"]["archived"], false);
+        assert!(
+            get_sessions_for_test(port, &token, &repo, Some("only")).is_empty(),
+            "unarchived"
+        );
+
+        post_form_for_test(
+            port,
+            &token,
+            "/api/session-archive",
+            &format!("session_id={archived_id}"),
+        );
+        let response = post_form_for_test(
+            port,
+            &token,
+            "/api/session-delete",
+            &format!("session_id={archived_id}&repo={}", repo.display()),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            get_sessions_for_test(port, &token, &repo, None),
+            vec![(kept_id, false)]
+        );
+    }
+
+    #[test]
+    fn session_archive_route_refuses_an_unknown_filter_and_session() {
+        let (repo, _engine, _session_id) = findings_fixture("archive-refusals");
+        let (port, token) = serve_for_test();
+        let response = send_for_test(
+            port,
+            format!(
+                "GET /api/sessions?repo={}&archived=maybe HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n",
+                repo.display()
+            ),
+        );
+        assert!(!response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let response = post_form_for_test(
+            port,
+            &token,
+            "/api/session-archive",
+            "session_id=session_missing",
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+
+    /// A running worker's session is refused with 409 and stays unarchived.
+    /// The route asks the supervisor; this drives the answer it builds.
+    #[test]
+    fn archiving_a_running_worker_is_a_conflict() {
+        let (_repo, engine, session_id) = findings_fixture("archive-running");
+        let (status, body) = super::session_archive_answer(&engine, &session_id, true, true);
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("Stop the worker first"), "{body}");
+        assert!(
+            !engine
+                .session_store
+                .read_session(&session_id)
+                .unwrap()
+                .unwrap()
+                .archived
+        );
+
+        let (status, body) = super::session_archive_answer(&engine, &session_id, true, false);
+        assert_eq!(status, 200, "{body}");
     }
 
     /// Staleness is derived against `repo`'s files (spec 22 `context.md`

@@ -18939,6 +18939,7 @@ mod pending_turn_defaults_tests {
                 updated_at_ms: 0,
                 summary: String::new(),
                 origin: "user".to_string(),
+                archived: false,
             },
             task: Task {
                 id: "task".to_string(),
@@ -19482,6 +19483,7 @@ mod evidence_tests {
             updated_at_ms: 0,
             summary: String::new(),
             origin: "user".to_string(),
+            archived: false,
         }
     }
 
