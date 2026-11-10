@@ -3342,6 +3342,15 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<CheckOutcome> {
         self.start_verification_step(task, plan, step_id, sink)?;
+        sink.phase(
+            PhaseKind::Tool,
+            running_command_label(&proposal.command),
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
         let cancel = sink.cancel;
         let on_progress = &mut *sink.on_progress;
         let mut on_output = |line: &str| {
@@ -5420,6 +5429,17 @@ impl ChatOrchestrator {
                     .unwrap_or_else(|_| CommandCensus::unavailable());
                 let max_rounds = self.tool_round_limit(false);
                 let max_exploration_rounds = self.default_exploration_round_limit();
+                // Spec 107 requirement 3: the status line names the command
+                // while it runs, not the proposal it was before approval.
+                sink.phase(
+                    PhaseKind::Tool,
+                    running_command_label(&proposal.command),
+                    pending.round,
+                    max_rounds,
+                    pending.exploration_rounds,
+                    max_exploration_rounds,
+                    pending.turn_notes.chars().count(),
+                );
                 let cancel = sink.cancel;
                 // Borrow only the progress field, so `cancel` can be read for
                 // the same call without two conflicting borrows of the sink.
@@ -11253,6 +11273,15 @@ impl ChatOrchestrator {
                                 break;
                             }
 
+                            sink.phase(
+                                PhaseKind::Tool,
+                                running_command_label(&proposal.command),
+                                action_rounds,
+                                max_rounds,
+                                exploration_rounds,
+                                max_exploration_rounds,
+                                turn_notes.text.chars().count(),
+                            );
                             let cancel = sink.cancel;
                             // Borrow only the progress field, so `cancel` can be read
                             // for the same call without two conflicting borrows of the
@@ -17470,6 +17499,12 @@ fn plan_review_response(plan: &TaskPlan, deferred_action: &str) -> String {
     text
 }
 
+/// The progress label while a command actually runs, as opposed to
+/// [`tool_action_label`]'s "Proposing" for the call that asked for it.
+fn running_command_label(command: &str) -> String {
+    format!("Running `{command}`")
+}
+
 /// What to show the user while a tool runs. Lives here rather than in the UI so
 /// the frontend never has to map tool names to prose.
 fn tool_action_label(action: &ToolAction) -> String {
@@ -17491,8 +17526,17 @@ fn tool_action_label(action: &ToolAction) -> String {
                 "Writing notes".to_string()
             }
         }
-        ToolAction::ReadFile { path, worktree, .. } => {
-            format!("Reading {path}{}", in_worktree(worktree.as_deref()))
+        ToolAction::ReadFile {
+            path,
+            range,
+            worktree,
+        } => {
+            // Spec 107 requirement 3: "Reading config.rs 1200–1600", so a
+            // second read of the same file is told apart from the first.
+            let lines = range
+                .map(|range| format!(" {}–{}", range.start, range.end))
+                .unwrap_or_default();
+            format!("Reading {path}{lines}{}", in_worktree(worktree.as_deref()))
         }
         ToolAction::ListDirectory { dir, worktree, .. } => match (dir, worktree) {
             (Some(dir), _) => format!("Listing {dir}{}", in_worktree(worktree.as_deref())),
@@ -20527,6 +20571,34 @@ mod clarification_tests {
         assert_eq!(tool_action_marker(&action).0, "propose_memory");
         assert!(!tool_action_marker(&action).2);
         assert_eq!(tool_action_label(&action), "Suggesting a memory");
+    }
+
+    // Spec 107 requirement 3: the status line names the lines a ranged read
+    // covers, and a command that runs is "Running", not still "Proposing".
+    #[test]
+    fn activity_labels_name_a_read_range_and_a_running_command() {
+        let ranged = ToolAction::ReadFile {
+            path: "src/config.rs".to_string(),
+            range: Some(crate::file_access::LineRange {
+                start: 1200,
+                end: 1600,
+            }),
+            worktree: None,
+        };
+        assert_eq!(
+            tool_action_label(&ranged),
+            "Reading src/config.rs 1200–1600"
+        );
+        let whole = ToolAction::ReadFile {
+            path: "src/config.rs".to_string(),
+            range: None,
+            worktree: None,
+        };
+        assert_eq!(tool_action_label(&whole), "Reading src/config.rs");
+        assert_eq!(
+            running_command_label("cargo test --test permission_profiles"),
+            "Running `cargo test --test permission_profiles`"
+        );
     }
 
     #[test]

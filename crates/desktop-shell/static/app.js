@@ -6332,7 +6332,7 @@ function appendChatMessage(role, content) {
 // `label` so this map never has to know tool names.
 const TURN_PHASE_LABELS = {
   context: "Assembling context",
-  model: "Waiting for model",
+  model: "Waiting for the model",
   thinking: "Thinking",
   tool: "Working",
   finalizing: "Finalizing",
@@ -6343,13 +6343,86 @@ function formatCharCount(chars) {
   return chars >= 1000 ? `${(chars / 1000).toFixed(1)}k` : String(chars);
 }
 
-// A live "something is happening" row inside an assistant bubble: the phase, an
-// elapsed clock, and a Stop button when `onStop` is given. A path with no
-// working cancel passes none, and gets no button that would do nothing.
+// "40s", "1m 12s", "1h 3m": a clock the user reads at a glance, so a twelve-
+// minute turn is not "705s".
+function formatClock(ms) {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+// Spec 107 requirement 3: the row a paused turn leaves behind, naming what it
+// waits on, with how long it has waited. One at a time; it goes when the
+// decision is settled or the next turn starts, whichever comes first.
+let waitingIndicator = null;
+
+function clearWaitingIndicator() {
+  if (!waitingIndicator) return;
+  clearInterval(waitingIndicator.timer);
+  waitingIndicator.row.remove();
+  waitingIndicator = null;
+}
+
+// `row` is a finished turn's indicator row, reused so the line stays where the
+// user was watching it; `label` is the engine's `statusLabel`.
+function showWaitingIndicator(row, label) {
+  clearWaitingIndicator();
+  row.dataset.state = "waiting";
+  for (const part of row.querySelectorAll(
+    ".turn-indicator-output, .turn-indicator-total, .turn-indicator-stop",
+  )) {
+    part.remove();
+  }
+  const text = row.querySelector(".turn-indicator-label");
+  const clock = row.querySelector(".turn-indicator-elapsed");
+  text.textContent = label;
+  const since = Date.now();
+  const tick = () => {
+    clock.textContent = formatClock(Date.now() - since);
+  };
+  tick();
+  waitingIndicator = { row, timer: setInterval(tick, 1000) };
+}
+
+// The waiting row's label when a patch card's baseline replaces the patch as
+// what the turn waits on, or the other way round.
+function renameWaitingIndicator(label) {
+  const text = waitingIndicator?.row.querySelector(".turn-indicator-label");
+  if (text && label) text.textContent = label;
+}
+
+// Reload: a task waiting on a decision gets the same row under its bubble that
+// the live turn left, so the line is not blank because the page was reloaded.
+function restoreWaitingIndicator(body, label) {
+  const row = document.createElement("p");
+  row.className = "turn-indicator";
+  const dot = document.createElement("span");
+  dot.className = "turn-indicator-dot";
+  dot.setAttribute("aria-hidden", "true");
+  const text = document.createElement("span");
+  text.className = "turn-indicator-label";
+  text.setAttribute("aria-live", "polite");
+  const clock = document.createElement("span");
+  clock.className = "turn-indicator-elapsed";
+  clock.setAttribute("aria-hidden", "true");
+  row.append(dot, text, clock);
+  body.after(row);
+  showWaitingIndicator(row, label);
+}
+
+// A live "something is happening" row inside an assistant bubble: the current
+// activity with its own clock, the turn's total beside it, and a Stop button
+// when `onStop` is given. A path with no working cancel passes none, and gets
+// no button that would do nothing.
 //
 // Owns its DOM, its interval, and its teardown so nothing outside has to track
 // them. `finish` is idempotent, which lets error paths call it blindly.
 function startTurnIndicator(target, onStop = null) {
+  // A new turn is under way, so whatever the last one waited on has been
+  // answered (or abandoned); its waiting row would now be wrong.
+  clearWaitingIndicator();
   const row = document.createElement("p");
   row.className = "turn-indicator";
   row.dataset.state = "running";
@@ -6370,13 +6443,20 @@ function startTurnIndicator(target, onStop = null) {
   output.className = "turn-indicator-output";
   output.hidden = true;
 
-  // Ticks every second. Inside the aria-live #chat-log it would otherwise be
-  // read out once per second, which is unusable.
+  // The current activity's clock. Ticks every second; inside the aria-live
+  // #chat-log it would otherwise be read out once per second, which is
+  // unusable.
   const elapsed = document.createElement("span");
   elapsed.className = "turn-indicator-elapsed";
   elapsed.setAttribute("aria-hidden", "true");
 
-  row.append(dot, label, output, elapsed);
+  // The whole turn's clock, apart from the step's (spec 107 requirement 3):
+  // "Thinking · 705s" read as one twelve-minute call when it was the turn.
+  const total = document.createElement("span");
+  total.className = "turn-indicator-total";
+  total.setAttribute("aria-hidden", "true");
+
+  row.append(dot, label, elapsed, total, output);
   let stop = null;
   if (onStop) {
     stop = document.createElement("button");
@@ -6389,11 +6469,26 @@ function startTurnIndicator(target, onStop = null) {
   target.body.after(row);
 
   const startedAt = Date.now();
+  // When the current activity began, and what it is. A repeated phase with the
+  // same activity (a model call's thinking updates, a command's output) keeps
+  // its clock; a new activity restarts it.
+  let stepStartedAt = startedAt;
   const tick = () => {
-    elapsed.textContent = `${Math.round((Date.now() - startedAt) / 1000)}s`;
+    const now = Date.now();
+    elapsed.textContent = formatClock(now - stepStartedAt);
+    // Until the first activity changes, the step is the turn: one clock.
+    total.hidden = stepStartedAt === startedAt;
+    total.textContent = `turn ${formatClock(now - startedAt)}`;
   };
   tick();
   const timer = setInterval(tick, 1000);
+  // Each new activity — context, a model call, a tool, the answer streaming —
+  // gets its own clock. A model call's thinking updates and a command's output
+  // lines belong to the activity already running and do not restart it.
+  const beginActivity = () => {
+    stepStartedAt = Date.now();
+    tick();
+  };
 
   let done = false;
   let streaming = false;
@@ -6419,6 +6514,7 @@ function startTurnIndicator(target, onStop = null) {
       // Within a round though, tokens are already flowing by the time the model
       // phase would repeat, and "Streaming" is the truer description.
       else if (streaming) return;
+      if (payload.phase !== "thinking") beginActivity();
       // Spec 81: how much the model has reasoned, never what.
       const reasoned =
         payload.phase === "thinking" && payload.reasoningChars > 0
@@ -6447,6 +6543,7 @@ function startTurnIndicator(target, onStop = null) {
       if (done || streaming) return;
       streaming = true;
       label.textContent = "Streaming";
+      beginActivity();
     },
     // "stopped" | "pending" | "complete" | "incomplete" | "failed"
     finish(state) {
@@ -6457,7 +6554,18 @@ function startTurnIndicator(target, onStop = null) {
         row.dataset.state = "stopped";
         label.textContent = "Stopped by you";
         elapsed.remove();
+        total.remove();
         stop?.remove();
+        return;
+      }
+      // Spec 107 requirement 3: a turn paused on the user is still alive, so
+      // its line stays and says what it waits on. `appendProposals` has run by
+      // now, so the engine's own label is in `pendingDecision`. "pending" alone
+      // is not enough: it is also every route's default when a payload has no
+      // presentation, and a line claiming Damaian waits on the user when it
+      // does not would be the opposite lie.
+      if (state === "pending" && pendingDecision && row.isConnected) {
+        showWaitingIndicator(row, pendingDecision.decision.statusLabel || "Waiting for you");
         return;
       }
       row.remove();
@@ -10586,12 +10694,35 @@ const STEP_OUTCOME_LABELS = {
   outstanding: "",
 };
 
+// Updates `message`'s plan panel, if it has one, with the waiting state the
+// pending decision implies (spec 107 requirement 4). In place rather than a
+// redraw, so a steps list the user opened stays open.
+function markPlanWaiting(message, waiting) {
+  const panel = message.body.parentElement?.querySelector('[data-plan-panel="true"]');
+  if (!panel?.plan) return;
+  panel.plan = { ...panel.plan, waiting };
+  for (const state of panel.querySelectorAll(".plan-step-live")) {
+    state.dataset.waiting = waiting ? "true" : "false";
+    state.textContent = planStepLiveLabel(panel.plan);
+  }
+}
+
+// The open step's state: waiting on the user, running, or left open by a
+// turn that has ended (spec 66 §5.4). An older payload without `active` reads
+// as live.
+function planStepLiveLabel(plan) {
+  if (plan.waiting) return "waiting for you";
+  return plan.active !== false ? "running" : "not finished";
+}
+
 function renderPlanPanel(message, plan) {
   if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) return;
 
   const panel = document.createElement("section");
   panel.className = "plan-panel";
   panel.dataset.planPanel = "true";
+  // Kept so `markPlanWaiting` can redraw it when the turn pauses or resumes.
+  panel.plan = plan;
 
   const header = document.createElement("div");
   header.className = "plan-panel-header";
@@ -10638,11 +10769,12 @@ function renderPlanPanel(message, plan) {
     if (step.status === "in_progress") {
       // "running" only while a turn is going. Once it has ended, an open step
       // is still open — say what Damaian knows rather than implying work is in
-      // flight (spec 66 §5.4). An older payload without `active` reads as live.
-      const live = plan.active !== false;
+      // flight. A task paused on the user is active but nothing runs: the
+      // step waits on them (spec 107 requirement 4).
       const state = document.createElement("span");
-      state.className = "plan-step-outcome";
-      state.textContent = live ? "running" : "not finished";
+      state.className = "plan-step-outcome plan-step-live";
+      state.dataset.waiting = plan.waiting ? "true" : "false";
+      state.textContent = planStepLiveLabel(plan);
       item.append(state);
     }
 
@@ -13284,7 +13416,11 @@ function setPendingDecision(message, card, decision) {
     $("chat-log").append(frame);
     if (message?.body) appendPendingPointer(message.body, decision, frame);
   }
-  pendingDecision = { decision, baseDecision: decision, card, frame };
+  const planMessage = message?.body ? message : null;
+  pendingDecision = { decision, baseDecision: decision, card, frame, planMessage };
+  // A live `plan` event is streamed before the pause is written, so it always
+  // says `waiting: false`; the decision is what makes the open step wait.
+  if (planMessage) markPlanWaiting(planMessage, true);
   syncComposerDecision();
   frame?.scrollIntoView({ block: "nearest" });
 }
@@ -13307,13 +13443,16 @@ function settlePendingDecision(card = null) {
   if (!pendingDecision) return;
   if (card && pendingDecision.card !== card) return;
   if (pendingDecision.frame) pendingDecision.frame.dataset.waiting = "false";
+  if (pendingDecision.planMessage) markPlanWaiting(pendingDecision.planMessage, false);
   pendingDecision = null;
+  clearWaitingIndicator();
   syncComposerDecision();
 }
 
 // The DOM the state pointed into is gone (a session render or a cleared chat).
 function resetPendingDecision() {
   pendingDecision = null;
+  clearWaitingIndicator();
   syncComposerDecision();
 }
 
@@ -13330,6 +13469,7 @@ function notePendingDecisionChange(card, decision) {
     current.frame.setAttribute("aria-label", current.decision.label);
     if (decision) current.frame.scrollIntoView({ block: "nearest" });
   }
+  renameWaitingIndicator(current.decision.statusLabel);
   syncComposerDecision();
 }
 
@@ -13359,6 +13499,7 @@ function restorePendingDecision(tasks) {
   );
   const body = bubble?.querySelector(".message-body");
   setPendingDecision(body ? { body } : null, card || null, decision);
+  if (body) restoreWaitingIndicator(body, decision.statusLabel || "Waiting for you");
 }
 
 function focusPendingDecision() {

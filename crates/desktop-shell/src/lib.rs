@@ -9674,6 +9674,75 @@ mod tests {
         ));
     }
 
+    /// Spec 107 Task 3, requirement 3: a turn paused on the user keeps its
+    /// status row, relabelled with the engine's `statusLabel`, until the
+    /// decision is settled or the next turn starts; the same row comes back on
+    /// reload. A pending state without a decision does not claim one.
+    #[test]
+    fn app_js_status_line_waits_with_the_engine_label_until_the_turn_ends() {
+        let finish = app_js_function("startTurnIndicator");
+        assert!(finish.contains("clearWaitingIndicator();"));
+        assert!(finish.contains("state === \"pending\" && pendingDecision"));
+        assert!(finish.contains("showWaitingIndicator(row, pendingDecision.decision.statusLabel"));
+        let show = app_js_function("showWaitingIndicator");
+        assert!(show.contains("row.dataset.state = \"waiting\""));
+        assert!(show.contains(".turn-indicator-stop"));
+        assert!(show.contains("formatClock(Date.now() - since)"));
+        for settled in ["settlePendingDecision", "resetPendingDecision"] {
+            assert!(
+                app_js_function(settled).contains("clearWaitingIndicator()"),
+                "{settled}"
+            );
+        }
+        assert!(
+            app_js_function("notePendingDecisionChange")
+                .contains("renameWaitingIndicator(current.decision.statusLabel)")
+        );
+        assert!(
+            app_js_function("restorePendingDecision")
+                .contains("restoreWaitingIndicator(body, decision.statusLabel")
+        );
+        let css = super::STYLE_CSS;
+        assert!(css.contains(".turn-indicator[data-state=\"waiting\"]"));
+    }
+
+    /// Spec 107 Task 3, requirement 3: while working, the row names the
+    /// current activity with its own clock and the turn's total apart from
+    /// it. Thinking updates belong to the model call already timed; reasoning
+    /// shows only its size (spec 81), never its text.
+    #[test]
+    fn app_js_status_line_times_the_current_activity_apart_from_the_turn() {
+        let indicator = app_js_function("startTurnIndicator");
+        assert!(indicator.contains("turn-indicator-total"));
+        assert!(indicator.contains("formatClock(now - stepStartedAt)"));
+        assert!(indicator.contains("`turn ${formatClock(now - startedAt)}`"));
+        assert!(indicator.contains("if (payload.phase !== \"thinking\") beginActivity();"));
+        assert!(indicator.contains("formatCharCount(payload.reasoningChars)"));
+        assert!(!indicator.contains("reasoningContent"));
+        let clock = app_js_function("formatClock");
+        assert!(clock.contains("`${minutes}m ${seconds % 60}s`"));
+        assert!(super::APP_JS.contains("model: \"Waiting for the model\""));
+    }
+
+    /// Spec 107 Task 3, requirement 4: the open step of a task waiting on the
+    /// user says so, from `plan.waiting` on reload and from the pending
+    /// decision live (whose `plan` events always say `waiting: false`).
+    #[test]
+    fn app_js_plan_step_reads_waiting_for_you_while_a_decision_is_pending() {
+        assert!(
+            app_js_function("planStepLiveLabel")
+                .contains("if (plan.waiting) return \"waiting for you\";")
+        );
+        assert!(app_js_function("renderPlanPanel").contains("planStepLiveLabel(plan)"));
+        assert!(
+            app_js_function("setPendingDecision").contains("markPlanWaiting(planMessage, true)")
+        );
+        assert!(
+            app_js_function("settlePendingDecision")
+                .contains("markPlanWaiting(pendingDecision.planMessage, false)")
+        );
+    }
+
     /// The done event of an SSE turn, whichever `data:` line carries it.
     fn sse_done(response: &str) -> serde_json::Value {
         for line in response.lines() {
@@ -16052,6 +16121,22 @@ mod tests {
                     .iter()
                     .map(|phase| phase["label"].clone())
                     .collect::<Vec<_>>()
+            );
+            // Spec 107 requirement 3: a command that runs without asking is
+            // named as running once it starts, after the call that proposed it.
+            let labels: Vec<&str> = tool_phases
+                .iter()
+                .filter_map(|phase| phase["label"].as_str())
+                .collect();
+            let proposing = labels
+                .iter()
+                .position(|label| label.starts_with("Proposing `"));
+            let running = labels
+                .iter()
+                .position(|label| label.starts_with("Running `"));
+            assert!(
+                matches!((proposing, running), (Some(p), Some(r)) if p < r),
+                "{labels:?}"
             );
 
             let texts = payloads(&lines, "text");

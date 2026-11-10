@@ -5117,6 +5117,30 @@ body.worker-view #chat-model-menu {
   font-variant-numeric: tabular-nums;
 }
 
+/* The whole turn's clock, quieter than the current activity's. */
+.turn-indicator-total {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+}
+
+/* Spec 107: a turn paused on the user. Still alive, so the row stays, but the
+   move is the user's: the label reads as a call to act and the dot holds
+   still instead of pulsing as if work were in flight. */
+.turn-indicator[data-state="waiting"] {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.turn-indicator[data-state="waiting"] .turn-indicator-dot {
+  animation: none;
+  background: var(--warn);
+}
+
+.turn-indicator[data-state="waiting"] .turn-indicator-elapsed {
+  font-weight: 400;
+  color: var(--muted);
+}
+
 .turn-indicator-stop {
   margin-left: auto;
   min-width: 0;
@@ -5217,6 +5241,11 @@ body.worker-view #chat-model-menu {
   letter-spacing: 0.03em;
   text-transform: uppercase;
   white-space: nowrap;
+}
+
+/* Spec 107 requirement 4: the open step waits on the user, not on Damaian. */
+.plan-step-live[data-waiting="true"] {
+  color: var(--warn);
 }
 
 /* "Completed, unverified" and "blocked" are the two the user most needs to
