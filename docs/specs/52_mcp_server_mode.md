@@ -6,13 +6,13 @@ Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 6 (Could). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#31](31_permission_profiles/proposal.md) (the profile the exposed set
-narrows) — built; [#33](33_mcp_management_and_deferred_discovery.md)
+narrows) — built; [#33](33_mcp_management_and_deferred_discovery/proposal.md)
 (the MCP runtime) — **not built**. Everything else named below is a
 cross-reference, not a prerequisite.
 Related implementation specs:
 [`06_mcp_support.md`](06_mcp_support.md) (the client half, whose protocol code
 and types this reuses),
-[`33_mcp_management_and_deferred_discovery.md`](33_mcp_management_and_deferred_discovery.md)
+[`33_mcp_management_and_deferred_discovery/proposal.md`](33_mcp_management_and_deferred_discovery/proposal.md)
 (client-side management; the mirror-image rules in §5.4 come from it),
 [`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) (the profile a server
 process narrows and can never widen),
@@ -90,7 +90,7 @@ a read-only feature and Could-tier rather than a larger one.
   (requirement 2). A client wanting two starts two.
 - **Replacing the desktop app or the CLI.**
 - **Any change to the client half.** [Spec 06](06_mcp_support.md) and
-  [spec 33](33_mcp_management_and_deferred_discovery.md) are untouched.
+  [spec 33](33_mcp_management_and_deferred_discovery/proposal.md) are untouched.
 
 ## 5. Design
 
@@ -150,7 +150,7 @@ two are written in the same pass.
 
 ### 5.4 The client is untrusted, in both directions
 
-[Spec 33](33_mcp_management_and_deferred_discovery.md) establishes that a remote
+[Spec 33](33_mcp_management_and_deferred_discovery/proposal.md) establishes that a remote
 MCP server's claims about itself cannot lower an approval requirement. The
 mirror image holds here and is easy to forget: **a connected client's requests
 are data.**

@@ -5,7 +5,7 @@ Order: 37 of 37
 Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#33](33_mcp_management_and_deferred_discovery.md) (the MCP client
+Depends on: [#33](33_mcp_management_and_deferred_discovery/proposal.md) (the MCP client
 it publishes through) — **not built**; [#35](35_commit_preparation/proposal.md) (commit
 preparation) — built (Done 2026-10-26); [#36](36_branch_and_worktree_delivery/proposal.md) (branch
 delivery) — built (Done 2026-10-28; CI run outstanding). Everything else named
@@ -21,7 +21,7 @@ bespoke API client),
 (`unknown_external_outcome` — the central mechanism here),
 [`23_verification_loop/proposal.md`](23_verification_loop/proposal.md) (the check evidence the PR
 body quotes), [`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md),
-[`33_mcp_management_and_deferred_discovery.md`](33_mcp_management_and_deferred_discovery.md)
+[`33_mcp_management_and_deferred_discovery/proposal.md`](33_mcp_management_and_deferred_discovery/proposal.md)
 (per-tool approval, and the rule that a remote read-only claim is an assertion),
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md),
 [`35_commit_preparation/proposal.md`](35_commit_preparation/proposal.md),
@@ -59,7 +59,7 @@ There is also a question of what to build. There is no remote API client of any
 kind in the product, and the roadmap is explicit: prefer MCP
 ([spec 06](06_mcp_support.md)), which already has per-server configuration,
 approval policy, audit, and — with
-[spec 33](33_mcp_management_and_deferred_discovery.md) — per-tool control. A
+[spec 33](33_mcp_management_and_deferred_discovery/proposal.md) — per-tool control. A
 bespoke GitHub client would duplicate all of that and add a credential path.
 
 ## 2. Current State
@@ -71,7 +71,7 @@ bespoke GitHub client would duplicate all of that and add a credential path.
   (`config.rs:153-175`) carries per-server `enabled` and `require_approval`, and
   `auth_token_env` (`config.rs:165-167`) holds `keychain:<account>` or an
   environment variable name — a reference, never a value.
-  [Spec 33](33_mcp_management_and_deferred_discovery.md) adds per-tool enable and
+  [Spec 33](33_mcp_management_and_deferred_discovery/proposal.md) adds per-tool enable and
   approval, and establishes that a remote tool's read-only self-description is an
   assertion with no local authority.
 - **Git is read-only today**; push does not exist. `git_service.rs` is `status`,
@@ -172,7 +172,7 @@ anyway; refusing earlier makes the sequence in requirement 2 structural.
 
 PR creation goes through an MCP tool the user has configured and enabled —
 per the roadmap's instruction to prefer MCP and
-[spec 33](33_mcp_management_and_deferred_discovery.md)'s management surface.
+[spec 33](33_mcp_management_and_deferred_discovery/proposal.md)'s management surface.
 What that buys: the token stays a reference resolved into an `Authorization`
 header, per-tool approval already exists, invocation history is already audited,
 and no new credential path is introduced.
@@ -180,7 +180,7 @@ and no new credential path is introduced.
 What it costs, and must be handled rather than assumed away:
 
 - **The tool is third-party code Damaian cannot verify.**
-  [Spec 33](33_mcp_management_and_deferred_discovery.md) §5.5 establishes that a
+  [Spec 33](33_mcp_management_and_deferred_discovery/proposal.md) §5.5 establishes that a
   remote tool's self-description carries no local authority. So the PR payload is
   built by Damaian, shown to the user in full, and passed to the tool — Damaian
   does not ask the tool what it intends to do and does not trust a `readOnlyHint`.
@@ -323,7 +323,7 @@ a path that should already be clean, which is the right place for one.
   ([spec 34](34_repository_config_trust_boundary.md)). A cloned repository cannot
   enable pushing.
 - The MCP server and the specific PR-creation tool must both be enabled by the
-  user ([spec 33](33_mcp_management_and_deferred_discovery.md) §5.2), and the
+  user ([spec 33](33_mcp_management_and_deferred_discovery/proposal.md) §5.2), and the
   tool's `require_approval` cannot be cleared by repository config.
 - Every step is audited: remote, refs, commit OIDs, base, head, title, body
   size, approval decisions, and outcome — never the token, and never the body

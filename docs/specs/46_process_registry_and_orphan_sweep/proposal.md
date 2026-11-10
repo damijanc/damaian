@@ -13,7 +13,7 @@ Related implementation specs:
 [`17_durable_task_state_and_crash_recovery/`](../17_durable_task_state_and_crash_recovery/proposal.md)
 (split from it; its sweep runs at launch, earlier than spec 17's — see §5.7),
 [`06_mcp_support.md`](../06_mcp_support.md) and
-[`33_mcp_management_and_deferred_discovery.md`](../33_mcp_management_and_deferred_discovery.md)
+[`33_mcp_management_and_deferred_discovery/proposal.md`](../33_mcp_management_and_deferred_discovery/proposal.md)
 (MCP stdio servers), [`12_web_app_troubleshooting.md`](../12_web_app_troubleshooting/proposal.md).
 
 ## 1. Motivation

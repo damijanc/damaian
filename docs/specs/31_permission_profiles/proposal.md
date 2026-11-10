@@ -28,7 +28,7 @@ untrusted),
 [`20_working_modes/proposal.md`](../20_working_modes/proposal.md) (mode narrows a profile; the
 permission matrix this extends),
 [`32_hooks/proposal.md`](../32_hooks/proposal.md) and
-[`33_mcp_management_and_deferred_discovery.md`](../33_mcp_management_and_deferred_discovery.md)
+[`33_mcp_management_and_deferred_discovery/proposal.md`](../33_mcp_management_and_deferred_discovery/proposal.md)
 (both reference "the effective profile" this spec defines).
 
 Implementation order note: the roadmap lists this as WP3, after WP2 (hooks).
@@ -153,7 +153,7 @@ system can read the resolved state.
 
 - Organization-wide or remotely managed policy — Phase 6 WP6. `admin.conf`
   remains a local file.
-- Per-tool MCP permissions — [spec 33](../33_mcp_management_and_deferred_discovery.md).
+- Per-tool MCP permissions — [spec 33](../33_mcp_management_and_deferred_discovery/proposal.md).
 - Hook permissions — [spec 32](../32_hooks/proposal.md).
 - Replacing modes. Mode and profile are different axes: a profile is what the
   installation permits, mode is what this session is doing.
@@ -182,7 +182,7 @@ reach the network:
 `mcp_enabled`, `mcp_server_allowlist`, per-server `enabled` and
 `require_approval`, `data_dir`, and every profile field added by
 [spec 32](../32_hooks/proposal.md) or
-[spec 33](../33_mcp_management_and_deferred_discovery.md).
+[spec 33](../33_mcp_management_and_deferred_discovery/proposal.md).
 
 **Preference keys** — everything else: `max_file_bytes`,
 `max_command_output_bytes`, `agent_max_tool_rounds`, model selection, UI

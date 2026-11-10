@@ -30,7 +30,7 @@ removes it),
 [`10_persistent_command_approval.md`](../10_persistent_command_approval.md) and
 [`34_repository_config_trust_boundary.md`](../34_repository_config_trust_boundary.md)
 (the approval scope rules the allowlist obeys),
-[`33_mcp_management_and_deferred_discovery.md`](../33_mcp_management_and_deferred_discovery.md)
+[`33_mcp_management_and_deferred_discovery/proposal.md`](../33_mcp_management_and_deferred_discovery/proposal.md)
 (the alternative this spec argues against in §5.1).
 
 ## 1. Motivation
@@ -118,7 +118,7 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
   session reuse. A page behind a login is out of reach, and that is the correct
   answer rather than a limitation to fix later.
 - **Replacing MCP.** A user who prefers an MCP fetch server may still add one;
-  [spec 33](../33_mcp_management_and_deferred_discovery.md) governs it. §5.1 says
+  [spec 33](../33_mcp_management_and_deferred_discovery/proposal.md) governs it. §5.1 says
   why a native tool is specified anyway.
 - **Caching as a knowledge base.** Fetched pages are cached to avoid re-fetching
   within a session, not to build a corpus. No index, no embeddings, no recall
@@ -135,7 +135,7 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
 
 ### 5.1 Why a native tool rather than an MCP server
 
-[Spec 33](../33_mcp_management_and_deferred_discovery.md) makes MCP servers
+[Spec 33](../33_mcp_management_and_deferred_discovery/proposal.md) makes MCP servers
 manageable, and a fetch server is available off the shelf. Specifying a native
 tool anyway is a deliberate choice with three reasons, each of which is a
 property this spec needs and MCP cannot give:

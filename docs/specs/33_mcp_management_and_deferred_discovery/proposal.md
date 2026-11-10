@@ -1,89 +1,89 @@
 # Feature Spec: MCP Management and Deferred Discovery
 
-Status: Not started
+Status: In progress (planned 2026-11-09)
 Order: 33 of 33
 Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#20](20_working_modes/proposal.md) (modes) — built;
-[#26](26_context_assembly/proposal.md) (the context budget schemas count against) —
-built (Done 2026-10-25); [#31](31_permission_profiles/proposal.md) (the profile a server cannot
-widen) — built. Everything else named below is a cross-reference, not a
-prerequisite.
+Depends on: [#20](../20_working_modes/proposal.md) (modes),
+[#26](../26_context_assembly/proposal.md) (the context budget schemas count
+against), and [#31](../31_permission_profiles/proposal.md) (the profile a server
+cannot widen) — #20, #26 and #31 are built; **nothing here is unbuilt, so this
+spec is ready to start**. Everything else named below is a cross-reference,
+not a prerequisite.
+
 Related spec sections: `ai_coding_assistant_specification.md` section 7.5 (model
 adapter, tool calling), section 7.6 (tool and action orchestrator), section 7.8
 (risk classification and approval). Related implementation specs:
-[`06_mcp_support.md`](06_mcp_support.md) (the delivered runtime this manages),
-[`03_structured_tool_calling.md`](03_structured_tool_calling.md),
-[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
+[`06_mcp_support.md`](../06_mcp_support.md) (the delivered runtime this
+manages), [`03_structured_tool_calling.md`](../03_structured_tool_calling.md),
+[`17_durable_task_state_and_crash_recovery/proposal.md`](../17_durable_task_state_and_crash_recovery/proposal.md)
 (the PID registry MCP servers are the primary client of),
-[`20_working_modes/proposal.md`](20_working_modes/proposal.md) (mode filters MCP tools),
-[`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (the context budget this
-protects), [`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) (the profile
-that governs external writes).
+[`20_working_modes/proposal.md`](../20_working_modes/proposal.md) (mode filters
+MCP tools), [`26_context_assembly/proposal.md`](../26_context_assembly/proposal.md)
+(the context budget this protects),
+[`31_permission_profiles/proposal.md`](../31_permission_profiles/proposal.md) (the
+profile that governs external writes).
 
 ## 1. Motivation
 
 Every enabled MCP server's complete tool schema reaches every model request.
 
 `ChatOrchestrator` builds the tool list once per turn and extends it with
-`mcp.tool_definitions()` for every active server (`chat.rs:711-731`). There is no
-per-tool control, no deferral, and no bound: a server exposing forty tools
-contributes forty JSON schemas to every request in the session, whether the task
-needs them or not.
+`mcp.tool_definitions()` for every active server. There is no per-tool control,
+no deferral, and no bound: a server exposing forty tools contributes forty JSON
+schemas to every request in the session, whether the task needs them or not.
 
-That is a direct conflict with [spec 26](26_context_assembly/proposal.md), which allocates
-context by category and accounts for every token. Tool schemas are not part of
-that accounting — they arrive in the request's `tools` array rather than as
-context items — so an unmanaged MCP configuration silently consumes the window
-that context assembly is carefully budgeting, and the manifest cannot even
-report it. The user sees a smaller file-range budget and no explanation.
+That is a direct conflict with [spec 26](../26_context_assembly/proposal.md),
+which allocates context by category and accounts for every token. Tool schemas
+are not part of that accounting — they arrive in the request's `tools` array
+rather than as context items — so an unmanaged MCP configuration silently
+consumes the window that context assembly is carefully budgeting, and the
+manifest cannot even report it. The user sees a smaller file-range budget and
+no explanation.
 
 The management gaps compound it. `/api/mcp-test` tests a connection on demand
 and nothing tracks health or authentication state afterwards, so a server whose
-token expired presents its tools to the model and fails at call time, every turn.
-Servers start eagerly. There is no way to enable one tool from a server and not
-another.
+token expired presents its tools to the model and fails at call time, every
+turn. Servers start eagerly. There is no way to enable one tool from a server
+and not another.
 
 And one correctness point worth stating plainly because it is easy to get wrong
-in the opposite direction: a remote tool describing itself as read-only is making
-an assertion about a system Damaian cannot see. Treating that claim as a
+in the opposite direction: a remote tool describing itself as read-only is
+making an assertion about a system Damaian cannot see. Treating that claim as a
 guarantee would let a remote server opt itself out of approval by describing
 itself favourably.
 
 ## 2. Current State
 
-- **All active servers' schemas go into every request.** `chat.rs:711-731`
-  builds `native_tools`, then `tools.extend(mcp.tool_definitions()…)`, filtering
+`context.md` supersedes the line references here where the survey found them
+stale; the behaviour described here is still what motivated this spec.
+
+- **All active servers' schemas go into every request.** The turn's tool list
+  is extended with `mcp.tool_definitions()` for every active server, filtering
   only browser-diagnostic servers. No per-tool selection, no deferral.
 - **Server gating is a three-way intersection already.**
-  `Config::active_mcp_servers` (`config.rs:475-488`) requires `mcp_enabled`, the
-  server's own `enabled`, and membership of `mcp_server_allowlist` when
-  non-empty. This narrowing pattern is the precedent
-  [spec 31](31_permission_profiles/proposal.md) §5.2 generalises.
-- **`McpServerConfig`** (`config.rs:153-175`) carries `id`, `label`,
-  `transport`, `command`, `args`, `env`, `url`, `auth_token_env`, `enabled`, and
-  `require_approval`. Per-**tool** configuration does not exist.
+  `Config::active_mcp_servers` requires `mcp_enabled`, the server's own
+  `enabled`, and membership of `mcp_server_allowlist` when non-empty. This
+  narrowing pattern is the precedent [spec 31](../31_permission_profiles/proposal.md)
+  §5.2 generalises.
+- **`McpServerConfig`** carries `id`, `label`, `transport`, `command`, `args`,
+  `env`, `url`, `auth_token_env`, `enabled`, and `require_approval`. Per-tool
+  configuration does not exist.
 - **`auth_token_env` is already a reference, not a value**: `keychain:<account>`
-  or an environment variable name (`config.rs:165-167`), matching the
-  `model_api_key_env` rule in `AGENTS.md`.
-- **Servers are per-turn and eager.** `build_mcp_runtime` (`chat.rs:708`)
-  connects lazily *within* a turn and tears everything down on drop, per
-  [spec 06](06_mcp_support.md) — but every active server is connected to list
+  or an environment variable name, matching the `model_api_key_env` rule in
+  `AGENTS.md`.
+- **Servers are per-turn and eager.** `build_mcp_runtime` connects lazily
+  *within* a turn and tears everything down on drop, per
+  [spec 06](../06_mcp_support.md) — but every active server is connected to list
   tools, whether or not a tool is called.
-- **Stdio servers spawn children with no kill-on-drop guard**
-  (`mcp.rs:323`), which
-  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 identifies as one
-  of three orphan sources and assigns to the PID registry.
 - **Tools are namespaced** `mcp__<server>__<tool>`, parsed by
-  `parse_namespaced_tool_name` (used at `chat.rs:726`), so per-tool addressing
-  has a naming scheme already.
+  `parse_namespaced_tool_name`, so per-tool addressing has a naming scheme
+  already.
 - **`/api/mcp-test` exists** in `crates/desktop-shell/src/lib.rs` as a manual
   connection test. There is no persistent health or auth state.
-- **`McpToolDescriptor::to_tool_definition`** (`mcp.rs:108`) converts a
-  discovered tool to a `ToolDefinition`.
-- **No timeouts are bounded** for startup, list, or call beyond whatever the
-  transport does.
+- **`McpTool::to_tool_definition`** converts a discovered tool to a
+  `ToolDefinition`.
 
 ## 3. Requirements
 
@@ -105,7 +105,7 @@ itself favourably.
 ## 4. Non-goals
 
 - Changing the MCP protocol implementation in `mcp.rs`, its transports, or its
-  framing. This manages what [spec 06](06_mcp_support.md) delivered.
+  framing. This manages what [spec 06](../06_mcp_support.md) delivered.
 - An MCP server marketplace, registry, or installer.
 - Authoring MCP servers.
 - Inferring what a remote tool actually does. §5.5 treats every remote tool as
@@ -172,12 +172,14 @@ Requirement 1's per-tool enable and disable, with the essential property from th
 roadmap's acceptance criteria: **a disabled tool is absent from the model's tool
 list, not merely refused on call.** Absent is cheaper (no schema, no tokens) and
 safer (the model cannot try), and it is the same principle as
-[spec 20](20_working_modes/proposal.md) §5.2 layer 1 — withholding beats refusing.
+[spec 20](../20_working_modes/proposal.md) §5.2 layer 1 — withholding beats
+refusing.
 
 Resolution is an intersection, following
-[spec 31](31_permission_profiles/proposal.md) §5.2: a tool is offered only if MCP is
-enabled globally, the server is enabled and allowlisted, the tool is enabled, the
-profile permits it, and the mode permits it. Any layer can remove; none can add.
+[spec 31](../31_permission_profiles/proposal.md) §5.2: a tool is offered only if
+MCP is enabled globally, the server is enabled and allowlisted, the tool is
+enabled, the profile permits it, and the mode permits it. Any layer can remove;
+none can add.
 
 Unknown tools default to **enabled** for a server the user enabled — a server
 that adds a tool in an update should not silently break — but a newly appearing
@@ -188,8 +190,12 @@ on update; this is that rule applied to tools.
 
 ### 5.3 Health, auth, and lazy startup
 
-Requirements 1 and 3. Per-server state, persisted per repository alongside other
-per-repository data:
+Requirements 1 and 3. Per-server state:
+
+Added in planning (2026-11-10, [`context.md`](context.md) D5): health is held
+**in memory** per shell process, keyed by repository and server, and is not
+persisted — only the tool inventory (D4) is written to disk. Persisting a
+per-session `Unknown`/`Failed` state would contradict its own semantics.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,9 +241,10 @@ Requirement 4, with three separate budgets because they fail differently:
 A call timeout is reported to the model as a tool error rather than failing the
 turn — a remote system being slow is a normal condition the agent can work
 around, and it is also, per
-[spec 17](17_durable_task_state_and_crash_recovery/proposal.md), an **unknown outcome**:
-the request may have been received and acted on. A timed-out call that could have
-written something is recorded as such and never automatically retried.
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md), an **unknown
+outcome**: the request may have been received and acted on. A timed-out call that
+could have written something is recorded as such and never automatically
+retried.
 
 ### 5.5 A read-only claim is an assertion, not a guarantee
 
@@ -261,22 +268,30 @@ So:
 - **The user may set `require_approval=false` for a specific tool** they have
   decided to trust, which is a local decision recorded in local config. That is
   the only way a remote tool becomes automatic, and it is exact-tool, mirroring
-  [spec 10](10_persistent_command_approval.md)'s exact-command rule.
+  [spec 10](../10_persistent_command_approval.md)'s exact-command rule.
 
 Requirement 7's "unless a user profile specifically allows them" is therefore a
-profile capability key ([spec 31](31_permission_profiles/proposal.md) §5.1), subject to
-that spec's rule that repository config cannot widen it: a cloned repository
-cannot enable an MCP server, nor drop a tool's approval requirement.
+profile capability key ([spec 31](../31_permission_profiles/proposal.md) §5.1),
+subject to that spec's rule that repository config cannot widen it: a cloned
+repository cannot enable an MCP server, nor drop a tool's approval requirement.
+
+Added in planning (2026-11-09, [`context.md`](context.md) D1): a read-only claim
+no longer widens the **profile** layer. `profile_permits` refuses an MCP call
+when `allow_mutating_mcp_tools` is false regardless of the claim, so a server
+cannot describe itself past the user's profile restriction. It still widens the
+**mode** layer (`mode.rs`), so an Ask or Review session can keep *offering* a
+tool whose server describes it as read-only; offering is not approval, and the
+approval decision is unchanged either way.
 
 **A local stdio server is not safer for being local.** It runs as a child process
-with the user's privileges (`mcp.rs:323`), so a local server's tools are governed
-by the same rule. Sandboxing is a non-goal, which makes the approval requirement
-the only control there is.
+with the user's privileges, so a local server's tools are governed by the same
+rule. Sandboxing is a non-goal, which makes the approval requirement the only
+control there is.
 
 ### 5.6 Secrets
 
-Requirement 5. `auth_token_env` already holds a reference (`config.rs:165-167`).
-The additions are about everything built around it:
+Requirement 5. `auth_token_env` already holds a reference. The additions are
+about everything built around it:
 
 - The resolved token value is used only to construct the `Authorization` header
   and is never placed in a struct that is serialised, logged, audited, or
@@ -298,18 +313,18 @@ holds; this one guards against a secret arriving *from* the server.
 
 Requirement 1's "sanitized invocation history": per call, the server, tool,
 timestamp, duration, outcome, approval decision, and redacted bounded arguments
-and result. Written through `AuditLog::record` (`audit.rs:42`), which redacts
-field values on the way in, rather than a parallel log — the roadmap is explicit
-that the audit log is the mechanism to reuse.
+and result. Written through `AuditLog::record`, which redacts field values on
+the way in, rather than a parallel log — the roadmap is explicit that the audit
+log is the mechanism to reuse.
 
 This is what makes "what has this server actually done?" answerable, which is the
 question a user has after enabling something authored by a third party.
 
 ### 5.8 Process lifetime
 
-Requirement 8. Stdio children (`mcp.rs:323`) register their PID and start time in
-the [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 registry, are
-killed by PID, and are start-time-checked before killing so a recycled PID is
+Requirement 8. Stdio children register their PID and start time in the
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.7 registry,
+are killed by PID, and are start-time-checked before killing so a recycled PID is
 never someone else's process.
 
 `AGENTS.md`'s prohibition on matching processes by name applies with force: MCP
@@ -354,7 +369,7 @@ authentication failure without exposing the token.
   allowlisted, tool enabled, profile, and mode. Any layer can remove a tool; no
   layer can add one — asserted per layer.
 - A repository config cannot enable an MCP server or clear a tool's approval
-  requirement ([spec 31](31_permission_profiles/proposal.md) §5.2).
+  requirement ([spec 31](../31_permission_profiles/proposal.md) §5.2).
 - A session that uses no MCP tool starts no MCP server process.
 - `Unknown` health is distinguished from `Ready` in the UI and in the API.
 - A server in `Failed` is not retried automatically, its tools are not offered,
@@ -380,7 +395,7 @@ authentication failure without exposing the token.
 - No MCP server process outlives the session that started it, and a recorded PID
   whose start time no longer matches is not killed.
 - Every quality-gate command from `AGENTS.md` passes, and the
-  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  [spec 18](../18_local_evaluation_harness/proposal.md) baseline shows no
   regression and no increase in approval-policy violations.
 
 ## 7. Implementation Notes
