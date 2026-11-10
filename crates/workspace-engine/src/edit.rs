@@ -1,5 +1,8 @@
 use crate::audit::AuditLog;
-use crate::baseline::{BaselineBatch, BaselineCoordinator, BaselinePreparation};
+use crate::baseline::{
+    BaselineBatch, BaselineCoordinator, BaselinePreparation, BaselineProgress,
+    BaselineResumeOutcome,
+};
 use crate::cancel::CancelToken;
 use crate::chat::{ToolAction, apply_protected_paths_reminder};
 use crate::checkpoint::{
@@ -872,6 +875,32 @@ impl EditOrchestrator {
             decisions,
             always,
             approved_by,
+        )
+    }
+
+    /// [`Self::resume_stored_patch_baseline`] for a caller that streams
+    /// progress and offers a cancel (spec 107 Task 4). A cancelled run records
+    /// the remaining baselines as declined and still never writes patch
+    /// content: the patch stays undecided.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_stored_patch_baseline_streamed(
+        &self,
+        repository_root: impl AsRef<Path>,
+        batch_id: &str,
+        decisions: &[(String, bool)],
+        always: &[String],
+        approved_by: &str,
+        cancel: &CancelToken,
+        on_progress: &mut dyn FnMut(BaselineProgress),
+    ) -> Result<BaselineResumeOutcome> {
+        self.baselines.resume_streamed(
+            repository_root.as_ref(),
+            batch_id,
+            decisions,
+            always,
+            approved_by,
+            cancel,
+            on_progress,
         )
     }
 

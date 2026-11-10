@@ -6378,12 +6378,34 @@ function showWaitingIndicator(row, label) {
   const text = row.querySelector(".turn-indicator-label");
   const clock = row.querySelector(".turn-indicator-elapsed");
   text.textContent = label;
-  const since = Date.now();
-  const tick = () => {
-    clock.textContent = formatClock(Date.now() - since);
+  const entry = { row, since: Date.now(), timer: null, tick: null };
+  entry.tick = () => {
+    clock.textContent = formatClock(Date.now() - entry.since);
   };
-  tick();
-  waitingIndicator = { row, timer: setInterval(tick, 1000) };
+  entry.tick();
+  entry.timer = setInterval(entry.tick, 1000);
+  waitingIndicator = entry;
+}
+
+// Spec 107 Task 4: while a baseline the user started runs, the waiting row is
+// a working row again, naming the check ("Running baseline: cargo test
+// (repository root)") with that check's own clock from `since`.
+function showWaitingActivity(label, since) {
+  if (!waitingIndicator) return;
+  delete waitingIndicator.row.dataset.state;
+  const text = waitingIndicator.row.querySelector(".turn-indicator-label");
+  if (text && label) text.textContent = label;
+  waitingIndicator.since = since;
+  waitingIndicator.tick();
+}
+
+// The baseline ended: back to waiting on the user, with a fresh clock. The
+// patch card's next render names the decision again.
+function endWaitingActivity() {
+  if (!waitingIndicator) return;
+  waitingIndicator.row.dataset.state = "waiting";
+  waitingIndicator.since = Date.now();
+  waitingIndicator.tick();
 }
 
 // The waiting row's label when a patch card's baseline replaces the patch as
@@ -14546,6 +14568,27 @@ function createBaselineBatchCard(batch, onDecide) {
   submit.className = "btn-sm";
   actions.append(runAll, submit);
 
+  // Spec 107 Task 4: what runs once the user submits — the engine's label for
+  // the running check, its clock, its latest output line, and Cancel.
+  const progress = document.createElement("div");
+  progress.className = "baseline-progress";
+  progress.hidden = true;
+  const progressLine = document.createElement("p");
+  progressLine.className = "baseline-progress-line";
+  const progressLabel = document.createElement("span");
+  progressLabel.className = "baseline-progress-label";
+  progressLabel.setAttribute("aria-live", "polite");
+  const progressClock = document.createElement("span");
+  progressClock.className = "baseline-progress-elapsed";
+  progressLine.append(progressLabel, progressClock);
+  const progressOutput = document.createElement("code");
+  progressOutput.className = "baseline-progress-output";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn-sm baseline-cancel";
+  cancel.textContent = batch.cancelLabel || "Cancel";
+  progress.append(progressLine, progressOutput, cancel);
+
   const syncSubmit = () => {
     const ticked = rows.filter(({ run }) => run.checked).length;
     submit.textContent = ticked > 0 ? batch.runLabel : batch.skipLabel;
@@ -14572,16 +14615,57 @@ function createBaselineBatchCard(batch, onDecide) {
       .filter(({ run, always }) => run.checked && always?.checked)
       .map(({ check }) => check.proposalId)
       .join("\n");
+    const controller = new AbortController();
+    let since = Date.now();
+    const tick = () => {
+      progressClock.textContent = formatClock(Date.now() - since);
+    };
+    const timer = setInterval(tick, 1000);
+    cancel.disabled = false;
+    cancel.onclick = () => {
+      // Closing the stream is the cancel: the shell notices on its next
+      // write and the engine records the rest as declined.
+      cancel.disabled = true;
+      progressLabel.textContent = "Cancelling…";
+      controller.abort();
+    };
+    const watch = {
+      signal: controller.signal,
+      baseline(event) {
+        if (event.kind === "started") {
+          progress.hidden = false;
+          since = Date.now();
+          const count = event.total > 1 ? ` (${event.index} of ${event.total})` : "";
+          progressLabel.textContent = `${event.label}${count}`;
+          progressOutput.textContent = "";
+          tick();
+          showWaitingActivity(event.label, since);
+        } else if (event.kind === "output") {
+          progressOutput.textContent = event.line;
+        } else if (event.kind === "finished") {
+          progressLabel.textContent = event.label;
+        }
+      },
+      elapsed(event) {
+        since = Date.now() - event.seconds * 1000;
+        tick();
+        showWaitingActivity("", since);
+      },
+    };
     try {
-      await onDecide(decisions, always);
+      await onDecide(decisions, always, watch);
     } catch (error) {
       submit.disabled = false;
       runAll.disabled = false;
+      progress.hidden = true;
       toast(error.message);
+    } finally {
+      clearInterval(timer);
+      cancel.disabled = true;
     }
   });
 
-  card.append(header, note, list, actions);
+  card.append(header, note, list, actions, progress);
   return card;
 }
 
@@ -14937,30 +15021,61 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
     }
     if (state.baseline) {
       list.append(
-        createBaselineBatchCard(state.baseline.batch, async (decisions, always) => {
+        createBaselineBatchCard(state.baseline.batch, async (decisions, always, watch) => {
           const pending = state.baseline;
           if (!pending) return;
-          let result;
+          // Spec 107 Task 4: streamed, so the card and the status line show the
+          // running check and its clock, and Cancel can stop it.
+          let result = null;
+          let failure = null;
           try {
-            result = await api(
-              "/api/resume-baseline",
-              form({
+            await streamRequest(
+              "/api/resume-baseline-stream",
+              null,
+              {
                 repo: patchRepo,
                 batch_id: pending.batch.id,
                 decisions: JSON.stringify(decisions),
                 always,
-              }),
+              },
+              {
+                token() {},
+                baseline: watch.baseline,
+                elapsed: watch.elapsed,
+                done(payload) {
+                  result = payload;
+                },
+                error(payload) {
+                  failure = new Error(payload.error || "The baseline could not run");
+                },
+              },
+              watch.signal,
             );
           } catch (error) {
+            if (!watch.signal.aborted) failure = error;
+          } finally {
+            endWaitingActivity();
+          }
+          if (failure) {
             // A stale card (for example after a reload rebuilt the batch) is
             // safe to re-offer: the next apply asks the engine again.
             state.baseline = null;
             render();
-            throw error;
+            throw failure;
+          }
+          // A cancelled baseline is recorded as declined, exactly as *Skip
+          // baselines* would, and the patch is left for the user: no apply is
+          // retried on their behalf.
+          if (watch.signal.aborted || result?.cancelled === true) {
+            state.baseline = null;
+            render();
+            toast("Baseline cancelled and recorded as declined. Apply or reject the patch.");
+            return;
           }
           // Incomplete or still-awaiting responses never retry the apply: the
           // only response that means every check has a terminal baseline is
           // the engine's explicit `completed: true`.
+          if (!result) throw new Error("The baseline response was incomplete");
           if (result.completed !== true) {
             if (!result.baselineBatch) {
               throw new Error("The baseline response was incomplete");
@@ -15647,6 +15762,10 @@ function processSseEvent(raw, handlers) {
     setContextManifest(payload, payload.taskId || "");
     if (handlers.context) handlers.context(payload);
   }
+  // A streamed baseline (spec 107 Task 4): the engine's progress, and the
+  // running check's clock on each keepalive tick.
+  if (event === "baseline" && handlers.baseline) handlers.baseline(payload);
+  if (event === "elapsed" && handlers.elapsed) handlers.elapsed(payload);
   if (event === "done") handlers.done(payload);
   if (event === "error") handlers.error(payload);
 }

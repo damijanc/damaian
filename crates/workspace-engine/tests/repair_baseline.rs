@@ -13,9 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::patch_engine::ProposedChange;
 use workspace_engine::{
-    BaselinePreparation, CheckBaseline, CheckId, CheckTermination, ClientError, Config,
-    EditProposalResult, MockModelAdapter, PatchApplyOutcome, Session, Task, WorkerRecord,
-    WorkspaceEngine,
+    BaselinePreparation, BaselineProgress, CancelToken, CheckBaseline, CheckId, CheckTermination,
+    ClientError, Config, EditProposalResult, MockModelAdapter, PatchApplyOutcome, Session, Task,
+    WorkerRecord, WorkspaceEngine,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -1057,6 +1057,237 @@ fn a_partial_hunk_apply_still_passes_the_baseline_gate() {
     assert!(written.contains("line two\n"), "{written}");
     assert!(written.contains("line 22\n"), "{written}");
     assert!(!written.contains("line twenty-two\n"), "{written}");
+
+    cleanup(&root, &data_dir);
+}
+
+// Spec 107 Task 4: a baseline the user started streams its progress and can be
+// cancelled.
+
+fn approval_engine(root: &Path, data_dir: &Path, shell: &str) -> WorkspaceEngine {
+    fs::create_dir_all(root).unwrap();
+    WorkspaceEngine::new(Config {
+        data_dir: data_dir.to_path_buf(),
+        enable_index_watcher: false,
+        shell: shell.to_string(),
+        require_approval_for_risky_commands: true,
+        ..Config::default()
+    })
+}
+
+#[test]
+fn a_streamed_baseline_reports_each_check_in_order() {
+    let root = temp_dir("stream-order");
+    let data_dir = temp_dir("stream-order-data");
+    write(&root, "crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
+    write(&root, "crates/a/src/lib.rs", "pub fn a() -> u8 { 1 }\n");
+    write(&root, "crates/b/Cargo.toml", "[package]\nname = \"b\"\n");
+    write(&root, "crates/b/src/lib.rs", "pub fn b() -> u8 { 1 }\n");
+    let script = data_dir.join("fake-shell.sh");
+    executable(
+        &script,
+        "#!/bin/sh\necho compiling\necho test result: ok\nexit 0\n",
+    );
+    let engine = approval_engine(&root, &data_dir, &script.to_string_lossy());
+    let proposal = propose(
+        &engine,
+        &root,
+        &edit_response(&[
+            ("crates/a/src/lib.rs", "pub fn a() -> u8 { 2 }\n"),
+            ("crates/b/src/lib.rs", "pub fn b() -> u8 { 2 }\n"),
+        ]),
+    );
+    let PatchApplyOutcome::BaselineRequired(batch) =
+        apply(&engine, &root, &proposal.patch.id, None).unwrap()
+    else {
+        panic!("the checks need their own approval");
+    };
+    assert_eq!(batch.checks.len(), 2, "{batch:?}");
+    assert_eq!(batch.cancel_label, "Cancel");
+    let decisions = batch
+        .checks
+        .iter()
+        .map(|check| (check.proposal_id.clone(), true))
+        .collect::<Vec<_>>();
+
+    let mut events = Vec::new();
+    let outcome = engine
+        .edit_orchestrator
+        .resume_stored_patch_baseline_streamed(
+            &root,
+            &batch.id,
+            &decisions,
+            &[],
+            "tester",
+            &CancelToken::new(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+    assert!(!outcome.cancelled);
+    assert_eq!(outcome.recorded.len(), 2);
+
+    // Output arrives in the chunks the runner reads, so it is compared joined.
+    let mut seen: Vec<String> = Vec::new();
+    for event in &events {
+        match event {
+            BaselineProgress::Output { line } => match seen.last_mut() {
+                Some(last) if last.starts_with("output ") => {
+                    last.push('\n');
+                    last.push_str(line);
+                }
+                _ => seen.push(format!("output {line}")),
+            },
+            other => seen.push(serde_json::to_string(other).unwrap()),
+        }
+    }
+    let mut expected = Vec::new();
+    for (index, check) in batch.checks.iter().enumerate() {
+        let name = check.check.label();
+        expected.push(
+            serde_json::to_string(&BaselineProgress::Started {
+                check: name.clone(),
+                label: format!("Running baseline: {name}"),
+                index: index + 1,
+                total: 2,
+            })
+            .unwrap(),
+        );
+        expected.push("output compiling\ntest result: ok".to_string());
+        expected.push(
+            serde_json::to_string(&BaselineProgress::Finished {
+                check: name.clone(),
+                result: "passed".to_string(),
+                label: format!("Baseline passed: {name}"),
+            })
+            .unwrap(),
+        );
+    }
+    assert_eq!(seen, expected);
+    // A completed streamed run records exactly what the unstreamed one does.
+    let recorded = baseline_events(&engine, &proposal.session);
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert!(
+        recorded
+            .iter()
+            .all(|(_, _, baseline)| baseline == &CheckBaseline::Passed)
+    );
+    assert!(pending_batches(&data_dir).is_empty());
+
+    cleanup(&root, &data_dir);
+}
+
+#[test]
+fn a_cancelled_baseline_is_recorded_as_declined_and_leaves_the_patch_undecided() {
+    let root = temp_dir("stream-cancel");
+    let data_dir = temp_dir("stream-cancel-data");
+    write(&root, "crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
+    write(&root, "crates/a/src/lib.rs", "pub fn a() -> u8 { 1 }\n");
+    write(&root, "crates/b/Cargo.toml", "[package]\nname = \"b\"\n");
+    write(&root, "crates/b/src/lib.rs", "pub fn b() -> u8 { 1 }\n");
+    // Prints, then would run far longer than the test: only the cancel ends it.
+    let script = data_dir.join("fake-shell.sh");
+    executable(&script, "#!/bin/sh\necho started\nsleep 30\nexit 0\n");
+    let engine = approval_engine(&root, &data_dir, &script.to_string_lossy());
+    let proposal = propose(
+        &engine,
+        &root,
+        &edit_response(&[
+            ("crates/a/src/lib.rs", "pub fn a() -> u8 { 2 }\n"),
+            ("crates/b/src/lib.rs", "pub fn b() -> u8 { 2 }\n"),
+        ]),
+    );
+    let PatchApplyOutcome::BaselineRequired(batch) =
+        apply(&engine, &root, &proposal.patch.id, None).unwrap()
+    else {
+        panic!("the checks need their own approval");
+    };
+    let decisions = batch
+        .checks
+        .iter()
+        .map(|check| (check.proposal_id.clone(), true))
+        .collect::<Vec<_>>();
+
+    // The user presses Cancel once the first check is visibly running.
+    let cancel = CancelToken::new();
+    let trigger = cancel.clone();
+    let mut events = Vec::new();
+    let started_at = std::time::Instant::now();
+    let outcome = engine
+        .edit_orchestrator
+        .resume_stored_patch_baseline_streamed(
+            &root,
+            &batch.id,
+            &decisions,
+            &[],
+            "tester",
+            &cancel,
+            &mut |event| {
+                if matches!(event, BaselineProgress::Output { .. }) {
+                    trigger.cancel();
+                }
+                events.push(event);
+            },
+        )
+        .unwrap();
+    assert!(
+        started_at.elapsed() < std::time::Duration::from_secs(20),
+        "the running check was not stopped"
+    );
+    assert!(outcome.cancelled);
+    assert_eq!(outcome.recorded.len(), 2);
+
+    let first = batch.checks[0].check.label();
+    let second = batch.checks[1].check.label();
+    let kinds = events
+        .iter()
+        .map(|event| match event {
+            BaselineProgress::Started { check, .. } => format!("started {check}"),
+            BaselineProgress::Output { line } => format!("output {line}"),
+            BaselineProgress::Finished { check, result, .. } => format!("{result} {check}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            format!("started {first}"),
+            "output started".to_string(),
+            format!("cancelled {first}"),
+            // The second check never started.
+            format!("declined {second}"),
+        ]
+    );
+
+    // Both are declined, the record *Skip baselines* leaves, and the card is
+    // gone: nothing is left to ask about.
+    let recorded = baseline_events(&engine, &proposal.session);
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert!(
+        recorded
+            .iter()
+            .all(|(_, _, baseline)| baseline == &CheckBaseline::Declined)
+    );
+    assert!(pending_batches(&data_dir).is_empty());
+    let audit = fs::read_to_string(data_dir.join("audit").join("events.jsonl")).unwrap();
+    assert!(audit.contains("verification_baseline_cancelled"), "{audit}");
+
+    // The patch is undecided: nothing was written, and it is still the user's
+    // to apply (or reject) — an apply now goes ahead without a new card.
+    assert_eq!(
+        fs::read_to_string(root.join("crates/a/src/lib.rs")).unwrap(),
+        "pub fn a() -> u8 { 1 }\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("crates/b/src/lib.rs")).unwrap(),
+        "pub fn b() -> u8 { 1 }\n"
+    );
+    assert!(matches!(
+        apply(&engine, &root, &proposal.patch.id, None).unwrap(),
+        PatchApplyOutcome::Applied(_)
+    ));
+    assert_eq!(
+        fs::read_to_string(root.join("crates/a/src/lib.rs")).unwrap(),
+        "pub fn a() -> u8 { 2 }\n"
+    );
 
     cleanup(&root, &data_dir);
 }

@@ -6057,6 +6057,43 @@ body.worker-view #chat-model-menu {
   opacity: 0.7;
 }
 
+/* A running baseline (spec 107 Task 4): the check, its clock, its latest
+   output line, and Cancel. */
+.baseline-progress {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+}
+
+.baseline-progress[hidden] {
+  display: none;
+}
+
+.baseline-progress-line {
+  display: flex;
+  gap: 8px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.baseline-progress-elapsed {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.baseline-progress-output {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.baseline-progress-output:empty {
+  display: none;
+}
+
 .verification-report {
   display: grid;
   gap: 4px;

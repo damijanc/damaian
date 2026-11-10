@@ -76,10 +76,22 @@ pub struct BaselineBatch {
     pub run_label: String,
     pub skip_label: String,
     pub run_all_label: String,
+    /// The control that stops a running baseline (spec 107 Task 4). Defaulted
+    /// so a card persisted before the field existed still loads.
+    #[serde(default = "default_cancel_label")]
+    pub cancel_label: String,
     pub checks: Vec<BaselineCheck>,
 }
 
+fn default_cancel_label() -> String {
+    "Cancel".to_string()
+}
+
 /// What preparing a patch's baseline came to.
+// One value per apply or resume call, returned and matched at once, never held
+// in a collection, so the size gap between the variants costs nothing; boxing
+// the card would only add a deref at every caller in four crates.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BaselinePreparation {
     /// Every newly selected check now has a terminal record. `recorded` names
@@ -89,6 +101,47 @@ pub enum BaselinePreparation {
     /// At least one baseline needs the user's ordinary command approval. No
     /// patch file has been written.
     Awaiting(BaselineBatch),
+}
+
+/// What a baseline run reports while it runs (spec 107 Task 4).
+///
+/// Every label is the engine's own text; a renderer shows it and never derives
+/// a check name or a result word of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BaselineProgress {
+    /// A check started running. `index` is 1-based among the checks that run.
+    #[serde(rename_all = "camelCase")]
+    Started {
+        check: String,
+        label: String,
+        index: usize,
+        total: usize,
+    },
+    /// The running check's latest output, already secret-redacted by the
+    /// command runner; one chunk as the runner read it, without its trailing
+    /// newline.
+    Output { line: String },
+    /// A check reached its terminal record. `result` is the recorded baseline
+    /// (`passed`, `failed`, `unavailable`, `declined`), or `cancelled` for the
+    /// check that was running when the user cancelled (recorded as declined).
+    #[serde(rename_all = "camelCase")]
+    Finished {
+        check: String,
+        result: String,
+        label: String,
+    },
+}
+
+/// What a streamed resume came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineResumeOutcome {
+    /// Every check on the card, each now with a terminal record.
+    pub recorded: Vec<CheckId>,
+    /// The user cancelled. The check that was running and every approved check
+    /// that had not started are recorded as declined (spec 102's existing
+    /// provenance), and the patch is left for the user to apply or reject.
+    pub cancelled: bool,
 }
 
 /// The persisted half of a paused baseline approval.
@@ -378,6 +431,7 @@ impl BaselineCoordinator {
             run_label: "Run selected baselines".to_string(),
             skip_label: "Skip baselines".to_string(),
             run_all_label: "Run all".to_string(),
+            cancel_label: default_cancel_label(),
             checks: awaiting,
         };
         // A different selection for the same source must not leave the previous
@@ -421,6 +475,41 @@ impl BaselineCoordinator {
         always: &[String],
         approved_by: &str,
     ) -> Result<BaselinePreparation> {
+        // No caller here can cancel or watch, so the run is the streamed one
+        // with a token nothing triggers and progress that goes nowhere.
+        let outcome = self.resume_streamed(
+            repository_root,
+            batch_id,
+            decisions,
+            always,
+            approved_by,
+            &CancelToken::new(),
+            &mut |_| {},
+        )?;
+        Ok(BaselinePreparation::Complete {
+            recorded: outcome.recorded,
+        })
+    }
+
+    /// [`Self::resume`] for a caller that shows progress and can cancel
+    /// (spec 107 Task 4).
+    ///
+    /// A cancel stops the running check (the command runner kills its process
+    /// group) and records it, and every approved check that had not started,
+    /// as declined — exactly the record *Skip baselines* leaves. The pending
+    /// card is removed either way: every check has a terminal record, so the
+    /// next apply goes ahead without asking again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_streamed(
+        &self,
+        repository_root: &Path,
+        batch_id: &str,
+        decisions: &[(String, bool)],
+        always: &[String],
+        approved_by: &str,
+        cancel: &CancelToken,
+        on_progress: &mut dyn FnMut(BaselineProgress),
+    ) -> Result<BaselineResumeOutcome> {
         let pending = self.load_pending(batch_id)?;
         self.validate_resume_against(&pending, repository_root, decisions, always)?;
         // Every *Allow Always* request was validated against this exact pending
@@ -431,8 +520,7 @@ impl BaselineCoordinator {
             self.validation
                 .allow_command_always(proposal_id, approved_by)?;
         }
-        let mut recorded = Vec::new();
-        for check in &pending.batch.checks {
+        let approved_of = |check: &BaselineCheck| {
             // Validated above, so every check has exactly one decision.
             let Some((_, approved)) = decisions
                 .iter()
@@ -440,11 +528,40 @@ impl BaselineCoordinator {
             else {
                 unreachable!("resume validated every decision before running")
             };
-            if *approved {
+            *approved
+        };
+        let total = pending
+            .batch
+            .checks
+            .iter()
+            .filter(|check| approved_of(check))
+            .count();
+        let mut started = 0;
+        let mut cancelled = false;
+        let mut recorded = Vec::new();
+        for check in &pending.batch.checks {
+            let approved = approved_of(check);
+            if approved && !cancel.is_cancelled() {
                 let proposal = self
                     .validation
                     .command_store()
                     .load_proposal(&check.proposal_id)?;
+                started += 1;
+                let name = check.check.label();
+                on_progress(BaselineProgress::Started {
+                    check: name.clone(),
+                    label: format!("Running baseline: {name}"),
+                    index: started,
+                    total,
+                });
+                let mut on_output = |line: &str| {
+                    let line = line.trim_end_matches(['\n', '\r']);
+                    if !line.is_empty() {
+                        on_progress(BaselineProgress::Output {
+                            line: line.to_string(),
+                        });
+                    }
+                };
                 let baseline = self.run_baseline(
                     &pending.session_id,
                     &pending.task_id,
@@ -452,13 +569,31 @@ impl BaselineCoordinator {
                     &proposal,
                     true,
                     approved_by,
+                    cancel,
+                    &mut on_output,
                 )?;
+                let result = match &baseline {
+                    BaselineRun::Recorded(baseline) => baseline_result_word(baseline),
+                    BaselineRun::Cancelled => {
+                        cancelled = true;
+                        "cancelled"
+                    }
+                };
+                let baseline = match baseline {
+                    BaselineRun::Recorded(baseline) => baseline,
+                    BaselineRun::Cancelled => CheckBaseline::Declined,
+                };
                 self.record(
                     &pending.session_id,
                     &pending.task_id,
                     &check.check,
                     baseline,
                 )?;
+                on_progress(BaselineProgress::Finished {
+                    label: finished_label(result, &name),
+                    check: name,
+                    result: result.to_string(),
+                });
             } else {
                 // Through the store as well as the log, so declining a
                 // baseline leaves the same command-store record an ordinary
@@ -472,12 +607,27 @@ impl BaselineCoordinator {
                     &check.check,
                     CheckBaseline::Declined,
                 )?;
+                // An approved check that never started because the user
+                // cancelled is declined, the same record as one left unticked.
+                if approved {
+                    cancelled = true;
+                    let name = check.check.label();
+                    on_progress(BaselineProgress::Finished {
+                        label: finished_label("declined", &name),
+                        check: name,
+                        result: "declined".to_string(),
+                    });
+                }
             }
             recorded.push(check.check.clone());
         }
         self.remove_pending(batch_id)?;
         self.audit_log.record(
-            "verification_baseline_resumed",
+            if cancelled {
+                "verification_baseline_cancelled"
+            } else {
+                "verification_baseline_resumed"
+            },
             &[
                 ("actor", approved_by.to_string()),
                 ("sessionId", pending.session_id.clone()),
@@ -487,7 +637,10 @@ impl BaselineCoordinator {
                 ("checks", recorded.len().to_string()),
             ],
         )?;
-        Ok(BaselinePreparation::Complete { recorded })
+        Ok(BaselineResumeOutcome {
+            recorded,
+            cancelled,
+        })
     }
 
     /// Read-only validation of a retry before the engine writes an *Allow
@@ -716,7 +869,21 @@ impl BaselineCoordinator {
             awaiting.push(self.batch_check(proposal, check));
             return Ok(());
         }
-        let baseline = self.run_baseline(session_id, task_id, check, proposal, false, "policy")?;
+        // Runs inside the apply request, which has no cancel to offer: a token
+        // nothing triggers, so the run always reaches a recorded result.
+        let baseline = match self.run_baseline(
+            session_id,
+            task_id,
+            check,
+            proposal,
+            false,
+            "policy",
+            &CancelToken::new(),
+            &mut |_| {},
+        )? {
+            BaselineRun::Recorded(baseline) => baseline,
+            BaselineRun::Cancelled => CheckBaseline::Declined,
+        };
         self.record(session_id, task_id, check, baseline)?;
         recorded.push(check.clone());
         Ok(())
@@ -769,6 +936,9 @@ impl BaselineCoordinator {
         }
     }
 
+    /// Run one baseline under the caller's cancel token, streaming its
+    /// (redacted) output to `on_output`.
+    #[allow(clippy::too_many_arguments)]
     fn run_baseline(
         &self,
         session_id: &str,
@@ -777,18 +947,19 @@ impl BaselineCoordinator {
         proposal: &CommandProposal,
         approved: bool,
         approved_by: &str,
-    ) -> Result<CheckBaseline> {
-        let cancel = CancelToken::new();
-        let mut on_output = |_line: &str| {};
+        cancel: &CancelToken,
+        on_output: &mut dyn FnMut(&str),
+    ) -> Result<BaselineRun> {
         let record = match self.validation.run_proposal(
             &proposal.id,
             approved,
             approved_by,
             Some(task_id),
-            &cancel,
-            &mut on_output,
+            cancel,
+            on_output,
         ) {
             Ok(record) => record,
+            Err(ClientError::Cancelled) => return Ok(BaselineRun::Cancelled),
             Err(error) => {
                 // Only a policy refusal or a real process-spawn failure is an
                 // unavailable baseline. An execution-store, audit or other
@@ -807,10 +978,24 @@ impl BaselineCoordinator {
                         ("termination", termination.as_str().to_string()),
                     ],
                 )?;
-                return Ok(unavailable(check, termination));
+                return Ok(BaselineRun::Recorded(unavailable(check, termination)));
             }
         };
         let execution = record.execution;
+        if execution.termination == crate::command_runner::CommandTermination::Cancelled {
+            // The user cancelled while it ran. Not evidence about the code or
+            // the environment: the caller records the baseline as declined.
+            self.audit_log.record(
+                "verification_baseline_cancelled",
+                &[
+                    ("actor", "system".to_string()),
+                    ("sessionId", session_id.to_string()),
+                    ("taskId", task_id.to_string()),
+                    ("check", check.label()),
+                ],
+            )?;
+            return Ok(BaselineRun::Cancelled);
+        }
         if execution.termination == crate::command_runner::CommandTermination::Exited
             && execution.exit_code == Some(0)
         {
@@ -824,12 +1009,12 @@ impl BaselineCoordinator {
                     ("result", "passed".to_string()),
                 ],
             )?;
-            return Ok(CheckBaseline::Passed);
+            return Ok(BaselineRun::Recorded(CheckBaseline::Passed));
         }
         let termination =
             CheckTermination::from_command(execution.termination, execution.exit_code);
         if matches!(&termination, CheckTermination::MissingExecutable) {
-            return Ok(unavailable(check, termination));
+            return Ok(BaselineRun::Recorded(unavailable(check, termination)));
         }
         let findings = findings_from_execution(&execution, &default_parsers(), &self.scanner)
             .iter()
@@ -848,11 +1033,11 @@ impl BaselineCoordinator {
                 ("fingerprint", fingerprint.as_str().to_string()),
             ],
         )?;
-        Ok(CheckBaseline::Failed {
+        Ok(BaselineRun::Recorded(CheckBaseline::Failed {
             termination,
             fingerprint,
             findings,
-        })
+        }))
     }
 
     fn record(
@@ -1022,6 +1207,35 @@ fn batch_id_for(patch_id: &str, checks: &[BaselineCheck]) -> String {
 
 fn canonical_root(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// How one baseline run ended.
+enum BaselineRun {
+    Recorded(CheckBaseline),
+    /// The caller's token was cancelled before or while it ran.
+    Cancelled,
+}
+
+/// The wire word for a recorded baseline in a [`BaselineProgress::Finished`].
+fn baseline_result_word(baseline: &CheckBaseline) -> &'static str {
+    match baseline {
+        CheckBaseline::Passed => "passed",
+        CheckBaseline::Failed { .. } => "failed",
+        CheckBaseline::Declined => "declined",
+        CheckBaseline::Uncertain => "uncertain",
+        CheckBaseline::Unavailable { .. } => "unavailable",
+    }
+}
+
+/// The engine's line for a finished baseline.
+fn finished_label(result: &str, check: &str) -> String {
+    match result {
+        "passed" => format!("Baseline passed: {check}"),
+        "failed" => format!("Baseline failed: {check}"),
+        "unavailable" => format!("Baseline could not run: {check}"),
+        "cancelled" => format!("Baseline cancelled: {check}"),
+        _ => format!("Baseline skipped: {check}"),
+    }
 }
 
 fn unavailable(check: &CheckId, termination: CheckTermination) -> CheckBaseline {

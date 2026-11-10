@@ -72,7 +72,8 @@ pub mod worktree_access;
 
 pub use audit::AuditLog;
 pub use baseline::{
-    BaselineBatch, BaselineCheck, BaselineCoordinator, BaselinePreparation, TaskBaselines,
+    BaselineBatch, BaselineCheck, BaselineCoordinator, BaselinePreparation, BaselineProgress,
+    BaselineResumeOutcome, TaskBaselines,
 };
 pub use branch::{
     BRANCH_SLUG_MAX_CHARS, BranchEngine, BranchError, BranchInspection, BranchOutcome,
