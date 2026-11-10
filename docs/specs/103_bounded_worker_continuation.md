@@ -501,3 +501,49 @@ budgeted request path uses it. It still returns `None` when no task in the chain
 has a usage record, so a request with no provable spend fails closed as before.
 Tests: `task_budget::budget_usage_chain::*` (the chain case failed before the
 reader existed; an unrelated task in the same session is not counted).
+
+### 2026-11-10: with a known window, the count cut is the fallback, not the first cut
+
+Damaian's first implementation task on a real spec (spec 33 Task 1, an
+ordinary session on deepseek-v4-pro) ran 64 rounds without a plan or an edit.
+It read `crates/workspace-engine/src/config.rs` (6,568 lines) 60 times, the same
+100–400-line ranges three or four times over. The legacy count cut at the
+default `agent_max_turn_messages = 24` kept only about ten rounds, so every
+earlier read had left the request by the time the model needed it, and the model
+read it again. Each request was 31k–43k tokens against a 1,000,000-token window,
+so the window share never triggered and no compaction attempt was recorded.
+The fixture behind this spec's tests and spec 106's acceptance never hit it,
+because its files are small.
+
+The request decision now orders the two bounds when the model's context window
+is known:
+
+1. Below `conversation_window_share` of the window, the whole turn is sent
+   unchanged: the count does not cut it.
+2. Above the share, the compactor turns eligible completed results into
+   manifests, as before.
+3. Only when the compactor cannot fit the full history does the count cut run,
+   dropping whole unpinned rounds down to `agent_max_turn_messages`. The
+   compactor is then tried again on that selection. Nothing is recorded for the
+   replaced attempt. A very long command-heavy turn in a small window therefore
+   stays bounded rather than stopping `TaskCompactionCannotFit` (R7's
+   follow-up).
+
+With no known window, the count cut applies on every request exactly as before,
+and R7's pins hold in both orders.
+
+Since 2026-11-10 a repository that lowers `agent_max_turn_messages` therefore
+lowers only the fallback when the window is known. The bound below that is
+`conversation_window_share`, which is also restrict-only. No new data leaves
+the machine: everything a request keeps was already sent earlier in the same
+turn.
+
+Tests in `within_turn_request_preparation`:
+
+- `a_long_turn_with_a_known_window_keeps_every_round_below_the_share` failed
+  before the change with 7 of 15 reads kept;
+- `a_long_budgeted_worker_at_the_default_message_limit_keeps_the_open_step_result`
+  and `a_failed_command_stops_being_pinned_after_the_same_command_succeeds` now
+  run without a known window, where their count-bound assertions still apply;
+- `a_command_heavy_budgeted_worker_stays_bounded_at_the_default_message_limit`
+  passes unchanged through the fallback.

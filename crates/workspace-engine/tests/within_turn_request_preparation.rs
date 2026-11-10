@@ -2027,11 +2027,13 @@ fn a_long_budgeted_worker_at_the_default_message_limit_keeps_the_early_failed_co
 }
 
 /// R7(c)+(d): the latest result for the still-open step survives, while the
-/// pin set stays a safety allowance rather than removing the count bound.
+/// pin set stays a safety allowance rather than removing the count bound. Run
+/// without a known context window: since 2026-11-10 that is where the count
+/// bound applies (a known window is bounded by its share instead).
 #[test]
 fn a_long_budgeted_worker_at_the_default_message_limit_keeps_the_open_step_result() {
     let (engine, adapter, _finished, _proposal) =
-        long_worker_at_the_default_message_limit("r7-default-limit-open-step", Some(1_000_000));
+        long_worker_at_the_default_message_limit("r7-default-limit-open-step", None);
 
     let resumed = &adapter.requests[2..];
     let final_request = resumed
@@ -2076,6 +2078,52 @@ fn a_long_budgeted_worker_at_the_default_message_limit_keeps_the_open_step_resul
         "no unpinned round was cut, so the bound is not a bound"
     );
     assert!(kept_reads >= 1, "the newest unpinned round must remain");
+}
+
+/// When the model's context window is known, the window share bounds the turn
+/// and the message count does not cut it (2026-11-10). Spec 33 Task 1 read a
+/// 6,568-line file 60 times in 64 rounds: the 24-message cut kept only about
+/// ten rounds, so every earlier read fell out of the request and was read
+/// again, while each request was a few percent of a 1M-token window. Below the
+/// share nothing is dropped, so the oldest read is still in the request.
+#[test]
+fn a_long_turn_with_a_known_window_keeps_every_round_below_the_share() {
+    let (engine, adapter, _finished, _proposal) =
+        long_worker_at_the_default_message_limit("window-keeps-rounds", Some(1_000_000));
+    let final_request = adapter
+        .requests
+        .last()
+        .expect("the resumed turn must call the model");
+    assert_request_pairing(final_request, "with every round kept");
+    let kept_reads = (0..15)
+        .filter(|index| tool_message(final_request, &format!("read_{index:02}")).is_some())
+        .count();
+    assert_eq!(
+        kept_reads, 15,
+        "every read must still be in the request below the window share"
+    );
+    assert!(
+        find_tool_message(final_request, "read_00")
+            .content
+            .contains("R7 READ 00 MARKER"),
+        "the oldest read reaches the model verbatim"
+    );
+    let session_id = engine
+        .session_store
+        .list_sessions(None)
+        .expect("sessions should list")
+        .first()
+        .expect("a session")
+        .id
+        .clone();
+    assert!(
+        engine
+            .session_store
+            .read_within_turn_compaction_attempts(&session_id)
+            .expect("attempts should read")
+            .is_empty(),
+        "nothing crossed the share, so nothing was compacted"
+    );
 }
 
 /// The other half of R7: below the limit nothing changes. The same short turn
@@ -2214,12 +2262,15 @@ fn fail_then_succeed_fixture(repo: &Path) {
 /// R7 follow-up: a failed result is pinned only while it is unresolved. Once
 /// the same command succeeds, the old failure may leave the count window; it
 /// must not stay pinned forever.
+/// Run without a known context window, where the count window applies on
+/// every request (since 2026-11-10 a known window falls back to it only when
+/// compaction cannot fit).
 #[test]
 fn a_failed_command_stops_being_pinned_after_the_same_command_succeeds() {
     let repo = temp_repo("r7-failed-then-resolved");
     r7_fixture(&repo);
     fail_then_succeed_fixture(&repo);
-    let engine = default_limit_engine(&repo.join(".damaian"), Some(1_000_000));
+    let engine = default_limit_engine(&repo.join(".damaian"), None);
 
     let mut responses = vec![
         "Planning.".to_string(),

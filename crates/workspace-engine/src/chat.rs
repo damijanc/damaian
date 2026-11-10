@@ -8130,14 +8130,26 @@ impl ChatOrchestrator {
         // send. The count is only needed when it will actually cut a round: a
         // turn below it is never elided, so nothing can be dropped and the
         // request stays today's byte for byte.
-        let message_budget = self.config.agent_max_turn_messages;
+        //
+        // The count cut is the fallback for a model whose context window is
+        // unknown. With a known window, the window share bounds the turn: the
+        // compactor below turns old results into short manifests the model can
+        // act on, where the count cut drops whole rounds. Dropping rounds well
+        // below the window made a turn that had to read a large file forget
+        // its own reads and read them again indefinitely (spec 33 Task 1,
+        // 2026-11-10: 60 reads of one file in 64 rounds at 4% of the window).
+        let context_window = self.config.context_window();
+        let message_budget = if context_window.is_some() {
+            usize::MAX
+        } else {
+            self.config.agent_max_turn_messages
+        };
         let cut_needed = messages.len() > message_budget;
         let legacy_request = self.request_for(
             bounded_messages(messages, message_budget, &notes_window),
             tools.clone(),
             max_tokens,
         );
-        let context_window = self.config.context_window();
         let threshold = context_window
             .map(|window| request_threshold_tokens(window, self.config.conversation_window_share));
         let request_tokens_before =
@@ -8173,73 +8185,101 @@ impl ChatOrchestrator {
                 }
             }
         }
-        let safety_request = self.request_for(
-            bounded_messages_preserving_safety(messages, message_budget, &notes_window, &pins),
-            tools,
-            max_tokens,
-        );
         let Some(context_window) = context_window else {
-            return Ok(TurnRequestDecision::prepared(safety_request));
+            return Ok(TurnRequestDecision::prepared(self.request_for(
+                bounded_messages_preserving_safety(messages, message_budget, &notes_window, &pins),
+                tools,
+                max_tokens,
+            )));
         };
-        // `request_tokens_before` measured the more aggressively cut legacy
-        // view. Keeping pinned rounds can push a count-cut turn over the share
-        // even when that legacy view stayed under it, so the window decision is
-        // made again on the request that will actually be sent.
-        // `prepare_request` returns `Unchanged` below the share, which sends
-        // exactly this selection and writes no attempt.
-        // Only completed rounds still present in the selected request may be
-        // described to the reducer. A round the safety selection elided has no
-        // declaration or result to pair with, and claiming one would turn a
-        // legitimate elision into an invalid request.
-        let rounds = present_completed_rounds(
-            &safety_request.messages,
-            &completed_tool_rounds.as_compaction_rounds(),
-        );
-        let outcome = prepare_request(&RequestPreparationInput {
-            request: &safety_request,
-            completed_rounds: &rounds,
-            pinned_call_ids: &pins,
-            context_window: Some(context_window),
-            window_share_bps: self.config.conversation_window_share,
-            scanner: &self.scanner,
-            session_id: &session.id,
-            task_id: &task.id,
-        });
-        match outcome {
-            RequestPreparationOutcome::Unchanged => {
-                Ok(TurnRequestDecision::prepared(safety_request))
-            }
-            RequestPreparationOutcome::Compacted { request, attempt } => {
-                self.record_within_turn_compaction_attempt(&attempt)?;
-                let compacted_call_ids = attempt
-                    .facts
-                    .iter()
-                    .map(|fact| fact.call_id.clone())
-                    .collect();
-                Ok(TurnRequestDecision::Prepared(PreparedTurnRequest {
-                    request,
-                    compacted_call_ids,
-                }))
-            }
-            RequestPreparationOutcome::FailedClosed { attempt } => {
-                self.record_within_turn_compaction_attempt(&attempt)?;
-                match attempt.outcome {
-                    // A request that cannot fit is a typed terminal outcome,
-                    // never a generic client error. It carries no request and
-                    // the caller settles it without sending a model call or
-                    // writing a segment boundary.
-                    crate::request_preparation::WithinTurnCompactionAttemptOutcome::CannotFit => {
-                        Ok(TurnRequestDecision::CannotFit(attempt))
-                    }
-                    // Invalid metadata stays fail-closed: a caller cannot act
-                    // on it as if the window were too small.
-                    _ => Err(ClientError::RequestPreparation(
-                        "the completed tool metadata does not match the request messages"
-                            .to_string(),
-                    )),
+        // With a known window the full history is tried first, and only a
+        // request the compactor cannot fit falls back to the count cut, which
+        // drops whole unpinned rounds. A very long turn in a small window
+        // stays bounded rather than stopping `CannotFit` (the R7 command-heavy
+        // case), while a turn below the share keeps every round.
+        let fallback = self.config.agent_max_turn_messages;
+        let budgets = if message_budget == fallback {
+            vec![message_budget]
+        } else {
+            vec![message_budget, fallback]
+        };
+        for (index, budget) in budgets.iter().copied().enumerate() {
+            let last = index + 1 == budgets.len();
+            let safety_request = self.request_for(
+                bounded_messages_preserving_safety(messages, budget, &notes_window, &pins),
+                tools.clone(),
+                max_tokens,
+            );
+            // `request_tokens_before` measured the more aggressively cut legacy
+            // view. Keeping pinned rounds can push a count-cut turn over the
+            // share even when that legacy view stayed under it, so the window
+            // decision is made again on the request that will actually be sent.
+            // `prepare_request` returns `Unchanged` below the share, which
+            // sends exactly this selection and writes no attempt. Only
+            // completed rounds still present in the selected request may be
+            // described to the reducer: a round the safety selection elided has
+            // no declaration or result to pair with.
+            let rounds = present_completed_rounds(
+                &safety_request.messages,
+                &completed_tool_rounds.as_compaction_rounds(),
+            );
+            let outcome = prepare_request(&RequestPreparationInput {
+                request: &safety_request,
+                completed_rounds: &rounds,
+                pinned_call_ids: &pins,
+                context_window: Some(context_window),
+                window_share_bps: self.config.conversation_window_share,
+                scanner: &self.scanner,
+                session_id: &session.id,
+                task_id: &task.id,
+            });
+            match outcome {
+                RequestPreparationOutcome::Unchanged => {
+                    return Ok(TurnRequestDecision::prepared(safety_request));
+                }
+                RequestPreparationOutcome::Compacted { request, attempt } => {
+                    self.record_within_turn_compaction_attempt(&attempt)?;
+                    let compacted_call_ids = attempt
+                        .facts
+                        .iter()
+                        .map(|fact| fact.call_id.clone())
+                        .collect();
+                    return Ok(TurnRequestDecision::Prepared(PreparedTurnRequest {
+                        request,
+                        compacted_call_ids,
+                    }));
+                }
+                // The full history could not fit even compacted: try the count
+                // cut before giving up. Nothing is recorded for the attempt
+                // the fallback replaces, so the log shows only what was sent.
+                RequestPreparationOutcome::FailedClosed { attempt }
+                    if !last
+                        && attempt.outcome
+                            == crate::request_preparation::WithinTurnCompactionAttemptOutcome::CannotFit =>
+                {
+                    continue;
+                }
+                RequestPreparationOutcome::FailedClosed { attempt } => {
+                    self.record_within_turn_compaction_attempt(&attempt)?;
+                    return match attempt.outcome {
+                        // A request that cannot fit is a typed terminal outcome,
+                        // never a generic client error. It carries no request
+                        // and the caller settles it without sending a model call
+                        // or writing a segment boundary.
+                        crate::request_preparation::WithinTurnCompactionAttemptOutcome::CannotFit => {
+                            Ok(TurnRequestDecision::CannotFit(attempt))
+                        }
+                        // Invalid metadata stays fail-closed: a caller cannot
+                        // act on it as if the window were too small.
+                        _ => Err(ClientError::RequestPreparation(
+                            "the completed tool metadata does not match the request messages"
+                                .to_string(),
+                        )),
+                    };
                 }
             }
         }
+        unreachable!("the last budget always returns")
     }
 
     /// Adds one call dispatched by a resume path to the paused turn's tracker.

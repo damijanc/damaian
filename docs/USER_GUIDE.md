@@ -2526,8 +2526,11 @@ The minimum accepted value is 1000 — below that, a turn would stop before it
 could do anything.
 With the cap set, a turn that reaches its action-round limit continues on its own
 instead of pausing for **Continue** ([While a turn runs](#while-a-turn-runs-and-how-it-ended)),
-and the messages it sends are bounded by `agent_max_turn_messages` so a long
-turn does not grow without limit.
+and what it sends stays bounded so a long turn does not grow without limit:
+when the model's context window is known, by `conversation_window_share` of that
+window (older results are first shortened to brief records, and only if that
+cannot fit are the oldest rounds dropped down to `agent_max_turn_messages`);
+when it is not known, by `agent_max_turn_messages` alone.
 
 When a turn stops this way you see **Token budget exhausted** under the answer,
 and the reply names what was finished and what was left. Nothing is lost:

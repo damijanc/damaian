@@ -3397,10 +3397,13 @@ None of these are a malfunction:
   toggling a tool or anything that edits the system prompt changes the first
   bytes of every request after it, and the cache starts over from there.
 - **A long turn outgrew its message window.** Within one turn, a request
-  carries at most `agent_max_turn_messages` (default 24) of the turn's
-  messages, so once a turn passes that, earlier rounds drop out of the request.
-  That changes the request's prefix, which the provider then has to warm
-  again. The session log still holds every round.
+  keeps the turn's whole history until it reaches `conversation_window_share`
+  of the model's context window; past that, older results are shortened to
+  brief records, and only if that still cannot fit are the oldest rounds
+  dropped down to `agent_max_turn_messages` (default 24). For a model whose
+  context window is not known, the 24-message cut applies on every request.
+  Either change rewrites the request's prefix, which the provider then has to
+  warm again. The session log still holds every round.
 - **The provider expired the cached prefix on its own schedule.** Providers
   hold a cached prefix for a limited window — commonly a few minutes of
   inactivity — and nothing in Damaian controls or extends it.
