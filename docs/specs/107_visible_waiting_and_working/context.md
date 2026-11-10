@@ -77,7 +77,20 @@ from the owner's screenshots and these session logs:
   so spec 103's `decide_segment_continuation` applies: continue while the
   progress digest advances and totals are under the ceilings; pause with the
   existing card when progress stops or a ceiling is reached. Ask, Plan and
-  Review modes keep the 16-round pause. Alternatives: raise
+  Review modes keep the 16-round pause.
+  Part of D3 (added 2026-11-10, owner): verification scope follows the same
+  decision. Today `chat.rs` (≈2690, `at_completion = plan.is_none_or(…)`)
+  treats a task with **no plan** as complete at every patch, because a planless
+  task really does settle after each verified patch (spec 77's continuation
+  needs open plan steps). So every patch runs the full completion floor (root
+  plus owning crate). Seen in spec 33 Task 1: about 4 minutes of `cargo test`
+  per patch for small `config.rs` edits. Once an ordinary Code-mode turn
+  continues after a verified patch, its patches are per-change (owning root
+  only, `propose_checks`) and the completion floor runs once, at the answer
+  (`floor_checks_needing_verification`). Changing the check selection alone,
+  without the continuation, would leave a planless task ending `incomplete` on
+  a missing root check — the spec 106 stall — so the two land together in
+  Task 5. Alternatives: raise
   `agent_max_tool_rounds` only (fewer pauses, no progress check); keep the pause
   but make the card a one-click default (still an interruption).
 - **D4 — baseline as a streamed request (recommended).** Run baselines through

@@ -68,6 +68,11 @@ not matter.
    while it is making progress** (context D3). It continues under the same
    progress and ceiling rules as spec 103's segments and still stops — with
    the existing card — when it stops making progress or reaches its ceiling.
+   While it continues, a patch's verification is a **per-change** run (the
+   owning root only), and the full completion floor runs once, when the task
+   ends (added 2026-11-10: a planless task treated every patch as its end and
+   ran root and crate `cargo test`, about 4 minutes, after each one —
+   observation 83).
 
 ## 3. Non-goals
 

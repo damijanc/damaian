@@ -105,8 +105,13 @@ Requirement 6; context D3. **Confirm D3 with the owner first.**
       the 16-round pause.
 - [ ] A turn that stops making progress or reaches a ceiling still shows the
       existing card.
+- [ ] A continuing ordinary turn without a plan continues after a verified patch,
+      and its patches verify per-change (owning root only); the completion floor
+      runs once at the answer (context D3, added 2026-11-10).
 - [ ] Tests: 40 progressing rounds pause zero times; a no-progress turn pauses;
-      Ask mode still pauses at 16; budgets stay restrict-only.
+      Ask mode still pauses at 16; budgets stay restrict-only; a planless
+      two-patch turn runs the owning crate's check per patch and the root check
+      once at the end, and never ends `incomplete` on a missing root check.
 
 Files: `crates/workspace-engine/src/chat.rs`, `task_segments.rs`, tests.
 Checks: `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`;
