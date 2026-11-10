@@ -67,8 +67,14 @@ Requirements 3, 4.
 
 - [ ] `startTurnIndicator`/`finish` keep the row with a waiting label for
       `Pending`; remove it only when the turn ends.
+- [ ] While working, the row names the current activity from the latest
+      progress event (tool and target, or the running command) and shows that
+      step's elapsed time apart from the turn's total; where the provider
+      streams reasoning, at most a one-line summary (requirement 3, added
+      2026-11-10).
 - [ ] `renderPlanPanel` shows **waiting for you** when `plan.waiting`.
-- [ ] Tests and a manual check (question, patch, round limit).
+- [ ] Tests and a manual check (question, patch, round limit, a read, a
+      running command).
 
 Files: `app.js`, `style.css`, desktop-shell tests.
 Checks: as Task 2.

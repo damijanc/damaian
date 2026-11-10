@@ -52,7 +52,12 @@ not matter.
 3. **The status line never goes blank while a turn is alive.** It shows the
    waiting state ("Waiting for your answer", "Waiting for your review",
    "Running baseline: cargo test (repository root) · 1m 12s") instead of being
-   removed when the engine reports `Pending`.
+   removed when the engine reports `Pending`. While the turn works, it names the
+   current activity from the last action ("Reading config.rs 1200–1600",
+   "Running cargo test --test permission_profiles · 40s", "Waiting for the
+   model · 12s"), and shows the current step's elapsed time separately from the
+   turn's total (added 2026-11-10 at the owner's request: "Thinking · … 705s"
+   read as one 12-minute call when it was the whole turn).
 4. **The plan step tells the truth.** A step whose task is waiting on a
    decision shows **waiting for you**, not **running**.
 5. **Baselines show progress and can be cancelled.** A pre-apply baseline
