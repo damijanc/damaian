@@ -14,7 +14,7 @@ survey are in [`context.md`](context.md).
 - Verify UI changes in the running app, as `docs/DEVELOPMENT.md` describes for
   `include_str!`-embedded assets (rebuild, restart, then check), and record what
   was checked in the task row.
-- Confirm D3 with the owner before Task 5; D1, D2, D4 and D5 are
+- D3 was decided by the owner on 2026-11-10 (A and C). D1, D2, D4 and D5 are
   recommendations to confirm when their task starts.
 - Scoped checks per task; the workspace gate stays with CI.
 
@@ -98,8 +98,14 @@ baseline test file) and the desktop-shell route tests; web checks as Task 2.
 
 ## Task 5 · Ordinary Code-mode continuation (D3)
 
-Requirement 6; context D3. **Confirm D3 with the owner first.**
+Requirement 6; context D3 (decided by the owner 2026-11-10: A and C).
 
+- [ ] With Worker sessions on, suggest a worker once per code-changing task at
+      its first change (a code-changing plan's review, or a planless task's
+      first patch): **Run in a worker** / **Continue here**. Not for a planning-
+      or documentation-only task, not in a worker; the choice is remembered for
+      the task. **Run in a worker** reuses spec 94's handoff (New worker dialog
+      prefilled).
 - [ ] Give an ordinary Code-mode turn a segment tracker with the default task
       budget so `decide_segment_continuation` applies; keep Ask/Plan/Review on
       the 16-round pause.
@@ -111,9 +117,12 @@ Requirement 6; context D3. **Confirm D3 with the owner first.**
 - [ ] Tests: 40 progressing rounds pause zero times; a no-progress turn pauses;
       Ask mode still pauses at 16; budgets stay restrict-only; a planless
       two-patch turn runs the owning crate's check per patch and the root check
-      once at the end, and never ends `incomplete` on a missing root check.
+      once at the end, and never ends `incomplete` on a missing root check;
+      the worker suggestion appears once for a code-changing task and never for
+      a docs-only plan or in a worker.
 
-Files: `crates/workspace-engine/src/chat.rs`, `task_segments.rs`, tests.
+Files: `crates/workspace-engine/src/chat.rs`, `task_segments.rs`, tests; for
+the suggestion, `crates/desktop-shell/static/app.js` and the shell payload.
 Checks: `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`;
 `cargo nextest run -p workspace-engine --test task_budget --test plan_turn`;
 `cargo run -p eval-harness -- run --tier deterministic`.

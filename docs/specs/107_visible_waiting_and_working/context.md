@@ -71,7 +71,7 @@ from the owner's screenshots and these session logs:
   an answer (AGENTS.md: questions are not approvals; the route matters).
   Alternative: route composer text as a free-text answer — rejected, because it
   silently changes what typing in the composer means.
-- **D3 — ordinary Code-mode continuation (owner to confirm before Task 5).**
+- **D3 — ordinary Code-mode continuation (decided by the owner, 2026-11-10: options A and C together).**
   Recommended: give an ordinary Code-mode turn a segment tracker with a default
   budget (the worker defaults, `worker_task_budget_*`, restrict-only as today)
   so spec 103's `decide_segment_continuation` applies: continue while the
@@ -93,6 +93,18 @@ from the owner's screenshots and these session logs:
   Task 5. Alternatives: raise
   `agent_max_tool_rounds` only (fewer pauses, no progress check); keep the pause
   but make the card a one-click default (still an interruption).
+  **Decision (owner, 2026-11-10):** both A and C. (C) With Worker sessions on,
+  an ordinary Code-mode session *suggests* a worker once per task, at the point
+  it is about to make its first change in a task that changes code. That is
+  a code-changing plan's review, or a planless task's first patch: one inline
+  choice, **Run in a worker** / **Continue here**. It is not shown for a
+  planning- or documentation-only task (spec 108 D2's complaint) or in a
+  worker. (A) If the user continues here, or Worker sessions are off, the
+  session behaves like a worker: it continues while it makes progress under the
+  default task budget, does not end after each verified patch, and verifies per
+  change with the completion floor once at the end. Ask, Plan and Review keep
+  the 16-round pause.
+
 - **D4 — baseline as a streamed request (recommended).** Run baselines through
   the same streamed path as verification checks, with phase events (check
   started, elapsed, finished) and a cancel token wired to a **Cancel** control.

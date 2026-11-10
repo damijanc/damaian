@@ -54,7 +54,10 @@ sessions (2026-11-09/10, v0.64.0–v0.66.0) and their session logs.
 - **D2 — remove Run in a worker from the plan card (decided by the owner).**
   Spec 94's user-guide text and its tests are updated; spec 94 gets a dated
   note. The worker handoff from `worker-prompt` blocks and **New worker** is
-  unchanged.
+  unchanged. The always-on button is replaced by spec 107 D3's conditional
+  suggestion (decided 2026-11-10), shown once per code-changing task and never
+  for a planning- or documentation-only plan. Build 108 Task 2 and 107 Task 5
+  so the two do not both offer it.
 - **D3 — where archived sessions live (recommended).** A durable
   `session_archived` / `session_unarchived` event and an `archived` flag on
   `Session`. `list_sessions` gains a filter; the sidebar shows unarchived

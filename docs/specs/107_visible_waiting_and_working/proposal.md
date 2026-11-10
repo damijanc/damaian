@@ -65,7 +65,10 @@ not matter.
    which records the baseline as declined (the patch is then applied or
    rejected as the user chooses, exactly as after **Skip baselines**).
 6. **An ordinary Code-mode session does not ask to continue every 16 rounds
-   while it is making progress** (context D3). It continues under the same
+   while it is making progress** (context D3, decided 2026-11-10). With Worker
+   sessions on, it first suggests a worker once per code-changing task
+   (**Run in a worker** / **Continue here**); continuing here, or with workers
+   off, it behaves as below. It continues under the same
    progress and ceiling rules as spec 103's segments and still stops — with
    the existing card — when it stops making progress or reaches its ceiling.
    While it continues, a patch's verification is a **per-change** run (the
