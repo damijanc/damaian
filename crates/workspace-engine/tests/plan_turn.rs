@@ -5581,3 +5581,228 @@ fn complete_step_refuses_a_step_whose_required_check_has_not_run() {
         result.task
     );
 }
+
+// --- Spec 107 D3: an ordinary planless task continues and verifies per change
+
+fn worker_check_engine(repo: &Path, shell: &Path, workers: bool) -> WorkspaceEngine {
+    WorkspaceEngine::new(Config {
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        shell: shell.to_string_lossy().to_string(),
+        command_allowlist: vec!["cargo test".to_string()],
+        enable_worker_sessions: workers,
+        ..Config::default()
+    })
+}
+
+fn started_checks(engine: &WorkspaceEngine, session_id: &str) -> Vec<Vec<CheckId>> {
+    engine
+        .session_store
+        .read_verification_events(session_id, &[])
+        .expect("the log should read")
+        .into_iter()
+        .filter_map(|event| match event {
+            VerificationEvent::Started { checks, .. } => Some(checks),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The member's value stays 1, so the workspace root's check passes too.
+const MEMBER_FIRST: &str = "pub fn value() -> u8 { 1 }\npub fn first() {}\n";
+const MEMBER_SECOND: &str = "pub fn value() -> u8 { 1 }\npub fn first() {}\npub fn second() {}\n";
+
+/// Spec 107 D3: a planless ordinary task no longer ends at its first verified
+/// patch. Each patch runs the owning crate's check only; the workspace root's
+/// floor check runs once, when the model answers; and the task never ends
+/// `incomplete` on the root check it has not run yet.
+#[test]
+fn a_planless_two_patch_task_verifies_per_change_and_runs_the_floor_once() {
+    let (repo, shell) = r16_workspace_fixture("d3-planless-two-patches");
+    let engine = worker_check_engine(&repo, &shell, false);
+    let member_check = CheckId::new("crates/member", "cargo test");
+    let root_check = CheckId::new("", "cargo test");
+
+    let mut first = scripted(vec![vec![patch_call_with(
+        "crates/member/src/lib.rs",
+        MEMBER_FIRST,
+    )]]);
+    let proposed = ask(&engine, &repo, "Add two helpers to the member", &mut first);
+    assert!(
+        plan_of(&engine, &proposed).is_none(),
+        "the task has no plan"
+    );
+    let session = proposed.session.id.clone();
+    let first_patch = proposed
+        .patch_proposal
+        .as_ref()
+        .expect("the first patch is proposed")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &first_patch, true);
+
+    // The verified first patch continues the task, which proposes the second.
+    let mut continuation = scripted(vec![vec![patch_call_with(
+        "crates/member/src/lib.rs",
+        MEMBER_SECOND,
+    )]]);
+    let continued =
+        run_verification_and_approve_checks(&engine, &repo, &session, &mut continuation);
+    assert_eq!(
+        started_checks(&engine, &session),
+        vec![vec![member_check.clone()]],
+        "the first patch runs only the member's check"
+    );
+    let continuation_prompt = format!("{:?}", continuation.requests.first());
+    assert!(
+        continuation_prompt.contains("the full completion checks run once then"),
+        "{continuation_prompt}"
+    );
+    let second_patch = continued
+        .patch_proposal
+        .as_ref()
+        .expect("the continuation proposes the second patch")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &second_patch, true);
+
+    let mut answer = MockModelAdapter::new("Both helpers are in.");
+    let finished = run_verification_and_approve_checks(&engine, &repo, &session, &mut answer);
+
+    assert_eq!(
+        started_checks(&engine, &session),
+        vec![
+            vec![member_check.clone()],
+            vec![member_check.clone()],
+            vec![root_check.clone()],
+        ],
+        "per change the member check; the root check once, at the answer"
+    );
+    assert_eq!(
+        finished.task.status,
+        TaskStatus::Complete,
+        "the floor ran, so the task completes: {:?}",
+        engine
+            .session_store
+            .read_completion_report(&session, &finished.task.id)
+    );
+    assert!(
+        finished.patch_proposal.is_none() && finished.check_batch.is_none(),
+        "the completion run is the end: it is not continued again"
+    );
+}
+
+/// Spec 107 D3 (C): with Worker sessions on, a code-changing planless task is
+/// offered a worker at its first patch, once — never at a later patch of the
+/// same task.
+#[test]
+fn a_code_changing_task_is_offered_a_worker_once() {
+    let (repo, shell) = r16_workspace_fixture("d3-worker-once");
+    let engine = worker_check_engine(&repo, &shell, true);
+
+    let mut first = scripted(vec![vec![patch_call_with(
+        "crates/member/src/lib.rs",
+        MEMBER_FIRST,
+    )]]);
+    let proposed = ask(&engine, &repo, "Add two helpers to the member", &mut first);
+    let patch = proposed.patch_proposal.as_ref().expect("the first patch");
+    let suggestion = proposed
+        .turn_presentation
+        .worker_suggestion
+        .as_ref()
+        .expect("the first code change suggests a worker");
+    assert_eq!(suggestion.card_id, patch.patch_id);
+    assert_eq!(
+        suggestion.kind,
+        workspace_engine::PendingDecisionKind::Patch
+    );
+    assert_eq!(suggestion.prompt, "Add two helpers to the member");
+    assert_eq!(suggestion.run_label, "Run in a worker");
+    assert_eq!(suggestion.continue_label, "Continue here");
+    let wire = serde_json::to_value(&proposed.turn_presentation).unwrap();
+    assert_eq!(wire["workerSuggestion"]["cardId"], patch.patch_id.as_str());
+
+    let session = proposed.session.id.clone();
+    let first_patch = patch.patch_id.clone();
+    apply_patch_with_baselines(&engine, &repo, &first_patch, true);
+    let mut continuation = scripted(vec![vec![patch_call_with(
+        "crates/member/src/lib.rs",
+        MEMBER_SECOND,
+    )]]);
+    let continued =
+        run_verification_and_approve_checks(&engine, &repo, &session, &mut continuation);
+    assert!(continued.patch_proposal.is_some(), "the second patch");
+    assert!(
+        continued.turn_presentation.worker_suggestion.is_none(),
+        "the same task is never asked twice"
+    );
+    let offers = engine
+        .session_store
+        .worker_suggestion_offers(&session)
+        .unwrap();
+    assert_eq!(offers.len(), 1, "{offers:?}");
+}
+
+/// Spec 107 D3 (C): no suggestion for a documentation-only plan, with Worker
+/// sessions off, or in a worker; a plan whose work changes code is offered one
+/// at its review.
+#[test]
+fn a_worker_is_suggested_only_for_code_changing_ordinary_tasks() {
+    let repo = temp_repo("d3-worker-where");
+    let shell = PathBuf::from("/usr/bin/true");
+    let plan = || {
+        call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Write"},{"title":"Review"}]}"#,
+        )
+    };
+
+    // A documentation-only plan: its review defers an edit to a Markdown file.
+    let engine = worker_check_engine(&repo, &shell, true);
+    let mut docs = scripted(vec![vec![plan()], vec![patch_call("docs/notes.md")]]);
+    let reviewed = ask(&engine, &repo, "Write the notes", &mut docs);
+    assert!(reviewed.plan_proposal.is_some(), "the plan is put up");
+    assert!(
+        reviewed.turn_presentation.worker_suggestion.is_none(),
+        "a documentation-only plan is never offered a worker"
+    );
+
+    // A plan whose first change is code is offered one at its review.
+    let mut code = scripted(vec![vec![plan()], vec![patch_call("src/b.rs")]]);
+    let reviewed = ask(&engine, &repo, "Add a module", &mut code);
+    let review = reviewed.plan_proposal.as_ref().expect("the plan is put up");
+    let suggestion = reviewed
+        .turn_presentation
+        .worker_suggestion
+        .as_ref()
+        .expect("a code-changing plan is offered a worker");
+    assert_eq!(suggestion.kind, workspace_engine::PendingDecisionKind::Plan);
+    assert_eq!(suggestion.card_id, review.id);
+
+    // Worker sessions off: nothing is offered.
+    let off_repo = temp_repo("d3-worker-off");
+    let off = worker_check_engine(&off_repo, &shell, false);
+    let mut patch = scripted(vec![vec![patch_call("src/b.rs")]]);
+    let proposed = ask(&off, &off_repo, "Add a module", &mut patch);
+    assert!(proposed.patch_proposal.is_some());
+    assert!(proposed.turn_presentation.worker_suggestion.is_none());
+
+    // In a worker: nothing is offered.
+    let worker_repo = temp_repo("d3-worker-in-worker");
+    let in_worker = worker_check_engine(&worker_repo, &shell, true);
+    let mut hello = MockModelAdapter::new("Hello.");
+    let session = ask(&in_worker, &worker_repo, "Hello", &mut hello)
+        .session
+        .id;
+    mark_worker_session(&in_worker, &session, &worker_repo);
+    let mut patch = scripted(vec![vec![patch_call("src/b.rs")]]);
+    let proposed = ask_in_session(
+        &in_worker,
+        &worker_repo,
+        &session,
+        "Add a module",
+        &mut patch,
+    );
+    assert!(proposed.patch_proposal.is_some());
+    assert!(proposed.turn_presentation.worker_suggestion.is_none());
+}

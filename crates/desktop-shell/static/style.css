@@ -5602,6 +5602,29 @@ body.worker-view #chat-model-menu {
 
 /* The engine-owned task budget (spec 103 Task 2). Rows are rendered as data;
    the card chooses no labels, units or values. */
+/* Spec 107 D3 (C): the one worker suggestion beside a plan review or patch. */
+.worker-suggestion {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.worker-suggestion-note {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.worker-suggestion-actions {
+  display: flex;
+  gap: 6px;
+}
+
 .plan-budget-review {
   display: grid;
   gap: 4px;

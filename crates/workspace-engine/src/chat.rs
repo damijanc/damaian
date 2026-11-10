@@ -822,6 +822,9 @@ struct TurnProposals {
     question: Option<AgentQuestionProposal>,
     fetch: Option<AgentFetchProposal>,
     checks: Option<AgentCheckBatch>,
+    /// Whether the work a plan review defers changes code rather than only
+    /// documentation (spec 107 D3): decides the one worker suggestion.
+    plan_changes_code: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2687,13 +2690,24 @@ impl ChatOrchestrator {
         // floor keeps them as completion obligations. The plan is the signal:
         // while primary work remains this is a per-change run; with no open or
         // blocked primary step it is the completion run.
+        //
+        // Spec 107 D3: a task with no plan continues after a verified patch
+        // (`continue_task_after_verification`), so its patch is a per-change
+        // run too, and the floor runs once when the model answers — that
+        // answer-time due names its checks and is handled above. Before this a
+        // planless task treated every patch as its end and ran the whole floor
+        // after each one.
         let plan = self.session_store.read_task_plan(session_id, &task.id)?;
-        let at_completion = plan.as_ref().is_none_or(|plan| {
-            plan.steps
+        let at_completion = match plan.as_ref().filter(|plan| has_primary_steps(plan)) {
+            Some(plan) => plan
+                .steps
                 .iter()
                 .filter(|step| !step.id.starts_with("verify_"))
-                .all(|step| step.status.is_terminal() && step.status != StepStatus::Blocked)
-        });
+                .all(|step| step.status.is_terminal() && step.status != StepStatus::Blocked),
+            None => !self
+                .session_store
+                .planless_continues(session_id, &due.task_id)?,
+        };
         let selection = if !due.checks.is_empty() {
             // A completion due carries the exact floor checks the answer-time
             // trigger found missing or stale. Run those and nothing else; the
@@ -4115,8 +4129,119 @@ impl ChatOrchestrator {
                 .pending_decision(&task.session_id, &task.id, &task.status)
                 .ok()
                 .flatten();
+            presentation.worker_suggestion = presentation
+                .pending_decision
+                .as_ref()
+                .and_then(|decision| self.worker_suggestion_for(task, decision));
         }
         presentation
+    }
+
+    /// The worker suggestion recorded beside `decision`'s card, if one was.
+    ///
+    /// Read back from the durable offer rather than decided here, so asking
+    /// twice for the same card answers the same way and no other card — a
+    /// later patch of the same task — ever carries it.
+    fn worker_suggestion_for(
+        &self,
+        task: &Task,
+        decision: &crate::task_control::TurnPendingDecision,
+    ) -> Option<crate::task_control::WorkerSuggestion> {
+        if !matches!(
+            decision.kind,
+            crate::task_control::PendingDecisionKind::Plan
+                | crate::task_control::PendingDecisionKind::Patch
+        ) {
+            return None;
+        }
+        let offered = self
+            .session_store
+            .worker_suggestion_offers(&task.session_id)
+            .ok()?
+            .into_iter()
+            .any(|(offered_task, card)| offered_task == task.id && card == decision.card_id);
+        if !offered {
+            return None;
+        }
+        let prompt = if task.user_prompt.starts_with(VERIFICATION_TURN_PROMPT) {
+            self.verification_origin_prompt(&task.session_id)
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        } else {
+            task.user_prompt.clone()
+        };
+        Some(crate::task_control::WorkerSuggestion::new(
+            decision.card_id.clone(),
+            decision.kind,
+            prompt,
+        ))
+    }
+
+    /// Records the one worker suggestion a code-changing task gets (spec 107
+    /// D3, option C), at its first change: a plan review whose deferred work
+    /// changes code, or a patch touching more than documentation.
+    ///
+    /// Never in a worker, never outside Code mode, never with Worker sessions
+    /// off, and never twice for the same task — its whole continuation chain,
+    /// so a planless task's later patches do not ask again. The user's answer
+    /// needs no record: either a worker takes the task, or the session simply
+    /// continues, which is what it does without one.
+    fn offer_worker_once(
+        &self,
+        session: &Session,
+        task: &Task,
+        proposals: &TurnProposals,
+    ) -> Result<()> {
+        let (kind, card_id, changes_code) = if let Some(plan) = &proposals.plan {
+            ("plan", plan.id.as_str(), proposals.plan_changes_code)
+        } else if let Some(patch) = &proposals.patch {
+            (
+                "patch",
+                patch.patch_id.as_str(),
+                patch
+                    .files
+                    .iter()
+                    .any(|file| !crate::verification::is_documentation(&file.path)),
+            )
+        } else {
+            return Ok(());
+        };
+        if !changes_code
+            || !self.config.enable_worker_sessions
+            || self.session_store.session_mode(&session.id) != SessionMode::Code
+            || self.session_store.worker_record(&session.id)?.is_some()
+        {
+            return Ok(());
+        }
+        let chain = self
+            .session_store
+            .task_continuation_chain(&session.id, &task.id)?;
+        let already = self
+            .session_store
+            .worker_suggestion_offers(&session.id)?
+            .iter()
+            .any(|(offered_task, _)| chain.contains(offered_task));
+        if already {
+            return Ok(());
+        }
+        self.session_store.record_worker_suggestion_offered(
+            &session.id,
+            &task.id,
+            kind,
+            card_id,
+        )?;
+        self.audit_log.record(
+            "worker_suggested",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
+                ("kind", kind.to_string()),
+                ("cardId", card_id.to_string()),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Continues an incomplete task as an explicit engine-authorized action
@@ -4809,48 +4934,91 @@ impl ChatOrchestrator {
         // open non-verification plan work. Any failed, stale, missing, pending
         // or policy-skipped evidence keeps it stopped, which is why the gate's
         // exact reasons are checked rather than just the status.
-        let may_continue = match result.task.status {
-            TaskStatus::Complete => true,
+        let session = result.session.clone();
+        let plan = self
+            .session_store
+            .read_task_plan(&session.id, &result.task.id)?;
+        let reason_codes = match result.task.status {
+            TaskStatus::Complete => Some(Vec::new()),
             TaskStatus::Incomplete => self
                 .session_store
-                .read_completion_report(&result.session.id, &result.task.id)?
-                .is_some_and(|settled| {
-                    settled.reason_codes() == vec![CompletionReasonCode::OpenPlanSteps]
-                }),
-            _ => false,
+                .read_completion_report(&session.id, &result.task.id)?
+                .map(|settled| settled.reason_codes()),
+            _ => None,
         };
-        if !may_continue {
-            return Ok(result);
-        }
-        let session = result.session.clone();
-        let Some(plan) = self
-            .session_store
-            .read_task_plan(&session.id, &result.task.id)?
-        else {
+        let Some(reason_codes) = reason_codes else {
             return Ok(result);
         };
-        let open: Vec<&PlanStep> = plan
-            .steps
-            .iter()
-            .filter(|step| !step.id.starts_with("verify_") && !step.status.is_terminal())
-            .collect();
-        if open.is_empty() {
-            return Ok(result);
-        }
-        let task = result.task.clone();
         let original_request = self
             .verification_origin_prompt(&session.id)?
             .map(|prompt| format!("The request was:\n\n{prompt}\n\n"))
             .unwrap_or_default();
-        let steps = open
-            .iter()
-            .map(|step| format!("- {} ({})", step.title, step.id))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let prompt = format!(
-            "{CONTINUE_AFTER_VERIFICATION_PROMPT}\n\n{original_request}Verification: {}\n\nOpen plan steps:\n{steps}",
-            report.summary(&plan.report()),
-        );
+        let prompt = match plan.as_ref().filter(|plan| has_primary_steps(plan)) {
+            Some(plan) => {
+                let may_continue = reason_codes.is_empty()
+                    || reason_codes == vec![CompletionReasonCode::OpenPlanSteps];
+                if !may_continue {
+                    return Ok(result);
+                }
+                let open: Vec<&PlanStep> = plan
+                    .steps
+                    .iter()
+                    .filter(|step| !step.id.starts_with("verify_") && !step.status.is_terminal())
+                    .collect();
+                if open.is_empty() {
+                    return Ok(result);
+                }
+                let steps = open
+                    .iter()
+                    .map(|step| format!("- {} ({})", step.title, step.id))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "{CONTINUE_AFTER_VERIFICATION_PROMPT}\n\n{original_request}Verification: {}\n\nOpen plan steps:\n{steps}",
+                    report.summary(&plan.report()),
+                )
+            }
+            // Spec 107 D3: a planless task does not end at its verified patch.
+            // Its per-change run cannot satisfy the completion floor's
+            // enclosing roots, so a missing or stale floor check is expected
+            // here and is what the answer-time run settles; anything else
+            // (a failed, skipped or pending check) keeps the task stopped. A
+            // completion run — the answer-time floor — is the end and is never
+            // continued, or the task would loop on its own answer.
+            None => {
+                let only_floor_left = reason_codes.iter().all(|code| {
+                    matches!(
+                        code,
+                        CompletionReasonCode::RequiredCheckMissing
+                            | CompletionReasonCode::RequiredCheckStale
+                    )
+                });
+                let verified = !matches!(
+                    report.outcome,
+                    Some(
+                        VerificationOutcome::Failed
+                            | VerificationOutcome::RepairLimitExhausted
+                            | VerificationOutcome::RepairStalled
+                            | VerificationOutcome::NoRepairApplied
+                    )
+                );
+                if !only_floor_left
+                    || !verified
+                    || !self
+                        .session_store
+                        .planless_continues(&session.id, &result.task.id)?
+                    || self.verification_was_completion_run(&session.id, &result.task.id)?
+                {
+                    return Ok(result);
+                }
+                let empty = TaskPlan::new(&result.task.id, 0);
+                format!(
+                    "{CONTINUE_PLANLESS_AFTER_VERIFICATION_PROMPT}\n\n{original_request}Verification: {}",
+                    report.summary(&empty.report()),
+                )
+            }
+        };
+        let task = result.task.clone();
         let changed = report.files_changed.clone();
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
         let conversation = self.session_store.read_conversation(&session.id)?;
@@ -4869,7 +5037,7 @@ impl ChatOrchestrator {
             limit: self.config.context_token_budget(),
             window: self.config.context_window(),
             hook_context: &[],
-            plan: Some(&plan),
+            plan: plan.as_ref(),
             pinned: &context_pins,
             restriction: context_restriction.as_deref(),
             conversation_summary: conversation.summary.as_ref(),
@@ -4948,6 +5116,28 @@ impl ChatOrchestrator {
         // is still drawn above the continuation's answer.
         continued.verification_report = Some(report);
         Ok(continued)
+    }
+
+    /// Whether `task_id`'s verification was the answer-time completion run:
+    /// the `verification_due` that started it named its checks (review
+    /// follow-up to R16). Read from the log so a resumed check card answers
+    /// the same way as a run that never paused.
+    fn verification_was_completion_run(&self, session_id: &str, task_id: &str) -> Result<bool> {
+        let events = self
+            .session_store
+            .read_verification_events(session_id, &[])?;
+        let mut due_named_checks = false;
+        let mut completion = false;
+        for event in &events {
+            match event {
+                VerificationEvent::Due { checks, .. } => due_named_checks = !checks.is_empty(),
+                VerificationEvent::Started {
+                    task_id: started, ..
+                } if started == task_id => completion = due_named_checks,
+                _ => {}
+            }
+        }
+        Ok(completion)
     }
 
     /// The latest request the user typed in this session. A continuation runs
@@ -9480,6 +9670,31 @@ impl ChatOrchestrator {
         if let Some(tracker) = &segment_tracker {
             max_exploration_rounds = max_exploration_rounds.min(tracker.exploration_allowance);
         }
+        // Spec 107 D3 (A): an ordinary Code-mode turn crosses its round
+        // checkpoint the way a worker segment does — while the progress digest
+        // advances and the default task budget allows — instead of pausing on
+        // **Continue** every segment. Ask, Plan and Review keep the pause, and
+        // a worker keeps its own approved-budget tracker above. A repair turn
+        // keeps its pause too: it is bounded by its attempt limit and the
+        // stagnation rules (spec 102), not by task progress. A configured token
+        // ceiling already continues past the checkpoint under its own bound
+        // (spec 47), so it keeps that path.
+        let mut ordinary_continuation = (!worker_session
+            && segment_tracker.is_none()
+            && mode == SessionMode::Code
+            && !turn_options.verification_turn
+            && self.config.agent_max_task_tokens.is_none())
+        .then(|| {
+            OrdinaryContinuation::new(
+                self.config.task_budget_policy().default,
+                self.segment_progress_digest(
+                    plan.as_ref(),
+                    &step_evidence,
+                    &completed_tool_rounds,
+                    &turn_notes,
+                ),
+            )
+        });
         // A request prepared for an automatic boundary is reused for the very
         // next model call, so one threshold crossing records one compaction
         // attempt rather than preparing the same request twice.
@@ -9619,6 +9834,11 @@ impl ChatOrchestrator {
                 .min(ABSOLUTE_TURN_ROUND_CAP);
             if let Some(tracker) = &segment_tracker {
                 max_rounds = max_rounds.min(tracker.action_allowance);
+            }
+            if let Some(ordinary) = &ordinary_continuation
+                && let Some(allowance) = ordinary.action_allowance
+            {
+                max_rounds = max_rounds.min(allowance);
             }
             let force_final = action_rounds >= max_rounds;
             // Spec 61 §5.1: at the round budget, with no token ceiling to
@@ -9952,6 +10172,72 @@ impl ChatOrchestrator {
                             let (run, response, stop) = self.task_terminal_stop(outcome)?;
                             break (run, response, TurnProposals::default(), stop);
                         }
+                    }
+                }
+                // Spec 107 D3 (A): the same pure predicate as a worker segment,
+                // under the default task budget. A decline is not a terminal
+                // stop here: it falls through to the existing round-budget card,
+                // so the user still decides how an ordinary session goes on.
+                // Nothing durable is written for a continued checkpoint beyond
+                // its audit line; the card's pause carries the counters as
+                // before.
+                if segment_tracker.is_none()
+                    && let Some(ordinary) = ordinary_continuation.as_mut()
+                {
+                    let totals = ordinary.totals(action_rounds, exploration_rounds);
+                    let usage = self
+                        .session_store
+                        .read_budget_usage(&session.id, &task.id)?;
+                    let digest = self.segment_progress_digest(
+                        plan.as_ref(),
+                        &step_evidence,
+                        &completed_tool_rounds,
+                        &turn_notes,
+                    );
+                    let decision = decide_segment_continuation(&SegmentContinuationInput {
+                        budget: &ordinary.budget,
+                        totals,
+                        usage: usage.as_ref(),
+                        normal_action_rounds: self.tool_round_limit(web_debug_mode),
+                        normal_exploration_rounds: self.default_exploration_round_limit(),
+                        progress_advanced: digest != ordinary.start_digest,
+                    });
+                    let (event, reason) = match decision {
+                        SegmentContinuationDecision::Continue { .. } => {
+                            ("ordinary_continuation", "progress".to_string())
+                        }
+                        SegmentContinuationDecision::Declined(reason) => (
+                            "ordinary_continuation_declined",
+                            reason.as_str().to_string(),
+                        ),
+                    };
+                    self.audit_log.record(
+                        event,
+                        &[
+                            ("actor", "system".to_string()),
+                            ("sessionId", session.id.clone()),
+                            ("taskId", task.id.clone()),
+                            ("reason", reason),
+                            ("totalActionRounds", totals.action_rounds.to_string()),
+                            (
+                                "totalExplorationRounds",
+                                totals.exploration_rounds.to_string(),
+                            ),
+                        ],
+                    )?;
+                    if let SegmentContinuationDecision::Continue {
+                        action_rounds: action_allowance,
+                        exploration_rounds: exploration_allowance,
+                    } = decision
+                    {
+                        ordinary.advance(totals, digest, action_allowance);
+                        action_rounds = 0;
+                        exploration_rounds = 0;
+                        round_budget_extension = 0;
+                        max_exploration_rounds = self
+                            .default_exploration_round_limit()
+                            .min(exploration_allowance);
+                        continue;
                     }
                 }
                 if segment_tracker.is_some()
@@ -10867,7 +11153,12 @@ impl ChatOrchestrator {
                 // A turn with no plan is not gated. The gate exists to review a
                 // plan, and inventing one to have something to approve would put a
                 // panel in front of every trivial question (§5.1).
+                // A plan holding only the verification loop's own `verify_`
+                // steps is not one the model proposed, so there is nothing to
+                // review: a planless task continuing after a verified patch
+                // (spec 107 D3) carries exactly that.
                 if let Some(current) = plan.as_ref()
+                    && has_primary_steps(current)
                     && !plan_approved
                     && !turn_options.verification_turn
                     && permission.is_allowed()
@@ -10944,6 +11235,8 @@ impl ChatOrchestrator {
                                 deferred_action,
                                 budget_review,
                             }),
+                            plan_changes_code: action_changes_code(&tool_action)
+                                || current.steps.iter().any(|step| step.check.is_some()),
                             ..Default::default()
                         },
                         StopReason::Answered,
@@ -12949,6 +13242,21 @@ impl ChatOrchestrator {
                 source: usage.source,
             })
         });
+        self.offer_worker_once(&session, &task, &proposals)?;
+        // Spec 107 D3: an ordinary agentic Code turn that pauses on a patch
+        // with no plan of its own does not end there. Recorded once per task
+        // chain, before the patch can be applied and verified.
+        if proposals.patch.is_some()
+            && mode == SessionMode::Code
+            && !turn_options.verification_turn
+            && plan.as_ref().is_none_or(|plan| !has_primary_steps(plan))
+            && !self
+                .session_store
+                .planless_continues(&session.id, &task.id)?
+        {
+            self.session_store
+                .record_planless_continuation(&session.id, &task.id)?;
+        }
         let task_control = self.task_control_for(&task);
         let turn_presentation = self.turn_presentation_for(
             &task,
@@ -14657,6 +14965,54 @@ fn validate_segment_resume(
     )))
 }
 
+/// An ordinary Code-mode turn's continuation state (spec 107 D3, option A).
+///
+/// The worker's [`SegmentRunState`] without its durable records: an ordinary
+/// session has no approved budget to account against across processes, so a
+/// decline returns to the existing round-budget card and the card's pause
+/// carries the counters. The totals therefore cover the rounds since the turn
+/// started or last resumed — every resume is a decision the user took. The
+/// budget is the effective worker default (`worker_task_budget_*`), which a
+/// repository or profile can only lower.
+struct OrdinaryContinuation {
+    budget: TaskExecutionBudget,
+    prior_action_rounds: u32,
+    prior_exploration_rounds: u32,
+    start_digest: String,
+    /// The next checkpoint's round allowance once one was crossed: the
+    /// remaining budget capped at an ordinary segment. `None` before the first
+    /// crossing, so a turn that never reaches it is unchanged.
+    action_allowance: Option<u32>,
+}
+
+impl OrdinaryContinuation {
+    fn new(budget: TaskExecutionBudget, start_digest: String) -> Self {
+        Self {
+            budget,
+            prior_action_rounds: 0,
+            prior_exploration_rounds: 0,
+            start_digest,
+            action_allowance: None,
+        }
+    }
+
+    fn totals(&self, action_rounds: u32, exploration_rounds: u32) -> SegmentTotals {
+        SegmentTotals {
+            action_rounds: self.prior_action_rounds.saturating_add(action_rounds),
+            exploration_rounds: self
+                .prior_exploration_rounds
+                .saturating_add(exploration_rounds),
+        }
+    }
+
+    fn advance(&mut self, totals: SegmentTotals, digest: String, action_allowance: u32) {
+        self.prior_action_rounds = totals.action_rounds;
+        self.prior_exploration_rounds = totals.exploration_rounds;
+        self.start_digest = digest;
+        self.action_allowance = Some(action_allowance);
+    }
+}
+
 /// One automatic worker segment's in-memory state (spec 103 Task 5).
 ///
 /// The current segment's counters stay in the turn loop (`action_rounds`,
@@ -15719,6 +16075,10 @@ pub(crate) fn is_damaian_task_prompt(prompt: &str) -> bool {
 
 /// The opening of a continuation after a verification that left the task's
 /// plan open (spec 77). Damaian's words, like [`VERIFICATION_TURN_PROMPT`].
+/// The continuation prompt for a task with no plan (spec 107 D3). The patch's
+/// own checks ran; the full completion checks run once, when the model
+/// answers, so the model is told not to stop merely to have them run.
+const CONTINUE_PLANLESS_AFTER_VERIFICATION_PROMPT: &str = "The patch was applied and the checks for the code it changed finished. The task is not finished until you say so: if the request needs more changes, propose the next one with `edit_file` or `propose_patch`. When the request is done, answer with what changed and what is left; the full completion checks run once then.";
 const CONTINUE_AFTER_VERIFICATION_PROMPT: &str = "The patch was applied and its verification finished. The task is not finished: continue it from its plan. Work through the open steps in order, propose each change with `edit_file` or `propose_patch`, and call `complete_step` as each step is done. Stop when the plan is done, then answer with what changed and what is left.";
 
 /// What a verification turn says when it parks on the check card.
@@ -17274,6 +17634,34 @@ fn carried_plan_has_outstanding_work(plan: &TaskPlan) -> bool {
             step.status == crate::plan::StepStatus::Blocked
                 || step.check.as_ref().is_some_and(|check| check.required)
         })
+}
+
+/// Whether the action a plan review defers changes code (spec 107 D3): an
+/// edit or patch touching anything but documentation, or a command. Other
+/// deferred actions are not evidence of a code change, so they suggest
+/// nothing — a planning or documentation task is never offered a worker.
+fn action_changes_code(action: &ToolAction) -> bool {
+    match action {
+        ToolAction::ProposePatch(edit) => edit
+            .changes
+            .iter()
+            .any(|change| !crate::verification::is_documentation(&change.path)),
+        ToolAction::EditFile { edits, .. } => edits
+            .iter()
+            .any(|edit| !crate::verification::is_documentation(&edit.path)),
+        ToolAction::Command(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether a plan holds any of the task's own steps, rather than only the
+/// `verify_` steps the verification loop adds. A task whose plan has none is
+/// planless for spec 107 D3: it verifies per change and continues after a
+/// verified patch.
+fn has_primary_steps(plan: &TaskPlan) -> bool {
+    plan.steps
+        .iter()
+        .any(|step| !step.id.starts_with("verify_"))
 }
 
 /// Whether taking this action would change something outside the session log,

@@ -3788,6 +3788,10 @@ fn a_hook_that_always_denies_never_gets_a_reminder() {
     hook.order = 0;
     let mut config = config_for(&root, vec![hook]);
     config.agent_max_tool_rounds = 3;
+    // Spec 107 D3: an ordinary Code turn continues past its round checkpoint while it makes
+    // progress under the default task budget. Lowering that budget to the round limit keeps
+    // this test on the round-budget pause it was written against.
+    config.worker_task_budget_action_rounds = 3;
     let engine = WorkspaceEngine::new(config.clone());
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
         vec![String::new(), "Done.".to_string()],

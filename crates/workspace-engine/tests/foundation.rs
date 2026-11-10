@@ -3620,6 +3620,10 @@ fn tool_round_exhaustion_pauses_when_model_still_requests_tools() {
     // before spec 59 (requirement 6 / the "same rounds, stop reason and audit
     // sequence" acceptance criterion).
     config.agent_max_exploration_rounds = 0;
+    // Spec 107 D3: an ordinary Code turn continues past its round checkpoint while it makes
+    // progress under the default task budget. Lowering that budget to the round limit keeps
+    // this test on the round-budget pause it was written against.
+    config.worker_task_budget_action_rounds = 1;
     config.model_providers.push(native_tool_provider());
     let engine = WorkspaceEngine::new(config);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(

@@ -13347,6 +13347,11 @@ function appendProposals(message, payload, repo) {
   // engine's `pendingDecision`, never from the card itself.
   const decision = payload.turnPresentation?.pendingDecision || null;
   const pendingField = decision ? PENDING_DECISION_FIELDS[decision.kind] : null;
+  // Spec 107 D3 (C): the engine's one worker suggestion for a code-changing
+  // task, beside the plan review or patch it was made at.
+  const suggestion = payload.turnPresentation?.workerSuggestion || null;
+  const suggestionFor = (kind, cardId) =>
+    suggestion && suggestion.kind === kind && suggestion.cardId === cardId ? suggestion : null;
   let pendingCard = null;
   const place = (field, card) => {
     if (field === pendingField && !pendingCard) {
@@ -13368,6 +13373,15 @@ function appendProposals(message, payload, repo) {
         startVerification(repo);
       },
     });
+    const patchSuggestion = suggestionFor("patch", payload.patchProposal.patchId);
+    if (patchSuggestion) {
+      patchCard.prepend(
+        createWorkerSuggestion(patchSuggestion, {
+          parentTaskId: payload.taskId || "",
+          handedNote: "Reject this patch here if the worker makes the change instead.",
+        }),
+      );
+    }
     place("patchProposal", patchCard);
   }
   if (payload.checkBatch) {
@@ -13381,7 +13395,8 @@ function appendProposals(message, payload, repo) {
     );
   }
   if (payload.planProposal) {
-    place("planProposal", createPlanReview(payload.planProposal, repo));
+    const workerSuggestion = suggestionFor("plan", payload.planProposal.proposalId);
+    place("planProposal", createPlanReview(payload.planProposal, repo, { workerSuggestion }));
   }
   if (payload.fallbackProposal) {
     place("fallbackProposal", createFallbackOffer(payload.fallbackProposal, repo));
@@ -14155,7 +14170,11 @@ function planCheckTitle(check) {
   return `${kind}: ${checkLabel(check)}`;
 }
 
-function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = null } = {}) {
+function createPlanReview(
+  proposal,
+  proposalRepo,
+  { decide: decideInWorker = null, workerSuggestion = null } = {},
+) {
   const plan = proposal.plan || { steps: [] };
   const editable = decideInWorker
     ? []
@@ -14295,16 +14314,13 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
   declineButton.className = "btn-sm btn-quiet";
   declineButton.textContent = "Decline";
   actions.append(approveButton, declineButton);
-  // Spec 94: a plan is the moment a task shows its size, so the card offers to
-  // run it in its own worktree instead of this checkout. Damaian offers it, not
-  // the model. Not in a worker, whose card is answered in its own process.
-  let workerButton = null;
-  if (!decideInWorker && workersEnabled && currentSessionId && !isWorkerSession(currentSessionId)) {
-    workerButton = document.createElement("button");
-    workerButton.type = "button";
-    workerButton.className = "btn-sm";
-    workerButton.textContent = "Run in a worker";
-    actions.insertBefore(workerButton, declineButton);
+  // Spec 107 D3 (C), replacing spec 94's always-on button: the engine suggests
+  // a worker once, for a plan whose work changes code, and never in a worker,
+  // whose card is answered in its own process. Run in a worker is spec 94's
+  // handoff: the plan becomes the worker's prompt.
+  let suggestionRow = null;
+  if (workerSuggestion && !decideInWorker && workersEnabled && currentSessionId) {
+    suggestionRow = createWorkerSuggestion(workerSuggestion, { onRun: runInWorker });
   }
 
   const output = document.createElement("pre");
@@ -14442,51 +14458,112 @@ function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = nul
   });
   // The pause stays until a worker has started: a dialog the user cancels
   // leaves the card answerable, and the turn ends here only once the work has
-  // somewhere to go.
-  workerButton?.addEventListener("click", async () => {
+  // somewhere to go. Returns the started worker's row, or null.
+  async function runInWorker() {
     const sessionId = currentSessionId;
     const revision = revisionOrNull();
-    try {
-      const { prompt, taskId } = await api(
-        "/api/plan-worker-prompt",
-        form({
-          repo: proposalRepo,
-          proposal_id: proposal.proposalId,
-          steps: revision ? JSON.stringify(revision) : "",
-        }),
-      );
-      const started = await showNewWorkerDialog({
-        prompt,
-        parentSessionId: sessionId,
-        parentTaskId: taskId || proposal.plan?.taskId || "",
-      });
-      if (!started) return;
-      await api(
-        "/api/plan-to-worker",
-        form({
-          repo: proposalRepo,
-          proposal_id: proposal.proposalId,
-          worker_session_id: started.sessionId,
-        }),
-      );
-      [approveButton, declineButton, workerButton].forEach((button) => {
-        button.disabled = true;
-      });
-      list.querySelectorAll("input, button").forEach((control) => {
-        control.disabled = true;
-      });
-      output.hidden = false;
-      output.replaceChildren(createWorkerLink(started, "Handed to"));
-      await loadSessions(sessionId, false);
-    } catch (error) {
-      toast(error.message);
-    }
-  });
+    const { prompt, taskId } = await api(
+      "/api/plan-worker-prompt",
+      form({
+        repo: proposalRepo,
+        proposal_id: proposal.proposalId,
+        steps: revision ? JSON.stringify(revision) : "",
+      }),
+    );
+    const started = await showNewWorkerDialog({
+      prompt,
+      parentSessionId: sessionId,
+      parentTaskId: taskId || proposal.plan?.taskId || "",
+    });
+    if (!started) return null;
+    await api(
+      "/api/plan-to-worker",
+      form({
+        repo: proposalRepo,
+        proposal_id: proposal.proposalId,
+        worker_session_id: started.sessionId,
+      }),
+    );
+    [approveButton, declineButton].forEach((button) => {
+      button.disabled = true;
+    });
+    list.querySelectorAll("input, button").forEach((control) => {
+      control.disabled = true;
+    });
+    output.hidden = false;
+    output.replaceChildren(createWorkerLink(started, "Handed to"));
+    await loadSessions(sessionId, false);
+    return started;
+  }
 
   wrapper.append(header, note);
+  if (suggestionRow) wrapper.append(suggestionRow);
   if (budgetSection) wrapper.append(budgetSection);
   wrapper.append(list, actions, output);
   return wrapper;
+}
+
+// Spec 107 D3 (C): Damaian's one suggestion to run a code-changing task in a
+// worker, with the engine's labels. **Run in a worker** is spec 94's handoff —
+// the New worker dialog, prefilled — through `onRun` when the card has its own
+// (the plan review hands the plan over), else with the engine's prompt.
+// **Continue here** only dismisses the row: the engine records the offer, so
+// the task is not asked again, and continuing is what the session does anyway.
+function createWorkerSuggestion(
+  suggestion,
+  { onRun = null, parentTaskId = "", handedNote = "" } = {},
+) {
+  const row = document.createElement("section");
+  row.className = "worker-suggestion";
+  row.dataset.cardId = suggestion.cardId;
+  const title = document.createElement("strong");
+  title.textContent = suggestion.title;
+  const note = document.createElement("p");
+  note.className = "worker-suggestion-note";
+  note.textContent = suggestion.note;
+  const actions = document.createElement("div");
+  actions.className = "worker-suggestion-actions";
+  const run = document.createElement("button");
+  run.type = "button";
+  run.className = "btn-sm btn-primary";
+  run.textContent = suggestion.runLabel;
+  const stay = document.createElement("button");
+  stay.type = "button";
+  stay.className = "btn-sm btn-quiet";
+  stay.textContent = suggestion.continueLabel;
+  actions.append(run, stay);
+  row.append(title, note, actions);
+
+  stay.addEventListener("click", () => row.remove());
+  run.addEventListener("click", async () => {
+    run.disabled = true;
+    stay.disabled = true;
+    try {
+      const started = onRun
+        ? await onRun()
+        : await showNewWorkerDialog({
+            prompt: suggestion.prompt,
+            parentSessionId: currentSessionId,
+            parentTaskId,
+          });
+      if (!started) {
+        run.disabled = false;
+        stay.disabled = false;
+        return;
+      }
+      const handed = document.createElement("p");
+      handed.className = "worker-suggestion-note";
+      handed.append(createWorkerLink(started, "Handed to"));
+      if (handedNote) handed.append(document.createTextNode(` ${handedNote}`));
+      row.replaceChildren(handed);
+      if (!onRun) await loadSessions(currentSessionId, false);
+    } catch (error) {
+      run.disabled = false;
+      stay.disabled = false;
+      toast(error.message);
+    }
+  });
+  return row;
 }
 
 // The engine-owned card for checks that need a pre-apply baseline (spec 102

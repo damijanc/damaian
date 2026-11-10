@@ -60,6 +60,11 @@ pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
   ] } },
 ]
 
+# Spec 107 D3: once the repair verifies, the planless task continues, and the
+# model answers that the work is done.
+[[turn]]
+content = "The retry helper is in and the check passes."
+
 [assert]
 verification_outcome = "passed"
 verification_passed_commands = ["cargo test"]

@@ -22,8 +22,12 @@ prompt = "Check whether the no-such-directory folder lists cleanly, and keep try
 #
 # Pinned to the old default of 8 so the loop stays short; the bound is what is
 # tested, not the product default (16).
+# Spec 107 D3: an ordinary Code turn continues past its checkpoint while it
+# makes progress under the default task budget; lowering that budget to the
+# pinned round limit keeps this scenario on the round-budget pause.
 config_overlay = """
 agent_max_tool_rounds=8
+worker_task_budget_action_rounds=8
 """
 
 [[turn]]

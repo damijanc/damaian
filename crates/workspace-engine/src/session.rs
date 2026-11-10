@@ -2621,6 +2621,72 @@ impl SessionStore {
         self.append_session_event(session_id, "steering_note_added", &payload.to_string())
     }
 
+    /// Records that Damaian suggested running `task_id` in a worker, beside
+    /// the plan review or patch card `card_id` (spec 107 D3, option C).
+    ///
+    /// Durable so the suggestion is made once per task — its whole
+    /// continuation chain — however many patches, reloads or restarts follow.
+    pub fn record_worker_suggestion_offered(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        kind: &str,
+        card_id: &str,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "sessionId": session_id,
+            "taskId": task_id,
+            "kind": kind,
+            "cardId": card_id,
+        });
+        self.append_session_event(
+            session_id,
+            "worker_suggestion_offered",
+            &payload.to_string(),
+        )
+    }
+
+    /// Records that `task_id` is an ordinary planless task that continues
+    /// after a verified patch (spec 107 D3): an agentic Code-mode turn paused
+    /// on its patch. Its patches then verify per change and the completion
+    /// floor runs once, when the model answers. A one-shot edit proposal never
+    /// writes this, so its patch still settles the task with the whole floor.
+    pub fn record_planless_continuation(&self, session_id: &str, task_id: &str) -> Result<()> {
+        let payload = serde_json::json!({ "sessionId": session_id, "taskId": task_id });
+        self.append_session_event(session_id, "planless_task_continues", &payload.to_string())
+    }
+
+    /// Whether any task in `task_id`'s continuation chain was recorded by
+    /// [`Self::record_planless_continuation`].
+    pub fn planless_continues(&self, session_id: &str, task_id: &str) -> Result<bool> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(false);
+        };
+        let marked: Vec<String> = active_events(&content)
+            .into_iter()
+            .filter(|event| event.event_type == "planless_task_continues")
+            .filter_map(|event| event.text("taskId"))
+            .collect();
+        if marked.is_empty() {
+            return Ok(false);
+        }
+        let chain = self.task_continuation_chain(session_id, task_id)?;
+        Ok(marked.iter().any(|task| chain.contains(task)))
+    }
+
+    /// Every worker suggestion recorded in the session, as `(task id, card
+    /// id)` in log order.
+    pub fn worker_suggestion_offers(&self, session_id: &str) -> Result<Vec<(String, String)>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        Ok(active_events(&content)
+            .into_iter()
+            .filter(|event| event.event_type == "worker_suggestion_offered")
+            .filter_map(|event| Some((event.text("taskId")?, event.text("cardId")?)))
+            .collect())
+    }
+
     /// Sets [`TaskStatus::WaitingForApproval`] and records which stored
     /// proposal the task is waiting on, so recovery can reattach it (§5.5).
     pub fn await_approval(&self, task: &Task, pending: &PendingApprovalRef) -> Result<Task> {

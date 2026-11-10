@@ -291,9 +291,9 @@ pub use task_control::{
     TaskCommand, TaskComposer, TaskControl, TaskControlService, TaskOutcomeKind,
     TurnIndicatorState, TurnPendingDecision, TurnPresentation, TurnStopNotice,
     WORKER_STALE_PROGRESS_AFTER_MS, WorkerBoardGroup, WorkerDot, WorkerProcessState,
-    WorkerTaskFacts, baseline_pending_decision, continuation_prompt, pending_decision_presentation,
-    returned_task_control, returned_task_control_with_outcome, turn_presentation,
-    turn_presentation_with_outcome,
+    WorkerSuggestion, WorkerTaskFacts, baseline_pending_decision, continuation_prompt,
+    pending_decision_presentation, returned_task_control, returned_task_control_with_outcome,
+    turn_presentation, turn_presentation_with_outcome,
 };
 pub use task_outcomes::{
     TASK_TERMINAL_OUTCOME_FORMAT_VERSION, TaskCompactionFacts, TaskOutcomeFigures,

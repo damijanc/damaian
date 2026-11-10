@@ -67,6 +67,11 @@ fn engine(repo: &Path, max_tool_rounds: u32, max_exploration_rounds: u32) -> Wor
         data_dir: repo.join(".damaian"),
         agent_max_tool_rounds: max_tool_rounds,
         agent_max_exploration_rounds: max_exploration_rounds,
+        // Spec 107 D3: an ordinary Code turn continues past its round checkpoint while it makes
+        // progress under the default task budget. Lowering that budget to the round limit keeps
+        // this test on the round-budget pause it was written against.
+        worker_task_budget_action_rounds: max_tool_rounds,
+        worker_task_budget_exploration_rounds: max_exploration_rounds.max(1),
         // Throwaway repository: a watcher would only cost FSEvents registration.
         enable_index_watcher: false,
         ..Config::default()

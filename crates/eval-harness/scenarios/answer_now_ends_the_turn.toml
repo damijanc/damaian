@@ -13,8 +13,12 @@ round_budget_decision = "answer_now"
 # the round budget before and after that spec.
 # Pinned to the old default: the scenario counts rounds against this
 # budget, and the product default (16) is not what it tests.
+# Spec 107 D3: an ordinary Code turn continues past its checkpoint while it
+# makes progress under the default task budget; lowering that budget to the
+# pinned round limit keeps this scenario on the round-budget pause.
 config_overlay = """
 agent_max_tool_rounds=8
+worker_task_budget_action_rounds=8
 """
 
 [[turn]]

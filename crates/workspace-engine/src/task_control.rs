@@ -290,6 +290,49 @@ pub struct TurnPresentation {
     /// read this; none of them infers the kind from card markup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_decision: Option<TurnPendingDecision>,
+    /// Damaian's one suggestion to run this code-changing task in a worker,
+    /// shown beside the pending plan review or patch it was made at (spec 107
+    /// D3, option C). Absent everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_suggestion: Option<WorkerSuggestion>,
+}
+
+/// The engine's suggestion to move a code-changing task into a worker.
+///
+/// Offered once per task (its continuation chain), only with Worker sessions
+/// on, only in an ordinary Code-mode session, and only at the task's first
+/// code change: a plan review whose work changes code, or a planless task's
+/// first patch that touches more than documentation. The labels are the
+/// engine's; the client renders them and reuses spec 94's New worker handoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSuggestion {
+    /// The plan review or patch card the suggestion belongs to.
+    pub card_id: String,
+    pub kind: PendingDecisionKind,
+    pub title: String,
+    pub note: String,
+    pub run_label: String,
+    pub continue_label: String,
+    /// The user's request, to prefill the New worker dialog.
+    pub prompt: String,
+}
+
+impl WorkerSuggestion {
+    pub fn new(card_id: String, kind: PendingDecisionKind, prompt: String) -> Self {
+        Self {
+            card_id,
+            kind,
+            title: "This task changes code".to_string(),
+            note: "A worker runs it in its own worktree and keeps going while it makes \
+                   progress. Continue here to work in this checkout; Damaian will not ask \
+                   again for this task."
+                .to_string(),
+            run_label: "Run in a worker".to_string(),
+            continue_label: "Continue here".to_string(),
+            prompt,
+        }
+    }
 }
 
 /// What kind of decision a waiting turn needs from the user.
@@ -1430,6 +1473,7 @@ pub fn turn_presentation_with_outcome(
             }),
             terminal_outcome,
             pending_decision: None,
+            worker_suggestion: None,
         };
     }
     match status {
@@ -1445,6 +1489,7 @@ pub fn turn_presentation_with_outcome(
             }),
             terminal_outcome,
             pending_decision: None,
+            worker_suggestion: None,
         },
         TaskStatus::Incomplete => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
@@ -1453,6 +1498,7 @@ pub fn turn_presentation_with_outcome(
             stop_notice: None,
             terminal_outcome,
             pending_decision: None,
+            worker_suggestion: None,
         },
         TaskStatus::TaskBudgetExhausted
         | TaskStatus::TaskCompactionCannotFit
@@ -1474,6 +1520,7 @@ pub fn turn_presentation_with_outcome(
                 }),
                 terminal_outcome,
                 pending_decision: None,
+                worker_suggestion: None,
             }
         }
         TaskStatus::Failed if outcome.is_some_and(usage_unavailable) => {
@@ -1490,6 +1537,7 @@ pub fn turn_presentation_with_outcome(
                 }),
                 terminal_outcome,
                 pending_decision: None,
+                worker_suggestion: None,
             }
         }
         TaskStatus::ToolBudgetExhausted => TurnPresentation {
@@ -1513,6 +1561,7 @@ pub fn turn_presentation_with_outcome(
             }),
             terminal_outcome,
             pending_decision: None,
+            worker_suggestion: None,
         },
         TaskStatus::TokenBudgetExhausted => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
@@ -1529,6 +1578,7 @@ pub fn turn_presentation_with_outcome(
             }),
             terminal_outcome,
             pending_decision: None,
+            worker_suggestion: None,
         },
         TaskStatus::Failed | TaskStatus::UnknownExternalOutcome => TurnPresentation {
             indicator_state: TurnIndicatorState::Failed,
@@ -1537,6 +1587,7 @@ pub fn turn_presentation_with_outcome(
             stop_notice: None,
             terminal_outcome,
             pending_decision: None,
+            worker_suggestion: None,
         },
         TaskStatus::Interrupted => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
@@ -1550,6 +1601,7 @@ pub fn turn_presentation_with_outcome(
             }),
             terminal_outcome,
             pending_decision: None,
+            worker_suggestion: None,
         },
         TaskStatus::Complete if model_incomplete => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
@@ -1563,6 +1615,7 @@ pub fn turn_presentation_with_outcome(
             }),
             terminal_outcome,
             pending_decision: None,
+            worker_suggestion: None,
         },
         TaskStatus::Complete => TurnPresentation {
             indicator_state: TurnIndicatorState::Complete,
@@ -1571,6 +1624,7 @@ pub fn turn_presentation_with_outcome(
             stop_notice: None,
             terminal_outcome,
             pending_decision: None,
+            worker_suggestion: None,
         },
         // Everything below is still in progress or waiting for the user. It is
         // explicitly not success, including `waiting_for_approval`, whose
@@ -1590,6 +1644,7 @@ pub fn turn_presentation_with_outcome(
             stop_notice: None,
             terminal_outcome,
             pending_decision: None,
+            worker_suggestion: None,
         },
     }
 }

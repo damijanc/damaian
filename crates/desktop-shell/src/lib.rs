@@ -9992,6 +9992,57 @@ mod tests {
     /// Spec 107 Task 4 in the UI: the card streams, shows the engine's label and
     /// a clock, offers the engine's Cancel, and a cancel leaves the patch to
     /// the user instead of retrying the apply.
+    /// Spec 107 D3 (C): the worker suggestion is drawn only where the engine's
+    /// `workerSuggestion` names the card, with the engine's labels; the plan
+    /// card no longer offers spec 94's always-on **Run in a worker**.
+    #[test]
+    fn app_js_suggests_a_worker_only_where_the_engine_says() {
+        let proposals = app_js_function("appendProposals");
+        assert!(
+            proposals.contains("payload.turnPresentation?.workerSuggestion"),
+            "{proposals}"
+        );
+        assert!(
+            proposals.contains("suggestionFor(\"plan\", payload.planProposal.proposalId)"),
+            "{proposals}"
+        );
+        assert!(
+            proposals.contains("suggestionFor(\"patch\", payload.patchProposal.patchId)"),
+            "{proposals}"
+        );
+        assert!(
+            proposals.contains("suggestion.cardId === cardId"),
+            "{proposals}"
+        );
+
+        let plan = app_js_function("createPlanReview");
+        assert!(
+            !plan.contains("\"Run in a worker\""),
+            "the plan card has no always-on worker button: {plan}"
+        );
+        assert!(
+            plan.contains("if (workerSuggestion && !decideInWorker && workersEnabled"),
+            "{plan}"
+        );
+        assert!(plan.contains("\"/api/plan-to-worker\""), "{plan}");
+
+        let row = app_js_function("createWorkerSuggestion");
+        for engine_label in [
+            "suggestion.title",
+            "suggestion.note",
+            "suggestion.runLabel",
+            "suggestion.continueLabel",
+            "prompt: suggestion.prompt",
+        ] {
+            assert!(row.contains(engine_label), "{engine_label}: {row}");
+        }
+        assert!(row.contains("showNewWorkerDialog"), "{row}");
+        assert!(
+            !row.contains("Run in a worker") && !row.contains("Continue here"),
+            "labels come from the engine: {row}"
+        );
+    }
+
     #[test]
     fn app_js_baseline_card_streams_progress_and_cancels() {
         let card = app_js_function("createBaselineBatchCard");

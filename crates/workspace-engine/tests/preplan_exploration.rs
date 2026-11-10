@@ -408,6 +408,11 @@ fn an_interactive_session_keeps_todays_round_limits_and_continue() {
         config.agent_max_tool_rounds = 1;
         config.agent_max_exploration_rounds = 1;
         config.worker_preplan_exploration_rounds = 20;
+        // Spec 107 D3: an ordinary Code turn continues past its round checkpoint while it makes
+        // progress under the default task budget. Lowering that budget to the round limit keeps
+        // this test on the round-budget pause it was written against.
+        config.worker_task_budget_action_rounds = 1;
+        config.worker_task_budget_exploration_rounds = 1;
     });
     let mut adapter = read_sequence(&repo, 4, &[("Done.".to_string(), Vec::new())]);
 

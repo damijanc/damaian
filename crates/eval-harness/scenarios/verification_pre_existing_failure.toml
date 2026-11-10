@@ -51,6 +51,11 @@ pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
   ] } },
 ]
 
+# Spec 107 D3: a planless task does not end at its verified patch. The
+# verification continues it, and the model answers that the work is done.
+[[turn]]
+content = "The retry helper is in; the failing integration test predates it."
+
 [assert]
 # Spec 106 requirement 11: an unchanged pre-existing failure is reported and
 # never repaired, but it is not this task's failure: the run finishes
@@ -62,6 +67,7 @@ verification_provenances = [{ command = "cargo test", provenance = "pre_existing
 verification_repair_targets = 0
 verification_action_kinds = ["review_pre_existing_failure"]
 repair_stall_reason = "none"
-# Two model calls are the read and the patch. A repair turn would need another.
-model_calls_at_most = 2
+# Three model calls are the read, the patch and the answer after the verified
+# patch (spec 107 D3). A repair turn would need another.
+model_calls_at_most = 3
 final_task_status = "complete"

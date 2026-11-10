@@ -1079,8 +1079,13 @@ fn without_an_exploration_allowance_long_discovery_reaches_the_action_budget() {
     let path = scenario::scenarios_dir().join("long_discovery.toml");
     let mut loaded = scenario::load(&path).expect("scenario");
     loaded.config_overlay = Some(
-        ConfigOverlay::parse("agent_max_exploration_rounds=0\nagent_max_tool_rounds=8\n")
-            .expect("the zero allowance is valid config"),
+        // Spec 107 D3: the default task budget lowered to the round limit, so
+        // the progressing discovery stops at the round-budget pause.
+        ConfigOverlay::parse(
+            "agent_max_exploration_rounds=0\nagent_max_tool_rounds=8\n\
+             worker_task_budget_action_rounds=8\n",
+        )
+        .expect("the zero allowance is valid config"),
     );
     loaded.round_budget_decision = Some(scenario::RoundBudgetDecision::AnswerNow);
 
