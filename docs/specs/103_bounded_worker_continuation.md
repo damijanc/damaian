@@ -547,3 +547,7 @@ Tests in `within_turn_request_preparation`:
   run without a known window, where their count-bound assertions still apply;
 - `a_command_heavy_budgeted_worker_stays_bounded_at_the_default_message_limit`
   passes unchanged through the fallback.
+
+The full seven-check gate passed in CI on 2026-11-10. Scoped checks passed
+locally: `workspace-engine` (2,614 tests), `eval-harness` (151, including the
+deterministic tier), clippy for `workspace-engine`, and the fast checks.
