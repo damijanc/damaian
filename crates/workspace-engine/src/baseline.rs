@@ -910,34 +910,64 @@ impl BaselineCoordinator {
     /// the patch's baselines and before it writes a replacement card, so a
     /// reload never finds two competing decisions for one apply.
     fn remove_pending_for_patch(&self, patch_id: &str) -> Result<()> {
-        let directory = self.pending_dir();
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        for entry in entries {
-            let entry = entry?;
-            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(content) = fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            let Ok(pending) = serde_json::from_str::<PendingBaseline>(&content) else {
-                continue;
-            };
+        for (path, pending) in pending_baselines_in(&self.pending_dir())? {
             if pending.batch.patch_id == patch_id {
-                fs::remove_file(entry.path())?;
+                fs::remove_file(path)?;
             }
         }
         Ok(())
     }
 
     fn pending_dir(&self) -> PathBuf {
-        self.config.data_dir.join("baselines").join("pending")
+        pending_baseline_dir(&self.config.data_dir)
     }
+}
 
+fn pending_baseline_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("baselines").join("pending")
+}
+
+/// Every readable pending baseline card under `directory`. An unreadable or
+/// foreign file is skipped, as it always was for the per-patch cleanup.
+fn pending_baselines_in(directory: &Path) -> Result<Vec<(PathBuf, PendingBaseline)>> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(pending) = serde_json::from_str::<PendingBaseline>(&content) else {
+            continue;
+        };
+        found.push((entry.path(), pending));
+    }
+    Ok(found)
+}
+
+/// The baseline card a patch's apply is waiting on, if any (spec 107 Task 1).
+///
+/// The engine keeps at most one pending card per patch
+/// (`remove_pending_for_patch` runs before a replacement is written), so this
+/// is the decision the user owes before that patch can apply.
+pub fn pending_baseline_for_patch(
+    data_dir: &Path,
+    patch_id: &str,
+) -> Result<Option<BaselineBatch>> {
+    Ok(pending_baselines_in(&pending_baseline_dir(data_dir))?
+        .into_iter()
+        .map(|(_, pending)| pending.batch)
+        .find(|batch| batch.patch_id == patch_id))
+}
+
+impl BaselineCoordinator {
     /// A batch id reaches the filesystem, so it is not trusted as a path
     /// component. The engine only ever generates `baseline_` ids made of
     /// alphanumerics, `_` and `-`; anything else is refused before a path is

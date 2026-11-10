@@ -14,10 +14,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
-    CancelToken, ChatTurnResult, CompletionGateReport, CompletionGateService, CompletionReason,
-    CompletionReasonCode, Config, MockModelAdapter, ModelAdapter, PLANNED_CHECK_VERSION,
-    PatchFileDecision, PlanStep, PlannedCheck, TaskPlan, TaskStatus, ToolCall, TurnProgress,
-    TurnSink, WorkerRecord, WorkspaceEngine, hash::repository_id_for_root,
+    CancelToken, ChatTurnOptions, ChatTurnResult, CompletionGateReport, CompletionGateService,
+    CompletionReason, CompletionReasonCode, Config, MockModelAdapter, ModelAdapter,
+    ModelProviderConfig, PLANNED_CHECK_VERSION, PatchFileDecision, PendingApprovalRef,
+    PendingDecisionKind, PlanStep, PlannedCheck, TaskControlService, TaskPlan, TaskStatus,
+    ToolCall, TurnPendingDecision, TurnProgress, TurnSink, WorkerRecord, WorkspaceEngine,
+    hash::repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1198,4 +1200,225 @@ fn an_incomplete_worker_progress_status_stays_literal() {
         "the returned card names the gate's reason: {}",
         control.detail
     );
+}
+
+// Spec 107 Task 1: the pending-decision presentation state.
+
+/// What `/api/session` reports for the result's task after a reload: the same
+/// engine reader, fed the durable status rather than the live result.
+fn reloaded_decision(
+    engine: &WorkspaceEngine,
+    result: &ChatTurnResult,
+) -> Option<TurnPendingDecision> {
+    let statuses = engine
+        .session_store
+        .read_task_statuses(&result.session.id)
+        .unwrap();
+    let status = TaskStatus::parse(&statuses[&result.task.id]).expect("a known status");
+    TaskControlService::new(&engine.session_store, None)
+        .pending_decision(&result.session.id, &result.task.id, &status)
+        .unwrap()
+}
+
+/// The live decision, asserted equal to the reloaded one.
+fn live_decision(engine: &WorkspaceEngine, result: &ChatTurnResult) -> TurnPendingDecision {
+    let live = result
+        .turn_presentation
+        .pending_decision
+        .clone()
+        .unwrap_or_else(|| panic!("a waiting turn carries its decision: {result:?}"));
+    assert_eq!(
+        reloaded_decision(engine, result).as_ref(),
+        Some(&live),
+        "a reload must report what the live stream reported"
+    );
+    live
+}
+
+#[test]
+fn a_plan_review_then_a_command_approval_each_name_their_decision_and_a_finished_turn_none() {
+    let repo = temp_repo("pending-plan-command");
+    let engine = engine_for(&repo);
+    write_recovering_check(&repo);
+
+    let mut first = scripted(vec![
+        vec![plan_call(&["Run the check", "Report"])],
+        vec![check_call()],
+    ]);
+    let paused = ask(&engine, &repo, "Check the folder", &mut first);
+    let review = paused.plan_proposal.clone().expect("a plan review");
+    let decision = live_decision(&engine, &paused);
+    assert_eq!(decision.kind, PendingDecisionKind::Plan);
+    assert_eq!(decision.card_id, review.id);
+    assert_eq!(decision.status_label, "Waiting for your review");
+
+    let mut command_round = scripted(vec![vec![check_call()]]);
+    let paused = approve_plan(&engine, &review.id, &mut command_round);
+    let command = paused.command_proposal.clone().expect("a command approval");
+    let decision = live_decision(&engine, &paused);
+    assert_eq!(decision.kind, PendingDecisionKind::Command);
+    assert_eq!(decision.card_id, command.id);
+    assert_eq!(decision.label, "Approve the command");
+
+    // The turn moves on and settles: nothing is pending, live or reloaded,
+    // even though older status events in the log recorded a link.
+    let mut finish = scripted(vec![vec![complete_step_call()]]);
+    let settled = approve_command(&engine, &command.id, &mut finish);
+    assert_ne!(settled.task.status, TaskStatus::WaitingForApproval);
+    assert!(settled.turn_presentation.pending_decision.is_none());
+    assert!(reloaded_decision(&engine, &settled).is_none());
+}
+
+#[test]
+fn a_question_names_its_decision_and_card() {
+    let repo = temp_repo("pending-question");
+    // `ask_user` is offered only on a native-tools provider, to a user who is
+    // present (spec 50).
+    let mut config = Config {
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        ..Config::default()
+    };
+    config.model_providers.push(ModelProviderConfig {
+        id: config.model_provider.clone(),
+        label: config.model_provider.clone(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
+        context_window: None,
+        provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
+    });
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = scripted(vec![vec![call(
+        "ask_user",
+        r#"{"question":"Did you mean the CLI or the shell?","options":["The CLI","The shell"]}"#,
+    )]]);
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = sink(&cancel, &mut on_token, &mut on_progress);
+    let paused = engine
+        .chat_orchestrator
+        .ask_with_session_with_options(
+            &repo,
+            "Fix the entry point",
+            &[],
+            None,
+            &mut adapter,
+            &mut sink,
+            ChatTurnOptions::interactive(),
+        )
+        .expect("the turn should run");
+    let question = paused.question_proposal.clone().expect("a question");
+    let decision = live_decision(&engine, &paused);
+    assert_eq!(decision.kind, PendingDecisionKind::Question);
+    assert_eq!(decision.card_id, question.question_id);
+    assert_eq!(decision.label, "Damaian needs your answer");
+    assert_eq!(decision.status_label, "Waiting for your answer");
+}
+
+#[test]
+fn a_patch_names_its_decision_and_card() {
+    let repo = temp_repo("pending-patch");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![vec![call(
+        "propose_patch",
+        r##"{"summary":"Change the readme","files":[{"path":"README.md","content":"# Changed\n"}]}"##,
+    )]]);
+    let paused = ask(&engine, &repo, "Change the readme", &mut adapter);
+    let patch = paused.patch_proposal.clone().expect("a patch");
+    let decision = live_decision(&engine, &paused);
+    assert_eq!(decision.kind, PendingDecisionKind::Patch);
+    assert_eq!(decision.card_id, patch.patch_id);
+    assert_eq!(decision.label, "Review the patch");
+}
+
+#[test]
+fn a_round_limit_pause_names_its_decision_and_card() {
+    let repo = temp_repo("pending-round-budget");
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: repo.join(".damaian"),
+        agent_max_tool_rounds: 2,
+        enable_index_watcher: false,
+        ..Config::default()
+    });
+    let read_only = "DAMAIAN_COMMAND_V1\nCOMMAND: ls src\nREASON: Look again.\nEND_COMMAND\n";
+    let mut adapter = MockModelAdapter::new_sequence(vec![read_only.to_string(); 2]);
+    let paused = ask(&engine, &repo, "Look at the source", &mut adapter);
+    let proposal = paused
+        .round_budget_proposal
+        .clone()
+        .expect("a round-budget pause");
+    let decision = live_decision(&engine, &paused);
+    assert_eq!(decision.kind, PendingDecisionKind::RoundBudget);
+    assert_eq!(decision.card_id, proposal.id);
+    assert_eq!(decision.status_label, "Waiting for your decision");
+}
+
+#[test]
+fn a_plain_answer_has_no_pending_decision() {
+    let repo = temp_repo("pending-none");
+    let engine = engine_for(&repo);
+    let mut adapter = MockModelAdapter::new_sequence(vec!["Nothing to do.".to_string()]);
+    let result = ask(&engine, &repo, "Say hello", &mut adapter);
+    assert!(result.turn_presentation.pending_decision.is_none());
+    assert!(reloaded_decision(&engine, &result).is_none());
+}
+
+/// The pauses whose live setup needs a provider refusal, a context-review
+/// setting, a fetch tool or a verification run: their durable link is what
+/// both the live result and the reload read, so the link alone decides.
+#[test]
+fn every_other_pause_link_reads_back_as_its_decision() {
+    let repo = temp_repo("pending-links");
+    let engine = engine_for(&repo);
+    let store = &engine.session_store;
+    let session = store
+        .create_session(&repository_id_for_root(&repo), "Links")
+        .unwrap();
+    let reader = TaskControlService::new(store, None);
+    for (link, kind) in [
+        ("checks", PendingDecisionKind::Checks),
+        ("provider_fallback", PendingDecisionKind::Fallback),
+        ("context_review", PendingDecisionKind::ContextReview),
+        ("fetch", PendingDecisionKind::Fetch),
+    ] {
+        let task = store
+            .create_task(&session.id, "Wait", "mock", "mock")
+            .unwrap();
+        let waiting = store
+            .await_approval(
+                &task,
+                &PendingApprovalRef {
+                    kind: link.to_string(),
+                    proposal_id: format!("{link}_proposal"),
+                },
+            )
+            .unwrap();
+        let decision = reader
+            .pending_decision(&session.id, &task.id, &waiting.status)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{link} is a pending decision"));
+        assert_eq!(decision.kind, kind, "{link}");
+        assert_eq!(decision.card_id, format!("{link}_proposal"));
+
+        // The same task, moved on, waits on nothing.
+        let moved = store
+            .update_task_status(&waiting, TaskStatus::Incomplete, None)
+            .unwrap();
+        assert!(
+            reader
+                .pending_decision(&session.id, &task.id, &moved.status)
+                .unwrap()
+                .is_none(),
+            "{link}"
+        );
+    }
 }

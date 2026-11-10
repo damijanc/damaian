@@ -285,11 +285,13 @@ pub use task_budget::{
     TaskBudgetPolicy, TaskBudgetReview, TaskBudgetReviewRow, TaskExecutionBudget,
 };
 pub use task_control::{
-    TaskAction, TaskActionInput, TaskActionTransport, TaskCommand, TaskComposer, TaskControl,
-    TaskControlService, TaskOutcomeKind, TurnIndicatorState, TurnPresentation, TurnStopNotice,
+    PendingDecisionFacts, PendingDecisionKind, TaskAction, TaskActionInput, TaskActionTransport,
+    TaskCommand, TaskComposer, TaskControl, TaskControlService, TaskOutcomeKind,
+    TurnIndicatorState, TurnPendingDecision, TurnPresentation, TurnStopNotice,
     WORKER_STALE_PROGRESS_AFTER_MS, WorkerBoardGroup, WorkerDot, WorkerProcessState,
-    WorkerTaskFacts, continuation_prompt, returned_task_control,
-    returned_task_control_with_outcome, turn_presentation, turn_presentation_with_outcome,
+    WorkerTaskFacts, baseline_pending_decision, continuation_prompt, pending_decision_presentation,
+    returned_task_control, returned_task_control_with_outcome, turn_presentation,
+    turn_presentation_with_outcome,
 };
 pub use task_outcomes::{
     TASK_TERMINAL_OUTCOME_FORMAT_VERSION, TaskCompactionFacts, TaskOutcomeFigures,

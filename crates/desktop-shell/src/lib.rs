@@ -722,6 +722,22 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
         .session_store
         .read_task_outcomes(&session_id)
         .map_err(|error| error.to_string())?;
+    // What each waiting task needs from the user (spec 107 Task 1), read by
+    // the engine from the durable pause link — the same reader a live turn's
+    // presentation uses, so a reload shows the decision the stream showed.
+    let mut task_pending_decisions = HashMap::new();
+    let pending_reader = workspace_engine::TaskControlService::new(&engine.session_store, None);
+    for (task_id, raw_status) in &task_statuses {
+        let Some(status) = workspace_engine::TaskStatus::parse(raw_status) else {
+            continue;
+        };
+        if let Some(decision) = pending_reader
+            .pending_decision(&session_id, task_id, &status)
+            .map_err(|error| error.to_string())?
+        {
+            task_pending_decisions.insert(task_id.clone(), decision);
+        }
+    }
     // Each turn's newest context manifest, joined by `taskId` (spec 27 §5.3),
     // and the session's pins and restriction (spec 27 §5.4).
     let task_contexts = engine
@@ -769,7 +785,8 @@ fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
                 &task_notes,
                 &task_contexts,
                 &engine.config,
-                &task_outcomes
+                &task_outcomes,
+                &task_pending_decisions
             ),
             conversation_json(&engine, &session_id),
             serde_json::to_string(&context_pins).unwrap_or_else(|_| "[]".to_string()),
@@ -3045,9 +3062,10 @@ fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> Result<(), S
             200,
             "application/json",
             &format!(
-                "{{\"patchId\":\"{}\",\"appliedFiles\":[],\"baselineBatch\":{}}}",
+                "{{\"patchId\":\"{}\",\"appliedFiles\":[],\"baselineBatch\":{},\"pendingDecision\":{}}}",
                 escape_json(&patch_id),
-                baseline_batch_json(&batch)
+                baseline_batch_json(&batch),
+                baseline_pending_decision_json(&batch)
             ),
         );
     };
@@ -3101,8 +3119,9 @@ fn handle_resume_baseline(stream: &mut TcpStream, request: &Request) -> Result<(
             200,
             "application/json",
             &format!(
-                "{{\"completed\":false,\"baselineBatch\":{}}}",
-                baseline_batch_json(&batch)
+                "{{\"completed\":false,\"baselineBatch\":{},\"pendingDecision\":{}}}",
+                baseline_batch_json(&batch),
+                baseline_pending_decision_json(&batch)
             ),
         ),
     }
@@ -3110,6 +3129,14 @@ fn handle_resume_baseline(stream: &mut TcpStream, request: &Request) -> Result<(
 
 fn baseline_batch_json(batch: &BaselineBatch) -> String {
     serde_json::to_string(batch).unwrap_or_else(|_| "null".to_string())
+}
+
+/// The pending decision a baseline card puts its task in (spec 107 Task 1):
+/// the engine's own presentation, the same value `/api/session` reports for
+/// the task while the card is pending.
+fn baseline_pending_decision_json(batch: &BaselineBatch) -> String {
+    serde_json::to_string(&workspace_engine::baseline_pending_decision(batch))
+        .unwrap_or_else(|_| "null".to_string())
 }
 
 fn handle_rollback_patch(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
@@ -6310,6 +6337,15 @@ fn phase_json(phase: &TurnPhase) -> String {
 /// out, because a panel that silently rendered the first of two in-progress
 /// steps would conceal exactly the invariant requirement 2 exists to catch.
 pub(crate) fn plan_json(plan: &TaskPlan, active: bool) -> String {
+    plan_json_with_waiting(plan, active, false)
+}
+
+/// [`plan_json`] for a task that may be waiting on the user (spec 107 Task 1).
+///
+/// `waiting` is true exactly when the engine reports a pending decision for
+/// the plan's task, so the panel can say *waiting for you* instead of
+/// *running* for the open step without reading the task status itself.
+pub(crate) fn plan_json_with_waiting(plan: &TaskPlan, active: bool, waiting: bool) -> String {
     let report = plan.report();
     let steps = plan
         .steps
@@ -6333,11 +6369,12 @@ pub(crate) fn plan_json(plan: &TaskPlan, active: bool) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"taskId\":\"{}\",\"steps\":[{}],\"summary\":\"{}\",\"active\":{},\"isComplete\":{},\"verified\":{},\"unverified\":{},\"blocked\":{},\"skipped\":{},\"outstanding\":{},\"violatesSingleInProgress\":{}}}",
+        "{{\"taskId\":\"{}\",\"steps\":[{}],\"summary\":\"{}\",\"active\":{},\"waiting\":{},\"isComplete\":{},\"verified\":{},\"unverified\":{},\"blocked\":{},\"skipped\":{},\"outstanding\":{},\"violatesSingleInProgress\":{}}}",
         escape_json(&plan.task_id),
         steps,
         escape_json(&report.summary(active)),
         active,
+        waiting,
         report.is_complete,
         report.verified,
         report.unverified,
@@ -7326,6 +7363,7 @@ fn task_states_json(
         contexts,
         config,
         &HashMap::new(),
+        &HashMap::new(),
     )
 }
 
@@ -7343,6 +7381,7 @@ fn task_states_json_with_outcomes(
     contexts: &HashMap<String, ContextManifest>,
     config: &Config,
     outcomes: &HashMap<String, workspace_engine::TaskTerminalOutcome>,
+    pending_decisions: &HashMap<String, workspace_engine::TurnPendingDecision>,
 ) -> String {
     let mut entries: Vec<&String> = statuses.keys().collect();
     // Sorted so the payload is stable between requests.
@@ -7379,8 +7418,14 @@ fn task_states_json_with_outcomes(
                 .get(*id)
                 .and_then(|status| workspace_engine::TaskStatus::parse(status))
                 .is_some_and(|status| status.is_active());
+            // Spec 107 Task 1: a task waiting on a decision says so, from the
+            // same engine value the turn presentation carries below.
+            let pending_decision = pending_decisions.get(*id);
             let plan_json_field = match plans.get(*id) {
-                Some(plan) => format!(",\"plan\":{}", plan_json(plan, active)),
+                Some(plan) => format!(
+                    ",\"plan\":{}",
+                    plan_json_with_waiting(plan, active, pending_decision.is_some())
+                ),
                 None => String::new(),
             };
             // A named failure reason, when the turn failed with one (spec 48
@@ -7433,13 +7478,15 @@ fn task_states_json_with_outcomes(
                 .get(*id)
                 .and_then(|status| workspace_engine::TaskStatus::parse(status))
                 .map(|status| {
-                    workspace_engine::turn_presentation_with_outcome(
+                    let mut presentation = workspace_engine::turn_presentation_with_outcome(
                         &status,
                         false,
                         false,
                         Some(id.as_str()),
                         outcome,
-                    )
+                    );
+                    presentation.pending_decision = pending_decision.cloned();
+                    presentation
                 });
             let turn_presentation_field = match turn_presentation {
                 Some(presentation) => format!(
@@ -8016,6 +8063,63 @@ mod tests {
         );
         assert!(json.contains("\"active\":true"), "{json}");
         assert!(json.contains("1 step outstanding"), "{json}");
+    }
+
+    /// Spec 107 Task 1: a reloaded task waiting on a decision carries it in its
+    /// presentation, and its plan says `waiting`; a running task's does not.
+    #[test]
+    fn a_waiting_task_s_plan_and_presentation_carry_its_pending_decision() {
+        let mut plans = HashMap::new();
+        plans.insert("task_1".to_string(), sample_plan());
+        let mut statuses = HashMap::new();
+        statuses.insert("task_1".to_string(), "waiting_for_approval".to_string());
+        let decision = workspace_engine::TurnPendingDecision {
+            kind: workspace_engine::PendingDecisionKind::Patch,
+            label: "Review the patch".to_string(),
+            status_label: "Waiting for your review".to_string(),
+            card_id: "patch_1".to_string(),
+        };
+        let mut pending = HashMap::new();
+        pending.insert("task_1".to_string(), decision.clone());
+        let json = task_states_json_with_outcomes(
+            &statuses,
+            &HashMap::new(),
+            &plans,
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &HashMap::new(),
+            &Config::default(),
+            &HashMap::new(),
+            &pending,
+        );
+        let tasks: serde_json::Value = serde_json::from_str(&format!("[{json}]")).unwrap();
+        assert_eq!(tasks[0]["plan"]["waiting"], true, "{json}");
+        assert_eq!(tasks[0]["plan"]["active"], true, "{json}");
+        assert_eq!(
+            tasks[0]["turnPresentation"]["pendingDecision"],
+            serde_json::to_value(&decision).unwrap()
+        );
+
+        statuses.insert("task_1".to_string(), "running_tool".to_string());
+        let json = task_states_json(
+            &statuses,
+            &HashMap::new(),
+            &plans,
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &HashMap::new(),
+            &Config::default(),
+        );
+        let tasks: serde_json::Value = serde_json::from_str(&format!("[{json}]")).unwrap();
+        assert_eq!(tasks[0]["plan"]["waiting"], false, "{json}");
+        assert!(
+            tasks[0]["turnPresentation"]
+                .get("pendingDecision")
+                .is_none(),
+            "{json}"
+        );
     }
 
     #[test]
@@ -9103,8 +9207,28 @@ mod tests {
                 &mut MockModelAdapter::new(edit_response),
             )
             .expect("the edit should be proposed");
+        let session_id = proposal.session.id.clone();
+        let task_id = proposal.task.id.clone();
         let patch_id = proposal.patch.id;
         let (port, token) = serve_for_test();
+        // Spec 107 Task 1: what `/api/session` says the task is waiting on.
+        let reloaded_decision = || {
+            let session = response_json(&get_for_test(
+                port,
+                &token,
+                &format!("/api/session?session_id={session_id}"),
+            ));
+            session["tasks"]
+                .as_array()
+                .expect("tasks")
+                .iter()
+                .find(|task| task["id"] == task_id.as_str())
+                .expect("the patch task is in the session")["turnPresentation"]["pendingDecision"]
+                .clone()
+        };
+        let decision = reloaded_decision();
+        assert_eq!(decision["kind"], "patch", "{decision}");
+        assert_eq!(decision["cardId"], patch_id.as_str());
 
         let applied = post_fields_for_test(
             port,
@@ -9135,6 +9259,14 @@ mod tests {
         let batch_id = batch["id"].as_str().expect("batch id");
         let proposal_id = check["proposalId"].as_str().expect("proposal id");
 
+        // Spec 107 Task 1: the card puts the task in a baseline decision,
+        // answered through the batch, and a reload reports the same value.
+        let decision = &applied["pendingDecision"];
+        assert_eq!(decision["kind"], "baseline", "{applied}");
+        assert_eq!(decision["cardId"], batch_id);
+        assert_eq!(decision["statusLabel"], "Waiting for your approval");
+        assert_eq!(&reloaded_decision(), decision);
+
         let decisions = serde_json::json!([{
             "proposalId": proposal_id,
             "approved": false
@@ -9157,6 +9289,8 @@ mod tests {
             "let a = 1;\n",
             "resuming a baseline is not an apply"
         );
+        // The baseline is settled; the patch itself is still the decision.
+        assert_eq!(reloaded_decision()["kind"], "patch");
 
         let applied = post_fields_for_test(
             port,
@@ -14731,6 +14865,7 @@ mod tests {
             &HashMap::new(),
             &engine.config,
             &outcomes,
+            &HashMap::new(),
         );
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["terminalOutcome"]["kind"], "no_progress");

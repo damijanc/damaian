@@ -284,6 +284,167 @@ pub struct TurnPresentation {
     /// live turn and a reload carry the same engine-owned facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_outcome: Option<crate::task_outcomes::TaskTerminalOutcome>,
+    /// The one decision this turn is waiting on, when it is waiting on the user
+    /// (spec 107 Task 1). Absent for a running or finished turn. The card's
+    /// placement, the composer line, the status line and the plan label all
+    /// read this; none of them infers the kind from card markup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_decision: Option<TurnPendingDecision>,
+}
+
+/// What kind of decision a waiting turn needs from the user.
+///
+/// One variant per durable pause link the engine writes
+/// (`SessionStore::await_approval` / `await_answer`), plus `Baseline`, which is
+/// a patch whose apply is held on a pre-apply baseline card (spec 102).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingDecisionKind {
+    Question,
+    Patch,
+    Checks,
+    Baseline,
+    Command,
+    RoundBudget,
+    Plan,
+    Fallback,
+    ContextReview,
+    Fetch,
+}
+
+impl PendingDecisionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Question => "question",
+            Self::Patch => "patch",
+            Self::Checks => "checks",
+            Self::Baseline => "baseline",
+            Self::Command => "command",
+            Self::RoundBudget => "round_budget",
+            Self::Plan => "plan",
+            Self::Fallback => "fallback",
+            Self::ContextReview => "context_review",
+            Self::Fetch => "fetch",
+        }
+    }
+}
+
+/// The engine's presentation of a pending decision (spec 107 D1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnPendingDecision {
+    pub kind: PendingDecisionKind,
+    /// The composer line: what the user has to do ("Review the patch").
+    pub label: String,
+    /// The status line while the turn waits ("Waiting for your review").
+    pub status_label: String,
+    /// The id the card answers through: the question, proposal, check batch or
+    /// baseline batch id. The UI finds the card by it.
+    pub card_id: String,
+}
+
+/// The facts behind a durable pause link that its label depends on.
+///
+/// Read from the same durable artifacts for a live turn and a reload, so both
+/// produce the same [`TurnPendingDecision`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingDecisionFacts {
+    /// The pending baseline card a waiting patch's apply is held on:
+    /// `(batch id, number of checks)`.
+    pub baseline: Option<(String, usize)>,
+    /// How many checks a waiting check batch holds, when its paused turn is
+    /// readable.
+    pub check_count: Option<usize>,
+    /// Every file of the waiting patch was already applied or rejected one by
+    /// one, so there is nothing left to review (spec 93).
+    pub patch_decided: bool,
+}
+
+/// The presentation for one durable pause link.
+///
+/// `None` for a link this build cannot classify, and for a patch whose files
+/// were all decided already: saying "Review the patch" with no card to review
+/// would send the user looking for nothing.
+pub fn pending_decision_presentation(
+    link: &crate::clarification::PendingDecision,
+    facts: &PendingDecisionFacts,
+) -> Option<TurnPendingDecision> {
+    use crate::clarification::PendingDecision;
+    let (kind, card_id) = match link {
+        PendingDecision::Question(question) => (
+            PendingDecisionKind::Question,
+            question.question_id().to_string(),
+        ),
+        PendingDecision::Approval(approval) => {
+            let id = approval.proposal_id.clone();
+            match approval.kind.as_str() {
+                "patch" if facts.patch_decided => return None,
+                "patch" => match &facts.baseline {
+                    Some((batch_id, _)) => (PendingDecisionKind::Baseline, batch_id.clone()),
+                    None => (PendingDecisionKind::Patch, id),
+                },
+                "checks" => (PendingDecisionKind::Checks, id),
+                "command" => (PendingDecisionKind::Command, id),
+                "round_budget" => (PendingDecisionKind::RoundBudget, id),
+                "plan" => (PendingDecisionKind::Plan, id),
+                "provider_fallback" => (PendingDecisionKind::Fallback, id),
+                "context_review" => (PendingDecisionKind::ContextReview, id),
+                "fetch" => (PendingDecisionKind::Fetch, id),
+                _ => return None,
+            }
+        }
+    };
+    let count_label = |count: Option<usize>, noun: &str| match count {
+        Some(1) => format!("Approve 1 {noun}"),
+        Some(count) if count > 1 => format!("Approve {count} {noun}s"),
+        _ => format!("Approve the {noun}s"),
+    };
+    let (label, status_label) = match kind {
+        PendingDecisionKind::Question => ("Damaian needs your answer".to_string(), "answer"),
+        PendingDecisionKind::Patch => ("Review the patch".to_string(), "review"),
+        PendingDecisionKind::Checks => (count_label(facts.check_count, "check"), "approval"),
+        PendingDecisionKind::Baseline => (
+            count_label(
+                facts.baseline.as_ref().map(|(_, count)| *count),
+                "baseline check",
+            ),
+            "approval",
+        ),
+        PendingDecisionKind::Command => ("Approve the command".to_string(), "approval"),
+        PendingDecisionKind::RoundBudget => ("Choose whether to continue".to_string(), "decision"),
+        PendingDecisionKind::Plan => ("Review the plan".to_string(), "review"),
+        PendingDecisionKind::Fallback => (
+            "Choose whether to use the fallback provider".to_string(),
+            "decision",
+        ),
+        PendingDecisionKind::ContextReview => ("Review the context".to_string(), "review"),
+        PendingDecisionKind::Fetch => ("Approve the web fetch".to_string(), "approval"),
+    };
+    Some(TurnPendingDecision {
+        kind,
+        label,
+        status_label: format!("Waiting for your {status_label}"),
+        card_id,
+    })
+}
+
+/// The decision a freshly offered baseline card puts its patch's task in.
+///
+/// The apply and resume routes return the card itself rather than a turn, so
+/// they report this; it is the value [`TaskControlService::pending_decision`]
+/// reads back for the same task while the card stays pending.
+pub fn baseline_pending_decision(batch: &crate::baseline::BaselineBatch) -> TurnPendingDecision {
+    let link =
+        crate::clarification::PendingDecision::Approval(crate::session::PendingApprovalRef {
+            kind: "patch".to_string(),
+            proposal_id: batch.patch_id.clone(),
+        });
+    let facts = PendingDecisionFacts {
+        baseline: Some((batch.id.clone(), batch.checks.len())),
+        ..PendingDecisionFacts::default()
+    };
+    pending_decision_presentation(&link, &facts)
+        .expect("a patch link with a baseline is classified")
 }
 
 /// One engine-labelled row under a stopped turn.
@@ -1268,6 +1429,7 @@ pub fn turn_presentation_with_outcome(
                 action: None,
             }),
             terminal_outcome,
+            pending_decision: None,
         };
     }
     match status {
@@ -1282,6 +1444,7 @@ pub fn turn_presentation_with_outcome(
                 action: None,
             }),
             terminal_outcome,
+            pending_decision: None,
         },
         TaskStatus::Incomplete => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
@@ -1289,6 +1452,7 @@ pub fn turn_presentation_with_outcome(
             show_task_control: true,
             stop_notice: None,
             terminal_outcome,
+            pending_decision: None,
         },
         TaskStatus::TaskBudgetExhausted
         | TaskStatus::TaskCompactionCannotFit
@@ -1309,6 +1473,7 @@ pub fn turn_presentation_with_outcome(
                     action: None,
                 }),
                 terminal_outcome,
+                pending_decision: None,
             }
         }
         TaskStatus::Failed if outcome.is_some_and(usage_unavailable) => {
@@ -1324,6 +1489,7 @@ pub fn turn_presentation_with_outcome(
                     action: None,
                 }),
                 terminal_outcome,
+                pending_decision: None,
             }
         }
         TaskStatus::ToolBudgetExhausted => TurnPresentation {
@@ -1346,6 +1512,7 @@ pub fn turn_presentation_with_outcome(
                 ),
             }),
             terminal_outcome,
+            pending_decision: None,
         },
         TaskStatus::TokenBudgetExhausted => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
@@ -1361,6 +1528,7 @@ pub fn turn_presentation_with_outcome(
                 action: None,
             }),
             terminal_outcome,
+            pending_decision: None,
         },
         TaskStatus::Failed | TaskStatus::UnknownExternalOutcome => TurnPresentation {
             indicator_state: TurnIndicatorState::Failed,
@@ -1368,6 +1536,7 @@ pub fn turn_presentation_with_outcome(
             show_task_control: false,
             stop_notice: None,
             terminal_outcome,
+            pending_decision: None,
         },
         TaskStatus::Interrupted => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
@@ -1380,6 +1549,7 @@ pub fn turn_presentation_with_outcome(
                 action: None,
             }),
             terminal_outcome,
+            pending_decision: None,
         },
         TaskStatus::Complete if model_incomplete => TurnPresentation {
             indicator_state: TurnIndicatorState::Incomplete,
@@ -1392,6 +1562,7 @@ pub fn turn_presentation_with_outcome(
                 action: None,
             }),
             terminal_outcome,
+            pending_decision: None,
         },
         TaskStatus::Complete => TurnPresentation {
             indicator_state: TurnIndicatorState::Complete,
@@ -1399,6 +1570,7 @@ pub fn turn_presentation_with_outcome(
             show_task_control: false,
             stop_notice: None,
             terminal_outcome,
+            pending_decision: None,
         },
         // Everything below is still in progress or waiting for the user. It is
         // explicitly not success, including `waiting_for_approval`, whose
@@ -1417,6 +1589,7 @@ pub fn turn_presentation_with_outcome(
             show_task_control: false,
             stop_notice: None,
             terminal_outcome,
+            pending_decision: None,
         },
     }
 }
@@ -1514,6 +1687,58 @@ impl<'a> TaskControlService<'a> {
             },
             outcome.as_ref(),
         ))
+    }
+
+    /// The decision `task_id` is waiting on, read from the durable pause link
+    /// and the artifacts behind it (spec 107 Task 1).
+    ///
+    /// A live turn result and `/api/session` both call this, so a reload
+    /// reports exactly what the live stream reported. `None` unless the status
+    /// is `waiting_for_approval`: a task that moved on has nothing pending even
+    /// if an older event recorded a link.
+    pub fn pending_decision(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        status: &TaskStatus,
+    ) -> Result<Option<TurnPendingDecision>> {
+        use crate::clarification::PendingDecision;
+        use crate::session::PendingApprovalRef;
+        if *status != TaskStatus::WaitingForApproval {
+            return Ok(None);
+        }
+        let Some(link) = self
+            .session_store
+            .pending_decision_for(session_id, task_id)?
+        else {
+            return Ok(None);
+        };
+        let data_dir = self.session_store.data_dir();
+        let mut facts = PendingDecisionFacts::default();
+        if let PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }) = &link {
+            match kind.as_str() {
+                "patch" => {
+                    facts.patch_decided = crate::recovery::patch_already_decided(
+                        self.session_store,
+                        &crate::edit::PatchStore::new(data_dir),
+                        session_id,
+                        task_id,
+                        proposal_id,
+                    )?;
+                    facts.baseline =
+                        crate::baseline::pending_baseline_for_patch(data_dir, proposal_id)?
+                            .filter(|batch| batch.task_id == task_id)
+                            .map(|batch| (batch.id, batch.checks.len()));
+                }
+                "checks" => {
+                    facts.check_count = crate::chat::PausedTurns::new(data_dir)
+                        .check_batch_proposals(proposal_id)
+                        .map(|checks| checks.len());
+                }
+                _ => {}
+            }
+        }
+        Ok(pending_decision_presentation(&link, &facts))
     }
 }
 
@@ -2149,5 +2374,138 @@ mod tests {
         assert!(prompt.contains("carries no plan"), "{prompt}");
         assert!(!prompt.contains("No plan step is open"), "{prompt}");
         assert!(prompt.contains("Run the checks."), "{prompt}");
+    }
+
+    /// Spec 107 Task 1: every durable pause link maps to one kind, an
+    /// engine-owned composer label and status label, and the id its card
+    /// answers through.
+    #[test]
+    fn every_pause_link_has_one_engine_owned_pending_decision() {
+        use crate::clarification::{PendingDecision, PendingQuestionRef};
+        use crate::session::PendingApprovalRef;
+        let approval = |kind: &str| {
+            PendingDecision::Approval(PendingApprovalRef {
+                kind: kind.to_string(),
+                proposal_id: format!("{kind}_1"),
+            })
+        };
+        let none = PendingDecisionFacts::default();
+        let cases = [
+            (
+                approval("patch"),
+                PendingDecisionKind::Patch,
+                "Review the patch",
+                "review",
+            ),
+            (
+                approval("checks"),
+                PendingDecisionKind::Checks,
+                "Approve the checks",
+                "approval",
+            ),
+            (
+                approval("command"),
+                PendingDecisionKind::Command,
+                "Approve the command",
+                "approval",
+            ),
+            (
+                approval("round_budget"),
+                PendingDecisionKind::RoundBudget,
+                "Choose whether to continue",
+                "decision",
+            ),
+            (
+                approval("plan"),
+                PendingDecisionKind::Plan,
+                "Review the plan",
+                "review",
+            ),
+            (
+                approval("provider_fallback"),
+                PendingDecisionKind::Fallback,
+                "Choose whether to use the fallback provider",
+                "decision",
+            ),
+            (
+                approval("context_review"),
+                PendingDecisionKind::ContextReview,
+                "Review the context",
+                "review",
+            ),
+            (
+                approval("fetch"),
+                PendingDecisionKind::Fetch,
+                "Approve the web fetch",
+                "approval",
+            ),
+        ];
+        for (link, kind, label, waiting_for) in cases {
+            let decision = pending_decision_presentation(&link, &none).expect("a known link");
+            let PendingDecision::Approval(approval) = &link else {
+                unreachable!()
+            };
+            assert_eq!(decision.kind, kind);
+            assert_eq!(decision.label, label);
+            assert_eq!(
+                decision.status_label,
+                format!("Waiting for your {waiting_for}")
+            );
+            assert_eq!(decision.card_id, approval.proposal_id);
+        }
+
+        let question = PendingDecision::Question(PendingQuestionRef::recorded("q_1".to_string()));
+        let decision = pending_decision_presentation(&question, &none).unwrap();
+        assert_eq!(decision.kind, PendingDecisionKind::Question);
+        assert_eq!(decision.label, "Damaian needs your answer");
+        assert_eq!(decision.status_label, "Waiting for your answer");
+        assert_eq!(decision.card_id, "q_1");
+
+        // A patch held on a baseline card is a baseline decision, answered
+        // through the batch, not the patch.
+        let held = PendingDecisionFacts {
+            baseline: Some(("baseline_abc".to_string(), 2)),
+            ..PendingDecisionFacts::default()
+        };
+        let decision = pending_decision_presentation(&approval("patch"), &held).unwrap();
+        assert_eq!(decision.kind, PendingDecisionKind::Baseline);
+        assert_eq!(decision.label, "Approve 2 baseline checks");
+        assert_eq!(decision.card_id, "baseline_abc");
+
+        let counted = PendingDecisionFacts {
+            check_count: Some(1),
+            ..PendingDecisionFacts::default()
+        };
+        let decision = pending_decision_presentation(&approval("checks"), &counted).unwrap();
+        assert_eq!(decision.label, "Approve 1 check");
+
+        // Nothing to review, and nothing this build can classify, is no
+        // decision rather than a guess.
+        let decided = PendingDecisionFacts {
+            patch_decided: true,
+            ..PendingDecisionFacts::default()
+        };
+        assert!(pending_decision_presentation(&approval("patch"), &decided).is_none());
+        assert!(pending_decision_presentation(&approval("telepathy"), &none).is_none());
+
+        let wire = serde_json::to_value(
+            pending_decision_presentation(&approval("round_budget"), &none).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["kind"], "round_budget");
+        assert_eq!(wire["cardId"], "round_budget_1");
+        assert_eq!(wire["statusLabel"], "Waiting for your decision");
+    }
+
+    #[test]
+    fn a_presentation_without_a_pending_decision_omits_the_field() {
+        let wire = serde_json::to_value(turn_presentation(
+            &TaskStatus::WaitingForApproval,
+            false,
+            false,
+            Some("task_1"),
+        ))
+        .unwrap();
+        assert!(wire.get("pendingDecision").is_none(), "{wire}");
     }
 }

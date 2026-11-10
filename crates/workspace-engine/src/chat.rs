@@ -80,7 +80,7 @@ use crate::task_budget::{
     TaskBudgetDimension, TaskBudgetPolicy, TaskBudgetReview, TaskExecutionBudget,
 };
 use crate::task_control::{
-    TaskControl, TurnPresentation, continuation_prompt, turn_presentation,
+    TaskControl, TaskControlService, TurnPresentation, continuation_prompt,
     turn_presentation_with_outcome,
 };
 use crate::task_outcomes::{
@@ -2185,7 +2185,7 @@ impl ChatOrchestrator {
             ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
         model_run.content = response.clone();
         let task_control = self.task_control_for(&task);
-        let turn_presentation = turn_presentation(&task.status, false, false, Some(&task.id));
+        let turn_presentation = self.turn_presentation_for(&task, false, false, None);
         Ok(ChatTurnResult {
             session,
             task,
@@ -2287,7 +2287,7 @@ impl ChatOrchestrator {
             );
             model_run.content = message.clone();
             let task_control = self.task_control_for(&task);
-            let turn_presentation = turn_presentation(&task.status, false, true, Some(&task.id));
+            let turn_presentation = self.turn_presentation_for(&task, false, true, None);
             return Ok(ChatTurnResult {
                 session: pending.session,
                 task,
@@ -4081,6 +4081,35 @@ impl ChatOrchestrator {
         TaskControl::for_session_with_outcome(Some(task), report.as_ref(), outcome.as_ref())
     }
 
+    /// The live turn's presentation, with the decision it is waiting on read
+    /// back from the durable pause link (spec 107 Task 1) — the same reader
+    /// `/api/session` uses, so a reload shows what the live stream showed.
+    ///
+    /// An unreadable link leaves `pendingDecision` absent rather than failing a
+    /// turn that has already settled; the indicator still says `pending`.
+    fn turn_presentation_for(
+        &self,
+        task: &Task,
+        model_incomplete: bool,
+        cancelled: bool,
+        outcome: Option<&crate::task_outcomes::TaskTerminalOutcome>,
+    ) -> TurnPresentation {
+        let mut presentation = turn_presentation_with_outcome(
+            &task.status,
+            model_incomplete,
+            cancelled,
+            Some(&task.id),
+            outcome,
+        );
+        if !cancelled {
+            presentation.pending_decision = TaskControlService::new(&self.session_store, None)
+                .pending_decision(&task.session_id, &task.id, &task.status)
+                .ok()
+                .flatten();
+        }
+        presentation
+    }
+
     /// Continues an incomplete task as an explicit engine-authorized action
     /// (spec 101 Task 3).
     ///
@@ -5111,7 +5140,7 @@ impl ChatOrchestrator {
             ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
         model_run.content = response.clone();
         let task_control = self.task_control_for(&task);
-        let turn_presentation = turn_presentation(&task.status, false, false, Some(&task.id));
+        let turn_presentation = self.turn_presentation_for(&task, false, false, None);
         Ok(ChatTurnResult {
             session,
             task,
@@ -12886,11 +12915,10 @@ impl ChatOrchestrator {
             })
         });
         let task_control = self.task_control_for(&task);
-        let turn_presentation = turn_presentation_with_outcome(
-            &task.status,
+        let turn_presentation = self.turn_presentation_for(
+            &task,
             final_run.incomplete,
             false,
-            Some(&task.id),
             task_terminal_outcome.as_ref(),
         );
         Ok(ChatTurnResult {
@@ -13022,7 +13050,7 @@ impl ChatOrchestrator {
             ModelRun::cancelled_before_start(&offer.refused_provider, &offer.refused_model);
         model_run.content = response.clone();
         let task_control = self.task_control_for(&task);
-        let turn_presentation = turn_presentation(&task.status, false, false, Some(&task.id));
+        let turn_presentation = self.turn_presentation_for(&task, false, false, None);
         Ok(ChatTurnResult {
             session,
             task,
@@ -13176,7 +13204,7 @@ impl ChatOrchestrator {
             ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
         model_run.content = response.clone();
         let task_control = self.task_control_for(&task);
-        let turn_presentation = turn_presentation(&task.status, false, false, Some(&task.id));
+        let turn_presentation = self.turn_presentation_for(&task, false, false, None);
         Ok(ChatTurnResult {
             session,
             task,
@@ -13285,7 +13313,7 @@ impl ChatOrchestrator {
             })
         });
         let task_control = self.task_control_for(&task);
-        let turn_presentation = turn_presentation(&task.status, false, true, Some(&task.id));
+        let turn_presentation = self.turn_presentation_for(&task, false, true, None);
         Ok(ChatTurnResult {
             session,
             task,

@@ -1,6 +1,6 @@
 # Spec 107 tasks
 
-**Started:** not yet — specified 2026-11-10
+**Started:** 2026-11-10
 
 Implementation plan for [`proposal.md`](proposal.md). The decisions and the code
 survey are in [`context.md`](context.md).
@@ -20,7 +20,7 @@ survey are in [`context.md`](context.md).
 
 | Task | State | Durable result |
 |---|---|---|
-| 1 · Engine: pending-decision presentation state | Not started | — |
+| 1 · Engine: pending-decision presentation state | Done 2026-11-10 | `TurnPresentation.pendingDecision { kind, label, statusLabel, cardId }` (`task_control.rs`: `PendingDecisionKind`, `TurnPendingDecision`, pure `pending_decision_presentation`, durable reader `TaskControlService::pending_decision`). One reader serves both paths: every live `ChatTurnResult` goes through `ChatOrchestrator::turn_presentation_for` (`chat.rs`), and `/api/session` fills each task's `turnPresentation.pendingDecision` from the same call (`lib.rs` `handle_session`), so reload equals live by construction. The reader takes the newest status event's pause link (`SessionStore::pending_decision_for`) and only for `waiting_for_approval`. `plan_json_with_waiting` adds `plan.waiting`, true exactly when the task has a `pendingDecision`. **Deviations from D1:** (1) an added `statusLabel` ("Waiting for your answer/review/approval/decision") so Task 3 renders the status line from engine text; (2) two more kinds than D1 lists, `context_review` and `fetch`, because the engine has those pauses too (the durable `provider_fallback` link presents as `fallback`); (3) `baseline` has no link of its own: it is a waiting `patch` whose apply is held on a pending baseline card (new `baseline::pending_baseline_for_patch`), and its `cardId` is the baseline batch id; `POST /api/apply-patch` and `/api/resume-baseline` add `pendingDecision` (`baseline_pending_decision`) whenever they return a card, because that card arrives outside a turn; (4) a patch whose files were all applied or rejected one by one (spec 93's `patch_already_decided`, now `pub(crate)`) and an unknown link kind yield no decision rather than a guess. **For Tasks 2–3:** a live `plan` SSE event always carries `waiting: false` (the plan is streamed before the pause is written), so the live UI takes the waiting state from the `done` event's `turnPresentation.pendingDecision`; check counts in the label come from the paused-turn file (`PausedTurns::check_batch_proposals`); a command's spec 102 R18 baseline card is a `checks` decision, not `baseline`. **Tests:** `workspace-engine --test task_control` 23/23 (new: plan review → command approval → settled turn has none, question, patch, round limit, plain answer, and the checks/fallback/context-review/fetch links, each asserting live equals reload); two new `task_control.rs` unit tests (every link's kind, labels, card id and wire spelling; no field when nothing is pending); desktop-shell: the baseline route test now asserts the patch → baseline → patch decision through `/api/session` and the apply response, and a new reload test covers `plan.waiting` and the field. **Checks run locally, all passing:** `cargo clippy -p workspace-engine -p desktop-shell --all-targets --locked -- -D warnings`; `scripts/quality-gate.sh fmt node lint typos deny`; `cargo nextest run -p workspace-engine` `--test task_control`, `--test round_budget --test clarification` (58), `--test repair_baseline --test verification_loop --test deferred_check_waiver --test plan_turn` (217), `--lib` filtered to task_control/baseline/recovery (17); `cargo nextest run -p desktop-shell` (289 passed, 20 ignored side-effect tests skipped). Desktop-shell tests bind local ports, which this agent's sandbox refuses, so they ran outside it. Workspace clippy and the full test suite are left to CI. |
 | 2 · Pending cards above the composer, and the composer line | Not started | — |
 | 3 · Status line and plan label while waiting | Not started | — |
 | 4 · Baseline progress and cancel | Not started | — |
@@ -31,11 +31,11 @@ survey are in [`context.md`](context.md).
 
 Requirements 1–4; context D1.
 
-- [ ] Add `pendingDecision { kind, label, cardId }` to the turn presentation
+- [x] Add `pendingDecision { kind, label, cardId }` to the turn presentation
       (`task_control.rs`) for every waiting kind, and to `/api/session`'s
       payload for reload (`lib.rs`).
-- [ ] `plan_json` carries `waiting: true` for a task waiting on a decision.
-- [ ] Tests: each pause kind yields its `pendingDecision`; a finished turn
+- [x] `plan_json` carries `waiting: true` for a task waiting on a decision.
+- [x] Tests: each pause kind yields its `pendingDecision`; a finished turn
       yields none; reload yields the same value as the live stream.
 
 Files: `crates/workspace-engine/src/task_control.rs`, `session.rs` (if needed),

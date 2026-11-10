@@ -544,7 +544,7 @@ pub enum ReattachedApproval {
 /// the reason, rather than being left waiting on something that no longer
 /// exists.
 /// Whether the log already holds a decision for every file of `patch_id`.
-fn patch_already_decided(
+pub(crate) fn patch_already_decided(
     store: &SessionStore,
     patches: &PatchStore,
     session_id: &str,
