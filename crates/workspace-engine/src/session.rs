@@ -746,12 +746,42 @@ pub struct DanglingAction {
     pub seq: u64,
 }
 
+/// A provider and model a task's model call ran on (spec 108 D5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskModel {
+    pub provider: String,
+    pub name: String,
+}
+
+/// The model one recorded call ran on, as [`SessionStore::record_task_usage`]
+/// writes it. Borrowed, because every caller already holds the strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallModel<'a> {
+    pub provider: &'a str,
+    pub name: &'a str,
+}
+
+impl<'a> CallModel<'a> {
+    pub fn new(provider: &'a str, name: &'a str) -> Self {
+        Self { provider, name }
+    }
+
+    /// The configured provider and model: the same pair `create_task` records,
+    /// and what a call on this configuration runs on. Read from the
+    /// configuration rather than the adapter's [`crate::ModelRun`], whose
+    /// provider is the adapter's own name (`mock` in tests).
+    pub fn configured(config: &'a crate::config::Config) -> Self {
+        Self::new(&config.model_provider, &config.model_name)
+    }
+}
+
 /// A task's total token usage, summed from its `task_usage_recorded` events.
 ///
 /// Not a stored record, for the same reason [`Task`] is not: the event log is
 /// where task facts live, so a crash mid-task loses at most the run that was
 /// in flight while every completed run stays correctly accounted.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -779,6 +809,13 @@ pub struct TaskUsage {
     /// How many contributing runs reported no split, so a surface can say what
     /// the rate covers rather than implying it covers everything.
     pub runs_without_cache_report: u32,
+    /// Every model the task's calls ran on, in the order first used (spec 108
+    /// D5). The model `task_created` recorded comes first: it is the model the
+    /// task started on. A mid-task switch adds the new one, because resumed
+    /// rounds run on the current configuration while the task record keeps
+    /// the model it was created with. A call recorded before the field
+    /// existed names no model and adds nothing.
+    pub models: Vec<TaskModel>,
 }
 
 /// The result of settling one typed terminal outcome (spec 103 Task 6).
@@ -2884,10 +2921,16 @@ impl SessionStore {
     /// free text from a model, a file, or a provider.
     ///
     /// Requirement 7 is satisfied by construction: every field written is a
-    /// number or an id.
+    /// number, an id, or the configured provider and model name.
+    ///
+    /// `model` is the provider and model the call ran on (spec 108 D5), so a
+    /// task whose model was switched mid-task records both. `None` only where
+    /// the call's model is not known, such as a call lost to a crash.
+    #[allow(clippy::too_many_arguments)] // Every argument is one field of the event being written.
     pub fn record_task_usage(
         &self,
         task: &Task,
+        model: Option<CallModel<'_>>,
         run_id: &str,
         marker_id: Option<&str>,
         usage: TokenUsage,
@@ -2897,6 +2940,7 @@ impl SessionStore {
         self.record_task_usage_for_task_id(
             &task.session_id,
             &task.id,
+            model,
             run_id,
             marker_id,
             usage,
@@ -2912,12 +2956,23 @@ impl SessionStore {
         &self,
         session_id: &str,
         task_id: &str,
+        model: Option<CallModel<'_>>,
         run_id: &str,
         marker_id: Option<&str>,
         usage: TokenUsage,
         reported_cost: Option<f64>,
         reason: Option<&str>,
     ) -> Result<()> {
+        // Absent rather than empty when the call's model is unknown, so the
+        // reader treats it exactly like an event written before spec 108.
+        let model = match model {
+            Some(model) => format!(
+                ",\"modelProvider\":\"{}\",\"modelName\":\"{}\"",
+                escape_json(model.provider),
+                escape_json(model.name)
+            ),
+            None => String::new(),
+        };
         let cost = match reported_cost {
             Some(cost) => format!("{cost}"),
             None => "null".to_string(),
@@ -2943,9 +2998,10 @@ impl SessionStore {
             session_id,
             "task_usage_recorded",
             &format!(
-                "{{\"taskId\":\"{}\",\"runId\":\"{}\"{},\"inputTokens\":{},\"outputTokens\":{}{},\"source\":\"{}\",\"reportedCost\":{}{}}}",
+                "{{\"taskId\":\"{}\",\"runId\":\"{}\"{}{},\"inputTokens\":{},\"outputTokens\":{}{},\"source\":\"{}\",\"reportedCost\":{}{}}}",
                 escape_json(task_id),
                 escape_json(run_id),
+                model,
                 marker,
                 usage.input_tokens,
                 usage.output_tokens,
@@ -2973,12 +3029,36 @@ impl SessionStore {
         };
         let mut totals: HashMap<String, TaskUsage> = HashMap::new();
         let mut every_run_costed: HashMap<String, bool> = HashMap::new();
+        // The model each task was created with: the first entry of its
+        // `models`, ahead of anything its calls recorded (spec 108 D5).
+        let mut starting_models: HashMap<String, TaskModel> = HashMap::new();
         for event in parsed_events(&content).0 {
+            if event.event_type == "task_created" {
+                if let (Some(id), Some(provider), Some(name)) = (
+                    event.text("id"),
+                    event.text("modelProvider"),
+                    event.text("modelName"),
+                ) && !name.is_empty()
+                {
+                    starting_models
+                        .entry(id)
+                        .or_insert(TaskModel { provider, name });
+                }
+                continue;
+            }
             if event.event_type != "task_usage_recorded" {
                 continue;
             }
             let Some(task_id) = event.text("taskId") else {
                 continue;
+            };
+            // Optional on read: a call recorded before spec 108 names no
+            // model, and is still counted.
+            let call_model = match (event.text("modelProvider"), event.text("modelName")) {
+                (Some(provider), Some(name)) if !name.is_empty() => {
+                    Some(TaskModel { provider, name })
+                }
+                _ => None,
             };
             let input = event
                 .payload
@@ -3022,7 +3102,13 @@ impl SessionStore {
                 cached_input_tokens: None,
                 cache_reported_input_tokens: 0,
                 runs_without_cache_report: 0,
+                models: Vec::new(),
             });
+            if let Some(model) = call_model
+                && !total.models.contains(&model)
+            {
+                total.models.push(model);
+            }
             total.input_tokens += input;
             total.output_tokens += output;
             total.run_count += 1;
@@ -3042,6 +3128,10 @@ impl SessionStore {
         for (task_id, total) in totals.iter_mut() {
             if !every_run_costed.get(task_id).copied().unwrap_or(false) {
                 total.reported_cost = None;
+            }
+            if let Some(starting) = starting_models.remove(task_id) {
+                total.models.retain(|model| *model != starting);
+                total.models.insert(0, starting);
             }
         }
         Ok(totals)
@@ -3077,7 +3167,13 @@ impl SessionStore {
                 cached_input_tokens: None,
                 cache_reported_input_tokens: 0,
                 runs_without_cache_report: 0,
+                models: Vec::new(),
             });
+            for model in &part.models {
+                if !sum.models.contains(model) {
+                    sum.models.push(model.clone());
+                }
+            }
             sum.input_tokens += part.input_tokens;
             sum.output_tokens += part.output_tokens;
             sum.run_count += part.run_count;

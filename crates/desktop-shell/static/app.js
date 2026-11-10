@@ -10552,6 +10552,14 @@ function cacheUsageTitle(usage) {
 // `reportedCost` is what the provider charged. It is absent for almost every
 // provider, and absent is rendered as nothing rather than as a zero, which
 // would read as "this turn was free".
+function turnModelsText(models) {
+  if (!Array.isArray(models)) return "";
+  const names = models
+    .map((model) => (typeof model?.name === "string" ? model.name : ""))
+    .filter((name) => name);
+  return [...new Set(names)].join(" → ");
+}
+
 function markMessageUsage(target, usage, durationMs = null) {
   if (!usage || typeof usage.inputTokens !== "number") return;
   if (target.body.nextElementSibling?.dataset?.state === "usage") return;
@@ -10567,6 +10575,10 @@ function markMessageUsage(target, usage, durationMs = null) {
     `${estimated ? "~" : ""}${total.toLocaleString()} tokens${estimated ? " (estimated)" : ""}`,
     calls,
   ];
+  // Every model the turn's calls ran on, the starting model first (spec 108
+  // D5): a model switched mid-task shows as both, not as the one it began on.
+  const models = turnModelsText(usage.models);
+  if (models) parts.push(models);
   if (typeof durationMs === "number") parts.push(formatElapsed(durationMs));
   // What the provider charged wins over what the user's own rates compute:
   // one is a fact about the bill, the other is arithmetic, and the label says

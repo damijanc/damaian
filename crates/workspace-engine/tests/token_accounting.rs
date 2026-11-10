@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, SecretScanner, SessionStore, Task, TaskStatus, TokenUsage, UsageSource,
-    classify_session,
+    AuditLog, CallModel, SecretScanner, SessionStore, Task, TaskModel, TaskStatus, TokenUsage,
+    UsageSource, classify_session,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -95,6 +95,7 @@ mod cached_tokens {
                 .store
                 .record_task_usage(
                     &fixture.task,
+                    None,
                     run,
                     None,
                     measured_with_cache(input, 10, cached),
@@ -126,6 +127,7 @@ mod cached_tokens {
             .store
             .record_task_usage(
                 &fixture.task,
+                None,
                 "modelrun_1",
                 None,
                 measured(100, 10),
@@ -166,6 +168,7 @@ mod cached_tokens {
             .store
             .record_task_usage(
                 &fixture.task,
+                None,
                 "modelrun_1",
                 None,
                 measured(5000, 10),
@@ -177,6 +180,7 @@ mod cached_tokens {
             .store
             .record_task_usage(
                 &fixture.task,
+                None,
                 "modelrun_2",
                 None,
                 measured_with_cache(1000, 10, 800),
@@ -209,6 +213,7 @@ mod cached_tokens {
             .store
             .record_task_usage(
                 &fixture.task,
+                None,
                 "modelrun_1",
                 None,
                 measured_with_cache(1000, 10, 0),
@@ -240,6 +245,7 @@ mod cached_tokens {
             .store
             .record_task_usage(
                 &fixture.task,
+                None,
                 "modelrun_1",
                 None,
                 measured(100, 10),
@@ -265,6 +271,7 @@ fn a_tasks_usage_is_the_sum_of_its_runs() {
         .store
         .record_task_usage(
             &fixture.task,
+            None,
             "modelrun_1",
             None,
             measured(100, 10),
@@ -276,6 +283,7 @@ fn a_tasks_usage_is_the_sum_of_its_runs() {
         .store
         .record_task_usage(
             &fixture.task,
+            None,
             "modelrun_2",
             None,
             measured(200, 20),
@@ -307,6 +315,7 @@ fn one_estimated_run_makes_the_whole_total_estimated() {
         .store
         .record_task_usage(
             &fixture.task,
+            None,
             "modelrun_1",
             None,
             measured(100, 10),
@@ -318,6 +327,7 @@ fn one_estimated_run_makes_the_whole_total_estimated() {
         .store
         .record_task_usage(
             &fixture.task,
+            None,
             "modelrun_2",
             None,
             TokenUsage::estimated(50, 5),
@@ -351,6 +361,7 @@ fn cost_is_summed_only_when_every_run_reported_one() {
         .store
         .record_task_usage(
             &fixture.task,
+            None,
             "modelrun_1",
             None,
             measured(1, 1),
@@ -362,6 +373,7 @@ fn cost_is_summed_only_when_every_run_reported_one() {
         .store
         .record_task_usage(
             &fixture.task,
+            None,
             "modelrun_2",
             None,
             measured(1, 1),
@@ -387,7 +399,15 @@ fn cost_is_reported_when_every_run_carried_one() {
     for (run, cost) in [("modelrun_1", 0.01), ("modelrun_2", 0.02)] {
         fixture
             .store
-            .record_task_usage(&fixture.task, run, None, measured(1, 1), Some(cost), None)
+            .record_task_usage(
+                &fixture.task,
+                None,
+                run,
+                None,
+                measured(1, 1),
+                Some(cost),
+                None,
+            )
             .unwrap();
     }
 
@@ -533,6 +553,7 @@ fn a_call_that_was_already_accounted_is_not_billed_again_at_recovery() {
         .store
         .record_task_usage(
             &task,
+            None,
             "modelrun_1",
             Some(&marker_id),
             measured(4200, 130),
@@ -584,6 +605,7 @@ fn a_usage_record_carries_no_prompt_or_file_content() {
         .store
         .record_task_usage(
             &fixture.task,
+            None,
             "modelrun_1",
             None,
             measured(100, 10),
@@ -604,4 +626,150 @@ fn a_usage_record_carries_no_prompt_or_file_content() {
     );
 
     fixture.cleanup();
+}
+
+/// Spec 108 D5: each call records the model it ran on, and a task's usage
+/// lists every model its calls used, the model it was created with first.
+mod models_used {
+    use super::*;
+
+    fn model(provider: &str, name: &str) -> TaskModel {
+        TaskModel {
+            provider: provider.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_mid_task_switch_records_both_models() {
+        let data_dir = temp_data_dir("models-switch");
+        let store = SessionStore::new(&data_dir);
+        let session = store.create_session("repo_1", "Switch").unwrap();
+        let task = store
+            .create_task(&session.id, "do the thing", "deepseek", "deepseek-v4-flash")
+            .unwrap();
+        for (run, name) in [
+            ("modelrun_1", "deepseek-v4-flash"),
+            ("modelrun_2", "deepseek-v4-pro"),
+            ("modelrun_3", "deepseek-v4-pro"),
+        ] {
+            store
+                .record_task_usage(
+                    &task,
+                    Some(CallModel::new("deepseek", name)),
+                    run,
+                    None,
+                    measured(10, 1),
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let usage = &store.read_task_usage(&session.id).unwrap()[&task.id];
+        assert_eq!(
+            usage.models,
+            vec![
+                model("deepseek", "deepseek-v4-flash"),
+                model("deepseek", "deepseek-v4-pro"),
+            ]
+        );
+        assert_eq!(usage.run_count, 3);
+        // The task record is not rewritten: it is the starting model.
+        let log = fs::read_to_string(
+            data_dir
+                .join("sessions")
+                .join(format!("{}.jsonl", session.id)),
+        )
+        .unwrap();
+        assert!(log.contains("\"modelName\":\"deepseek-v4-pro\""), "{log}");
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn the_starting_model_comes_first_even_when_no_call_used_it() {
+        let data_dir = temp_data_dir("models-start");
+        let store = SessionStore::new(&data_dir);
+        let session = store.create_session("repo_1", "Switch").unwrap();
+        let task = store
+            .create_task(&session.id, "do the thing", "deepseek", "deepseek-v4-flash")
+            .unwrap();
+        store
+            .record_task_usage(
+                &task,
+                Some(CallModel::new("deepseek", "deepseek-v4-pro")),
+                "modelrun_1",
+                None,
+                measured(10, 1),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let usage = &store.read_task_usage(&session.id).unwrap()[&task.id];
+        assert_eq!(
+            usage.models,
+            vec![
+                model("deepseek", "deepseek-v4-flash"),
+                model("deepseek", "deepseek-v4-pro"),
+            ]
+        );
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    /// A log written before spec 108: the usage event carries no model. It
+    /// still counts, and the task lists only the model it was created with.
+    #[test]
+    fn a_log_without_the_model_fields_still_reads() {
+        let data_dir = temp_data_dir("models-legacy");
+        fs::create_dir_all(data_dir.join("sessions")).unwrap();
+        fs::write(
+            data_dir.join("sessions").join("legacy.jsonl"),
+            concat!(
+                "{\"eventId\":\"e1\",\"seq\":1,\"timestampMs\":1,\"eventType\":\"session_created\",\"payload\":{\"id\":\"legacy\",\"repositoryId\":\"repo_1\",\"title\":\"Old\",\"createdAtMs\":1,\"updatedAtMs\":1,\"summary\":\"\"}}\n",
+                "{\"eventId\":\"e2\",\"seq\":2,\"timestampMs\":2,\"eventType\":\"task_created\",\"payload\":{\"id\":\"task_old\",\"sessionId\":\"legacy\",\"status\":\"created\",\"userPrompt\":\"hi\",\"modelProvider\":\"deepseek\",\"modelName\":\"deepseek-v4-flash\",\"createdAtMs\":2,\"completedAtMs\":null}}\n",
+                "{\"eventId\":\"e3\",\"seq\":3,\"timestampMs\":3,\"eventType\":\"task_usage_recorded\",\"payload\":{\"taskId\":\"task_old\",\"runId\":\"modelrun_1\",\"inputTokens\":100,\"outputTokens\":20,\"source\":\"measured\",\"reportedCost\":null}}\n",
+            ),
+        )
+        .unwrap();
+        let store = SessionStore::new(&data_dir);
+
+        let usage = &store.read_task_usage("legacy").unwrap()["task_old"];
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.run_count, 1);
+        assert_eq!(usage.models, vec![model("deepseek", "deepseek-v4-flash")]);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    /// A call whose model is unknown (one lost to a crash) writes no model
+    /// fields at all, so it reads exactly like a call from before spec 108.
+    #[test]
+    fn an_unknown_model_writes_no_model_fields() {
+        let fixture = fixture("models-unknown");
+        fixture
+            .store
+            .record_task_usage(
+                &fixture.task,
+                None,
+                "lost_marker_1",
+                Some("marker_1"),
+                TokenUsage::estimated(100, 0),
+                None,
+                Some("lost_to_crash"),
+            )
+            .unwrap();
+
+        assert!(
+            !fixture
+                .session_log()
+                .contains("\"runId\":\"lost_marker_1\",\"model")
+        );
+        let usage = &fixture
+            .store
+            .read_task_usage(&fixture.task.session_id)
+            .unwrap()[&fixture.task.id];
+        assert_eq!(usage.models, vec![model("mock", "m")]);
+        fixture.cleanup();
+    }
 }

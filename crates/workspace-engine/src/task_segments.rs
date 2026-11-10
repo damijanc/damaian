@@ -674,6 +674,7 @@ mod tests {
             cached_input_tokens: None,
             cache_reported_input_tokens: 0,
             runs_without_cache_report: 0,
+            models: Vec::new(),
         }
     }
 

@@ -343,8 +343,7 @@ fn durable_usage(
         .session_store
         .read_task_usage(session_id)
         .expect("the durable usage reads")
-        .get(task_id)
-        .copied()
+        .remove(task_id)
         .expect("the task recorded its usage")
 }
 

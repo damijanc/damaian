@@ -831,6 +831,7 @@ mod budget_usage_chain {
         store
             .record_task_usage(
                 &first,
+                None,
                 "run_1",
                 None,
                 usage(100, 10, UsageSource::Measured),
@@ -852,6 +853,7 @@ mod budget_usage_chain {
         store
             .record_task_usage(
                 &continued,
+                None,
                 "run_2",
                 None,
                 usage(50, 5, UsageSource::Estimated),
@@ -885,6 +887,7 @@ mod budget_usage_chain {
         store
             .record_task_usage(
                 &other,
+                None,
                 "run_1",
                 None,
                 usage(999, 99, UsageSource::Measured),

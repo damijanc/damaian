@@ -21,7 +21,7 @@ use crate::patch_engine::{
 use crate::path_policy::PathPolicy;
 use crate::protected_paths::{ensure_patch_paths_allowed, record_task_protected_paths_from_prompt};
 use crate::secret_scanner::SecretScanner;
-use crate::session::{PatchFileDecision, Session, SessionStore, Task, TaskStatus};
+use crate::session::{CallModel, PatchFileDecision, Session, SessionStore, Task, TaskStatus};
 use crate::verification::{VerificationEvent, fold_verification};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -738,6 +738,7 @@ impl EditOrchestrator {
         // mid-action. Spec 19 §5.4.
         self.session_store.record_task_usage(
             &task,
+            Some(CallModel::configured(&self.config)),
             &run.run_id,
             None,
             run.usage,
@@ -747,6 +748,7 @@ impl EditOrchestrator {
         for attempt in 0..run.retry_count {
             self.session_store.record_task_usage(
                 &task,
+                Some(CallModel::configured(&self.config)),
                 &format!("{}_retry{}", run.run_id, attempt + 1),
                 None,
                 TokenUsage::estimated(run.usage.input_tokens, 0),

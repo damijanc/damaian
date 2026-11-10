@@ -6782,15 +6782,20 @@ pub(crate) fn task_usage_json(
         }
         None => String::new(),
     };
+    // Every model the task's calls ran on, the starting model first (spec 108
+    // D5). Always present beside the token fields; empty only for a task whose
+    // log names no model at all.
+    let models = serde_json::to_string(&usage.models).unwrap_or_else(|_| "[]".to_string());
     format!(
         "{{\"inputTokens\":{},\"outputTokens\":{},\"usageSource\":\"{}\",\"runCount\":{}{}\
-         ,\"runsWithoutCacheReport\":{}{}{}}}",
+         ,\"runsWithoutCacheReport\":{},\"models\":{}{}{}}}",
         usage.input_tokens,
         usage.output_tokens,
         usage.source.as_str(),
         usage.run_count,
         cache,
         usage.runs_without_cache_report,
+        models,
         match usage.reported_cost {
             Some(cost) => format!(",\"reportedCost\":{cost}"),
             None => String::new(),
@@ -8379,6 +8384,73 @@ mod tests {
         assert_eq!(
             used,
             Some(("deepseek".to_string(), "deepseek-v4-pro".to_string()))
+        );
+    }
+
+    /// Spec 108 D5: the task record keeps the model it was created with, but
+    /// a resume on a switched model runs its calls on the new one. Both must
+    /// be recorded, the starting model first, and reach the payload.
+    #[test]
+    fn a_resume_on_a_switched_model_records_both_models() {
+        isolated_data_dir();
+        let repo = question_repo("resume-switched-model");
+        let paused = paused_on_question(&repo);
+        let starting = paused.task.model_name.clone();
+        assert_ne!(
+            starting, "deepseek-v4-pro",
+            "the fixture must start elsewhere"
+        );
+        let question_id = paused
+            .question_proposal
+            .as_ref()
+            .expect("the question pauses")
+            .question_id
+            .clone();
+        // What the answer route does: an engine on the model the request
+        // names, which here is not the one the task was created with.
+        let form = form_fields(&[
+            ("repo", repo.to_str().unwrap()),
+            ("model_provider", "deepseek"),
+            ("model", "deepseek-v4-pro"),
+        ]);
+        let switched = chat_engine(
+            super::config_for_repo_with_model_options(repo.to_str().unwrap(), &form)
+                .expect("config"),
+        );
+        assert_eq!(switched.config.model_name, "deepseek-v4-pro");
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = turn_sink(&cancel, &mut on_token, &mut on_progress);
+        let mut adapter = MockModelAdapter::new("Done.");
+        switched
+            .chat_orchestrator
+            .resume_after_answer(&question_id, "The CLI", Some(0), &mut adapter, &mut sink)
+            .expect("the resume runs");
+
+        let engine = engine_for_question_test(&repo);
+        let usage = engine
+            .session_store
+            .read_task_usage(&paused.session.id)
+            .expect("usage reads");
+        let total = usage.get(&paused.task.id).expect("the task recorded usage");
+        let names: Vec<&str> = total
+            .models
+            .iter()
+            .map(|model| model.name.as_str())
+            .collect();
+        assert_eq!(names, vec![starting.as_str(), "deepseek-v4-pro"]);
+        assert_eq!(total.models[1].provider, "deepseek");
+        // The task record itself is unchanged: it is the starting model.
+        assert_eq!(paused.task.model_name, starting);
+
+        let json = task_usage_json(Some(total), None);
+        assert!(
+            json.contains(&format!(
+                "\"models\":[{{\"provider\":\"{}\",\"name\":\"{}\"}},{{\"provider\":\"deepseek\",\"name\":\"deepseek-v4-pro\"}}]",
+                paused.task.model_provider, starting
+            )),
+            "{json}"
         );
     }
 
@@ -10870,6 +10942,7 @@ mod tests {
             .record_task_usage_for_task_id(
                 &session.id,
                 &interrupted.id,
+                None,
                 "lost_marker_inspection",
                 Some("marker_inspection"),
                 workspace_engine::TokenUsage::estimated(4820, 0),
@@ -11073,6 +11146,7 @@ mod tests {
             .record_task_usage_for_task_id(
                 &session.id,
                 &task.id,
+                None,
                 "run_command_activity",
                 None,
                 workspace_engine::TokenUsage::estimated(5200, 640),
@@ -14203,6 +14277,7 @@ mod tests {
                 cached_input_tokens: None,
                 cache_reported_input_tokens: 0,
                 runs_without_cache_report: 1,
+                models: Vec::new(),
             },
         )]);
 
@@ -14231,6 +14306,55 @@ mod tests {
         // "we cannot see it".
         assert!(!json.contains("cachedInputTokens"), "{json}");
         assert!(!json.contains("cacheHitRate"), "{json}");
+        // Spec 108 D5: always present beside the tokens, empty here because
+        // this usage names no model.
+        assert!(json.contains("\"models\":[]"), "{json}");
+    }
+
+    /// Spec 108 D5: a reloaded turn lists every model its calls ran on, the
+    /// starting model first.
+    #[test]
+    fn the_session_payload_carries_every_model_a_task_used() {
+        let statuses = HashMap::from([("task_1".to_string(), "complete".to_string())]);
+        let model = |provider: &str, name: &str| workspace_engine::TaskModel {
+            provider: provider.to_string(),
+            name: name.to_string(),
+        };
+        let usage = HashMap::from([(
+            "task_1".to_string(),
+            TaskUsage {
+                input_tokens: 10,
+                output_tokens: 2,
+                source: UsageSource::Measured,
+                reported_cost: None,
+                run_count: 2,
+                cached_input_tokens: None,
+                cache_reported_input_tokens: 0,
+                runs_without_cache_report: 2,
+                models: vec![
+                    model("deepseek", "deepseek-v4-flash"),
+                    model("deepseek", "deepseek-v4-pro"),
+                ],
+            },
+        )]);
+
+        let json = task_states_json(
+            &statuses,
+            &usage,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &HashMap::new(),
+            &Config::default(),
+        );
+
+        assert!(
+            json.contains(
+                "\"models\":[{\"provider\":\"deepseek\",\"name\":\"deepseek-v4-flash\"},{\"provider\":\"deepseek\",\"name\":\"deepseek-v4-pro\"}]"
+            ),
+            "{json}"
+        );
     }
 
     /// Spec 49 task 6: what the client is told about the cache.
@@ -14248,6 +14372,7 @@ mod tests {
                 cached_input_tokens: cached,
                 cache_reported_input_tokens: reported_input,
                 runs_without_cache_report: silent_runs,
+                models: Vec::new(),
             }
         }
 

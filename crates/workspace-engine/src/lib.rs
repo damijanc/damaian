@@ -263,11 +263,11 @@ pub use request_preparation::{
 };
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
-    ARCHIVE_RUNNING_WORKER_REFUSAL, ActionMarker, ArchivedFilter, ChatMessage,
+    ARCHIVE_RUNNING_WORKER_REFUSAL, ActionMarker, ArchivedFilter, CallModel, ChatMessage,
     ConsumedWorkerReturn, ContextPin, ContinuedTask, DanglingAction, ExportFormat,
     PatchFileDecision, PendingApprovalRef, PlanApproval, SearchOptions, Session, SessionSearchHit,
-    SessionSearchResult, SessionStore, Task, TaskStatus, TaskTerminalSettlement, TaskUsage,
-    TurnNotes, WorkerRecord, WorkerReturn, validate_plan_approval,
+    SessionSearchResult, SessionStore, Task, TaskModel, TaskStatus, TaskTerminalSettlement,
+    TaskUsage, TurnNotes, WorkerRecord, WorkerReturn, validate_plan_approval,
 };
 pub use stagnation::{
     RepairStall, RepairStallReason, detect_repair_stall, proposed_patch_digest, repair_state_entry,

@@ -1606,6 +1606,7 @@ mod tests {
             .record_task_usage_for_task_id(
                 &session.id,
                 &task.id,
+                None,
                 "lost_marker_1",
                 Some("marker_1"),
                 workspace_engine::TokenUsage::estimated(1200, 0),

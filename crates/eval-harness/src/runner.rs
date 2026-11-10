@@ -1290,7 +1290,10 @@ fn drive(
     // the status match below. A resumed turn re-reads the same task, so its
     // total already covers the rounds before the approval and wins when there
     // is one.
-    let mut recorded_usage = outcome.as_ref().ok().and_then(|result| result.usage);
+    let mut recorded_usage = outcome
+        .as_ref()
+        .ok()
+        .and_then(|result| result.usage.clone());
 
     // A scenario that scripts an approval decision resumes the turn with it, so
     // the denied path is exercised end to end rather than stopping at the
@@ -1572,9 +1575,9 @@ fn drive(
     }
 
     if let Ok(result) = &outcome
-        && let Some(usage) = result.usage
+        && let Some(usage) = &result.usage
     {
-        recorded_usage = Some(usage);
+        recorded_usage = Some(usage.clone());
     }
     let duration_ms = now_millis().saturating_sub(started_at_ms);
 
@@ -2026,17 +2029,26 @@ fn drive(
     // rounds before the approval; the resumed result therefore wins when there
     // is one.
     run_record.tokens = Tokens {
-        input: recorded_usage.map(|usage| usage.input_tokens).unwrap_or(0),
-        output: recorded_usage.map(|usage| usage.output_tokens).unwrap_or(0),
+        input: recorded_usage
+            .as_ref()
+            .map(|usage| usage.input_tokens)
+            .unwrap_or(0),
+        output: recorded_usage
+            .as_ref()
+            .map(|usage| usage.output_tokens)
+            .unwrap_or(0),
         measured: recorded_usage
+            .as_ref()
             .map(|usage| usage.source == UsageSource::Measured)
             .unwrap_or(false),
     };
-    run_record.cost = recorded_usage.and_then(|usage| usage.reported_cost);
+    run_record.cost = recorded_usage
+        .as_ref()
+        .and_then(|usage| usage.reported_cost);
     // Spec 49 §5.6: read through the same `TaskUsage`, not a second
     // aggregation. `cached_input_tokens` is `None` when no run in the task
     // reported a split, which `and_then` carries straight into `record.cache`.
-    run_record.cache = recorded_usage.and_then(|usage| {
+    run_record.cache = recorded_usage.as_ref().and_then(|usage| {
         usage.cached_input_tokens.map(|cached| CacheUsage {
             cached_input_tokens: cached,
             cache_reported_input_tokens: usage.cache_reported_input_tokens,

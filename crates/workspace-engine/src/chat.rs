@@ -71,7 +71,7 @@ use crate::request_preparation::{
 };
 use crate::secret_scanner::SecretScanner;
 use crate::session::{
-    ChatMessage, PendingApprovalRef, Session, SessionStore, Task, TaskStatus, TaskUsage,
+    CallModel, ChatMessage, PendingApprovalRef, Session, SessionStore, Task, TaskStatus, TaskUsage,
     validate_plan_approval,
 };
 use crate::stagnation::{RepairStall, detect_repair_stall, repair_state_entry};
@@ -2172,7 +2172,7 @@ impl ChatOrchestrator {
             .session_store
             .read_task_usage(&session.id)
             .ok()
-            .and_then(|usage| usage.get(&task.id).copied());
+            .and_then(|usage| usage.get(&task.id).cloned());
         let estimated_cost = usage.as_ref().and_then(|usage| {
             self.config.estimated_cost(&TokenUsage {
                 input_tokens: usage.input_tokens,
@@ -2272,7 +2272,7 @@ impl ChatOrchestrator {
                 .session_store
                 .read_task_usage(&pending.session.id)
                 .ok()
-                .and_then(|usage| usage.get(&task.id).copied());
+                .and_then(|usage| usage.get(&task.id).cloned());
             let estimated_cost = usage.as_ref().and_then(|usage| {
                 self.config.estimated_cost(&TokenUsage {
                     input_tokens: usage.input_tokens,
@@ -5136,7 +5136,7 @@ impl ChatOrchestrator {
             .session_store
             .read_task_usage(&session.id)
             .ok()
-            .and_then(|usage| usage.get(&task.id).copied());
+            .and_then(|usage| usage.get(&task.id).cloned());
         let estimated_cost = usage.as_ref().and_then(|usage| {
             self.config.estimated_cost(&TokenUsage {
                 input_tokens: usage.input_tokens,
@@ -7927,6 +7927,7 @@ impl ChatOrchestrator {
             let _ = self.session_store.record_task_usage_for_task_id(
                 session_id,
                 &format!("compaction_{}", summary.id),
+                Some(CallModel::configured(&self.config)),
                 &run.run_id,
                 None,
                 run.usage,
@@ -9518,6 +9519,7 @@ impl ChatOrchestrator {
                 if !recorded_any_usage {
                     self.session_store.record_task_usage(
                         &task,
+                        Some(CallModel::configured(&self.config)),
                         &cancelled_run.run_id,
                         None,
                         TokenUsage::measured_zero(),
@@ -10246,6 +10248,7 @@ impl ChatOrchestrator {
                     // and what came back before the stop.
                     self.session_store.record_task_usage(
                         &task,
+                        Some(CallModel::configured(&self.config)),
                         &cancelled_run.run_id,
                         Some(&model_marker_id),
                         TokenUsage::estimated(
@@ -10289,6 +10292,7 @@ impl ChatOrchestrator {
                     };
                     self.session_store.record_task_usage(
                         &task,
+                        Some(CallModel::configured(&self.config)),
                         &create_id("modelrun"),
                         Some(&model_marker_id),
                         usage,
@@ -10392,6 +10396,7 @@ impl ChatOrchestrator {
 
             self.session_store.record_task_usage(
                 &task,
+                Some(CallModel::configured(&self.config)),
                 &model_run.run_id,
                 Some(&model_marker_id),
                 model_run.usage,
@@ -10406,6 +10411,7 @@ impl ChatOrchestrator {
             for attempt in 0..model_run.retry_count {
                 self.session_store.record_task_usage(
                     &task,
+                    Some(CallModel::configured(&self.config)),
                     &format!("{}_retry{}", model_run.run_id, attempt + 1),
                     Some(&model_marker_id),
                     TokenUsage::estimated(model_run.usage.input_tokens, 0),
@@ -12934,7 +12940,7 @@ impl ChatOrchestrator {
             .session_store
             .read_task_usage(&session.id)
             .ok()
-            .and_then(|usage| usage.get(&task.id).copied());
+            .and_then(|usage| usage.get(&task.id).cloned());
         let estimated_cost = usage.as_ref().and_then(|usage| {
             self.config.estimated_cost(&TokenUsage {
                 input_tokens: usage.input_tokens,
@@ -13066,7 +13072,7 @@ impl ChatOrchestrator {
             .session_store
             .read_task_usage(&session.id)
             .ok()
-            .and_then(|usage| usage.get(&task.id).copied());
+            .and_then(|usage| usage.get(&task.id).cloned());
         let estimated_cost = usage.as_ref().and_then(|usage| {
             self.config.estimated_cost(&TokenUsage {
                 input_tokens: usage.input_tokens,
@@ -13220,7 +13226,7 @@ impl ChatOrchestrator {
             .session_store
             .read_task_usage(&session.id)
             .ok()
-            .and_then(|usage| usage.get(&task.id).copied());
+            .and_then(|usage| usage.get(&task.id).cloned());
         let estimated_cost = usage.as_ref().and_then(|usage| {
             self.config.estimated_cost(&TokenUsage {
                 input_tokens: usage.input_tokens,
@@ -13332,7 +13338,7 @@ impl ChatOrchestrator {
             .session_store
             .read_task_usage(&session.id)
             .ok()
-            .and_then(|usage| usage.get(&task.id).copied());
+            .and_then(|usage| usage.get(&task.id).cloned());
         let estimated_cost = usage.as_ref().and_then(|usage| {
             self.config.estimated_cost(&TokenUsage {
                 input_tokens: usage.input_tokens,

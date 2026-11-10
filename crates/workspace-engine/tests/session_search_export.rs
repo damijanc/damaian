@@ -202,6 +202,7 @@ fn export_markdown_redacts_with_a_count_and_includes_tasks_and_plans() {
     store
         .record_task_usage(
             &task,
+            None,
             "run_1",
             None,
             TokenUsage {

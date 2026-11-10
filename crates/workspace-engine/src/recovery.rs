@@ -348,6 +348,8 @@ fn account_for_lost_model_calls(
         store.record_task_usage_for_task_id(
             session_id,
             &action.task_id,
+            // The marker does not record which model the lost call went to.
+            None,
             &format!("lost_{}", action.marker_id),
             Some(&action.marker_id),
             TokenUsage::estimated(estimate, 0),
