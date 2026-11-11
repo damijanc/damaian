@@ -764,7 +764,19 @@ The choice is remembered in the app for each working folder and sent with each r
 
 ### While a turn runs, and how it ended
 
-Progress is shown inside the reply, not in the header. While a turn runs, a line in the assistant's message shows what it is doing ("Waiting for model", "Thinking · 1.2k chars" while a thinking-mode model such as DeepSeek reasons before it answers, a tool's own label, "Streaming", "round 2/8", "round 2/8 · 12 reads" when the turn has also taken read-only rounds, "· notes 2.1k" when it has kept notes, or "Generating patch" for a file-change request), how long it has been running, and **Stop** when that kind of turn can be stopped. A chat message you send can be stopped. A turn that resumes after you approve a command, a plan or a fallback offer, and a patch being generated, show the line without Stop. The Thinking count is how much the model has reasoned so far, not what: the reasoning itself is never shown. When a turn finishes normally, the line disappears.
+Progress is shown inside the reply, not in the header. While a turn runs, a status line in the assistant's message names what it is doing right now: "Waiting for the model", "Thinking · 1.2k chars" while a thinking-mode model such as DeepSeek reasons before it answers, "Reading src/config.rs 1200–1600" for a ranged read, "Running `cargo test --test permission_profiles`" while a command runs (its latest output line underneath), a tool's own label, "Streaming", or "Generating patch" for a file-change request. Beside it come the round counts ("round 2/8", "round 2/8 · 12 reads" when the turn has also taken read-only rounds, "· notes 2.1k" when it has kept notes) and **Stop** when that kind of turn can be stopped. The line carries two clocks: the first is how long the *current* activity has run, and restarts when the activity changes; "turn 3m 4s" after it is the whole turn so far, shown once the turn has moved past its first activity. So "Waiting for the model 12s · turn 11m" is one 12-second model call in a long turn, not a 12-minute call. A chat message you send can be stopped. A turn that resumes after you approve a command, a plan or a fallback offer, and a patch being generated, show the line without Stop. The Thinking count is how much the model has reasoned so far, not what: the reasoning itself is never shown.
+
+The status line does not go blank while the turn is alive. When the turn stops to wait for you, the line stays and says so — "Waiting for your answer", "Waiting for your review", "Waiting for your approval" or "Waiting for your decision" — with a clock for how long it has waited, and no Stop button (there is nothing running to stop). While a pre-apply baseline you approved is running, it reads "Running baseline: cargo test (repository root)" with that check's clock, and goes back to waiting when the baseline ends. The line is removed only when the turn has ended, or when the next turn starts.
+
+#### When Damaian is waiting for you
+
+A decision the turn is waiting on — a question, a patch to review, checks or a baseline to approve, a command, a plan, the round-limit offer, a provider fallback, a context review or a web fetch — appears in one place: **at the end of the conversation, directly above the prompt box**, scrolled into view when it arrives. The assistant's message keeps its text and a one-line pointer such as "Review the patch — the card is below." A card you have answered stays where it is in the history.
+
+While a decision is pending, a line above the prompt box names it — "Damaian needs your answer", "Review the patch", "Approve 2 checks", "Approve 1 baseline check", "Approve the command", "Review the plan", "Choose whether to continue", "Choose whether to use the fallback provider" — with **Show**, which scrolls to the card and focuses it (**Answer** for a question, which focuses its answer field). The line is hidden while a turn is running, and it is not shown in a worker's session, whose composer belongs to the worker.
+
+While a **question** is pending, the prompt box and **Send** are disabled and read "Answer the question above": the card's own field is the only place to answer it, so a message typed in the prompt box is never mistaken for an answer. Any other pending decision leaves the prompt box usable.
+
+The plan panel tells the same story: the step whose task is waiting reads **waiting for you**, not **running**, live and after a reload. A reload puts the pending card back at the end of the conversation and restores the waiting status line under its message. Within one app run, a reloaded patch, check or command decision may have no card to move; the line above the prompt box still names it, without **Show**.
 
 A round in which the assistant only reads — `read_file`, `list_directory`, `search_content`, `search_codebase`, `read_git_status`, `read_git_diff`, `list_worktrees` or `read_git_log`, with no repeated call — is a *read-only round*. It is charged to `agent_max_exploration_rounds` (24 by default) instead of `agent_max_tool_rounds`. A round that runs a command, proposes a change, asks a question or repeats an earlier read is an *action round* and is charged as before. Spending the read-only allowance never pauses a turn by itself: later reads are simply charged as action rounds. Set `agent_max_exploration_rounds=0` to charge every round the way Damaian did before this allowance existed.
 
@@ -778,7 +790,14 @@ A turn that has notes shows a collapsed **Notes** disclosure under its answer; w
 
 When older rounds are dropped, the request also names the calls that left the window and, once the window is full, warns which round leaves next. Both are for the assistant: they tell it what it has already looked at so it does not re-read it. A read it makes anyway still counts as a repeat, exactly as before.
 
-A turn that reaches its action-round limit (`agent_max_tool_rounds`, 16 by default) while the assistant still wants a tool does not stop: it pauses, and the reply names the action rounds it used against that limit and how many read-only rounds it had used. Select **Continue — N more** to give the same turn another segment of action rounds, keeping every message, tool result and plan step it had, or **Answer now** to have the assistant answer with what it has, with no tools. The pause comes before that final call, so nothing is spent until you choose. A turn can be continued up to 64 action rounds in total; at that cap only **Answer now** is offered. The pause is saved, so after a restart the same offer is still waiting. A worker that approved a [task budget](#worker-sessions) crosses this checkpoint on its own instead. With a token cap set, the turn continues on its own instead of pausing (see [Capping What One Turn May Spend](#capping-what-one-turn-may-spend)).
+A turn reaches a checkpoint at its action-round limit (`agent_max_tool_rounds`, 16 by default) when the assistant still wants a tool. What happens there depends on the mode:
+
+- **Code mode carries on while it is making progress.** An ordinary Code-mode turn crosses the checkpoint on its own, the way a worker with an approved budget does, as long as the task's work has moved on since the last checkpoint (its plan, the evidence on its steps, its tool results or its notes changed) and it is still under the default task budget: the `worker_task_budget_*` totals, 96 action rounds, 144 read-only rounds, 8,000,000 input and 512,000 output tokens by default. Those can be lowered, never raised, by a repository or a profile. Each crossing is recorded as `ordinary_continuation` in the audit log. When the task stops making progress, reaches one of those totals, or its usage cannot be read, the turn pauses on the card below instead, and the audit log records `ordinary_continuation_declined` with the reason.
+- **Ask, Plan and Review pause at every checkpoint**, as does a worker without an approved task budget.
+
+The pause names the action rounds the turn used against the limit and how many read-only rounds it had used. Select **Continue — N more** to give the same turn another segment of action rounds, keeping every message, tool result and plan step it had, or **Answer now** to have the assistant answer with what it has, with no tools. The pause comes before that final call, so nothing is spent until you choose. **Continue** can extend a stretch of the turn up to 64 action rounds; at that cap only **Answer now** is offered. The pause is saved, so after a restart the same offer is still waiting. A worker that approved a [task budget](#worker-sessions) crosses the checkpoint on its own under that budget. With a token cap set (`agent_max_task_tokens`), the turn follows that cap instead (see [Capping What One Turn May Spend](#capping-what-one-turn-may-spend)).
+
+**The worker suggestion.** With Worker sessions on, an ordinary Code-mode task that is about to change code suggests a worker once: on its plan review, or on its first patch when it has no plan, a row reads **This task changes code** with **Run in a worker** and **Continue here**. **Run in a worker** opens the New worker dialog with your request (and, on a plan, the plan as the card shows it); see [Reviewing a plan before it runs](#reviewing-a-plan-before-it-runs). On a patch, the patch card stays here: reject it if the worker is to make the change instead. **Continue here** dismisses the row, and the task carries on in this checkout as described above. The row is not shown for a planning- or documentation-only task, inside a worker, or a second time for the same task.
 
 A turn that ends any other way leaves a mark on its message: **Stopped by you**, **Tool budget exhausted** (after **Answer now**; the reply names the action and read-only rounds it had used, and **Ask again** starts a new turn from the stopped task's own request, carrying its plan forward), **Token budget exhausted**, **Stopped before finishing**, or the error itself when the request failed. The stop and budget marks are still there when you reopen the session. **Stopped before finishing** and a failure's error are shown only in the window where the turn ran; after a reload, a stopped turn reads **Stopped by you** and a failed one has no mark.
 
@@ -911,10 +930,13 @@ not obeyed.
 If the request is ambiguous and guessing would spend the turn on the wrong
 reading, the assistant can pause and ask you one short question — "Did you mean
 the CLI or the shell?" — instead of ending the turn. The question appears as a
-card in the assistant's message with two to four suggested answers, plus a
-free-text field when the question allows one. Answer by clicking an option or
-typing a reply and selecting **Send**; the turn then continues with your answer,
-carrying everything it had already read.
+card with two to four suggested answers, plus a
+free-text field when the question allows one. The card appears at the end of
+the conversation, above the prompt box, and the prompt box is disabled until you
+answer (see [When Damaian is waiting for you](#when-damaian-is-waiting-for-you)).
+Answer by clicking an option or typing a reply in the card and selecting
+**Send**; the turn then continues with your answer, carrying everything it had
+already read.
 
 - **Answering a question authorises nothing.** It is not an approval. A command,
   a patch or a configuration change that follows still asks for its own approval
@@ -1055,6 +1077,17 @@ baselined before that patch applies. If a baseline command itself changes a
 tracked file, the reviewed patch becomes stale and needs a fresh preview rather
 than applying over bytes you did not see.
 
+A baseline can take minutes (a workspace `cargo test`), so once you run it the
+card shows which check is running ("Running baseline: cargo test (crates/a)
+(1 of 2)"), how long it has run, its latest output line, and **Cancel**. The
+status line says the same. **Cancel** stops the running check and records it,
+and every approved check not yet started, as a **declined** baseline — exactly
+what skipping the baselines records — and writes nothing. The patch is left
+undecided: **Apply** or **Reject** it as you choose, as after skipping. A
+failure in a check whose baseline was cancelled is later reported as unknown
+provenance. A baseline that needs no approval runs as part of **Apply** and
+cannot be cancelled from the card.
+
 **What a failure is attributed to.** The report keeps six outcomes apart rather
 than calling everything failed:
 
@@ -1123,8 +1156,15 @@ does not offer this action.
 larger task and its plan still has open steps, the same reply continues: the
 report comes first, then the assistant carries on with the next step, which
 usually ends in the next patch preview. This repeats until the plan is done. A
-failed verification does not continue; repair and the report handle it. A
-change made without a plan ends with the report, as before.
+failed verification does not continue; repair and the report handle it.
+
+A Code-mode chat task with no plan of its own goes on the same way: after a
+verified patch the assistant carries on with the task instead of treating that
+patch as the end. Each of its patches runs only the owning root's checks (the
+crate's `cargo test`, not the workspace's), and the full completion set —
+owning and enclosing roots — runs once, when the assistant answers. A single
+patch proposed with the one-shot patch flow (no tools) still ends with the
+report and its full completion set, as before.
 
 **"No checks were available" is not "checks passed".** A project with no
 detected checks, or a documentation-only change, says so in its own words. So
@@ -1257,7 +1297,10 @@ Short requests get no plan. A question answered by reading one file is a single
 step, and gets no panel.
 
 Exactly one step runs at a time. If the panel ever shows two as running, it
-says so in red: that is a fault in Damaian, not something you caused.
+says so in red: that is a fault in Damaian, not something you caused. While the
+task is waiting on a decision from you — a question, a patch, a check card, a
+plan review — the open step reads **waiting for you** instead of **running**;
+it reads **not finished** once the turn has ended with the step still open.
 
 ### What each step says
 
@@ -1398,7 +1441,19 @@ You can:
 - **Retitle** a step by typing in its box.
 - **Delete** a step with **×**.
 - **Approve** the plan as it stands, or **Decline** it.
-- **Run in a worker** (with Worker sessions on, outside a worker): opens the New worker dialog with your request and the plan as the card shows it, edits included. Once the worker starts, this turn ends here with nothing changed, its steps are marked skipped, and the card links to the worker. Handing over is not an approval: the worker puts the plan up for review again before its first change, and that is where you approve it. Cancel the dialog and the card is still waiting for an answer.
+
+When the plan changes code and Worker sessions are on, the card also carries
+the one-time [worker suggestion](#while-a-turn-runs-and-how-it-ended), **This
+task changes code**, with **Run in a worker** and **Continue here**. It is not
+offered for a plan that only plans or edits documentation, inside a worker, or
+again once the task has been offered it. **Run in a worker** opens the New
+worker dialog with your request and the plan as the card shows it, edits
+included. Once the worker starts, this turn ends here with nothing changed, its
+steps are marked skipped, and the card links to the worker. Handing over is not
+an approval: the worker puts the plan up for review again before its first
+change, and that is where you approve it. Cancel the dialog and the card is
+still waiting for an answer. **Continue here** removes the row and leaves
+**Approve** and **Decline**.
 
 **Required checks on the card.** A step may carry a **required check** — a
 command the plan says must pass before the task can complete, such as `cargo
@@ -1954,7 +2009,7 @@ A **worker** is a session that runs on its own: it gets a prompt, works in a new
 
 **Working in another branch or worktree.** A session's edits and commands always apply to its own checkout. It can read another worktree of the repository, but it cannot change one: an edit to a path inside a worktree is refused. With Worker sessions on, asking for work "on a new branch" or "in a separate worktree" makes the assistant recommend a `worker-prompt` handoff instead of creating a worktree itself, and the worker does the work in a worktree of its own. You can still choose **Work here instead**: the work then happens in the current checkout, and no worktree is created or selected. With them off, the assistant tells you the setting is needed or asks whether to make the change in your checkout.
 
-**Starting a worker.** A `worker-prompt` block in an assistant's answer gets a **Start worker** button once the answer has finished, and a secondary **Work here instead** button. No other block gets either. Clicking **Start worker** opens the New worker dialog with the block's text, which you can still edit. Confirm with **Start worker**. **Work here instead** sends the block to the current conversation as an ordinary turn, with an instruction that you chose this checkout rather than a worker; it does not create, switch to, or write in another worktree. The session holding the block becomes the worker's parent: the block then shows "Started *‹title›* →", and the conversation gets a one-line "Spawned worker" link. A plan put up for review also offers **Run in a worker**, so you do not depend on the assistant writing a block (see [Reviewing a plan before it runs](#reviewing-a-plan-before-it-runs)). **New worker** on a project's ⋮ menu or on the Workers board opens the same dialog empty, for a worker with no parent. A worker cannot start workers of its own.
+**Starting a worker.** A `worker-prompt` block in an assistant's answer gets a **Start worker** button once the answer has finished, and a secondary **Work here instead** button. No other block gets either. Clicking **Start worker** opens the New worker dialog with the block's text, which you can still edit. Confirm with **Start worker**. **Work here instead** sends the block to the current conversation as an ordinary turn, with an instruction that you chose this checkout rather than a worker; it does not create, switch to, or write in another worktree. The session holding the block becomes the worker's parent: the block then shows "Started *‹title›* →", and the conversation gets a one-line "Spawned worker" link. An ordinary Code-mode task that is about to change code also suggests **Run in a worker** once, on its plan review or its first patch, so you do not depend on the assistant writing a block (see [the worker suggestion](#while-a-turn-runs-and-how-it-ended) and [Reviewing a plan before it runs](#reviewing-a-plan-before-it-runs)). **New worker** on a project's ⋮ menu or on the Workers board opens the same dialog empty, for a worker with no parent. A worker cannot start workers of its own.
 
 **When a worker finishes.** A worker with a parent leaves one redacted result in that parent when its task reaches a terminal outcome: complete, incomplete, stopped, failed, or out of budget. The parent shows a **Worker result** card naming the task outcome, branch, worktree and the worker's final response, with a link to the worker. Its next action is **Continue with result**. That starts an ordinary turn in the parent with the result as a delimited user message; it never starts a turn by itself, and it does not merge the branch, apply a patch, or approve anything. An incomplete result is labelled **Task incomplete** and names the completion reasons; it is never presented as success. A task waiting on a command, patch, plan, check card or provider choice returns only after that decision produces a terminal outcome. A worker started from **New worker**, with no parent, returns nothing.
 

@@ -34,6 +34,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | Model calls fail | [Model calls fail](#model-calls-fail) |
 | The provider refused a call (rate limit, quota, auth) | [Provider refusal classifications](#provider-refusal-classifications) |
 | A refusal offered no switch to another provider | [A refusal offered no switch to my other provider](#a-refusal-offered-no-switch-to-my-other-provider) |
+| Damaian looks stopped: nothing seems to happen, or a baseline runs for minutes | [Damaian looks stopped](#damaian-looks-stopped) |
 | A turn stopped early, or asks *Answer now* / *Continue* | [A turn stopped early](#a-turn-stopped-early-which-budget-ran-out) |
 | A worker stopped on its task budget, a full request, or no progress | [A worker stopped on its approved task budget](#a-worker-stopped-on-its-approved-task-budget-a-full-request-or-no-progress) |
 | A crash-recovery card, or a task marked unknown outcome | [After a crash: what recovery decided](#after-a-crash-what-recovery-decided) |
@@ -916,7 +917,8 @@ Event types grouped by what they tell you:
 | Area | Event types |
 |------|-------------|
 | Model turn | `context_assembled`, `model_request_prepared`, `model_response_completed`, `edit_model_request_prepared`, `chat_turn_cancelled`, `model_usage_reporting_unsupported`, `model_tool_call_markup_recovered`, `model_upstream_provider`, `turn_continued` |
-| Round budget | `round_budget_paused`, `round_budget_decision`, `turn_budget_extended` |
+| Round budget | `round_budget_paused`, `round_budget_decision`, `turn_budget_extended`, `ordinary_continuation`, `ordinary_continuation_declined` |
+| Worker suggestion | `worker_suggested` |
 | Plan review | `plan_review_decision` |
 | Patches | `patch_proposed`, `edit_patch_ready_for_approval`, `edit_failed`, `patch_applied`, `patch_hunks_rejected`, `patch_rollback_started`, `patch_rolled_back`, `stored_patch_applied`, `stored_patch_files_rejected`, `stored_patch_rejected`, `stored_patch_rolled_back` |
 | Commands | `command_proposed`, `command_proposal_stored`, `command_executed`, `stored_command_executed`, `stored_command_rejected`, `command_allowlisted`, `repository_allowlist_migrated` |
@@ -1374,6 +1376,14 @@ root and in `crates/engine` are two checks. Each appears in exactly one of
 passed, failed, skipped or stale in the report; **an unrun check is never
 passed**.
 
+**A patch ran only the crate's checks, not the workspace's.** In a Code-mode
+chat task with no plan, the first patch writes a `planless_task_continues`
+session event for the task. From then on each patch is verified per change (the
+owning root only) and the task continues after it; the full completion set,
+including the repository root, runs once when the assistant answers. A patch
+from the one-shot patch flow writes no such event and still runs the full set
+each time.
+
 **A check failed before the patch too.** The report calls it `pre_existing` and
 starts no repair. The pre-apply baseline ran the same check against the reviewed
 bytes and recorded a matching redacted fingerprint. Fix it separately if you
@@ -1395,7 +1405,11 @@ the pre-patch files is its own ordinary command decision. Approving the patch
 does not approve the baseline, and skipping the baseline does not skip the patch.
 If a baseline command changes a tracked file, the reviewed patch is stale and
 must be previewed again. The card is recorded as `verification_baseline_paused`
-and `verification_baseline_resumed` in the audit log.
+and `verification_baseline_resumed` in the audit log. A baseline you stopped with
+**Cancel** writes `verification_baseline_cancelled`, and its checks — the one
+that was running and every approved one not yet started — are recorded as
+`declined` baselines, the same record skipping leaves. That is why a later
+failure in such a check is `unknown_provenance`.
 
 **Automatic repair stopped and says `repair stalled`.** This is progress
 detection, not the numeric limit. Two consecutive attempts left the same failure,
@@ -1663,10 +1677,54 @@ How to read what a turn, a crash, a worker or a rewind left behind. Each
 section names the log events it relies on; [Logs](#logs) describes the logs
 themselves.
 
+### Damaian looks stopped
+
+Before assuming a turn is stuck, read the status line under the assistant's
+latest message ([spec 107](specs/107_visible_waiting_and_working/proposal.md)).
+While a turn is alive the line is always there; it is removed only when the
+turn has ended.
+
+- **It names an activity with a moving clock** ("Waiting for the model 40s ·
+  turn 6m", "Running `cargo test` 2m 10s · turn 9m"). Damaian is working. The
+  first clock is the current activity alone and the "turn" clock is the whole
+  turn, so a long turn total does not mean one long call. A running command's
+  latest output line is shown under it; a `cargo test` that prints nothing for a
+  while is still running. **Stop** ends the turn if you do not want to wait.
+- **It reads "Waiting for your answer / review / approval / decision".** The
+  turn is paused on a card you have to answer. The card is the last thing in the
+  conversation, directly above the prompt box, and the line above the prompt box
+  names it ("Review the patch", "Approve 2 checks", …); **Show** (or **Answer**
+  for a question) scrolls to it. While a question is pending the prompt box is
+  disabled and reads "Answer the question above" — that is deliberate, not a
+  frozen app. The plan step reads **waiting for you**. Nothing times out; the
+  task waits, across reloads and restarts, until you decide.
+- **It reads "Running baseline: …".** A pre-apply baseline you approved is
+  running the check against the pre-patch files; a workspace `cargo test` can
+  take several minutes. The baseline card shows the check ("(1 of 2)" when
+  several run), its clock, its latest output line and **Cancel**. Cancelling
+  records the baseline as declined and leaves the patch for you to apply or
+  reject; see [Verification](#verification-which-checks-ran-and-why-one-was-skipped).
+  A baseline that needed no approval runs inside **Apply** and shows no progress
+  or Cancel.
+- **There is no status line, and no card above the prompt box.** The turn has
+  ended. Its message carries the mark that says how ([A turn stopped
+  early](#a-turn-stopped-early-which-budget-ran-out)), or a **Task incomplete**
+  card ([A task ended incomplete](#a-task-ended-incomplete-what-the-completion-gate-saw)).
+
+To confirm from the logs which decision a task is waiting on, read the newest
+`task_status_updated` for that task: it is `waiting_for_approval` with a
+`pendingApproval` or `pendingQuestion` link (the `jq` in [Session
+logs](#session-logs) prints it). `/api/session` reports the same decision as the
+task's `turnPresentation.pendingDecision` (`kind`, `label`, `statusLabel`,
+`cardId`); a pending baseline appears there as kind `baseline` on a waiting
+patch.
+
 ### A turn stopped early: which budget ran out
 
-What happens at `agent_max_tool_rounds` (default 16) depends on whether a token
-ceiling is set ([spec 61](specs/61_continue_the_stopped_turn/proposal.md)).
+What happens at `agent_max_tool_rounds` (default 16) depends on the mode, on
+whether the session is a worker, and on whether a token ceiling is set
+([spec 61](specs/61_continue_the_stopped_turn/proposal.md),
+[spec 107](specs/107_visible_waiting_and_working/proposal.md)).
 That budget counts **action rounds**. A round in which every call was a read —
 `read_file`, `list_directory`, `search_content`, `search_codebase`,
 `read_git_status`, `read_git_diff`, `list_worktrees` or `read_git_log` — and no
@@ -1677,7 +1735,33 @@ allowance never pauses a turn; later reads are action rounds.
 `agent_max_exploration_rounds=0` restores the behaviour where every round is
 charged to `agent_max_tool_rounds`.
 
-- **No `agent_max_task_tokens` (the default).** When the turn reaches its
+- **An ordinary Code-mode session, no `agent_max_task_tokens` (the default).**
+  The turn crosses the checkpoint on its own while the task is making progress
+  and is under the default task budget (the `worker_task_budget_*` totals:
+  96 action rounds, 144 read-only rounds, 8,000,000 input and 512,000 output
+  tokens unless lowered). Each crossing writes an `ordinary_continuation` audit
+  record. It pauses on the round-budget card below only when the engine declines
+  to continue, and then writes `ordinary_continuation_declined` with a `reason`:
+  `no_progress` (the plan, step evidence, tool results and notes did not change
+  since the last checkpoint — a model repeating itself), one of
+  `action_rounds_exhausted`, `exploration_rounds_exhausted`,
+  `input_tokens_exhausted` or `output_tokens_exhausted` (a ceiling), or
+  `usage_unavailable` (the task's token usage could not be read). The record
+  also carries `totalActionRounds` and `totalExplorationRounds`. Answer the
+  card as below; **Continue** is your decision to go on regardless. A worker,
+  a repair turn after verification and a session with `agent_max_task_tokens`
+  never write these records. Only native tool rounds count toward the tool
+  results part of progress, so a provider using the text command protocol is
+  far more likely to be declined with `no_progress`.
+
+  ```bash
+  jq -c 'select(.eventType|startswith("ordinary_continuation"))
+         | {event: .eventType, reason, totalActionRounds}' \
+    "$DATA_DIR/audit/events.jsonl" | tail -5
+  ```
+
+- **Ask, Plan or Review mode, or a worker without an approved budget, no
+  `agent_max_task_tokens`.** When the turn reaches its
   action-round budget and the model still wants a tool, the turn **pauses**
   instead of stopping. The task goes to `waiting_for_approval` on a
   `chat/pending/roundbudget_<id>.json` proposal with
