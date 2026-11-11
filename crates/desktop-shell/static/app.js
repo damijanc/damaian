@@ -12401,6 +12401,16 @@ function renderHunks(file, onToggle, controlsDisabled = false) {
   return view;
 }
 
+// `raw` is the whole porcelain record (status code plus path, for a rename the
+// new path), so it already names the path; appending `path` printed it twice.
+// Fall back to the path alone for a payload that carries no record.
+function gitStatusLine(file) {
+  if (typeof file === "string") {
+    return file;
+  }
+  return file.raw || file.path || "changed";
+}
+
 function renderGitStatusText(payload) {
   if (payload.clean) {
     return "Git status: clean workspace.";
@@ -12408,7 +12418,7 @@ function renderGitStatusText(payload) {
   const files = payload.files || [];
   const visible = files
     .slice(0, 12)
-    .map((file) => `- ${file.raw || "changed"} ${file.path || file}`)
+    .map((file) => `- ${gitStatusLine(file)}`)
     .join("\n");
   const hiddenCount = Math.max(0, files.length - 12);
   const suffix = hiddenCount ? `\n- ... ${hiddenCount} more` : "";

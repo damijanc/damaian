@@ -15095,6 +15095,58 @@ mod tests {
         );
     }
 
+    /// Spec 108 Task 5 (D4). The route serves `raw` as status plus path, so
+    /// the card must print it alone: a deletion, a modification and an
+    /// untracked directory each name their path once.
+    #[test]
+    fn git_status_card_prints_each_path_once() {
+        let repo = temp_path("git-status-card");
+        fs::create_dir_all(&repo).unwrap();
+        git_for_test(&repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("gone.md"), "x\n").unwrap();
+        fs::write(repo.join("kept.md"), "one\n").unwrap();
+        git_for_test(&repo, &["add", "."]);
+        git_for_test(&repo, &["commit", "-q", "-m", "initial"]);
+        fs::remove_file(repo.join("gone.md")).unwrap();
+        fs::write(repo.join("kept.md"), "two\n").unwrap();
+        fs::create_dir_all(repo.join("newdir")).unwrap();
+        fs::write(repo.join("newdir/file.txt"), "n\n").unwrap();
+
+        let payload = json_of(&git_status_for_test(&repo));
+        let lines: Vec<String> = payload["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["raw"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            [" D gone.md", " M kept.md", "?? newdir/"],
+            "{payload}"
+        );
+        // Each record already ends with its path, which is why the card must
+        // not append `path` again.
+        for file in payload["files"].as_array().unwrap() {
+            let (raw, path) = (
+                file["raw"].as_str().unwrap(),
+                file["path"].as_str().unwrap(),
+            );
+            assert!(
+                raw.ends_with(path) && raw.matches(path).count() == 1,
+                "{file}"
+            );
+        }
+
+        let line = app_js_function("gitStatusLine");
+        assert!(line.contains("file.raw || file.path"), "{line}");
+        let render = app_js_function("renderGitStatusText");
+        assert!(render.contains("gitStatusLine(file)"), "{render}");
+        assert!(
+            !render.contains("${file.raw") && !render.contains("file.path"),
+            "the card prints the record alone: {render}"
+        );
+    }
+
     /// Requirement 12: an origin that is not github.com yields `null`, never
     /// the raw remote.
     #[test]
