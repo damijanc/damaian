@@ -1,6 +1,6 @@
 # Feature Spec: Interface Cleanup and Session Archive
 
-Status: In progress (started 2026-11-10; Tasks 1, 3, 4, 6 and 8 done; Tasks 1–8 in [tasks.md](tasks.md))
+Status: In progress (started 2026-11-10; Tasks 1, 3, 4, 5, 6 and 8 done; Tasks 1–8 in [tasks.md](tasks.md))
 Order: 108 of 108
 Plan: none. Written from the owner's 2026-11-09/10 dogfooding of spec 33; the
 decisions and code survey are in [context.md](context.md).
@@ -9,7 +9,7 @@ whose manual control this removes), [#94](../94_run_a_plan_in_a_worker.md)
 (plan review "Run in a worker", which this removes) and
 [#95](../95_one_workers_panel.md) (the Workers board) — all built; **nothing here is unbuilt, so this spec
 is ready to start**. It shares `app.js` with
-[#107](../107_visible_waiting_and_working/proposal.md); build one after the
+[#107](../107_visible_waiting_and_working/proposal.md) (Done 2026-11-11); build one after the
 other, not in parallel.
 
 ## 1. Motivation

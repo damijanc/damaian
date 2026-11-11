@@ -1,6 +1,6 @@
 # Feature Spec: Show When Damaian Is Waiting for You or Still Working
 
-Status: In progress (started 2026-11-10; Tasks 1–5 of 6 done; Task 6's documentation written, close-out waits for CI; see [tasks.md](tasks.md))
+Status: Done 2026-11-11 (started 2026-11-10; six tasks in [tasks.md](tasks.md))
 Order: 107 of 108
 Plan: none. Written from the 2026-11-09/10 dogfooding sessions in which the
 owner ran Damaian on spec 33 (planning, then Task 1). The decisions and the

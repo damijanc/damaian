@@ -1,12 +1,12 @@
 # Feature Spec: Fast Verification
 
-Status: In progress (started 2026-11-11; Tasks 1–7 in [tasks.md](tasks.md))
+Status: In progress (started 2026-11-11; Tasks 1–2 done; Tasks 1–7 in [tasks.md](tasks.md))
 Order: 109 of 109
 Plan: none. Written from the owner's spec 33 Task 1 run on Damaian v0.69.0
 (2026-11-11); the code survey and decisions are in [context.md](context.md).
 Depends on: [#102](../102_repair_provenance_and_stagnation.md) (baselines and
 provenance), [#105](../105_structured_plan_checks/proposal.md) (structured plan
-checks), [#107](../107_visible_waiting_and_working/proposal.md) (per-change
+checks), [#107](../107_visible_waiting_and_working/proposal.md) (Done 2026-11-11; per-change
 verification for continuing turns, baseline progress) — all built or in
 progress with the parts this spec changes already on main; **nothing here is
 unbuilt, so this spec is ready to start**.
