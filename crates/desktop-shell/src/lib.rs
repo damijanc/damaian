@@ -9921,6 +9921,86 @@ mod tests {
         );
     }
 
+    /// Spec 108 D3, the UI half: Archive in both session menus and the
+    /// worker's, archived sessions out of the sidebar list and into a
+    /// collapsed Archived (N) entry with Open and Unarchive, search labelling
+    /// archived hits, and the board hiding archived workers by default. The
+    /// route's own refusal message reaches the user through the toast.
+    #[test]
+    fn app_js_archives_sessions_out_of_the_sidebar() {
+        let item = app_js_function("sessionArchiveMenuItem");
+        assert!(
+            item.contains("archived ? \"Unarchive\" : \"Archive\""),
+            "{item}"
+        );
+        assert!(
+            item.contains("setSessionArchived(projectPath, session, !archived)"),
+            "{item}"
+        );
+        for menu in ["toggleSessionMenu", "toggleThreadMenu", "toggleWorkerMenu"] {
+            let body = app_js_function(menu);
+            assert!(body.contains("sessionArchiveMenuItem("), "{menu}: {body}");
+            // Delete stays, and stays the destructive one.
+            assert!(body.contains("action: \"delete\""), "{menu}: {body}");
+        }
+        assert!(
+            app_js_function("runSessionAction").contains("toast(error.message)"),
+            "an archive refusal is shown as the route's message"
+        );
+
+        let set = app_js_function("setSessionArchived");
+        assert!(set.contains("\"/api/session-archive\""), "{set}");
+        assert!(set.contains("\"/api/session-unarchive\""), "{set}");
+
+        let list = app_js_function("renderProjectList");
+        assert!(
+            list.contains("sessions.filter((session) => !session.archived)"),
+            "{list}"
+        );
+        assert!(
+            list.contains("(workers || []).filter((row) => !row.archived)"),
+            "{list}"
+        );
+        assert!(
+            list.contains("renderArchivedEntry(projectPath, archived)"),
+            "{list}"
+        );
+
+        let entry = app_js_function("renderArchivedEntry");
+        assert!(entry.contains("`Archived (${entries.length})`"), "{entry}");
+        assert!(entry.contains("if (!open) return [toggle];"), "{entry}");
+        let archived_row = app_js_function("renderArchivedSession");
+        assert!(archived_row.contains("loadSession(id)"), "{archived_row}");
+        assert!(archived_row.contains("\"Unarchive\""), "{archived_row}");
+        assert!(
+            archived_row.contains("setSessionArchived(projectPath, { id, title }, false)"),
+            "{archived_row}"
+        );
+
+        let search = app_js_function("renderSessionSearchResults");
+        assert!(
+            search.contains("archivedIds.has(hit.sessionId)"),
+            "{search}"
+        );
+        assert!(search.contains("\"Archived\""), "{search}");
+
+        let board = app_js_function("renderWorkersBoard");
+        assert!(
+            board.contains(
+                "workersBoardShowArchived ? shown : shown.filter((row) => !row.archived)"
+            ),
+            "{board}"
+        );
+        assert!(
+            board.contains("`Show archived (${archivedCount})`"),
+            "{board}"
+        );
+        assert!(
+            super::APP_JS.contains("let workersBoardShowArchived = false;"),
+            "the board hides archived workers by default"
+        );
+    }
+
     #[test]
     fn app_js_baseline_card_streams_progress_and_cancels() {
         let card = app_js_function("createBaselineBatchCard");
@@ -17644,6 +17724,42 @@ exec /bin/cat > /dev/null
                 .and_then(|rest| rest.split("\nfunction ").next())
                 .expect("the worker header renderer");
             assert!(header.contains("workerProtectedPathsText(row)"), "{header}");
+
+            fixture.supervisor.shutdown_all();
+        }
+
+        /// Spec 108 D3: a worker row says whether its session is archived, so
+        /// the board can hide it by default and the sidebar can list it under
+        /// Archived.
+        #[test]
+        fn a_worker_row_carries_its_archived_flag() {
+            let fixture = Fixture::new();
+            let archived = fixture.spawn("An archived worker", None);
+            let kept = fixture.spawn("A kept worker", None);
+            fixture
+                .store()
+                .archive_session(&archived.session_id, false)
+                .expect("an archive with no running worker");
+
+            let rows = fixture
+                .route(
+                    "GET",
+                    "/api/workers",
+                    &[("repo", fixture.repo.to_str().unwrap())],
+                    &[],
+                )
+                .unwrap()["workers"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let archived_flag = |session: &str| {
+                rows.iter()
+                    .find(|row| row["sessionId"] == session)
+                    .map(|row| row["archived"].clone())
+                    .unwrap()
+            };
+            assert_eq!(archived_flag(&archived.session_id), json!(true));
+            assert_eq!(archived_flag(&kept.session_id), json!(false));
 
             fixture.supervisor.shutdown_all();
         }

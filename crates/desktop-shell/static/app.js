@@ -9006,7 +9006,13 @@ function createWorkerDot(row) {
 // every second; the sidebar is redrawn only when this changes.
 function workerSidebarSignature(rows) {
   return JSON.stringify(
-    (rows || []).map((row) => [row.sessionId, row.title, row.parentSessionId, workerDotState(row)]),
+    (rows || []).map((row) => [
+      row.sessionId,
+      row.title,
+      row.parentSessionId,
+      workerDotState(row),
+      Boolean(row.archived),
+    ]),
   );
 }
 
@@ -9135,6 +9141,9 @@ function toggleWorkerMenu(row, projectPath, anchorEl, { board }) {
           action: "reveal",
           onSelect: runSessionAction(() => revealWorkerWorktree(row)),
         },
+        // Left enabled while the worker runs: the shell refuses, and its
+        // "Stop the worker first" message is the toast.
+        sessionArchiveMenuItem(projectPath, { id: row.sessionId, archived: row.archived }),
       ],
       [
         {
@@ -9302,6 +9311,7 @@ let workersBoardOpen = false;
 let workersBoardRows = null; // null until the board's first answer
 let workersBoardError = "";
 let workersBoardSignature = "";
+let workersBoardShowArchived = false;
 let workersBoardInFlight = false;
 let workersBoardRequestStartedAt = 0;
 let workersBoardAnsweredAt = 0;
@@ -9565,12 +9575,20 @@ function renderWorkerBoardRow(row, projectPath) {
 function renderWorkersBoard() {
   const board = $("workers-board");
   if (!workersBoardOpen) return;
-  const rows = (workersBoardRows || []).filter(
+  const shown = (workersBoardRows || []).filter(
     (row) => !(row.group === "finished" && dismissedWorkers.has(row.sessionId)),
   );
+  // Archived workers are hidden by default (spec 108 D3); the head offers them.
+  const archivedCount = shown.filter((row) => row.archived).length;
+  const rows = workersBoardShowArchived ? shown : shown.filter((row) => !row.archived);
   // Redrawn only when what it shows changed, so a menu or a focused button
   // is not replaced every second for nothing.
-  const signature = JSON.stringify([workersBoardRows === null, rows]);
+  const signature = JSON.stringify([
+    workersBoardRows === null,
+    workersBoardShowArchived,
+    archivedCount,
+    rows,
+  ]);
   if (signature === workersBoardSignature && board.childElementCount) {
     renderWorkersBoardStatus();
     return;
@@ -9602,7 +9620,22 @@ function renderWorkersBoard() {
     const started = await showNewWorkerDialog({});
     if (started) refreshWorkersAfterAction(repo());
   });
-  head.append(summary, status, newWorker);
+  head.append(summary, status);
+  if (archivedCount) {
+    const archivedToggle = document.createElement("button");
+    archivedToggle.type = "button";
+    archivedToggle.className = "btn-sm workers-archived-toggle";
+    archivedToggle.setAttribute("aria-pressed", String(workersBoardShowArchived));
+    archivedToggle.textContent = workersBoardShowArchived
+      ? "Hide archived"
+      : `Show archived (${archivedCount})`;
+    archivedToggle.addEventListener("click", () => {
+      workersBoardShowArchived = !workersBoardShowArchived;
+      renderWorkersBoard();
+    });
+    head.append(archivedToggle);
+  }
+  head.append(newWorker);
   board.replaceChildren(head);
 
   if (workersBoardRows !== null && !rows.length) {
@@ -11523,8 +11556,14 @@ function renderProjectList() {
             renderProjectList();
           });
       } else {
-        const entries = sidebarEntries(sessions, workers || []);
-        if (!entries.length) {
+        // Spec 108 D3: an archived session or worker leaves the list and is
+        // reached from the collapsed Archived entry at its bottom.
+        const entries = sidebarEntries(
+          sessions.filter((session) => !session.archived),
+          (workers || []).filter((row) => !row.archived),
+        );
+        const archived = archivedSidebarEntries(sessions, workers || []);
+        if (!entries.length && !archived.length) {
           const empty = document.createElement("p");
           empty.className = "project-session-empty";
           empty.textContent = "No sessions yet";
@@ -11537,6 +11576,9 @@ function renderProjectList() {
               : renderProjectWorker(projectPath, entry.row, { nested: entry.nested }),
           );
         });
+        if (archived.length) {
+          sessionsList.append(...renderArchivedEntry(projectPath, archived));
+        }
       }
       group.append(sessionsList);
     }
@@ -11599,6 +11641,96 @@ function renderProjectSession(projectPath, session) {
   return row;
 }
 
+// Projects whose Archived entry is open. Not stored: the entry starts
+// collapsed in every window, as D3 asks.
+const expandedArchivedProjects = new Set();
+
+// A project's archived sessions and workers, most recently active first.
+function archivedSidebarEntries(sessions, rows) {
+  return [
+    ...sessions.filter((session) => session.archived).map((session) => ({ session })),
+    ...rows.filter((row) => row.archived).map((row) => ({ row })),
+  ].sort((a, b) => (b.session || b.row).updatedAtMs - (a.session || a.row).updatedAtMs);
+}
+
+// The collapsed "Archived (N)" toggle and, when open, one row per archived
+// session with Open (its title) and Unarchive.
+function renderArchivedEntry(projectPath, entries) {
+  const open = expandedArchivedProjects.has(projectPath);
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "project-archived-toggle";
+  toggle.setAttribute("aria-expanded", String(open));
+  toggle.textContent = `Archived (${entries.length})`;
+  toggle.addEventListener("click", () => {
+    if (open) expandedArchivedProjects.delete(projectPath);
+    else expandedArchivedProjects.add(projectPath);
+    renderProjectList();
+  });
+  if (!open) return [toggle];
+  return [toggle, ...entries.map((entry) => renderArchivedSession(projectPath, entry))];
+}
+
+function renderArchivedSession(projectPath, entry) {
+  const id = entry.session ? entry.session.id : entry.row.sessionId;
+  const title = entry.session ? entry.session.title : entry.row.title;
+  const row = document.createElement("div");
+  row.className = "session-item project-session-item project-archived-item";
+  row.dataset.sessionId = id;
+  row.dataset.projectPath = projectPath;
+  if (projectPath === repo() && id === currentSessionId && !workersBoardOpen) {
+    row.classList.add("active");
+  }
+  const openButton = document.createElement("button");
+  openButton.type = "button";
+  openButton.className = "project-session-open";
+  openButton.textContent = title;
+  openButton.title = `Open ${title}`;
+  openButton.addEventListener(
+    "click",
+    entry.session
+      ? runSessionAction(async () => {
+          await switchProject(projectPath, {
+            preferredSessionId: id,
+            reloadSelected: false,
+          });
+          await loadSession(id);
+          renderProjectList();
+        })
+      : () => openWorkerSession(id, { source: projectPath }),
+  );
+  const unarchive = document.createElement("button");
+  unarchive.type = "button";
+  unarchive.className = "btn-sm project-unarchive-btn";
+  unarchive.textContent = "Unarchive";
+  unarchive.setAttribute("aria-label", `Unarchive ${title}`);
+  unarchive.addEventListener(
+    "click",
+    runSessionAction(() => setSessionArchived(projectPath, { id, title }, false)),
+  );
+  row.append(openButton, unarchive);
+  return row;
+}
+
+// Spec 108 D3: archive or unarchive through the shell, which keeps the
+// history, worktree and branch. A running worker is refused there ("Stop the
+// worker first"), and that message is what the caller's toast shows.
+async function setSessionArchived(projectPath, session, archived) {
+  await api(
+    archived ? "/api/session-archive" : "/api/session-unarchive",
+    form({ session_id: session.id }),
+  );
+  const normalized = normalizeProjectPath(projectPath);
+  if (normalized === repo()) {
+    await loadSessions(currentSessionId || "", false);
+  } else {
+    await loadProjectSessions(normalized);
+    renderProjectList();
+  }
+  if (workersEnabled) refreshWorkersAfterAction(normalized);
+  toast(archived ? "Session archived" : "Session unarchived");
+}
+
 // "now", minutes, hours, a weekday within the last 6 days, else a short date.
 function formatRelativeTime(ms, now = Date.now()) {
   const age = now - ms;
@@ -11643,6 +11775,7 @@ function toggleSessionMenu(projectPath, session, anchorEl) {
           action: "export",
           onSelect: runSessionAction(() => exportSessionDownload(session)),
         },
+        sessionArchiveMenuItem(projectPath, session),
       ],
       [
         {
@@ -11654,6 +11787,18 @@ function toggleSessionMenu(projectPath, session, anchorEl) {
       ],
     ],
   });
+}
+
+// Archive for a listed session, Unarchive for an archived one (spec 108 D3).
+// Delete stays the destructive action, in its own section.
+function sessionArchiveMenuItem(projectPath, session, { disabled = false } = {}) {
+  const archived = Boolean(session?.archived);
+  return {
+    label: archived ? "Unarchive" : "Archive",
+    action: archived ? "unarchive" : "archive",
+    disabled,
+    onSelect: runSessionAction(() => setSessionArchived(projectPath, session, !archived)),
+  };
 }
 
 function renderSessionOptions(sessions = []) {
@@ -11838,6 +11983,11 @@ function renderSessionSearchResults(payload) {
     results.append(empty);
     return;
   }
+  const archivedIds = new Set(
+    (projectSessionsByPath.get(repo()) || [])
+      .filter((session) => session.archived)
+      .map((session) => session.id),
+  );
   hits.forEach((hit) => {
     const row = document.createElement("button");
     row.type = "button";
@@ -11848,6 +11998,14 @@ function renderSessionSearchResults(payload) {
     const snippet = document.createElement("span");
     snippet.className = "session-search-hit-snippet";
     snippet.textContent = hit.snippet;
+    // Search covers archived sessions too (spec 108 D3), and says which.
+    if (archivedIds.has(hit.sessionId)) {
+      row.classList.add("is-archived");
+      const label = document.createElement("span");
+      label.className = "session-search-hit-archived";
+      label.textContent = "Archived";
+      title.append(" ", label);
+    }
     row.append(title, snippet);
     row.addEventListener("click", () => {
       void openSearchHit(hit);
@@ -15949,6 +16107,7 @@ function toggleThreadMenu(anchorEl) {
           disabled: noSession,
           onSelect: runSessionAction(() => exportSessionDownload(session)),
         },
+        sessionArchiveMenuItem(projectPath, session, { disabled: noSession }),
       ],
       [
         {

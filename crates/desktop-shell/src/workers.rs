@@ -1228,6 +1228,9 @@ fn worker_row(
         // shown read-only on its card since spec 108 D1 removed the manual
         // control: the card is where a refused patch's path can be explained.
         "protectedPaths": record.inherited_protected_paths,
+        // Spec 108 D3: the board hides archived workers by default, and the
+        // sidebar lists them under its Archived entry.
+        "archived": session.archived,
         // The project the row belongs to, for the all-projects panel (spec 95).
         "sourceRepository": record.source_repository.display().to_string(),
         "alive": alive,

@@ -584,6 +584,45 @@ button:disabled {
   color: var(--ink);
 }
 
+/* Spec 108 D3: the collapsed Archived (N) entry at the bottom of a project. */
+.project-archived-toggle {
+  min-height: 28px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 9px;
+  text-align: left;
+}
+
+.project-archived-toggle::before {
+  display: inline-block;
+  margin-right: 6px;
+  content: "▸";
+}
+
+.project-archived-toggle[aria-expanded="true"]::before {
+  content: "▾";
+}
+
+.project-archived-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+  color: var(--muted);
+}
+
+.project-archived-item .project-session-open {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-search-hit-archived {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
 .project-session-empty {
   overflow: hidden;
   color: var(--muted);
