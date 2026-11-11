@@ -1,6 +1,6 @@
 # Feature Spec: Interface Cleanup and Session Archive
 
-Status: In progress (started 2026-11-10; Tasks 1, 3, 4 and 6 done; Tasks 1–7 in [tasks.md](tasks.md))
+Status: In progress (started 2026-11-10; Tasks 1, 3, 4 and 6 done; Tasks 1–8 in [tasks.md](tasks.md))
 Order: 108 of 108
 Plan: none. Written from the owner's 2026-11-09/10 dogfooding of spec 33; the
 decisions and code survey are in [context.md](context.md).
@@ -48,6 +48,19 @@ harder to use without adding anything he needed:
 4. **The Git status card names each path once**, with its status.
 5. **A task records the model each call used**, and shows every model a task
    used where it shows the model.
+6. **The plan review card is read, not edited, and declining asks how to change
+   it** (decided by the owner, 2026-11-11). The steps are a numbered, read-only
+   list with each step's required check shown as text: no title inputs, no
+   ↑ ↓ × controls, no "+ Add a required check" editor. The card offers
+   **Approve** and **Decline**. **Decline** opens a question in the card, "How
+   should the plan be changed?", with a text field. Sending an answer leaves
+   the plan's outstanding steps open, gives Damaian the answer, and Damaian
+   must propose a revised plan, which comes back to the user as a new review
+   card before anything changes (owner: "and then damaian needs to offer a new
+   plan based on the user input"). A quiet **Decline without changes** keeps
+   today's decline (nothing changes, the steps are skipped, the turn explains).
+   The header no longer shows the deferred tool call as an upper-case chip; at
+   most a short muted "Next: …" line.
 
 ## 3. Non-goals
 
@@ -59,7 +72,11 @@ harder to use without adding anything he needed:
 
 - No session shows a Protected paths form; spec 98's enforcement tests pass
   unchanged; a worker's card lists its protected paths read-only.
-- The plan review card has Approve and Decline only.
+- The plan review card has Approve and Decline only, and its steps are
+  read-only.
+- Decline → "How should the plan be changed?" → an answer produces a revised
+  plan on a new review card with no repository change in between (engine test
+  and a deterministic eval scenario); Decline without changes behaves as today.
 - Archive removes a session from the sidebar and from the Workers board's
   default view; Archived lists it; Unarchive restores it; Delete still deletes.
   Archiving is durable across a reload and a restart.

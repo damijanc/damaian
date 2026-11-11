@@ -24,6 +24,7 @@ survey are in [`context.md`](context.md).
 | 5 · Git status card names each path once (D4) | Not started | — |
 | 6 · Record the model of each call (D5) | Done 2026-11-10 | `task_usage_recorded` carries optional `modelProvider`/`modelName`; both absent when the call's model is unknown (a call lost to a crash), so such an event reads exactly like one written before spec 108. `record_task_usage` / `record_task_usage_for_task_id` take `model: Option<CallModel>` as their second/third argument (`CallModel` is borrowed; `CallModel::configured(&config)`). **Deviation/discovery:** callers record the *configured* provider and model, not `ModelRun.provider`/`model` — the adapter's provider is its own name (`mock` in tests), which would have made every mocked turn look like a switch; the config is the same source `create_task` uses, and a resumed round's engine is built from the current config. Read side: `TaskUsage.models: Vec<TaskModel>` (`{provider, name}`), derived in `read_task_usage`: the `task_created` model first, then each distinct model the calls named in order of first use; `read_budget_usage` unions the chain's models. `TaskUsage` is no longer `Copy` (it now owns a `Vec`); `.copied()` callers in `chat.rs`, `task_outcomes.rs` and `eval-harness/src/runner.rs` became clones/borrows. Shell: there was no per-task model in `/api/session` or the UI before, so "where the task's model is shown" became the usage payload — `task_usage_json` (the one funnel for the live turn response, the reloaded session's task entries and recovery) always carries `"models":[{provider,name}…]`. UI: the turn's usage line (`markMessageUsage`, via `turnModelsText`) adds the model names joined by " → ", one name for a single-model turn; nothing else in `app.js` changed (spec 107 Task 3 owns the status line and plan panel). Recovery's spend line does not show models. Tests: `token_accounting.rs` `models_used` (4: mid-task switch records both, starting model first even when no call used it, a hand-written log without the fields reads, an unknown model writes no fields); desktop-shell `a_resume_on_a_switched_model_records_both_models` (a question paused on the fixture model, answered through an engine built from a `deepseek`/`deepseek-v4-pro` form as the answer route does; usage lists both and `task_usage_json` carries them), `the_session_payload_carries_every_model_a_task_used`, and `the_session_payload_carries_each_tasks_usage` now asserts `"models":[]`. Checks (local, 2026-11-10): `cargo clippy -p workspace-engine -p desktop-shell -p eval-harness --all-targets --locked -- -D warnings` clean; `cargo nextest run -p desktop-shell -p eval-harness` 444 passed (22 skipped by default filter; port-binding tests need to run outside the agent sandbox); `cargo nextest run -p workspace-engine` 2626 passed (30 skipped); `scripts/quality-gate.sh fmt node lint typos deny` ok. **Not done:** the usage line was not checked in the running app. Workspace clippy and tests left to CI. |
 | 7 · Documentation and close-out | Not started | — |
+| 8 · Plan review: read-only steps, decline asks for changes (D6) | Not started | — |
 
 ## Task 1 · Remove the Protected paths panel (D1)
 
@@ -91,9 +92,34 @@ Files: `crates/workspace-engine/src/session.rs`, `chat.rs`, `lib.rs`, `app.js`, 
 Checks: `cargo clippy -p workspace-engine -p desktop-shell --all-targets --locked -- -D warnings`;
 scoped nextest; web checks.
 
+## Task 8 · Plan review: read-only steps, decline asks for changes (D6)
+
+Build before Task 7, so the docs describe the new card.
+
+- [ ] `createPlanReview`: read-only numbered steps with their checks as text;
+      remove the title inputs, ↑ ↓ ×, the check editor and the raw
+      `deferredAction` chip (a muted "Next: …" line at most).
+- [ ] Decline opens "How should the plan be changed?" (text field, **Send**,
+      and **Decline without changes**); the card stays the pending decision
+      (spec 107) until one is sent.
+- [ ] Engine and route: `changes` on `/api/resume-plan`; `changes_requested`
+      decision keeps steps outstanding and asks the model for a revised plan;
+      empty `changes` keeps today's decline.
+- [ ] Tests: engine — changes requested → no patch applied, a new plan review
+      pauses with the revised plan, steps not skipped; decline without changes
+      unchanged; desktop-shell — the card has no editing controls, Decline
+      shows the question; a deterministic eval scenario for the round trip.
+- [ ] Dated notes in specs 66 and 105; manual check in the running app.
+
+Files: `app.js`, `style.css`, `crates/desktop-shell/src/lib.rs`,
+`crates/workspace-engine/src/chat.rs`, tests, eval scenario.
+Checks: `cargo clippy -p workspace-engine -p desktop-shell --all-targets --locked -- -D warnings`;
+`cargo nextest run -p workspace-engine --test plan_turn`; `cargo nextest run -p desktop-shell`;
+`cargo run -p eval-harness -- run --tier deterministic`; web checks.
+
 ## Task 7 · Documentation and close-out
 
-- [ ] `USER_GUIDE.md`: archive, the plan card, where protected paths now show;
+- [ ] `USER_GUIDE.md`: archive, the plan card (read-only steps, Decline asks how to change it), where protected paths now show;
       `TROUBLESHOOTING.md`: finding an archived session; why a patch was refused
       without a visible Protected paths panel.
 - [ ] Status Done in all four places only after CI is green; README row,

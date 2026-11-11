@@ -70,3 +70,24 @@ sessions (2026-11-09/10, v0.64.0–v0.66.0) and their session logs.
 - **D5 — per-call model (recommended).** Add `modelProvider`/`modelName` to
   `task_usage_recorded`, and derive "models used" from usage records, keeping
   `task_created`'s model as the starting model. No new event type.
+- **D6 — plan review: read-only steps, decline asks for changes (decided by the
+  owner, 2026-11-11).** Today `createPlanReview` (`app.js` ≈14238) renders each
+  outstanding step as a title input with ↑ ↓ × buttons and spec 105's check
+  editor (`planCheckControl` ≈14135), and puts `proposal.deferredAction` (the
+  raw tool call, e.g. a long `grep -n …`) in the header chip. Decline
+  (`resume_after_plan_review`, `chat.rs` ≈6165) marks every non-terminal step
+  `Skipped` and tells the model to explain and stop. The owner found the
+  editing controls confusing and wants the conversation, not a form, to change
+  the plan. Change: the card renders read-only steps and their checks; Decline
+  shows an inline question; `POST /api/resume-plan` gains `changes` (text).
+  With `approved=false` and non-empty `changes`, the engine records
+  `plan_review_decision` with decision `changes_requested` (the text is not
+  audited, only its length), keeps the steps outstanding, appends a user
+  message "The user reviewed the plan and asked for changes: … Do not change the
+  repository. Propose a revised plan with propose_plan that addresses this.",
+  and continues the turn; the next mutating action meets the plan-review gate
+  again with the revised plan. The answer authorises nothing (AGENTS.md
+  "Questions are not approvals"). Without `changes` the decline is today's.
+  The route still accepts `steps` (spec 66/105 revisions) so the engine API
+  and its tests are unchanged; the UI no longer sends it. Specs 66 and 105 get
+  dated notes that the in-card editor was removed and why.
