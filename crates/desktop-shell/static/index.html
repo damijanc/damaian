@@ -172,36 +172,6 @@
         <section id="chat-log" class="chat-log" aria-live="polite"></section>
 
         <section
-          id="protected-paths-panel"
-          class="protected-paths-panel"
-          aria-label="Protected paths"
-          hidden
-        >
-          <div class="protected-paths-header">
-            <strong>Protected paths</strong>
-            <span id="protected-paths-task" class="protected-paths-task"></span>
-          </div>
-          <p id="protected-paths-note" class="protected-paths-note" aria-live="polite"></p>
-          <ul id="protected-paths-list" class="protected-paths-list"></ul>
-          <form id="protected-paths-form" class="protected-paths-form">
-            <label class="protected-paths-label" for="protected-paths-input">
-              Add repository-relative paths (one per line)
-            </label>
-            <textarea
-              id="protected-paths-input"
-              rows="2"
-              placeholder="src/lib.rs&#10;src/nested"
-            ></textarea>
-            <div class="protected-paths-actions">
-              <button id="protected-paths-add" class="btn-sm btn-primary" type="submit">
-                Protect paths
-              </button>
-            </div>
-          </form>
-          <p id="protected-paths-outcome" class="protected-paths-note" aria-live="polite"></p>
-        </section>
-
-        <section
           id="context-panel"
           class="context-panel"
           role="dialog"

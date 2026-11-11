@@ -6100,9 +6100,6 @@ function clearChat() {
   stopWorkerView();
   $("chat-log").innerHTML = "";
   resetPendingDecision();
-  protectedPathsControl = null;
-  $("protected-paths-panel").hidden = true;
-  showProtectedPathOutcome("");
   sessionHasRecordedDiagnostics = false;
   // Every caller means "no conversation": a new, deleted or unselected
   // session. The findings belong to the conversation that just left.
@@ -7437,118 +7434,6 @@ async function renderRecoveryPrompts(sessionId) {
     $("chat-log").append(card);
   });
   cards[0]?.scrollIntoView({ block: "nearest" });
-}
-
-// Spec 98 Task 4: this view is render-and-submit only. The shell chooses the
-// target task from durable creation order, validates every request and returns
-// all labels, notes, rows and outcome text. JavaScript never selects a task,
-// decides availability, parses the textarea, or interprets accepted/refused.
-let protectedPathsControl = null;
-
-function setProtectedPathsEnabled(enabled) {
-  $("protected-paths-input").disabled = !enabled;
-  $("protected-paths-add").disabled = !enabled;
-}
-
-function showProtectedPathOutcome(message = "") {
-  const outcome = $("protected-paths-outcome");
-  outcome.textContent = message;
-  outcome.hidden = message === "";
-}
-
-function renderProtectedPathsControl(control) {
-  $("protected-paths-panel").hidden = false;
-  protectedPathsControl = control || {
-    available: false,
-    taskId: "",
-    taskLabel: "",
-    note: "",
-    rows: [],
-  };
-  $("protected-paths-task").textContent = protectedPathsControl.taskLabel || "";
-  const note = $("protected-paths-note");
-  note.textContent = protectedPathsControl.note || "";
-  note.hidden = !protectedPathsControl.note;
-  setProtectedPathsEnabled(protectedPathsControl.available === true);
-  const list = $("protected-paths-list");
-  list.replaceChildren();
-  (protectedPathsControl.rows || []).forEach((row) => {
-    const item = document.createElement("li");
-    item.className = "protected-path-row";
-    item.dataset.kind = row.kind;
-    const name = document.createElement("code");
-    name.textContent = row.path;
-    const kind = document.createElement("span");
-    kind.className = "protected-path-kind";
-    kind.textContent = row.kindLabel;
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "btn-sm btn-quiet protected-path-remove";
-    remove.textContent = "Stop protecting";
-    remove.setAttribute("aria-label", row.removeLabel);
-    remove.addEventListener("click", () => void removeProtectedPath(row.path));
-    item.append(name, kind, remove);
-    list.append(item);
-  });
-}
-
-function protectedPathRequestIsCurrent(repoPath, sessionId, taskId) {
-  return (
-    repo() === repoPath &&
-    currentSessionId === sessionId &&
-    protectedPathsControl?.taskId === taskId
-  );
-}
-
-async function addProtectedPaths() {
-  const control = protectedPathsControl;
-  const repoPath = repo();
-  const sessionId = currentSessionId;
-  if (!control?.taskId || !repoPath || !sessionId) return;
-  const taskId = control.taskId;
-  try {
-    const payload = await api(
-      "/api/protected-paths-add",
-      form({
-        repo: repoPath,
-        session_id: sessionId,
-        task_id: taskId,
-        paths: $("protected-paths-input").value,
-      }),
-    );
-    if (!protectedPathRequestIsCurrent(repoPath, sessionId, taskId)) return;
-    $("protected-paths-input").value = "";
-    renderProtectedPathsControl(payload.protectedPathsControl);
-    showProtectedPathOutcome(payload.outcome);
-  } catch (error) {
-    if (!protectedPathRequestIsCurrent(repoPath, sessionId, taskId)) return;
-    showProtectedPathOutcome(errorMessage(error));
-  }
-}
-
-async function removeProtectedPath(path) {
-  const control = protectedPathsControl;
-  const repoPath = repo();
-  const sessionId = currentSessionId;
-  if (!control?.taskId || !repoPath || !sessionId) return;
-  const taskId = control.taskId;
-  try {
-    const payload = await api(
-      "/api/protected-paths-remove",
-      form({
-        repo: repoPath,
-        session_id: sessionId,
-        task_id: taskId,
-        paths: path,
-      }),
-    );
-    if (!protectedPathRequestIsCurrent(repoPath, sessionId, taskId)) return;
-    renderProtectedPathsControl(payload.protectedPathsControl);
-    showProtectedPathOutcome(payload.outcome);
-  } catch (error) {
-    if (!protectedPathRequestIsCurrent(repoPath, sessionId, taskId)) return;
-    showProtectedPathOutcome(errorMessage(error));
-  }
 }
 
 // Spec 29 §5.7: the pending-proposal stack. It is rendered after the turn's
@@ -9573,6 +9458,17 @@ function workerRowAction(row, projectPath) {
   }
 }
 
+// Spec 108 D1: the protected paths a worker was handed by its planner task,
+// read-only. Enforcement is the engine's (spec 98); this only names them so a
+// refused patch has a visible reason. Empty when the worker was handed none.
+function workerProtectedPathsText(row) {
+  const paths = Array.isArray(row?.protectedPaths) ? row.protectedPaths : [];
+  if (paths.length === 0) return "";
+  // Canonical paths carry no trailing slash; one marks a directory here.
+  const names = paths.map((entry) => (entry.kind === "directory" ? `${entry.path}/` : entry.path));
+  return `Protected: ${names.join(", ")}`;
+}
+
 function renderWorkerBoardRow(row, projectPath) {
   const tr = document.createElement("tr");
   tr.className = "workers-row";
@@ -9596,6 +9492,14 @@ function renderWorkerBoardRow(row, projectPath) {
   branch.className = "workers-branch";
   branch.textContent = row.branch;
   worker.append(title, branch);
+  const protectedText = workerProtectedPathsText(row);
+  if (protectedText) {
+    const protectedPaths = document.createElement("span");
+    protectedPaths.className = "workers-protected";
+    protectedPaths.textContent = protectedText;
+    protectedPaths.title = protectedText;
+    worker.append(protectedPaths);
+  }
 
   const project = cell("workers-cell-project");
   project.textContent = projectName(projectPath);
@@ -10164,10 +10068,13 @@ function renderWorkerHeaderMeta() {
   const branch = document.createElement("code");
   branch.textContent = row.branch;
   parts.push(branch);
+  const protectedText = workerProtectedPathsText(row);
+  if (protectedText) parts.push(document.createTextNode(` · ${protectedText}`));
   meta.replaceChildren(...parts);
-  meta.title = row.parentTitle
+  const where = row.parentTitle
     ? `Worker from ${row.parentTitle}, on ${row.branch}`
     : `Worker on ${row.branch}`;
+  meta.title = protectedText ? `${where}. ${protectedText}` : where;
 }
 
 function workerStripButton(label, className, run) {
@@ -15668,10 +15575,6 @@ async function loadSession(sessionId) {
   if (!isWorkerSession(currentSessionId)) {
     renderTaskControlInto($("chat-log"), payload.taskControl, currentSessionId);
   }
-  // Spec 98 Task 4: the explicit protected-path control is server-computed in
-  // this same payload, so a reload needs no second decision-making fetch.
-  renderProtectedPathsControl(payload.protectedPathsControl);
-  showProtectedPathOutcome("");
   // Spec 96: a reloaded report is text, so the explicit continuation comes
   // from the durable outcome. It follows the verification turn's last message.
   renderRepairStallOffer(rendered, payload.verification);
@@ -15914,11 +15817,6 @@ $("context-pin-btn").addEventListener("click", async () => {
   } catch (error) {
     toast(error.message);
   }
-});
-
-$("protected-paths-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  addProtectedPaths().catch((error) => toast(error.message));
 });
 
 $("context-pins-clear").addEventListener("click", () => {

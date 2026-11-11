@@ -1224,6 +1224,10 @@ fn worker_row(
         "parentTitle": parent_title,
         "branch": record.branch,
         "worktree": record.worktree_path.display().to_string(),
+        // The planner task's protected paths this worker was handed (spec 98),
+        // shown read-only on its card since spec 108 D1 removed the manual
+        // control: the card is where a refused patch's path can be explained.
+        "protectedPaths": record.inherited_protected_paths,
         // The project the row belongs to, for the all-projects panel (spec 95).
         "sourceRepository": record.source_repository.display().to_string(),
         "alive": alive,

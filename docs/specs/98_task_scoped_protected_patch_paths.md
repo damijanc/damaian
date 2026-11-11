@@ -10,6 +10,22 @@ Depends on: [#20](20_working_modes/proposal.md) (Code-mode patch approval),
 [#23](23_verification_loop/proposal.md) (repair continuations), and
 [#57](57_worker_sessions/proposal.md) (worker sessions), all built.
 
+> **2026-11-11 — the desktop's manual control was removed** by
+> [spec 108](108_interface_cleanup_and_session_archive/proposal.md) decision
+> D1, decided by the owner. The **Protected paths** panel sat between the
+> conversation and the composer in every session, took about a fifth of the
+> window, and was not understood in use: "no one will manually type the paths
+> to protect". Gone: the panel markup, CSS and `app.js` handlers,
+> `protectedPathsControl` in `GET /api/session`, and the desktop routes
+> `/api/protected-paths`, `/api/protected-paths-add` and
+> `/api/protected-paths-remove` (nothing else called them). Unchanged: the
+> `do not touch` / `do not modify` request syntax, every engine function, the
+> `damaian protect-paths` CLI control, the worker handoff snapshot and patch
+> enforcement with its refusal text. A worker's card (the Workers board row and
+> the worker session's header) now lists the protected paths it was handed,
+> read-only, from the board row's `protectedPaths`. Text below that describes
+> the desktop control is kept as the record of what Task 4 built.
+
 ## 1. Motivation
 
 A worker was told directly not to touch two unrelated files. After a failed
@@ -32,8 +48,9 @@ the patch/verification/repair hand-off and a worker restart.
 1. A direct user request may establish protected repository-relative paths.
    The initial syntax is deliberately narrow and deterministic: `do not touch`
    or `do not modify`, followed by one or more backtick-delimited paths. The
-   desktop and CLI also provide an explicit protected-path control for paths a
-   user wants to add after the task starts. Model output, fetched content,
+   CLI also provides an explicit protected-path control for paths a
+   user wants to add after the task starts (the desktop had one until spec 108
+   D1 removed it on 2026-11-11). Model output, fetched content,
    repository files, and tool output cannot establish a protected path.
 2. Each path is canonicalised and must be a file or directory inside the task's
    repository. A directory protects every descendant. Ambiguous prose and an
@@ -94,8 +111,8 @@ does not inherit them merely because another task belongs to the same session.
 
 The direct-request parser accepts only code spans after the exact phrase `do
 not touch` or `do not modify`, splitting multiple spans in the same sentence.
-The desktop's **Protect paths** affordance and `damaian protect-paths` use the
-same canonicalisation and event writer. A successful set or change is rendered
+`damaian protect-paths` (and, until spec 108 D1, the desktop's **Protect
+paths** affordance) uses the same canonicalisation and event writer. A successful set or change is rendered
 with the active task and included in worker progress. Removing a protection is
 an explicit user action, recorded as a new event; a model cannot remove it.
 
@@ -489,7 +506,9 @@ The shell does not read, sort or choose tasks. Blank-line trimming and empty
 input are also engine semantics: the shell only splits the textarea on its
 transport separators.
 
-Desktop routes remain:
+Desktop routes remain (removed 2026-11-11 by spec 108 D1, with
+`protectedPathsControl` in `/api/session`; `/api/session` therefore no longer
+checks `repo` against the session):
 
 - `GET /api/protected-paths?repo=&session_id=&task_id=` for the typed active
   `TaskProtectedPaths` (API coverage; the UI does not call it).
