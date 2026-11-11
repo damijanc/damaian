@@ -723,6 +723,97 @@ impl CheckRun {
                 .iter()
                 .any(|(path, hash)| current_hashes.get(path) != Some(hash))
     }
+
+    /// Whether this run can stand for a new run of the same check (spec 109
+    /// requirement 5, decision D6).
+    ///
+    /// Stricter than `!is_stale`: the run must have covered **exactly** the
+    /// current tree — the same mutation generation and the same changed-file
+    /// set with the same hashes — because a file the task changed after the
+    /// run is not in `file_hashes` and so cannot make it stale. Only a run
+    /// that exited is reusable, passed or failed alike: a failure is reused as
+    /// that failure, never as a pass. A signalled, timed-out, cancelled or
+    /// environment-refused run, a skip and a browser check say nothing stable
+    /// about the tree, so they run again.
+    pub fn reusable_for(
+        &self,
+        current_hashes: &BTreeMap<String, String>,
+        current_generation: u32,
+    ) -> bool {
+        self.generation == current_generation
+            && &self.file_hashes == current_hashes
+            && matches!(
+                self.outcome.termination(),
+                Some(CheckTermination::Exited { .. })
+            )
+            && matches!(self.outcome, CheckOutcome::Ran { .. })
+    }
+}
+
+/// The recorded runs a verification may reuse instead of proposing a check
+/// again (spec 109 D6), and the ones it did reuse.
+///
+/// Built once per verification from the task chain's folded state; the
+/// selection functions consult it before anything is stored as a proposal, so
+/// a reused check is neither proposed, audited as proposed, nor run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckReuse {
+    reusable: BTreeSet<CheckId>,
+    reused: Vec<CheckId>,
+}
+
+impl CheckReuse {
+    /// Reuse nothing: every selected check is proposed, as before spec 109.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// The checks whose latest run in `state` covered exactly the current tree.
+    pub fn from_state(
+        state: &VerificationState,
+        current_hashes: &BTreeMap<String, String>,
+        current_generation: u32,
+    ) -> Self {
+        Self {
+            reusable: state
+                .checks
+                .iter()
+                .filter(|(check, run)| {
+                    !check.is_browser() && run.reusable_for(current_hashes, current_generation)
+                })
+                .map(|(check, _)| check.clone())
+                .collect(),
+            reused: Vec::new(),
+        }
+    }
+
+    /// Keep only the reusable checks `keep` accepts, for a caller with a rule
+    /// of its own about which checks this verification may stand for.
+    pub fn retain(&mut self, mut keep: impl FnMut(&CheckId) -> bool) {
+        self.reusable.retain(|check| keep(check));
+    }
+
+    /// Whether `check`'s recorded run may stand for a new run.
+    pub fn can_reuse(&self, check: &CheckId) -> bool {
+        self.reusable.contains(check)
+    }
+
+    /// Whether `check` is reused; a reused check is remembered once, in the
+    /// order it was selected.
+    fn take(&mut self, check: &CheckId) -> bool {
+        if !self.reusable.contains(check) {
+            return false;
+        }
+        if !self.reused.contains(check) {
+            self.reused.push(check.clone());
+        }
+        true
+    }
+
+    /// The selected checks that were reused rather than proposed.
+    pub fn reused(&self) -> &[CheckId] {
+        &self.reused
+    }
 }
 
 /// The most bytes of a generic check's normalized output tail that are part of
@@ -971,6 +1062,12 @@ pub enum VerificationEvent {
         #[serde(default, skip_serializing_if = "is_zero")]
         generation: u32,
     },
+    /// A selected check was not run because its latest recorded run covered
+    /// exactly the current tree (spec 109 D6). It writes no `Check`: the
+    /// recorded run *is* the result, so the completion gate and provenance
+    /// read the same `CheckRun` they would have read anyway.
+    #[serde(rename = "verification_reused", rename_all = "camelCase")]
+    Reused { task_id: String, check: CheckId },
     #[serde(rename = "verification_finished", rename_all = "camelCase")]
     Finished {
         task_id: String,
@@ -1019,6 +1116,7 @@ impl VerificationEvent {
             Self::Due { task_id, .. }
             | Self::Started { task_id, .. }
             | Self::Check { task_id, .. }
+            | Self::Reused { task_id, .. }
             | Self::Finished { task_id, .. }
             | Self::Baseline { task_id, .. }
             | Self::Provenance { task_id, .. }
@@ -1084,6 +1182,9 @@ pub struct VerificationState {
     /// set until a `Finished` too: a run can be both due and in progress, and
     /// the completion gate reports each fact it can see.
     pub in_progress: bool,
+    /// Checks the latest attempt reused instead of running (spec 109 D6),
+    /// cleared by a new `Started` and by a later run of the same check.
+    pub reused: BTreeSet<CheckId>,
     /// Private so the state cannot be constructed by hand into a shape the
     /// events do not support; the report's honesty rests on the fold.
     passed_before: BTreeSet<CheckId>,
@@ -1129,6 +1230,7 @@ impl VerificationState {
                 self.finished = None;
                 self.repair_stall = None;
                 self.in_progress = true;
+                self.reused.clear();
                 for check in checks {
                     if !self.selected.contains(check) {
                         self.selected.push(check.clone());
@@ -1146,6 +1248,7 @@ impl VerificationState {
                     self.passed_before.insert(check.clone());
                 }
                 self.provenance_current.remove(check);
+                self.reused.remove(check);
                 self.checks.insert(
                     check.clone(),
                     CheckRun {
@@ -1154,6 +1257,15 @@ impl VerificationState {
                         generation: *generation,
                     },
                 );
+            }
+            VerificationEvent::Reused { check, .. } => {
+                // Deliberately leaves `checks`, `passed_before` and
+                // `provenance_current` alone: nothing ran, so the recorded run
+                // and its classification stay exactly what they were.
+                if !self.selected.contains(check) {
+                    self.selected.push(check.clone());
+                }
+                self.reused.insert(check.clone());
             }
             VerificationEvent::Finished { outcome, .. } => {
                 self.due = None;
@@ -1266,6 +1378,11 @@ pub struct VerificationReport {
     pub failed: Vec<FailedCheck>,
     pub skipped: Vec<SkippedCheck>,
     pub stale: Vec<CheckId>,
+    /// Checks the latest verification did not run because their recorded
+    /// result covered exactly the current tree (spec 109 D6). Not a fifth
+    /// partition: each is also in `passed` or `failed` by its recorded result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reused: Vec<CheckId>,
     pub behaviour_verified: Vec<String>,
     pub unverified_steps: Vec<String>,
     pub regressions: Vec<CheckId>,
@@ -1312,6 +1429,12 @@ impl VerificationReport {
             failed: Vec::new(),
             skipped: Vec::new(),
             stale: Vec::new(),
+            reused: state
+                .selected
+                .iter()
+                .filter(|check| state.reused.contains(*check))
+                .cloned()
+                .collect(),
             behaviour_verified: Vec::new(),
             unverified_steps: plan
                 .steps
@@ -1584,7 +1707,13 @@ impl VerificationReport {
         lines.push(section("Files changed", &list_or_none(&self.files_changed)));
 
         let passed = if !self.passed.is_empty() {
-            format!("{}   (all ran, exit 0)", labels(&self.passed).join(", "))
+            // "all ran" would be false for a reused result, which did not run
+            // this time; the reused line below says which ones those are.
+            if self.reused.is_empty() {
+                format!("{}   (all ran, exit 0)", labels(&self.passed).join(", "))
+            } else {
+                format!("{}   (exit 0)", labels(&self.passed).join(", "))
+            }
         } else {
             match self.outcome {
                 Some(VerificationOutcome::NoChecksAvailable) => {
@@ -1626,6 +1755,18 @@ impl VerificationReport {
             labels(&self.stale).join(", ")
         };
         lines.push(section("Checks stale", &stale));
+
+        // Only when something was reused, so every report written before spec
+        // 109 renders exactly as it did.
+        if !self.reused.is_empty() {
+            lines.push(section(
+                "Checks reused",
+                &format!(
+                    "{}   (not run again: the files are unchanged since the recorded run)",
+                    labels(&self.reused).join(", ")
+                ),
+            ));
+        }
 
         let behaviour = if self.behaviour_verified.is_empty() {
             "none".to_string()
@@ -1907,6 +2048,7 @@ pub fn propose_checks(
     repository_root: &Path,
     map: &RepositoryMap,
     changed: &[String],
+    reuse: &mut CheckReuse,
 ) -> Result<Selection> {
     propose_checks_for_roots(
         orchestrator,
@@ -1914,6 +2056,7 @@ pub fn propose_checks(
         map,
         &select_roots(map, changed),
         true,
+        reuse,
     )
 }
 
@@ -1935,6 +2078,7 @@ pub fn propose_completion_checks(
     repository_root: &Path,
     map: &RepositoryMap,
     changed: &[String],
+    reuse: &mut CheckReuse,
 ) -> Result<Selection> {
     propose_checks_for_roots(
         orchestrator,
@@ -1942,6 +2086,7 @@ pub fn propose_completion_checks(
         map,
         &select_floor_roots(map, changed),
         false,
+        reuse,
     )
 }
 
@@ -1951,6 +2096,7 @@ fn propose_checks_for_roots(
     map: &RepositoryMap,
     roots: &[String],
     drop_covered: bool,
+    reuse: &mut CheckReuse,
 ) -> Result<Selection> {
     if roots.is_empty() {
         return Ok(Selection::OnlyDocumentation);
@@ -1959,8 +2105,34 @@ fn propose_checks_for_roots(
     if drop_covered {
         drop_covered_member_checks(repository_root, &mut restricted);
     }
+    let reused_any = drop_reused(&mut restricted, reuse);
     let proposals = orchestrator.propose_detected_validations(repository_root, &restricted)?;
-    Ok(selection_from_proposals(repository_root, roots, proposals))
+    Ok(selection_from_proposals(
+        repository_root,
+        roots,
+        proposals,
+        reused_any,
+    ))
+}
+
+/// Remove the commands `reuse` reuses from a restricted map before anything is
+/// proposed (spec 109 D6), so a reused check is never stored, audited as
+/// proposed, or run. Returns whether any was removed.
+fn drop_reused(map: &mut RepositoryMap, reuse: &mut CheckReuse) -> bool {
+    let mut reused_any = false;
+    for root in &mut map.roots {
+        if root.user_override == Some(crate::repository_map::RootOverride::Removed) {
+            // Never proposed anyway; reporting it reused would be invented.
+            continue;
+        }
+        let path = root.path.clone();
+        root.commands.retain(|command| {
+            let reused = reuse.take(&CheckId::new(path.as_str(), command.command.as_str()));
+            reused_any |= reused;
+            !reused
+        });
+    }
+    reused_any
 }
 
 /// Propose exactly the requested checks, with no other command from their
@@ -1975,6 +2147,7 @@ pub fn propose_checks_exactly(
     repository_root: &Path,
     map: &RepositoryMap,
     checks: &[CheckId],
+    reuse: &mut CheckReuse,
 ) -> Result<Selection> {
     if checks.is_empty() {
         return Ok(Selection::OnlyDocumentation);
@@ -1993,8 +2166,14 @@ pub fn propose_checks_exactly(
             })
         });
     }
+    let reused_any = drop_reused(&mut restricted, reuse);
     let proposals = orchestrator.propose_detected_validations(repository_root, &restricted)?;
-    Ok(selection_from_proposals(repository_root, &roots, proposals))
+    Ok(selection_from_proposals(
+        repository_root,
+        &roots,
+        proposals,
+        reused_any,
+    ))
 }
 
 /// Adds the plan-declared checks the gate says must run again to a selection.
@@ -2009,6 +2188,7 @@ pub fn with_plan_checks(
     repository_root: &Path,
     selection: Selection,
     checks: &[CheckId],
+    reuse: &mut CheckReuse,
 ) -> Result<Selection> {
     let mut proposed = match selection {
         Selection::Proposed(proposed) => proposed,
@@ -2017,6 +2197,11 @@ pub fn with_plan_checks(
     };
     for check in checks {
         if proposed.iter().any(|(existing, _)| existing == check) {
+            continue;
+        }
+        // The gate asked for this check because its run is stale, so it is
+        // normally not reusable; reuse still decides, for one rule everywhere.
+        if reuse.take(check) {
             continue;
         }
         let working_directory = if check.working_directory.is_empty() {
@@ -2035,8 +2220,11 @@ fn selection_from_proposals(
     repository_root: &Path,
     roots: &[String],
     proposals: Vec<CommandProposal>,
+    reused_any: bool,
 ) -> Selection {
-    if proposals.is_empty() {
+    // Every check reused is a selection with nothing left to propose, not
+    // "no checks were available": the reused results are the verification.
+    if proposals.is_empty() && !reused_any {
         return Selection::NoChecksAvailable {
             roots: roots.to_vec(),
         };

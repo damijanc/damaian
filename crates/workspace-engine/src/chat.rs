@@ -99,8 +99,8 @@ use crate::validation::{
 };
 use crate::vector_index::VectorIndexCache;
 use crate::verification::{
-    CheckId, CheckOutcome, CheckTermination, FailureProvenance, FindingEvidence, Selection,
-    SkipReason, VerificationEvent, VerificationOutcome, VerificationReport,
+    CheckId, CheckOutcome, CheckReuse, CheckTermination, FailureProvenance, FindingEvidence,
+    Selection, SkipReason, VerificationEvent, VerificationOutcome, VerificationReport,
     environment_termination, fold_verification, propose_checks, propose_checks_exactly,
     propose_completion_checks, with_plan_checks,
 };
@@ -2708,6 +2708,15 @@ impl ChatOrchestrator {
                 .session_store
                 .planless_continues(session_id, &due.task_id)?,
         };
+        // Spec 109 D6: a check whose latest run in this task chain covered
+        // exactly the current tree is not proposed or run again; its recorded
+        // run stands, passed or failed. A check the plan defers to an open step
+        // is left to that step, as it would be if it were proposed.
+        let generation = plan.as_ref().map_or(0, TaskPlan::mutation_generation);
+        let mut reuse = CheckReuse::from_state(&scoped_state, &file_hashes, generation);
+        if let Some(plan) = plan.as_ref() {
+            reuse.retain(|check| !plan_defers_check(repository_root, plan, check));
+        }
         let selection = if !due.checks.is_empty() {
             // A completion due carries the exact floor checks the answer-time
             // trigger found missing or stale. Run those and nothing else; the
@@ -2718,6 +2727,7 @@ impl ChatOrchestrator {
                 repository_root,
                 &map,
                 &due.checks,
+                &mut reuse,
             )?
         } else if at_completion {
             propose_completion_checks(
@@ -2725,6 +2735,7 @@ impl ChatOrchestrator {
                 repository_root,
                 &map,
                 &changed,
+                &mut reuse,
             )?
         } else {
             propose_checks(
@@ -2732,6 +2743,7 @@ impl ChatOrchestrator {
                 repository_root,
                 &map,
                 &changed,
+                &mut reuse,
             )?
         };
         // Spec 106 Task 6: a finished step's required check that went stale
@@ -2744,7 +2756,9 @@ impl ChatOrchestrator {
             repository_root,
             selection,
             &plan_reruns,
+            &mut reuse,
         )?;
+        let reused = reuse.reused().to_vec();
         let browser = self.browser_check(session_id, &session, &task, &changed)?;
         if browser.is_none() {
             return match selection {
@@ -2773,6 +2787,7 @@ impl ChatOrchestrator {
                     due,
                     attempt,
                     checks,
+                    reused,
                     browser,
                     changed,
                     file_hashes,
@@ -2795,6 +2810,7 @@ impl ChatOrchestrator {
             due,
             attempt,
             checks,
+            reused,
             browser,
             changed,
             file_hashes,
@@ -3117,6 +3133,9 @@ impl ChatOrchestrator {
         due: crate::verification::VerificationDue,
         attempt: u32,
         checks: Vec<(CheckId, CommandProposal)>,
+        // Checks not proposed because their recorded run covered exactly the
+        // current tree (spec 109 D6). Recorded, never run.
+        reused: Vec<CheckId>,
         browser: Option<BrowserCheck>,
         changed: Vec<String>,
         file_hashes: BTreeMap<String, String>,
@@ -3173,6 +3192,25 @@ impl ChatOrchestrator {
                 checks: selected,
             },
         )?;
+        for check in &reused {
+            self.session_store.append_verification_event(
+                &session.id,
+                &VerificationEvent::Reused {
+                    task_id: task.id.clone(),
+                    check: check.clone(),
+                },
+            )?;
+            self.audit_log.record(
+                "verification_check_reused",
+                &[
+                    ("actor", "system".to_string()),
+                    ("sessionId", session.id.clone()),
+                    ("taskId", task.id.clone()),
+                    ("command", check.command.clone()),
+                    ("workingDirectory", check.working_directory.clone()),
+                ],
+            )?;
+        }
         // A rerun (proposal §5.5) reuses the step of a check an earlier attempt
         // already has and adds one only for a check new in this attempt: the
         // step is closed by id, so a second `verify_1` would take the old

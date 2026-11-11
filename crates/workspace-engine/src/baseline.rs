@@ -228,7 +228,13 @@ impl BaselineCoordinator {
         };
         let checks = match &map {
             Some(map) => {
-                match propose_checks(&self.validation, repository_root, map, &selected_paths)? {
+                match propose_checks(
+                    &self.validation,
+                    repository_root,
+                    map,
+                    &selected_paths,
+                    &mut crate::verification::CheckReuse::none(),
+                )? {
                     Selection::Proposed(checks) => checks.into_iter().collect(),
                     Selection::OnlyDocumentation | Selection::NoChecksAvailable { .. } => {
                         BTreeMap::new()

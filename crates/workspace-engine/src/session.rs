@@ -3944,6 +3944,7 @@ impl SessionStore {
             VerificationEvent::Due { .. } => "verification_due",
             VerificationEvent::Started { .. } => "verification_started",
             VerificationEvent::Check { .. } => "verification_check",
+            VerificationEvent::Reused { .. } => "verification_reused",
             VerificationEvent::Finished { .. } => "verification_finished",
             VerificationEvent::Baseline { .. } => "verification_baseline",
             VerificationEvent::Provenance { .. } => "verification_provenance",
@@ -4174,6 +4175,7 @@ impl SessionStore {
                 "verification_due"
                     | "verification_started"
                     | "verification_check"
+                    | "verification_reused"
                     | "verification_finished"
                     | "verification_baseline"
                     | "verification_provenance"

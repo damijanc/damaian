@@ -13149,6 +13149,16 @@ function createVerificationReportCard(report, reportRepo, { onContinueRepair = n
     }),
   );
   if (report.stale?.length) stale.classList.add("has-stale");
+  // Spec 109 D6: a check whose recorded result covered exactly the current
+  // files was not run again. Only shown when something was reused.
+  if (report.reused?.length) {
+    section(
+      "Checks reused",
+      report.reused.map((check) =>
+        document.createTextNode(`${checkLabel(check)} — not run again, files unchanged`),
+      ),
+    );
+  }
   section(
     "Behaviour verified",
     (report.behaviourVerified || []).map((item) => document.createTextNode(item)),

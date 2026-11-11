@@ -1,6 +1,6 @@
 # Spec 109 tasks
 
-**Started:** not yet — specified 2026-11-11
+**Started:** 2026-11-11
 
 Implementation plan for [`proposal.md`](proposal.md). The decisions and the code
 survey are in [`context.md`](context.md).
@@ -19,7 +19,7 @@ survey are in [`context.md`](context.md).
 
 | Task | State | Durable result |
 |---|---|---|
-| 1 · Reuse a result for an unchanged tree (D6) | Not started | — |
+| 1 · Reuse a result for an unchanged tree (D6) | Done 2026-11-11 | `CheckRun::reusable_for` (stricter than `!is_stale`: same generation **and** the same changed-file map with the same hashes, so a file changed after the run cannot hide; only an exited `Ran` outcome — passed or failed — is reusable; signalled, timed-out, cancelled, environment, skipped and browser runs rerun). `CheckReuse` is built in `verify_due` from the task chain's folded state (minus checks the plan defers to an open step) and passed to `propose_checks` / `propose_completion_checks` / `propose_checks_exactly` / `with_plan_checks`, which drop reused commands from the restricted map before `propose_detected_validations`, so nothing is stored, audited as proposed or run; all-reused is `Selection::Proposed([])`, not "no checks available". New event `verification_reused` (`VerificationEvent::Reused`, also accepted by `read_verification_events`) and audit `verification_check_reused`; it writes no `Check`, so the completion gate and provenance read the original `CheckRun`. `VerificationState::reused` (cleared by `Started` and by a later run) feeds `VerificationReport::reused`; the text report adds a "Checks reused" line (and drops "all ran") only when something was reused; the panel shows the same row. The spec 105 once-per-batch filter in `run_verification_checks` is unchanged — Task 2 owns selection. Tests (`verification_loop`): reusability rules, a reused check is never proposed, fold/report/serialisation, second verification of an unchanged tree runs nothing and the gate evidence is identical, a changed file reruns, a failed run is reused as failed. Checks passed locally: scoped clippy (`-p workspace-engine`); `cargo nextest run -p workspace-engine --test verification_loop --test plan_turn --test closed_task_completion` (239 passed, 19s wall in this worktree); `cargo check -p desktop-shell -p eval-harness --tests`; deterministic eval tier (62/62 pass; needs a local port, so it ran outside the agent sandbox); `scripts/quality-gate.sh fmt node lint typos deny` (deny outside the sandbox, which blocks its advisory-DB lock). Workspace clippy and tests left to CI. |
 | 2 · Plan's scoped check per change (D4) | Not started | — |
 | 3 · Lazy baseline on a pre-patch worktree (D1, D2) | Not started | — |
 | 4 · Rerun only the failing tests (D3) | Not started | — |
@@ -29,9 +29,9 @@ survey are in [`context.md`](context.md).
 
 ## Task 1 · Reuse a result for an unchanged tree (D6)
 
-- [ ] Before proposing a check, reuse a non-stale `CheckRun` of the same
+- [x] Before proposing a check, reuse a non-stale `CheckRun` of the same
       identity; record the reuse in the verification events and the report.
-- [ ] Tests: a second verification of an unchanged tree runs nothing; any file
+- [x] Tests: a second verification of an unchanged tree runs nothing; any file
       change or mutation generation makes it run.
 
 Files: `verification.rs`, `chat.rs`, tests. Checks: scoped clippy;

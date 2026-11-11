@@ -313,8 +313,8 @@ pub use validation::{
     command_approval_prompt, resolve_command_directory,
 };
 pub use verification::{
-    BROWSER_CHECK_PREFIX, CheckBaseline, CheckId, CheckOutcome, CheckProvenanceRecord, CheckRun,
-    CheckTermination, FAILURE_FINGERPRINT_VERSION, FailedCheck, FailureFingerprint,
+    BROWSER_CHECK_PREFIX, CheckBaseline, CheckId, CheckOutcome, CheckProvenanceRecord, CheckReuse,
+    CheckRun, CheckTermination, FAILURE_FINGERPRINT_VERSION, FailedCheck, FailureFingerprint,
     FailureProvenance, FindingEvidence, GENERIC_IDENTITY_TAIL_TRUNCATED,
     MAX_GENERIC_IDENTITY_TAIL_BYTES, MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, Selection,
     SkipReason, SkippedCheck, VerificationDue, VerificationEvent, VerificationOutcome,

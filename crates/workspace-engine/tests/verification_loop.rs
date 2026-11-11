@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use workspace_engine::plan::StepStatus;
 use workspace_engine::{
-    CancelToken, ChatTurnResult, CheckBaseline, CheckId, CheckOutcome, CommandPurpose,
+    CancelToken, ChatTurnResult, CheckBaseline, CheckId, CheckOutcome, CheckReuse, CommandPurpose,
     CompletionReasonCode, Config, ContextDecision, Evidence, FailureProvenance, HookConfig,
     HookEvent, HookMode, HookSource, MockModelAdapter, PLANNED_CHECK_VERSION, PausedTurns,
     PlanReport, PlanStep, PlannedCheck, ReattachedApproval, RepairStallReason, RoundBudgetDecision,
@@ -757,8 +757,14 @@ fn a_member_change_selects_only_its_owning_root() {
         "per-change selection is the owning root only"
     );
 
-    let selection =
-        propose_checks(&engine.validation_orchestrator, &repo.root, &map, &changed).unwrap();
+    let selection = propose_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &changed,
+        &mut CheckReuse::none(),
+    )
+    .unwrap();
     let Selection::Proposed(checks) = selection else {
         panic!("expected proposed checks, got {selection:?}");
     };
@@ -930,6 +936,7 @@ fn a_member_check_is_kept_in_the_completion_floor_when_the_root_does_not_run_it(
         &repo.root,
         &map,
         &changed,
+        &mut CheckReuse::none(),
     )
     .unwrap();
     let Selection::Proposed(checks) = selection else {
@@ -957,8 +964,14 @@ fn a_web_change_does_not_duplicate_the_test_script() {
         vec!["packages/web".to_string()]
     );
 
-    let selection =
-        propose_checks(&engine.validation_orchestrator, &repo.root, &map, &changed).unwrap();
+    let selection = propose_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &changed,
+        &mut CheckReuse::none(),
+    )
+    .unwrap();
     let Selection::Proposed(checks) = selection else {
         panic!("expected proposed checks, got {selection:?}");
     };
@@ -1011,7 +1024,8 @@ fn only_documentation_changes_select_nothing() {
             &engine.validation_orchestrator,
             &repo.root,
             &map,
-            &["docs/guide.md".to_string()]
+            &["docs/guide.md".to_string()],
+            &mut CheckReuse::none(),
         )
         .unwrap(),
         Selection::OnlyDocumentation
@@ -1063,8 +1077,14 @@ fn only_the_selected_roots_proposals_are_stored() {
     let changed = vec!["crates/engine/src/lib.rs".to_string()];
 
     let before = repo.pending_proposals();
-    let selection =
-        propose_checks(&engine.validation_orchestrator, &repo.root, &map, &changed).unwrap();
+    let selection = propose_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &changed,
+        &mut CheckReuse::none(),
+    )
+    .unwrap();
     let Selection::Proposed(checks) = selection else {
         panic!("expected proposed checks, got {selection:?}");
     };
@@ -1157,6 +1177,7 @@ fn a_repository_with_no_detected_checks_says_so() {
         &root,
         &map,
         &["src/main.rs".to_string()],
+        &mut CheckReuse::none(),
     )
     .unwrap();
     assert_eq!(
@@ -6166,6 +6187,349 @@ fn a_member_change_puts_the_workspace_root_check_in_the_floor() {
             .any(|reason| reason.explanation.contains("cargo test (repository root)")),
         "the workspace root check is a floor obligation: {settled:?}"
     );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+// --- Spec 109 Task 1: reuse a result for an unchanged tree (D6) -------------
+
+fn hashes(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(path, hash)| ((*path).to_string(), (*hash).to_string()))
+        .collect()
+}
+
+fn reusable(events: &[VerificationEvent], current: &[(&str, &str)], generation: u32) -> bool {
+    let folded = state(events);
+    let reuse = CheckReuse::from_state(&folded, &hashes(current), generation);
+    folded.checks.keys().any(|check| reuse.can_reuse(check))
+}
+
+/// A recorded run stands for a new one only when it covered exactly the
+/// current tree: the same generation, the same changed files with the same
+/// hashes. A failed exit is reusable (as a failure); a run that did not exit,
+/// a skip and an environment refusal are not.
+#[test]
+fn a_recorded_run_is_reusable_only_for_exactly_the_tree_it_covered() {
+    let cargo = check("", "cargo test");
+    let tree = [("src/a.rs", "h1")];
+    let passed = [ran_at_generation(cargo.clone(), Some(0), &tree, 2)];
+    assert!(reusable(&passed, &tree, 2), "same tree, same generation");
+    assert!(!reusable(&passed, &tree, 3), "a new mutation generation");
+    assert!(
+        !reusable(&passed, &[("src/a.rs", "h2")], 2),
+        "a changed file"
+    );
+    assert!(
+        !reusable(&passed, &[("src/a.rs", "h1"), ("src/b.rs", "h3")], 2),
+        "a file the task changed after the run is not covered by it"
+    );
+    assert!(!reusable(&passed, &[], 2), "a file the run covered is gone");
+
+    let failed = [ran_at_generation(cargo.clone(), Some(101), &tree, 2)];
+    assert!(
+        reusable(&failed, &tree, 2),
+        "a failed exit is reused as failed"
+    );
+
+    let signalled = [ran_at_generation(cargo.clone(), None, &tree, 2)];
+    assert!(
+        !reusable(&signalled, &tree, 2),
+        "killed or signalled reruns"
+    );
+
+    let cancelled = [VerificationEvent::Check {
+        task_id: "task".to_string(),
+        check: cargo.clone(),
+        outcome: CheckOutcome::Ran {
+            exit_code: None,
+            marker_id: "marker".to_string(),
+            termination: Some(workspace_engine::CheckTermination::Cancelled),
+        },
+        file_hashes: hashes(&tree),
+        generation: 2,
+    }];
+    assert!(!reusable(&cancelled, &tree, 2), "a cancelled run reruns");
+
+    let declined = [VerificationEvent::Check {
+        task_id: "task".to_string(),
+        check: cargo.clone(),
+        outcome: CheckOutcome::Skipped(SkipReason::DeclinedByUser),
+        file_hashes: hashes(&tree),
+        generation: 2,
+    }];
+    assert!(
+        !reusable(&declined, &tree, 2),
+        "a declined check asks again"
+    );
+
+    let environment = [VerificationEvent::Check {
+        task_id: "task".to_string(),
+        check: cargo.clone(),
+        outcome: CheckOutcome::Environment {
+            termination: workspace_engine::CheckTermination::MissingExecutable,
+        },
+        file_hashes: hashes(&tree),
+        generation: 2,
+    }];
+    assert!(
+        !reusable(&environment, &tree, 2),
+        "an environment refusal reruns"
+    );
+
+    let browser = [ran_at_generation(
+        CheckId::browser("http://localhost:3000"),
+        Some(0),
+        &tree,
+        2,
+    )];
+    assert!(
+        !reusable(&browser, &tree, 2),
+        "a page can change without a file"
+    );
+}
+
+/// A reused check is removed before anything is proposed, so it is neither
+/// stored as a proposal nor run, and the selection names it as reused.
+#[test]
+fn a_reused_check_is_never_proposed() {
+    let repo = Monorepo::new("reuse-selection");
+    let engine = repo.engine();
+    let map = repo.map(&engine);
+    let changed = vec!["crates/engine/src/lib.rs".to_string()];
+
+    let Selection::Proposed(all) = propose_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &changed,
+        &mut CheckReuse::none(),
+    )
+    .unwrap() else {
+        panic!("the member has checks");
+    };
+    let before = repo.pending_proposals();
+    let reused_check = all[0].0.clone();
+
+    let recorded = state(&[ran_with_hashes(reused_check.clone(), Some(0), &[])]);
+    let mut reuse = CheckReuse::from_state(&recorded, &BTreeMap::new(), 0);
+    let selection = propose_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &changed,
+        &mut reuse,
+    )
+    .unwrap();
+    let Selection::Proposed(proposed) = selection else {
+        panic!("reusing every check is still a selection, got {selection:?}");
+    };
+    assert!(proposed.iter().all(|(check, _)| check != &reused_check));
+    assert_eq!(proposed.len(), all.len() - 1);
+    assert_eq!(reuse.reused(), std::slice::from_ref(&reused_check));
+    assert_eq!(
+        repo.pending_proposals(),
+        before + proposed.len(),
+        "nothing is stored for the reused check"
+    );
+}
+
+/// The fold and the report: a reused check keeps its recorded run (the gate's
+/// evidence is untouched) and the report names it as reused.
+#[test]
+fn a_reused_check_keeps_its_run_and_the_report_says_reused() {
+    let cargo = check("", "cargo test");
+    let first = vec![
+        due(),
+        started(0, std::slice::from_ref(&cargo)),
+        ran(cargo.clone(), Some(0)),
+        finished(VerificationOutcome::Passed),
+    ];
+    let before = state(&first);
+    let mut events = first.clone();
+    events.extend([
+        due(),
+        started(1, &[]),
+        VerificationEvent::Reused {
+            task_id: "task".to_string(),
+            check: cargo.clone(),
+        },
+        finished(VerificationOutcome::Passed),
+    ]);
+    let after = state(&events);
+    assert_eq!(after.checks, before.checks, "the recorded run is unchanged");
+    assert!(after.reused.contains(&cargo));
+
+    let report = report_for(&events);
+    assert_eq!(report.passed, vec![cargo.clone()]);
+    assert_eq!(report.reused, vec![cargo.clone()]);
+    let text = report.render();
+    assert!(text.contains("Checks reused"), "{text}");
+    assert!(
+        !text.contains("all ran"),
+        "a reused check did not run: {text}"
+    );
+
+    // A later run of the same check is no longer reused.
+    events.extend([
+        started(2, std::slice::from_ref(&cargo)),
+        ran(cargo.clone(), Some(0)),
+    ]);
+    assert!(report_for(&events).reused.is_empty());
+    assert!(!report_for(&first).render().contains("Checks reused"));
+
+    let json = serde_json::to_value(VerificationEvent::Reused {
+        task_id: "task".to_string(),
+        check: cargo,
+    })
+    .unwrap();
+    assert_eq!(json["kind"], "verification_reused");
+    assert_eq!(json["taskId"], "task");
+    assert_eq!(json["check"]["command"], "cargo test");
+}
+
+fn check_events(engine: &WorkspaceEngine, session_id: &str) -> usize {
+    outcome_events(engine, session_id)
+        .iter()
+        .filter(|event| matches!(event, VerificationEvent::Check { .. }))
+        .count()
+}
+
+fn reused_events(engine: &WorkspaceEngine, session_id: &str) -> Vec<CheckId> {
+    outcome_events(engine, session_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            VerificationEvent::Reused { check, .. } => Some(check),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Make the patch's verification due again with nothing changed, as recovery
+/// does for a verification it offers again.
+fn due_again(engine: &WorkspaceEngine, session_id: &str) {
+    let due = outcome_events(engine, session_id)
+        .into_iter()
+        .find(|event| matches!(event, VerificationEvent::Due { .. }))
+        .expect("the patch recorded a due");
+    engine
+        .session_store
+        .append_verification_event(session_id, &due)
+        .expect("the due records");
+}
+
+/// Spec 109 requirement 5: a second verification of an unchanged tree runs
+/// nothing, records the reuse, and reports it; the completion gate reads the
+/// same `CheckRun` it read after the first run.
+#[test]
+fn a_second_verification_of_an_unchanged_tree_runs_nothing() {
+    let root = temp_dir("reuse-unchanged");
+    let data_dir = temp_dir("reuse-unchanged-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+    let first = run_verification(&engine, &root, &session, &mut adapter);
+    assert_eq!(
+        first.verification_report.as_ref().unwrap().outcome,
+        Some(VerificationOutcome::Passed)
+    );
+    assert_eq!(check_events(&engine, &session), 1);
+    let gate_evidence = fold_verification(outcome_events(&engine, &session).iter()).checks;
+
+    due_again(&engine, &session);
+    let second = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert!(second.check_batch.is_none(), "nothing to approve");
+    assert_eq!(check_events(&engine, &session), 1, "nothing ran again");
+    let cargo = CheckId::new("", "cargo test");
+    assert_eq!(reused_events(&engine, &session), vec![cargo.clone()]);
+    let report = second.verification_report.as_ref().expect("a report");
+    assert_eq!(report.outcome, Some(VerificationOutcome::Passed));
+    assert_eq!(report.passed, vec![cargo.clone()]);
+    assert_eq!(report.reused, vec![cargo]);
+    assert!(
+        second.response.contains("Checks reused"),
+        "{}",
+        second.response
+    );
+    assert_eq!(
+        fold_verification(outcome_events(&engine, &session).iter()).checks,
+        gate_evidence,
+        "the gate reads the original run"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// Any change to a file the run covered makes the check run again.
+#[test]
+fn a_changed_file_makes_the_check_run_again() {
+    let root = temp_dir("reuse-changed");
+    let data_dir = temp_dir("reuse-changed-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+    run_verification(&engine, &root, &session, &mut adapter);
+    assert_eq!(check_events(&engine, &session), 1);
+
+    write(&root, "src/a.rs", "let a = 3;\n");
+    due_again(&engine, &session);
+    let second = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert_eq!(check_events(&engine, &session), 2, "the check ran again");
+    assert!(reused_events(&engine, &session).is_empty());
+    assert!(second.verification_report.unwrap().reused.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+/// A failed recorded run is reused as that failure — never as a pass.
+#[test]
+fn a_failed_run_is_reused_as_failed() {
+    let root = temp_dir("reuse-failed");
+    let data_dir = temp_dir("reuse-failed-data");
+    cargofile(&root);
+    let engine = verify_engine(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[]);
+    let (session, _task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    let mut adapter = MockModelAdapter::new("");
+    let first = run_verification(&engine, &root, &session, &mut adapter);
+    let first_report = first.verification_report.expect("a report");
+    assert!(first_report.passed.is_empty());
+    assert_eq!(check_events(&engine, &session), 1);
+
+    due_again(&engine, &session);
+    let second = run_verification(&engine, &root, &session, &mut adapter);
+
+    let cargo = CheckId::new("", "cargo test");
+    assert_eq!(check_events(&engine, &session), 1, "nothing ran again");
+    assert_eq!(reused_events(&engine, &session), vec![cargo.clone()]);
+    let report = second.verification_report.expect("a report");
+    assert!(report.passed.is_empty(), "{report:?}");
+    assert!(
+        report.failed.iter().any(|failed| failed.check == cargo),
+        "{report:?}"
+    );
+    assert_eq!(report.reused, vec![cargo]);
+    assert_ne!(report.outcome, Some(VerificationOutcome::Passed));
+    assert!(!second.response.contains("Verification complete"));
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);
