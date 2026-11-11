@@ -1745,8 +1745,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        62,
-        "all sixty-two deterministic scenario files should be accounted for; the live \
+        63,
+        "all sixty-three deterministic scenario files should be accounted for; the live \
          injection twin is credential-gated"
     );
     assert_eq!(
