@@ -11354,6 +11354,9 @@ mod tests {
     /// cargo test -p desktop-shell --lib -- --ignored --nocapture serves_the_ui
     /// ```
     ///
+    /// It binds port 4899; set `DAMAIAN_UI_INSPECTION_PORT` to use another
+    /// when 4899 is taken by another checkout's server.
+    ///
     /// Then, in the browser console (the token gates every `/api/` route):
     ///
     /// ```js
@@ -11577,8 +11580,14 @@ mod tests {
         let command_activity_session = command_activity_session(&engine, &repository_id, &repo_arg);
         let question_session = pending_question_session(&engine, &repository_id);
 
+        // 4899 unless overridden, so two checkouts can be inspected at once
+        // without stopping each other's server.
+        let port = std::env::var("DAMAIAN_UI_INSPECTION_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4899);
         let options = ShellOptions {
-            port: 4899,
+            port,
             default_repo: Some(repo_arg.clone()),
             api_token: "damaian-ui-inspection-token".to_string(),
         };
@@ -13630,6 +13639,67 @@ mod tests {
 
         let unknown_error = desktop_settings_config_path(Some("admin")).unwrap_err();
         assert_eq!(unknown_error, "scope must be user");
+    }
+
+    /// The Settings task-budget fields (spec 103, 2026-11-11) save through
+    /// `/api/config-set`, which writes the user overlay with the engine's own
+    /// parser: a valid value lands, zero, text and anything above the product
+    /// ceiling are refused, and the file keeps the last good value.
+    #[test]
+    fn task_budget_settings_save_through_the_config_parser() {
+        let dir = std::env::temp_dir().join(format!(
+            "damaian-task-budget-settings-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user.conf");
+
+        super::update_config_overlay(path.clone(), "worker_task_budget_input_tokens", "20000000")
+            .unwrap();
+        super::update_config_overlay(path.clone(), "worker_task_budget_action_rounds", "120")
+            .unwrap();
+        let ceiling = workspace_engine::ABSOLUTE_TASK_INPUT_TOKEN_CEILING;
+        for refused in ["0", "lots", &(ceiling + 1).to_string()] {
+            let error = super::update_config_overlay(
+                path.clone(),
+                "worker_task_budget_input_tokens",
+                refused,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("worker_task_budget_input_tokens"),
+                "{refused}: {error}"
+            );
+        }
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("worker_task_budget_input_tokens=20000000"),
+            "{saved}"
+        );
+        assert!(
+            saved.contains("worker_task_budget_action_rounds=120"),
+            "{saved}"
+        );
+
+        // Every field the page renders names a key the overlay accepts.
+        for key in [
+            "worker_task_budget_action_rounds",
+            "worker_task_budget_exploration_rounds",
+            "worker_task_budget_input_tokens",
+            "worker_task_budget_output_tokens",
+        ] {
+            assert!(
+                super::INDEX_HTML.contains(&format!("data-config-key=\"{key}\"")),
+                "{key}"
+            );
+            super::update_config_overlay(path.clone(), key, "1").unwrap();
+        }
+        assert!(super::APP_JS.contains("\"/api/config-set\", form({ key: input.dataset.configKey"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

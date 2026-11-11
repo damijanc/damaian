@@ -427,7 +427,7 @@ fn weakening_cases() -> Vec<WeakeningCase> {
         case(
             "worker_task_budget_input_tokens",
             "worker_task_budget_input_tokens=4000000\n",
-            "worker_task_budget_input_tokens=8000000\n",
+            "worker_task_budget_input_tokens=64000000\n",
             Reported("worker_task_budget_input_tokens"),
         ),
         case(

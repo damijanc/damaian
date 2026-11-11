@@ -502,6 +502,44 @@ has a usage record, so a request with no provable spend fails closed as before.
 Tests: `task_budget::budget_usage_chain::*` (the chain case failed before the
 reader existed; an unrelated task in the same session is not counted).
 
+### 2026-11-11: the default input budget is 60,000,000, and Settings shows the totals
+
+The owner dogfooded an ordinary Code turn (spec 107 D3, which continues under
+the `worker_task_budget_*` defaults) on Damaian's own repository. It stopped on
+`input_tokens_exhausted` against the 8,000,000 default after 16 action and 24
+read-only rounds and fell back to the **Answer now / Continue** card, with the
+continuation task's usage line at 2.9M tokens over 40 calls, 97% cached. Each
+request re-sends the whole turn (by design since the 2026-11-10 entry below),
+so a chain's input grows with the size of each request times the number of
+calls, not with the work done. 8,000,000 was sized for about 125 requests at a
+64k context; on a 1M-token window a request may grow to the default
+`conversation_window_share` (25%), 250k, so the input total ran out at about a
+sixth of the round budget it sits beside.
+
+The owner first chose to count only uncached input, then decided to raise the
+default instead and keep the input dimension's meaning unchanged: every input
+token counts, cached or not. The new default is **60,000,000** = the default
+round budget (96 action + 144 read-only = 240 rounds) × 250k, the largest
+request the default window share allows on a 1M-token window. With it, the
+round totals rather than the input total end an ordinary long task. It stays
+under `ABSOLUTE_TASK_INPUT_TOKEN_CEILING` (64,000,000) and the default
+`worker_task_budget_max_input_tokens`. The output default (512,000) and both
+round defaults are unchanged.
+
+The owner also asked for the totals to be configurable in the app.
+**Settings → General → Task budget** shows the four `worker_task_budget_*`
+totals for the selected repository and saves a change through
+`/api/config-set`, which writes only the user overlay and validates with the
+engine's own parsers (`parse_task_budget_rounds`, `parse_task_budget_tokens`).
+A field whose effective value came from repository or profile config says so.
+The ceilings (`worker_task_budget_max_*`) stay config-file only. The keys keep
+their `Capability` classification, so a repository or profile may still lower
+a value and never raise it.
+
+Tests: `desktop-shell` `task_budget_settings_save_through_the_config_parser`;
+the permission-profile restrict-only case now raises to 64,000,000, since
+8,000,000 is no longer above the default.
+
 ### 2026-11-10: with a known window, the count cut is the fallback, not the first cut
 
 Damaian's first implementation task on a real spec (spec 33 Task 1, an

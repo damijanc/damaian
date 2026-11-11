@@ -562,6 +562,65 @@
               it.
             </p>
           </section>
+          <section class="settings-section" id="task-budget-section">
+            <h3>Task budget</h3>
+            <p class="settings-page-hint">
+              How far a Code-mode turn, or a worker with an approved plan, carries on by itself
+              before it stops and asks you to Continue. Input tokens count every request in full,
+              including what the provider serves from its cache. Saved to your user configuration;
+              a repository or permission profile may lower these values but never raise them.
+            </p>
+            <div class="provider-fields task-budget-fields">
+              <label class="field">
+                <span>Action rounds</span>
+                <input
+                  id="task-budget-action-rounds-input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  data-config-key="worker_task_budget_action_rounds"
+                  disabled
+                />
+                <small class="field-note" hidden></small>
+              </label>
+              <label class="field">
+                <span>Read-only rounds</span>
+                <input
+                  id="task-budget-exploration-rounds-input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  data-config-key="worker_task_budget_exploration_rounds"
+                  disabled
+                />
+                <small class="field-note" hidden></small>
+              </label>
+              <label class="field">
+                <span>Input tokens</span>
+                <input
+                  id="task-budget-input-tokens-input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  data-config-key="worker_task_budget_input_tokens"
+                  disabled
+                />
+                <small class="field-note" hidden></small>
+              </label>
+              <label class="field">
+                <span>Output tokens</span>
+                <input
+                  id="task-budget-output-tokens-input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  data-config-key="worker_task_budget_output_tokens"
+                  disabled
+                />
+                <small class="field-note" hidden></small>
+              </label>
+            </div>
+          </section>
           <section class="settings-section">
             <div class="section-heading">
               <h3>User configuration</h3>

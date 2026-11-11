@@ -1738,8 +1738,9 @@ charged to `agent_max_tool_rounds`.
 - **An ordinary Code-mode session, no `agent_max_task_tokens` (the default).**
   The turn crosses the checkpoint on its own while the task is making progress
   and is under the default task budget (the `worker_task_budget_*` totals:
-  96 action rounds, 144 read-only rounds, 8,000,000 input and 512,000 output
-  tokens unless lowered). Each crossing writes an `ordinary_continuation` audit
+  96 action rounds, 144 read-only rounds, 60,000,000 input and 512,000 output
+  tokens unless lowered; set them under **Settings → General → Task budget**,
+  where a value a repository lowered says so). Each crossing writes an `ordinary_continuation` audit
   record. It pauses on the round-budget card below only when the engine declines
   to continue, and then writes `ordinary_continuation_declined` with a `reason`:
   `no_progress` (the plan, step evidence, tool results and notes did not change

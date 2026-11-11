@@ -6022,6 +6022,7 @@ async function loadConfigFile() {
   $("worker-sessions-input").disabled = false;
   void refreshConversationAutoCompact();
   void refreshPauseForContextReview();
+  void refreshTaskBudgetSettings();
   void refreshModelKeyStatus().catch((error) => setModelKeyStatus(error.message, "error"));
   return payload;
 }
@@ -8398,6 +8399,72 @@ async function refreshPauseForContextReview() {
   } catch {
     input.checked = false;
     input.disabled = true;
+  }
+}
+
+// Spec 103 (2026-11-11): the task-budget totals, user scope only. Each field
+// shows the *effective* value for the selected repository, so a value a
+// repository or profile lowered is what the field reads, with a note naming
+// who lowered it. The engine's own parser validates a save
+// (`ConfigOverlay::set` behind `/api/config-set`).
+function taskBudgetInputs() {
+  return [...document.querySelectorAll("#task-budget-section input[data-config-key]")];
+}
+
+function taskBudgetLoweredBy(rule) {
+  const lowering = (rule?.sources || []).filter(
+    (source) => source.kind === "repository" || source.kind === "profile",
+  );
+  return lowering.map((source) => source.label).join(", ");
+}
+
+async function refreshTaskBudgetSettings() {
+  const inputs = taskBudgetInputs();
+  let rules = [];
+  try {
+    const payload = await api(`/api/effective-policy?repo=${encodeURIComponent(repo() || "")}`);
+    rules = payload.rules || [];
+  } catch {
+    // Unknown reads as empty and disabled: a field must not appear to hold a
+    // value it could not read.
+    for (const input of inputs) {
+      input.value = "";
+      input.disabled = true;
+    }
+    return;
+  }
+  for (const input of inputs) {
+    const rule = rules.find((entry) => entry.key === input.dataset.configKey);
+    input.value = rule?.value ?? "";
+    input.dataset.effective = input.value;
+    input.disabled = !rule;
+    const note = input.parentElement.querySelector(".field-note");
+    const loweredBy = taskBudgetLoweredBy(rule);
+    note.hidden = !loweredBy;
+    note.textContent = loweredBy ? `Lowered for this repository by ${loweredBy}.` : "";
+  }
+}
+
+async function saveTaskBudgetSetting(input) {
+  const label = input.parentElement.querySelector("span").textContent;
+  const value = String(input.value || "").trim();
+  if (input.validity?.badInput || !/^\d+$/.test(value)) {
+    toast(`${label} must be a whole number`);
+    input.value = input.dataset.effective || "";
+    return;
+  }
+  try {
+    await api("/api/config-set", form({ key: input.dataset.configKey, value }));
+    // The editor is authoritative for everything else; reload it so its next
+    // Save cannot write the old value back.
+    await loadConfigFile();
+    await refreshTaskBudgetSettings();
+    if (input.value !== value) {
+      toast(`Saved ${label.toLowerCase()} = ${value}; this repository's limit is lower`);
+    }
+  } catch (error) {
+    toast(errorMessage(error));
+    await refreshTaskBudgetSettings();
   }
 }
 
@@ -16737,6 +16804,13 @@ $("conversation-auto-compact-input").addEventListener("change", async (event) =>
     await refreshConversationAutoCompact();
   }
 });
+
+for (const input of taskBudgetInputs()) {
+  input.addEventListener("change", () => {
+    if (input.value.trim() === input.dataset.effective) return;
+    void saveTaskBudgetSetting(input);
+  });
+}
 
 $("worker-sessions-input").addEventListener("change", async (event) => {
   const enabled = event.target.checked;

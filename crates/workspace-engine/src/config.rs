@@ -3463,10 +3463,15 @@ impl Default for Config {
             // the proposal an open-ended spend.
             worker_task_budget_action_rounds: 96,
             worker_task_budget_exploration_rounds: 144,
-            // A generous but finite starting point: about 125 requests at the
-            // 64k context ceiling, and a reply allowance well above one model
-            // response. Both can be lowered by a repository or profile.
-            worker_task_budget_input_tokens: 8_000_000,
+            // Input: enough for every round of the default round budget
+            // (96 + 144 = 240) at the largest request the default window share
+            // allows on a 1M-token window (25% = 250k): 240 × 250k. Each
+            // request re-sends the whole turn, so the old 8,000,000 ran out
+            // after about 40 rounds of an ordinary turn (spec 103,
+            // 2026-11-11), long before the round budget it sits beside.
+            // Output: a reply allowance well above one model response. Both
+            // can be lowered by a repository or profile.
+            worker_task_budget_input_tokens: 60_000_000,
             worker_task_budget_output_tokens: 512_000,
             // The absolute product ceilings. A user or administrator may lower
             // these, and an untrusted scope may only lower them further.
