@@ -17667,12 +17667,17 @@ fn has_primary_steps(plan: &TaskPlan) -> bool {
 /// Whether taking this action would change something outside the session log,
 /// and so must wait for the plan to be reviewed (spec 21 §5.5).
 ///
-/// Derived from [`tool_action_marker`]'s side-effect answer so that question
-/// keeps living in one place, with two deliberate departures:
+/// Every variant is decided here by name, with no fallback. It used to defer
+/// to [`tool_action_marker`]'s crash-recovery side-effect flag for everything
+/// but a patch and a command, and that flag is the wrong question: proposing
+/// an edit applies nothing, so `edit_file` was not side-effecting and a plan
+/// whose first change was an `edit_file` call was never reviewed (2026-11-11).
+/// A new `ToolAction` variant now fails to compile until it is decided here.
 ///
-/// * `propose_patch` writes nothing to the repository and is correctly *not*
-///   side-effecting for crash recovery — but it is the front door to an edit,
-///   and §5.5 exists to put the plan in front of the user before edits start.
+/// * `propose_patch` and `edit_file` write nothing to the repository and are
+///   correctly *not* side-effecting for crash recovery — but each is the front
+///   door to an edit, and §5.5 exists to put the plan in front of the user
+///   before edits start.
 /// * `run_command` is answered by `command_needs_approval`, not by the action
 ///   alone. Whether a command mutates depends on the command, and the command
 ///   policy is the only thing that knows: a sandbox-safe `ls` is a read, and
@@ -17683,9 +17688,30 @@ fn action_awaits_plan_review(
     command_needs_approval: impl FnOnce(&str) -> bool,
 ) -> bool {
     match action {
-        ToolAction::ProposePatch(_) => true,
+        // Proposals of a repository change.
+        ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => true,
         ToolAction::Command(request) => command_needs_approval(&request.command),
-        other => tool_action_marker(other).2,
+        // Reach outside the machine or into another process: an MCP tool or a
+        // web diagnostic can act, and a fetch is an external outcome.
+        ToolAction::McpCall { .. } | ToolAction::WebDiagnostic(_) | ToolAction::FetchUrl { .. } => {
+            true
+        }
+        // Shape the turn or write only the session log; an answer or a memory
+        // suggestion authorises nothing and changes no file.
+        ToolAction::ProposePlan(_)
+        | ToolAction::CompleteStep
+        | ToolAction::AskUser(_)
+        | ToolAction::TurnNotes { .. }
+        | ToolAction::ProposeMemory { .. } => false,
+        // Reads.
+        ToolAction::ReadFile { .. }
+        | ToolAction::ListDirectory { .. }
+        | ToolAction::SearchContent { .. }
+        | ToolAction::SearchCodebase { .. }
+        | ToolAction::ReadGitStatus { .. }
+        | ToolAction::ReadGitDiff { .. }
+        | ToolAction::ListWorktrees { .. }
+        | ToolAction::ReadGitLog { .. } => false,
     }
 }
 

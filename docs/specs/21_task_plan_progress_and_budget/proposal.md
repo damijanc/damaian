@@ -546,3 +546,26 @@ that finds nothing no longer blocks. Pinned by
 (`tests/plan_turn.rs`), and the status-rule tests beside
 `one_failure_among_successes_still_blocks` (`tests/plan.rs`); with the
 supersession rule disabled, the three that rerun a command fail.
+
+### An `edit_file` first change skipped the review
+
+Found while dogfooding on 2026-11-11 (v0.69.0): a turn proposed a nine-step
+plan, then called `edit_file`, and the user saw a patch card with no plan
+review before it. The §5.5 gate asked `action_awaits_plan_review`, which
+answered `propose_patch` and `run_command` itself and sent every other action
+to the crash-recovery side-effect flag. That flag is false for `edit_file`
+([spec 47](../47_agent_working_capability/proposal.md)'s tool, added after the
+gate): proposing an edit applies nothing, just as for `propose_patch`, which
+was the gate's original deliberate exception. The flag answers "what might a
+crash leave half done", not "is this the first step that changes anything".
+
+The function now names every `ToolAction` variant, with no fallback: patches
+and edits wait for the review, a command waits when the command policy needs
+approval, MCP calls, web diagnostics and fetches wait (as before), and
+turn-shaping, notes, questions, memory suggestions and reads do not. A new
+variant does not compile until it is decided there. Spec 107 D3 is unchanged:
+a planless turn is still not gated, and a code-changing plan whose first
+change is an `edit_file` now gets the worker suggestion on its review. Pinned
+by `an_edit_file_call_waits_for_the_plan_review_like_a_patch` and
+`a_plan_whose_first_change_is_an_edit_file_is_offered_a_worker_at_its_review`
+(`tests/plan_turn.rs`), both of which fail on the old code.

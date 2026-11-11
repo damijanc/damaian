@@ -981,6 +981,81 @@ fn approving_the_plan_lets_the_patch_through() {
     assert!(result.plan_proposal.is_none());
 }
 
+/// An `edit_file` call replacing `fn main() {}` in the fixture's `src/a.rs`.
+fn edit_call(path: &str) -> ToolCall {
+    call(
+        "edit_file",
+        &format!(
+            r#"{{"summary":"Edit {path}","edits":[{{"path":"{path}","old_text":"fn main() {{}}","new_text":"fn main() {{ run(); }}"}}]}}"#
+        ),
+    )
+}
+
+#[test]
+fn an_edit_file_call_waits_for_the_plan_review_like_a_patch() {
+    // 2026-11-11 dogfooding: a planned turn whose first change was `edit_file`
+    // went straight to a patch card. Proposing an edit applies nothing, so the
+    // crash-recovery side-effect flag is false for it — but it is the front
+    // door to an edit exactly as `propose_patch` is, and §5.5 puts the plan in
+    // front of the user before that door opens.
+    let repo = temp_repo("gate-edit-file");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Read main"},{"title":"Call run from main"}]}"#,
+        )],
+        vec![edit_call("src/a.rs")],
+    ]);
+
+    let paused = ask(&engine, &repo, "Call run from main", &mut adapter);
+
+    let proposal = paused
+        .plan_proposal
+        .expect("the plan should be put up before the edit");
+    assert_eq!(proposal.deferred_action, "Preparing an edit: Edit src/a.rs");
+    assert!(
+        paused.patch_proposal.is_none(),
+        "the edit must not be prepared before the plan is reviewed"
+    );
+    assert_eq!(paused.task.status.as_str(), "waiting_for_approval");
+
+    let mut after = scripted(vec![vec![edit_call("src/a.rs")]]);
+    let result = decide(&engine, &proposal.id, true, None, &mut after);
+
+    assert!(
+        result.patch_proposal.is_some(),
+        "after approval the edit reaches its own patch review"
+    );
+    assert!(result.plan_proposal.is_none());
+}
+
+/// Spec 107 D3: the worker suggestion belongs on a code-changing plan's
+/// review, and an `edit_file` first change now reaches that review.
+#[test]
+fn a_plan_whose_first_change_is_an_edit_file_is_offered_a_worker_at_its_review() {
+    let repo = temp_repo("d3-worker-edit-file");
+    let engine = worker_check_engine(&repo, Path::new("/usr/bin/true"), true);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Write"},{"title":"Review"}]}"#,
+        )],
+        vec![edit_call("src/a.rs")],
+    ]);
+
+    let reviewed = ask(&engine, &repo, "Call run from main", &mut adapter);
+
+    let review = reviewed.plan_proposal.as_ref().expect("the plan is put up");
+    let suggestion = reviewed
+        .turn_presentation
+        .worker_suggestion
+        .as_ref()
+        .expect("a code-changing plan is offered a worker");
+    assert_eq!(suggestion.kind, workspace_engine::PendingDecisionKind::Plan);
+    assert_eq!(suggestion.card_id, review.id);
+}
+
 #[test]
 fn a_declined_plan_stops_the_work_it_was_holding_back() {
     let repo = temp_repo("decline");
