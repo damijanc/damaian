@@ -57,6 +57,10 @@ pub struct Run {
     /// put up for an answer, and, like `continuation_request`, only the
     /// deterministic tier can supply it.
     pub answer_request: Option<String>,
+    /// The message contents of the first model request made after a plan
+    /// review was answered with changes (spec 108 D6). Deterministic tier only,
+    /// like `answer_request`.
+    pub plan_changes_request: Option<String>,
     /// The report the verification continuation produced, when the scenario
     /// asked for one (spec 23 Task 9). `None` for every other scenario.
     pub verification: Option<VerificationReport>,
@@ -317,6 +321,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     // its next call, so the calls before it are the pre-pause ones.
     run.continuation_request = continuation_request(&run.trace, &adapter.requests);
     run.answer_request = answer_request(&run.trace, &adapter.requests);
+    run.plan_changes_request = plan_changes_request(&run.trace, &adapter.requests);
     (run.compacted_request, run.compacted_system_prompt) = compacted_requests(&adapter.requests);
     run.pinned_state_unchanged = pinned_state_survived(&run.trace, &adapter.requests);
     run.request = adapter.requests.first().map(flattened_request);
@@ -424,6 +429,21 @@ fn answer_request(trace: &Trace, requests: &[ModelRequest]) -> Option<String> {
             && event.field("status") == Some("question_pending")
     })?;
     let index = trace.events[..paused_at]
+        .iter()
+        .filter(|event| event.event_type == "model_request_prepared")
+        .count();
+    requests.get(index).map(flattened_request)
+}
+
+/// The request that followed a plan review answered with changes, flattened.
+/// Located by the decision's own audit record, which is written before the
+/// resumed turn makes its next call. `None` when no review was answered so.
+fn plan_changes_request(trace: &Trace, requests: &[ModelRequest]) -> Option<String> {
+    let answered_at = trace.events.iter().position(|event| {
+        event.event_type == "plan_review_decision"
+            && event.field("decision") == Some("changes_requested")
+    })?;
+    let index = trace.events[..answered_at]
         .iter()
         .filter(|event| event.event_type == "model_request_prepared")
         .count();
@@ -731,6 +751,7 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
         apply_error: None,
         continuation_request: None,
         answer_request: None,
+        plan_changes_request: None,
         verification: None,
         verification_baselines: BTreeMap::new(),
         last_assistant_message: None,
@@ -1245,7 +1266,7 @@ fn drive(
                 .record_worker_spawned(&session_id, &worker_record_for(materialized))?;
         }
         let budget: Option<TaskExecutionBudget> = match decision {
-            PlanDecision::Approve => None,
+            PlanDecision::Approve | PlanDecision::RequestChanges => None,
             PlanDecision::ApproveBudget => Some(
                 proposal
                     .budget_review
@@ -1268,17 +1289,29 @@ fn drive(
             cancel: &cancel,
             steering: None,
         };
-        outcome = engine
-            .chat_orchestrator
-            .resume_after_plan_decision_with_budget(
-                &proposal.id,
-                true,
-                None,
-                budget.as_ref(),
-                "eval-harness",
-                adapter,
-                &mut sink,
-            );
+        outcome = match (decision, scenario.plan_changes.as_deref()) {
+            (PlanDecision::RequestChanges, Some(changes)) => {
+                engine.chat_orchestrator.request_plan_changes(
+                    &proposal.id,
+                    changes,
+                    None,
+                    "eval-harness",
+                    adapter,
+                    &mut sink,
+                )
+            }
+            _ => engine
+                .chat_orchestrator
+                .resume_after_plan_decision_with_budget(
+                    &proposal.id,
+                    true,
+                    None,
+                    budget.as_ref(),
+                    "eval-harness",
+                    adapter,
+                    &mut sink,
+                ),
+        };
         if let Ok(result) = &outcome
             && let Some(proposal) = &result.command_proposal
         {
@@ -2097,6 +2130,7 @@ fn drive(
         // available; the live tier has no request record to read.
         continuation_request: None,
         answer_request: None,
+        plan_changes_request: None,
         verification,
         verification_baselines,
         last_assistant_message,

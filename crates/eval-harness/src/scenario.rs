@@ -200,6 +200,13 @@ pub struct Asserts {
     /// result rather than being recorded and dropped. Script-derived, so it is
     /// `deterministic_only`.
     pub answer_request_contains: Option<Vec<String>>,
+    /// Strings the first model request after a plan review was answered with
+    /// changes must contain (spec 108 D6): the user's words reached the model.
+    /// Script-derived, so `deterministic_only`.
+    pub plan_changes_request_contains: Option<Vec<String>>,
+    /// How many times the run paused on a plan review. Two for a review
+    /// answered with changes and a revised plan reviewed again.
+    pub plan_reviews: Option<u64>,
     /// That the run dispatched at least this many tool calls, which proves a
     /// batch ran every call the model made in one message. Script-derived, so a
     /// scenario using it lists it in `deterministic_only`.
@@ -419,6 +426,10 @@ pub enum RoundBudgetDecision {
 pub enum PlanDecision {
     Approve,
     ApproveBudget,
+    /// Decline with the scenario's `plan_changes` as the answer to "How
+    /// should the plan be changed?" (spec 108 D6). Approves nothing: the model
+    /// is asked for a revised plan, which is reviewed again.
+    RequestChanges,
 }
 
 #[derive(Debug, Clone)]
@@ -440,6 +451,8 @@ pub struct Scenario {
     pub worker_record_after_plan_review: bool,
     /// Answer the worker's plan review, if the script produces one.
     pub plan_decision: Option<PlanDecision>,
+    /// The user's answer for `plan_decision = "request_changes"`.
+    pub plan_changes: Option<String>,
     /// The mock provider's resolved context window. The deterministic tier has
     /// no real provider, so a within-turn compaction scenario has to declare
     /// the window whose share it wants to cross (spec 103 Task 4).
@@ -550,6 +563,8 @@ struct RawScenario {
     worker_record_after_plan_review: bool,
     #[serde(default)]
     plan_decision: Option<PlanDecision>,
+    #[serde(default)]
+    plan_changes: Option<String>,
     #[serde(default)]
     context_window: Option<u32>,
     #[serde(default)]
@@ -730,6 +745,16 @@ pub fn load(path: &Path) -> Result<Scenario> {
             path.display()
         )));
     }
+    let has_changes = raw
+        .plan_changes
+        .as_deref()
+        .is_some_and(|changes| !changes.trim().is_empty());
+    if (raw.plan_decision == Some(PlanDecision::RequestChanges)) != has_changes {
+        return Err(ClientError::InvalidInput(format!(
+            "{}: plan_decision = \"request_changes\" and a non-empty plan_changes go together",
+            path.display()
+        )));
+    }
     if raw.worker_record_after_plan_review {
         if raw.worker_record {
             return Err(ClientError::InvalidInput(format!(
@@ -843,6 +868,7 @@ pub fn load(path: &Path) -> Result<Scenario> {
         worker_record: raw.worker_record,
         worker_record_after_plan_review: raw.worker_record_after_plan_review,
         plan_decision: raw.plan_decision,
+        plan_changes: raw.plan_changes,
         context_window: raw.context_window,
         reload_outcome: raw.reload_outcome,
         modify_after_proposal: raw

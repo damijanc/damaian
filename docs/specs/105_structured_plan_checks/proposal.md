@@ -56,6 +56,15 @@ engine-owned statement that all requested checks had passed on the final tree.
 7. The plan review card clearly lists required checks and their directories.
    The user may remove or change a proposed check before approval; that edit is
    recorded as part of the approved plan.
+
+   *Note 2026-11-11 (spec 108 D6):* the card's check editor (add, change,
+   remove) was removed with the rest of the in-card plan editor. The owner,
+   dogfooding, found the controls confusing and wants the plan changed through
+   the conversation: the card now lists each step's check as text, and
+   **Decline** asks "How should the plan be changed?", after which the model
+   proposes a revised plan that is reviewed again. The engine and
+   `/api/resume-plan` still accept a revised step list with check edits, so the
+   revision rules and their tests here are unchanged; no UI sends one.
 8. Checks named by the task instructions or repository agent instructions are
    proposed by the model for review, not silently trusted from repository
    configuration. Repository text cannot auto-approve a command.

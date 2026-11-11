@@ -14154,110 +14154,14 @@ function createRoundBudgetOffer(proposal, proposalRepo) {
 }
 
 // The plan review gate, per spec 21 §5.5: the turn has stopped before its
-// first mutating step and the user may reorder, retitle, delete or approve.
-//
-// Steps that already reached an outcome are shown but not editable — their
-// evidence is tied to a state of the repository, and the engine refuses to
-// delete one, so offering the control would be offering something that does
-// not work.
+// first mutating step. Since spec 108 D6 the card is read-only: the steps and
+// their checks are shown as text, and the plan is changed through the
+// conversation, not a form. Decline asks "How should the plan be changed?";
+// an answer sends the model back for a revised plan, which is reviewed again
+// before any change. The answer authorises nothing.
 //
 // `decide` is for a worker's plan (spec 57 §5.6), as on the command card. The
-// worker's `approve` takes no revision, so its steps are shown, not edited.
-
-// The check editor on one editable plan-review step (spec 105 §7). The step's
-// check is the object `plan_json` sent — `{ command, workingDirectory, purpose,
-// required, version }` — or `null` for none. Editing mutates that object in
-// place, so the revision the card later sends carries exactly what the user
-// settled. `version` is transported, not shown: the change path keeps the
-// existing value, and the add path omits it so the server defaults a new check.
-function planCheckControl(step, index) {
-  const wrap = document.createElement("div");
-  wrap.className = "plan-review-check";
-
-  function field(initial, placeholder) {
-    const input = document.createElement("input");
-    input.type = "text";
-    input.className = "plan-review-check-input";
-    input.value = initial ?? "";
-    input.placeholder = placeholder;
-    return input;
-  }
-
-  function renderForm(existing) {
-    wrap.innerHTML = "";
-    const command = field(existing?.command, "command");
-    const directory = field(existing?.workingDirectory, "directory (empty = repository root)");
-    const purpose = field(existing?.purpose, "why (purpose)");
-    const required = document.createElement("input");
-    required.type = "checkbox";
-    required.checked = existing ? existing.required !== false : true;
-    const requiredLabel = document.createElement("label");
-    requiredLabel.className = "plan-review-check-required";
-    requiredLabel.title = "When unchecked the check still runs but does not gate completion";
-    requiredLabel.append(required, document.createTextNode("Required"));
-    const save = document.createElement("button");
-    save.type = "button";
-    save.className = "btn-sm btn-primary";
-    save.textContent = "Save";
-    save.addEventListener("click", () => {
-      if (command.value.trim() === "") return;
-      const next = {
-        command: command.value.trim(),
-        workingDirectory: directory.value.trim(),
-        purpose: purpose.value.trim(),
-        required: required.checked,
-      };
-      // A changed check keeps the version it already had; a newly added one
-      // omits it so the server defaults it to the current version.
-      if (existing?.version !== undefined) next.version = existing.version;
-      step.check = next;
-      render();
-    });
-    const cancel = document.createElement("button");
-    cancel.type = "button";
-    cancel.className = "btn-sm btn-quiet";
-    cancel.textContent = "Cancel";
-    cancel.addEventListener("click", render);
-    wrap.append(command, directory, purpose, requiredLabel, save, cancel);
-  }
-
-  function render() {
-    wrap.innerHTML = "";
-    if (step.check) {
-      const label = document.createElement("span");
-      label.className = "plan-review-check-label";
-      label.textContent = planCheckTitle(step.check);
-      const change = document.createElement("button");
-      change.type = "button";
-      change.className = "btn-icon";
-      change.title = "Change this check";
-      change.setAttribute("aria-label", `Change check for step ${index + 1}`);
-      change.textContent = "✎";
-      change.addEventListener("click", () => renderForm(step.check));
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "btn-icon";
-      remove.title = "Remove this check";
-      remove.setAttribute("aria-label", `Remove check from step ${index + 1}`);
-      remove.textContent = "×";
-      remove.addEventListener("click", () => {
-        step.check = null;
-        render();
-      });
-      wrap.append(label, change, remove);
-    } else {
-      const add = document.createElement("button");
-      add.type = "button";
-      add.className = "btn-sm btn-quiet";
-      add.textContent = "+ Add a required check";
-      add.setAttribute("aria-label", `Add a check to step ${index + 1}`);
-      add.addEventListener("click", () => renderForm(null));
-      wrap.append(add);
-    }
-  }
-  render();
-  return wrap;
-}
+// worker's route takes no changes, so its Decline is the plain one.
 
 // The card lists a check's command and directory; `required: false` is visually
 // distinct from a required check so the user can see which checks gate
@@ -14273,17 +14177,12 @@ function createPlanReview(
   { decide: decideInWorker = null, workerSuggestion = null } = {},
 ) {
   const plan = proposal.plan || { steps: [] };
-  const editable = decideInWorker
+  const outstanding = decideInWorker
     ? []
     : (plan.steps || []).filter((step) => step.outcome === "outstanding");
   const settled = decideInWorker
     ? plan.steps || []
     : (plan.steps || []).filter((step) => step.outcome !== "outstanding");
-  let steps = editable.map((step) => ({
-    id: step.id,
-    title: step.title,
-    check: step.check ?? null,
-  }));
 
   const wrapper = document.createElement("div");
   wrapper.className = "command-approval";
@@ -14292,19 +14191,23 @@ function createPlanReview(
   header.className = "command-approval-header";
   const title = document.createElement("strong");
   title.textContent = "Review the plan";
-  const meta = document.createElement("span");
-  meta.className = "command-approval-risk";
-  meta.textContent = proposal.deferredAction || "review";
-  meta.dataset.blocked = "false";
-  header.append(title, meta);
+  header.append(title);
 
   const note = document.createElement("p");
   note.className = "plan-review-note";
   note.textContent = decideInWorker
     ? "Nothing has changed yet. Approve the steps as they stand, or decline them."
-    : settled.length
-      ? `Nothing has changed yet. ${settled.length === 1 ? "One step has" : `${settled.length} steps have`} already finished and cannot be removed.`
-      : "Nothing has changed yet. Adjust the steps or approve them as they stand.";
+    : "Nothing has changed yet. Approve the plan, or decline it and say what to change.";
+
+  // What the turn was about to do, as a quiet line rather than a chip: the
+  // label can be a long command, and it is context, not the decision.
+  let next = null;
+  if (proposal.deferredAction) {
+    next = document.createElement("p");
+    next.className = "plan-review-next";
+    next.textContent = `Next: ${proposal.deferredAction}`;
+    next.title = proposal.deferredAction;
+  }
 
   // Spec 103 Task 2: the budget arrives with its title, note, rows, labels and
   // units from the engine. This card renders those rows as data; it does not
@@ -14334,71 +14237,34 @@ function createPlanReview(
 
   const list = document.createElement("ol");
   list.className = "plan-review-list";
-
-  function renderRows() {
-    list.innerHTML = "";
-    settled.forEach((step) => {
-      const row = document.createElement("li");
-      row.className = "plan-review-row";
-      row.dataset.settled = "true";
-      const text = document.createElement("span");
-      text.className = "plan-step-title";
-      text.textContent = step.title;
-      const outcome = document.createElement("span");
-      outcome.className = "plan-step-outcome";
-      outcome.textContent = STEP_OUTCOME_LABELS[step.outcome] || "";
-      row.append(text, outcome);
-      list.append(row);
-    });
-    steps.forEach((step, index) => {
-      const row = document.createElement("li");
-      row.className = "plan-review-row";
-      const input = document.createElement("input");
-      input.type = "text";
-      input.className = "plan-review-title";
-      input.value = step.title;
-      input.setAttribute("aria-label", `Step ${index + 1} title`);
-      input.addEventListener("input", () => {
-        steps[index].title = input.value;
-      });
-      const up = document.createElement("button");
-      up.type = "button";
-      up.className = "btn-icon";
-      up.title = "Move up";
-      up.setAttribute("aria-label", `Move step ${index + 1} up`);
-      up.textContent = "↑";
-      up.disabled = index === 0;
-      up.addEventListener("click", () => {
-        [steps[index - 1], steps[index]] = [steps[index], steps[index - 1]];
-        renderRows();
-      });
-      const down = document.createElement("button");
-      down.type = "button";
-      down.className = "btn-icon";
-      down.title = "Move down";
-      down.setAttribute("aria-label", `Move step ${index + 1} down`);
-      down.textContent = "↓";
-      down.disabled = index === steps.length - 1;
-      down.addEventListener("click", () => {
-        [steps[index], steps[index + 1]] = [steps[index + 1], steps[index]];
-        renderRows();
-      });
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "btn-icon";
-      remove.title = "Remove this step";
-      remove.setAttribute("aria-label", `Remove step ${index + 1}`);
-      remove.textContent = "×";
-      remove.addEventListener("click", () => {
-        steps = steps.filter((_, position) => position !== index);
-        renderRows();
-      });
-      row.append(input, up, down, remove);
-      row.append(planCheckControl(step, index));
-      list.append(row);
-    });
+  for (const step of settled) {
+    const row = document.createElement("li");
+    row.className = "plan-review-row";
+    row.dataset.settled = "true";
+    const text = document.createElement("span");
+    text.className = "plan-step-title";
+    text.textContent = step.title;
+    const outcome = document.createElement("span");
+    outcome.className = "plan-step-outcome";
+    outcome.textContent = STEP_OUTCOME_LABELS[step.outcome] || "";
+    row.append(text, outcome);
+    list.append(row);
   }
-  renderRows();
+  for (const step of outstanding) {
+    const row = document.createElement("li");
+    row.className = "plan-review-row";
+    const text = document.createElement("span");
+    text.className = "plan-step-title";
+    text.textContent = step.title;
+    row.append(text);
+    if (step.check) {
+      const check = document.createElement("span");
+      check.className = "plan-review-check";
+      check.textContent = planCheckTitle(step.check);
+      row.append(check);
+    }
+    list.append(row);
+  }
 
   const actions = document.createElement("div");
   actions.className = "command-approval-actions";
@@ -14420,51 +14286,70 @@ function createPlanReview(
     suggestionRow = createWorkerSuggestion(workerSuggestion, { onRun: runInWorker });
   }
 
+  // Spec 108 D6: Decline asks first. Nothing is sent until the user answers,
+  // so the card stays the pending decision (spec 107) while the question is
+  // open.
+  const changes = document.createElement("div");
+  changes.className = "plan-review-changes";
+  changes.hidden = true;
+  const changesId = `plan-changes-${proposal.proposalId}`;
+  const changesLabel = document.createElement("label");
+  changesLabel.htmlFor = changesId;
+  changesLabel.textContent = "How should the plan be changed?";
+  const changesInput = document.createElement("textarea");
+  changesInput.id = changesId;
+  changesInput.rows = 3;
+  const changesActions = document.createElement("div");
+  changesActions.className = "plan-review-changes-actions";
+  const sendButton = document.createElement("button");
+  sendButton.type = "button";
+  sendButton.className = "btn-sm btn-primary";
+  sendButton.textContent = "Send";
+  sendButton.disabled = true;
+  const declineOnlyButton = document.createElement("button");
+  declineOnlyButton.type = "button";
+  declineOnlyButton.className = "btn-sm btn-quiet";
+  declineOnlyButton.textContent = "Decline without changes";
+  changesActions.append(sendButton, declineOnlyButton);
+  changes.append(changesLabel, changesInput, changesActions);
+  changesInput.addEventListener("input", () => {
+    sendButton.disabled = changesInput.value.trim() === "";
+  });
+  changesInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !sendButton.disabled) {
+      event.preventDefault();
+      sendButton.click();
+    }
+  });
+
   const output = document.createElement("pre");
   output.className = "command-approval-output";
   output.hidden = true;
 
-  // Whether this counts as a revision is decided by comparing against what was
-  // proposed, not by whether the user touched a control: a reorder followed by
-  // a reorder back is not a revision, and recording one would put a
-  // `plan_revised` event in the log describing no change.
-  function revisionOrNull() {
-    const sameCheck = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-    const same =
-      steps.length === editable.length &&
-      steps.every((step, index) => {
-        const original = editable[index];
-        return (
-          step.id === original.id &&
-          step.title === original.title &&
-          sameCheck(step.check, original.check)
-        );
-      });
-    return same ? null : steps;
+  const controls = [approveButton, declineButton, sendButton, declineOnlyButton, changesInput];
+  function setControlsDisabled(disabled) {
+    for (const control of controls) control.disabled = disabled;
+    if (!disabled) sendButton.disabled = changesInput.value.trim() === "";
   }
 
-  async function decide(approved) {
-    approveButton.disabled = true;
-    declineButton.disabled = true;
-    list.querySelectorAll("input, button").forEach((control) => {
-      control.disabled = true;
-    });
+  // `changes` is the user's answer to the Decline question, sent only with a
+  // decline; an empty answer is the plain decline.
+  async function decide(approved, changesText = "") {
+    setControlsDisabled(true);
     output.hidden = false;
-    output.textContent = approved ? "Continuing…" : "Declining…";
+    output.textContent = approved ? "Continuing…" : changesText ? "Sending…" : "Declining…";
 
     if (decideInWorker) {
       try {
         output.textContent = await decideInWorker(approved);
       } catch (error) {
-        approveButton.disabled = false;
-        declineButton.disabled = false;
+        setControlsDisabled(false);
         output.textContent = error.message;
         throw error;
       }
       return;
     }
 
-    const revision = approved ? revisionOrNull() : null;
     const assistantMessage = appendChatMessage("assistant", "");
     // No Stop: this stream is sent without an abort signal, so nothing on this
     // path can cancel it.
@@ -14477,7 +14362,7 @@ function createPlanReview(
           repo: proposalRepo,
           proposal_id: proposal.proposalId,
           approved: approved ? "true" : "false",
-          steps: revision ? JSON.stringify(revision) : "",
+          changes: approved ? "" : changesText,
           // The exact typed budget the engine proposed, returned unchanged.
           budget: proposal.budgetReview ? JSON.stringify(proposal.budgetReview.budget) : "",
         },
@@ -14525,47 +14410,52 @@ function createPlanReview(
       indicator.finish("failed");
     }
     if (streamError) {
-      // The bubble is the failure's record; the caller's toast goes away.
+      // The bubble is the failure's record; the caller's toast goes away. A
+      // failure before the engine took the pause (no model key, say) leaves
+      // the review answerable, so the card is too; the typed answer stays.
       renderChatMessageError(assistantMessage, streamError);
+      setControlsDisabled(false);
+      output.hidden = true;
       throw streamError;
     }
     output.textContent = approved
-      ? revision
-        ? "Plan revised and approved — see the assistant's answer above."
-        : "Plan approved — see the assistant's answer above."
-      : "Plan declined — see the assistant's answer above.";
+      ? "Plan approved — see the assistant's answer above."
+      : changesText
+        ? "Asked for a revised plan — see the assistant's answer above."
+        : "Plan declined — see the assistant's answer above.";
     await loadSessions(currentSessionId, false);
     await refreshFindings();
     void refreshRepoBar();
   }
 
-  approveButton.addEventListener("click", async () => {
-    try {
-      await decide(true);
-    } catch (error) {
-      toast(error.message);
+  function run(approved, changesText = "") {
+    decide(approved, changesText).catch((error) => toast(error.message));
+  }
+
+  approveButton.addEventListener("click", () => run(true));
+  declineButton.addEventListener("click", () => {
+    if (decideInWorker) {
+      run(false);
+      return;
     }
+    declineButton.hidden = true;
+    changes.hidden = false;
+    changesInput.focus();
   });
-  declineButton.addEventListener("click", async () => {
-    try {
-      await decide(false);
-    } catch (error) {
-      toast(error.message);
-    }
+  sendButton.addEventListener("click", () => {
+    const text = changesInput.value.trim();
+    if (text) run(false, text);
   });
+  declineOnlyButton.addEventListener("click", () => run(false));
+
   // The pause stays until a worker has started: a dialog the user cancels
   // leaves the card answerable, and the turn ends here only once the work has
   // somewhere to go. Returns the started worker's row, or null.
   async function runInWorker() {
     const sessionId = currentSessionId;
-    const revision = revisionOrNull();
     const { prompt, taskId } = await api(
       "/api/plan-worker-prompt",
-      form({
-        repo: proposalRepo,
-        proposal_id: proposal.proposalId,
-        steps: revision ? JSON.stringify(revision) : "",
-      }),
+      form({ repo: proposalRepo, proposal_id: proposal.proposalId }),
     );
     const started = await showNewWorkerDialog({
       prompt,
@@ -14581,12 +14471,7 @@ function createPlanReview(
         worker_session_id: started.sessionId,
       }),
     );
-    [approveButton, declineButton].forEach((button) => {
-      button.disabled = true;
-    });
-    list.querySelectorAll("input, button").forEach((control) => {
-      control.disabled = true;
-    });
+    setControlsDisabled(true);
     output.hidden = false;
     output.replaceChildren(createWorkerLink(started, "Handed to"));
     await loadSessions(sessionId, false);
@@ -14594,9 +14479,10 @@ function createPlanReview(
   }
 
   wrapper.append(header, note);
+  if (next) wrapper.append(next);
   if (suggestionRow) wrapper.append(suggestionRow);
   if (budgetSection) wrapper.append(budgetSection);
-  wrapper.append(list, actions, output);
+  wrapper.append(list, actions, changes, output);
   return wrapper;
 }
 

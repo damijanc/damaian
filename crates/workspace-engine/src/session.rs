@@ -4645,6 +4645,53 @@ impl SessionStore {
         Ok(untouched)
     }
 
+    /// Records that the user reviewed this task's plan and asked for changes
+    /// instead of approving or declining it (spec 108 D6).
+    ///
+    /// Only the length of the user's text is written here; the text itself is
+    /// the user message the same resume appends. The event is what lets the
+    /// model's next `propose_plan` replace the plan rather than be refused as
+    /// a second one (see [`Self::plan_changes_requested`]).
+    pub fn request_plan_changes(
+        &self,
+        task: &Task,
+        requested_by: &str,
+        changes_length: usize,
+    ) -> Result<()> {
+        self.append_session_event(
+            &task.session_id,
+            "plan_changes_requested",
+            &format!(
+                "{{\"taskId\":\"{}\",\"requestedBy\":\"{}\",\"changesLength\":{changes_length}}}",
+                escape_json(&task.id),
+                escape_json(requested_by)
+            ),
+        )
+    }
+
+    /// Whether the user's latest word on this task's plan is a request for
+    /// changes that no plan has answered yet (spec 108 D6). A new, revised or
+    /// approved plan settles it.
+    pub fn plan_changes_requested(&self, session_id: &str, task_id: &str) -> Result<bool> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(false);
+        };
+        let mut requested = false;
+        for event in active_events(&content) {
+            if event.text("taskId").as_deref() != Some(task_id) {
+                continue;
+            }
+            match event.event_type.as_str() {
+                "plan_changes_requested" => requested = true,
+                "plan_created" | "plan_revised" | "plan_resumed" | "plan_approved" => {
+                    requested = false;
+                }
+                _ => {}
+            }
+        }
+        Ok(requested)
+    }
+
     /// Tasks carrying a usage entry for a model call lost to a crash, written
     /// by `recovery::account_for_lost_model_calls` (spec 19 §5.5).
     ///

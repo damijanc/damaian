@@ -6251,8 +6251,6 @@ impl ChatOrchestrator {
             _ => None,
         };
         let pending = self.pending_commands.take(proposal_id)?;
-        let turn_notes = TurnNotesState::from_pending(&pending);
-        let mut messages = pending.messages;
 
         let mut plan = current_plan;
         let note = if !approved {
@@ -6365,6 +6363,87 @@ impl ChatOrchestrator {
             ],
         )?;
 
+        self.continue_after_plan_review(pending, note, model_adapter, sink)
+    }
+
+    /// Answers a plan review with the user's request for changes (spec 108
+    /// D6): neither an approval nor a decline.
+    ///
+    /// The steps stay outstanding, exactly as proposed; the decision is
+    /// recorded as `plan_review_decision` `changes_requested` (the audit holds
+    /// the text's length, never the text) and as a `plan_changes_requested`
+    /// session event, which lets the model's next `propose_plan` replace the
+    /// plan. The user's words reach the model as a user message telling it not
+    /// to change the repository and to propose a revised plan. The answer
+    /// authorises nothing: no plan is approved here, so the revised plan — or
+    /// any mutating action the model tries instead — meets the plan-review
+    /// gate again (AGENTS.md "Questions are not approvals").
+    ///
+    /// `budget` follows the decline rule of
+    /// [`Self::resume_after_plan_decision_with_budget`]: it may be omitted, and
+    /// when sent must be the reviewed one.
+    pub fn request_plan_changes(
+        &self,
+        proposal_id: &str,
+        changes: &str,
+        budget: Option<&TaskExecutionBudget>,
+        requested_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let changes = changes.trim();
+        if changes.is_empty() {
+            return Err(ClientError::InvalidInput(
+                "Say how the plan should be changed, or decline it without changes.".to_string(),
+            ));
+        }
+        // Validated before `take`, as for a decision: a refusal leaves the
+        // review pending and answerable.
+        let pending = self.pending_commands.load(proposal_id)?;
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::PlanReview)?;
+        let Some(review) = pending.plan_review.clone() else {
+            unreachable!("a plan review pause must carry its review");
+        };
+        validate_plan_budget_decision(&review, false, budget, &self.config.task_budget_policy())?;
+        let pending = self.pending_commands.take(proposal_id)?;
+
+        // User text bound for the model: redacted like an answer, because the
+        // card's text field invites pasting.
+        let changes = self.scanner.redact(changes).text;
+        self.session_store.request_plan_changes(
+            &pending.task,
+            requested_by,
+            changes.chars().count(),
+        )?;
+        self.audit_log.record(
+            "plan_review_decision",
+            &[
+                ("actor", requested_by.to_string()),
+                ("sessionId", pending.session.id.clone()),
+                ("taskId", pending.task.id.clone()),
+                ("proposalId", proposal_id.to_string()),
+                ("decision", "changes_requested".to_string()),
+                ("changesLength", changes.chars().count().to_string()),
+            ],
+        )?;
+        let note = format!(
+            "The user reviewed the plan and asked for changes:\n{changes}\nDo not change the repository. Propose a revised plan with propose_plan that addresses this, then continue with it: the user reviews the revised plan before any change is made."
+        );
+        self.continue_after_plan_review(pending, note, model_adapter, sink)
+    }
+
+    /// The common end of every plan-review answer that continues the turn:
+    /// the decision goes to the model as a user message, and the turn runs on.
+    fn continue_after_plan_review(
+        &self,
+        pending: PendingChatTurn,
+        note: String,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let turn_notes = TurnNotesState::from_pending(&pending);
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let mut messages = pending.messages;
         self.session_store.append_message(
             &pending.session.id,
             Some(&pending.task.id),
@@ -11833,12 +11912,22 @@ impl ChatOrchestrator {
                             // first mutating action.
                             let continue_protected = turn_options.plan_already_carried
                                 && plan.as_ref().is_some_and(carried_plan_has_outstanding_work);
-                            let replaceable = plan.is_some()
-                                && !continue_protected
+                            // Spec 108 D6: the user reviewed this plan and asked
+                            // for changes, so its replacement is exactly what
+                            // they asked for, carried or not. It still meets the
+                            // review gate before any change.
+                            let changes_requested = plan.is_some()
                                 && self
                                     .session_store
-                                    .carried_plan_untouched(&session.id, &task.id)
+                                    .plan_changes_requested(&session.id, &task.id)
                                     .unwrap_or(false);
+                            let replaceable = plan.is_some()
+                                && (changes_requested
+                                    || (!continue_protected
+                                        && self
+                                            .session_store
+                                            .carried_plan_untouched(&session.id, &task.id)
+                                            .unwrap_or(false)));
                             if plan.is_some() && !replaceable {
                                 // Refused rather than replaced. Steps already carry
                                 // evidence tied to a state of the repository, and

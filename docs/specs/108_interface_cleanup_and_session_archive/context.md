@@ -91,3 +91,12 @@ sessions (2026-11-09/10, v0.64.0–v0.66.0) and their session logs.
   The route still accepts `steps` (spec 66/105 revisions) so the engine API
   and its tests are unchanged; the UI no longer sends it. Specs 66 and 105 get
   dated notes that the in-card editor was removed and why.
+  *As built (Task 8, 2026-11-11):* the engine entry is
+  `ChatOrchestrator::request_plan_changes`; it also writes a
+  `plan_changes_requested` session event, because without it the model's
+  `propose_plan` would be refused as "a second plan" — the event makes the
+  plan replaceable until a new, revised or approved plan settles it. The
+  message to the model ends "…then continue with it: the user reviews the
+  revised plan before any change is made", so the model does not stop at the
+  proposal. A worker's plan card keeps the plain Decline: its decide route
+  takes no `changes`.

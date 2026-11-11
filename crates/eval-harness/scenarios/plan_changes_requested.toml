@@ -1,0 +1,69 @@
+name = "plan_changes_requested"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Add a retry to the upload client."
+plan_decision = "request_changes"
+plan_changes = "Do not touch the scheduler; keep the retry inside upload.rs."
+
+# Spec 108 D6: the plan review is answered with "How should the plan be
+# changed?" instead of an approval. The answer reaches the model as a user
+# message, the model proposes a revised plan, and its next change meets the
+# plan-review gate again with the revision. Nothing is approved and nothing is
+# applied: the run ends paused on the second review.
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_plan", arguments = { steps = [
+    { title = "Rework the scheduler" },
+    { title = "Add a retry to upload" },
+  ] } },
+]
+
+# The deferred change that raises the first review. Dropped, never prepared.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Retry uploads", files = [
+    { path = "src/upload.rs", status = "modified", content = "pub fn upload() {}\n" },
+  ] } },
+]
+
+# After the changes: the revised plan replaces the first one.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_plan", arguments = { steps = [
+    { title = "Add a retry inside upload.rs" },
+  ] } },
+]
+
+# The same change again: the revised plan is reviewed before it.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Retry uploads", files = [
+    { path = "src/upload.rs", status = "modified", content = "pub fn upload() {}\n" },
+  ] } },
+]
+
+[[turn]]
+content = "Unreachable: the run pauses on the second review."
+
+[assert]
+plan_reviews = 2
+plan_changes_request_contains = [
+  "asked for changes",
+  "Do not touch the scheduler; keep the retry inside upload.rs.",
+  "Propose a revised plan with propose_plan",
+]
+patch_applied = false
+files_changed_outside_patch = 0
+final_task_status = "waiting_for_approval"
+task_count = 1
+deterministic_only = [
+  "plan_reviews",
+  "plan_changes_request_contains",
+  "final_task_status",
+  "task_count",
+]

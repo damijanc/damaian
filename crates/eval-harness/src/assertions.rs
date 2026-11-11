@@ -676,6 +676,52 @@ pub fn evaluate(
             }
         }
 
+        // Spec 108 D6: the user's requested changes reached the model.
+        if let Some(wanted) = &asserts.plan_changes_request_contains {
+            match &run.plan_changes_request {
+                Some(request) => {
+                    let missing: Vec<&String> = wanted
+                        .iter()
+                        .filter(|needle| !request.contains(needle.as_str()))
+                        .collect();
+                    push(
+                        "plan_changes_request_contains",
+                        missing.is_empty(),
+                        format!("{wanted:?}"),
+                        if missing.is_empty() {
+                            "all present".to_string()
+                        } else {
+                            format!("missing from the post-changes request: {missing:?}")
+                        },
+                    );
+                }
+                None => push(
+                    "plan_changes_request_contains",
+                    false,
+                    format!("{wanted:?}"),
+                    "no plan review was answered with changes".to_string(),
+                ),
+            }
+        }
+
+        if let Some(expected) = asserts.plan_reviews {
+            let actual = run
+                .trace
+                .events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "model_response_completed"
+                        && event.field("status") == Some("plan_review_required")
+                })
+                .count() as u64;
+            push(
+                "plan_reviews",
+                actual == expected,
+                expected.to_string(),
+                actual.to_string(),
+            );
+        }
+
         if let Some(expected) = asserts.exploration_findings {
             let exploration = run.record.findings_by_purpose.exploration;
             push(

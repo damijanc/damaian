@@ -219,6 +219,16 @@ never asks the model to complete work the user refused, and the panel reports
 what happened. This is not "the model's behalf": the status records the user's
 answer, and the step keeps any evidence it already had.
 
+*Note 2026-11-11 (spec 108 D6):* a decline now first asks "How should the plan
+be changed?". Only **Decline without changes** (or an empty answer) is the
+decline described here. An answer is a third outcome, `changes_requested`: the
+steps stay outstanding rather than `skipped`, because the user has not refused
+the work, only this version of it; the model is told not to change the
+repository and to propose a revised plan, which replaces this one and meets the
+review gate again. The card's step editor (retitle, reorder, remove) was
+removed at the same time — the owner found it confusing and wants the plan
+changed through the conversation rather than a form.
+
 ### 5.2 The reminder
 
 At each completion point in `run_agentic_turn` — the no-tool-call answer

@@ -5633,7 +5633,7 @@ body.worker-view #chat-model-menu {
   font-size: 11px;
 }
 
-/* The review card's editable rows. Spec 21 §5.5. */
+/* The plan review card (spec 21 §5.5; read-only since spec 108 D6). */
 .plan-review-note {
   margin: 0;
   color: var(--muted);
@@ -5707,65 +5707,64 @@ body.worker-view #chat-model-menu {
 }
 
 .plan-review-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
+  display: grid;
+  gap: 2px;
 }
 
-/* A step that already ran is shown but not editable: the engine refuses to
-   delete one, so offering the control would offer something that does not
-   work. */
+/* A step that already ran is listed with its outcome. */
 .plan-review-row[data-settled="true"] {
   color: var(--muted);
 }
 
-.plan-review-title {
-  flex: 1 1 auto;
-  min-width: 0;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--surface);
-  color: var(--ink);
-  font-size: 12px;
-  padding: 3px 7px;
-}
-
-/* The structured check on one editable plan-review step (spec 105 §7): the
-   command, directory, purpose and required flag the user may add, change or
-   remove before approval. */
+/* Spec 108 D6: the card is read-only; a step's check is text under it. */
 .plan-review-check {
-  flex-basis: 100%;
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 2px;
-}
-
-.plan-review-check-label {
   color: var(--muted);
   font-size: 11px;
+  overflow-wrap: anywhere;
 }
 
-.plan-review-check-input {
-  flex: 1 1 120px;
-  min-width: 0;
+/* What the turn was about to do when it paused, quietly. */
+.plan-review-next {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Decline asks how to change the plan (spec 108 D6). */
+.plan-review-changes {
+  display: grid;
+  gap: 6px;
+}
+
+/* `display: grid` would otherwise override the attribute: the question stays
+   out of sight until Decline opens it. */
+.plan-review-changes[hidden] {
+  display: none;
+}
+
+.plan-review-changes label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.plan-review-changes textarea {
+  min-height: 56px;
+  resize: vertical;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface);
   color: var(--ink);
+  font: inherit;
   font-size: 12px;
-  padding: 3px 7px;
+  padding: 5px 7px;
 }
 
-.plan-review-check-required {
+.plan-review-changes-actions {
   display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  color: var(--ink);
-  white-space: nowrap;
+  gap: 6px;
 }
 
 @keyframes turn-indicator-pulse {

@@ -1083,6 +1083,166 @@ fn a_declined_plan_stops_the_work_it_was_holding_back() {
     );
 }
 
+/// Answers a plan review with "How should the plan be changed?" (spec 108 D6).
+fn request_changes(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    changes: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.request_plan_changes(
+        proposal_id,
+        changes,
+        None,
+        "tester",
+        adapter,
+        &mut sink,
+    )
+}
+
+#[test]
+fn asking_for_changes_puts_the_revised_plan_up_for_review_and_applies_nothing() {
+    // Spec 108 D6. The user's answer is not an approval: the model proposes
+    // a revised plan, which replaces the first, and its next change meets the
+    // gate again with the revision on the card.
+    let repo = temp_repo("changes-requested");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![plan_call(&[
+            "Read the retry helper",
+            "Rewrite the scheduler",
+        ])],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let first = paused.plan_proposal.expect("the plan should be put up");
+
+    let mut after = scripted(vec![
+        vec![plan_call(&[
+            "Read the retry helper",
+            "Add a bounded backoff",
+        ])],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let result = request_changes(
+        &engine,
+        &first.id,
+        "Leave the scheduler alone; add a bounded backoff instead.",
+        &mut after,
+    )
+    .expect("the turn should run");
+
+    assert!(
+        result.patch_proposal.is_none(),
+        "asking for changes approves nothing, so no patch is prepared"
+    );
+    assert!(!repo.join("src/retry.rs").exists(), "nothing was applied");
+    let review = result
+        .plan_proposal
+        .expect("the revised plan is put up for review again");
+    assert_ne!(review.id, first.id);
+    let titles: Vec<&str> = review
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.title.as_str())
+        .collect();
+    assert_eq!(titles, ["Read the retry helper", "Add a bounded backoff"]);
+    assert_eq!(result.task.status.as_str(), "waiting_for_approval");
+    assert!(
+        !engine
+            .session_store
+            .read_plan_approved(&result.session.id, &result.task.id)
+            .unwrap()
+    );
+
+    let log = log_of(&repo, &result.session.id);
+    assert!(log.contains("plan_changes_requested"), "{log}");
+    assert!(
+        log.contains("asked for changes:\\nLeave the scheduler alone"),
+        "the user's words reach the model as a user message: {log}"
+    );
+    let decisions = audit_events(&repo, "plan_review_decision");
+    let decision = decisions.last().expect("the decision is audited");
+    let fields = decision.to_string();
+    assert!(fields.contains("changes_requested"), "{fields}");
+    assert!(fields.contains("\"changesLength\":\"57\""), "{fields}");
+    assert!(
+        !fields.contains("scheduler alone"),
+        "the audit holds the length, never the text: {fields}"
+    );
+}
+
+#[test]
+fn asking_for_changes_keeps_the_steps_outstanding() {
+    // Unlike a decline, the plan is not settled: nothing is skipped while the
+    // model works out its revision.
+    let repo = temp_repo("changes-outstanding");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![plan_call(&[
+            "Read the retry helper",
+            "Add a bounded backoff",
+        ])],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+
+    // The model answers in prose and never proposes again; the steps are
+    // still the user's open plan, not skipped work.
+    let mut after = MockModelAdapter::new("What backoff ceiling do you want?");
+    let result = request_changes(&engine, &proposal.id, "Cap it at 30s", &mut after)
+        .expect("the turn should run");
+
+    let plan = plan_of(&engine, &result).expect("the plan reads back");
+    assert!(
+        plan.steps
+            .iter()
+            .all(|step| step.status != StepStatus::Skipped),
+        "{:?}",
+        plan.steps
+    );
+    assert!(result.patch_proposal.is_none());
+}
+
+#[test]
+fn an_empty_answer_is_refused_and_leaves_the_review_answerable() {
+    let repo = temp_repo("changes-empty");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![plan_call(&["Read", "Write"])],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+
+    let mut unused = MockModelAdapter::new("unused");
+    assert!(request_changes(&engine, &proposal.id, "   ", &mut unused).is_err());
+
+    // The plain decline still works afterwards, and is today's decline.
+    let mut after = MockModelAdapter::new("I won't make that change.");
+    let result = decide(&engine, &proposal.id, false, None, &mut after);
+    let plan = plan_of(&engine, &result).expect("the plan reads back");
+    assert!(
+        plan.steps
+            .iter()
+            .all(|step| step.status == StepStatus::Skipped)
+    );
+    let decision = audit_events(&repo, "plan_review_decision");
+    assert!(decision.last().unwrap().to_string().contains("declined"));
+    assert!(!log_of(&repo, &result.session.id).contains("plan_changes_requested"));
+}
+
 #[test]
 fn a_revision_is_what_the_work_goes_on_to_follow() {
     // §5.5: the user may delete and retitle steps, and both the original and

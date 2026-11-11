@@ -4049,6 +4049,11 @@ fn parse_check_decisions(raw: &str) -> Result<Vec<(String, bool)>, String> {
 /// the user wants them to run. Absent means "approved as proposed" — which is
 /// not the same as an empty array, and the difference matters: an empty array
 /// is a revision that deletes every step the engine would let it delete.
+///
+/// Spec 108 D6: a decline may carry `changes`, the user's answer to "How
+/// should the plan be changed?". Non-empty, it asks the model for a revised
+/// plan instead of ending the plan; empty or absent, the decline is the plain
+/// one. The card no longer sends `steps`, but the route still takes them.
 fn run_resume_plan_request(
     form: &HashMap<String, String>,
     cancel: &CancelToken,
@@ -4061,6 +4066,15 @@ fn run_resume_plan_request(
         Some(raw) => Some(parse_plan_revision(raw, Path::new(&repo))?),
         None => None,
     };
+    let changes = form
+        .get("changes")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if changes.is_some() && (approved || revised.is_some()) {
+        // Changes answer a decline; with an approval or an edited step list
+        // the request would be two decisions at once.
+        return Err("Changes are sent with a decline, not with an approval.".to_string());
+    }
     // Transport only: the typed budget the card returned is handed back
     // unchanged. The engine decides whether it matches the review, is within
     // the effective ceiling, or is allowed at all.
@@ -4084,6 +4098,19 @@ fn run_resume_plan_request(
         cancel,
         steering: None,
     };
+    if let Some(changes) = changes {
+        return engine
+            .chat_orchestrator
+            .request_plan_changes(
+                &proposal_id,
+                &changes,
+                budget.as_ref(),
+                "desktop_user",
+                adapter.as_mut(),
+                &mut sink,
+            )
+            .map_err(|error| error.to_string());
+    }
     engine
         .chat_orchestrator
         .resume_after_plan_decision_with_budget(
@@ -8820,6 +8847,84 @@ mod tests {
             vec!["budgetReview", "deferredAction", "plan", "proposalId"],
             "a worker review adds exactly the budget key"
         );
+    }
+
+    /// Spec 108 D6: the plan card shows the steps and their checks as text;
+    /// the plan is changed through the conversation. Decline opens the
+    /// question and sends nothing until it is answered.
+    #[test]
+    fn the_plan_card_is_read_only_and_decline_asks_how_to_change_it() {
+        let card = app_js_function("createPlanReview");
+        for editor in [
+            "input.className = \"plan-review-title\"",
+            "Move step",
+            "Remove this step",
+            "planCheckControl",
+            "Add a required check",
+            "steps: revision",
+            "command-approval-risk",
+            "\"↑\"",
+            "\"↓\"",
+            "\"×\"",
+        ] {
+            assert!(!card.contains(editor), "editing control left: {editor}");
+        }
+        assert!(
+            !super::APP_JS.contains("function planCheckControl("),
+            "the check editor is gone"
+        );
+        // Checks are text, the deferred action a quiet line.
+        assert!(card.contains("planCheckTitle(step.check)"), "{card}");
+        assert!(
+            card.contains("`Next: ${proposal.deferredAction}`"),
+            "{card}"
+        );
+
+        assert!(
+            card.contains("\"How should the plan be changed?\""),
+            "{card}"
+        );
+        assert!(card.contains("\"Send\""), "{card}");
+        assert!(card.contains("\"Decline without changes\""), "{card}");
+        assert!(
+            card.contains("changes: approved ? \"\" : changesText"),
+            "{card}"
+        );
+        // Decline only opens the question; a worker's card keeps the plain
+        // decline because its route takes no changes.
+        let decline = card
+            .split("declineButton.addEventListener(\"click\"")
+            .nth(1)
+            .and_then(|rest| rest.split("});").next())
+            .expect("the decline handler");
+        assert!(decline.contains("changes.hidden = false"), "{decline}");
+        assert!(decline.contains("if (decideInWorker)"), "{decline}");
+
+        let css = include_str!("../static/style.css");
+        for gone in [".plan-review-title", ".plan-review-check-input"] {
+            assert!(!css.contains(gone), "{gone} is styled still");
+        }
+        // Its `display: grid` must not defeat `hidden` before Decline.
+        assert!(css.contains(".plan-review-changes[hidden]"), "{css}");
+    }
+
+    /// Spec 108 D6: `changes` answers a decline. With an approval the request
+    /// would be two decisions at once, so it is refused before anything runs.
+    #[test]
+    fn the_resume_plan_route_refuses_changes_with_an_approval() {
+        let form: HashMap<String, String> = [
+            ("repo", "/nonexistent-damaian-repo"),
+            ("proposal_id", "planreview_x"),
+            ("approved", "true"),
+            ("changes", "Skip the docs step"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let (events, _discard) = std::sync::mpsc::channel();
+        let error = super::run_resume_plan_request(&form, &CancelToken::new(), &events)
+            .expect_err("changes with an approval");
+        assert!(error.contains("sent with a decline"), "{error}");
     }
 
     #[test]
