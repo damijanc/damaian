@@ -39,6 +39,7 @@ harness, and **Release** covers packaging, signing and distribution.
 
 | | |
 |---|---|
+| **v0.69.0** | **App**<br>- Remove the Protected paths panel and list a worker's protected paths on its card (spec 108 Task 1). |
 | **v0.68.0** | Documentation and specification updates only. |
 | **v0.67.0** | **Engine**<br>- Continue ordinary Code-mode turns while they progress, verify per change, and suggest a worker once (spec 107 Task 5).<br>- Stream baseline progress and let the user cancel a running baseline (spec 107 Task 4).<br>- Record the model of each call and list every model a turn used (spec 108 Task 6).<br>- Keep a waiting status line and show the current activity with its own clock (spec 107 Task 3).<br>- Archive and unarchive sessions durably in the engine and shell routes (spec 108 Task 3).<br>- Report the decision a waiting turn needs from the engine, live and on reload (spec 107 Task 1).<br><br>**App**<br>- Show the decision a turn waits on above the composer, with a composer line naming it (spec 107 Task 2). |
 | **v0.66.0** | **Engine**<br>- Keep a turn's whole history below the window share and cut by count only as a fallback. |
