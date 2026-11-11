@@ -314,12 +314,12 @@ pub use validation::{
 };
 pub use verification::{
     BROWSER_CHECK_PREFIX, CheckBaseline, CheckId, CheckOutcome, CheckProvenanceRecord, CheckReuse,
-    CheckRun, CheckTermination, FAILURE_FINGERPRINT_VERSION, FailedCheck, FailureFingerprint,
-    FailureProvenance, FindingEvidence, GENERIC_IDENTITY_TAIL_TRUNCATED,
-    MAX_GENERIC_IDENTITY_TAIL_BYTES, MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, Selection,
-    SkipReason, SkippedCheck, VerificationDue, VerificationEvent, VerificationOutcome,
+    CheckRun, CheckTermination, DeferredCheck, FAILURE_FINGERPRINT_VERSION, FailedCheck,
+    FailureFingerprint, FailureProvenance, FindingEvidence, GENERIC_IDENTITY_TAIL_TRUNCATED,
+    MAX_GENERIC_IDENTITY_TAIL_BYTES, MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, ScopedSelection,
+    Selection, SkipReason, SkippedCheck, VerificationDue, VerificationEvent, VerificationOutcome,
     VerificationReport, VerificationState, fold_verification, is_documentation, propose_checks,
-    select_roots,
+    propose_scoped_checks, scoped_selection, select_roots,
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,

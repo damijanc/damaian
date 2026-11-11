@@ -976,6 +976,15 @@ pub(crate) fn normalized_repository_path(path: &str) -> String {
     }
 }
 
+/// A check left to the open plan step that carries it (spec 109 D4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferredCheck {
+    pub check: CheckId,
+    /// The plan step's title.
+    pub step: String,
+}
+
 /// What the whole verification came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1068,6 +1077,18 @@ pub enum VerificationEvent {
     /// read the same `CheckRun` they would have read anyway.
     #[serde(rename = "verification_reused", rename_all = "camelCase")]
     Reused { task_id: String, check: CheckId },
+    /// A check that would verify this change was not run because its own open
+    /// plan step runs it (spec 105 §4, spec 109 D4). It writes no `Check` and
+    /// is not selected: nothing ran, so it is never evidence for the gate or
+    /// for `complete_step`. It exists so the report can say where the check
+    /// went instead of reading as "no verification has run".
+    #[serde(rename = "verification_deferred", rename_all = "camelCase")]
+    Deferred {
+        task_id: String,
+        check: CheckId,
+        /// The title of the open plan step that carries the check.
+        step: String,
+    },
     #[serde(rename = "verification_finished", rename_all = "camelCase")]
     Finished {
         task_id: String,
@@ -1117,6 +1138,7 @@ impl VerificationEvent {
             | Self::Started { task_id, .. }
             | Self::Check { task_id, .. }
             | Self::Reused { task_id, .. }
+            | Self::Deferred { task_id, .. }
             | Self::Finished { task_id, .. }
             | Self::Baseline { task_id, .. }
             | Self::Provenance { task_id, .. }
@@ -1185,6 +1207,10 @@ pub struct VerificationState {
     /// Checks the latest attempt reused instead of running (spec 109 D6),
     /// cleared by a new `Started` and by a later run of the same check.
     pub reused: BTreeSet<CheckId>,
+    /// Checks the latest attempt left to their open plan step, with that
+    /// step's title (spec 109 D4), cleared by a new `Started` and by a later
+    /// run of the same check. Never evidence: nothing ran.
+    pub deferred: BTreeMap<CheckId, String>,
     /// Private so the state cannot be constructed by hand into a shape the
     /// events do not support; the report's honesty rests on the fold.
     passed_before: BTreeSet<CheckId>,
@@ -1231,6 +1257,7 @@ impl VerificationState {
                 self.repair_stall = None;
                 self.in_progress = true;
                 self.reused.clear();
+                self.deferred.clear();
                 for check in checks {
                     if !self.selected.contains(check) {
                         self.selected.push(check.clone());
@@ -1249,6 +1276,7 @@ impl VerificationState {
                 }
                 self.provenance_current.remove(check);
                 self.reused.remove(check);
+                self.deferred.remove(check);
                 self.checks.insert(
                     check.clone(),
                     CheckRun {
@@ -1266,6 +1294,11 @@ impl VerificationState {
                     self.selected.push(check.clone());
                 }
                 self.reused.insert(check.clone());
+            }
+            VerificationEvent::Deferred { check, step, .. } => {
+                // Not selected and not a run: the report names it, the gate
+                // and provenance never see it.
+                self.deferred.insert(check.clone(), step.clone());
             }
             VerificationEvent::Finished { outcome, .. } => {
                 self.due = None;
@@ -1383,6 +1416,11 @@ pub struct VerificationReport {
     /// partition: each is also in `passed` or `failed` by its recorded result.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reused: Vec<CheckId>,
+    /// Checks that would verify this change but were left to the open plan
+    /// step that carries them (spec 109 D4, spec 105 §4). Not run, not
+    /// passed, never evidence; the report says so in plain words.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred: Vec<DeferredCheck>,
     pub behaviour_verified: Vec<String>,
     pub unverified_steps: Vec<String>,
     pub regressions: Vec<CheckId>,
@@ -1434,6 +1472,14 @@ impl VerificationReport {
                 .iter()
                 .filter(|check| state.reused.contains(*check))
                 .cloned()
+                .collect(),
+            deferred: state
+                .deferred
+                .iter()
+                .map(|(check, step)| DeferredCheck {
+                    check: check.clone(),
+                    step: step.clone(),
+                })
                 .collect(),
             behaviour_verified: Vec::new(),
             unverified_steps: plan
@@ -1651,6 +1697,12 @@ impl VerificationReport {
                     count(self.skipped.len(), "check")
                 );
             }
+            if !self.deferred.is_empty() {
+                return format!(
+                    "No check ran for this change: {}. {plan_note}",
+                    self.deferred_phrase()
+                );
+            }
             return format!("No verification has run. {plan_note}");
         }
         if plan_report.is_complete {
@@ -1664,6 +1716,21 @@ impl VerificationReport {
                 count(self.passed.len(), "check")
             )
         }
+    }
+
+    /// "`cmd` in `dir` is left to its plan step \"Title\"", joined.
+    fn deferred_phrase(&self) -> String {
+        self.deferred
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} is left to its plan step \"{}\"",
+                    item.check.label(),
+                    item.step
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     /// The engine-owned breakdown for the failed summary. It names introduced
@@ -1765,6 +1832,26 @@ impl VerificationReport {
                     "{}   (not run again: the files are unchanged since the recorded run)",
                     labels(&self.reused).join(", ")
                 ),
+            ));
+        }
+
+        // Only when a check was left to its step, so every other report
+        // renders exactly as it did.
+        if !self.deferred.is_empty() {
+            lines.push(section(
+                "Checks deferred",
+                &self
+                    .deferred
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "{} — not run: left to plan step \"{}\"",
+                            item.check.label(),
+                            item.step
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n                     "),
             ));
         }
 
@@ -2060,6 +2147,116 @@ pub fn propose_checks(
     )
 }
 
+/// How a change's owning roots split between the plan's scoped checks and
+/// their detected checks (spec 109 D4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopedSelection {
+    /// Owning roots no plan check covers: they keep their detected checks.
+    pub detected_roots: Vec<String>,
+    /// The plan's required checks that stand in for the other roots' detected
+    /// checks, in the order given, de-duplicated.
+    pub plan_checks: Vec<CheckId>,
+}
+
+/// Splits a change's owning roots ([`select_roots`]) between the plan's
+/// required checks and their detected checks (spec 109 D4).
+///
+/// A plan check covers an owning root when its working directory is that root
+/// or one of the roots enclosing it, so `cargo nextest run -p crate --test a`
+/// declared at the workspace root covers a change in the crate. A covered root
+/// proposes no detected check per change; the completion floor, which
+/// [`floor_checks`] computes separately, still requires them. Directories are
+/// compared in `CheckId` form, so the caller normalizes the plan's.
+pub fn scoped_selection(
+    map: &RepositoryMap,
+    changed: &[String],
+    plan_checks: &[CheckId],
+) -> ScopedSelection {
+    let mut selection = ScopedSelection::default();
+    for root in select_roots(map, changed) {
+        let enclosing = map.enclosing_roots(&root);
+        let covering: Vec<&CheckId> = plan_checks
+            .iter()
+            .filter(|check| {
+                check.working_directory == root
+                    || enclosing.contains(&check.working_directory.as_str())
+            })
+            .collect();
+        if covering.is_empty() {
+            selection.detected_roots.push(root);
+            continue;
+        }
+        for check in covering {
+            if !selection.plan_checks.contains(check) {
+                selection.plan_checks.push(check.clone());
+            }
+        }
+    }
+    selection
+}
+
+/// Per-change selection when the plan declares required checks (spec 109
+/// D4): the plan's check stands in for the detected checks of every owning
+/// root it covers ([`scoped_selection`]); uncovered roots select their
+/// detected checks as [`propose_checks`] does.
+///
+/// A covering check `deferred` reports — one whose own plan step is still
+/// open (spec 105 §4) — still displaces the detected checks but is not
+/// proposed: its step runs it through the ordinary command flow, and the
+/// gate reads that step's evidence. Proposing it here would write a
+/// `CheckRun`, which the gate treats as authoritative over the step's later
+/// command exit. A displaced root whose only plan check is deferred therefore
+/// runs nothing per change, and that is `Proposed` with nothing in it, not
+/// "no checks available". Reuse (spec 109 D6) applies to the plan checks as to
+/// detected ones. With no plan checks this is exactly [`propose_checks`].
+pub fn propose_scoped_checks(
+    orchestrator: &ValidationOrchestrator,
+    repository_root: &Path,
+    map: &RepositoryMap,
+    changed: &[String],
+    plan_checks: &[CheckId],
+    deferred: &dyn Fn(&CheckId) -> bool,
+    reuse: &mut CheckReuse,
+) -> Result<Selection> {
+    let scoped = scoped_selection(map, changed, plan_checks);
+    if scoped.plan_checks.is_empty() {
+        return propose_checks(orchestrator, repository_root, map, changed, reuse);
+    }
+    let detected = if scoped.detected_roots.is_empty() {
+        Selection::Proposed(Vec::new())
+    } else {
+        propose_checks_for_roots(
+            orchestrator,
+            repository_root,
+            map,
+            &scoped.detected_roots,
+            true,
+            reuse,
+        )?
+    };
+    let runnable: Vec<CheckId> = scoped
+        .plan_checks
+        .into_iter()
+        .filter(|check| !deferred(check))
+        .collect();
+    let detected = match detected {
+        // The covered roots have a plan check standing in for them, deferred
+        // or not, so the change as a whole is not one with no checks.
+        Selection::NoChecksAvailable { .. } | Selection::OnlyDocumentation => {
+            Selection::Proposed(Vec::new())
+        }
+        proposed => proposed,
+    };
+    append_plan_checks(
+        orchestrator,
+        repository_root,
+        detected,
+        &runnable,
+        reuse,
+        PlanCheckReason::ScopedForChange,
+    )
+}
+
 /// Select the task-completion floor's roots and ask for their detected checks.
 ///
 /// This is the same set [`floor_checks`] reports, kept as proposals so a
@@ -2190,6 +2387,33 @@ pub fn with_plan_checks(
     checks: &[CheckId],
     reuse: &mut CheckReuse,
 ) -> Result<Selection> {
+    append_plan_checks(
+        orchestrator,
+        repository_root,
+        selection,
+        checks,
+        reuse,
+        PlanCheckReason::StaleRerun,
+    )
+}
+
+/// Why a plan check is proposed, for the proposal's stored reason.
+#[derive(Debug, Clone, Copy)]
+enum PlanCheckReason {
+    /// A finished step's check went stale (spec 106 Task 6).
+    StaleRerun,
+    /// The plan's scoped check verifies a change (spec 109 D4).
+    ScopedForChange,
+}
+
+fn append_plan_checks(
+    orchestrator: &ValidationOrchestrator,
+    repository_root: &Path,
+    selection: Selection,
+    checks: &[CheckId],
+    reuse: &mut CheckReuse,
+    reason: PlanCheckReason,
+) -> Result<Selection> {
     let mut proposed = match selection {
         Selection::Proposed(proposed) => proposed,
         other if checks.is_empty() => return Ok(other),
@@ -2209,8 +2433,16 @@ pub fn with_plan_checks(
         } else {
             repository_root.join(&check.working_directory)
         };
-        let proposal =
-            orchestrator.propose_plan_check(repository_root, &working_directory, &check.command)?;
+        let proposal = match reason {
+            PlanCheckReason::StaleRerun => {
+                orchestrator.propose_plan_check(repository_root, &working_directory, &check.command)
+            }
+            PlanCheckReason::ScopedForChange => orchestrator.propose_scoped_plan_check(
+                repository_root,
+                &working_directory,
+                &check.command,
+            ),
+        }?;
         proposed.push((check.clone(), proposal));
     }
     Ok(Selection::Proposed(proposed))

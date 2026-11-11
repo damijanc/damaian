@@ -101,8 +101,8 @@ use crate::vector_index::VectorIndexCache;
 use crate::verification::{
     CheckId, CheckOutcome, CheckReuse, CheckTermination, FailureProvenance, FindingEvidence,
     Selection, SkipReason, VerificationEvent, VerificationOutcome, VerificationReport,
-    environment_termination, fold_verification, propose_checks, propose_checks_exactly,
-    propose_completion_checks, with_plan_checks,
+    environment_termination, fold_verification, propose_checks_exactly, propose_completion_checks,
+    propose_scoped_checks, scoped_selection, with_plan_checks,
 };
 use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
@@ -2717,6 +2717,9 @@ impl ChatOrchestrator {
         if let Some(plan) = plan.as_ref() {
             reuse.retain(|check| !plan_defers_check(repository_root, plan, check));
         }
+        // Plan checks standing in for this change that their open step runs
+        // instead (spec 109 D4); the report names them.
+        let mut displaced_deferred: Vec<CheckId> = Vec::new();
         let selection = if !due.checks.is_empty() {
             // A completion due carries the exact floor checks the answer-time
             // trigger found missing or stale. Run those and nothing else; the
@@ -2738,11 +2741,38 @@ impl ChatOrchestrator {
                 &mut reuse,
             )?
         } else {
-            propose_checks(
+            // Spec 109 D4: the approved plan's scoped required check stands in
+            // per change for the detected checks of the root it covers; those
+            // stay in the completion floor and run once at the end. A check
+            // deferred to its own open step displaces them too but is left to
+            // that step (see `propose_scoped_checks`). An unapproved plan
+            // narrows nothing, as it gates nothing (spec 105).
+            let plan_checks = match plan.as_ref() {
+                Some(plan)
+                    if self
+                        .session_store
+                        .read_plan_approved(session_id, &task.id)? =>
+                {
+                    plan_required_checks(repository_root, plan)
+                }
+                _ => Vec::new(),
+            };
+            let deferred = |check: &CheckId| {
+                plan.as_ref()
+                    .is_some_and(|plan| plan_defers_check(repository_root, plan, check))
+            };
+            displaced_deferred = scoped_selection(&map, &changed, &plan_checks)
+                .plan_checks
+                .into_iter()
+                .filter(|check| deferred(check))
+                .collect();
+            propose_scoped_checks(
                 &self.validation_orchestrator,
                 repository_root,
                 &map,
                 &changed,
+                &plan_checks,
+                &deferred,
                 &mut reuse,
             )?
         };
@@ -2788,6 +2818,7 @@ impl ChatOrchestrator {
                     attempt,
                     checks,
                     reused,
+                    displaced_deferred,
                     browser,
                     changed,
                     file_hashes,
@@ -2811,6 +2842,7 @@ impl ChatOrchestrator {
             attempt,
             checks,
             reused,
+            displaced_deferred,
             browser,
             changed,
             file_hashes,
@@ -3136,6 +3168,9 @@ impl ChatOrchestrator {
         // Checks not proposed because their recorded run covered exactly the
         // current tree (spec 109 D6). Recorded, never run.
         reused: Vec<CheckId>,
+        // Checks standing in for this change that their open plan step runs
+        // instead (spec 109 D4); recorded so the report can name them.
+        displaced_deferred: Vec<CheckId>,
         browser: Option<BrowserCheck>,
         changed: Vec<String>,
         file_hashes: BTreeMap<String, String>,
@@ -3168,9 +3203,16 @@ impl ChatOrchestrator {
             .steps
             .iter()
             .any(|step| !step.id.starts_with("verify_"));
+        let mut deferred = displaced_deferred;
         let checks: Vec<_> = checks
             .into_iter()
-            .filter(|(check, _)| !plan_defers_check(repository_root, &plan, check))
+            .filter(|(check, _)| {
+                let defers = plan_defers_check(repository_root, &plan, check);
+                if defers && !deferred.contains(check) {
+                    deferred.push(check.clone());
+                }
+                !defers
+            })
             .filter(|(check, _)| {
                 if !batch_scoped {
                     return true;
@@ -3209,6 +3251,19 @@ impl ChatOrchestrator {
                     ("command", check.command.clone()),
                     ("workingDirectory", check.working_directory.clone()),
                 ],
+            )?;
+        }
+        for check in &deferred {
+            let Some(step) = plan_deferring_step(repository_root, &plan, check) else {
+                continue;
+            };
+            self.session_store.append_verification_event(
+                &session.id,
+                &VerificationEvent::Deferred {
+                    task_id: task.id.clone(),
+                    check: check.clone(),
+                    step: step.title.clone(),
+                },
             )?;
         }
         // A rerun (proposal §5.5) reuses the step of a check an earlier attempt
@@ -16163,7 +16218,16 @@ fn reset_verify_step(plan: &mut TaskPlan, step_id: &str) {
 /// no `PlannedCheck`, so they defer nothing (requirement 10): a command named in
 /// a step's text is no longer a signal.
 fn plan_defers_check(repository_root: &Path, plan: &TaskPlan, check: &CheckId) -> bool {
-    plan.steps.iter().any(|step| {
+    plan_deferring_step(repository_root, plan, check).is_some()
+}
+
+/// The open plan step [`plan_defers_check`] defers `check` to.
+fn plan_deferring_step<'a>(
+    repository_root: &Path,
+    plan: &'a TaskPlan,
+    check: &CheckId,
+) -> Option<&'a PlanStep> {
+    plan.steps.iter().find(|step| {
         if step.id.starts_with("verify_") || step.status.is_terminal() {
             return false;
         }
@@ -16180,6 +16244,32 @@ fn plan_defers_check(repository_root: &Path, plan: &TaskPlan, check: &CheckId) -
         };
         CheckId::new(directory, planned.command.as_str()) == *check
     })
+}
+
+/// The plan's `required` structured checks (non-`verify_` steps, any status),
+/// in plan order and de-duplicated, with their directories in `CheckId` form
+/// (spec 109 D4). A check whose directory leaves the repository is dropped,
+/// as `plan_defers_check` ignores it.
+fn plan_required_checks(repository_root: &Path, plan: &TaskPlan) -> Vec<CheckId> {
+    let mut checks = Vec::new();
+    for planned in plan
+        .steps
+        .iter()
+        .filter(|step| !step.id.starts_with("verify_"))
+        .filter_map(|step| step.check.as_ref())
+        .filter(|planned| planned.required)
+    {
+        let Some(directory) =
+            normalize_planned_check_directory(repository_root, &planned.working_directory)
+        else {
+            continue;
+        };
+        let check = CheckId::new(directory, planned.command.as_str());
+        if !checks.contains(&check) {
+            checks.push(check);
+        }
+    }
+    checks
 }
 
 fn root_label(working_directory: &str) -> &str {

@@ -304,6 +304,25 @@ impl ValidationOrchestrator {
         )
     }
 
+    /// Proposes the plan's scoped required check as a change's per-change
+    /// check, in place of the detected checks of the root it covers (spec 109
+    /// D4). The same policy path as every check; only the stored reason differs.
+    pub fn propose_scoped_plan_check(
+        &self,
+        repository_root: impl AsRef<Path>,
+        working_directory: impl AsRef<Path>,
+        command: &str,
+    ) -> Result<CommandProposal> {
+        self.store_proposal(
+            repository_root,
+            working_directory,
+            command,
+            "Required check from the plan, run for this change in place of the detected check",
+            true,
+            Vec::new(),
+        )
+    }
+
     /// `detected` marks a proposal from [`Self::propose_detected_validations`],
     /// whose purpose is `Check` whatever its text.
     fn store_proposal(

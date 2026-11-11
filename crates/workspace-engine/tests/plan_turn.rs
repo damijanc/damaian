@@ -4611,6 +4611,256 @@ fn a_plan_declared_member_check_does_not_hide_the_missing_workspace_root_floor()
     );
 }
 
+// --- Spec 109 D4: the plan's scoped check per change ----------------------
+//
+// The spec 33 shape: the plan declares a scoped nextest run as its required
+// check. Per change that check stands in for the member's detected
+// `cargo test`; the detected checks stay in the completion floor and run once
+// when the task ends.
+
+const D4_SCOPED_COMMAND: &str = "cargo nextest run -p member --test a --test b";
+
+/// The scoped check on a first step the model has already finished, declared
+/// at the workspace root (an enclosing root of the member).
+const D4_FINISHED_STEP_PLAN: &str = r#"{"steps":[
+    {"title":"Add the scoped tests","check":{"command":"cargo nextest run -p member --test a --test b","workingDirectory":"","purpose":"the member's scoped tests","required":true}},
+    {"title":"Change the member"}
+]}"#;
+
+/// The scoped check on the step the change belongs to, declared in the crate.
+const D4_OPEN_STEP_PLAN: &str = r#"{"steps":[
+    {"title":"Change the member","check":{"command":"cargo nextest run -p member --test a --test b","workingDirectory":"crates/member","purpose":"the member's scoped tests","required":true}},
+    {"title":"Finish the task"}
+]}"#;
+
+/// Spec 109 D4 (the spec 33 shape): a patch is verified with only the plan's
+/// scoped check, not the member's `cargo test`; the task's completion still
+/// runs the detected floor of the member and its workspace root once, and the
+/// task completes.
+#[test]
+fn a_plans_scoped_check_verifies_a_change_and_the_floor_runs_once_at_completion() {
+    let (repo, shell) = r16_workspace_fixture("d4-scoped-per-change");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let scoped = CheckId::new("", D4_SCOPED_COMMAND);
+    let member_check = CheckId::new("crates/member", "cargo test");
+    let root_check = CheckId::new("", "cargo test");
+    let patch = patch_call_with(
+        "crates/member/src/helper.rs",
+        "pub fn helper() -> u8 { 1 }\n",
+    );
+    let proposed = r16_proposed_member_change(&engine, &repo, D4_FINISHED_STEP_PLAN, patch);
+
+    // The first step is finished, the patch belongs to the second: the scoped
+    // check is not deferred to an open step.
+    let mut plan = engine
+        .session_store
+        .read_task_plan(&proposed.session.id, &proposed.task.id)
+        .expect("the plan should read")
+        .expect("the task carries the plan");
+    plan.steps[0].status = StepStatus::Completed;
+    plan.steps[1].status = StepStatus::InProgress;
+    engine
+        .session_store
+        .revise_plan(&proposed.task, &plan)
+        .expect("the plan records");
+
+    let mut due = MockModelAdapter::new("Done.");
+    let _ = run_verification_and_approve_checks(&engine, &repo, &proposed.session.id, &mut due);
+    assert_eq!(
+        latest_started_checks(&engine, &proposed.session.id),
+        vec![scoped.clone()],
+        "per change only the plan's scoped check runs"
+    );
+    assert!(a_check_passed(&engine, &proposed.session.id, &scoped));
+    assert!(
+        !a_check_passed(&engine, &proposed.session.id, &member_check),
+        "the member's detected check did not run per change"
+    );
+
+    let mut adapter = scripted(vec![vec![call("complete_step", "{}")], Vec::new()]);
+    let mut result = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Finish the task",
+        &mut adapter,
+    );
+    approve_until_finished(&engine, &mut result, &mut adapter);
+
+    assert_eq!(result.task.status, TaskStatus::Complete, "{result:?}");
+    // The floor is the workspace root's `cargo test`: it runs the member's
+    // tests, so the member's own `cargo test` is not repeated (spec 90).
+    let completion = latest_started_checks(&engine, &proposed.session.id);
+    assert_eq!(
+        completion,
+        vec![root_check.clone()],
+        "completion runs the detected floor, and the scoped check's current run stands"
+    );
+    let root_runs = engine
+        .session_store
+        .read_verification_events(&proposed.session.id, &[])
+        .expect("the log should read")
+        .iter()
+        .filter(
+            |event| matches!(event, VerificationEvent::Check { check, .. } if check == &root_check),
+        )
+        .count();
+    assert_eq!(root_runs, 1, "the floor runs once, at completion");
+    assert!(!a_check_passed(
+        &engine,
+        &proposed.session.id,
+        &member_check
+    ));
+}
+
+/// Spec 109 D4 with spec 105's deferral: the scoped check sits on the step the
+/// change belongs to, so it stays that step's own command. It still displaces
+/// the member's `cargo test`, so the per-change verification runs nothing; the
+/// model runs the scoped check at its step, and completion runs the floor.
+#[test]
+fn a_scoped_check_deferred_to_its_open_step_displaces_the_detected_check() {
+    let (repo, shell) = r16_workspace_fixture("d4-scoped-deferred");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let scoped = CheckId::new("crates/member", D4_SCOPED_COMMAND);
+    let member_check = CheckId::new("crates/member", "cargo test");
+    let root_check = CheckId::new("", "cargo test");
+    let patch = patch_call_with(
+        "crates/member/src/helper.rs",
+        "pub fn helper() -> u8 { 1 }\n",
+    );
+    let proposed = r16_proposed_member_change(&engine, &repo, D4_OPEN_STEP_PLAN, patch);
+
+    let mut due = MockModelAdapter::new("Done.");
+    let verified = run_verification_due(&engine, &repo, &proposed.session.id, &mut due);
+    let per_change = latest_started_checks(&engine, &proposed.session.id);
+    assert!(
+        !per_change.contains(&member_check) && !per_change.contains(&scoped),
+        "the detected check is displaced and the deferred check is left to its step: {per_change:?}"
+    );
+
+    // Nothing ran, and the report says so plainly, naming the step and the
+    // command, never a pass. No card stops the turn.
+    assert!(
+        verified.check_batch.is_none(),
+        "no check card: {verified:?}"
+    );
+    let events = engine
+        .session_store
+        .read_verification_events(&proposed.session.id, &[])
+        .expect("the log should read");
+    let outcome = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            VerificationEvent::Finished { outcome, .. } => Some(*outcome),
+            _ => None,
+        })
+        .expect("the per-change verification finished");
+    assert_eq!(outcome, VerificationOutcome::NothingVerified);
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, VerificationEvent::Check { check, .. } if check == &scoped)
+        ),
+        "the deferred check wrote no run, so it is no evidence"
+    );
+    let state = fold_verification(events.iter());
+    assert!(!state.checks.contains_key(&scoped));
+    let plan = engine
+        .session_store
+        .read_task_plan(&proposed.session.id, &proposed.task.id)
+        .expect("the plan should read")
+        .expect("the task carries the plan");
+    let report = workspace_engine::VerificationReport::build(
+        &state,
+        &plan,
+        &["crates/member/src/helper.rs".to_string()],
+        &BTreeMap::new(),
+    );
+    assert_eq!(
+        report.deferred,
+        vec![workspace_engine::DeferredCheck {
+            check: scoped.clone(),
+            step: "Change the member".to_string(),
+        }]
+    );
+    assert!(report.passed.is_empty(), "{report:?}");
+    let summary = report.summary(&plan.report());
+    assert!(
+        summary.starts_with(&format!(
+            "No check ran for this change: {} is left to its plan step \"Change the member\".",
+            scoped.label()
+        )),
+        "{summary}"
+    );
+    assert!(
+        !summary.contains("passed") && !summary.contains("complete"),
+        "{summary}"
+    );
+    let rendered = report.render();
+    assert!(
+        rendered.contains(&format!(
+            "{} — not run: left to plan step \"Change the member\"",
+            scoped.label()
+        )),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("all ran"), "{rendered}");
+    // The turn carries the same report, and continues the plan without a
+    // card: its response is the continued model turn, not a verdict.
+    let carried = verified
+        .verification_report
+        .as_ref()
+        .expect("the turn carries the verification report");
+    assert_eq!(carried.deferred, report.deferred, "{carried:?}");
+    assert_eq!(
+        verified.response, "Done.",
+        "the continued model turn answered"
+    );
+    let gate = engine
+        .session_store
+        .read_completion_report(&proposed.session.id, &verified.task.id)
+        .expect("the report should read")
+        .expect("the continued turn settles through the gate");
+    assert_eq!(
+        gate.reason_codes(),
+        vec![CompletionReasonCode::OpenPlanSteps],
+        "the deferred check is the open step's work, not a pass, failure or missing run: {gate:?}"
+    );
+
+    let mut adapter = scripted(vec![
+        vec![call(
+            "run_command",
+            r#"{"command":"cargo nextest run -p member --test a --test b","working_directory":"crates/member","reason":"Run the required check"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        vec![call("complete_step", "{}")],
+        Vec::new(),
+    ]);
+    let mut result = ask_in_session(
+        &engine,
+        &repo,
+        &proposed.session.id,
+        "Finish the task",
+        &mut adapter,
+    );
+    approve_until_finished(&engine, &mut result, &mut adapter);
+
+    assert_eq!(result.task.status, TaskStatus::Complete, "{result:?}");
+    // The floor is the workspace root's `cargo test`. The scoped check's
+    // command evidence went stale when the next step began, so spec 106 Task 6
+    // reruns it here; the member's `cargo test` never runs.
+    let completion = latest_started_checks(&engine, &proposed.session.id);
+    assert!(
+        completion.contains(&root_check),
+        "completion runs the detected floor: {completion:?}"
+    );
+    assert!(!a_check_passed(
+        &engine,
+        &proposed.session.id,
+        &member_check
+    ));
+}
+
 /// (b) A mixed gate: the plan's required member check was never run and the
 /// floor's workspace root check is missing. The plan-declared check remains the
 /// model's job and is never auto-run. Since spec 106 Task 6 the model can no

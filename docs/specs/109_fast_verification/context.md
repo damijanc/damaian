@@ -67,6 +67,24 @@ partly fixed by spec 107 D3), 86 (main-checkout test-process overhead) and 89
   check whose working directory is the patch's owning root (or an enclosing
   root), run that per change instead of the detected `cargo test` for that root.
   The detected check stays in the completion floor and runs once at the end.
+  *Resolved in Task 2 (2026-11-11):* "covers" means the plan check's
+  `CheckId` directory equals the owning root or one of the map's roots
+  enclosing it; a directory that is not a root covers nothing. A covered root
+  proposes none of its detected checks per change (a cargo root detects only
+  `cargo test`). Only an **approved** plan's `required` checks count, since an
+  unapproved plan gates nothing (spec 105). **Deferral wins:** a covering check
+  whose own step is still open (spec 105 `plan_defers_check`) still displaces
+  the detected checks but is not run by the loop; its step runs it as an
+  ordinary command. Running it through the loop would write a `CheckRun`, which
+  the gate treats as authoritative over the step's later `CommandExit`, so the
+  step's own run would read stale. A per-change verification whose only
+  covering check is deferred therefore runs nothing for that root —
+  `Selection::Proposed([])`, not "no checks available"; it ends
+  `nothing_verified` and the report names each such check and its step
+  (`verification_deferred`, "left to its plan step"), never as evidence.
+  Reuse (D6) applies to
+  the substituted check. The completion branch, the answer-time exact floor
+  run and the gate's evidence lookup are unchanged.
 - **D5 — per-task approval (security; confirm before Task 5).** An approved
   check identity is remembered on the task chain (a durable event), and later
   proposals of the same identity in that chain are approved automatically and

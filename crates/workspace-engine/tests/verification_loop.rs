@@ -25,7 +25,7 @@ use workspace_engine::{
     WebDiagnosticCall, WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport,
     WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerRecord, WorkspaceEngine,
     fold_verification, is_documentation, pending_verifications, propose_checks,
-    reattach_pending_approvals, select_roots,
+    propose_scoped_checks, reattach_pending_approvals, scoped_selection, select_roots,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -779,6 +779,117 @@ fn a_member_change_selects_only_its_owning_root() {
     assert!(!directories.contains(&""));
     assert!(!directories.contains(&"crates/cli"));
     assert!(!directories.contains(&"packages/web"));
+}
+
+/// Spec 109 D4: a plan's required check covers a change's owning root when its
+/// directory is that root or an enclosing one; a covered root selects no
+/// detected check, an uncovered root keeps its own, and a directory that is not
+/// a root covers nothing.
+#[test]
+fn a_plan_check_covers_its_own_and_enclosed_roots_only() {
+    let repo = Monorepo::new("d4-scoped-selection");
+    let engine = repo.engine();
+    let map = repo.map(&engine);
+    let engine_change = vec!["crates/engine/src/lib.rs".to_string()];
+    let both = vec![
+        "crates/engine/src/lib.rs".to_string(),
+        "packages/web/src/index.ts".to_string(),
+    ];
+    let at_root = CheckId::new("", "cargo nextest run -p engine --test a --test b");
+    let in_crate = CheckId::new("crates/engine", "cargo nextest run --test a");
+    let elsewhere = CheckId::new("crates/cli", "cargo nextest run -p cli");
+    let not_a_root = CheckId::new("crates/engine/src", "cargo nextest run --test a");
+
+    let scoped = scoped_selection(&map, &engine_change, std::slice::from_ref(&at_root));
+    assert_eq!(scoped.plan_checks, vec![at_root.clone()], "{scoped:?}");
+    assert!(scoped.detected_roots.is_empty(), "{scoped:?}");
+
+    let scoped = scoped_selection(&map, &engine_change, std::slice::from_ref(&in_crate));
+    assert_eq!(scoped.plan_checks, vec![in_crate.clone()], "{scoped:?}");
+
+    let scoped = scoped_selection(&map, &engine_change, &[elsewhere, not_a_root]);
+    assert!(scoped.plan_checks.is_empty(), "{scoped:?}");
+    assert_eq!(scoped.detected_roots, vec!["crates/engine".to_string()]);
+
+    // The workspace-root check also encloses `packages/web`: one plan check
+    // covers both roots and appears once.
+    let scoped = scoped_selection(&map, &both, std::slice::from_ref(&at_root));
+    assert_eq!(scoped.plan_checks, vec![at_root.clone()], "{scoped:?}");
+    assert!(scoped.detected_roots.is_empty(), "{scoped:?}");
+    let scoped = scoped_selection(&map, &both, std::slice::from_ref(&in_crate));
+    assert_eq!(scoped.detected_roots, vec!["packages/web".to_string()]);
+
+    // Proposed: the plan check stands in for the crate's `cargo test`, the
+    // uncovered web root keeps its detected check.
+    let Selection::Proposed(checks) = propose_scoped_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &both,
+        std::slice::from_ref(&in_crate),
+        &|_| false,
+        &mut CheckReuse::none(),
+    )
+    .unwrap() else {
+        panic!("expected proposed checks");
+    };
+    let proposed: Vec<&CheckId> = checks.iter().map(|(check, _)| check).collect();
+    assert!(proposed.contains(&&in_crate), "{proposed:?}");
+    assert!(
+        !proposed.contains(&&CheckId::new("crates/engine", "cargo test")),
+        "the covered root's detected check is not proposed per change: {proposed:?}"
+    );
+    assert!(
+        proposed
+            .iter()
+            .any(|check| check.working_directory == "packages/web"),
+        "{proposed:?}"
+    );
+
+    // Deferred to its open step: it still displaces the detected check, is
+    // not proposed itself, and nothing is stored.
+    let before = repo.pending_proposals();
+    let selection = propose_scoped_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &engine_change,
+        std::slice::from_ref(&in_crate),
+        &|_| true,
+        &mut CheckReuse::none(),
+    )
+    .unwrap();
+    assert_eq!(selection, Selection::Proposed(Vec::new()));
+    assert_eq!(repo.pending_proposals(), before, "nothing is stored");
+
+    // No plan check: exactly today's per-change selection.
+    let today = propose_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &engine_change,
+        &mut CheckReuse::none(),
+    )
+    .unwrap();
+    let scoped = propose_scoped_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &engine_change,
+        &[],
+        &|_| false,
+        &mut CheckReuse::none(),
+    )
+    .unwrap();
+    let ids = |selection: &Selection| match selection {
+        Selection::Proposed(checks) => checks.iter().map(|(check, _)| check.clone()).collect(),
+        _ => Vec::new(),
+    };
+    assert_eq!(ids(&scoped), ids(&today));
+    assert_eq!(
+        ids(&today),
+        vec![CheckId::new("crates/engine", "cargo test")]
+    );
 }
 
 /// Review fix R16: the per-change verification turn runs the owning root's
@@ -6334,6 +6445,34 @@ fn a_reused_check_is_never_proposed() {
         before + proposed.len(),
         "nothing is stored for the reused check"
     );
+}
+
+/// Spec 109 D4 with D6: the plan's scoped check standing in for a root's
+/// detected check is reused like any other, so an unchanged tree runs nothing.
+#[test]
+fn a_scoped_plan_check_is_reused_for_an_unchanged_tree() {
+    let repo = Monorepo::new("reuse-scoped");
+    let engine = repo.engine();
+    let map = repo.map(&engine);
+    let changed = vec!["crates/engine/src/lib.rs".to_string()];
+    let scoped = CheckId::new("", "cargo nextest run -p engine --test a");
+    let before = repo.pending_proposals();
+
+    let recorded = state(&[ran_with_hashes(scoped.clone(), Some(0), &[])]);
+    let mut reuse = CheckReuse::from_state(&recorded, &BTreeMap::new(), 0);
+    let selection = propose_scoped_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &changed,
+        std::slice::from_ref(&scoped),
+        &|_| false,
+        &mut reuse,
+    )
+    .unwrap();
+    assert_eq!(selection, Selection::Proposed(Vec::new()));
+    assert_eq!(reuse.reused(), std::slice::from_ref(&scoped));
+    assert_eq!(repo.pending_proposals(), before, "nothing is stored");
 }
 
 /// The fold and the report: a reused check keeps its recorded run (the gate's
