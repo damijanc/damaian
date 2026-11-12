@@ -997,29 +997,39 @@ impl PathArgument {
 }
 
 /// The operators a read-only line may use (spec 64 requirement 6; spec 70
-/// requirement 1 added `Sequence`).
+/// requirement 1 added `Sequence`). `Or` is produced only for the command
+/// rules' chains (spec 111 D3); the read-only tokenizer still refuses `||`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Operator {
+pub(crate) enum Operator {
     And,
     Pipe,
     /// `;` or a newline. Judged like `&&`: every segment must be admitted on
     /// its own.
     Sequence,
+    Or,
 }
 
 /// The command line as the shell will see it, or the reason it cannot be
 /// known before the shell runs (spec 64 requirement 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ShellLine {
+pub(crate) struct ShellLine {
     /// Each simple command's words; `operators[i]` joins `commands[i]` and
     /// `commands[i + 1]`. A command may be empty (`&& ls`), which the
     /// caller refuses.
-    commands: Vec<Vec<String>>,
-    operators: Vec<Operator>,
+    pub(crate) commands: Vec<Vec<String>>,
+    pub(crate) operators: Vec<Operator>,
     /// The first expansion found anywhere in the line. The words are still
     /// returned, with the expanding characters left in, so the caller can
     /// tell which program was meant.
-    expansion: Option<&'static str>,
+    pub(crate) expansion: Option<&'static str>,
+    /// Like `expansion`, except that a home tilde (below) does not count:
+    /// the command rules resolve `~` themselves (spec 111 D4), while the
+    /// read-only boundary keeps refusing it.
+    pub(crate) unanalysable: Option<&'static str>,
+    /// `(command, word)` indexes of the words that begin with an unquoted
+    /// `~` followed by `/` or nothing, which the shell replaces with the home
+    /// directory. A quoted `'~/x'` is a literal name and is not listed.
+    pub(crate) home_tilde: Vec<(usize, usize)>,
 }
 
 /// Splits `command` into simple commands and words the way a POSIX shell or
@@ -1030,10 +1040,23 @@ struct ShellLine {
 /// any other redirect), which is a parsing gap and so must ask rather than run
 /// (spec 64 §5.1).
 fn shell_line(command: &str) -> Option<ShellLine> {
+    scan_shell_line(command, false)
+}
+
+/// The same tokenizer for the command rules (spec 111 D3), which also split
+/// chains at `||`. Everything else it refuses stays refused, so a here-doc,
+/// a backslash or an unmodelled redirect is still `None`: cannot analyse.
+pub(crate) fn chain_line(command: &str) -> Option<ShellLine> {
+    scan_shell_line(command, true)
+}
+
+fn scan_shell_line(command: &str, admit_or: bool) -> Option<ShellLine> {
     let mut commands = Vec::new();
     let mut operators = Vec::new();
     let mut words = Vec::new();
     let mut expansion = None;
+    let mut unanalysable = None;
+    let mut home_tilde = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
     // Whether the word in progress has a quoted part: `'2'>x` is a word
@@ -1042,8 +1065,11 @@ fn shell_line(command: &str) -> Option<ShellLine> {
     // The previous unquoted character, for the positions where `~` expands.
     let mut previous: Option<char> = None;
     let mut characters = command.chars().peekable();
-    let note = |found: &'static str, expansion: &mut Option<&'static str>| {
+    let note = |found: &'static str,
+                expansion: &mut Option<&'static str>,
+                unanalysable: &mut Option<&'static str>| {
         expansion.get_or_insert(found);
+        unanalysable.get_or_insert(found);
     };
     while let Some(character) = characters.next() {
         match character {
@@ -1114,6 +1140,10 @@ fn shell_line(command: &str) -> Option<ShellLine> {
                         characters.next();
                         Operator::And
                     }
+                    ('|', Some('|')) if admit_or => {
+                        characters.next();
+                        Operator::Or
+                    }
                     ('|', Some('|' | '&')) => return None,
                     ('|', _) => Operator::Pipe,
                     _ => return None,
@@ -1145,7 +1175,11 @@ fn shell_line(command: &str) -> Option<ShellLine> {
                     match characters.next()? {
                         '"' => break,
                         '$' | '`' => {
-                            note("`$` or a backtick inside double quotes", &mut expansion);
+                            note(
+                                "`$` or a backtick inside double quotes",
+                                &mut expansion,
+                                &mut unanalysable,
+                            );
                             current.push('$');
                         }
                         '\\' => return None,
@@ -1159,22 +1193,41 @@ fn shell_line(command: &str) -> Option<ShellLine> {
             }
             '\\' | '<' | '\r' => return None,
             control if control.is_control() => return None,
-            '$' => note("`$`", &mut expansion),
-            '`' => note("a backtick", &mut expansion),
+            '$' => note("`$`", &mut expansion, &mut unanalysable),
+            '`' => note("a backtick", &mut expansion, &mut unanalysable),
             '*' | '?' | '[' | '{' | '(' | ')' => {
-                note("a glob, brace or parenthesis", &mut expansion);
+                note(
+                    "a glob, brace or parenthesis",
+                    &mut expansion,
+                    &mut unanalysable,
+                );
+            }
+            // A word that is `~` or starts `~/` is the home directory, which
+            // the command rules resolve (spec 111 D4). `~user` and a `~`
+            // after `=` or `:` are not modelled.
+            '~' if !in_word
+                && characters.peek().is_none_or(|&next| {
+                    next.is_whitespace() || matches!(next, '/' | ';' | '|' | '&' | '>')
+                }) =>
+            {
+                expansion.get_or_insert("`~`");
+                home_tilde.push((commands.len(), words.len()));
             }
             // Tilde expansion happens at the start of a word and, in
             // assignments and zsh's `magic_equal_subst`, after `=` or `:`.
             // Elsewhere (`HEAD~1`) the shell leaves it alone.
             '~' if !in_word || matches!(previous, Some('=' | ':')) => {
-                note("`~`", &mut expansion);
+                note("`~`", &mut expansion, &mut unanalysable);
             }
             // zsh expands a word starting with `=` to a program's path
             // (`=ls` is `/bin/ls`), `^` starts a negated glob under
             // `extended_glob`, and `#` starts a comment.
             '=' | '^' | '#' if !in_word => {
-                note("`=`, `^` or `#` at the start of a word", &mut expansion);
+                note(
+                    "`=`, `^` or `#` at the start of a word",
+                    &mut expansion,
+                    &mut unanalysable,
+                );
             }
             _ => {}
         }
@@ -1196,6 +1249,8 @@ fn shell_line(command: &str) -> Option<ShellLine> {
         commands,
         operators,
         expansion,
+        unanalysable,
+        home_tilde,
     })
 }
 
@@ -2160,7 +2215,9 @@ fn token_escapes_root(token: &str, repository_root: &Path, working_directory: &P
     !normalize_lexically(&absolute).starts_with(normalize_lexically(repository_root))
 }
 
-fn normalize_lexically(path: &Path) -> PathBuf {
+/// Removes `.` and `..` without touching the filesystem, so symlinks are not
+/// followed; `..` at the root stays at the root, as the kernel resolves it.
+pub(crate) fn normalize_lexically(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
         match component {
@@ -2551,6 +2608,8 @@ mod tests {
                     ]],
                     operators: Vec::new(),
                     expansion: None,
+                    unanalysable: None,
+                    home_tilde: Vec::new(),
                 })
             );
             assert_eq!(

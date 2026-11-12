@@ -5,6 +5,7 @@ pub mod cancel;
 pub mod chat;
 pub mod checkpoint;
 pub mod clarification;
+pub mod command_parse;
 pub mod command_policy;
 pub mod command_purpose;
 pub mod command_runner;

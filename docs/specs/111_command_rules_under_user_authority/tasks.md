@@ -1,6 +1,6 @@
 # Spec 111 tasks
 
-**Started:** not yet — specified 2026-11-12
+**Started:** 2026-11-12
 
 Implementation plan for [`proposal.md`](proposal.md). The decisions and the code
 survey are in [`context.md`](context.md).
@@ -17,7 +17,7 @@ survey are in [`context.md`](context.md).
 
 | Task | State | Durable result |
 |---|---|---|
-| 1 · Parser: chains, words, known programs' options, paths (D3, D4) | Not started | — |
+| 1 · Parser: chains, words, known programs' options, paths (D3, D4) | Done 2026-11-12 | New `command_parse.rs`: `parse_command(command, &ParseContext { working_directory, home })` → `CommandParse::Chain { parts, operators }` or `Unanalysable { reason }`. Each `CommandPart` has `program`, the `working_directory` it runs in, and a `PartShape`: `Known { subcommand, global_options, options: BTreeSet, operands }` or `Unknown { arguments }` (word for word, path-like words resolved). The tokenizer is spec 64's `shell_line`, generalised in `command_policy.rs` as `scan_shell_line(command, admit_or)`: `chain_line` also splits `\|\|` (new `Operator::Or`), and `ShellLine` gained `unanalysable` (like `expansion` minus home tildes) and `home_tilde` (unquoted `~`/`~/…` words); `shell_line` is unchanged, so no decision changed (748 lib tests pass). Table: `rm`, `rmdir`, `mv`, `cp`, `ln`, `mkdir`, `touch`, `chmod`, `chown`/`chgrp`, `find` (leading options, start paths, expression in order), `dd` (`key=value` as a set, `if`/`of` paths), `curl`, `wget`, and `git` (global options; `-C` moves path resolution; subcommands `reset`, `clean`, `rm`, `add`, `restore`, `checkout`, `switch`, `branch`, `push`, `commit`; any other subcommand word for word). Paths resolve lexically (`normalize_lexically`, now `pub(crate)`), `/..` stays `/`. Discoveries for Task 2: `cd <dir> &&` moves later parts' directory, any other `cd` with a later part is unanalysable; a leading `NAME=value` is unanalysable; `/bin/rm` etc. are recorded as `rm`; options are read anywhere among operands (GNU), so BSD's `rm / -rf` reads as options; an unknown letter in a short group keeps the rest of the group as one literal option (`rm -rZf` → `--recursive`, `-Zf`); wrappers (`sudo`, `env`, `xargs`, `command`, `nice`, `time`) are unknown programs, so a built-in `deny` on `rm` does not see `sudo rm -rf /` — Task 2 should decide them. 11 parser tests in `command_parse::tests`. Checks: scoped clippy, `cargo nextest run -p workspace-engine --lib` (748 passed) and the config-trust and profile suites, fast checks all passed locally; workspace gate left to CI. |
 | 2 · Rules and evaluation with the trust limits (D1, D2, D5) | Not started | — |
 | 3 · Migration of the old keys, with an equivalence corpus (D6) | Not started | — |
 | 4 · Switch the policy to rules; cards and audit name the rule (D7) | Not started | — |
@@ -26,12 +26,12 @@ survey are in [`context.md`](context.md).
 
 ## Task 1 · Parser: chains, words, known programs' options, paths (D3, D4)
 
-- [ ] Extend the spec 64 tokenizer to split chains into parts and to report
+- [x] Extend the spec 64 tokenizer to split chains into parts and to report
       "cannot analyse" for expansion, substitution, globs and here-docs.
-- [ ] Known-program flag table (combined short flags, long forms, path
+- [x] Known-program flag table (combined short flags, long forms, path
       arguments); options compare as sets for known programs.
-- [ ] Lexical path resolution against the working directory.
-- [ ] Tests: `rm -rf`, `-fr`, `-r -f`, `--recursive --force` parse equal;
+- [x] Lexical path resolution against the working directory.
+- [x] Tests: `rm -rf`, `-fr`, `-r -f`, `--recursive --force` parse equal;
       `/tmp/..` resolves to `/`; `$(…)`, `$HOME`, backticks, `*` are
       unanalysable; chains split correctly, quotes respected.
 
