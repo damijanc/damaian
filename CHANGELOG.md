@@ -39,6 +39,7 @@ harness, and **Release** covers packaging, signing and distribution.
 
 | | |
 |---|---|
+| **v0.74.0** | **Engine**<br>- Make the cancelled-baseline test stop a run that is still in progress. |
 | **v0.73.0** | **Engine**<br>- Take a baseline only when a check fails, on a temporary task-start tree (spec 109 Task 3).<br>- Ask one decision at a time: the worker suggestion after plan approval and before a patch (spec 108 Task 9).<br>- Serve every request on its own thread with one work lane per session (spec 110 Task 1).<br>- Verify a change only with its own plan step's check and rerun finished steps' checks at completion (spec 109 Task 2 fix). |
 | **v0.72.0** | **Evaluation**<br>- Count the plan-changes-requested scenario in the deterministic tier total. |
 | **v0.71.0** | **Evaluation**<br>- Count the plan-changes-requested scenario in the eval harness scenario total. |
