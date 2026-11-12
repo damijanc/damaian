@@ -9807,6 +9807,36 @@ mod tests {
         }
     }
 
+    /// Answering a decision clears it at once: the composer stopped saying
+    /// "Approve the command" only when the resumed turn ended, while the
+    /// approved command ran for minutes. Every resume goes through
+    /// `resumeDecision`, which settles the pending decision first.
+    #[test]
+    fn app_js_settles_a_decision_as_soon_as_it_is_answered() {
+        assert!(
+            app_js_function("resumeDecision").contains("settlePendingDecision();"),
+            "resumeDecision must settle the pending decision before streaming"
+        );
+        let resumes = super::APP_JS
+            .match_indices("\nasync function streamResume")
+            .map(|(start, _)| {
+                let name = &super::APP_JS[start + "\nasync function ".len()..];
+                &name[..name.find('(').unwrap()]
+            })
+            .collect::<Vec<_>>();
+        assert!(resumes.len() >= 8, "found {resumes:?}");
+        for name in resumes {
+            let body = app_js_function(name);
+            assert!(
+                body.contains("resumeDecision(") && !body.contains("streamRequest("),
+                "{name} must resume through resumeDecision"
+            );
+        }
+        let command = app_js_function("createCommandApprovalPreview");
+        assert!(command.contains("actions.hidden = true;"));
+        assert!(command.contains("actions.hidden = false;"));
+    }
+
     fn app_js_function(name: &str) -> &'static str {
         let app = super::APP_JS;
         let start = app

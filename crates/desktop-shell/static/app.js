@@ -15245,6 +15245,8 @@ function createCommandApprovalPreview(
     rejectButton.disabled = true;
     if (overflowButton) overflowButton.disabled = true;
     closeApprovalMenu();
+    // Decided: the buttons go, so the card no longer looks like it asks.
+    actions.hidden = true;
     output.hidden = false;
     output.textContent = approved
       ? isBrowserDiagnostic
@@ -15370,6 +15372,7 @@ function createCommandApprovalPreview(
   // Re-enable after a failure so the user can retry or pick a different
   // action; a blocked proposal's run button stays disabled regardless.
   function restoreActions() {
+    actions.hidden = false;
     runButton.disabled = Boolean(proposal.blocked);
     rejectButton.disabled = false;
     if (overflowButton) overflowButton.disabled = false;
@@ -15527,19 +15530,27 @@ function withChatModel(data) {
   return { ...chatModelFormFields(), ...data };
 }
 
+// Answering a decision resumes the paused turn, which no longer waits on the
+// user: the card and the composer line stop asking now, not when the resumed
+// turn ends (a command can run for minutes).
+async function resumeDecision(path, fallbackPath, data, handlers) {
+  settlePendingDecision();
+  return streamRequest(path, fallbackPath, data, handlers);
+}
+
 async function streamChatRequest(data, handlers, signal) {
   return streamRequest("/api/ask-stream", "/api/ask", data, handlers, signal);
 }
 
 async function streamResumeCommandRequest(data, handlers) {
   const fallbackPath = data.approved === "true" ? "/api/run-command" : "/api/reject-command";
-  return streamRequest("/api/resume-command-stream", fallbackPath, withChatModel(data), handlers);
+  return resumeDecision("/api/resume-command-stream", fallbackPath, withChatModel(data), handlers);
 }
 
 // A fetch decision resumes the turn, so the non-streaming fallback carries the
 // same decision and answers with the whole turn result.
 async function streamResumeFetchRequest(data, handlers) {
-  return streamRequest(
+  return resumeDecision(
     "/api/resume-fetch-stream",
     "/api/fetch-decision",
     withChatModel(data),
@@ -15551,29 +15562,29 @@ async function streamResumeFetchRequest(data, handlers) {
 // no one-shot endpoint that could stand in for one. `streamRequest` raises
 // rather than posting the decision somewhere that would not carry it.
 async function streamResumePlanRequest(data, handlers) {
-  return streamRequest("/api/resume-plan-stream", null, withChatModel(data), handlers);
+  return resumeDecision("/api/resume-plan-stream", null, withChatModel(data), handlers);
 }
 
 // Like a plan decision, answering a question *is* a turn, so there is no
 // one-shot endpoint to fall back to.
 async function streamResumeAnswerRequest(data, handlers) {
-  return streamRequest("/api/answer-question-stream", null, withChatModel(data), handlers);
+  return resumeDecision("/api/answer-question-stream", null, withChatModel(data), handlers);
 }
 
 // Like a plan decision, answering a fallback offer *is* a turn, so there is no
 // one-shot endpoint to fall back to.
 async function streamResumeFallbackRequest(data, handlers) {
-  return streamRequest("/api/resume-fallback-stream", null, data, handlers);
+  return resumeDecision("/api/resume-fallback-stream", null, data, handlers);
 }
 
 // Like a fallback decision, answering a round-budget pause *is* a turn, so
 // there is no one-shot endpoint to fall back to.
 async function streamResumeRoundBudgetRequest(data, handlers) {
-  return streamRequest("/api/resume-round-budget-stream", null, withChatModel(data), handlers);
+  return resumeDecision("/api/resume-round-budget-stream", null, withChatModel(data), handlers);
 }
 
 async function streamResumeContextRequest(data, handlers) {
-  return streamRequest("/api/resume-context-stream", null, withChatModel(data), handlers);
+  return resumeDecision("/api/resume-context-stream", null, withChatModel(data), handlers);
 }
 
 // Verification is a continuation turn the engine starts, not a user prompt, so
@@ -15589,7 +15600,7 @@ async function streamContinueRepairRequest(data, handlers) {
 }
 
 async function streamResumeChecksRequest(data, handlers) {
-  return streamRequest("/api/resume-checks-stream", null, withChatModel(data), handlers);
+  return resumeDecision("/api/resume-checks-stream", null, withChatModel(data), handlers);
 }
 
 // A refused request answers JSON (`{"error": …, "code": …}`); the user reads
