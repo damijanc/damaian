@@ -311,28 +311,6 @@ impl RepositoryMap {
         restricted
     }
 
-    /// Every root a command run in `working_directory` could write into: the
-    /// roots that own or enclose it (its completion floor), plus every root
-    /// beneath it. A command's effects are unknown until it runs, so the whole
-    /// subtree it can write is the honest scope (spec 102 review fix R18).
-    /// Removed roots are skipped, as for [`Self::enclosing_roots`].
-    pub fn roots_for_command(&self, working_directory: &str) -> Vec<String> {
-        let mut roots: BTreeSet<String> = self
-            .enclosing_roots(working_directory)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        for root in &self.roots {
-            if root.user_override == Some(RootOverride::Removed) {
-                continue;
-            }
-            if working_directory.is_empty() || owns(working_directory, &root.path) {
-                roots.insert(root.path.clone());
-            }
-        }
-        roots.into_iter().collect()
-    }
-
     /// Every root that encloses `path` — its owning root and every root above
     /// it — skipping removed roots. Empty only when no root encloses it.
     pub fn enclosing_roots(&self, path: &str) -> Vec<&str> {

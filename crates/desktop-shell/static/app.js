@@ -6385,34 +6385,6 @@ function showWaitingIndicator(row, label) {
   waitingIndicator = entry;
 }
 
-// Spec 107 Task 4: while a baseline the user started runs, the waiting row is
-// a working row again, naming the check ("Running baseline: cargo test
-// (repository root)") with that check's own clock from `since`.
-function showWaitingActivity(label, since) {
-  if (!waitingIndicator) return;
-  delete waitingIndicator.row.dataset.state;
-  const text = waitingIndicator.row.querySelector(".turn-indicator-label");
-  if (text && label) text.textContent = label;
-  waitingIndicator.since = since;
-  waitingIndicator.tick();
-}
-
-// The baseline ended: back to waiting on the user, with a fresh clock. The
-// patch card's next render names the decision again.
-function endWaitingActivity() {
-  if (!waitingIndicator) return;
-  waitingIndicator.row.dataset.state = "waiting";
-  waitingIndicator.since = Date.now();
-  waitingIndicator.tick();
-}
-
-// The waiting row's label when a patch card's baseline replaces the patch as
-// what the turn waits on, or the other way round.
-function renameWaitingIndicator(label) {
-  const text = waitingIndicator?.row.querySelector(".turn-indicator-label");
-  if (text && label) text.textContent = label;
-}
-
 // Reload: a task waiting on a decision gets the same row under its bubble that
 // the live turn left, so the line is not blank because the page was reloaded.
 function restoreWaitingIndicator(body, label) {
@@ -13017,7 +12989,9 @@ function createCheckBatchCard(
   const header = document.createElement("div");
   header.className = "check-batch-header";
   const title = document.createElement("strong");
-  title.textContent = "Checks need approval";
+  // A failed check's baseline card (spec 109) brings its own heading and
+  // explanation from the engine; the ordinary check card keeps its wording.
+  title.textContent = batch.title || "Checks need approval";
   const count = document.createElement("span");
   count.className = "check-batch-count";
   count.textContent = `${batch.checks.length} check${batch.checks.length === 1 ? "" : "s"}`;
@@ -13026,8 +13000,9 @@ function createCheckBatchCard(
   const note = document.createElement("p");
   note.className = "check-batch-note";
   note.textContent =
+    batch.note ||
     "Verification is waiting for these checks. Tick the ones to run; unticked checks are " +
-    "skipped and reported as declined. The report follows once you answer.";
+      "skipped and reported as declined. The report follows once you answer.";
 
   const list = document.createElement("div");
   list.className = "check-batch-list";
@@ -13619,19 +13594,16 @@ function appendProposals(message, payload, repo) {
 // The card is the last element of `#chat-log`, directly above the composer
 // (spec 93's rule for recovery cards), and the composer line names it. A
 // decided card stays where it is in the history (context D5).
-// `{ decision, baseDecision, card, frame }`; `baseDecision` is what a patch
-// card reverts to once its baseline card is decided.
+// `{ decision, card, frame }`.
 let pendingDecision = null;
 // The composer's own placeholder while a pending question has taken it over.
 let composerQuestionLock = null;
 
-// Which proposal of a turn's payload carries the card for each kind. A
-// baseline decision is a patch whose apply waits on the baseline card inside
-// the patch card, so the patch card is what moves.
+// Which proposal of a turn's payload carries the card for each kind. A failed
+// check's baseline (spec 109) is a check card like any other.
 const PENDING_DECISION_FIELDS = {
   question: "questionProposal",
   patch: "patchProposal",
-  baseline: "patchProposal",
   checks: "checkBatch",
   command: "commandProposal",
   round_budget: "roundBudgetProposal",
@@ -13664,7 +13636,7 @@ function setPendingDecision(message, card, decision, mount = card) {
     if (message?.body) appendPendingPointer(message.body, decision, frame);
   }
   const planMessage = message?.body ? message : null;
-  pendingDecision = { decision, baseDecision: decision, card, frame, planMessage };
+  pendingDecision = { decision, card, frame, planMessage };
   // A live `plan` event is streamed before the pause is written, so it always
   // says `waiting: false`; the decision is what makes the open step wait.
   if (planMessage) markPlanWaiting(planMessage, true);
@@ -13703,23 +13675,6 @@ function resetPendingDecision() {
   syncComposerDecision();
 }
 
-// A patch card's apply can raise a baseline card outside any turn; the apply
-// and baseline routes return its `pendingDecision`. `null` means the baseline
-// is settled and the patch itself is pending again.
-function notePendingDecisionChange(card, decision) {
-  const current = pendingDecision;
-  if (!current || current.card !== card) return;
-  current.decision = decision || current.baseDecision;
-  if (current.frame) {
-    current.frame.dataset.kind = current.decision.kind;
-    current.frame.dataset.cardId = current.decision.cardId || "";
-    current.frame.setAttribute("aria-label", current.decision.label);
-    if (decision) current.frame.scrollIntoView({ block: "nearest" });
-  }
-  renameWaitingIndicator(current.decision.statusLabel);
-  syncComposerDecision();
-}
-
 // Reload: the engine reports the decision in `/api/session`; the card is the
 // reloaded question or, after a restart, the reattached approval (spec 45).
 function restorePendingDecision(tasks) {
@@ -13755,14 +13710,12 @@ function focusPendingDecision() {
   frame.scrollIntoView({ block: "nearest" });
   const kind = pendingDecision.decision.kind;
   // D2: the question's own answer field, or its first option when it takes no
-  // free text. A baseline is decided on its own card inside the patch.
+  // free text.
   const target =
     kind === "question"
       ? frame.querySelector(".question-card-free-text input:not(:disabled)") ||
         frame.querySelector(".question-card-options button:not(:disabled)")
-      : kind === "baseline"
-        ? frame.querySelector(".baseline-batch button:not(:disabled)")
-        : null;
+      : null;
   (target || frame).focus({ preventScroll: true });
 }
 
@@ -14674,186 +14627,6 @@ function createWorkerSuggestion(
   return row;
 }
 
-// The engine-owned card for checks that need a pre-apply baseline (spec 102
-// Task 2). The label, note, buttons and per-check risk/cause all arrive from
-// the engine: this renders them and sends the decisions back unchanged.
-function createBaselineBatchCard(batch, onDecide) {
-  const card = document.createElement("section");
-  card.className = "check-batch baseline-batch";
-
-  const header = document.createElement("div");
-  header.className = "check-batch-header";
-  const title = document.createElement("strong");
-  title.textContent = batch.title;
-  const count = document.createElement("span");
-  count.className = "check-batch-count";
-  count.textContent = `${batch.checks.length} check${batch.checks.length === 1 ? "" : "s"}`;
-  header.append(title, count);
-
-  const note = document.createElement("p");
-  note.className = "check-batch-note";
-  note.textContent = batch.note;
-
-  const list = document.createElement("div");
-  list.className = "check-batch-list";
-  const rows = batch.checks.map((check) => {
-    const row = document.createElement("div");
-    row.className = "check-batch-item";
-
-    const run = document.createElement("input");
-    run.type = "checkbox";
-    run.className = "check-batch-run";
-    run.checked = false;
-    run.setAttribute("aria-label", `${check.prompt} ${check.command} in ${check.locationLabel}`);
-
-    const command = document.createElement("code");
-    command.className = "check-batch-command";
-    command.textContent = check.command;
-    const where = document.createElement("span");
-    where.className = "check-batch-where";
-    where.textContent = `in ${check.locationLabel}`;
-    command.append(document.createElement("br"), where);
-
-    const risk = document.createElement("span");
-    risk.className = "check-batch-risk";
-    risk.dataset.blocked = check.blocked ? "true" : "false";
-    risk.textContent = check.riskLabel;
-
-    const cause = document.createElement("span");
-    cause.className = "check-batch-cause";
-    cause.textContent = check.cause;
-
-    row.append(run, command, risk, cause);
-
-    let always = null;
-    if (check.allowAlways) {
-      const grant = document.createElement("label");
-      grant.className = "check-batch-allow";
-      always = document.createElement("input");
-      always.type = "checkbox";
-      always.disabled = true;
-      run.addEventListener("change", () => {
-        always.disabled = !run.checked;
-      });
-      grant.append(always, document.createTextNode(" Always allow"));
-      row.append(grant);
-    }
-    list.append(row);
-    return { check, run, always };
-  });
-
-  const actions = document.createElement("div");
-  actions.className = "check-batch-actions";
-  const runAll = document.createElement("button");
-  runAll.type = "button";
-  runAll.className = "btn-sm";
-  runAll.textContent = batch.runAllLabel;
-  const submit = document.createElement("button");
-  submit.type = "button";
-  submit.className = "btn-sm";
-  actions.append(runAll, submit);
-
-  // Spec 107 Task 4: what runs once the user submits — the engine's label for
-  // the running check, its clock, its latest output line, and Cancel.
-  const progress = document.createElement("div");
-  progress.className = "baseline-progress";
-  progress.hidden = true;
-  const progressLine = document.createElement("p");
-  progressLine.className = "baseline-progress-line";
-  const progressLabel = document.createElement("span");
-  progressLabel.className = "baseline-progress-label";
-  progressLabel.setAttribute("aria-live", "polite");
-  const progressClock = document.createElement("span");
-  progressClock.className = "baseline-progress-elapsed";
-  progressLine.append(progressLabel, progressClock);
-  const progressOutput = document.createElement("code");
-  progressOutput.className = "baseline-progress-output";
-  const cancel = document.createElement("button");
-  cancel.type = "button";
-  cancel.className = "btn-sm baseline-cancel";
-  cancel.textContent = batch.cancelLabel || "Cancel";
-  progress.append(progressLine, progressOutput, cancel);
-
-  const syncSubmit = () => {
-    const ticked = rows.filter(({ run }) => run.checked).length;
-    submit.textContent = ticked > 0 ? batch.runLabel : batch.skipLabel;
-    submit.classList.toggle("btn-primary", ticked > 0);
-    runAll.hidden = ticked === rows.length;
-  };
-  for (const { run } of rows) run.addEventListener("change", syncSubmit);
-  syncSubmit();
-
-  runAll.addEventListener("click", () => {
-    for (const { run } of rows) {
-      run.checked = true;
-      run.dispatchEvent(new Event("change"));
-    }
-  });
-  submit.addEventListener("click", async () => {
-    submit.disabled = true;
-    runAll.disabled = true;
-    const decisions = rows.map(({ check, run }) => ({
-      proposalId: check.proposalId,
-      approved: run.checked,
-    }));
-    const always = rows
-      .filter(({ run, always }) => run.checked && always?.checked)
-      .map(({ check }) => check.proposalId)
-      .join("\n");
-    const controller = new AbortController();
-    let since = Date.now();
-    const tick = () => {
-      progressClock.textContent = formatClock(Date.now() - since);
-    };
-    const timer = setInterval(tick, 1000);
-    cancel.disabled = false;
-    cancel.onclick = () => {
-      // Closing the stream is the cancel: the shell notices on its next
-      // write and the engine records the rest as declined.
-      cancel.disabled = true;
-      progressLabel.textContent = "Cancelling…";
-      controller.abort();
-    };
-    const watch = {
-      signal: controller.signal,
-      baseline(event) {
-        if (event.kind === "started") {
-          progress.hidden = false;
-          since = Date.now();
-          const count = event.total > 1 ? ` (${event.index} of ${event.total})` : "";
-          progressLabel.textContent = `${event.label}${count}`;
-          progressOutput.textContent = "";
-          tick();
-          showWaitingActivity(event.label, since);
-        } else if (event.kind === "output") {
-          progressOutput.textContent = event.line;
-        } else if (event.kind === "finished") {
-          progressLabel.textContent = event.label;
-        }
-      },
-      elapsed(event) {
-        since = Date.now() - event.seconds * 1000;
-        tick();
-        showWaitingActivity("", since);
-      },
-    };
-    try {
-      await onDecide(decisions, always, watch);
-    } catch (error) {
-      submit.disabled = false;
-      runAll.disabled = false;
-      progress.hidden = true;
-      toast(error.message);
-    } finally {
-      clearInterval(timer);
-      cancel.disabled = true;
-    }
-  });
-
-  card.append(header, note, list, actions, progress);
-  return card;
-}
-
 // `onResolved` is called once no file is left pending, for a patch reattached
 // after a crash: the task it belonged to has to be closed out, or the next
 // launch offers the same patch again. See
@@ -14865,10 +14638,6 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
     // Warnings a hook returned on an apply (spec 32 Task 9). They are not a
     // reason to roll back, so they stay beside the applied files.
     hookWarnings: [],
-    // A pre-apply baseline batch the engine is waiting on (spec 102 Task 2).
-    // The card carries the engine's own labels and decisions; this object only
-    // remembers the exact apply snapshot to retry once the user answers.
-    baseline: null,
     files: (payload.files || []).map((file) => {
       const stats = diffStats(file.diff);
       return {
@@ -14917,7 +14686,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
     const additions = selected.reduce((sum, file) => sum + file.additions, 0);
     const deletions = selected.reduce((sum, file) => sum + file.deletions, 0);
     applyButton.textContent = `Apply ${selected.length}`;
-    applyButton.disabled = selected.length === 0 || Boolean(state.baseline);
+    applyButton.disabled = selected.length === 0;
     meta.textContent =
       selected.length === 1
         ? `1 file · +${additions} −${deletions}`
@@ -15113,7 +14882,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.checked = file.selected;
-      checkbox.disabled = file.state !== "pending" || Boolean(state.baseline);
+      checkbox.disabled = file.state !== "pending";
       checkbox.addEventListener("change", () => {
         file.selected = checkbox.checked;
         // Not `render()`: this handler deliberately does not rebuild the list,
@@ -15183,7 +14952,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       }
 
       cardHeader.append(label, meta);
-      card.append(cardHeader, renderHunks(file, null, Boolean(state.baseline)));
+      card.append(cardHeader, renderHunks(file, null, false));
       list.append(card);
     });
 
@@ -15204,86 +14973,9 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       });
       list.append(notice);
     }
-    if (state.baseline) {
-      list.append(
-        createBaselineBatchCard(state.baseline.batch, async (decisions, always, watch) => {
-          const pending = state.baseline;
-          if (!pending) return;
-          // Spec 107 Task 4: streamed, so the card and the status line show the
-          // running check and its clock, and Cancel can stop it.
-          let result = null;
-          let failure = null;
-          try {
-            await streamRequest(
-              "/api/resume-baseline-stream",
-              null,
-              {
-                repo: patchRepo,
-                batch_id: pending.batch.id,
-                decisions: JSON.stringify(decisions),
-                always,
-              },
-              {
-                token() {},
-                baseline: watch.baseline,
-                elapsed: watch.elapsed,
-                done(payload) {
-                  result = payload;
-                },
-                error(payload) {
-                  failure = new Error(payload.error || "The baseline could not run");
-                },
-              },
-              watch.signal,
-            );
-          } catch (error) {
-            if (!watch.signal.aborted) failure = error;
-          } finally {
-            endWaitingActivity();
-          }
-          if (failure) {
-            // A stale card (for example after a reload rebuilt the batch) is
-            // safe to re-offer: the next apply asks the engine again.
-            state.baseline = null;
-            render();
-            throw failure;
-          }
-          // A cancelled baseline is recorded as declined, exactly as *Skip
-          // baselines* would, and the patch is left for the user: no apply is
-          // retried on their behalf.
-          if (watch.signal.aborted || result?.cancelled === true) {
-            state.baseline = null;
-            render();
-            toast("Baseline cancelled and recorded as declined. Apply or reject the patch.");
-            return;
-          }
-          // Incomplete or still-awaiting responses never retry the apply: the
-          // only response that means every check has a terminal baseline is
-          // the engine's explicit `completed: true`.
-          if (!result) throw new Error("The baseline response was incomplete");
-          if (result.completed !== true) {
-            if (!result.baselineBatch) {
-              throw new Error("The baseline response was incomplete");
-            }
-            state.baseline = {
-              batch: result.baselineBatch,
-              selection: pending.selection,
-              decision: result.pendingDecision || null,
-            };
-            render();
-            return;
-          }
-          state.baseline = null;
-          render();
-          await runApply(pending.selection);
-        }),
-      );
-    }
-    applyButton.disabled = !hasPending || Boolean(state.baseline);
-    rejectButton.disabled = !hasPending || Boolean(state.baseline);
+    applyButton.disabled = !hasPending;
+    rejectButton.disabled = !hasPending;
     $("chat-log").scrollTop = $("chat-log").scrollHeight;
-    // Spec 107: while the baseline card is up, the composer names it.
-    notePendingDecisionChange(wrapper, state.baseline?.decision || null);
   }
 
   async function runApply(selection) {
@@ -15297,19 +14989,6 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       };
       if (selection.allowSecrets) fields.allow_secrets = "1";
       const result = await api("/api/apply-patch", form(fields));
-
-      // Nothing was written; the engine needs the pre-apply baselines decided
-      // first. The batch already carries its own labels and decisions. Keep
-      // this exact snapshot so the retry cannot pick up later control changes.
-      if (result.baselineBatch) {
-        state.baseline = {
-          batch: result.baselineBatch,
-          selection,
-          decision: result.pendingDecision || null,
-        };
-        render();
-        return;
-      }
 
       // Nothing was written; the server is asking whether to go ahead.
       const blocked = result.blockedBySecrets || [];
@@ -15943,10 +15622,6 @@ function processSseEvent(raw, handlers) {
     setContextManifest(payload, payload.taskId || "");
     if (handlers.context) handlers.context(payload);
   }
-  // A streamed baseline (spec 107 Task 4): the engine's progress, and the
-  // running check's clock on each keepalive tick.
-  if (event === "baseline" && handlers.baseline) handlers.baseline(payload);
-  if (event === "elapsed" && handlers.elapsed) handlers.elapsed(payload);
   if (event === "done") handlers.done(payload);
   if (event === "error") handlers.error(payload);
 }

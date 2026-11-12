@@ -10,8 +10,7 @@ use crate::clarification::{
 };
 use crate::command_policy::{
     ApprovalCause, CommandClassification, CommandRisk, allow_always_eligible,
-    is_low_risk_read_only, is_read_only_pipeline, is_source_writing_command, is_validation_command,
-    relative_location,
+    is_validation_command, relative_location,
 };
 use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
@@ -509,6 +508,11 @@ pub struct AgentCheckBatch {
     /// [`ChatOrchestrator::resume_after_check_decision`].
     pub id: String,
     pub checks: Vec<AgentCommandProposal>,
+    /// The card's own heading and explanation when it is not the ordinary
+    /// "checks need approval" card: a failed check's baseline (spec 109 D1)
+    /// says why it asks. `None` keeps the renderer's ordinary wording.
+    pub title: Option<String>,
+    pub note: Option<String>,
 }
 
 /// A patch the model proposed mid-conversation via the `propose_patch` tool
@@ -966,9 +970,9 @@ pub struct ChatOrchestrator {
     validation_orchestrator: ValidationOrchestrator,
     command_store: CommandStore,
     pending_commands: PendingCommandStore,
-    /// The same task-start baseline gate the patch path uses (spec 102 review
-    /// fix R18): the command path takes it after an approval and before the
-    /// command runs.
+    /// Failure-time baselines (spec 109 D1): a verification check that failed
+    /// with no baseline in its task chain takes one on the task-start tree
+    /// before it is classified.
     baselines: BaselineCoordinator,
     file_access: FileAccessController,
     navigation: NavigationController,
@@ -2131,7 +2135,7 @@ impl ChatOrchestrator {
             segment: None,
             question: None,
             check_batch: None,
-            command_baseline: None,
+            failure_baseline: None,
             fetch_call: None,
             context_review: Some(PendingContextReview {
                 prepared,
@@ -2943,11 +2947,11 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.load(batch_id)?;
-        // A command's task-start baseline uses the same card and the same
-        // resume route (spec 102 review fix R18). It records baselines, not
-        // verification checks, and then resumes the command that was paused.
-        if pending.command_baseline.is_some() {
-            return self.resume_command_baseline(
+        // A failed check's baseline uses the same card and the same resume
+        // route (spec 109 D1). It records baselines, then finishes the
+        // verification that was waiting to classify its failures.
+        if pending.failure_baseline.is_some() {
+            return self.resume_failure_baseline(
                 batch_id,
                 decisions,
                 approved_by,
@@ -2961,14 +2965,19 @@ impl ChatOrchestrator {
         self.continue_task_after_verification(&repository_root, result, model_adapter, sink)
     }
 
-    /// Parks an approved command on the baseline card its required checks
-    /// raised, before anything executes (spec 102 review fix R18). The command
-    /// is not declined: its pause is saved again, marked as waiting on this
-    /// card, and resumes after the `CheckBaseline`s are recorded.
-    fn pause_for_command_baseline(
+    /// Parks a verification on the card for its failed checks' baselines
+    /// (spec 109 D1). The checks have run and failed; nothing is classified
+    /// yet. The verification resumes once every baseline has a terminal
+    /// record, from a decision or a cancel.
+    #[allow(clippy::too_many_arguments)]
+    fn pause_for_failure_baseline(
         &self,
-        pending: PendingChatTurn,
-        command_id: &str,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        attempt: u32,
+        changed: Vec<String>,
+        file_hashes: BTreeMap<String, String>,
         batch: BaselineBatch,
     ) -> Result<ChatTurnResult> {
         let batch_id = create_id("checkbatch");
@@ -2980,53 +2989,85 @@ impl ChatOrchestrator {
         let card = AgentCheckBatch {
             id: batch_id.clone(),
             checks: entries,
+            title: Some(batch.title.clone()),
+            note: Some(batch.note.clone()),
         };
-        let mut paused = pending;
-        paused.proposal_id = batch_id.clone();
-        paused.command_baseline = Some(PendingCommandBaseline {
-            command_id: command_id.to_string(),
-            batch,
-        });
-        self.pending_commands.save(&paused)?;
+        self.pending_commands.save(&PendingChatTurn {
+            proposal_id: batch_id.clone(),
+            session: session.clone(),
+            task: task.clone(),
+            repository_root: repository_root.to_string_lossy().to_string(),
+            context_files: changed.clone(),
+            round: 0,
+            exploration_rounds: 0,
+            turn_notes: String::new(),
+            turn_notes_carried: false,
+            calls: Vec::new(),
+            completed_tool_rounds: Vec::new(),
+            step_evidence: Vec::new(),
+            plan_reminder_sent: false,
+            messages: Vec::new(),
+            matched_tool_call: None,
+            last_content: String::new(),
+            turn_options: ChatTurnOptions::default(),
+            reasoning_content: None,
+            round_calls_fed_back: false,
+            mcp_call: None,
+            web_diagnostic_call: None,
+            plan_review: None,
+            provider_fallback: None,
+            round_budget: None,
+            segment: None,
+            question: None,
+            check_batch: None,
+            failure_baseline: Some(PendingFailureBaseline {
+                batch,
+                attempt,
+                files_changed: changed.clone(),
+                file_hashes,
+            }),
+            fetch_call: None,
+            context_review: None,
+        })?;
         self.note_pending_approvals(
-            &paused.session,
-            &paused.task,
+            &session,
+            &task,
             vec![PendingApproval {
                 kind: "checks".to_string(),
                 proposal_id: batch_id.clone(),
             }],
         );
         let task = self.session_store.await_approval(
-            &paused.task,
+            &task,
             &PendingApprovalRef {
                 kind: "checks".to_string(),
                 proposal_id: batch_id.clone(),
             },
         )?;
         self.audit_log.record(
-            "command_baseline_paused",
+            "failure_baseline_paused",
             &[
                 ("actor", "system".to_string()),
-                ("sessionId", paused.session.id.clone()),
-                ("taskId", paused.task.id.clone()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
                 ("proposalId", batch_id.clone()),
-                ("commandId", command_id.to_string()),
                 ("checks", card.checks.len().to_string()),
             ],
         )?;
         self.verification_turn_result(
-            paused.session,
+            session,
             task,
-            COMMAND_BASELINE_PAUSED_RESPONSE.to_string(),
+            FAILURE_BASELINE_PAUSED_RESPONSE.to_string(),
             Some(card),
             None,
-            paused.context_files,
+            changed,
         )
     }
 
-    /// Answers the baseline card an approved command raised, records the
-    /// `CheckBaseline`s, and only then resumes the command itself.
-    fn resume_command_baseline(
+    /// Answers the card for a failed check's baseline, runs the approved ones
+    /// in the task-start tree under the turn's cancel, and finishes the
+    /// verification that was waiting on them.
+    fn resume_failure_baseline(
         &self,
         batch_id: &str,
         decisions: &[(String, bool)],
@@ -3035,42 +3076,47 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(batch_id)?;
-        self.refuse_unless_paused_for(batch_id, &pending, PausedFor::CommandBaseline)?;
-        let Some(command_baseline) = pending.command_baseline.clone() else {
-            unreachable!("the pause was proved to be a command baseline")
+        self.refuse_unless_paused_for(batch_id, &pending, PausedFor::FailureBaseline)?;
+        let Some(failure) = pending.failure_baseline.clone() else {
+            unreachable!("the pause was proved to be a failure baseline")
         };
         let repository_root = PathBuf::from(&pending.repository_root);
-        // Validate the whole decision set before anything runs, exactly as the
-        // patch baseline route does; a malformed retry leaves the card intact.
-        self.baselines.validate_resume(
-            &repository_root,
-            &command_baseline.batch.id,
-            decisions,
-            &[],
-        )?;
-        self.baselines.resume(
-            &repository_root,
-            &command_baseline.batch.id,
-            decisions,
-            &[],
-            approved_by,
-        )?;
-        // The command turn was taken to present this card. Put it back under its
-        // own proposal id, without the marker, so the ordinary command resume
-        // finds exactly the pause it saved.
+        // Validate the whole decision set before anything runs; a malformed
+        // retry leaves the card intact.
+        if let Err(error) =
+            self.baselines
+                .validate_resume(&repository_root, &failure.batch.id, decisions, &[])
+        {
+            self.pending_commands.save(&pending)?;
+            return Err(error);
+        }
         self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
-        let mut restored = pending;
-        restored.proposal_id = command_baseline.command_id.clone();
-        restored.command_baseline = None;
-        self.pending_commands.save(&restored)?;
-        self.resume_after_command_decision_with_options(
-            &command_baseline.command_id,
-            true,
+        let task =
+            self.session_store
+                .update_task_status(&pending.task, TaskStatus::Validating, None)?;
+        sink.session(&pending.session.id);
+        let cancel = sink.cancel;
+        let on_progress = &mut *sink.on_progress;
+        self.baselines.resume_streamed(
+            &repository_root,
+            &failure.batch.id,
+            decisions,
+            &[],
             approved_by,
+            cancel,
+            &mut |progress| on_progress(baseline_turn_progress(progress)),
+        )?;
+        let result = self.finish_verification(
+            &repository_root,
+            pending.session,
+            task,
+            failure.attempt,
+            failure.files_changed,
+            failure.file_hashes,
             model_adapter,
             sink,
-            ResumeDecisionOptions::default(),
-        )
+        )?;
+        self.continue_task_after_verification(&repository_root, result, model_adapter, sink)
     }
 
     fn check_decision_report(
@@ -3729,6 +3775,8 @@ impl ChatOrchestrator {
         let batch = AgentCheckBatch {
             id: batch_id.clone(),
             checks: entries,
+            title: None,
+            note: None,
         };
         self.pending_commands.save(&PendingChatTurn {
             proposal_id: batch_id.clone(),
@@ -3765,7 +3813,7 @@ impl ChatOrchestrator {
                 files_changed: changed.clone(),
                 file_hashes,
             }),
-            command_baseline: None,
+            failure_baseline: None,
             fetch_call: None,
             context_review: None,
         })?;
@@ -3857,12 +3905,12 @@ impl ChatOrchestrator {
         let previous = self
             .session_store
             .task_verification_provenance(&session.id, &task.id)?;
-        // A required check with no recorded baseline has no task-start
-        // baseline: the pre-apply gate establishes every required check on the
-        // task's first patch. This fallback covers a check that became
-        // required after the last patch, or a historical log whose first patch
-        // predates required-check baselining. A declined baseline is still
-        // `Some(Declined)` and stays unknown, never uncertain.
+        // A failed check takes its baseline just before this classification
+        // (spec 109 D1), so a required check reaches here without one only
+        // when none was taken: its run was cancelled, or the log predates
+        // baselining. It stays `uncertain` rather than guessed. A declined
+        // baseline is still `Some(Declined)` and stays unknown, never
+        // uncertain.
         let required = plan
             .steps
             .iter()
@@ -3941,6 +3989,34 @@ impl ChatOrchestrator {
             .session_store
             .read_verification_events(&session.id, &[])?;
         let state = fold_verification(events.iter());
+        // Spec 109 D1: a check that failed and has no baseline in this task
+        // chain takes one now, on the task-start tree, before anything
+        // classifies it. A passing check never does. One that needs approval
+        // parks the verification on the baseline card.
+        let failed = checks_needing_failure_baseline(&state);
+        if !failed.is_empty() {
+            let cancel = sink.cancel;
+            let on_progress = &mut *sink.on_progress;
+            let preparation = self.baselines.prepare_for_failures(
+                repository_root,
+                &session.id,
+                &task.id,
+                &failed,
+                cancel,
+                &mut |progress| on_progress(baseline_turn_progress(progress)),
+            )?;
+            if let BaselinePreparation::Awaiting(batch) = preparation {
+                return self.pause_for_failure_baseline(
+                    repository_root,
+                    session,
+                    task,
+                    attempt,
+                    changed,
+                    file_hashes,
+                    batch,
+                );
+            }
+        }
         let plan = self
             .session_store
             .read_task_plan(&session.id, &task.id)?
@@ -4112,7 +4188,7 @@ impl ChatOrchestrator {
                 kind: PendingQuestionKind::RepairDecision,
             }),
             check_batch: None,
-            command_baseline: None,
+            failure_baseline: None,
             fetch_call: None,
             context_review: None,
         })?;
@@ -5715,26 +5791,6 @@ impl ChatOrchestrator {
                     .reject_proposal(proposal_id, rejected_by)?;
                 refusal_message(permission)
             } else if approved {
-                // Spec 102 review fix R18: a task whose first mutation is this
-                // approved command still needs its task-start baseline before
-                // the command runs. Commands that only read (admitted read-only,
-                // a read-only shell pipeline, or a validation check) take none.
-                // The same batch/policy path as a patch is used, after this
-                // approval and before the census.
-                if command_needs_task_start_baseline(&proposal) {
-                    match self.baselines.prepare_for_command(
-                        &repository_root,
-                        &pending.session.id,
-                        &pending.task.id,
-                        &proposal,
-                    )? {
-                        BaselinePreparation::Complete { .. } => {}
-                        BaselinePreparation::Awaiting(batch) => {
-                            pending.messages = messages;
-                            return self.pause_for_command_baseline(pending, proposal_id, batch);
-                        }
-                    }
-                }
                 // The census has to be taken before the command runs: once it
                 // has, the pre-command bytes are gone.
                 let census = self
@@ -11530,7 +11586,7 @@ impl ChatOrchestrator {
                             .map(|tracker| tracker.pause_state(action_rounds, exploration_rounds)),
                         question: None,
                         check_batch: None,
-                        command_baseline: None,
+                        failure_baseline: None,
                         fetch_call: None,
                         context_review: None,
                     })?;
@@ -11857,7 +11913,7 @@ impl ChatOrchestrator {
                                     }),
                                     question: None,
                                     check_batch: None,
-                                    command_baseline: None,
+                                    failure_baseline: None,
                                     fetch_call: None,
                                     context_review: None,
                                 })?;
@@ -12484,7 +12540,7 @@ impl ChatOrchestrator {
                                         }),
                                         question: None,
                                         check_batch: None,
-                                        command_baseline: None,
+                                        failure_baseline: None,
                                         fetch_call: Some(PendingFetchCall {
                                             host: host.clone(),
                                             url: proposal.url.clone(),
@@ -12575,7 +12631,7 @@ impl ChatOrchestrator {
                                     }),
                                     question: None,
                                     check_batch: None,
-                                    command_baseline: None,
+                                    failure_baseline: None,
                                     fetch_call: None,
                                     context_review: None,
                                 })?;
@@ -12706,7 +12762,7 @@ impl ChatOrchestrator {
                                     }),
                                     question: None,
                                     check_batch: None,
-                                    command_baseline: None,
+                                    failure_baseline: None,
                                     fetch_call: None,
                                     context_review: None,
                                 })?;
@@ -12994,7 +13050,7 @@ impl ChatOrchestrator {
                                             kind: PendingQuestionKind::Agent,
                                         }),
                                         check_batch: None,
-                                        command_baseline: None,
+                                        failure_baseline: None,
                                         fetch_call: None,
                                         context_review: None,
                                     })?;
@@ -13682,7 +13738,7 @@ impl ChatOrchestrator {
             segment: segment.map(|tracker| tracker.pause_state(action_rounds, exploration_rounds)),
             question: None,
             check_batch: None,
-            command_baseline: None,
+            failure_baseline: None,
             fetch_call: None,
             context_review: None,
         })?;
@@ -13828,7 +13884,7 @@ impl ChatOrchestrator {
             segment: segment.map(|tracker| tracker.pause_state(action_rounds, exploration_rounds)),
             question: None,
             check_batch: None,
-            command_baseline: None,
+            failure_baseline: None,
             fetch_call: None,
             context_review: None,
         })?;
@@ -15093,9 +15149,9 @@ enum PausedFor {
     /// A batch of verification checks waiting for one card's decisions
     /// (spec 23).
     CheckBatch,
-    /// An approved command's task-start baseline waiting for one card's
-    /// decisions before the command may run (spec 102 review fix R18).
-    CommandBaseline,
+    /// A failed check's baseline waiting for one card's decisions before the
+    /// verification can classify the failure (spec 109 D1).
+    FailureBaseline,
     Question,
     /// A host approval before a `fetch_url` request (spec 51 §5.3). Nothing
     /// was requested, and the only route that may continue it is
@@ -15119,7 +15175,7 @@ impl PausedFor {
             Self::ProviderFallback => "a provider fallback offer",
             Self::RoundBudget => "a round-budget pause",
             Self::CheckBatch => "a check approval",
-            Self::CommandBaseline => "a command's baseline approval",
+            Self::FailureBaseline => "a failed check's baseline approval",
             Self::Question => "a question",
             Self::Fetch => "a fetch approval",
             Self::ContextReview => "a context review",
@@ -15134,7 +15190,7 @@ impl PausedFor {
             Self::ProviderFallback => "resume_after_fallback_decision",
             Self::RoundBudget => "resume_round_budget",
             Self::CheckBatch => "resume_after_check_decision",
-            Self::CommandBaseline => "resume_after_check_decision",
+            Self::FailureBaseline => "resume_after_check_decision",
             Self::Question => "resume_after_answer",
             Self::Fetch => "resume_after_fetch_decision",
             Self::ContextReview => "resume_after_context_decision",
@@ -15195,7 +15251,7 @@ fn paused_for(pending: &PendingChatTurn) -> PausedFor {
         pending.round_budget.is_some(),
         pending.question.is_some(),
         pending.check_batch.is_some(),
-        pending.command_baseline.is_some(),
+        pending.failure_baseline.is_some(),
         pending.fetch_call.is_some(),
         pending.context_review.is_some(),
     ) {
@@ -15205,7 +15261,7 @@ fn paused_for(pending: &PendingChatTurn) -> PausedFor {
         (false, false, true, false, false, false, false, false) => PausedFor::RoundBudget,
         (false, false, false, true, false, false, false, false) => PausedFor::Question,
         (false, false, false, false, true, false, false, false) => PausedFor::CheckBatch,
-        (false, false, false, false, false, true, false, false) => PausedFor::CommandBaseline,
+        (false, false, false, false, false, true, false, false) => PausedFor::FailureBaseline,
         (false, false, false, false, false, false, true, false) => PausedFor::Fetch,
         (false, false, false, false, false, false, false, true) => PausedFor::ContextReview,
         _ => PausedFor::Conflicting,
@@ -15858,13 +15914,13 @@ struct PendingChatTurn {
     /// finishes the report without re-deriving what the check saw.
     #[serde(default)]
     check_batch: Option<PendingCheckBatch>,
-    /// Present when an approved command's task-start baseline needs its own
-    /// approval before the command may run (spec 102 review fix R18). The card
-    /// is the existing check batch; this marker names the paused command that
-    /// resumes once the baselines are decided. Defaulted so a pending turn
-    /// written before this pause existed still loads.
+    /// Present when a failed check's baseline needs its own approval before
+    /// the verification can classify the failure (spec 109 D1). The card is
+    /// the existing check batch; this marker carries the baseline batch and
+    /// what the verification needs to finish once it is decided. Defaulted so
+    /// a pending turn written before this pause existed still loads.
     #[serde(default)]
-    command_baseline: Option<PendingCommandBaseline>,
+    failure_baseline: Option<PendingFailureBaseline>,
     /// Present when the pause is a host approval before a fetch (spec 51
     /// §5.3). Nothing was requested: an unapproved host stops the turn before
     /// the request is built. `#[serde(default)]` keeps pending turns written
@@ -15878,15 +15934,18 @@ struct PendingChatTurn {
     context_review: Option<PendingContextReview>,
 }
 
-/// The persisted half of a command-baseline pause (spec 102 review fix R18).
+/// The persisted half of a failure-baseline pause (spec 109 D1).
 ///
-/// The command itself stays paused: this records which proposal must resume
-/// after the check card's decisions are recorded as baselines, and the batch
-/// whose proposal ids those decisions address.
+/// The verification stays paused between running its checks and classifying
+/// their failures: this records the baseline batch whose proposal ids the
+/// card's decisions address, and the attempt's inputs, so the resumed turn
+/// finishes the same report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct PendingCommandBaseline {
-    command_id: String,
+struct PendingFailureBaseline {
     batch: BaselineBatch,
+    attempt: u32,
+    files_changed: Vec<String>,
+    file_hashes: BTreeMap<String, String>,
 }
 
 /// The persisted half of a check-batch pause (spec 23 §3).
@@ -16204,10 +16263,10 @@ impl PausedTurns {
                     .collect(),
             );
         }
-        // A command's task-start baseline uses the same card (spec 102 R18);
-        // its batch is serialized camelCase on the `command_baseline` marker.
+        // A failed check's baseline uses the same card (spec 109 D1); its
+        // batch is serialized camelCase on the `failure_baseline` marker.
         let checks = value
-            .get("command_baseline")?
+            .get("failure_baseline")?
             .get("batch")?
             .get("checks")?
             .as_array()?;
@@ -16437,9 +16496,43 @@ const CONTINUE_AFTER_VERIFICATION_PROMPT: &str = "The patch was applied and its 
 const CHECK_BATCH_PAUSED_RESPONSE: &str =
     "These checks need your approval before verification can continue.";
 
-/// What an approved command says when it parks on the baseline card.
-const COMMAND_BASELINE_PAUSED_RESPONSE: &str =
-    "These checks need your approval before the command can run.";
+/// The selected checks of the latest verification that failed with a code
+/// result: what a failure-time baseline is for (spec 109 D1). A passed,
+/// skipped or declined check, an environment failure, a run the user
+/// cancelled and a browser check (which has no command to rerun) take none.
+fn checks_needing_failure_baseline(state: &crate::verification::VerificationState) -> Vec<CheckId> {
+    state
+        .selected
+        .iter()
+        .filter(|check| !check.is_browser())
+        .filter(|check| {
+            state.checks.get(*check).is_some_and(|run| {
+                matches!(run.outcome, CheckOutcome::Ran { .. })
+                    && !run.outcome.is_passed()
+                    && run.outcome.termination().is_some_and(|termination| {
+                        !termination.is_environment_failure()
+                            && termination != CheckTermination::Cancelled
+                    })
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// A baseline's progress as the turn's status line shows it: the running
+/// check, its output, and how it ended.
+fn baseline_turn_progress(progress: crate::baseline::BaselineProgress) -> TurnProgress {
+    let (kind, label) = match progress {
+        crate::baseline::BaselineProgress::Started { label, .. } => (PhaseKind::Tool, label),
+        crate::baseline::BaselineProgress::Output { line } => (PhaseKind::Output, line),
+        crate::baseline::BaselineProgress::Finished { label, .. } => (PhaseKind::Tool, label),
+    };
+    TurnProgress::Phase(TurnPhase::new(kind, label, 0, 0, 0, 0, 0))
+}
+
+/// What a verification says when a failed check's baseline needs approval.
+const FAILURE_BASELINE_PAUSED_RESPONSE: &str = "A check failed. Run it on the files as they \
+     were before this task's changes to tell whether the failure is new?";
 
 /// A check's root as the report names it.
 /// The first `verify_N` the plan does not use yet, so a check new in a rerun
@@ -19193,30 +19286,6 @@ fn parse_command_request(value: &str) -> Option<CommandRequest> {
     })
 }
 
-/// Whether an approved command can plausibly change source files, and so must
-/// take the task-start baseline before it runs (spec 102 review fix R18).
-///
-/// A command that only reads is skipped: an admitted read-only command, a
-/// read-only shell pipeline, or a validation the engine already treats as a
-/// check. Formatters, fixers and generators keep the baseline even when a
-/// validation list calls them a check, and anything the engine cannot describe
-/// (`CommandPurpose::Other`, including every unknown command) stays on the safe
-/// side. A wrong skip is still fail-safe: spec 85 sees the files the command
-/// changed, and a check without a task-start baseline reports `uncertain`.
-fn command_needs_task_start_baseline(proposal: &CommandProposal) -> bool {
-    let command = proposal.command.trim();
-    if is_source_writing_command(command) {
-        return true;
-    }
-    if is_low_risk_read_only(command) || is_read_only_pipeline(command) {
-        return false;
-    }
-    if is_validation_command(command) {
-        return false;
-    }
-    matches!(proposal.purpose, CommandPurpose::Other)
-}
-
 /// The user-facing first line is the policy's own deciding reason (spec 62
 /// §5.2). `reasons` is rendered from the classification's causes, so this
 /// leads with the same words the card's **Why this command** shows.
@@ -19851,7 +19920,7 @@ mod pending_turn_defaults_tests {
             segment: None,
             question: None,
             check_batch: None,
-            command_baseline: None,
+            failure_baseline: None,
             fetch_call: None,
             context_review: None,
         };

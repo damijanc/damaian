@@ -6,10 +6,10 @@ use workspace_engine::{
     AgentCommandProposal, AgentPatchProposal, CancelToken, ChatTurnOptions, ClientError, Config,
     ContextCategory, ContextDecision, CurlModelTransport, MemoryProposal, MemoryScope, MemoryState,
     MemoryStore, MemoryStoreConfig, MemoryTarget, MockModelAdapter, ModelAdapter,
-    ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, PatchApplyOutcome, ProcessRegistry,
-    ProjectIdentity, ProjectKeySource, ProposalOrigin, Result, RoundBudgetDecision, SecretScanner,
-    SessionStore, Task, TaskExecutionBudget, TaskStatus, TaskTerminalOutcome, ToolCall,
-    TurnProgress, TurnSink, UsageSource, UserConfirmation, VerificationEvent, VerificationReport,
+    ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, ProcessRegistry, ProjectIdentity,
+    ProjectKeySource, ProposalOrigin, Result, RoundBudgetDecision, SecretScanner, SessionStore,
+    Task, TaskExecutionBudget, TaskStatus, TaskTerminalOutcome, ToolCall, TurnProgress, TurnSink,
+    UsageSource, UserConfirmation, VerificationEvent, VerificationReport,
     WithinTurnCompactionAttemptOutcome, WorkerRecord, WorkspaceEngine, classify_session,
     evidence_ref_for, resume,
 };
@@ -146,22 +146,16 @@ pub fn mock_provider() -> ModelProviderConfig {
     }
 }
 
-/// Apply a stored patch the way a headless harness must: spec 102's pre-apply
-/// baseline is its own ordinary approval, and the harness has no user to ask.
-/// A baseline for a check the scenario already approves therefore runs, so the
-/// recorded baseline is what makes a later failure attributable to the patch;
-/// a check the scenario declines (or does not name) keeps the harness's
-/// headless default of declining the baseline. Declining a baseline never
-/// declines the patch, so the same apply is retried either way. Always
-/// declining here would record `declined` for every check, and spec 102 Task 3
-/// correctly reads that as unknown provenance, which starts no repair.
+/// Apply a stored patch as the desktop app's apply route does. Spec 109 takes
+/// no baseline before a patch: a check that fails afterwards raises its own
+/// baseline card in the verification, answered by [`card_decisions`].
 fn apply_eval_patch(
     engine: &WorkspaceEngine,
     root: &Path,
     patch_id: &str,
-    scenario: &Scenario,
+    _scenario: &Scenario,
 ) -> Result<()> {
-    let mut outcome = engine.edit_orchestrator.apply_stored_patch_with_baseline(
+    engine.edit_orchestrator.apply_stored_patch(
         root,
         patch_id,
         None,
@@ -169,37 +163,33 @@ fn apply_eval_patch(
         "eval-harness",
         false,
     )?;
-    while let PatchApplyOutcome::BaselineRequired(batch) = outcome {
-        let decisions = batch
-            .checks
-            .iter()
-            .map(|check| {
-                (
-                    check.proposal_id.clone(),
-                    baseline_approved(scenario, &check.command),
-                )
-            })
-            .collect::<Vec<_>>();
-        engine.edit_orchestrator.resume_stored_patch_baseline(
-            root,
-            &batch.id,
-            &decisions,
-            &[],
-            "eval-harness",
-        )?;
-        outcome = engine.edit_orchestrator.apply_stored_patch_with_baseline(
-            root,
-            patch_id,
-            None,
-            None,
-            "eval-harness",
-            false,
-        )?;
-    }
-    let PatchApplyOutcome::Applied(_) = outcome else {
-        unreachable!("the baseline loop only exits with an applied patch")
-    };
     Ok(())
+}
+
+/// The harness's answer to a check card. A failed check's baseline card (spec
+/// 109 D1, the card with its own title) follows [`baseline_approved`]; an
+/// ordinary check card follows the scenario's check decisions, and a check it
+/// does not name is declined.
+fn card_decisions(
+    scenario: &Scenario,
+    batch: &workspace_engine::AgentCheckBatch,
+) -> Vec<(String, bool)> {
+    batch
+        .checks
+        .iter()
+        .map(|check| {
+            let approved = if batch.title.is_some() {
+                baseline_approved(scenario, &check.command)
+            } else {
+                scenario
+                    .check_decisions
+                    .iter()
+                    .find(|decision| decision.command == check.command)
+                    .is_some_and(|decision| decision.approved)
+            };
+            (check.id.clone(), approved)
+        })
+        .collect()
 }
 
 /// A headless harness has no user to answer a baseline card, so the scenario's
@@ -1461,27 +1451,14 @@ fn drive(
         ));
     }
 
-    // Spec 102 R18: an approved command takes its task-start baseline before it
-    // runs. A baseline that needs approval pauses on the same check card, so
-    // answer it with the scenario's own check decisions (an unmentioned
-    // baseline is declined) and let the still-approved command resume.
+    // A check card the resumed command turn raises is answered with the
+    // scenario's own decisions.
     while let Some(batch) = resumed
         .as_ref()
         .and_then(|turn| turn.as_ref().ok())
         .and_then(|turn| turn.check_batch.clone())
     {
-        let decisions = batch
-            .checks
-            .iter()
-            .map(|check| {
-                let approved = scenario
-                    .check_decisions
-                    .iter()
-                    .find(|decision| decision.command == check.command)
-                    .is_some_and(|decision| decision.approved);
-                (check.id.clone(), approved)
-            })
-            .collect::<Vec<_>>();
+        let decisions = card_decisions(scenario, &batch);
         let cancel = CancelToken::new();
         let mut on_resume_token = |_token: &str| {};
         let mut on_progress = |_event: TurnProgress| {};
@@ -1683,18 +1660,7 @@ fn drive(
                 }
             };
             if let Some(batch) = turn.check_batch.clone() {
-                let decisions = batch
-                    .checks
-                    .iter()
-                    .map(|check| {
-                        let approved = scenario
-                            .check_decisions
-                            .iter()
-                            .find(|decision| decision.command == check.command)
-                            .is_some_and(|decision| decision.approved);
-                        (check.id.clone(), approved)
-                    })
-                    .collect::<Vec<_>>();
+                let decisions = card_decisions(scenario, &batch);
                 let cancel = CancelToken::new();
                 let mut on_token = |_token: &str| {};
                 let mut on_progress = |_event: TurnProgress| {};

@@ -13,27 +13,26 @@ use workspace_engine::hooks::{
 };
 use workspace_engine::{
     AgentCheckBatch, AgentContextReview, AgentFallbackProposal, AgentFetchProposal,
-    AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal, BaselineBatch, BranchError,
+    AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal, BranchError,
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult,
     ClientError, CommitError, Config, ContextDecision, ContextManifest, CostEstimate,
     CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExportFormat, FetchDecision,
     GeneratedSecretWarning, GitMutation, HookActivation, HookEvent, LanguageServerStatus,
     LineRange, McpClient, McpServerConfig, McpTokenResolver, McpTransport, MemoryRecallRef,
     MemoryScope, ModelAdapter, ModelMessage, ModelRequest, ModelRun, OpenAICompatibleAdapter,
-    PatchApplyOutcome, PausedTurns, PlanRevisionCheck, PlanRevisionStep, PlannedCheck,
-    ProcessRegistry, ProfileId, ProjectIdentity, ProposedFilePatch, QuestionState,
-    RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session,
-    SessionMode, SessionStore, StepStatus, SymbolRef, Task, TaskExecutionBudget, TaskPlan,
-    TaskUsage, TokenUsage, TurnNotes, TurnPhase, TurnProgress, TurnSink, UserConfirmation,
-    VerificationEvent, VerificationOutcome, VerificationReport, WebDiagnosticCall,
-    WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkerReturn, WorkspaceEngine, allow_always_eligible,
-    builtin_context_window, builtin_token_defaults, command_approval_prompt, custom_profile_ids,
-    ensure_data_dir_schema, export_profile, fold_verification, import_profile,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    normalize_planned_check_directory, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
-    profile_import_base, repository_id_for_root, review_profile_import, review_profile_rejections,
-    select_profile,
+    PausedTurns, PlanRevisionCheck, PlanRevisionStep, PlannedCheck, ProcessRegistry, ProfileId,
+    ProjectIdentity, ProposedFilePatch, QuestionState, RepositoryConfigReport,
+    ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, SessionStore,
+    StepStatus, SymbolRef, Task, TaskExecutionBudget, TaskPlan, TaskUsage, TokenUsage, TurnNotes,
+    TurnPhase, TurnProgress, TurnSink, UserConfirmation, VerificationEvent, VerificationOutcome,
+    VerificationReport, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerReturn,
+    WorkspaceEngine, allow_always_eligible, builtin_context_window, builtin_token_defaults,
+    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
+    fold_verification, import_profile, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, normalize_planned_check_directory, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
+    review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -501,8 +500,6 @@ fn dispatch(
         Route::Ask => handle_ask(stream, request),
         Route::ProposeEdit => handle_propose_edit(stream, request),
         Route::ApplyPatch => handle_apply_patch(stream, request),
-        Route::ResumeBaseline => handle_resume_baseline(stream, request),
-        Route::ResumeBaselineStream => handle_resume_baseline_stream(stream, request),
         Route::RollbackPatch => handle_rollback_patch(stream, request),
         Route::RejectPatchFiles => handle_reject_patch_files(stream, request),
         Route::RejectPatch => handle_reject_patch(stream, request),
@@ -3128,7 +3125,7 @@ fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> Result<(), S
     }
     let result = engine
         .edit_orchestrator
-        .apply_stored_patch_with_baseline(
+        .apply_stored_patch(
             &repo,
             &patch_id,
             approved_paths.as_deref(),
@@ -3137,23 +3134,6 @@ fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> Result<(), S
             allow_generated_secrets,
         )
         .map_err(|error| error.to_string())?;
-    let PatchApplyOutcome::Applied(result) = result else {
-        let PatchApplyOutcome::BaselineRequired(batch) = result else {
-            unreachable!("an apply outcome is applied or needs a baseline")
-        };
-        return write_response(
-            stream,
-            request,
-            200,
-            "application/json",
-            &format!(
-                "{{\"patchId\":\"{}\",\"appliedFiles\":[],\"baselineBatch\":{},\"pendingDecision\":{}}}",
-                escape_json(&patch_id),
-                baseline_batch_json(&batch),
-                baseline_pending_decision_json(&batch)
-            ),
-        );
-    };
     write_response(
         stream,
         request,
@@ -3167,216 +3147,6 @@ fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> Result<(), S
             json_string_array(&result.hook_warnings)
         ),
     )
-}
-
-fn handle_resume_baseline(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
-    let form = parse_form(&request.body);
-    let repo = required_form(&form, "repo")?;
-    let batch_id = required_form(&form, "batch_id")?;
-    let decisions = parse_check_decisions(&required_form(&form, "decisions")?)?;
-    let always = parse_baseline_always(form.get("always").map(String::as_str));
-    let engine = engine_for_repo(&repo)?;
-    // The engine validates the whole retry against the pending batch before it
-    // writes any *Allow Always* grant or runs any baseline command. The shell
-    // only transports the ids the card rendered; it never decides eligibility.
-    let outcome = engine
-        .edit_orchestrator
-        .resume_stored_patch_baseline(&repo, &batch_id, &decisions, &always, "desktop_user")
-        .map_err(|error| error.to_string())?;
-    match outcome {
-        workspace_engine::BaselinePreparation::Complete { recorded } => write_response(
-            stream,
-            request,
-            200,
-            "application/json",
-            &format!(
-                "{{\"completed\":true,\"recorded\":[{}]}}",
-                recorded
-                    .iter()
-                    .map(|check| format!("\"{}\"", escape_json(&check.label())))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-        ),
-        workspace_engine::BaselinePreparation::Awaiting(batch) => write_response(
-            stream,
-            request,
-            200,
-            "application/json",
-            &format!(
-                "{{\"completed\":false,\"baselineBatch\":{},\"pendingDecision\":{}}}",
-                baseline_batch_json(&batch),
-                baseline_pending_decision_json(&batch)
-            ),
-        ),
-    }
-}
-
-/// What the worker running a streamed baseline reports to the handler holding
-/// the socket (spec 107 Task 4).
-enum BaselineStreamEvent {
-    Progress(workspace_engine::BaselineProgress),
-    Done(workspace_engine::BaselineResumeOutcome),
-    Failed(String),
-}
-
-/// `/api/resume-baseline` as an event stream (spec 107 Task 4, context D4).
-///
-/// The engine resumes the card on a worker under a cancel token, exactly as a
-/// streamed turn does: the client cancels by closing the request, the relay
-/// notices on its next write and cancels the token, and the command runner
-/// kills the running check. Events: `baseline` (the engine's
-/// `BaselineProgress`), `elapsed` (seconds the current check has run, written
-/// on the keepalive tick), then `done` or `error`. The request is validated
-/// before the stream starts, so a stale or malformed card answers with an
-/// ordinary error and has no side effects.
-fn handle_resume_baseline_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
-    let form = parse_form(&request.body);
-    let repo = required_form(&form, "repo")?;
-    let batch_id = required_form(&form, "batch_id")?;
-    let decisions = parse_check_decisions(&required_form(&form, "decisions")?)?;
-    let always = parse_baseline_always(form.get("always").map(String::as_str));
-    let engine = engine_for_repo(&repo)?;
-    engine
-        .edit_orchestrator
-        .validate_stored_patch_baseline_resume(&repo, &batch_id, &decisions, &always)
-        .map_err(|error| error.to_string())?;
-    write_event_stream_headers(stream, request)?;
-
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let cancel = CancelToken::new();
-    let worker_cancel = cancel.clone();
-    let worker = spawn_with_shell_stack("damaian-baseline", move || {
-        let progress = sender.clone();
-        let mut on_progress = |event: workspace_engine::BaselineProgress| {
-            let _ = progress.send(BaselineStreamEvent::Progress(event));
-        };
-        let event = match engine
-            .edit_orchestrator
-            .resume_stored_patch_baseline_streamed(
-                &repo,
-                &batch_id,
-                &decisions,
-                &always,
-                "desktop_user",
-                &worker_cancel,
-                &mut on_progress,
-            ) {
-            Ok(outcome) => BaselineStreamEvent::Done(outcome),
-            Err(error) => BaselineStreamEvent::Failed(error.to_string()),
-        };
-        let _ = sender.send(event);
-    })
-    .map_err(|error| format!("start the baseline thread: {error}"))?;
-    lanes::with_current(|lane| lane.set_cancel(&cancel));
-    let outcome = relay_baseline_events(stream, &cancel, receiver, KEEPALIVE_INTERVAL);
-    // Joined unconditionally: the worker owns the running check's process.
-    let _ = worker.join();
-    outcome
-}
-
-/// Forwards a streamed baseline's events, and cancels it if the client goes
-/// away. The keepalive tick doubles as the `elapsed` event while a check runs,
-/// so a silent `cargo test` still shows its clock moving and a departed client
-/// is still noticed.
-fn relay_baseline_events<W: Write>(
-    out: &mut W,
-    cancel: &CancelToken,
-    events: std::sync::mpsc::Receiver<BaselineStreamEvent>,
-    keepalive: Duration,
-) -> Result<(), String> {
-    let mut client_gone = false;
-    // The current check and when it started, for `elapsed`.
-    let mut running: Option<(String, std::time::Instant)> = None;
-    loop {
-        let written = match events.recv_timeout(keepalive) {
-            Ok(event) => {
-                let finished = matches!(
-                    event,
-                    BaselineStreamEvent::Done(_) | BaselineStreamEvent::Failed(_)
-                );
-                let written = match &event {
-                    BaselineStreamEvent::Progress(progress) => {
-                        match progress {
-                            workspace_engine::BaselineProgress::Started { check, .. } => {
-                                running = Some((check.clone(), std::time::Instant::now()));
-                            }
-                            workspace_engine::BaselineProgress::Finished { .. } => running = None,
-                            workspace_engine::BaselineProgress::Output { .. } => {}
-                        }
-                        (!client_gone).then(|| {
-                            write_sse_event(
-                                out,
-                                "baseline",
-                                &serde_json::to_string(progress).unwrap_or_default(),
-                            )
-                        })
-                    }
-                    BaselineStreamEvent::Done(outcome) => (!client_gone).then(|| {
-                        write_sse_event(out, "done", &baseline_resume_outcome_json(outcome))
-                    }),
-                    BaselineStreamEvent::Failed(error) => {
-                        (!client_gone).then(|| write_sse_event(out, "error", &json_error(error)))
-                    }
-                };
-                if finished {
-                    return Ok(());
-                }
-                written
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                (!client_gone).then(|| match &running {
-                    Some((check, since)) => write_sse_event(
-                        out,
-                        "elapsed",
-                        &format!(
-                            "{{\"check\":\"{}\",\"seconds\":{}}}",
-                            escape_json(check),
-                            since.elapsed().as_secs()
-                        ),
-                    ),
-                    None => out
-                        .write_all(b": keepalive\n\n")
-                        .and_then(|_| out.flush())
-                        .map_err(|error| error.to_string()),
-                })
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-        };
-        if matches!(written, Some(Err(_))) {
-            client_gone = true;
-            cancel.cancel();
-        }
-    }
-}
-
-/// The terminal `done` of a streamed baseline: the same `completed`/`recorded`
-/// as `/api/resume-baseline`, plus whether the user cancelled. A cancelled run
-/// is complete (every check has a terminal record) but the client must not
-/// retry the apply on its own: the patch stays the user's to decide.
-fn baseline_resume_outcome_json(outcome: &workspace_engine::BaselineResumeOutcome) -> String {
-    format!(
-        "{{\"completed\":true,\"cancelled\":{},\"recorded\":[{}]}}",
-        outcome.cancelled,
-        outcome
-            .recorded
-            .iter()
-            .map(|check| format!("\"{}\"", escape_json(&check.label())))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-fn baseline_batch_json(batch: &BaselineBatch) -> String {
-    serde_json::to_string(batch).unwrap_or_else(|_| "null".to_string())
-}
-
-/// The pending decision a baseline card puts its task in (spec 107 Task 1):
-/// the engine's own presentation, the same value `/api/session` reports for
-/// the task while the card is pending.
-fn baseline_pending_decision_json(batch: &BaselineBatch) -> String {
-    serde_json::to_string(&workspace_engine::baseline_pending_decision(batch))
-        .unwrap_or_else(|_| "null".to_string())
 }
 
 fn handle_rollback_patch(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
@@ -4152,19 +3922,6 @@ fn run_resume_checks_request(
             &mut sink,
         )
         .map_err(|error| error.to_string())
-}
-
-/// The ids a baseline card marked *Allow Always*. They are only transport
-/// values: the engine checks each one against the pending batch, the user's
-/// approval and its own eligibility before writing a grant.
-fn parse_baseline_always(raw: Option<&str>) -> Vec<String> {
-    raw.map(|raw| raw.split(['\n', ',']))
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 fn parse_check_decisions(raw: &str) -> Result<Vec<(String, bool)>, String> {
@@ -7071,9 +6828,19 @@ fn check_batch_json(batch: Option<&AgentCheckBatch>) -> String {
     let Some(batch) = batch else {
         return "null".to_string();
     };
+    // A failed check's baseline card (spec 109 D1) carries the engine's own
+    // heading and explanation; `null` keeps the ordinary check card's wording.
+    let optional = |text: Option<&String>| {
+        text.map_or_else(
+            || "null".to_string(),
+            |text| format!("\"{}\"", escape_json(text)),
+        )
+    };
     format!(
-        "{{\"proposalId\":\"{}\",\"checks\":[{}]}}",
+        "{{\"proposalId\":\"{}\",\"title\":{},\"note\":{},\"checks\":[{}]}}",
         escape_json(&batch.id),
+        optional(batch.title.as_ref()),
+        optional(batch.note.as_ref()),
         batch
             .checks
             .iter()
@@ -8014,16 +7781,15 @@ mod responsive_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        BaselineStreamEvent, Request, ShellOptions, TurnEvent, allowed_cors_origin,
-        api_request_requires_token, baseline_resume_outcome_json, browser_report_from_tool_result,
-        cached_model_api_key, chat_engine, checkpoint_list_json, checkpoint_restore_json,
-        config_and_report_for_repo, default_engine, desktop_settings_config_path,
-        effective_policy_for_repo, engine_for_repo, fetch_decision_error_code,
-        fetch_decision_error_json, fetch_proposal_json, forget_model_api_key,
-        generated_secret_warnings_json, handle_connection, index_html, json_error,
-        json_optional_string, keychain, language_servers_json, mcp_browser_arguments, message_json,
-        parse_form, parse_path_list, parse_plan_revision, patch_payload_json, percent_decode,
-        phase_json, plan_json, plan_proposal_json, question_proposal_json, relay_baseline_events,
+        Request, ShellOptions, TurnEvent, allowed_cors_origin, api_request_requires_token,
+        browser_report_from_tool_result, cached_model_api_key, chat_engine, checkpoint_list_json,
+        checkpoint_restore_json, config_and_report_for_repo, default_engine,
+        desktop_settings_config_path, effective_policy_for_repo, engine_for_repo,
+        fetch_decision_error_code, fetch_decision_error_json, fetch_proposal_json,
+        forget_model_api_key, generated_secret_warnings_json, handle_connection, index_html,
+        json_error, json_optional_string, keychain, language_servers_json, mcp_browser_arguments,
+        message_json, parse_form, parse_path_list, parse_plan_revision, patch_payload_json,
+        percent_decode, phase_json, plan_json, plan_proposal_json, question_proposal_json,
         relay_turn_events, remember_model_api_key, render_markdown_with_optional_file_links,
         repository_config_review_json, repository_config_write_target, require_api_token,
         resolve_shell_model_api_key, run_answer_question_request, run_continue_task_request_with,
@@ -9101,7 +8867,7 @@ mod tests {
         let card = app
             .split("function createPlanReview")
             .nth(1)
-            .and_then(|rest| rest.split("function createBaselineBatchCard").next())
+            .and_then(|rest| rest.split("function createPatchPreview").next())
             .expect("the plan review card");
         assert!(card.contains("budgetReview.rows"), "{card}");
         assert!(card.contains("row.label"), "{card}");
@@ -9605,251 +9371,6 @@ mod tests {
         fs::remove_dir_all(&repo).ok();
     }
 
-    /// Spec 102 Task 2 transport: an approved patch whose selected check needs
-    /// its own approval writes nothing and returns the engine's card. Resuming
-    /// the decisions then lets the same apply write the reviewed bytes.
-    #[test]
-    fn apply_patch_endpoint_returns_a_baseline_batch_and_resume_then_applies() {
-        let repo = temp_path("apply-baseline");
-        fs::create_dir_all(repo.join("src")).unwrap();
-        fs::create_dir_all(repo.join(".damaian")).unwrap();
-        isolated_data_dir();
-        fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
-        // A repository may tighten approval, so this test does not depend on
-        // whatever a concurrent test left in the shared user config.
-        fs::write(
-            repo.join(".damaian").join("config.conf"),
-            "require_approval_for_risky_commands=true\n",
-        )
-        .unwrap();
-        fs::write(repo.join("src/a.rs"), "let a = 1;\n").unwrap();
-
-        let repo_arg = repo.to_string_lossy().to_string();
-        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
-        let edit_response = "DAMAIAN_EDIT_V1\nSUMMARY: change\n\
-                             FILE: src/a.rs\nSTATUS: modified\nCONTENT:\n\
-                             let a = 2;\nEND_FILE\nEND_PATCH\n";
-        let proposal = engine
-            .edit_orchestrator
-            .propose_edit(
-                &repo,
-                "change it",
-                &[],
-                None,
-                &mut MockModelAdapter::new(edit_response),
-            )
-            .expect("the edit should be proposed");
-        let session_id = proposal.session.id.clone();
-        let task_id = proposal.task.id.clone();
-        let patch_id = proposal.patch.id;
-        let (port, token) = serve_for_test();
-        // Spec 107 Task 1: what `/api/session` says the task is waiting on.
-        let reloaded_decision = || {
-            let session = response_json(&get_for_test(
-                port,
-                &token,
-                &format!("/api/session?session_id={session_id}"),
-            ));
-            session["tasks"]
-                .as_array()
-                .expect("tasks")
-                .iter()
-                .find(|task| task["id"] == task_id.as_str())
-                .expect("the patch task is in the session")["turnPresentation"]["pendingDecision"]
-                .clone()
-        };
-        let decision = reloaded_decision();
-        assert_eq!(decision["kind"], "patch", "{decision}");
-        assert_eq!(decision["cardId"], patch_id.as_str());
-
-        let applied = post_fields_for_test(
-            port,
-            &token,
-            "/api/apply-patch",
-            &[("repo", &repo_arg), ("patch_id", &patch_id)],
-        );
-        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
-        let applied = response_json(&applied);
-        assert_eq!(applied["appliedFiles"], serde_json::json!([]));
-        assert_eq!(
-            fs::read_to_string(repo.join("src/a.rs")).unwrap(),
-            "let a = 1;\n",
-            "a baseline offer must not write the patch"
-        );
-
-        let batch = &applied["baselineBatch"];
-        assert_eq!(batch["patchId"], patch_id.as_str());
-        assert!(batch["title"].is_string(), "{batch}");
-        assert!(batch["note"].is_string(), "{batch}");
-        assert!(batch["runLabel"].is_string(), "{batch}");
-        assert!(batch["skipLabel"].is_string(), "{batch}");
-        assert!(batch["runAllLabel"].is_string(), "{batch}");
-        let check = &batch["checks"][0];
-        assert!(check["prompt"].is_string(), "{check}");
-        assert!(check["riskLabel"].is_string(), "{check}");
-        assert!(check["locationLabel"].is_string(), "{check}");
-        let batch_id = batch["id"].as_str().expect("batch id");
-        let proposal_id = check["proposalId"].as_str().expect("proposal id");
-
-        // Spec 107 Task 1: the card puts the task in a baseline decision,
-        // answered through the batch, and a reload reports the same value.
-        let decision = &applied["pendingDecision"];
-        assert_eq!(decision["kind"], "baseline", "{applied}");
-        assert_eq!(decision["cardId"], batch_id);
-        assert_eq!(decision["statusLabel"], "Waiting for your approval");
-        assert_eq!(&reloaded_decision(), decision);
-
-        let decisions = serde_json::json!([{
-            "proposalId": proposal_id,
-            "approved": false
-        }])
-        .to_string();
-        let resumed = post_fields_for_test(
-            port,
-            &token,
-            "/api/resume-baseline",
-            &[
-                ("repo", &repo_arg),
-                ("batch_id", batch_id),
-                ("decisions", &decisions),
-            ],
-        );
-        assert!(resumed.starts_with("HTTP/1.1 200"), "{resumed}");
-        assert!(resumed.contains("\"completed\":true"), "{resumed}");
-        assert_eq!(
-            fs::read_to_string(repo.join("src/a.rs")).unwrap(),
-            "let a = 1;\n",
-            "resuming a baseline is not an apply"
-        );
-        // The baseline is settled; the patch itself is still the decision.
-        assert_eq!(reloaded_decision()["kind"], "patch");
-
-        let applied = post_fields_for_test(
-            port,
-            &token,
-            "/api/apply-patch",
-            &[("repo", &repo_arg), ("patch_id", &patch_id)],
-        );
-        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
-        assert!(
-            applied.contains("\"appliedFiles\":[\"src/a.rs\"]"),
-            "{applied}"
-        );
-        assert_eq!(
-            fs::read_to_string(repo.join("src/a.rs")).unwrap(),
-            "let a = 2;\n"
-        );
-
-        fs::remove_dir_all(&repo).ok();
-    }
-
-    /// Spec 102 Task 2 security: *Allow Always* on a baseline card is still a
-    /// separate, exact-command grant. The engine refuses an id that is not on
-    /// this pending batch, a check the user did not approve, and a duplicate,
-    /// before writing any grant or running any command.
-    #[test]
-    fn baseline_resume_refuses_unrelated_unapproved_and_duplicate_always_ids() {
-        let repo = temp_path("baseline-always");
-        fs::create_dir_all(repo.join("src")).unwrap();
-        fs::create_dir_all(repo.join(".damaian")).unwrap();
-        isolated_data_dir();
-        fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
-        fs::write(
-            repo.join(".damaian").join("config.conf"),
-            "require_approval_for_risky_commands=true\n",
-        )
-        .unwrap();
-        fs::write(repo.join("src/a.rs"), "let a = 1;\n").unwrap();
-
-        let repo_arg = repo.to_string_lossy().to_string();
-        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
-        let edit_response = "DAMAIAN_EDIT_V1\nSUMMARY: change\n\
-                             FILE: src/a.rs\nSTATUS: modified\nCONTENT:\n\
-                             let a = 2;\nEND_FILE\nEND_PATCH\n";
-        let proposal = engine
-            .edit_orchestrator
-            .propose_edit(
-                &repo,
-                "change it",
-                &[],
-                None,
-                &mut MockModelAdapter::new(edit_response),
-            )
-            .expect("the edit should be proposed");
-        let patch_id = proposal.patch.id;
-        let (port, token) = serve_for_test();
-
-        let applied = post_fields_for_test(
-            port,
-            &token,
-            "/api/apply-patch",
-            &[("repo", &repo_arg), ("patch_id", &patch_id)],
-        );
-        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
-        let batch = response_json(&applied)["baselineBatch"].clone();
-        let batch_id = batch["id"].as_str().expect("batch id").to_string();
-        let proposal_id = batch["checks"][0]["proposalId"]
-            .as_str()
-            .expect("proposal id")
-            .to_string();
-        assert_eq!(
-            batch["checks"][0]["allowAlways"], true,
-            "the engine must offer the ordinary always control: {batch}"
-        );
-        let config_path = engine.config.user_config_path();
-
-        let refused = [
-            (
-                serde_json::json!([{"proposalId": proposal_id.clone(), "approved": true}])
-                    .to_string(),
-                "cmd_unrelated".to_string(),
-                "Unknown baseline proposal",
-            ),
-            (
-                serde_json::json!([{"proposalId": proposal_id.clone(), "approved": false}])
-                    .to_string(),
-                proposal_id.clone(),
-                "without approval",
-            ),
-            (
-                serde_json::json!([{"proposalId": proposal_id.clone(), "approved": true}])
-                    .to_string(),
-                format!("{proposal_id}\n{proposal_id}"),
-                "Duplicate always decision",
-            ),
-        ];
-        for (decisions, always, message) in refused {
-            let response = post_fields_for_test(
-                port,
-                &token,
-                "/api/resume-baseline",
-                &[
-                    ("repo", &repo_arg),
-                    ("batch_id", &batch_id),
-                    ("decisions", decisions.as_str()),
-                    ("always", always.as_str()),
-                ],
-            );
-            assert!(
-                !response.starts_with("HTTP/1.1 200"),
-                "an invalid always id was accepted: {response}"
-            );
-            assert!(response.contains(message), "{response}");
-            assert!(
-                !fs::read_to_string(&config_path)
-                    .unwrap_or_default()
-                    .contains("cargo test"),
-                "an invalid always id wrote an allowlist grant"
-            );
-            assert_eq!(
-                fs::read_to_string(repo.join("src/a.rs")).unwrap(),
-                "let a = 1;\n"
-            );
-        }
-
-        fs::remove_dir_all(&repo).ok();
-    }
-
     /// A turn paused on a model question, for looking at spec 107's reload
     /// placement: the question card below everything else, the composer line
     /// and the disabled composer.
@@ -9889,258 +9410,6 @@ mod tests {
         session.id
     }
 
-    /// must not retry an incomplete resume response, and must not offer a
-    /// second conflicting patch action while the baseline is pending.
-    #[test]
-    fn app_js_retries_the_exact_snapshot_after_a_baseline() {
-        assert!(super::APP_JS.contains("function snapshotSelection"));
-        assert!(super::APP_JS.contains("hunkSelection"));
-        assert!(super::APP_JS.contains("selection,"));
-        assert!(super::APP_JS.contains("result.completed !== true"));
-        assert!(super::APP_JS.contains("The baseline response was incomplete"));
-        assert!(super::APP_JS.contains("state.baseline = null"));
-        assert!(super::APP_JS.contains("runApply(pending.selection)"));
-        assert!(super::APP_JS.contains("Boolean(state.baseline)"));
-        assert!(super::APP_JS.contains("check.riskLabel"));
-        assert!(super::APP_JS.contains("check.locationLabel"));
-        assert!(super::APP_JS.contains("batch.runAllLabel"));
-        assert!(super::APP_JS.contains("check.allowAlways"));
-        assert!(super::APP_JS.contains("Always allow"));
-        assert!(super::APP_JS.contains("always,"));
-        assert!(!super::APP_JS.contains("Checks need a baseline"));
-    }
-
-    // Spec 107 Task 4: the streamed baseline's transport.
-
-    fn sample_baseline_outcome(cancelled: bool) -> workspace_engine::BaselineResumeOutcome {
-        workspace_engine::BaselineResumeOutcome {
-            recorded: vec![workspace_engine::CheckId::new("", "cargo test")],
-            cancelled,
-        }
-    }
-
-    #[test]
-    fn the_baseline_relay_writes_progress_in_order_with_an_elapsed_tick() {
-        use workspace_engine::BaselineProgress;
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let cancel = CancelToken::new();
-        std::thread::spawn(move || {
-            let check = "cargo test (repository root)".to_string();
-            let _ = sender.send(BaselineStreamEvent::Progress(BaselineProgress::Started {
-                check: check.clone(),
-                label: format!("Running baseline: {check}"),
-                index: 1,
-                total: 1,
-            }));
-            // Silent long enough for the keepalive tick to report the clock.
-            std::thread::sleep(Duration::from_millis(120));
-            let _ = sender.send(BaselineStreamEvent::Progress(BaselineProgress::Output {
-                line: "test result: ok".to_string(),
-            }));
-            let _ = sender.send(BaselineStreamEvent::Progress(BaselineProgress::Finished {
-                check: check.clone(),
-                result: "passed".to_string(),
-                label: format!("Baseline passed: {check}"),
-            }));
-            let _ = sender.send(BaselineStreamEvent::Done(sample_baseline_outcome(false)));
-        });
-
-        let mut out = FlakyWriter {
-            written: Vec::new(),
-            writes_before_failure: usize::MAX,
-        };
-        relay_baseline_events(&mut out, &cancel, receiver, Duration::from_millis(25))
-            .expect("relay");
-
-        let text = String::from_utf8_lossy(&out.written);
-        let position = |needle: &str| {
-            text.find(needle)
-                .unwrap_or_else(|| panic!("{needle:?} missing from {text:?}"))
-        };
-        let started = position("\"kind\":\"started\"");
-        let elapsed = position(
-            "event: elapsed\ndata: {\"check\":\"cargo test (repository root)\",\"seconds\":0}",
-        );
-        let output = position("\"kind\":\"output\"");
-        let finished = position("\"kind\":\"finished\"");
-        let done = position(
-            "event: done\ndata: {\"completed\":true,\"cancelled\":false,\"recorded\":[\"cargo test (repository root)\"]}",
-        );
-        assert!(started < elapsed && elapsed < output, "{text}");
-        assert!(output < finished && finished < done, "{text}");
-        assert!(text.contains("\"label\":\"Running baseline: cargo test (repository root)\""));
-        assert!(text.contains("\"index\":1,\"total\":1"), "{text}");
-        // No clock once the check finished: only a plain keepalive may follow.
-        assert!(!text[finished..].contains("event: elapsed"), "{text}");
-        assert!(!cancel.is_cancelled());
-    }
-
-    /// Cancel is the client closing the stream, as Stop is for a turn: the
-    /// relay's next write fails and it cancels the engine's token.
-    #[test]
-    fn the_baseline_relay_cancels_the_run_when_the_client_goes_away() {
-        use workspace_engine::BaselineProgress;
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let cancel = CancelToken::new();
-        let worker_cancel = cancel.clone();
-        let worker = std::thread::spawn(move || {
-            let _ = sender.send(BaselineStreamEvent::Progress(BaselineProgress::Started {
-                check: "cargo test (repository root)".to_string(),
-                label: "Running baseline: cargo test (repository root)".to_string(),
-                index: 1,
-                total: 1,
-            }));
-            // A check that only ends when it is cancelled.
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !worker_cancel.is_cancelled() && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let _ = sender.send(BaselineStreamEvent::Done(sample_baseline_outcome(
-                worker_cancel.is_cancelled(),
-            )));
-        });
-
-        // The `started` event is written; the client is gone before the tick.
-        let mut out = FlakyWriter {
-            written: Vec::new(),
-            writes_before_failure: 1,
-        };
-        relay_baseline_events(&mut out, &cancel, receiver, Duration::from_millis(25))
-            .expect("relay");
-        worker.join().unwrap();
-
-        assert!(
-            cancel.is_cancelled(),
-            "a departed client must cancel the run"
-        );
-        let text = String::from_utf8_lossy(&out.written);
-        assert!(text.contains("\"kind\":\"started\""), "{text}");
-        assert!(!text.contains("event: done"), "{text}");
-    }
-
-    #[test]
-    fn a_cancelled_baseline_outcome_is_complete_and_says_so() {
-        assert_eq!(
-            baseline_resume_outcome_json(&sample_baseline_outcome(true)),
-            "{\"completed\":true,\"cancelled\":true,\"recorded\":[\"cargo test (repository root)\"]}"
-        );
-    }
-
-    /// The streamed route end to end with *Skip baselines* (an approved check
-    /// would run the user's real shell): it validates before streaming, ends
-    /// with a complete, uncancelled `done`, writes nothing, and leaves the
-    /// patch as the task's decision.
-    #[test]
-    fn the_streamed_baseline_route_settles_the_card_and_leaves_the_patch() {
-        let repo = temp_path("baseline-stream");
-        fs::create_dir_all(repo.join("src")).unwrap();
-        fs::create_dir_all(repo.join(".damaian")).unwrap();
-        isolated_data_dir();
-        fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
-        fs::write(
-            repo.join(".damaian").join("config.conf"),
-            "require_approval_for_risky_commands=true\n",
-        )
-        .unwrap();
-        fs::write(repo.join("src/a.rs"), "let a = 1;\n").unwrap();
-
-        let repo_arg = repo.to_string_lossy().to_string();
-        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
-        let edit_response = "DAMAIAN_EDIT_V1\nSUMMARY: change\n\
-                             FILE: src/a.rs\nSTATUS: modified\nCONTENT:\n\
-                             let a = 2;\nEND_FILE\nEND_PATCH\n";
-        let proposal = engine
-            .edit_orchestrator
-            .propose_edit(
-                &repo,
-                "change it",
-                &[],
-                None,
-                &mut MockModelAdapter::new(edit_response),
-            )
-            .expect("the edit should be proposed");
-        let session_id = proposal.session.id.clone();
-        let task_id = proposal.task.id.clone();
-        let patch_id = proposal.patch.id;
-        let (port, token) = serve_for_test();
-
-        let applied = response_json(&post_fields_for_test(
-            port,
-            &token,
-            "/api/apply-patch",
-            &[("repo", &repo_arg), ("patch_id", &patch_id)],
-        ));
-        let batch = &applied["baselineBatch"];
-        assert_eq!(batch["cancelLabel"], "Cancel", "{batch}");
-        let batch_id = batch["id"].as_str().expect("batch id");
-        let proposal_id = batch["checks"][0]["proposalId"]
-            .as_str()
-            .expect("proposal id");
-
-        // A malformed retry is refused before the stream starts.
-        let refused = post_fields_for_test(
-            port,
-            &token,
-            "/api/resume-baseline-stream",
-            &[
-                ("repo", &repo_arg),
-                ("batch_id", batch_id),
-                ("decisions", "[]"),
-            ],
-        );
-        assert!(!refused.starts_with("HTTP/1.1 200"), "{refused}");
-        assert!(!refused.contains("text/event-stream"), "{refused}");
-
-        let decisions = serde_json::json!([{
-            "proposalId": proposal_id,
-            "approved": false
-        }])
-        .to_string();
-        let streamed = post_fields_for_test(
-            port,
-            &token,
-            "/api/resume-baseline-stream",
-            &[
-                ("repo", &repo_arg),
-                ("batch_id", batch_id),
-                ("decisions", &decisions),
-            ],
-        );
-        assert!(streamed.starts_with("HTTP/1.1 200"), "{streamed}");
-        assert!(streamed.contains("text/event-stream"), "{streamed}");
-        assert!(
-            streamed.contains(
-                "event: done\ndata: {\"completed\":true,\"cancelled\":false,\"recorded\":[\"cargo test (repository root)\"]}"
-            ),
-            "{streamed}"
-        );
-        // Nothing ran, so nothing started.
-        assert!(!streamed.contains("\"kind\":\"started\""), "{streamed}");
-        assert_eq!(
-            fs::read_to_string(repo.join("src/a.rs")).unwrap(),
-            "let a = 1;\n",
-            "resuming a baseline is not an apply"
-        );
-        let session = response_json(&get_for_test(
-            port,
-            &token,
-            &format!("/api/session?session_id={session_id}"),
-        ));
-        let decision = session["tasks"]
-            .as_array()
-            .expect("tasks")
-            .iter()
-            .find(|task| task["id"] == task_id.as_str())
-            .expect("the patch task")["turnPresentation"]["pendingDecision"]
-            .clone();
-        assert_eq!(decision["kind"], "patch", "{decision}");
-
-        fs::remove_dir_all(&repo).ok();
-    }
-
-    /// Spec 107 Task 4 in the UI: the card streams, shows the engine's label and
-    /// a clock, offers the engine's Cancel, and a cancel leaves the patch to
-    /// the user instead of retrying the apply.
     /// Spec 107 D3 (C): the worker suggestion is drawn only where the engine's
     /// `workerSuggestion` names the card, with the engine's labels; the plan
     /// card no longer offers spec 94's always-on **Run in a worker**.
@@ -10357,41 +9626,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn app_js_baseline_card_streams_progress_and_cancels() {
-        let card = app_js_function("createBaselineBatchCard");
-        assert!(card.contains("batch.cancelLabel"), "{card}");
-        assert!(card.contains("new AbortController()"), "{card}");
-        assert!(card.contains("controller.abort()"), "{card}");
-        assert!(card.contains("event.kind === \"started\""), "{card}");
-        assert!(card.contains("formatClock(Date.now() - since)"), "{card}");
-        assert!(
-            card.contains("showWaitingActivity(event.label, since)"),
-            "{card}"
-        );
-
-        let patch = app_js_function("createPatchPreview");
-        assert!(patch.contains("\"/api/resume-baseline-stream\""), "{patch}");
-        let cancelled = patch
-            .find("result?.cancelled === true")
-            .expect("the patch card handles a cancelled baseline");
-        let retry = patch
-            .find("await runApply(pending.selection)")
-            .expect("a completed baseline still retries the apply");
-        let cancelled_branch = &patch[cancelled..retry];
-        assert!(cancelled_branch.contains("return;"), "{cancelled_branch}");
-        assert!(!cancelled_branch.contains("runApply"), "{cancelled_branch}");
-
-        let sse = app_js_function("processSseEvent");
-        assert!(sse.contains("event === \"baseline\""), "{sse}");
-        assert!(sse.contains("event === \"elapsed\""), "{sse}");
-
-        let activity = app_js_function("showWaitingActivity");
-        assert!(activity.contains("delete waitingIndicator.row.dataset.state"));
-        let end = app_js_function("endWaitingActivity");
-        assert!(end.contains("dataset.state = \"waiting\""), "{end}");
-    }
-
     /// The body of the top-level `function <name>(` in `app.js`, up to the
     /// next top-level declaration.
     fn app_js_function(name: &str) -> &'static str {
@@ -10416,7 +9650,6 @@ mod tests {
             Kind::Question,
             Kind::Patch,
             Kind::Checks,
-            Kind::Baseline,
             Kind::Command,
             Kind::RoundBudget,
             Kind::Plan,
@@ -10432,8 +9665,7 @@ mod tests {
         for kind in kinds {
             let (field, create) = match kind {
                 Kind::Question => ("questionProposal", "createQuestionCard"),
-                // A baseline card lives inside its patch card; the patch moves.
-                Kind::Patch | Kind::Baseline => ("patchProposal", "createPatchPreview"),
+                Kind::Patch => ("patchProposal", "createPatchPreview"),
                 Kind::Checks => ("checkBatch", "createCheckBatchCard"),
                 Kind::Command => ("commandProposal", "createCommandApprovalPreview"),
                 Kind::RoundBudget => ("roundBudgetProposal", "createRoundBudgetOffer"),
@@ -10473,12 +9705,6 @@ mod tests {
         let one_shot = app_js_function("proposePatchFromChat");
         assert!(one_shot.contains("setPendingDecision("));
         assert!(!one_shot.contains("body.append(createPatchPreview"));
-        // A baseline card raised by an apply renames the pending decision.
-        assert!(super::APP_JS.contains("decision: result.pendingDecision || null"));
-        assert!(
-            super::APP_JS
-                .contains("notePendingDecisionChange(wrapper, state.baseline?.decision || null)")
-        );
     }
 
     /// Spec 107 Task 2: after a reload the decision comes from `/api/session`
@@ -10529,10 +9755,31 @@ mod tests {
         assert!(app_js_function("setComposerBusy").contains("syncComposerDecision()"));
         let focus = app_js_function("focusPendingDecision");
         assert!(focus.contains(".question-card-free-text input:not(:disabled)"));
-        assert!(focus.contains(".baseline-batch button"));
         assert!(super::APP_JS.contains(
             "$(\"composer-decision-btn\").addEventListener(\"click\", focusPendingDecision)"
         ));
+    }
+
+    /// Spec 109 Task 3: a failed check's baseline asks on the ordinary check
+    /// card, with the engine's own heading and note saying why; a card without
+    /// them keeps the check card's wording.
+    #[test]
+    fn a_check_card_shows_the_engines_title_and_note_when_it_has_them() {
+        let card = app_js_function("createCheckBatchCard");
+        assert!(
+            card.contains("batch.title || \"Checks need approval\""),
+            "{card}"
+        );
+        assert!(card.contains("batch.note ||"), "{card}");
+        let json = super::check_batch_json(Some(&workspace_engine::AgentCheckBatch {
+            id: "checkbatch_1".to_string(),
+            checks: Vec::new(),
+            title: Some("A check failed: is the failure new?".to_string()),
+            note: None,
+        }));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["title"], "A check failed: is the failure new?");
+        assert!(value["note"].is_null(), "{value}");
     }
 
     /// Spec 107 Task 3, requirement 3: a turn paused on the user keeps its
@@ -10555,10 +9802,6 @@ mod tests {
                 "{settled}"
             );
         }
-        assert!(
-            app_js_function("notePendingDecisionChange")
-                .contains("renameWaitingIndicator(current.decision.statusLabel)")
-        );
         assert!(
             app_js_function("restorePendingDecision")
                 .contains("restoreWaitingIndicator(body, decision.statusLabel")
@@ -10656,32 +9899,10 @@ mod tests {
             .unwrap();
         patch.session_id = session.id.clone();
         engine.patch_store.save(&patch).unwrap();
-        // Spec 102 Task 2: a patch whose paths select checks must settle their
-        // baselines first. This fixture is about the later verification card,
-        // so it declines each offered baseline and continues.
-        let mut outcome = engine
+        engine
             .edit_orchestrator
-            .apply_stored_patch_with_baseline(repo, &patch.id, None, None, "tester", false)
+            .apply_stored_patch(repo, &patch.id, None, None, "tester", false)
             .unwrap();
-        while let workspace_engine::PatchApplyOutcome::BaselineRequired(batch) = outcome {
-            let decisions = batch
-                .checks
-                .iter()
-                .map(|check| (check.proposal_id.clone(), false))
-                .collect::<Vec<_>>();
-            engine
-                .edit_orchestrator
-                .resume_stored_patch_baseline(repo, &batch.id, &decisions, &[], "tester")
-                .unwrap();
-            outcome = engine
-                .edit_orchestrator
-                .apply_stored_patch_with_baseline(repo, &patch.id, None, None, "tester", false)
-                .unwrap();
-        }
-        assert!(matches!(
-            outcome,
-            workspace_engine::PatchApplyOutcome::Applied(_)
-        ));
         session.id
     }
 

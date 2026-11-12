@@ -338,15 +338,14 @@ impl WorkerSuggestion {
 /// What kind of decision a waiting turn needs from the user.
 ///
 /// One variant per durable pause link the engine writes
-/// (`SessionStore::await_approval` / `await_answer`), plus `Baseline`, which is
-/// a patch whose apply is held on a pre-apply baseline card (spec 102).
+/// (`SessionStore::await_approval` / `await_answer`). A failed check's
+/// baseline (spec 109 D1) waits as `Checks`, on the check card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingDecisionKind {
     Question,
     Patch,
     Checks,
-    Baseline,
     Command,
     RoundBudget,
     Plan,
@@ -361,7 +360,6 @@ impl PendingDecisionKind {
             Self::Question => "question",
             Self::Patch => "patch",
             Self::Checks => "checks",
-            Self::Baseline => "baseline",
             Self::Command => "command",
             Self::RoundBudget => "round_budget",
             Self::Plan => "plan",
@@ -381,8 +379,8 @@ pub struct TurnPendingDecision {
     pub label: String,
     /// The status line while the turn waits ("Waiting for your review").
     pub status_label: String,
-    /// The id the card answers through: the question, proposal, check batch or
-    /// baseline batch id. The UI finds the card by it.
+    /// The id the card answers through: the question, proposal or check batch
+    /// id. The UI finds the card by it.
     pub card_id: String,
 }
 
@@ -392,9 +390,6 @@ pub struct TurnPendingDecision {
 /// produce the same [`TurnPendingDecision`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingDecisionFacts {
-    /// The pending baseline card a waiting patch's apply is held on:
-    /// `(batch id, number of checks)`.
-    pub baseline: Option<(String, usize)>,
     /// How many checks a waiting check batch holds, when its paused turn is
     /// readable.
     pub check_count: Option<usize>,
@@ -422,10 +417,7 @@ pub fn pending_decision_presentation(
             let id = approval.proposal_id.clone();
             match approval.kind.as_str() {
                 "patch" if facts.patch_decided => return None,
-                "patch" => match &facts.baseline {
-                    Some((batch_id, _)) => (PendingDecisionKind::Baseline, batch_id.clone()),
-                    None => (PendingDecisionKind::Patch, id),
-                },
+                "patch" => (PendingDecisionKind::Patch, id),
                 "checks" => (PendingDecisionKind::Checks, id),
                 "command" => (PendingDecisionKind::Command, id),
                 "round_budget" => (PendingDecisionKind::RoundBudget, id),
@@ -446,13 +438,6 @@ pub fn pending_decision_presentation(
         PendingDecisionKind::Question => ("Damaian needs your answer".to_string(), "answer"),
         PendingDecisionKind::Patch => ("Review the patch".to_string(), "review"),
         PendingDecisionKind::Checks => (count_label(facts.check_count, "check"), "approval"),
-        PendingDecisionKind::Baseline => (
-            count_label(
-                facts.baseline.as_ref().map(|(_, count)| *count),
-                "baseline check",
-            ),
-            "approval",
-        ),
         PendingDecisionKind::Command => ("Approve the command".to_string(), "approval"),
         PendingDecisionKind::RoundBudget => ("Choose whether to continue".to_string(), "decision"),
         PendingDecisionKind::Plan => ("Review the plan".to_string(), "review"),
@@ -469,25 +454,6 @@ pub fn pending_decision_presentation(
         status_label: format!("Waiting for your {status_label}"),
         card_id,
     })
-}
-
-/// The decision a freshly offered baseline card puts its patch's task in.
-///
-/// The apply and resume routes return the card itself rather than a turn, so
-/// they report this; it is the value [`TaskControlService::pending_decision`]
-/// reads back for the same task while the card stays pending.
-pub fn baseline_pending_decision(batch: &crate::baseline::BaselineBatch) -> TurnPendingDecision {
-    let link =
-        crate::clarification::PendingDecision::Approval(crate::session::PendingApprovalRef {
-            kind: "patch".to_string(),
-            proposal_id: batch.patch_id.clone(),
-        });
-    let facts = PendingDecisionFacts {
-        baseline: Some((batch.id.clone(), batch.checks.len())),
-        ..PendingDecisionFacts::default()
-    };
-    pending_decision_presentation(&link, &facts)
-        .expect("a patch link with a baseline is classified")
 }
 
 /// One engine-labelled row under a stopped turn.
@@ -1780,10 +1746,6 @@ impl<'a> TaskControlService<'a> {
                         task_id,
                         proposal_id,
                     )?;
-                    facts.baseline =
-                        crate::baseline::pending_baseline_for_patch(data_dir, proposal_id)?
-                            .filter(|batch| batch.task_id == task_id)
-                            .map(|batch| (batch.id, batch.checks.len()));
                 }
                 "checks" => {
                     facts.check_count = crate::chat::PausedTurns::new(data_dir)
@@ -2515,17 +2477,6 @@ mod tests {
         assert_eq!(decision.label, "Damaian needs your answer");
         assert_eq!(decision.status_label, "Waiting for your answer");
         assert_eq!(decision.card_id, "q_1");
-
-        // A patch held on a baseline card is a baseline decision, answered
-        // through the batch, not the patch.
-        let held = PendingDecisionFacts {
-            baseline: Some(("baseline_abc".to_string(), 2)),
-            ..PendingDecisionFacts::default()
-        };
-        let decision = pending_decision_presentation(&approval("patch"), &held).unwrap();
-        assert_eq!(decision.kind, PendingDecisionKind::Baseline);
-        assert_eq!(decision.label, "Approve 2 baseline checks");
-        assert_eq!(decision.card_id, "baseline_abc");
 
         let counted = PendingDecisionFacts {
             check_count: Some(1),

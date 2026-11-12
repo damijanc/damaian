@@ -39,6 +39,7 @@ pub mod navigation;
 pub mod patch_engine;
 pub mod path_policy;
 pub mod plan;
+pub mod pre_task_tree;
 pub mod process_registry;
 pub mod profile;
 pub mod protected_paths;
@@ -142,8 +143,8 @@ pub use data_schema::{
 };
 pub use diff::{DiffLine, Hunk, create_unified_diff, diff_file, reconstruct_content};
 pub use edit::{
-    EditOrchestrator, EditProposalResult, GeneratedEdit, PatchApplyOutcome, PatchStore,
-    parse_generated_edit, patch_diff_text, patch_hunk_summary,
+    EditOrchestrator, EditProposalResult, GeneratedEdit, PatchStore, parse_generated_edit,
+    patch_diff_text, patch_hunk_summary,
 };
 pub use effective_policy::{
     EffectivePolicy, PolicyEntry, PolicyRule, PolicySource, RefusedBy, RefusedRequest, SourceKind,
@@ -291,9 +292,9 @@ pub use task_control::{
     TaskCommand, TaskComposer, TaskControl, TaskControlService, TaskOutcomeKind,
     TurnIndicatorState, TurnPendingDecision, TurnPresentation, TurnStopNotice,
     WORKER_STALE_PROGRESS_AFTER_MS, WorkerBoardGroup, WorkerDot, WorkerProcessState,
-    WorkerSuggestion, WorkerTaskFacts, baseline_pending_decision, continuation_prompt,
-    pending_decision_presentation, returned_task_control, returned_task_control_with_outcome,
-    turn_presentation, turn_presentation_with_outcome,
+    WorkerSuggestion, WorkerTaskFacts, continuation_prompt, pending_decision_presentation,
+    returned_task_control, returned_task_control_with_outcome, turn_presentation,
+    turn_presentation_with_outcome,
 };
 pub use task_outcomes::{
     TASK_TERMINAL_OUTCOME_FORMAT_VERSION, TaskCompactionFacts, TaskOutcomeFigures,

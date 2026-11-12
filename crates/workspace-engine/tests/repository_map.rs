@@ -977,56 +977,6 @@ fn root_for_path_is_the_longest_root_that_is_a_segment_prefix() {
 }
 
 #[test]
-fn command_baseline_scope_covers_enclosing_roots_and_beneath_the_working_directory() {
-    let repo = IndexedMonorepo::new("command-roots");
-    let map = repo.build();
-
-    // A command at the repository root can write anywhere, so every root is in
-    // its scope.
-    let root_scope = map.roots_for_command("");
-    assert!(root_scope.contains(&String::new()), "{root_scope:?}");
-    assert!(
-        root_scope.contains(&"crates/engine".to_string()),
-        "{root_scope:?}"
-    );
-    assert!(
-        root_scope.contains(&"packages/api".to_string()),
-        "{root_scope:?}"
-    );
-
-    // A command in a member covers the member and its enclosing roots, but not
-    // a sibling package: its relative writes cannot reach there.
-    let member_scope = map.roots_for_command("crates/engine/src");
-    assert!(
-        member_scope.contains(&"crates/engine".to_string()),
-        "{member_scope:?}"
-    );
-    assert!(
-        member_scope.contains(&String::new()),
-        "the enclosing workspace root is in its floor: {member_scope:?}"
-    );
-    assert!(
-        !member_scope.contains(&"packages/api".to_string()),
-        "a sibling root is outside the command's subtree: {member_scope:?}"
-    );
-
-    // A directory that contains several roots covers each of them.
-    let grouped_scope = map.roots_for_command("crates");
-    assert!(
-        grouped_scope.contains(&"crates/engine".to_string()),
-        "{grouped_scope:?}"
-    );
-    assert!(
-        grouped_scope.contains(&"crates/cli".to_string()),
-        "{grouped_scope:?}"
-    );
-    assert!(
-        !grouped_scope.contains(&"packages/api".to_string()),
-        "{grouped_scope:?}"
-    );
-}
-
-#[test]
 fn the_fingerprint_tracks_manifest_content_and_not_modification_times() {
     let repo = IndexedMonorepo::new("fingerprint");
     let before = repo.build().fingerprint;

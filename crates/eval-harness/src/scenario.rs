@@ -532,8 +532,8 @@ pub struct Scenario {
     /// How each check on a verification card is answered, matched by command.
     /// A check the list omits is declined, which is the card's default.
     pub check_decisions: Vec<CheckDecision>,
-    /// Decline every baseline the pre-apply gate offers, while still approving
-    /// the check itself (spec 102 Task 6). A headless harness has no user, so
+    /// Decline every failed check's baseline card (spec 109 D1), while still
+    /// approving the check itself (spec 102 Task 6). A headless harness has no user, so
     /// this is how a scenario exercises requirement 6's declined-baseline path
     /// separately from its post-patch check decision.
     pub decline_baseline: bool,

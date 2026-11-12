@@ -1011,11 +1011,12 @@ fn a_member_change_runs_only_the_members_check_per_change() {
     );
 }
 
-/// Review fix R16 (f): the enclosing roots are still baselined at task start.
-/// A member's first patch records both the member's per-change check and the
-/// workspace root's floor check before the patch applies.
+/// Spec 109 D1 replaces review fix R16 (f): a member's patch takes no
+/// baseline before it applies, neither the member's per-change check nor the
+/// enclosing root's floor check. A baseline is taken only when one of them
+/// fails afterwards.
 #[test]
-fn a_member_change_baselines_its_own_and_enclosing_root_at_task_start() {
+fn a_member_change_takes_no_baseline_before_it_applies() {
     let repo = Monorepo::new("r16-member-baseline");
     let engine = WorkspaceEngine::new(Config {
         data_dir: repo.data_dir.clone(),
@@ -1024,34 +1025,29 @@ fn a_member_change_baselines_its_own_and_enclosing_root_at_task_start() {
         command_allowlist: vec!["cargo test".to_string()],
         ..Config::default()
     });
-    let (session, task) = applied_change(
+    write(
+        &repo.root,
+        "crates/engine/src/lib.rs",
+        "pub fn engine() {}\n",
+    );
+    let proposal = propose(
         &engine,
         &repo.root,
-        &[(
+        &edit_response(&[(
             "crates/engine/src/lib.rs",
-            "pub fn engine() {}\n",
             "pub fn engine() { let _ = 1; }\n",
-        )],
+        )]),
     );
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo.root, &proposal.patch.id, None, None, "tester", false)
+        .expect("the patch applies with no baseline gate");
 
     let baselines = engine
         .session_store
-        .task_verification_baselines(&session, &task)
+        .task_verification_baselines(&proposal.session.id, &proposal.task.id)
         .expect("the baselines should read");
-    assert!(
-        matches!(
-            baselines.get(&check("crates/engine", "cargo test")),
-            Some(CheckBaseline::Passed)
-        ),
-        "the member's per-change check is baselined: {baselines:?}"
-    );
-    assert!(
-        matches!(
-            baselines.get(&check("", "cargo test")),
-            Some(CheckBaseline::Passed)
-        ),
-        "the enclosing workspace root's floor check is still baselined: {baselines:?}"
-    );
+    assert!(baselines.is_empty(), "{baselines:?}");
 }
 
 /// Review fix R16 (c): a file owned directly by the root still runs the root
@@ -1976,10 +1972,11 @@ fn applied_change(
     applied_change_with_baselines(engine, root, files, true)
 }
 
-/// Apply a change and keep the baseline the real pre-apply path recorded,
-/// approving a baseline that needs its own decision instead of overwriting it
-/// with a fixture value. A failed baseline therefore carries the real findings
-/// and line numbers the check reported before the patch.
+/// Apply a change and let the real failure-time baseline run (spec 109 D1)
+/// instead of writing a fixture value. The fixture becomes a Git repository
+/// whose commit is the task-start state, so a failing check reruns on that
+/// tree and a failed baseline carries the real findings and line numbers the
+/// check reports there.
 fn applied_change_keeping_baseline(
     engine: &WorkspaceEngine,
     root: &std::path::Path,
@@ -1988,34 +1985,31 @@ fn applied_change_keeping_baseline(
     for (path, before, _) in files {
         write(root, path, before);
     }
+    for args in [
+        &["init", "--quiet"][..],
+        &["config", "user.email", "test@damaian.invalid"],
+        &["config", "user.name", "Damaian Test"],
+        &["config", "commit.gpgsign", "false"],
+        &["add", "."],
+        &["commit", "--quiet", "-m", "task start"],
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
     let changes: Vec<(&str, &str)> = files
         .iter()
         .map(|(path, _, after)| (*path, *after))
         .collect();
     let proposal = propose(engine, root, &edit_response(&changes));
-    let mut outcome = engine
+    engine
         .edit_orchestrator
-        .apply_stored_patch_with_baseline(root, &proposal.patch.id, None, None, "tester", false)
+        .apply_stored_patch(root, &proposal.patch.id, None, None, "tester", false)
         .expect("the patch should apply");
-    while let workspace_engine::PatchApplyOutcome::BaselineRequired(batch) = outcome {
-        let decisions = batch
-            .checks
-            .iter()
-            .map(|check| (check.proposal_id.clone(), true))
-            .collect::<Vec<_>>();
-        engine
-            .edit_orchestrator
-            .resume_stored_patch_baseline(root, &batch.id, &decisions, &[], "tester")
-            .expect("the baseline decisions should record");
-        outcome = engine
-            .edit_orchestrator
-            .apply_stored_patch_with_baseline(root, &proposal.patch.id, None, None, "tester", false)
-            .expect("the patch should apply");
-    }
-    assert!(matches!(
-        outcome,
-        workspace_engine::PatchApplyOutcome::Applied(_)
-    ));
     (proposal.session.id, proposal.task.id)
 }
 
@@ -2048,37 +2042,18 @@ fn applied_change_with_baselines(
     // Spec 102 Task 2: these fixtures force check approval to exercise the
     // verification card. Decline the pre-apply baselines here so the patch
     // applies and the later verification pause is the one under test.
-    let mut outcome = engine
+    engine
         .edit_orchestrator
-        .apply_stored_patch_with_baseline(root, &proposal.patch.id, None, None, "tester", false)
+        .apply_stored_patch(root, &proposal.patch.id, None, None, "tester", false)
         .expect("the patch should apply");
-    while let workspace_engine::PatchApplyOutcome::BaselineRequired(batch) = outcome {
-        let decisions = batch
-            .checks
-            .iter()
-            .map(|check| (check.proposal_id.clone(), false))
-            .collect::<Vec<_>>();
-        engine
-            .edit_orchestrator
-            .resume_stored_patch_baseline(root, &batch.id, &decisions, &[], "tester")
-            .expect("the baseline decisions should record");
-        outcome = engine
-            .edit_orchestrator
-            .apply_stored_patch_with_baseline(root, &proposal.patch.id, None, None, "tester", false)
-            .expect("the patch should apply");
-    }
-    assert!(matches!(
-        outcome,
-        workspace_engine::PatchApplyOutcome::Applied(_)
-    ));
     // Spec 102 Task 3: these fixtures exercise the repair loop, so the check
     // must have passed before the patch. Task 2's coordinator establishes the
     // baseline through the ordinary policy path; the declined/failed baseline
     // cases have their own tests.
     if pass_baselines {
-        mark_baselines_passed(engine, &proposal.session.id, &proposal.task.id);
+        mark_baselines_passed(engine, root, &proposal.session.id, &proposal.task.id);
     } else {
-        mark_baselines_declined(engine, &proposal.session.id, &proposal.task.id);
+        mark_baselines_declined(engine, root, &proposal.session.id, &proposal.task.id);
     }
     (proposal.session.id, proposal.task.id)
 }
@@ -2087,8 +2062,13 @@ fn applied_change_with_baselines(
 /// about post-patch repair rather than baseline acquisition. The latest event
 /// for a check wins in the fold, so this is deterministic and still replays as
 /// durable evidence.
-fn mark_baselines_passed(engine: &WorkspaceEngine, session_id: &str, task_id: &str) {
-    for check in recorded_checks(engine, session_id, task_id) {
+fn mark_baselines_passed(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) {
+    for check in recorded_checks(engine, root, session_id, task_id) {
         engine
             .session_store
             .append_verification_event(
@@ -2106,8 +2086,13 @@ fn mark_baselines_passed(engine: &WorkspaceEngine, session_id: &str, task_id: &s
 /// Record a declined baseline for every check the patch task selected. The
 /// ordinary approval path writes the same event when the user skips the card;
 /// this fixture writes it directly so the test is about Task 3.
-fn mark_baselines_declined(engine: &WorkspaceEngine, session_id: &str, task_id: &str) {
-    for check in recorded_checks(engine, session_id, task_id) {
+fn mark_baselines_declined(
+    engine: &WorkspaceEngine,
+    root: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) {
+    for check in recorded_checks(engine, root, session_id, task_id) {
         engine
             .session_store
             .append_verification_event(
@@ -2122,22 +2107,31 @@ fn mark_baselines_declined(engine: &WorkspaceEngine, session_id: &str, task_id: 
     }
 }
 
+/// Every check the task's changed files can select, per change or at
+/// completion: the floor of every root they touch, a superset of what a
+/// verification runs. Spec 109 takes no baseline before a patch, so a fixture
+/// that wants one recorded writes it for these checks.
 fn recorded_checks(
     engine: &WorkspaceEngine,
+    root: &std::path::Path,
     session_id: &str,
     task_id: &str,
 ) -> std::collections::BTreeSet<CheckId> {
-    let events = engine
+    let touched = engine
         .session_store
-        .read_verification_events(session_id, &[task_id])
-        .expect("the verification log should read");
-    let mut checks = std::collections::BTreeSet::new();
-    for event in events {
-        if let VerificationEvent::Baseline { check, .. } = event {
-            checks.insert(check);
-        }
-    }
-    checks
+        .task_touched_paths(session_id, task_id)
+        .expect("the touched paths should read");
+    let index = workspace_engine::index_cache::IndexCache::get_or_build(&engine.indexer, root)
+        .expect("the index should build");
+    let (map, _) = workspace_engine::repository_map::RepositoryMapStore::new(
+        &engine.config.data_dir,
+        engine.audit_log.clone(),
+    )
+    .load_or_build(&index, &engine.command_policy)
+    .expect("the repository map should build");
+    workspace_engine::verification::floor_checks(root, &map, &touched)
+        .into_iter()
+        .collect()
 }
 
 /// Marks the session as spec 57's worker, whose worktree is the fixture root.

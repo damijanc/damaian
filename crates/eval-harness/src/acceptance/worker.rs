@@ -19,12 +19,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use workspace_engine::worker_progress::read_progress_after;
-use workspace_engine::{
-    BaselinePreparation, ClientError, Config, PatchApplyOutcome, Result, SessionStore,
-    WorkspaceEngine,
-};
+use workspace_engine::{ClientError, Config, Result, SessionStore, WorkspaceEngine};
 
-use super::driver::{ApplyStep, Pending, PendingCheck, Transport};
+use super::driver::{Pending, PendingCheck, Transport};
 
 /// Sends one control-socket request (a JSON object with `command` and its
 /// arguments; the transport adds nothing else) and returns the worker's reply.
@@ -358,49 +355,18 @@ impl<C: WorkerControl> Transport for WorkerTransport<C> {
         Ok(())
     }
 
-    fn apply_patch(&mut self, patch_id: &str) -> Result<ApplyStep> {
-        let outcome = self
-            .engine
-            .edit_orchestrator
-            .apply_stored_patch_with_baseline(
-                &self.repository_root,
-                patch_id,
-                None,
-                None,
-                PATCH_ACTOR,
-                false,
-            )?;
-        match outcome {
-            PatchApplyOutcome::Applied(_) => {
-                self.decided.insert(patch_id.to_string());
-                self.send(json!({"command": "verify"}))?;
-                Ok(ApplyStep::Applied)
-            }
-            PatchApplyOutcome::BaselineRequired(batch) => Ok(ApplyStep::Baselines {
-                batch_id: batch.id.clone(),
-                checks: batch
-                    .checks
-                    .iter()
-                    .map(|check| PendingCheck {
-                        id: check.proposal_id.clone(),
-                        command: check.command.clone(),
-                        working_directory: check.directory.clone(),
-                    })
-                    .collect(),
-            }),
-        }
-    }
-
-    fn decide_baselines(&mut self, batch_id: &str, decisions: &[(String, bool)]) -> Result<()> {
-        match self.engine.edit_orchestrator.resume_stored_patch_baseline(
+    fn apply_patch(&mut self, patch_id: &str) -> Result<()> {
+        self.engine.edit_orchestrator.apply_stored_patch(
             &self.repository_root,
-            batch_id,
-            decisions,
-            &[],
+            patch_id,
+            None,
+            None,
             PATCH_ACTOR,
-        )? {
-            BaselinePreparation::Complete { .. } | BaselinePreparation::Awaiting(_) => Ok(()),
-        }
+            false,
+        )?;
+        self.decided.insert(patch_id.to_string());
+        self.send(json!({"command": "verify"}))?;
+        Ok(())
     }
 
     fn reject_patch(&mut self, patch_id: &str) -> Result<()> {

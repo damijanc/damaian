@@ -65,19 +65,6 @@ pub struct PendingCheck {
     pub working_directory: String,
 }
 
-/// The pre-apply baseline gate's answer to an apply request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ApplyStep {
-    /// The patch is applied and its verification has been requested, as the
-    /// desktop shell does after a patch settles.
-    Applied,
-    /// Baselines must be decided before the patch can apply.
-    Baselines {
-        batch_id: String,
-        checks: Vec<PendingCheck>,
-    },
-}
-
 /// The allowed decisions, and nothing else (requirement 7, D5).
 pub trait Transport {
     /// The fixture repository the worker works in.
@@ -96,9 +83,9 @@ pub trait Transport {
         option: Option<usize>,
     ) -> Result<()>;
     /// Apply a proposed patch the way the desktop shell does, then request its
-    /// verification.
-    fn apply_patch(&mut self, patch_id: &str) -> Result<ApplyStep>;
-    fn decide_baselines(&mut self, batch_id: &str, decisions: &[(String, bool)]) -> Result<()>;
+    /// verification. A failed check's baseline (spec 109) is a check card
+    /// later, answered through `decide_checks`.
+    fn apply_patch(&mut self, patch_id: &str) -> Result<()>;
     fn reject_patch(&mut self, patch_id: &str) -> Result<()>;
 }
 
@@ -116,7 +103,6 @@ pub enum DecisionKind {
     PlanReview,
     Command,
     Checks,
-    Baselines,
     Question,
     Patch,
 }
@@ -127,7 +113,6 @@ impl DecisionKind {
             Self::PlanReview => "plan_review",
             Self::Command => "command",
             Self::Checks => "checks",
-            Self::Baselines => "baselines",
             Self::Question => "question",
             Self::Patch => "patch",
         }
@@ -367,7 +352,7 @@ fn drive_inner(
                     deviate(outcome, sequence, DecisionKind::Patch, detail);
                 }
                 PatchDecision::Apply => {
-                    apply_with_baselines(transport, outcome, &patch_id)?;
+                    transport.apply_patch(&patch_id)?;
                     record(
                         outcome,
                         sequence,
@@ -377,32 +362,6 @@ fn drive_inner(
                     );
                 }
             },
-        }
-    }
-}
-
-/// Apply a patch, answering every baseline card the pre-apply gate raises
-/// (D6: checks are approved).
-fn apply_with_baselines(
-    transport: &mut dyn Transport,
-    outcome: &mut DriveOutcome,
-    patch_id: &str,
-) -> Result<()> {
-    loop {
-        match transport.apply_patch(patch_id)? {
-            ApplyStep::Applied => return Ok(()),
-            ApplyStep::Baselines { batch_id, checks } => {
-                let decisions = approve_all(&checks);
-                transport.decide_baselines(&batch_id, &decisions)?;
-                let sequence = outcome.decisions.len() + 1;
-                record(
-                    outcome,
-                    sequence,
-                    DecisionKind::Baselines,
-                    describe_checks(&checks),
-                    "approved",
-                );
-            }
         }
     }
 }
@@ -463,7 +422,6 @@ mod tests {
     struct FakeTransport {
         root: PathBuf,
         script: VecDeque<Pending>,
-        apply_steps: VecDeque<ApplyStep>,
         calls: Vec<String>,
     }
 
@@ -472,7 +430,6 @@ mod tests {
             Self {
                 root: PathBuf::from("/tmp/damaian-eval-fixture"),
                 script: script.into(),
-                apply_steps: VecDeque::new(),
                 calls: Vec::new(),
             }
         }
@@ -510,13 +467,8 @@ mod tests {
             self.calls.push(format!("answer {question_id} {answer}"));
             Ok(())
         }
-        fn apply_patch(&mut self, patch_id: &str) -> Result<ApplyStep> {
+        fn apply_patch(&mut self, patch_id: &str) -> Result<()> {
             self.calls.push(format!("apply {patch_id}"));
-            Ok(self.apply_steps.pop_front().unwrap_or(ApplyStep::Applied))
-        }
-        fn decide_baselines(&mut self, batch_id: &str, decisions: &[(String, bool)]) -> Result<()> {
-            self.calls
-                .push(format!("decide_baselines {batch_id} {}", decisions.len()));
             Ok(())
         }
         fn reject_patch(&mut self, patch_id: &str) -> Result<()> {
@@ -568,10 +520,6 @@ mod tests {
                 status: "complete".to_string(),
             },
         ]);
-        transport.apply_steps.push_back(ApplyStep::Baselines {
-            batch_id: "base_1".to_string(),
-            checks: vec![check("b1", "cargo test"), check("b2", "cargo test")],
-        });
         let outcome = drive(&mut transport, &policy(), DEFAULT_MAX_DECISIONS);
 
         assert_eq!(outcome.failure, None, "{outcome:?}");
@@ -585,12 +533,9 @@ mod tests {
                 format!("answer q_1 {}", policy().acceptance().clarification.answer),
                 "decide_command cmd_1 true".to_string(),
                 "apply patch_1".to_string(),
-                "decide_baselines base_1 2".to_string(),
-                "apply patch_1".to_string(),
                 "decide_checks batch_1 1".to_string(),
             ]
         );
-        assert_eq!(outcome.count(DecisionKind::Baselines), 1);
         assert_eq!(outcome.count(DecisionKind::Patch), 1);
     }
 

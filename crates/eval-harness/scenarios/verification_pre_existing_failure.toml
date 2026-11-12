@@ -6,8 +6,9 @@ prompt = "Add a retry to the upload client"
 # Specification 102 requirement 4 and acceptance criterion 1: a check that fails
 # identically before and after the patch is `pre_existing`, and no repair turn
 # starts. The failing integration test is seeded before the turn, so the
-# pre-apply baseline sees exactly the failure the post-patch check sees. The
-# patch itself compiles and touches a different file.
+# failure-time baseline on the task-start tree (spec 109) sees exactly the
+# failure the post-patch check sees. The patch itself compiles and touches a
+# different file.
 verify_after_apply = true
 check_decisions = [{ command = "cargo test", approved = true }]
 seed_files = [

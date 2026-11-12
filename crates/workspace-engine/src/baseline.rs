@@ -1,13 +1,19 @@
-//! Pre-apply check baselines (spec 102 Task 2).
+//! Failure-time check baselines (spec 102, made lazy by spec 109 D1).
 //!
-//! A patch is reviewed against base hashes. Once it is approved, the checks its
-//! approved paths select are established against those same bytes *before* the
-//! patch writes. This module owns that decision: which checks are new, which
-//! already have a task-local baseline, which run under the ordinary command
-//! policy, and which need the user's separate approval.
+//! A baseline answers whether a failing check already failed before the task
+//! changed anything. Spec 102 took every baseline before a task's first patch;
+//! spec 109 takes one only when a per-change or completion check fails and the
+//! task chain has none for that check yet. A passing check never needs one.
 //!
-//! It deliberately does not classify a post-patch result. It records
-//! [`CheckBaseline`] facts; spec 102 Task 3 compares them with later results.
+//! The baseline runs the same command, through the same command policy, in a
+//! temporary task-start tree ([`crate::pre_task_tree`]), never in the user's
+//! checkout. A command the policy lets run does so at once; one that needs
+//! approval goes on one card that says why. A tree that cannot be rebuilt
+//! exactly is an unavailable baseline.
+//!
+//! It deliberately does not classify a result. It records [`CheckBaseline`]
+//! facts; spec 102 Task 3's `provenance::classify` compares them with the
+//! failed result, with the meaning it always had.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -18,23 +24,31 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
-use crate::command_policy::{allow_always_eligible, relative_location};
+use crate::checkpoint::CheckpointStore;
+use crate::command_policy::allow_always_eligible;
 use crate::config::Config;
 use crate::error::{ClientError, Result};
 use crate::finding::{default_parsers, findings_from_execution};
-use crate::index_cache::IndexCache;
-use crate::indexer::ProjectIndexer;
-use crate::patch_engine::ProposedPatch;
-use crate::repository_map::RepositoryMapStore;
+use crate::pre_task_tree::{PreTaskSources, TreeBuild, build_pre_task_tree};
 use crate::secret_scanner::SecretScanner;
 use crate::session::SessionStore;
 use crate::validation::{CommandProposal, ValidationOrchestrator};
 use crate::verification::{
-    CheckBaseline, CheckId, CheckTermination, FailureFingerprint, FindingEvidence, Selection,
-    VerificationEvent, command_floor_checks, environment_termination, floor_checks, propose_checks,
+    CheckBaseline, CheckId, CheckTermination, FailureFingerprint, FindingEvidence,
+    VerificationEvent, environment_termination,
 };
 
-/// One command the user must decide about before the patch can apply.
+/// Why a failure-time baseline is proposed. Stored with the proposal, so the
+/// command store and the audit say what the run was for.
+const FAILURE_BASELINE_REASON: &str =
+    "Baseline for a failed check: run on the files as they were before this task's changes";
+
+/// The one-line question a failure-time baseline asks (spec 109 Task 3).
+pub const FAILURE_BASELINE_PROMPT: &str = "This check failed; run it on the files as they were \
+     before this task's changes to tell whether the failure is new?";
+
+/// One command the user must decide about before the failure can be
+/// classified.
 ///
 /// The fields are the engine's own labels and facts. The desktop and CLI render
 /// them and transport the decision; neither derives a risk or a reason.
@@ -69,7 +83,10 @@ pub struct BaselineCheck {
 #[serde(rename_all = "camelCase")]
 pub struct BaselineBatch {
     pub id: String,
-    pub patch_id: String,
+    /// What the card belongs to: the verification task whose failed checks it
+    /// baselines. Spec 102 cards named a patch here, under `patchId`.
+    #[serde(alias = "patchId")]
+    pub source_id: String,
     pub task_id: String,
     pub title: String,
     pub note: String,
@@ -87,19 +104,17 @@ fn default_cancel_label() -> String {
     "Cancel".to_string()
 }
 
-/// What preparing a patch's baseline came to.
-// One value per apply or resume call, returned and matched at once, never held
-// in a collection, so the size gap between the variants costs nothing; boxing
-// the card would only add a deref at every caller in four crates.
+/// What preparing the baselines of failed checks came to.
+// One value per call, returned and matched at once, never held in a
+// collection, so the size gap between the variants costs nothing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BaselinePreparation {
-    /// Every newly selected check now has a terminal record. `recorded` names
-    /// the checks this call recorded; empty means the patch reused current
-    /// task-local baselines.
+    /// Every failed check now has a terminal record. `recorded` names the
+    /// checks this call recorded; empty means the task chain already had them.
     Complete { recorded: Vec<CheckId> },
-    /// At least one baseline needs the user's ordinary command approval. No
-    /// patch file has been written.
+    /// At least one baseline needs the user's ordinary command approval.
+    /// Nothing on the card has run.
     Awaiting(BaselineBatch),
 }
 
@@ -140,7 +155,7 @@ pub struct BaselineResumeOutcome {
     pub recorded: Vec<CheckId>,
     /// The user cancelled. The check that was running and every approved check
     /// that had not started are recorded as declined (spec 102's existing
-    /// provenance), and the patch is left for the user to apply or reject.
+    /// provenance).
     pub cancelled: bool,
 }
 
@@ -154,15 +169,15 @@ struct PendingBaseline {
     task_id: String,
 }
 
-/// Selects and records pre-apply check baselines.
+/// Selects, runs and records failure-time check baselines.
 #[derive(Debug, Clone)]
 pub struct BaselineCoordinator {
     config: Config,
     scanner: SecretScanner,
     audit_log: AuditLog,
-    indexer: ProjectIndexer,
     session_store: SessionStore,
     validation: ValidationOrchestrator,
+    checkpoints: CheckpointStore,
 }
 
 impl BaselineCoordinator {
@@ -170,211 +185,52 @@ impl BaselineCoordinator {
         config: Config,
         scanner: SecretScanner,
         audit_log: AuditLog,
-        indexer: ProjectIndexer,
         session_store: SessionStore,
         validation: ValidationOrchestrator,
+        checkpoints: CheckpointStore,
     ) -> Self {
         Self {
             config,
             scanner,
             audit_log,
-            indexer,
             session_store,
             validation,
+            checkpoints,
         }
     }
 
-    /// Establish every check the approved paths select that does not already
-    /// have a current task-local baseline.
+    /// Establish a baseline for every failed check the task chain has none
+    /// for (spec 109 D1).
     ///
-    /// Runs under the ordinary policy: a safe detected check runs as it would
-    /// during verification, while one that needs approval is returned as a
-    /// batch and nothing is written.
-    pub fn prepare(
-        &self,
-        repository_root: &Path,
-        patch: &ProposedPatch,
-        approved_paths: Option<&[String]>,
-    ) -> Result<BaselinePreparation> {
-        let session_id = patch.session_id.as_str();
-        let Some(task_id) = patch.task_id.as_deref() else {
-            // A legacy patch has no session log to record a task-local baseline
-            // in. Its apply behaviour is unchanged.
-            return Ok(BaselinePreparation::Complete {
-                recorded: Vec::new(),
-            });
-        };
-        if session_id.is_empty() {
-            // A task id alone is not a session. `create_patch` leaves the field
-            // empty for callers that do not own a session, including legacy and
-            // directly-created patches, and there is nowhere to write a
-            // task-local baseline for them.
-            return Ok(BaselinePreparation::Complete {
-                recorded: Vec::new(),
-            });
-        }
-        let selected_paths = self.selected_paths(patch, approved_paths)?;
-        // The repository map answers two questions here: which checks the
-        // patch's own paths select for their per-change baseline, and which
-        // checks the completion floor requires for every root the task has
-        // touched (spec 101/105 review fix R15). It is loaded once.
-        let map = if selected_paths.is_empty() {
-            None
-        } else {
-            let index = IndexCache::get_or_build(&self.indexer, repository_root)?;
-            let map_store = RepositoryMapStore::new(&self.config.data_dir, self.audit_log.clone());
-            let (map, _) = map_store.load_or_build(&index, self.validation.command_policy())?;
-            Some(map)
-        };
-        let checks = match &map {
-            Some(map) => {
-                match propose_checks(
-                    &self.validation,
-                    repository_root,
-                    map,
-                    &selected_paths,
-                    &mut crate::verification::CheckReuse::none(),
-                )? {
-                    Selection::Proposed(checks) => checks.into_iter().collect(),
-                    Selection::OnlyDocumentation | Selection::NoChecksAvailable { .. } => {
-                        BTreeMap::new()
-                    }
-                }
-            }
-            None => BTreeMap::new(),
-        };
-        // Spec 102 D2 piece 1 and spec 101/105 R15: required checks are
-        // baselined before the first patch the task writes, on the untouched
-        // tree, even when that patch's paths do not select them. That set is
-        // the plan's required checks merged with the completion floor for every
-        // file the task will have touched after this patch. A required check
-        // with no task-start baseline (it became required only after the task
-        // had already changed files) is never given a post-patch baseline: it
-        // is recorded `Uncertain`, so its later failure is reported and asks the
-        // user rather than looking pre-existing.
-        let mut required: BTreeMap<CheckId, String> = self
-            .required_checks(session_id, task_id)?
-            .into_iter()
-            .collect();
-        if let Some(map) = &map {
-            let touched = self.task_touched_paths(session_id, task_id, &selected_paths)?;
-            for check in floor_checks(repository_root, map, &touched) {
-                required
-                    .entry(check)
-                    .or_insert_with(|| "required by the changed files".to_string());
-            }
-        }
-        if checks.is_empty() && required.is_empty() {
-            return Ok(BaselinePreparation::Complete {
-                recorded: Vec::new(),
-            });
-        }
-        self.settle(
-            repository_root,
-            session_id,
-            task_id,
-            &patch.id,
-            required,
-            checks,
-            "This patch has not been applied. Run these checks against the current, \
-             pre-patch files, or skip them. Skipping a baseline does not skip the patch.",
-        )
-    }
-
-    /// Establish the task-start baselines before the first mutating-capable
-    /// command of a task runs (spec 102 review fix R18).
-    ///
-    /// The command path cannot know which files a command will change before it
-    /// runs, so the scope is the plan's required checks plus the completion
-    /// floor of every root the command's working directory could write
-    /// ([`command_floor_checks`]). This runs only while the task has not changed
-    /// any files yet: once it has, the task-start tree is gone and the patch
-    /// gate's existing `Uncertain` rule owns any check that becomes required
-    /// later. A read-only command is filtered by the caller, because it cannot
-    /// change a file.
-    pub fn prepare_for_command(
+    /// Runs under the ordinary policy: a check the policy lets run is run now
+    /// in the task-start tree, a blocked one is unavailable, and one that needs
+    /// approval is returned on one card; nothing on the card has run. A cancel
+    /// records the running check and every one not yet run as declined.
+    pub fn prepare_for_failures(
         &self,
         repository_root: &Path,
         session_id: &str,
         task_id: &str,
-        proposal: &CommandProposal,
+        failed: &[CheckId],
+        cancel: &CancelToken,
+        on_progress: &mut dyn FnMut(BaselineProgress),
     ) -> Result<BaselinePreparation> {
         if session_id.is_empty() || task_id.is_empty() {
             return Ok(BaselinePreparation::Complete {
                 recorded: Vec::new(),
             });
         }
-        if self.task_has_changed_files(session_id, task_id)? {
-            return Ok(BaselinePreparation::Complete {
-                recorded: Vec::new(),
-            });
-        }
-        let mut required: BTreeMap<CheckId, String> = self
-            .required_checks(session_id, task_id)?
-            .into_iter()
-            .collect();
-        let working_directory =
-            relative_location(repository_root, Path::new(&proposal.working_directory))
-                .unwrap_or_default();
-        let index = IndexCache::get_or_build(&self.indexer, repository_root)?;
-        let map_store = RepositoryMapStore::new(&self.config.data_dir, self.audit_log.clone());
-        let (map, _) = map_store.load_or_build(&index, self.validation.command_policy())?;
-        for check in command_floor_checks(repository_root, &map, &working_directory) {
-            required
-                .entry(check)
-                .or_insert_with(|| "required by the command's working directory".to_string());
-        }
-        if required.is_empty() {
-            return Ok(BaselinePreparation::Complete {
-                recorded: Vec::new(),
-            });
-        }
-        self.settle(
-            repository_root,
-            session_id,
-            task_id,
-            &proposal.id,
-            required,
-            BTreeMap::new(),
-            "This command has not run. Run these checks against the current files, \
-             or skip them. Skipping a baseline does not skip the command.",
-        )
-    }
-
-    /// Record every required check that has no current task-local baseline, and
-    /// return the ones that still need the user's approval as one batch.
-    ///
-    /// Shared by the patch gate and the command gate so both take the task-start
-    /// baseline through exactly the same policy, reuse and `Uncertain` rules.
-    #[allow(clippy::too_many_arguments)]
-    fn settle(
-        &self,
-        repository_root: &Path,
-        session_id: &str,
-        task_id: &str,
-        batch_key: &str,
-        required: BTreeMap<CheckId, String>,
-        mut checks: BTreeMap<CheckId, CommandProposal>,
-        note: &str,
-    ) -> Result<BaselinePreparation> {
-        // A baseline belongs to the task. Look through its continuation chain
-        // so a repair or worker continuation reuses the source task's baseline
-        // instead of taking a post-failure one.
+        // A baseline belongs to the task chain: a repair or a continuation
+        // reuses the one its source task took.
         let current = self
             .session_store
             .task_verification_baselines(session_id, task_id)?;
-        let changed_before = self.task_has_changed_files(session_id, task_id)?;
         let mut recorded = Vec::new();
         let mut awaiting = Vec::new();
-        let mut handled = BTreeSet::new();
-        for (check, purpose) in required {
-            handled.insert(check.clone());
-            if current.contains_key(&check) {
-                continue;
-            }
-            if changed_before {
-                self.record(session_id, task_id, &check, CheckBaseline::Uncertain)?;
-                recorded.push(check);
+        let mut runnable = Vec::new();
+        let mut seen = BTreeSet::new();
+        for check in failed {
+            if current.contains_key(check) || !seen.insert(check.clone()) {
                 continue;
             }
             let directory = if check.working_directory.is_empty() {
@@ -382,69 +238,68 @@ impl BaselineCoordinator {
             } else {
                 repository_root.join(&check.working_directory)
             };
-            let reason = if purpose.is_empty() {
-                "required by the approved plan".to_string()
+            let proposal = self.validation.propose_command_at(
+                repository_root,
+                &directory,
+                &check.command,
+                FAILURE_BASELINE_REASON,
+            )?;
+            if proposal.blocked {
+                self.record(
+                    session_id,
+                    task_id,
+                    check,
+                    unavailable(check, CheckTermination::PolicyRefused),
+                )?;
+                recorded.push(check.clone());
+            } else if proposal.requires_approval {
+                awaiting.push(self.batch_check(&proposal, check));
             } else {
-                purpose
-            };
-            let proposal = match checks.remove(&check) {
-                Some(proposal) => proposal,
-                None => self.validation.propose_command_at(
-                    repository_root,
-                    &directory,
-                    &check.command,
-                    &reason,
-                )?,
-            };
-            self.establish(
-                session_id,
-                task_id,
-                &check,
-                &proposal,
-                &mut recorded,
-                &mut awaiting,
-            )?;
-        }
-        for (check, proposal) in checks {
-            if handled.contains(&check) || current.contains_key(&check) {
-                continue;
+                runnable.push((check.clone(), proposal.id));
             }
-            self.establish(
+        }
+        if !runnable.is_empty() {
+            let outcome = self.run_in_task_start_tree(
+                repository_root,
                 session_id,
                 task_id,
-                &check,
-                &proposal,
-                &mut recorded,
-                &mut awaiting,
+                &runnable,
+                false,
+                "policy",
+                cancel,
+                on_progress,
             )?;
+            recorded.extend(outcome.recorded);
         }
         if awaiting.is_empty() {
-            // Every check now has a terminal baseline, so a batch left by an
-            // earlier reload or a competing apply would only re-offer work the
-            // engine has already settled.
-            self.remove_pending_for_patch(batch_key)?;
+            // Every check now has a terminal baseline, so a card left by an
+            // earlier pause would only re-offer settled work.
+            self.remove_pending_for_source(task_id)?;
             return Ok(BaselinePreparation::Complete { recorded });
         }
         let batch = BaselineBatch {
             // Deterministic in the source and the checks it still needs, so a
-            // reload or a repeated request re-offers the same batch instead of
-            // orphaning a duplicate file with a fresh proposal id set.
-            id: batch_id_for(batch_key, &awaiting),
-            patch_id: batch_key.to_string(),
+            // repeated request re-offers the same card instead of orphaning a
+            // duplicate file with a fresh proposal id set.
+            id: batch_id_for(task_id, &awaiting),
+            source_id: task_id.to_string(),
             task_id: task_id.to_string(),
-            title: "Checks need a baseline".to_string(),
-            note: note.to_string(),
+            title: if awaiting.len() == 1 {
+                "A check failed: is the failure new?".to_string()
+            } else {
+                "Checks failed: are the failures new?".to_string()
+            },
+            note: "This check failed. Run it on the files as they were before this task's \
+                   changes to tell whether the failure is new. Skipping leaves the cause \
+                   unknown; it changes no file."
+                .to_string(),
             run_label: "Run selected baselines".to_string(),
             skip_label: "Skip baselines".to_string(),
             run_all_label: "Run all".to_string(),
             cancel_label: default_cancel_label(),
             checks: awaiting,
         };
-        // A different selection for the same source must not leave the previous
-        // card resumable beside this one. The new card is written after the old
-        // one is removed, so the store never holds two pending decisions for the
-        // same source.
-        self.remove_pending_for_patch(batch_key)?;
+        self.remove_pending_for_source(task_id)?;
         self.save_pending(PendingBaseline {
             batch: batch.clone(),
             repository_root: canonical_root(repository_root)
@@ -459,7 +314,6 @@ impl BaselineCoordinator {
                 ("actor", "system".to_string()),
                 ("sessionId", session_id.to_string()),
                 ("taskId", task_id.to_string()),
-                ("patchId", batch_key.to_string()),
                 ("proposalId", batch.id.clone()),
                 ("checks", batch.checks.len().to_string()),
             ],
@@ -467,44 +321,15 @@ impl BaselineCoordinator {
         Ok(BaselinePreparation::Awaiting(batch))
     }
 
-    /// Apply one card's decisions and record a terminal result for each check.
+    /// Apply one card's decisions and record a terminal result for each check
+    /// (spec 107 Task 4's streamed run, with its cancel).
     ///
     /// The whole decision set is validated against the pending batch before a
-    /// single command runs or a single baseline is recorded. A malformed retry
-    /// therefore has no side effects and can be retried after the client
-    /// refreshes its card.
-    pub fn resume(
-        &self,
-        repository_root: &Path,
-        batch_id: &str,
-        decisions: &[(String, bool)],
-        always: &[String],
-        approved_by: &str,
-    ) -> Result<BaselinePreparation> {
-        // No caller here can cancel or watch, so the run is the streamed one
-        // with a token nothing triggers and progress that goes nowhere.
-        let outcome = self.resume_streamed(
-            repository_root,
-            batch_id,
-            decisions,
-            always,
-            approved_by,
-            &CancelToken::new(),
-            &mut |_| {},
-        )?;
-        Ok(BaselinePreparation::Complete {
-            recorded: outcome.recorded,
-        })
-    }
-
-    /// [`Self::resume`] for a caller that shows progress and can cancel
-    /// (spec 107 Task 4).
-    ///
-    /// A cancel stops the running check (the command runner kills its process
-    /// group) and records it, and every approved check that had not started,
-    /// as declined — exactly the record *Skip baselines* leaves. The pending
-    /// card is removed either way: every check has a terminal record, so the
-    /// next apply goes ahead without asking again.
+    /// single command runs or a single baseline is recorded, so a malformed
+    /// retry has no side effects. A cancel stops the running check (the command
+    /// runner kills its process group) and records it, and every approved
+    /// check that had not started, as declined — exactly the record *Skip
+    /// baselines* leaves. The pending card is removed either way.
     #[allow(clippy::too_many_arguments)]
     pub fn resume_streamed(
         &self,
@@ -520,116 +345,52 @@ impl BaselineCoordinator {
         self.validate_resume_against(&pending, repository_root, decisions, always)?;
         // Every *Allow Always* request was validated against this exact pending
         // batch above, so no grant can be written for an unknown, unapproved or
-        // ineligible proposal. The grant is written before the first baseline
-        // command runs, exactly as the ordinary command card does.
+        // ineligible proposal.
         for proposal_id in always {
             self.validation
                 .allow_command_always(proposal_id, approved_by)?;
         }
         let approved_of = |check: &BaselineCheck| {
-            // Validated above, so every check has exactly one decision.
-            let Some((_, approved)) = decisions
+            decisions
                 .iter()
                 .find(|(proposal_id, _)| proposal_id == &check.proposal_id)
-            else {
-                unreachable!("resume validated every decision before running")
-            };
-            *approved
+                .is_some_and(|(_, approved)| *approved)
         };
-        let total = pending
-            .batch
-            .checks
-            .iter()
-            .filter(|check| approved_of(check))
-            .count();
-        let mut started = 0;
-        let mut cancelled = false;
         let mut recorded = Vec::new();
+        let mut approved = Vec::new();
         for check in &pending.batch.checks {
-            let approved = approved_of(check);
-            if approved && !cancel.is_cancelled() {
-                let proposal = self
-                    .validation
-                    .command_store()
-                    .load_proposal(&check.proposal_id)?;
-                started += 1;
-                let name = check.check.label();
-                on_progress(BaselineProgress::Started {
-                    check: name.clone(),
-                    label: format!("Running baseline: {name}"),
-                    index: started,
-                    total,
-                });
-                let mut on_output = |line: &str| {
-                    let line = line.trim_end_matches(['\n', '\r']);
-                    if !line.is_empty() {
-                        on_progress(BaselineProgress::Output {
-                            line: line.to_string(),
-                        });
-                    }
-                };
-                let baseline = self.run_baseline(
-                    &pending.session_id,
-                    &pending.task_id,
-                    &check.check,
-                    &proposal,
-                    true,
-                    approved_by,
-                    cancel,
-                    &mut on_output,
-                )?;
-                let result = match &baseline {
-                    BaselineRun::Recorded(baseline) => baseline_result_word(baseline),
-                    BaselineRun::Cancelled => {
-                        cancelled = true;
-                        "cancelled"
-                    }
-                };
-                let baseline = match baseline {
-                    BaselineRun::Recorded(baseline) => baseline,
-                    BaselineRun::Cancelled => CheckBaseline::Declined,
-                };
-                self.record(
-                    &pending.session_id,
-                    &pending.task_id,
-                    &check.check,
-                    baseline,
-                )?;
-                on_progress(BaselineProgress::Finished {
-                    label: finished_label(result, &name),
-                    check: name,
-                    result: result.to_string(),
-                });
-            } else {
-                // Through the store as well as the log, so declining a
-                // baseline leaves the same command-store record an ordinary
-                // declined check does.
-                let _ = self
-                    .validation
-                    .reject_proposal(&check.proposal_id, approved_by);
-                self.record(
-                    &pending.session_id,
-                    &pending.task_id,
-                    &check.check,
-                    CheckBaseline::Declined,
-                )?;
-                // An approved check that never started because the user
-                // cancelled is declined, the same record as one left unticked.
-                if approved {
-                    cancelled = true;
-                    let name = check.check.label();
-                    on_progress(BaselineProgress::Finished {
-                        label: finished_label("declined", &name),
-                        check: name,
-                        result: "declined".to_string(),
-                    });
-                }
+            if approved_of(check) {
+                approved.push((check.check.clone(), check.proposal_id.clone()));
+                continue;
             }
+            // Through the store as well as the log, so declining a baseline
+            // leaves the same command-store record an ordinary declined check
+            // does.
+            let _ = self
+                .validation
+                .reject_proposal(&check.proposal_id, approved_by);
+            self.record(
+                &pending.session_id,
+                &pending.task_id,
+                &check.check,
+                CheckBaseline::Declined,
+            )?;
             recorded.push(check.check.clone());
         }
+        let outcome = self.run_in_task_start_tree(
+            repository_root,
+            &pending.session_id,
+            &pending.task_id,
+            &approved,
+            true,
+            approved_by,
+            cancel,
+            on_progress,
+        )?;
+        recorded.extend(outcome.recorded);
         self.remove_pending(batch_id)?;
         self.audit_log.record(
-            if cancelled {
+            if outcome.cancelled {
                 "verification_baseline_cancelled"
             } else {
                 "verification_baseline_resumed"
@@ -638,21 +399,20 @@ impl BaselineCoordinator {
                 ("actor", approved_by.to_string()),
                 ("sessionId", pending.session_id.clone()),
                 ("taskId", pending.task_id.clone()),
-                ("patchId", pending.batch.patch_id.clone()),
                 ("proposalId", batch_id.to_string()),
                 ("checks", recorded.len().to_string()),
             ],
         )?;
         Ok(BaselineResumeOutcome {
             recorded,
-            cancelled,
+            cancelled: outcome.cancelled,
         })
     }
 
     /// Read-only validation of a retry before the engine writes an *Allow
-    /// Always* grant or runs any baseline command. `resume` repeats this
-    /// validation, so a transport that skips this call still cannot perform a
-    /// partial grant.
+    /// Always* grant or runs any baseline command. `resume_streamed` repeats
+    /// this validation, so a transport that skips this call still cannot
+    /// perform a partial grant.
     pub fn validate_resume(
         &self,
         repository_root: &Path,
@@ -704,9 +464,7 @@ impl BaselineCoordinator {
         }
         // *Allow Always* is a separate grant. It is only meaningful for a check
         // on this exact card that the user approved and that the engine marked
-        // eligible when it built the card. Validate the whole set before the
-        // caller writes any grant or runs any command, so a malformed retry has
-        // no side effects and can be corrected.
+        // eligible when it built the card.
         let mut grants = BTreeSet::new();
         for proposal_id in always {
             if !grants.insert(proposal_id.as_str()) {
@@ -755,163 +513,165 @@ impl BaselineCoordinator {
         Ok(())
     }
 
-    /// The pending batch, for a caller that recovered a patch card and needs
-    /// the same engine-owned labels.
-    pub fn pending(&self, batch_id: &str) -> Result<Option<BaselineBatch>> {
-        let path = self.pending_path(batch_id)?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        Ok(Some(self.load_pending(batch_id)?.batch))
-    }
-
-    /// The plan's required checks, by identity, with the purpose to explain
-    /// them on a baseline card. A plan that is not approved yet authorises
-    /// nothing, so an unapproved plan contributes no required check.
-    fn required_checks(&self, session_id: &str, task_id: &str) -> Result<Vec<(CheckId, String)>> {
-        if !self.session_store.read_plan_approved(session_id, task_id)? {
-            return Ok(Vec::new());
-        }
-        let Some(plan) = self.session_store.read_task_plan(session_id, task_id)? else {
-            return Ok(Vec::new());
-        };
-        let mut checks: BTreeMap<CheckId, String> = BTreeMap::new();
-        for step in plan
-            .steps
-            .iter()
-            .filter(|step| !step.id.starts_with("verify_"))
-        {
-            let Some(planned) = step.check.as_ref() else {
-                continue;
-            };
-            if !planned.required {
-                continue;
-            }
-            let check = CheckId::new(planned.working_directory.as_str(), planned.command.as_str());
-            checks
-                .entry(check)
-                .or_insert_with(|| planned.purpose.clone());
-        }
-        Ok(checks.into_iter().collect())
-    }
-
-    /// Every path the task will have touched after this patch: the durable
-    /// patches and command changes already recorded, plus the patch being
-    /// applied now. The completion floor is computed over this set, so the
-    /// first patch of a task baselines every root its changes will select.
-    fn task_touched_paths(
+    /// Run `checks` (each with its stored proposal) in one task-start tree and
+    /// record each one's baseline. The tree is built once and removed when
+    /// this returns, whatever happened.
+    #[allow(clippy::too_many_arguments)]
+    fn run_in_task_start_tree(
         &self,
+        repository_root: &Path,
         session_id: &str,
         task_id: &str,
-        patch_paths: &[String],
-    ) -> Result<Vec<String>> {
-        let mut paths: BTreeSet<String> = self
-            .session_store
-            .task_touched_paths(session_id, task_id)?
-            .into_iter()
-            .collect();
-        paths.extend(patch_paths.iter().cloned());
-        Ok(paths.into_iter().collect())
-    }
-
-    /// Whether the task has already changed files, through any task in its
-    /// continuation chain. This is what distinguishes a task-start baseline
-    /// from one taken after the task started; it does not use the plan's
-    /// mutation generation, because a command or a patch can change files
-    /// before the plan exists.
-    fn task_has_changed_files(&self, session_id: &str, task_id: &str) -> Result<bool> {
-        let chain = self
-            .session_store
-            .task_continuation_chain(session_id, task_id)?;
-        for decision in self
-            .session_store
-            .read_all_patch_file_decisions(session_id)?
-        {
-            if decision.applied && chain.contains(&decision.task_id) {
-                return Ok(true);
-            }
+        checks: &[(CheckId, String)],
+        approved: bool,
+        approved_by: &str,
+        cancel: &CancelToken,
+        on_progress: &mut dyn FnMut(BaselineProgress),
+    ) -> Result<BaselineResumeOutcome> {
+        let mut recorded = Vec::new();
+        if checks.is_empty() {
+            return Ok(BaselineResumeOutcome {
+                recorded,
+                cancelled: false,
+            });
         }
-        for event in self
-            .session_store
-            .read_verification_events(session_id, &[])?
-        {
-            if let VerificationEvent::Due {
-                task_id: due_task,
-                paths,
-                ..
-            } = event
-                && !paths.is_empty()
-                && chain.contains(&due_task)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Record a check's baseline through the ordinary policy path: a blocked
-    /// command is unavailable, one that needs approval goes on the batch, and
-    /// a safe one runs now.
-    fn establish(
-        &self,
-        session_id: &str,
-        task_id: &str,
-        check: &CheckId,
-        proposal: &CommandProposal,
-        recorded: &mut Vec<CheckId>,
-        awaiting: &mut Vec<BaselineCheck>,
-    ) -> Result<()> {
-        if proposal.blocked {
-            self.record(
+        let build = if cancel.is_cancelled() {
+            None
+        } else {
+            Some(build_pre_task_tree(
+                repository_root,
+                &PreTaskSources {
+                    data_dir: &self.config.data_dir,
+                    session_store: &self.session_store,
+                    checkpoints: &self.checkpoints,
+                },
                 session_id,
                 task_id,
-                check,
-                unavailable(check, CheckTermination::PolicyRefused),
-            )?;
-            recorded.push(check.clone());
-            return Ok(());
-        }
-        if proposal.requires_approval {
-            awaiting.push(self.batch_check(proposal, check));
-            return Ok(());
-        }
-        // Runs inside the apply request, which has no cancel to offer: a token
-        // nothing triggers, so the run always reaches a recorded result.
-        let baseline = match self.run_baseline(
-            session_id,
-            task_id,
-            check,
-            proposal,
-            false,
-            "policy",
-            &CancelToken::new(),
-            &mut |_| {},
-        )? {
-            BaselineRun::Recorded(baseline) => baseline,
-            BaselineRun::Cancelled => CheckBaseline::Declined,
+            )?)
         };
-        self.record(session_id, task_id, check, baseline)?;
-        recorded.push(check.clone());
-        Ok(())
+        let tree = match build {
+            Some(TreeBuild::Ready(tree)) => Some(tree),
+            Some(TreeBuild::Unavailable(reason)) => {
+                // D2: a task-start tree that cannot be rebuilt exactly is no
+                // baseline at all, never a guess. Unknown provenance follows.
+                for (check, _) in checks {
+                    self.audit_log.record(
+                        "verification_baseline_unavailable",
+                        &[
+                            ("actor", "system".to_string()),
+                            ("sessionId", session_id.to_string()),
+                            ("taskId", task_id.to_string()),
+                            ("check", check.label()),
+                            ("termination", "task_start_tree_unavailable".to_string()),
+                            ("reason", reason.clone()),
+                        ],
+                    )?;
+                    self.record(
+                        session_id,
+                        task_id,
+                        check,
+                        unavailable(check, CheckTermination::UnavailableInfrastructure),
+                    )?;
+                    let name = check.label();
+                    on_progress(BaselineProgress::Finished {
+                        label: finished_label("unavailable", &name),
+                        check: name,
+                        result: "unavailable".to_string(),
+                    });
+                    recorded.push(check.clone());
+                }
+                return Ok(BaselineResumeOutcome {
+                    recorded,
+                    cancelled: false,
+                });
+            }
+            None => None,
+        };
+        let env = vec![("CARGO_TARGET_DIR", self.cargo_target_dir(repository_root))];
+        let total = checks.len();
+        let mut cancelled = false;
+        for (index, (check, proposal_id)) in checks.iter().enumerate() {
+            let name = check.label();
+            let result = match (&tree, cancel.is_cancelled()) {
+                (Some(tree), false) => {
+                    on_progress(BaselineProgress::Started {
+                        check: name.clone(),
+                        label: format!("Running baseline: {name}"),
+                        index: index + 1,
+                        total,
+                    });
+                    let mut on_output = |line: &str| {
+                        let line = line.trim_end_matches(['\n', '\r']);
+                        if !line.is_empty() {
+                            on_progress(BaselineProgress::Output {
+                                line: line.to_string(),
+                            });
+                        }
+                    };
+                    self.run_baseline(
+                        session_id,
+                        task_id,
+                        check,
+                        proposal_id,
+                        tree.root(),
+                        &env,
+                        approved,
+                        approved_by,
+                        cancel,
+                        &mut on_output,
+                    )?
+                }
+                // Cancelled before this one started: declined, the same
+                // record as one left unticked.
+                _ => BaselineRun::NotStarted,
+            };
+            let (baseline, word) = match result {
+                BaselineRun::Recorded(baseline) => {
+                    let word = baseline_result_word(&baseline);
+                    (baseline, word)
+                }
+                BaselineRun::Cancelled => {
+                    cancelled = true;
+                    (CheckBaseline::Declined, "cancelled")
+                }
+                BaselineRun::NotStarted => {
+                    cancelled = true;
+                    let _ = self.validation.reject_proposal(proposal_id, approved_by);
+                    (CheckBaseline::Declined, "declined")
+                }
+            };
+            self.record(session_id, task_id, check, baseline)?;
+            on_progress(BaselineProgress::Finished {
+                label: finished_label(word, &name),
+                check: name,
+                result: word.to_string(),
+            });
+            recorded.push(check.clone());
+        }
+        Ok(BaselineResumeOutcome {
+            recorded,
+            cancelled,
+        })
     }
 
-    fn selected_paths(
-        &self,
-        patch: &ProposedPatch,
-        approved_paths: Option<&[String]>,
-    ) -> Result<Vec<String>> {
-        let selected = approved_paths
-            .map(|paths| paths.to_vec())
-            .unwrap_or_else(|| patch.files.iter().map(|file| file.path.clone()).collect());
-        if let Some(path) = selected
-            .iter()
-            .find(|path| !patch.files.iter().any(|file| &file.path == *path))
-        {
-            return Err(ClientError::InvalidInput(format!(
-                "Selected patch file was not found: {path}"
-            )));
-        }
-        Ok(selected)
+    /// A Damaian-owned build cache for baselines of this repository, so a
+    /// Rust baseline in a fresh tree reuses its compiled dependencies instead
+    /// of building everything again, without writing into the user's own
+    /// `target`. Ignored by every other tool.
+    ///
+    /// The directory name is hex only: cargo joins the target directory into
+    /// `DYLD_FALLBACK_LIBRARY_PATH`, where a `:` (as in a repository id's
+    /// `sha256:` prefix) is a separator and fails the build.
+    fn cargo_target_dir(&self, repository_root: &Path) -> String {
+        let root = canonical_root(repository_root);
+        let digest = crate::hash::sha256_hex(root.to_string_lossy().as_bytes());
+        self.config
+            .data_dir
+            .join("baselines")
+            .join("cargo-target")
+            .join(&digest[..16])
+            .to_string_lossy()
+            .to_string()
     }
 
     fn batch_check(&self, proposal: &CommandProposal, check: &CheckId) -> BaselineCheck {
@@ -929,7 +689,7 @@ impl BaselineCoordinator {
             location_label,
             risk: proposal.risk.as_str().to_string(),
             risk_label: proposal.risk.as_str().to_string(),
-            prompt: "Run this check against the current, pre-patch files?".to_string(),
+            prompt: FAILURE_BASELINE_PROMPT.to_string(),
             cause: proposal
                 .causes
                 .first()
@@ -942,25 +702,29 @@ impl BaselineCoordinator {
         }
     }
 
-    /// Run one baseline under the caller's cancel token, streaming its
-    /// (redacted) output to `on_output`.
+    /// Run one baseline in the task-start tree under the caller's cancel
+    /// token, streaming its (redacted) output to `on_output`.
     #[allow(clippy::too_many_arguments)]
     fn run_baseline(
         &self,
         session_id: &str,
         task_id: &str,
         check: &CheckId,
-        proposal: &CommandProposal,
+        proposal_id: &str,
+        tree_root: &Path,
+        env: &[(&str, String)],
         approved: bool,
         approved_by: &str,
         cancel: &CancelToken,
         on_output: &mut dyn FnMut(&str),
     ) -> Result<BaselineRun> {
-        let record = match self.validation.run_proposal(
-            &proposal.id,
+        let record = match self.validation.run_proposal_in_tree(
+            proposal_id,
             approved,
             approved_by,
             Some(task_id),
+            tree_root,
+            env,
             cancel,
             on_output,
         ) {
@@ -1097,12 +861,11 @@ impl BaselineCoordinator {
         }
     }
 
-    /// Drops every pending card for `patch_id`. Called when the engine settles
-    /// the patch's baselines and before it writes a replacement card, so a
-    /// reload never finds two competing decisions for one apply.
-    fn remove_pending_for_patch(&self, patch_id: &str) -> Result<()> {
+    /// Drops every pending card for `source_id`, so a repeated request never
+    /// finds two competing decisions for one verification.
+    fn remove_pending_for_source(&self, source_id: &str) -> Result<()> {
         for (path, pending) in pending_baselines_in(&self.pending_dir())? {
-            if pending.batch.patch_id == patch_id {
+            if pending.batch.source_id == source_id {
                 fs::remove_file(path)?;
             }
         }
@@ -1110,16 +873,21 @@ impl BaselineCoordinator {
     }
 
     fn pending_dir(&self) -> PathBuf {
-        pending_baseline_dir(&self.config.data_dir)
+        self.config.data_dir.join("baselines").join("pending")
+    }
+
+    /// A batch id reaches the filesystem, so it is not trusted as a path
+    /// component. The engine only ever generates `baseline_` ids made of
+    /// alphanumerics, `_` and `-`; anything else is refused before a path is
+    /// built, which makes `..` and separators impossible.
+    fn pending_path(&self, batch_id: &str) -> Result<PathBuf> {
+        validate_batch_id(batch_id)?;
+        Ok(self.pending_dir().join(format!("{batch_id}.json")))
     }
 }
 
-fn pending_baseline_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("baselines").join("pending")
-}
-
 /// Every readable pending baseline card under `directory`. An unreadable or
-/// foreign file is skipped, as it always was for the per-patch cleanup.
+/// foreign file is skipped.
 fn pending_baselines_in(directory: &Path) -> Result<Vec<(PathBuf, PendingBaseline)>> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -1143,32 +911,6 @@ fn pending_baselines_in(directory: &Path) -> Result<Vec<(PathBuf, PendingBaselin
     Ok(found)
 }
 
-/// The baseline card a patch's apply is waiting on, if any (spec 107 Task 1).
-///
-/// The engine keeps at most one pending card per patch
-/// (`remove_pending_for_patch` runs before a replacement is written), so this
-/// is the decision the user owes before that patch can apply.
-pub fn pending_baseline_for_patch(
-    data_dir: &Path,
-    patch_id: &str,
-) -> Result<Option<BaselineBatch>> {
-    Ok(pending_baselines_in(&pending_baseline_dir(data_dir))?
-        .into_iter()
-        .map(|(_, pending)| pending.batch)
-        .find(|batch| batch.patch_id == patch_id))
-}
-
-impl BaselineCoordinator {
-    /// A batch id reaches the filesystem, so it is not trusted as a path
-    /// component. The engine only ever generates `baseline_` ids made of
-    /// alphanumerics, `_` and `-`; anything else is refused before a path is
-    /// built, which makes `..` and separators impossible.
-    fn pending_path(&self, batch_id: &str) -> Result<PathBuf> {
-        validate_batch_id(batch_id)?;
-        Ok(self.pending_dir().join(format!("{batch_id}.json")))
-    }
-}
-
 const BATCH_ID_PREFIX: &str = "baseline_";
 const MAX_BATCH_ID_CHARS: usize = 96;
 
@@ -1187,10 +929,10 @@ fn validate_batch_id(batch_id: &str) -> Result<()> {
     }
 }
 
-/// Stable for one patch and one set of still-undecided checks, so reload and
-/// repeated apply requests re-offer the same card instead of leaving orphaned
-/// pending batches behind.
-fn batch_id_for(patch_id: &str, checks: &[BaselineCheck]) -> String {
+/// Stable for one source and one set of still-undecided checks, so repeated
+/// requests re-offer the same card instead of leaving orphaned pending batches
+/// behind.
+fn batch_id_for(source_id: &str, checks: &[BaselineCheck]) -> String {
     let mut selected = checks
         .iter()
         .map(|check| {
@@ -1202,7 +944,7 @@ fn batch_id_for(patch_id: &str, checks: &[BaselineCheck]) -> String {
         .collect::<Vec<_>>();
     selected.sort_unstable();
     let identity = serde_json::json!({
-        "patchId": patch_id,
+        "sourceId": source_id,
         "checks": selected,
     });
     let digest = crate::hash::sha256_hex(
@@ -1218,8 +960,10 @@ fn canonical_root(path: &Path) -> PathBuf {
 /// How one baseline run ended.
 enum BaselineRun {
     Recorded(CheckBaseline),
-    /// The caller's token was cancelled before or while it ran.
+    /// The caller's token was cancelled while it ran.
     Cancelled,
+    /// The caller's token was cancelled before it started.
+    NotStarted,
 }
 
 /// The wire word for a recorded baseline in a [`BaselineProgress::Finished`].
@@ -1251,8 +995,8 @@ fn unavailable(check: &CheckId, termination: CheckTermination) -> CheckBaseline 
     }
 }
 
-/// The task-local baselines a patch task currently has, keyed by check.
+/// The task-local baselines a task currently has, keyed by check.
 ///
 /// Exposed as a value rather than a second lookup rule so spec 102 Task 3
-/// classifies against exactly the state Task 2 recorded.
+/// classifies against exactly the state that was recorded.
 pub type TaskBaselines = BTreeMap<CheckId, CheckBaseline>;

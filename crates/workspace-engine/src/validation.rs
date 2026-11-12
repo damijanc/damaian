@@ -466,6 +466,94 @@ impl ValidationOrchestrator {
         Ok(record)
     }
 
+    /// Runs a stored proposal in a copy of its repository instead of the
+    /// repository itself (spec 109 D2: the failure-time baseline's task-start
+    /// tree).
+    ///
+    /// The approval decision is the stored proposal's, made against the real
+    /// repository: a blocked proposal never runs and one that needs approval
+    /// runs only with `approved`. The command and its directory relative to the
+    /// repository root are unchanged; only the root moves to `tree_root`. The
+    /// runner still classifies the command where it runs, so a policy that
+    /// refuses it there refuses it here too. `env` is added to the child.
+    ///
+    /// The recorded output names the tree's paths as the repository's, so a
+    /// finding parsed from it locates the same file as the live run's would.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_proposal_in_tree(
+        &self,
+        proposal_id: &str,
+        approved: bool,
+        approved_by: &str,
+        task_id: Option<&str>,
+        tree_root: &Path,
+        env: &[(&str, String)],
+        cancel: &CancelToken,
+        on_output: &mut dyn FnMut(&str),
+    ) -> Result<CommandRunRecord> {
+        let proposal = self.command_store.load_proposal(proposal_id)?;
+        if proposal.blocked {
+            return Err(ClientError::PolicyBlocked(
+                "Command proposal is blocked by policy".to_string(),
+            ));
+        }
+        if proposal.requires_approval && !approved {
+            return Err(ClientError::ApprovalRequired(
+                "Command proposal requires explicit approval before execution".to_string(),
+            ));
+        }
+        let repository_root = Path::new(&proposal.repository_root);
+        let relative = Path::new(&proposal.working_directory)
+            .strip_prefix(repository_root)
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let working_directory = tree_root.join(&relative);
+        let mut execution = self.command_runner.run_at_with_env(
+            &proposal.command,
+            tree_root,
+            &working_directory,
+            &proposal.reason,
+            CommandRunOptions {
+                // The stored decision stands: the runner reclassifies against
+                // the tree, which is not the repository a grant was made for.
+                approved: approved || !proposal.requires_approval,
+                approved_by: Some(approved_by),
+                task_id,
+                cancel,
+                on_output,
+                purpose: proposal.purpose,
+            },
+            env,
+        )?;
+        let repository = repository_root.to_string_lossy().to_string();
+        let mut tree_forms = vec![tree_root.to_string_lossy().to_string()];
+        if let Ok(canonical) = std::fs::canonicalize(tree_root) {
+            tree_forms.push(canonical.to_string_lossy().to_string());
+        }
+        // Longest first, so `/private/var/...` is replaced before `/var/...`.
+        tree_forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
+        for form in &tree_forms {
+            execution.stdout = execution.stdout.replace(form.as_str(), &repository);
+            execution.stderr = execution.stderr.replace(form.as_str(), &repository);
+        }
+        execution.working_directory = proposal.working_directory.clone();
+        let record = self.command_store.save_execution(&proposal, &execution)?;
+        self.audit_log.record(
+            "stored_command_executed",
+            &[
+                ("actor", "command".to_string()),
+                ("proposalId", proposal.id.clone()),
+                ("commandId", execution.id.clone()),
+                ("exitCode", execution.exit_code.unwrap_or(-1).to_string()),
+                ("purpose", execution.purpose.as_str().to_string()),
+                ("stdoutRef", record.stdout_ref.to_string_lossy().to_string()),
+                ("stderrRef", record.stderr_ref.to_string_lossy().to_string()),
+                ("tree", "task_start".to_string()),
+            ],
+        )?;
+        Ok(record)
+    }
+
     /// Permanently allows a proposal's command, so future proposals for the
     /// exact same command classify as low risk and skip the approval prompt.
     ///

@@ -807,6 +807,61 @@ fn read_existing(path: &Path) -> Result<Option<String>> {
     }
 }
 
+/// What one applied patch's rollback snapshot says a file held just before the
+/// patch wrote it (spec 109 D2). Read-only: the failure-time baseline uses it
+/// to rebuild the task-start tree and never writes it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreApplyContent {
+    /// `None` when the patch created the file.
+    pub content: Option<String>,
+    /// The base hash the patch was reviewed against, which the snapshot's
+    /// content must match.
+    pub base_hash: String,
+    pub captured_at_ms: u128,
+}
+
+impl PreApplyContent {
+    /// Whether the snapshot's bytes are the ones the patch was reviewed
+    /// against. A file the patch created has no bytes and no base hash.
+    pub(crate) fn verified(&self) -> bool {
+        match &self.content {
+            Some(content) => !self.base_hash.is_empty() && sha256(content) == self.base_hash,
+            None => self.base_hash.is_empty(),
+        }
+    }
+}
+
+/// The rollback snapshot `apply_patch` wrote for `path` of `patch_id`, or
+/// `None` when there is none.
+pub(crate) fn read_pre_apply_content(
+    data_dir: &Path,
+    patch_id: &str,
+    path: &str,
+) -> Result<Option<PreApplyContent>> {
+    let snapshot_path = data_dir
+        .join("rollback")
+        .join(patch_id)
+        .join(path.replace('/', "__"));
+    let raw = match fs::read_to_string(&snapshot_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let Ok(snapshot) = serde_json::from_str::<RollbackSnapshot>(&raw) else {
+        return Ok(None);
+    };
+    // The file name flattens `/` to `__`, so two paths can share one file; the
+    // snapshot names its own path, and a different one is not this file's.
+    if snapshot.path != path {
+        return Ok(None);
+    }
+    Ok(Some(PreApplyContent {
+        content: snapshot.existed.then_some(snapshot.content),
+        base_hash: snapshot.base_hash,
+        captured_at_ms: snapshot.captured_at_ms,
+    }))
+}
+
 fn temp_path_for(path: &Path) -> PathBuf {
     let mut temp_path = path.to_path_buf();
     let extension = format!(

@@ -93,8 +93,6 @@ pub(crate) enum Route {
     Ask,
     ProposeEdit,
     ApplyPatch,
-    ResumeBaseline,
-    ResumeBaselineStream,
     RollbackPatch,
     RejectPatchFiles,
     RejectPatch,
@@ -288,12 +286,6 @@ pub(crate) const ROUTES: &[(&str, &str, Route)] = &[
     ("POST", "/api/ask", Route::Ask),
     ("POST", "/api/propose-edit", Route::ProposeEdit),
     ("POST", "/api/apply-patch", Route::ApplyPatch),
-    ("POST", "/api/resume-baseline", Route::ResumeBaseline),
-    (
-        "POST",
-        "/api/resume-baseline-stream",
-        Route::ResumeBaselineStream,
-    ),
     ("POST", "/api/rollback-patch", Route::RollbackPatch),
     ("POST", "/api/reject-patch-files", Route::RejectPatchFiles),
     ("POST", "/api/reject-patch", Route::RejectPatch),
@@ -387,12 +379,10 @@ impl Route {
             | Route::AnswerQuestionStream
             | Route::ResumeFallbackStream
             | Route::ResumeRoundBudgetStream
-            // Command and check runs, baselines.
+            // Command and check runs.
             | Route::ProposeCommand
             | Route::RunCommand
             | Route::RejectCommand
-            | Route::ResumeBaseline
-            | Route::ResumeBaselineStream
             // Patches and checkpoints.
             | Route::ProposeEdit
             | Route::ApplyPatch
@@ -511,7 +501,6 @@ impl Route {
             Route::ContinueRepairStream => "Repairing after verification",
             Route::ContinueTaskStream | Route::ContinueWorkerResultStream => "Continuing the task",
             Route::RunCommand | Route::ResumeCommandStream => "Running a command",
-            Route::ResumeBaseline | Route::ResumeBaselineStream => "Running baseline checks",
             Route::ApplyPatch | Route::RollbackPatch => "Applying a patch",
             Route::Rewind => "Rewinding",
             Route::Compact => "Compacting the conversation",
@@ -578,8 +567,6 @@ mod tests {
             "/api/propose-command",
             "/api/run-command",
             "/api/reject-command",
-            "/api/resume-baseline",
-            "/api/resume-baseline-stream",
             "/api/propose-edit",
             "/api/apply-patch",
             "/api/rollback-patch",

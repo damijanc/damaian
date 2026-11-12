@@ -51,7 +51,32 @@ partly fixed by spec 107 D3), 86 (main-checkout test-process overhead) and 89
   R18's pre-command baseline. When a per-change or completion check fails and
   the task has no baseline for it, take one then, on the pre-patch tree, and
   classify with it. A passing check never needs one.
-- **D2 — the pre-patch tree (to confirm in Task 3).** Build it in a temporary
+  *Built in Task 3 (2026-11-12).* `finish_verification` (`chat.rs`) calls
+  `BaselineCoordinator::prepare_for_failures` before `record_post_patch_provenance`,
+  for every selected check whose run failed with a code result
+  (`checks_needing_failure_baseline`: not passed, skipped, declined, an
+  environment failure, a cancelled run or a browser check) and that has no
+  baseline in the task chain. The baseline proposes the same command through
+  the ordinary policy (`propose_command_at`, reason "Baseline for a failed
+  check…"): blocked is `Unavailable`, auto-run runs at once in the task-start
+  tree (D2), and one that needs approval parks the verification on the
+  existing check card (`AgentCheckBatch`, now with an optional engine `title`
+  and `note`: "This check failed. Run it on the files as they were before this
+  task's changes to tell whether the failure is new…"), the pause marker
+  `failure_baseline` (R18's `command_baseline` pause, repurposed). The answer
+  goes through `resume_after_check_decision` → `resume_failure_baseline`, which
+  runs the approved ones with spec 107's streamed `resume_streamed` under the
+  turn's cancel token (Stop records the running and unstarted ones `Declined`)
+  and then finishes the same verification. `classify` is unchanged. Removed:
+  `BaselineCoordinator::prepare`/`prepare_for_command`, `PatchApplyOutcome`
+  and `apply_stored_patch_with_baseline` (the apply route returns the applied
+  result again), the patch card's baseline card and the
+  `/api/resume-baseline(-stream)` routes, the `baseline` pending-decision kind,
+  `command_floor_checks`, `RepositoryMap::roots_for_command`,
+  `is_read_only_pipeline` and `is_source_writing_command`. `Uncertain` stays:
+  a log written before spec 109 still carries it, and a required check whose
+  run was cancelled reaches classification without a baseline.
+- **D2 — the pre-patch tree (confirmed by the owner 2026-11-11).** Build it in a temporary
   git worktree at `HEAD`, then apply the task's state *before* the patch under
   verification: the uncommitted changes that existed when the task started plus
   the task's earlier applied patches (the patch engine stores each applied
@@ -59,6 +84,67 @@ partly fixed by spec 107 D3), 86 (main-checkout test-process overhead) and 89
   worktree afterwards. If the pre-patch state cannot be reconstructed exactly
   (hash mismatch), record `CheckBaseline::Unavailable` — the existing
   `UnknownProvenance` path — rather than guess.
+  *Confirmed by the owner 2026-11-11; built in Task 3 (2026-11-12).* What
+  Task 3 decided while building it:
+  - **Which tree: the task-start tree.** The baseline tree is the state before
+    the task chain changed anything, not the state just before the patch under
+    verification. A baseline is recorded once per check per task chain and
+    reused for every later failure of that check, and a completion-floor
+    failure has no single patch under verification, so only the task-start
+    state gives one meaning. It is also what spec 102's pre-apply gate
+    produced, and it is the safe side: a regression patch 1 introduced but a
+    check first saw after patch 3 (D4 makes this common, since the floor runs
+    only at completion) still reads `new_regression`, where a "before patch 3"
+    tree would have called it `pre_existing`. Test:
+    `plan_turn::a_regression_first_seen_after_a_later_patch_is_classified_against_the_task_start_tree`.
+  - **Task-start state is not captured at task start; the engine already
+    records it.** Every applied patch writes a rollback snapshot of each file's
+    pre-apply bytes with the base hash it was reviewed against
+    (`patch_engine::read_pre_apply_content`), and each turn's checkpoint holds
+    the pre-change bytes and hash of every file a patch or an approved command
+    changed (spec 16, spec 85's census). For each path the chain changed (its
+    applied patches' paths plus its commands' `verification_due` paths — a
+    `Due` with no patch *and no checks*; the answer-time completion due also
+    has no patch but names checks), the earliest record is the task-start
+    content, verified against its hash. Cost at task start: nothing.
+  - **Unavailable, never guessed** when: a changed path has no record; a record
+    does not match its hash; a command changed a path and no checkpoint holds it
+    from before the command (a checkpoint whose census was truncated,
+    `command_effects_covered = false`, counts as no record); the repository is
+    not a Git checkout; it has submodules. Recorded as
+    `CheckBaseline::Unavailable { termination: unavailable_infrastructure }`,
+    audit `verification_baseline_unavailable` with `termination:
+    task_start_tree_unavailable` and the reason (paths, never content).
+  - **The tree is a shared clone, not `git worktree add`.** `git clone --shared
+    --no-checkout` of the common Git directory, then a detached checkout of
+    `HEAD`, with `core.hooksPath=/dev/null`: it borrows the user's objects
+    through alternates and writes nothing into the user's `.git`, so a crash
+    mid-baseline leaves no worktree registration behind. A repository with no
+    commit yet starts from an empty `git init`. Over it go every path `git
+    status` reports changed or untracked in the user's checkout (copied as it
+    is now) except the chain's own changed paths, which get their task-start
+    content. The user's checkout is only read (`--no-optional-locks`). The tree
+    lives under `<data_dir>/baselines/trees/` (the system temporary directory
+    when the data directory is inside the repository, as in development, where
+    a nested tree would sit in the checkout) and is removed when the baseline
+    run ends, on every path including errors and cancel; a tree older than a
+    day left by a crash is removed by the next build.
+  - **Known limit: the user's own edits during the task.** A path the task did
+    not change is taken as it is now, so an edit the user made by hand during
+    the task counts as task-start state, and a failure it causes reads
+    `pre_existing`, not the task's (pinned by
+    `plan_turn::a_failure_from_a_users_own_edit_during_the_task_is_not_attributed_to_the_task`).
+    Ignored files (build output, `node_modules`, `.env`) are not copied; a check
+    that needs them fails differently in the tree, which classifies as
+    `worsened` (repairable), not as a silent `pre_existing`.
+  - **A Damaian-owned cargo cache.** Baselines run with `CARGO_TARGET_DIR` set
+    to `<data_dir>/baselines/cargo-target/<16 hex of the canonical root>`, so a
+    Rust baseline reuses compiled dependencies instead of building everything in
+    each fresh tree, without writing into the user's `target`. It is kept
+    between baselines and is not cleaned up automatically (Task 7 documents
+    it). The name is hex only: cargo puts the target directory into
+    `DYLD_FALLBACK_LIBRARY_PATH`, where the `:` of a `sha256:` repository id
+    failed the build (found by the desktop-shell acceptance run).
 - **D3 — targeted rerun (recommended).** For Rust test findings, rerun the
   failing tests by name (`cargo test -- --exact <names>` / nextest `-E`
   filter) in the pre-patch tree; compare the same set. Anything else reruns the

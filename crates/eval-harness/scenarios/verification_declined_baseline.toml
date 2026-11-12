@@ -3,10 +3,11 @@ fixture = "rust-workspace"
 tier = "deterministic"
 prompt = "Add a retry to the upload client"
 
-# Specification 102 requirement 6 and acceptance criterion 6: declining the
-# baseline does not decline the patch, and a later failure is `unknown_provenance`
-# rather than assumed to be caused by the task. The check itself is approved
-# after the patch, so the run really does produce a failure.
+# Specification 102 requirement 6 and acceptance criterion 6: a declined
+# baseline leaves the failure `unknown_provenance` rather than assumed to be
+# caused by the task. The check itself is approved after the patch, so the run
+# really does produce a failure; spec 109 then offers its baseline on the
+# task-start tree, and the scenario declines that card.
 verify_after_apply = true
 check_decisions = [{ command = "cargo test", approved = true }]
 decline_baseline = true

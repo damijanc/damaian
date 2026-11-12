@@ -1,8 +1,4 @@
 use crate::audit::AuditLog;
-use crate::baseline::{
-    BaselineBatch, BaselineCoordinator, BaselinePreparation, BaselineProgress,
-    BaselineResumeOutcome,
-};
 use crate::cancel::CancelToken;
 use crate::chat::{ToolAction, apply_protected_paths_reminder};
 use crate::checkpoint::{
@@ -130,17 +126,6 @@ pub struct EditProposalResult {
     pub raw_model_output: String,
 }
 
-/// What an apply request came to before anything was written (spec 102 Task 2).
-///
-/// A baseline batch is not an error: the patch is still approved and can apply
-/// once every newly selected check has a terminal baseline, including a
-/// declined one.
-#[derive(Debug, Clone)]
-pub enum PatchApplyOutcome {
-    Applied(PatchApplyResult),
-    BaselineRequired(BaselineBatch),
-}
-
 #[derive(Debug, Clone)]
 pub struct PatchStore {
     data_dir: PathBuf,
@@ -256,7 +241,6 @@ pub struct EditOrchestrator {
     patch_store: PatchStore,
     checkpoint_store: CheckpointStore,
     hooks: HookDispatcher,
-    baselines: BaselineCoordinator,
 }
 
 impl EditOrchestrator {
@@ -274,7 +258,6 @@ impl EditOrchestrator {
         patch_store: PatchStore,
         checkpoint_store: CheckpointStore,
         hooks: HookDispatcher,
-        baselines: BaselineCoordinator,
     ) -> Self {
         Self {
             config,
@@ -287,7 +270,6 @@ impl EditOrchestrator {
             patch_store,
             checkpoint_store,
             hooks,
-            baselines,
         }
     }
 
@@ -844,83 +826,6 @@ impl EditOrchestrator {
         )
     }
 
-    /// Establish the baselines the approved paths select before this patch can
-    /// write. A returned batch is the engine-owned card a caller renders; no
-    /// patch file has been written.
-    pub fn prepare_stored_patch_baseline(
-        &self,
-        repository_root: impl AsRef<Path>,
-        patch_id: &str,
-        approved_paths: Option<&[String]>,
-    ) -> Result<BaselinePreparation> {
-        let patch = self.patch_store.load(patch_id)?;
-        self.baselines
-            .prepare(repository_root.as_ref(), &patch, approved_paths)
-    }
-
-    /// Apply one baseline card's decisions. The caller then retries the apply;
-    /// this method never writes patch content, so a declined baseline cannot
-    /// decline the patch.
-    pub fn resume_stored_patch_baseline(
-        &self,
-        repository_root: impl AsRef<Path>,
-        batch_id: &str,
-        decisions: &[(String, bool)],
-        always: &[String],
-        approved_by: &str,
-    ) -> Result<BaselinePreparation> {
-        self.baselines.resume(
-            repository_root.as_ref(),
-            batch_id,
-            decisions,
-            always,
-            approved_by,
-        )
-    }
-
-    /// [`Self::resume_stored_patch_baseline`] for a caller that streams
-    /// progress and offers a cancel (spec 107 Task 4). A cancelled run records
-    /// the remaining baselines as declined and still never writes patch
-    /// content: the patch stays undecided.
-    #[allow(clippy::too_many_arguments)]
-    pub fn resume_stored_patch_baseline_streamed(
-        &self,
-        repository_root: impl AsRef<Path>,
-        batch_id: &str,
-        decisions: &[(String, bool)],
-        always: &[String],
-        approved_by: &str,
-        cancel: &CancelToken,
-        on_progress: &mut dyn FnMut(BaselineProgress),
-    ) -> Result<BaselineResumeOutcome> {
-        self.baselines.resume_streamed(
-            repository_root.as_ref(),
-            batch_id,
-            decisions,
-            always,
-            approved_by,
-            cancel,
-            on_progress,
-        )
-    }
-
-    /// Read-only validation before a caller performs its own side effects.
-    pub fn validate_stored_patch_baseline_resume(
-        &self,
-        repository_root: impl AsRef<Path>,
-        batch_id: &str,
-        decisions: &[(String, bool)],
-        always: &[String],
-    ) -> Result<()> {
-        self.baselines
-            .validate_resume(repository_root.as_ref(), batch_id, decisions, always)
-    }
-
-    /// The baseline card a recovered review is still waiting on, if any.
-    pub fn pending_stored_patch_baseline(&self, batch_id: &str) -> Result<Option<BaselineBatch>> {
-        self.baselines.pending(batch_id)
-    }
-
     /// `allow_generated_secrets` records an explicit, per-apply user decision
     /// to accept content the secret scanner flagged. It is never inferred and
     /// never persisted — each apply asks again.
@@ -933,45 +838,6 @@ impl EditOrchestrator {
         approved_by: &str,
         allow_generated_secrets: bool,
     ) -> Result<PatchApplyResult> {
-        match self.apply_stored_patch_with_baseline(
-            repository_root,
-            patch_id,
-            approved_paths,
-            hunk_selection,
-            approved_by,
-            allow_generated_secrets,
-        )? {
-            PatchApplyOutcome::Applied(result) => Ok(result),
-            PatchApplyOutcome::BaselineRequired(batch) => {
-                Err(ClientError::ApprovalRequired(format!(
-                    "The patch needs a baseline first: {}",
-                    batch
-                        .checks
-                        .iter()
-                        .map(|check| check.label.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )))
-            }
-        }
-    }
-
-    /// The apply path with spec 102's pre-apply baseline decision.
-    ///
-    /// Everything before the baseline gate is a refusal that must not run a
-    /// check: protected paths and the session's current mode. The gate then
-    /// runs before the before-apply hooks, the action marker, the checkpoint
-    /// and every write.
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_stored_patch_with_baseline(
-        &self,
-        repository_root: impl AsRef<Path>,
-        patch_id: &str,
-        approved_paths: Option<&[String]>,
-        hunk_selection: Option<&std::collections::HashMap<String, Vec<String>>>,
-        approved_by: &str,
-        allow_generated_secrets: bool,
-    ) -> Result<PatchApplyOutcome> {
         let patch = self.patch_store.load(patch_id)?;
         // Spec 98 §2.5: resolve the patch task's current protections again.
         // The proposal-time fence cannot cover a path protected after the
@@ -1001,21 +867,8 @@ impl EditOrchestrator {
         // proposed from, whose mode can change after the preview appears.
         self.refuse_unless_mode_and_profile_permit_patches(&patch.session_id)?;
         self.refuse_unless_mode_and_profile_permit_patches(&patch.origin_session_id)?;
-        // Spec 102 requirement 1: select from the approved paths while the
-        // patch's base hashes still name the bytes the user reviewed. Safe
-        // checks run under ordinary policy; a check that needs approval stops
-        // here with an engine-owned batch. Nothing below this gate has run, so
-        // no patch file is written before every newly selected check has a
-        // terminal baseline.
-        match self
-            .baselines
-            .prepare(repository_root.as_ref(), &patch, approved_paths)?
-        {
-            BaselinePreparation::Complete { .. } => {}
-            BaselinePreparation::Awaiting(batch) => {
-                return Ok(PatchApplyOutcome::BaselineRequired(batch));
-            }
-        }
+        // Spec 109 D1: no baseline is taken before the patch writes. A check
+        // that fails afterwards takes its baseline then, on the task-start tree.
         // Spec 32 `context.md` §3: the last hook before anything is written.
         // It sits after the mode and profile refusals and before the marker
         // and the snapshot, so a denial opens no marker, takes no checkpoint
@@ -1210,7 +1063,7 @@ impl EditOrchestrator {
             &accepted_hunks,
             true,
         )?;
-        Ok(PatchApplyOutcome::Applied(result))
+        Ok(result)
     }
 
     /// Records one decision and, when it settles the patch, that verification

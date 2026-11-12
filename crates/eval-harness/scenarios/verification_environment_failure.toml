@@ -47,7 +47,10 @@ pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
 
 [assert]
 verification_outcome = "failed"
-verification_baselines = [{ command = "cargo test", state = "unavailable" }]
+# Spec 109 D1: a baseline is taken only for a check that failed with a code
+# result. A check that could not start is an environment failure, which
+# classification never compares with a baseline, so none is taken.
+verification_baselines = []
 verification_provenances = [{ command = "cargo test", provenance = "environment_failure" }]
 verification_repair_targets = 0
 verification_action_kinds = ["fix_environment"]

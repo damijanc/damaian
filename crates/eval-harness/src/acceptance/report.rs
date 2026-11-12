@@ -121,7 +121,6 @@ impl AcceptanceReport {
             DecisionKind::PlanReview,
             DecisionKind::Command,
             DecisionKind::Checks,
-            DecisionKind::Baselines,
             DecisionKind::Question,
             DecisionKind::Patch,
         ] {

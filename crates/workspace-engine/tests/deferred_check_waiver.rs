@@ -13,8 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::{
     CancelToken, ChatTurnResult, CheckId, CompletionReasonCode, Config, MockModelAdapter,
-    ModelAdapter, PatchApplyOutcome, TaskStatus, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
-    fold_verification,
+    ModelAdapter, TaskStatus, ToolCall, TurnProgress, TurnSink, WorkspaceEngine, fold_verification,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -484,29 +483,10 @@ fn patch_call_with(path: &str, content: &str) -> ToolCall {
 /// Applies a stored patch through the ordinary pre-apply baseline gate,
 /// declining every offered baseline so no check command runs in the fixture.
 fn apply_patch_declining_baselines(engine: &WorkspaceEngine, repo: &Path, patch_id: &str) {
-    let mut outcome = engine
+    engine
         .edit_orchestrator
-        .apply_stored_patch_with_baseline(repo, patch_id, None, None, "tester", false)
+        .apply_stored_patch(repo, patch_id, None, None, "tester", false)
         .expect("the patch should apply");
-    while let PatchApplyOutcome::BaselineRequired(batch) = outcome {
-        let decisions = batch
-            .checks
-            .iter()
-            .map(|check| (check.proposal_id.clone(), false))
-            .collect::<Vec<_>>();
-        engine
-            .edit_orchestrator
-            .resume_stored_patch_baseline(repo, &batch.id, &decisions, &[], "tester")
-            .expect("the baseline decisions should record");
-        outcome = engine
-            .edit_orchestrator
-            .apply_stored_patch_with_baseline(repo, patch_id, None, None, "tester", false)
-            .expect("the patch should apply after the baselines settle");
-    }
-    assert!(
-        matches!(outcome, PatchApplyOutcome::Applied(_)),
-        "the patch should be applied: {outcome:?}"
-    );
 }
 
 #[test]
