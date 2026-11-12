@@ -1879,11 +1879,14 @@ fn rerunning_the_deferred_check_after_the_patch_makes_it_current() {
 ///
 /// Spec 106 Task 6 (live run 1): this is the shape of every plan that updates
 /// its task record last. Nothing the model runs later can refresh a check
-/// declared on an earlier step, so the verification after the later patch
-/// reruns the finished step's stale check itself. The task then continues and
-/// completes instead of stopping `incomplete` on `required_check_stale`.
+/// declared on an earlier step, so the engine reruns the finished step's stale
+/// check itself. The task then continues and completes instead of stopping
+/// `incomplete` on `required_check_stale`.
+///
+/// Spec 109 D4: the rerun happens once, at completion, not after every later
+/// patch; mid-plan the stale check waits for completion like the floor.
 #[test]
-fn a_check_made_stale_by_a_later_step_is_rerun_by_the_next_verification() {
+fn a_check_made_stale_by_a_later_step_is_rerun_once_at_completion() {
     let repo = temp_repo("check-stale-later-step");
     let engine = engine_for(&repo);
     let mut adapter = scripted(vec![
@@ -1927,8 +1930,8 @@ fn a_check_made_stale_by_a_later_step_is_rerun_by_the_next_verification() {
     );
     assert_eq!(
         loop_runs_of_the_plan_check(&engine, &result.session.id),
-        1,
-        "the verification after the later patch reran the finished step's check"
+        0,
+        "the verification after the later patch does not rerun the finished step's check"
     );
     let report = engine
         .session_store
@@ -1938,18 +1941,18 @@ fn a_check_made_stale_by_a_later_step_is_rerun_by_the_next_verification() {
     assert_eq!(
         report.reason_codes(),
         vec![CompletionReasonCode::OpenPlanSteps],
-        "only the open later step remains: {report:?}"
+        "only the open later step remains; the stale check waits for completion: {report:?}"
     );
 
+    let session_id = result.session.id.clone();
     let mut adapter = scripted(vec![vec![call("complete_step", "{}")]]);
-    let result = continue_task(
-        &engine,
-        &repo,
-        &result.session.id,
-        &verified.task.id,
-        &mut adapter,
-    );
+    let result = continue_task(&engine, &repo, &session_id, &verified.task.id, &mut adapter);
 
+    assert_eq!(
+        loop_runs_of_the_plan_check(&engine, &session_id),
+        1,
+        "completion reran the finished step's stale check once"
+    );
     assert_eq!(
         result.task.status,
         TaskStatus::Complete,
@@ -3762,6 +3765,7 @@ fn a_required_check_is_baselined_at_task_start_and_a_later_regression_is_repaire
         .patch_id
         .clone();
     apply_patch_with_baselines(&engine, &repo, &patch2_id, true);
+    close_the_last_step(&engine, &continued.task);
 
     let mut repair_adapter = MockModelAdapter::new("Done.");
     let verified = run_verification_and_approve_checks(
@@ -3812,6 +3816,29 @@ fn close_first_two_steps(engine: &WorkspaceEngine, task: &workspace_engine::Task
     }
     plan.steps[2].status = StepStatus::InProgress;
     plan.steps[2].started_at_ms = Some(1);
+    engine
+        .session_store
+        .revise_plan(task, &plan)
+        .expect("the plan revision records");
+}
+
+/// Closes the plan's last step, written straight to the durable plan, so the
+/// next verification is the task's completion run.
+///
+/// Since spec 109 D4 a finished step's required check is not a per-change
+/// check: after patch 2, during the last step, the per-change verification
+/// leaves the covered `crates/foo` root to completion. These baseline and
+/// provenance tests need the loop's run of that check, which the completion
+/// run makes (the floor check of `crates/foo` is the same identity).
+fn close_the_last_step(engine: &WorkspaceEngine, task: &workspace_engine::Task) {
+    let mut plan = engine
+        .session_store
+        .read_task_plan(&task.session_id, &task.id)
+        .expect("the plan should read")
+        .expect("the task carries the plan");
+    let last = plan.steps.len() - 1;
+    plan.steps[last].status = StepStatus::Completed;
+    plan.steps[last].completed_at_ms = Some(2);
     engine
         .session_store
         .revise_plan(task, &plan)
@@ -3888,6 +3915,7 @@ fn uncertain_repair_fixture(
         .patch_id
         .clone();
     apply_patch_with_baselines(&engine, &repo, &patch2_id, true);
+    close_the_last_step(&engine, &continued.task);
     mark_worker_session(&engine, &continued.session.id, &repo);
 
     let mut verification_adapter = MockModelAdapter::new("Done.");
@@ -4780,97 +4808,216 @@ fn a_plan_declared_member_check_does_not_hide_the_missing_workspace_root_floor()
 
 const D4_SCOPED_COMMAND: &str = "cargo nextest run -p member --test a --test b";
 
-/// The scoped check on a first step the model has already finished, declared
-/// at the workspace root (an enclosing root of the member).
-const D4_FINISHED_STEP_PLAN: &str = r#"{"steps":[
-    {"title":"Add the scoped tests","check":{"command":"cargo nextest run -p member --test a --test b","workingDirectory":"","purpose":"the member's scoped tests","required":true}},
-    {"title":"Change the member"}
-]}"#;
-
 /// The scoped check on the step the change belongs to, declared in the crate.
 const D4_OPEN_STEP_PLAN: &str = r#"{"steps":[
     {"title":"Change the member","check":{"command":"cargo nextest run -p member --test a --test b","workingDirectory":"crates/member","purpose":"the member's scoped tests","required":true}},
     {"title":"Finish the task"}
 ]}"#;
 
-/// Spec 109 D4 (the spec 33 shape): a patch is verified with only the plan's
-/// scoped check, not the member's `cargo test`; the task's completion still
-/// runs the detected floor of the member and its workspace root once, and the
-/// task completes.
-#[test]
-fn a_plans_scoped_check_verifies_a_change_and_the_floor_runs_once_at_completion() {
-    let (repo, shell) = r16_workspace_fixture("d4-scoped-per-change");
-    let engine = check_engine(&repo, &shell, &["cargo test"]);
-    let scoped = CheckId::new("", D4_SCOPED_COMMAND);
-    let member_check = CheckId::new("crates/member", "cargo test");
-    let root_check = CheckId::new("", "cargo test");
-    let patch = patch_call_with(
-        "crates/member/src/helper.rs",
-        "pub fn helper() -> u8 { 1 }\n",
-    );
-    let proposed = r16_proposed_member_change(&engine, &repo, D4_FINISHED_STEP_PLAN, patch);
+/// The owner's spec 33 shape: every step's required check sits at the
+/// repository root, which encloses the member, so each covers every change.
+const D4_ROOT_CHECKS_PLAN: &str = r#"{"steps":[
+    {"title":"Add the scoped tests","check":{"command":"cargo nextest run -p member --test a","workingDirectory":"","purpose":"the first scoped tests","required":true}},
+    {"title":"Change the member","check":{"command":"cargo nextest run -p member --test b","workingDirectory":"","purpose":"the second scoped tests","required":true}},
+    {"title":"Change the member again"}
+]}"#;
 
-    // The first step is finished, the patch belongs to the second: the scoped
-    // check is not deferred to an open step.
-    let mut plan = engine
-        .session_store
-        .read_task_plan(&proposed.session.id, &proposed.task.id)
-        .expect("the plan should read")
-        .expect("the task carries the plan");
-    plan.steps[0].status = StepStatus::Completed;
-    plan.steps[1].status = StepStatus::InProgress;
+/// How many times the verification loop ran `check`, across the session.
+fn loop_runs_of(engine: &WorkspaceEngine, session_id: &str, check: &CheckId) -> usize {
     engine
         .session_store
-        .revise_plan(&proposed.task, &plan)
-        .expect("the plan records");
-
-    let mut due = MockModelAdapter::new("Done.");
-    let _ = run_verification_and_approve_checks(&engine, &repo, &proposed.session.id, &mut due);
-    assert_eq!(
-        latest_started_checks(&engine, &proposed.session.id),
-        vec![scoped.clone()],
-        "per change only the plan's scoped check runs"
-    );
-    assert!(a_check_passed(&engine, &proposed.session.id, &scoped));
-    assert!(
-        !a_check_passed(&engine, &proposed.session.id, &member_check),
-        "the member's detected check did not run per change"
-    );
-
-    let mut adapter = scripted(vec![vec![call("complete_step", "{}")], Vec::new()]);
-    let mut result = ask_in_session(
-        &engine,
-        &repo,
-        &proposed.session.id,
-        "Finish the task",
-        &mut adapter,
-    );
-    approve_until_finished(&engine, &mut result, &mut adapter);
-
-    assert_eq!(result.task.status, TaskStatus::Complete, "{result:?}");
-    // The floor is the workspace root's `cargo test`: it runs the member's
-    // tests, so the member's own `cargo test` is not repeated (spec 90).
-    let completion = latest_started_checks(&engine, &proposed.session.id);
-    assert_eq!(
-        completion,
-        vec![root_check.clone()],
-        "completion runs the detected floor, and the scoped check's current run stands"
-    );
-    let root_runs = engine
-        .session_store
-        .read_verification_events(&proposed.session.id, &[])
+        .read_verification_events(session_id, &[])
         .expect("the log should read")
         .iter()
         .filter(
-            |event| matches!(event, VerificationEvent::Check { check, .. } if check == &root_check),
+            |event| matches!(event, VerificationEvent::Check { check: ran, .. } if ran == check),
         )
-        .count();
-    assert_eq!(root_runs, 1, "the floor runs once, at completion");
-    assert!(!a_check_passed(
+        .count()
+}
+
+/// The gate reasons the latest settlement of `task_id` recorded.
+fn gate_reasons(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    task_id: &str,
+) -> Vec<CompletionReasonCode> {
+    engine
+        .session_store
+        .read_completion_report(session_id, task_id)
+        .expect("the report should read")
+        .expect("the turn settles through the gate")
+        .reason_codes()
+}
+
+/// Spec 109 D4, fixed after Task 2: per change only the check of the step the
+/// change belongs to stands in for a covered root, never a finished step's.
+/// A three-step plan with every check at the repository root: a patch during
+/// step 2 runs no step-1 check (step 2's own check is left to step 2), a patch
+/// during step 3, whose step has no check, runs nothing and leaves the
+/// member's `cargo test` to completion. Completion then reruns each finished
+/// step's stale check once and runs the detected floor once.
+#[test]
+fn a_finished_steps_check_is_not_rerun_per_change_only_once_at_completion() {
+    let (repo, shell) = r16_workspace_fixture("d4-finished-step-checks");
+    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let first = CheckId::new("", "cargo nextest run -p member --test a");
+    let second = CheckId::new("", "cargo nextest run -p member --test b");
+    let member_check = CheckId::new("crates/member", "cargo test");
+    let root_check = CheckId::new("", "cargo test");
+    let first_patch = patch_call_with("crates/member/src/one.rs", "pub fn one() -> u8 { 1 }\n");
+    let second_patch = patch_call_with("crates/member/src/two.rs", "pub fn two() -> u8 { 2 }\n");
+
+    // Step 1: the model runs its check and closes it; step 2's patch follows.
+    // The plan is put up for review before the first command runs.
+    let run_first = call(
+        "run_command",
+        r#"{"command":"cargo nextest run -p member --test a","working_directory":"","reason":"Run step 1's required check"}"#,
+    );
+    let mut planning = scripted(vec![
+        vec![call("propose_plan", D4_ROOT_CHECKS_PLAN)],
+        vec![run_first.clone()],
+    ]);
+    let paused = ask(&engine, &repo, "Change the member", &mut planning);
+    let review = paused.plan_proposal.expect("the plan is put up");
+    let mut step_one = scripted(vec![
+        vec![run_first],
+        vec![call("complete_step", "{}")],
+        vec![first_patch],
+    ]);
+    let mut result = decide(&engine, &review.id, true, None, &mut step_one);
+    approve_until_finished(&engine, &mut result, &mut step_one);
+    let patch_id = result
+        .patch_proposal
+        .as_ref()
+        .expect("step 2's patch is proposed")
+        .patch_id
+        .clone();
+    let session_id = result.session.id.clone();
+    apply_patch_with_baselines(&engine, &repo, &patch_id, true);
+
+    let verified = run_verification_and_approve_checks(
         &engine,
-        &proposed.session.id,
-        &member_check
-    ));
+        &repo,
+        &session_id,
+        &mut MockModelAdapter::new("Done."),
+    );
+    assert_eq!(
+        loop_runs_of(&engine, &session_id, &first),
+        0,
+        "a patch during step 2 runs no step-1 check per change"
+    );
+    assert!(latest_started_checks(&engine, &session_id).is_empty());
+    let state = fold_verification(
+        engine
+            .session_store
+            .read_verification_events(&session_id, &[])
+            .expect("the log should read")
+            .iter(),
+    );
+    assert_eq!(
+        state.deferred.get(&second).map(String::as_str),
+        Some("Change the member"),
+        "step 2's own check stands in, left to step 2: {state:?}"
+    );
+    assert!(!state.deferred.contains_key(&first), "{state:?}");
+    assert_eq!(
+        gate_reasons(&engine, &session_id, &verified.task.id),
+        vec![CompletionReasonCode::OpenPlanSteps],
+        "step 1's stale check waits for completion; it does not stop the plan"
+    );
+
+    // Step 2: the model runs its check and closes it; step 3's patch follows.
+    let mut step_two = scripted(vec![
+        vec![call(
+            "run_command",
+            r#"{"command":"cargo nextest run -p member --test b","working_directory":"","reason":"Run step 2's required check"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        vec![second_patch],
+    ]);
+    let mut result = continue_task(
+        &engine,
+        &repo,
+        &session_id,
+        &verified.task.id,
+        &mut step_two,
+    );
+    approve_until_finished(&engine, &mut result, &mut step_two);
+    let patch_id = result
+        .patch_proposal
+        .as_ref()
+        .expect("step 3's patch is proposed")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch_id, true);
+
+    let verified = run_verification_and_approve_checks(
+        &engine,
+        &repo,
+        &session_id,
+        &mut MockModelAdapter::new("Done."),
+    );
+    assert_eq!(loop_runs_of(&engine, &session_id, &first), 0);
+    assert_eq!(
+        loop_runs_of(&engine, &session_id, &second),
+        0,
+        "a patch during step 3 runs no step-2 check per change"
+    );
+    assert!(latest_started_checks(&engine, &session_id).is_empty());
+    let events = engine
+        .session_store
+        .read_verification_events(&session_id, &[])
+        .expect("the log should read");
+    let plan = engine
+        .session_store
+        .read_task_plan(&session_id, &verified.task.id)
+        .expect("the plan should read")
+        .expect("the task carries the plan");
+    let report = workspace_engine::VerificationReport::build(
+        &fold_verification(events.iter()),
+        &plan,
+        &["crates/member/src/two.rs".to_string()],
+        &BTreeMap::new(),
+    );
+    assert!(report.deferred.is_empty(), "{report:?}");
+    assert_eq!(report.deferred_to_completion, vec![member_check.clone()]);
+    let summary = report.summary(&plan.report());
+    assert!(
+        summary.starts_with(&format!(
+            "No check ran for this change: {} is left to task completion.",
+            member_check.label()
+        )),
+        "step 3 has no check, and the report says what waits: {summary}"
+    );
+    assert!(
+        report.render().contains(&format!(
+            "{} — not run: left to task completion",
+            member_check.label()
+        )),
+        "{}",
+        report.render()
+    );
+    assert_eq!(
+        gate_reasons(&engine, &session_id, &verified.task.id),
+        vec![CompletionReasonCode::OpenPlanSteps]
+    );
+
+    // Completion: each finished step's stale check reruns once, the floor once.
+    let mut finish = scripted(vec![vec![call("complete_step", "{}")], Vec::new()]);
+    let mut result = continue_task(&engine, &repo, &session_id, &verified.task.id, &mut finish);
+    approve_until_finished(&engine, &mut result, &mut finish);
+
+    assert_eq!(result.task.status, TaskStatus::Complete, "{result:?}");
+    assert_eq!(loop_runs_of(&engine, &session_id, &first), 1);
+    assert_eq!(loop_runs_of(&engine, &session_id, &second), 1);
+    assert_eq!(
+        loop_runs_of(&engine, &session_id, &root_check),
+        1,
+        "the floor runs once, at completion"
+    );
+    // The workspace root's `cargo test` runs the member's tests, so the
+    // member's own is not repeated (spec 90).
+    assert_eq!(loop_runs_of(&engine, &session_id, &member_check), 0);
 }
 
 /// Spec 109 D4 with spec 105's deferral: the scoped check sits on the step the

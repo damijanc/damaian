@@ -85,6 +85,29 @@ partly fixed by spec 107 D3), 86 (main-checkout test-process overhead) and 89
   Reuse (D6) applies to
   the substituted check. The completion branch, the answer-time exact floor
   run and the gate's evidence lookup are unchanged.
+  *Fixed 2026-11-12 — which plan check stands in:* per change, only the
+  required check of the step the change belongs to (the plan's in-progress
+  step) stands in for a covered root. Any approved required check still decides
+  whether a root is covered, so a covered root never runs its detected checks
+  per change. Task 2 as first landed took every covering required check, and
+  only open steps' checks were deferred, so each finished step's check reran
+  on every later patch — in the owner's 5-step plan with every check at the
+  repository root, several extra runs per patch. The rule now:
+  - the current step's check is normally deferred to that still-open step, so
+    nothing runs per change and the report says "left to its plan step";
+  - when the current step has no check covering the root, nothing runs per
+    change either; the root's detected checks are recorded as
+    `verification_deferred_to_completion` and the report says "`<check>` is
+    left to task completion" (`VerificationReport::deferred_to_completion`,
+    the same "Checks deferred" row);
+  - a finished step's check is not a per-change check. It is rerun once, when
+    stale, at completion: `verify_due` adds spec 106 Task 6's
+    `plan_checks_needing_rerun` only to a completion run (all primary steps
+    terminal, or the answer-time due), and the gate treats a finished step's
+    stale check like the floor — while primary plan work is open or blocked
+    it is not reported as `required_check_stale` (a failed or missing one
+    still is), so a worker's automatic continuation is not stopped by it. The
+    answer-time completion run reruns it with the floor, as before.
 - **D5 — per-task approval (security; confirm before Task 5).** An approved
   check identity is remembered on the task chain (a durable event), and later
   proposals of the same identity in that chain are approved automatically and

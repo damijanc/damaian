@@ -322,6 +322,7 @@ impl CompletionGateReport {
         // is one obligation, and a plan's own checks are added to the floor
         // rather than replacing it, so a trivial declared check cannot escape
         // the root checks the task's changes selected.
+        let plan_work_open = !open.is_empty() || !blocked.is_empty();
         let mut required: Vec<(CheckId, Option<&PlanStep>)> = Vec::new();
         let mut required_ids = BTreeSet::new();
         for step in plan
@@ -346,7 +347,7 @@ impl CompletionGateReport {
             // blocked the task is ineligible anyway, so requiring the floor
             // there would only add noise and, worse, would stop a mid-task
             // meeting its own open steps.
-            if !open.is_empty() || !blocked.is_empty() {
+            if plan_work_open {
                 continue;
             }
             if required_ids.insert(check.clone()) {
@@ -366,6 +367,14 @@ impl CompletionGateReport {
             let own_step_open = step.is_some_and(|step| {
                 matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
             });
+            // A finished step's stale check is a completion obligation, like
+            // the floor: while other plan work is open or blocked the task is
+            // ineligible anyway, and the completion run reruns it once
+            // ([`CompletionGateService::plan_checks_needing_rerun`]). Reporting
+            // it mid-plan would stop a worker's automatic continuation, and
+            // rerunning it after every later patch instead only repeats it
+            // (spec 109 D4). A failed or missing check is still reported.
+            let stale_waits_for_completion = own_step_open || (step.is_some() && plan_work_open);
             // The evidence for a required check is one of two things. A check
             // that ran through the verification loop has a `CheckRun` keyed by
             // identity; a check deferred to its own plan step was run by the
@@ -389,7 +398,7 @@ impl CompletionGateReport {
                         record_command_evidence(&check, evidence, &mut reasons, &mut waivers);
                         continue;
                     }
-                    if own_step_open {
+                    if stale_waits_for_completion {
                         continue;
                     }
                     reasons.push(CompletionReason {
@@ -481,7 +490,7 @@ impl CompletionGateReport {
             // from the durable plan record: the batch boundary and any mutation
             // recorded after this evidence (spec 105 requirement 5).
             if !deferred_evidence_is_current(plan, evidence_step, evidence_index) {
-                if own_step_open {
+                if stale_waits_for_completion {
                     continue;
                 }
                 reasons.push(CompletionReason {

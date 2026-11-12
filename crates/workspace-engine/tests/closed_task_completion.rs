@@ -289,6 +289,8 @@ fn every_blocking_fact_produces_its_stable_reason_code() {
         &current,
     );
 
+    // A finished step's stale check waits for completion while other plan
+    // work is open (spec 109 D4): the completion run reruns it once.
     assert!(!report.eligible);
     assert_eq!(
         report.reason_codes(),
@@ -299,7 +301,6 @@ fn every_blocking_fact_produces_its_stable_reason_code() {
             CompletionReasonCode::RequiredCheckFailed,
             CompletionReasonCode::RequiredCheckMissing,
             CompletionReasonCode::RequiredCheckSkipped,
-            CompletionReasonCode::RequiredCheckStale,
         ]
     );
     assert_eq!(report.waivers.len(), 1);
@@ -309,6 +310,30 @@ fn every_blocking_fact_produces_its_stable_reason_code() {
             .reasons
             .iter()
             .all(|reason| !reason.explanation.is_empty())
+    );
+
+    // Once no plan work is open, the stale check is reported in full. Dropping
+    // the open step keeps the mutation generation, so only the hash-stale run
+    // is stale.
+    let mut finished = plan.clone();
+    finished.steps.remove(0);
+    let report = evaluate(
+        task_id,
+        Some(&finished),
+        &verification,
+        Some(&pending),
+        &current,
+    );
+    assert_eq!(
+        report.reason_codes(),
+        vec![
+            CompletionReasonCode::VerificationDue,
+            CompletionReasonCode::PendingDecision,
+            CompletionReasonCode::RequiredCheckFailed,
+            CompletionReasonCode::RequiredCheckMissing,
+            CompletionReasonCode::RequiredCheckSkipped,
+            CompletionReasonCode::RequiredCheckStale,
+        ]
     );
 }
 

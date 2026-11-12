@@ -1388,11 +1388,19 @@ the task would stop incomplete on a check nothing would ever run.
 
 **A finished step's check that went stale runs again by itself.** When a later
 step changes files after an earlier step's check passed, that check's result no
-longer describes the tree, and only a fresh run can clear it. The verification
-after the next patch runs it again, and so does the end of the task when no
-step is left open. It is proposed like any check and asks for approval when the
-policy says so. A stale check on a step that is still in progress is that
-step's own work, so it does not stop a worker from continuing.
+longer describes the tree, and only a fresh run can clear it. It runs again
+once, at the end of the task when no step is left open — not after every later
+patch, which would only repeat it. It is proposed like any check and asks for
+approval when the policy says so. While steps are still open, a stale check —
+on a finished step or on the step in progress — does not stop a worker from
+continuing.
+
+After a patch, a plan step's required check stands in for the detected checks
+of the folder it covers, so those (`cargo test` in a crate, say) are not run
+after every patch; they run once when the task completes. Only the check of the
+step the change belongs to stands in, and that step runs it itself, so the
+verification report says "left to its plan step". When that step has no check,
+the report says the detected check "is left to task completion".
 
 A required check whose result is missing blocks completion as well. A detected
 check the policy can auto-run simply runs; one that needs approval appears on

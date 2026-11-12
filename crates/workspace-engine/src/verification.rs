@@ -1089,6 +1089,15 @@ pub enum VerificationEvent {
         /// The title of the open plan step that carries the check.
         step: String,
     },
+    /// A detected check this change would have selected, not run because a
+    /// plan check covers its root and the change's own step has no check that
+    /// stands in for it (spec 109 D4). The completion floor runs it once at
+    /// the end. Like `Deferred`, never evidence: nothing ran.
+    #[serde(
+        rename = "verification_deferred_to_completion",
+        rename_all = "camelCase"
+    )]
+    DeferredToCompletion { task_id: String, check: CheckId },
     #[serde(rename = "verification_finished", rename_all = "camelCase")]
     Finished {
         task_id: String,
@@ -1139,6 +1148,7 @@ impl VerificationEvent {
             | Self::Check { task_id, .. }
             | Self::Reused { task_id, .. }
             | Self::Deferred { task_id, .. }
+            | Self::DeferredToCompletion { task_id, .. }
             | Self::Finished { task_id, .. }
             | Self::Baseline { task_id, .. }
             | Self::Provenance { task_id, .. }
@@ -1211,6 +1221,10 @@ pub struct VerificationState {
     /// step's title (spec 109 D4), cleared by a new `Started` and by a later
     /// run of the same check. Never evidence: nothing ran.
     pub deferred: BTreeMap<CheckId, String>,
+    /// Detected checks the latest attempt left to the completion floor because
+    /// a plan check covers their root and the change's step has none (spec 109
+    /// D4); cleared like `deferred`. Never evidence.
+    pub deferred_to_completion: BTreeSet<CheckId>,
     /// Private so the state cannot be constructed by hand into a shape the
     /// events do not support; the report's honesty rests on the fold.
     passed_before: BTreeSet<CheckId>,
@@ -1258,6 +1272,7 @@ impl VerificationState {
                 self.in_progress = true;
                 self.reused.clear();
                 self.deferred.clear();
+                self.deferred_to_completion.clear();
                 for check in checks {
                     if !self.selected.contains(check) {
                         self.selected.push(check.clone());
@@ -1277,6 +1292,7 @@ impl VerificationState {
                 self.provenance_current.remove(check);
                 self.reused.remove(check);
                 self.deferred.remove(check);
+                self.deferred_to_completion.remove(check);
                 self.checks.insert(
                     check.clone(),
                     CheckRun {
@@ -1299,6 +1315,9 @@ impl VerificationState {
                 // Not selected and not a run: the report names it, the gate
                 // and provenance never see it.
                 self.deferred.insert(check.clone(), step.clone());
+            }
+            VerificationEvent::DeferredToCompletion { check, .. } => {
+                self.deferred_to_completion.insert(check.clone());
             }
             VerificationEvent::Finished { outcome, .. } => {
                 self.due = None;
@@ -1421,6 +1440,11 @@ pub struct VerificationReport {
     /// passed, never evidence; the report says so in plain words.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deferred: Vec<DeferredCheck>,
+    /// Detected checks left to the completion floor: a plan check covers their
+    /// root and the change's own step has no check standing in for them
+    /// (spec 109 D4). Not run, never evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_to_completion: Vec<CheckId>,
     pub behaviour_verified: Vec<String>,
     pub unverified_steps: Vec<String>,
     pub regressions: Vec<CheckId>,
@@ -1481,6 +1505,7 @@ impl VerificationReport {
                     step: step.clone(),
                 })
                 .collect(),
+            deferred_to_completion: state.deferred_to_completion.iter().cloned().collect(),
             behaviour_verified: Vec::new(),
             unverified_steps: plan
                 .steps
@@ -1697,7 +1722,7 @@ impl VerificationReport {
                     count(self.skipped.len(), "check")
                 );
             }
-            if !self.deferred.is_empty() {
+            if !self.deferred.is_empty() || !self.deferred_to_completion.is_empty() {
                 return format!(
                     "No check ran for this change: {}. {plan_note}",
                     self.deferred_phrase()
@@ -1718,7 +1743,8 @@ impl VerificationReport {
         }
     }
 
-    /// "`cmd` in `dir` is left to its plan step \"Title\"", joined.
+    /// "`cmd` in `dir` is left to its plan step \"Title\"" and "`cmd` in `dir`
+    /// is left to task completion", joined.
     fn deferred_phrase(&self) -> String {
         self.deferred
             .iter()
@@ -1729,6 +1755,11 @@ impl VerificationReport {
                     item.step
                 )
             })
+            .chain(
+                self.deferred_to_completion
+                    .iter()
+                    .map(|check| format!("{} is left to task completion", check.label())),
+            )
             .collect::<Vec<_>>()
             .join("; ")
     }
@@ -1835,23 +1866,29 @@ impl VerificationReport {
             ));
         }
 
-        // Only when a check was left to its step, so every other report
-        // renders exactly as it did.
-        if !self.deferred.is_empty() {
+        // Only when a check was left to its step or to completion, so every
+        // other report renders exactly as it did.
+        let deferred: Vec<String> = self
+            .deferred
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} — not run: left to plan step \"{}\"",
+                    item.check.label(),
+                    item.step
+                )
+            })
+            .chain(self.deferred_to_completion.iter().map(|check| {
+                format!(
+                    "{} — not run: left to task completion (the plan's checks cover it)",
+                    check.label()
+                )
+            }))
+            .collect();
+        if !deferred.is_empty() {
             lines.push(section(
                 "Checks deferred",
-                &self
-                    .deferred
-                    .iter()
-                    .map(|item| {
-                        format!(
-                            "{} — not run: left to plan step \"{}\"",
-                            item.check.label(),
-                            item.step
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n                     "),
+                &deferred.join("\n                     "),
             ));
         }
 
@@ -2153,9 +2190,13 @@ pub fn propose_checks(
 pub struct ScopedSelection {
     /// Owning roots no plan check covers: they keep their detected checks.
     pub detected_roots: Vec<String>,
-    /// The plan's required checks that stand in for the other roots' detected
-    /// checks, in the order given, de-duplicated.
+    /// The current step's required checks that stand in for the other roots'
+    /// detected checks, in the order given, de-duplicated.
     pub plan_checks: Vec<CheckId>,
+    /// Covered roots the current step has no covering check for: nothing
+    /// stands in for them per change, and their detected checks wait for the
+    /// completion floor.
+    pub completion_roots: Vec<String>,
 }
 
 /// Splits a change's owning roots ([`select_roots`]) between the plan's
@@ -2163,30 +2204,41 @@ pub struct ScopedSelection {
 ///
 /// A plan check covers an owning root when its working directory is that root
 /// or one of the roots enclosing it, so `cargo nextest run -p crate --test a`
-/// declared at the workspace root covers a change in the crate. A covered root
-/// proposes no detected check per change; the completion floor, which
-/// [`floor_checks`] computes separately, still requires them. Directories are
+/// declared at the workspace root covers a change in the crate. A root any of
+/// `plan_checks` covers proposes no detected check per change; the completion
+/// floor, which [`floor_checks`] computes separately, still requires them.
+///
+/// Only `current` — the required checks of the step the change belongs to —
+/// stands in per change. A finished step's check is not a per-change check:
+/// it is rerun once, when stale, at completion (spec 106 Task 6). A covered
+/// root no `current` check covers lands in `completion_roots`. Directories are
 /// compared in `CheckId` form, so the caller normalizes the plan's.
 pub fn scoped_selection(
     map: &RepositoryMap,
     changed: &[String],
     plan_checks: &[CheckId],
+    current: &[CheckId],
 ) -> ScopedSelection {
     let mut selection = ScopedSelection::default();
     for root in select_roots(map, changed) {
         let enclosing = map.enclosing_roots(&root);
-        let covering: Vec<&CheckId> = plan_checks
+        let covers = |check: &&CheckId| {
+            check.working_directory == root || enclosing.contains(&check.working_directory.as_str())
+        };
+        if !plan_checks
             .iter()
-            .filter(|check| {
-                check.working_directory == root
-                    || enclosing.contains(&check.working_directory.as_str())
-            })
-            .collect();
-        if covering.is_empty() {
+            .chain(current)
+            .any(|check| covers(&check))
+        {
             selection.detected_roots.push(root);
             continue;
         }
-        for check in covering {
+        let standing_in: Vec<&CheckId> = current.iter().filter(covers).collect();
+        if standing_in.is_empty() {
+            selection.completion_roots.push(root);
+            continue;
+        }
+        for check in standing_in {
             if !selection.plan_checks.contains(check) {
                 selection.plan_checks.push(check.clone());
             }
@@ -2195,10 +2247,30 @@ pub fn scoped_selection(
     selection
 }
 
+/// The detected checks of `roots`, without proposing or storing anything: what
+/// a per-change verification leaves to the completion floor when the current
+/// plan step has no check covering those roots (spec 109 D4).
+pub fn detected_checks_of_roots(map: &RepositoryMap, roots: &[String]) -> Vec<CheckId> {
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    map.restricted_to(roots)
+        .roots
+        .iter()
+        .flat_map(|root| {
+            root.commands
+                .iter()
+                .map(|command| CheckId::new(root.path.as_str(), command.command.as_str()))
+        })
+        .collect()
+}
+
 /// Per-change selection when the plan declares required checks (spec 109
-/// D4): the plan's check stands in for the detected checks of every owning
-/// root it covers ([`scoped_selection`]); uncovered roots select their
-/// detected checks as [`propose_checks`] does.
+/// D4), from the split [`scoped_selection`] made of `changed`: the current
+/// step's check stands in for the detected checks of every owning root it
+/// covers; a root only a finished or later step's check covers runs nothing
+/// per change and is left to the completion floor; uncovered roots select
+/// their detected checks as [`propose_checks`] does.
 ///
 /// A covering check `deferred` reports — one whose own plan step is still
 /// open (spec 105 §4) — still displaces the detected checks but is not
@@ -2214,12 +2286,11 @@ pub fn propose_scoped_checks(
     repository_root: &Path,
     map: &RepositoryMap,
     changed: &[String],
-    plan_checks: &[CheckId],
+    scoped: &ScopedSelection,
     deferred: &dyn Fn(&CheckId) -> bool,
     reuse: &mut CheckReuse,
 ) -> Result<Selection> {
-    let scoped = scoped_selection(map, changed, plan_checks);
-    if scoped.plan_checks.is_empty() {
+    if scoped.plan_checks.is_empty() && scoped.completion_roots.is_empty() {
         return propose_checks(orchestrator, repository_root, map, changed, reuse);
     }
     let detected = if scoped.detected_roots.is_empty() {
@@ -2236,12 +2307,14 @@ pub fn propose_scoped_checks(
     };
     let runnable: Vec<CheckId> = scoped
         .plan_checks
-        .into_iter()
+        .iter()
         .filter(|check| !deferred(check))
+        .cloned()
         .collect();
     let detected = match detected {
         // The covered roots have a plan check standing in for them, deferred
-        // or not, so the change as a whole is not one with no checks.
+        // or not, or their detected checks wait for completion, so the change
+        // as a whole is not one with no checks.
         Selection::NoChecksAvailable { .. } | Selection::OnlyDocumentation => {
             Selection::Proposed(Vec::new())
         }

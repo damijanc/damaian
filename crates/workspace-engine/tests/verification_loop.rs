@@ -24,8 +24,9 @@ use workspace_engine::{
     TurnSink, VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
     WebDiagnosticCall, WebDiagnosticDetails, WebDiagnosticRecord, WebDiagnosticReport,
     WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkerRecord, WorkspaceEngine,
-    fold_verification, is_documentation, pending_verifications, propose_checks,
-    propose_scoped_checks, reattach_pending_approvals, scoped_selection, select_roots,
+    detected_checks_of_roots, fold_verification, is_documentation, pending_verifications,
+    propose_checks, propose_scoped_checks, reattach_pending_approvals, scoped_selection,
+    select_roots,
 };
 
 fn check(directory: &str, command: &str) -> CheckId {
@@ -800,23 +801,48 @@ fn a_plan_check_covers_its_own_and_enclosed_roots_only() {
     let elsewhere = CheckId::new("crates/cli", "cargo nextest run -p cli");
     let not_a_root = CheckId::new("crates/engine/src", "cargo nextest run --test a");
 
-    let scoped = scoped_selection(&map, &engine_change, std::slice::from_ref(&at_root));
+    let scoped = scoped_selection(
+        &map,
+        &engine_change,
+        std::slice::from_ref(&at_root),
+        std::slice::from_ref(&at_root),
+    );
     assert_eq!(scoped.plan_checks, vec![at_root.clone()], "{scoped:?}");
     assert!(scoped.detected_roots.is_empty(), "{scoped:?}");
 
-    let scoped = scoped_selection(&map, &engine_change, std::slice::from_ref(&in_crate));
+    let scoped = scoped_selection(
+        &map,
+        &engine_change,
+        std::slice::from_ref(&in_crate),
+        std::slice::from_ref(&in_crate),
+    );
     assert_eq!(scoped.plan_checks, vec![in_crate.clone()], "{scoped:?}");
 
-    let scoped = scoped_selection(&map, &engine_change, &[elsewhere, not_a_root]);
+    let scoped = scoped_selection(
+        &map,
+        &engine_change,
+        &[elsewhere.clone(), not_a_root.clone()],
+        &[elsewhere, not_a_root],
+    );
     assert!(scoped.plan_checks.is_empty(), "{scoped:?}");
     assert_eq!(scoped.detected_roots, vec!["crates/engine".to_string()]);
 
     // The workspace-root check also encloses `packages/web`: one plan check
     // covers both roots and appears once.
-    let scoped = scoped_selection(&map, &both, std::slice::from_ref(&at_root));
+    let scoped = scoped_selection(
+        &map,
+        &both,
+        std::slice::from_ref(&at_root),
+        std::slice::from_ref(&at_root),
+    );
     assert_eq!(scoped.plan_checks, vec![at_root.clone()], "{scoped:?}");
     assert!(scoped.detected_roots.is_empty(), "{scoped:?}");
-    let scoped = scoped_selection(&map, &both, std::slice::from_ref(&in_crate));
+    let scoped = scoped_selection(
+        &map,
+        &both,
+        std::slice::from_ref(&in_crate),
+        std::slice::from_ref(&in_crate),
+    );
     assert_eq!(scoped.detected_roots, vec!["packages/web".to_string()]);
 
     // Proposed: the plan check stands in for the crate's `cargo test`, the
@@ -826,7 +852,12 @@ fn a_plan_check_covers_its_own_and_enclosed_roots_only() {
         &repo.root,
         &map,
         &both,
-        std::slice::from_ref(&in_crate),
+        &scoped_selection(
+            &map,
+            &both,
+            std::slice::from_ref(&in_crate),
+            std::slice::from_ref(&in_crate),
+        ),
         &|_| false,
         &mut CheckReuse::none(),
     )
@@ -854,8 +885,48 @@ fn a_plan_check_covers_its_own_and_enclosed_roots_only() {
         &repo.root,
         &map,
         &engine_change,
-        std::slice::from_ref(&in_crate),
+        &scoped_selection(
+            &map,
+            &engine_change,
+            std::slice::from_ref(&in_crate),
+            std::slice::from_ref(&in_crate),
+        ),
         &|_| true,
+        &mut CheckReuse::none(),
+    )
+    .unwrap();
+    assert_eq!(selection, Selection::Proposed(Vec::new()));
+    assert_eq!(repo.pending_proposals(), before, "nothing is stored");
+
+    // The covering check is a finished step's and the change's own step has
+    // none: nothing stands in per change, the crate's detected check is left
+    // to the completion floor, and nothing is proposed or stored.
+    let scoped = scoped_selection(&map, &engine_change, std::slice::from_ref(&at_root), &[]);
+    assert!(scoped.plan_checks.is_empty(), "{scoped:?}");
+    assert!(scoped.detected_roots.is_empty(), "{scoped:?}");
+    assert_eq!(scoped.completion_roots, vec!["crates/engine".to_string()]);
+    assert_eq!(
+        detected_checks_of_roots(&map, &scoped.completion_roots),
+        vec![CheckId::new("crates/engine", "cargo test")]
+    );
+    // A current check covering only the crate stands in for it; the web root,
+    // covered by the finished step's workspace-root check alone, waits.
+    let scoped = scoped_selection(
+        &map,
+        &both,
+        &[at_root.clone(), in_crate.clone()],
+        std::slice::from_ref(&in_crate),
+    );
+    assert_eq!(scoped.plan_checks, vec![in_crate.clone()], "{scoped:?}");
+    assert_eq!(scoped.completion_roots, vec!["packages/web".to_string()]);
+    let before = repo.pending_proposals();
+    let selection = propose_scoped_checks(
+        &engine.validation_orchestrator,
+        &repo.root,
+        &map,
+        &engine_change,
+        &scoped_selection(&map, &engine_change, std::slice::from_ref(&at_root), &[]),
+        &|_| false,
         &mut CheckReuse::none(),
     )
     .unwrap();
@@ -876,7 +947,7 @@ fn a_plan_check_covers_its_own_and_enclosed_roots_only() {
         &repo.root,
         &map,
         &engine_change,
-        &[],
+        &scoped_selection(&map, &engine_change, &[], &[]),
         &|_| false,
         &mut CheckReuse::none(),
     )
@@ -6465,7 +6536,12 @@ fn a_scoped_plan_check_is_reused_for_an_unchanged_tree() {
         &repo.root,
         &map,
         &changed,
-        std::slice::from_ref(&scoped),
+        &scoped_selection(
+            &map,
+            &changed,
+            std::slice::from_ref(&scoped),
+            std::slice::from_ref(&scoped),
+        ),
         &|_| false,
         &mut reuse,
     )

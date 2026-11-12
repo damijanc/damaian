@@ -538,6 +538,14 @@ Two rules changed. Neither lets stale evidence count as a pass:
   - every post-apply verification adds them to its selection;
   - the answer-time completion run adds them once no plan work is open.
 
+  *Changed by spec 109 D4 (2026-11-12):* only a completion verification adds
+  them now; rerunning a finished step's check after every later patch only
+  repeated it. While primary plan work is open or blocked, the gate does not
+  report a finished step's stale check (`required_check_stale`), as it does
+  not report the floor, so the continuation is not stopped by it; the
+  completion run reruns it once. The test below is now
+  `a_check_made_stale_by_a_later_step_is_rerun_once_at_completion`.
+
   Each one is proposed through the ordinary command policy
   (`ValidationOrchestrator::propose_plan_check`), with the gate's own
   identity, so its fresh `CheckRun` is the evidence the gate reads.

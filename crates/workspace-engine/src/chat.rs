@@ -101,8 +101,8 @@ use crate::vector_index::VectorIndexCache;
 use crate::verification::{
     CheckId, CheckOutcome, CheckReuse, CheckTermination, FailureProvenance, FindingEvidence,
     Selection, SkipReason, VerificationEvent, VerificationOutcome, VerificationReport,
-    environment_termination, fold_verification, propose_checks_exactly, propose_completion_checks,
-    propose_scoped_checks, scoped_selection, with_plan_checks,
+    detected_checks_of_roots, environment_termination, fold_verification, propose_checks_exactly,
+    propose_completion_checks, propose_scoped_checks, scoped_selection, with_plan_checks,
 };
 use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
@@ -2718,8 +2718,10 @@ impl ChatOrchestrator {
             reuse.retain(|check| !plan_defers_check(repository_root, plan, check));
         }
         // Plan checks standing in for this change that their open step runs
-        // instead (spec 109 D4); the report names them.
+        // instead, and detected checks a plan check displaces with nothing
+        // standing in for them per change (spec 109 D4); the report names both.
         let mut displaced_deferred: Vec<CheckId> = Vec::new();
+        let mut left_to_completion: Vec<CheckId> = Vec::new();
         let selection = if !due.checks.is_empty() {
             // A completion due carries the exact floor checks the answer-time
             // trigger found missing or stale. Run those and nothing else; the
@@ -2741,46 +2743,61 @@ impl ChatOrchestrator {
                 &mut reuse,
             )?
         } else {
-            // Spec 109 D4: the approved plan's scoped required check stands in
-            // per change for the detected checks of the root it covers; those
-            // stay in the completion floor and run once at the end. A check
-            // deferred to its own open step displaces them too but is left to
-            // that step (see `propose_scoped_checks`). An unapproved plan
-            // narrows nothing, as it gates nothing (spec 105).
-            let plan_checks = match plan.as_ref() {
+            // Spec 109 D4: any approved-plan required check covering a root
+            // displaces that root's detected checks per change; they stay in
+            // the completion floor and run once at the end. Only the check of
+            // the step the change belongs to (the in-progress step) stands in
+            // for them, and that check is normally deferred to its open step
+            // (see `propose_scoped_checks`). A finished step's check is not a
+            // per-change check: it is rerun once, when stale, at completion
+            // (spec 106 Task 6, below). An unapproved plan narrows nothing, as
+            // it gates nothing (spec 105).
+            let (plan_checks, current_checks) = match plan.as_ref() {
                 Some(plan)
                     if self
                         .session_store
                         .read_plan_approved(session_id, &task.id)? =>
                 {
-                    plan_required_checks(repository_root, plan)
+                    (
+                        plan_required_checks(repository_root, plan),
+                        plan_current_step_checks(repository_root, plan),
+                    )
                 }
-                _ => Vec::new(),
+                _ => (Vec::new(), Vec::new()),
             };
             let deferred = |check: &CheckId| {
                 plan.as_ref()
                     .is_some_and(|plan| plan_defers_check(repository_root, plan, check))
             };
-            displaced_deferred = scoped_selection(&map, &changed, &plan_checks)
+            let scoped = scoped_selection(&map, &changed, &plan_checks, &current_checks);
+            displaced_deferred = scoped
                 .plan_checks
-                .into_iter()
+                .iter()
                 .filter(|check| deferred(check))
+                .cloned()
                 .collect();
+            left_to_completion = detected_checks_of_roots(&map, &scoped.completion_roots);
             propose_scoped_checks(
                 &self.validation_orchestrator,
                 repository_root,
                 &map,
                 &changed,
-                &plan_checks,
+                &scoped,
                 &deferred,
                 &mut reuse,
             )?
         };
         // Spec 106 Task 6: a finished step's required check that went stale
-        // can only be refreshed here; nothing the model runs on a later step
-        // counts for it. Rerun it with the change's own checks.
-        let plan_reruns = CompletionGateService::new(&self.session_store, repository_root)
-            .plan_checks_needing_rerun(session_id, &task.id)?;
+        // can only be refreshed by the engine; nothing the model runs on a
+        // later step counts for it. It is rerun once, by the completion run
+        // (spec 109 D4): mid-plan the gate leaves it to completion, so
+        // rerunning it after every later patch would only repeat it.
+        let plan_reruns = if at_completion || !due.checks.is_empty() {
+            CompletionGateService::new(&self.session_store, repository_root)
+                .plan_checks_needing_rerun(session_id, &task.id)?
+        } else {
+            Vec::new()
+        };
         let selection = with_plan_checks(
             &self.validation_orchestrator,
             repository_root,
@@ -2819,6 +2836,7 @@ impl ChatOrchestrator {
                     checks,
                     reused,
                     displaced_deferred,
+                    left_to_completion,
                     browser,
                     changed,
                     file_hashes,
@@ -2843,6 +2861,7 @@ impl ChatOrchestrator {
             checks,
             reused,
             displaced_deferred,
+            left_to_completion,
             browser,
             changed,
             file_hashes,
@@ -3171,6 +3190,9 @@ impl ChatOrchestrator {
         // Checks standing in for this change that their open plan step runs
         // instead (spec 109 D4); recorded so the report can name them.
         displaced_deferred: Vec<CheckId>,
+        // Detected checks a plan check displaces with nothing standing in for
+        // them per change; the completion floor runs them (spec 109 D4).
+        left_to_completion: Vec<CheckId>,
         browser: Option<BrowserCheck>,
         changed: Vec<String>,
         file_hashes: BTreeMap<String, String>,
@@ -3263,6 +3285,15 @@ impl ChatOrchestrator {
                     task_id: task.id.clone(),
                     check: check.clone(),
                     step: step.title.clone(),
+                },
+            )?;
+        }
+        for check in &left_to_completion {
+            self.session_store.append_verification_event(
+                &session.id,
+                &VerificationEvent::DeferredToCompletion {
+                    task_id: task.id.clone(),
+                    check: check.clone(),
                 },
             )?;
         }
@@ -16333,6 +16364,31 @@ fn plan_deferring_step<'a>(
         };
         CheckId::new(directory, planned.command.as_str()) == *check
     })
+}
+
+/// The `required` checks of the plan's in-progress primary steps — the step a
+/// change belongs to — in `CheckId` form (spec 109 D4). Per change only these
+/// stand in for a covered root's detected checks.
+fn plan_current_step_checks(repository_root: &Path, plan: &TaskPlan) -> Vec<CheckId> {
+    let mut checks = Vec::new();
+    for planned in plan
+        .steps
+        .iter()
+        .filter(|step| !step.id.starts_with("verify_") && step.status == StepStatus::InProgress)
+        .filter_map(|step| step.check.as_ref())
+        .filter(|planned| planned.required)
+    {
+        let Some(directory) =
+            normalize_planned_check_directory(repository_root, &planned.working_directory)
+        else {
+            continue;
+        };
+        let check = CheckId::new(directory, planned.command.as_str());
+        if !checks.contains(&check) {
+            checks.push(check);
+        }
+    }
+    checks
 }
 
 /// The plan's `required` structured checks (non-`verify_` steps, any status),

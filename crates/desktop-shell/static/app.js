@@ -13238,14 +13238,21 @@ function createVerificationReportCard(report, reportRepo, { onContinueRepair = n
   }
   // Spec 109 D4: a check that would verify this change but belongs to an open
   // plan step was not run here; say where it went. Only shown when present.
-  if (report.deferred?.length) {
+  // A covered root whose change's step has no check leaves its detected checks
+  // to the completion floor.
+  const deferred = [
+    ...(report.deferred || []).map(
+      (item) => `${checkLabel(item.check)} — not run: left to plan step "${item.step}"`,
+    ),
+    ...(report.deferredToCompletion || []).map(
+      (check) =>
+        `${checkLabel(check)} — not run: left to task completion (the plan's checks cover it)`,
+    ),
+  ];
+  if (deferred.length) {
     section(
       "Checks deferred",
-      report.deferred.map((item) =>
-        document.createTextNode(
-          `${checkLabel(item.check)} — not run: left to plan step "${item.step}"`,
-        ),
-      ),
+      deferred.map((text) => document.createTextNode(text)),
     );
   }
   section(

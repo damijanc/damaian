@@ -318,8 +318,8 @@ pub use verification::{
     FailureFingerprint, FailureProvenance, FindingEvidence, GENERIC_IDENTITY_TAIL_TRUNCATED,
     MAX_GENERIC_IDENTITY_TAIL_BYTES, MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, ScopedSelection,
     Selection, SkipReason, SkippedCheck, VerificationDue, VerificationEvent, VerificationOutcome,
-    VerificationReport, VerificationState, fold_verification, is_documentation, propose_checks,
-    propose_scoped_checks, scoped_selection, select_roots,
+    VerificationReport, VerificationState, detected_checks_of_roots, fold_verification,
+    is_documentation, propose_checks, propose_scoped_checks, scoped_selection, select_roots,
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,
