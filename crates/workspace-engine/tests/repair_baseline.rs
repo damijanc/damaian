@@ -82,6 +82,7 @@ fn fake_shell(data_dir: &Path) -> PathBuf {
         format!(
             "#!/bin/sh\n\
              echo \"$PWD\" >> '{}'\n\
+             if [ -f '{}' ]; then sleep 30; fi\n\
              names=$(sed -n 's|^// fail ||p' src/lib.rs 2>/dev/null)\n\
              if [ -n \"$names\" ]; then\n\
              echo 'failures:'\n\
@@ -92,7 +93,8 @@ fn fake_shell(data_dir: &Path) -> PathBuf {
              fi\n\
              echo 'test result: ok. 1 passed; 0 failed'\n\
              exit 0\n",
-            log.display()
+            log.display(),
+            slow_marker(data_dir).display()
         ),
     )
     .unwrap();
@@ -100,6 +102,13 @@ fn fake_shell(data_dir: &Path) -> PathBuf {
     permissions.set_mode(0o755);
     fs::set_permissions(&script, permissions).unwrap();
     script
+}
+
+/// While this file exists the fake shell sleeps before answering, so a test
+/// can stop a run that is still in progress instead of racing one that has
+/// already finished.
+fn slow_marker(data_dir: &Path) -> PathBuf {
+    data_dir.join("slow-runs")
 }
 
 fn runs(data_dir: &Path) -> Vec<String> {
@@ -565,7 +574,9 @@ fn a_baseline_cancelled_while_it_runs_is_declined_and_its_tree_is_removed() {
     let card = failed.check_batch.expect("the baseline card");
 
     // The user stops the turn as soon as the baseline starts, after its tree
-    // was built.
+    // was built. The baseline sleeps until it is stopped, so the stop always
+    // lands on a running command (a fast fake run could finish first).
+    fs::write(slow_marker(&data_dir), "").unwrap();
     let cancel = CancelToken::new();
     let mut started = false;
     let mut adapter = MockModelAdapter::new("unused");
