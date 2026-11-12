@@ -75,10 +75,19 @@ label span {
   font-size: 12px;
 }
 
+/* Pinned to the window, and clipping rather than scrolling. `overflow: hidden`
+   on the body hides the scrollbar but still lets `scrollIntoView` (a pending
+   decision, a recovery card) scroll the page whenever anything pokes past the
+   window, which pushed the header and the sidebar's top off screen. A fixed
+   box adds nothing to the page's scroll height, and `clip` is not a scroll
+   container, so only the panes that are meant to scroll ever do. The narrow
+   layout below 1100px scrolls the page on purpose and undoes this. */
 .app {
+  position: fixed;
+  inset: 0;
+  overflow: clip;
   display: grid;
   grid-template-columns: 300px minmax(420px, 1fr);
-  height: 100vh;
   min-width: 0;
 }
 
@@ -5011,6 +5020,8 @@ body.worker-view #chat-model-menu {
   }
 
   .app {
+    position: static;
+    overflow: visible;
     grid-template-columns: 280px minmax(0, 1fr);
     height: auto;
     min-height: 100vh;

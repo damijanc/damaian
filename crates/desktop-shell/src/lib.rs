@@ -9837,6 +9837,29 @@ mod tests {
         assert!(command.contains("actions.hidden = false;"));
     }
 
+    /// The page itself never scrolls in the wide layout. `overflow: hidden` on
+    /// the body still let `scrollIntoView` scroll it whenever anything poked
+    /// past the window, which hid the header and the top of the sidebar
+    /// (2026-11-12). `.app` is pinned to the window and clips, and only the
+    /// narrow layout, which scrolls the page on purpose, undoes that.
+    #[test]
+    fn the_wide_layout_pins_the_app_to_the_window() {
+        let css = super::STYLE_CSS;
+        let start = css.find("\n.app {").expect("style.css has an .app rule");
+        let rule = &css[start..start + css[start..].find('}').unwrap()];
+        for declaration in ["position: fixed;", "inset: 0;", "overflow: clip;"] {
+            assert!(
+                rule.contains(declaration),
+                "`.app` lacks `{declaration}`: {rule}"
+            );
+        }
+        let narrow = &css[css.find("@media (max-width: 1100px)").unwrap()..];
+        let narrow_app = &narrow[narrow.find(".app {").unwrap()..];
+        let narrow_app = &narrow_app[..narrow_app.find('}').unwrap()];
+        assert!(narrow_app.contains("position: static;"), "{narrow_app}");
+        assert!(narrow_app.contains("overflow: visible;"), "{narrow_app}");
+    }
+
     fn app_js_function(name: &str) -> &'static str {
         let app = super::APP_JS;
         let start = app
