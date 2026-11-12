@@ -29,7 +29,7 @@ harness, and **Release** covers packaging, signing and distribution.
 
 | | |
 |---|---|
-| **Next** | - Verify fast: baseline only when a check fails, the plan's scoped check after each patch, one approval per check per task, and no rerun of an unchanged tree.<br>- Tidy the window: remove the Protected paths panel and Run in a worker from the plan card, archive sessions, and fix the Git status card.<br>- Per-tool MCP management, where nothing installed can widen what you allowed. |
+| **Next** | - Keep the window usable while Damaian works, and let several sessions work at once, even across projects.<br>- Verify fast: baseline only when a check fails, the plan's scoped check after each patch, one approval per check per task, and no rerun of an unchanged tree.<br>- Tidy the window: remove the Protected paths panel and Run in a worker from the plan card, archive sessions, and fix the Git status card.<br>- Per-tool MCP management, where nothing installed can widen what you allowed. |
 | **After that** | - Order each request so the provider's prompt cache can serve more of it, cutting cost and waiting time.<br>- Accept a pasted screenshot, and let the agent look at the screenshots its own browser diagnostics already capture. |
 | **Later** | - Open a pull request from the commits Damaian prepares, as its own explicit approval.<br>- Let another tool read your repository through Damaian, read-only, with the same redaction and path rules.<br>- Run several agents in parallel, only if measurement shows it beats a single agent. Abandoning it is a legitimate outcome. |
 

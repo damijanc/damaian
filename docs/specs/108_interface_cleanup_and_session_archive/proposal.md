@@ -1,6 +1,6 @@
 # Feature Spec: Interface Cleanup and Session Archive
 
-Status: In progress (started 2026-11-10; Tasks 1, 3, 4, 5, 6 and 8 done; Tasks 1–8 in [tasks.md](tasks.md))
+Status: In progress (started 2026-11-10; Tasks 1, 3, 4, 5, 6 and 8 done; Tasks 1–9 in [tasks.md](tasks.md))
 Order: 108 of 108
 Plan: none. Written from the owner's 2026-11-09/10 dogfooding of spec 33; the
 decisions and code survey are in [context.md](context.md).
@@ -61,6 +61,14 @@ harder to use without adding anything he needed:
    today's decline (nothing changes, the steps are skipped, the turn explains).
    The header no longer shows the deferred tool call as an upper-case chip; at
    most a short muted "Next: …" line.
+7. **One decision at a time** (decided by the owner, 2026-11-11: "Asking user
+   to approve 2 things at the same time must never happen"). No card asks the
+   user for two decisions at once. Spec 107 D3's one-time worker suggestion is
+   no longer shown inside the plan review card or on a patch card: at a plan
+   review, **Approve** first, and only then, if the engine suggests a worker,
+   the same card asks **Run in a worker** or **Continue here**; at a patch, the
+   suggestion is asked on its own before the patch card is shown. Declining a
+   plan never offers a worker.
 
 ## 3. Non-goals
 
@@ -73,7 +81,8 @@ harder to use without adding anything he needed:
 - No session shows a Protected paths form; spec 98's enforcement tests pass
   unchanged; a worker's card lists its protected paths read-only.
 - The plan review card has Approve and Decline only, and its steps are
-  read-only.
+  read-only; a worker suggestion appears only after Approve, never beside it,
+  and never on the same card as a patch decision.
 - Decline → "How should the plan be changed?" → an answer produces a revised
   plan on a new review card with no repository change in between (engine test
   and a deterministic eval scenario); Decline without changes behaves as today.

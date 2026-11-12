@@ -100,3 +100,24 @@ sessions (2026-11-09/10, v0.64.0–v0.66.0) and their session logs.
   revised plan before any change is made", so the model does not stop at the
   proposal. A worker's plan card keeps the plain Decline: its decide route
   takes no `changes`.
+- **D7 — one decision at a time (decided by the owner, 2026-11-11).** Seen in
+  the spec 33 Task 1 restart on the release after spec 109 Task 2: the plan
+  review card showed the worker suggestion (**Run in a worker** / **Continue
+  here**) above the steps and **Approve** / **Decline** below them — two
+  decisions on one card. Today `createPlanReview` (`app.js` ≈14352) inserts
+  `createWorkerSuggestion` when the engine's `turnPresentation.workerSuggestion`
+  names the plan card, and the patch path (≈13543) prepends it to the patch
+  card. Change, UI only unless the handoff needs it: the plan card's
+  **Approve** does not resume yet when a suggestion is pending; the card swaps
+  its actions for the suggestion (title and note from the engine). **Continue
+  here** sends the approval exactly as Approve does today; **Run in a worker**
+  hands the approved plan to a worker through the existing
+  `/api/plan-worker-prompt` + `/api/plan-to-worker` path (the worker must not
+  ask the user to approve the same plan again — check what the handoff records
+  and fix it if it would). **Decline** never shows the suggestion. At a patch,
+  the suggestion is shown as its own card first and the patch card only after
+  **Continue here** (a worker handoff leaves the patch for the user to reject,
+  as today). The engine's suggest-once-per-task rule (spec 107 D3) is
+  unchanged. Also on the same card: a hover tooltip ("Preparing an edit: …")
+  covers the suggestion's first line; drop the redundant `title` causing it.
+
