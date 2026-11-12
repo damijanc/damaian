@@ -67,6 +67,11 @@ the input field rather than beside it.
 - **No change to the model menu's contents.** Provider, Model, Effort and Reset
   keep their current panels, options and persistence. Only the entry points
   change.
+  *2026-11-12:* the Effort panel now lists only the levels the selected
+  provider's request carries (`supported_reasoning_levels` in `model.rs`,
+  mirrored by `providerReasoningLevels` in `app.js` and held equal by a
+  desktop-shell test). Before, every provider offered the same five levels
+  while only OpenAI and Custom sent any; DeepSeek and OpenRouter dropped them.
 - **No change to send/stop behaviour.** `setComposerBusy`, `stopCurrentTurn`
   and the disabled-when-empty rule are presentation-only edits here.
 - **No change to the at-rest row count.** The textarea still shows two rows of

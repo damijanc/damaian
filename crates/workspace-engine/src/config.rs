@@ -5631,9 +5631,12 @@ pub fn normalize_model_provider(value: &str) -> Result<String> {
 pub fn normalize_model_reasoning_level(value: &str) -> Result<String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "default" | "auto" => Ok("default".to_string()),
-        "minimal" | "low" | "medium" | "high" => Ok(value.trim().to_ascii_lowercase()),
+        "none" | "minimal" | "low" | "medium" | "high" | "max" => {
+            Ok(value.trim().to_ascii_lowercase())
+        }
         _ => Err(ClientError::InvalidInput(
-            "model_reasoning_level must be default, minimal, low, medium, or high".to_string(),
+            "model_reasoning_level must be default, none, minimal, low, medium, high, or max"
+                .to_string(),
         )),
     }
 }

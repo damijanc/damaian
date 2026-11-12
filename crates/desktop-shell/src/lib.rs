@@ -9628,6 +9628,39 @@ mod tests {
 
     /// The body of the top-level `function <name>(` in `app.js`, up to the
     /// next top-level declaration.
+    /// The effort menu offers a provider exactly the levels its request
+    /// carries. A level the menu shows but the engine drops was the original
+    /// defect: DeepSeek offered five efforts and sent none of them.
+    #[test]
+    fn app_js_effort_levels_match_what_the_engine_sends() {
+        let app = super::APP_JS;
+        let start = app
+            .find("const providerReasoningLevels = {")
+            .expect("app.js has the providerReasoningLevels table");
+        let table = &app[start..start + app[start..].find("\n};").unwrap()];
+        for provider in ["openai", "openai-compatible", "deepseek", "openrouter"] {
+            let key = if provider.contains('-') {
+                format!("\"{provider}\": [")
+            } else {
+                format!("{provider}: [")
+            };
+            let line = table
+                .lines()
+                .find(|line| line.trim_start().starts_with(&key))
+                .unwrap_or_else(|| panic!("app.js offers no levels for {provider}"));
+            let listed = line[line.find('[').unwrap() + 1..line.find(']').unwrap()]
+                .split(',')
+                .map(|level| level.trim().trim_matches('"'))
+                .filter(|level| !level.is_empty())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                listed,
+                workspace_engine::supported_reasoning_levels(provider),
+                "{provider}"
+            );
+        }
+    }
+
     fn app_js_function(name: &str) -> &'static str {
         let app = super::APP_JS;
         let start = app

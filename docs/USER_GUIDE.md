@@ -99,7 +99,7 @@ Common keys:
 | `model_name` | `gpt-4.1` | Model identifier | No |
 | `model_base_url` | `https://api.openai.com` | OpenAI-compatible API base URL | No |
 | `model_api_key_env` | `OPENAI_API_KEY` | API key reference: `keychain:model-api-key` for the desktop Keychain flow, or an environment variable name for [CLI and development](#environment-variables-cli-and-development-only) | No |
-| `model_reasoning_level` | `default` | Reasoning effort: `default`, `minimal`, `low`, `medium` or `high` | No |
+| `model_reasoning_level` | `default` | Reasoning effort: `default`, `none`, `minimal`, `low`, `medium`, `high` or `max`. A level the provider does not accept is not sent ([Choosing the model and effort](#choosing-the-model-and-effort)) | No |
 | `model_provider.<id>.supports_native_tools` | on | Use the provider's native tool-calling API ([Native tool-calling](#native-tool-calling)) | No |
 | `model_provider.<id>.max_output_tokens` | Per model | Largest reply the model may generate, in tokens ([Output and Context Limits](#output-and-context-limits)) | No |
 | `model_provider.<id>.context_token_budget` | Per model | How much repository content is packed into each request, in tokens (**Context per turn**); never more than the window | No |
@@ -757,7 +757,13 @@ Below the prompt, after the **+** button and the [mode](#working-modes) pill, tw
 
 - **Provider** lists your configured providers.
 - **Model** lists that provider's models, with a **Custom model** field and **Apply** for a model id that is not listed.
-- **Effort** offers **Default**, **Minimal**, **Low**, **Medium** and **Extra High**.
+- **Effort** offers the levels the chosen provider accepts, besides **Default** (send nothing and let the provider decide):
+  - OpenAI and **Custom**: **Minimal**, **Low**, **Medium**, **High**.
+  - DeepSeek: **Off** (no thinking), **Low**, **High**, **Max**. DeepSeek's own default is High, so **Default** and **High** behave the same there.
+  - OpenRouter: **Minimal**, **Low**, **Medium**, **High**, **Max**. How each level maps depends on the model OpenRouter routes to.
+  - A provider you defined yourself (`model_provider.<id>`) offers only **Default**, because Damaian does not know what its API accepts.
+
+  Switching to a provider that does not offer the current level sets Effort back to **Default**.
 - **Reset to default** goes back to the provider, model and effort in your configuration (`model_provider`, `model_name` and `model_reasoning_level`).
 
 The choice is remembered in the app for each working folder and sent with each request, including the ones that continue a paused turn: approving a command, a fetch or a plan, answering a question, *Continue* or *Answer now*, verification, checks, and **Compact**. Accepting an offer to answer with another provider is the exception, because it switches to the offered one. It is not written to your config file.

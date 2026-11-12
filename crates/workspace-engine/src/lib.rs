@@ -201,6 +201,7 @@ pub use model::{
     CurlModelTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,
     ModelRequest, ModelRun, ModelTransport, OpenAICompatibleAdapter, ResponseMeta, TokenUsage,
     ToolCall, ToolDefinition, UsageSource, extract_model_tokens, model_request_json,
+    supported_reasoning_levels,
 };
 pub use navigation::{DirectoryListing, NavigationController};
 pub use patch_engine::{

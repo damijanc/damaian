@@ -116,14 +116,34 @@ const builtInModelProviderPresets = {
 const modelProviderPresets = {};
 const configuredProviderIds = new Set();
 
-const validReasoningLevels = new Set(["default", "minimal", "low", "medium", "high"]);
+const validReasoningLevels = new Set([
+  "default",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "max",
+]);
 const providerLabels = {};
 const reasoningLabels = {
   default: "Default",
+  none: "Off",
   minimal: "Minimal",
   low: "Low",
   medium: "Medium",
-  high: "Extra High",
+  high: "High",
+  max: "Max",
+};
+// The levels each provider's request actually carries, besides Default. Must
+// match `supported_reasoning_levels` in the engine's model.rs (a desktop-shell
+// test compares them): a level offered here that the engine drops would be a
+// menu choice that does nothing. Providers not listed offer only Default.
+const providerReasoningLevels = {
+  openai: ["minimal", "low", "medium", "high"],
+  "openai-compatible": ["minimal", "low", "medium", "high"],
+  deepseek: ["none", "low", "high", "max"],
+  openrouter: ["minimal", "low", "medium", "high", "max"],
 };
 const popularProviderPresets = [
   {
@@ -4572,6 +4592,18 @@ function normalizeChatReasoning(value) {
   return validReasoningLevels.has(reasoning) ? reasoning : "default";
 }
 
+function reasoningLevelsFor(provider) {
+  return ["default", ...(providerReasoningLevels[provider] || [])];
+}
+
+// A level the provider does not take falls back to Default, so the menu never
+// shows a choice the request would silently drop (e.g. Medium kept after
+// switching to DeepSeek).
+function reasoningForProvider(provider, value) {
+  const reasoning = normalizeChatReasoning(value);
+  return reasoningLevelsFor(provider).includes(reasoning) ? reasoning : "default";
+}
+
 function chatModelPrefsStorageKey() {
   return `${chatModelPrefsStoragePrefix}:${repo() || "global"}`;
 }
@@ -4709,7 +4741,7 @@ function applyChatModelOptions(options, { resetModel = false, persist = false } 
   if (resetModel || options.model !== undefined || !$("chat-model").value.trim()) {
     $("chat-model").value = options.model || preset.defaultModel;
   }
-  $("chat-reasoning").value = normalizeChatReasoning(options.reasoning);
+  $("chat-reasoning").value = reasoningForProvider(provider, options.reasoning);
   if (persist) saveChatModelPrefs();
   renderChatModelMenu();
 }
@@ -4760,7 +4792,7 @@ function renderChatModelMenu() {
   $("custom-model-input").value = options.model;
   renderProviderOptions(options.provider);
   renderModelOptions(options.provider, options.model);
-  renderReasoningOptions(options.reasoning);
+  renderReasoningOptions(options.provider, options.reasoning);
 }
 
 function renderProviderOptions(selectedProvider) {
@@ -4813,10 +4845,10 @@ function renderModelOptions(provider, selectedModel) {
   });
 }
 
-function renderReasoningOptions(selectedReasoning) {
+function renderReasoningOptions(provider, selectedReasoning) {
   const container = $("model-reasoning-options");
   container.innerHTML = "";
-  ["default", "minimal", "low", "medium", "high"].forEach((reasoning) => {
+  reasoningLevelsFor(provider).forEach((reasoning) => {
     container.append(
       modelOptionButton(reasoningLabels[reasoning], selectedReasoning === reasoning, () => {
         applyChatModelOptions(

@@ -1593,13 +1593,14 @@ pub fn model_request_json(request: &ModelRequest) -> String {
     if request.request_usage && request.stream {
         body.push_str(",\"stream_options\":{\"include_usage\":true}");
     }
-    if let Some(reasoning_effort) =
-        api_reasoning_effort(&request.provider, &request.reasoning_level)
-    {
-        body.push_str(&format!(
-            ",\"reasoning_effort\":\"{}\"",
-            audit_escape_json(reasoning_effort)
-        ));
+    if let Some(effort) = api_reasoning_effort(&request.provider, &request.reasoning_level) {
+        // OpenRouter nests effort in a `reasoning` object; the others take
+        // OpenAI's top-level field.
+        if request.provider == "openrouter" {
+            body.push_str(&format!(",\"reasoning\":{{\"effort\":\"{effort}\"}}"));
+        } else {
+            body.push_str(&format!(",\"reasoning_effort\":\"{effort}\""));
+        }
     }
     if let Some(tools) = &request.tools
         && !tools.is_empty()
@@ -1628,23 +1629,33 @@ pub fn model_request_json(request: &ModelRequest) -> String {
     body
 }
 
-fn api_reasoning_effort<'a>(
-    provider: &str,
-    reasoning_level: &'a Option<String>,
-) -> Option<&'a str> {
-    let supports_reasoning_effort = matches!(
-        provider,
-        "openai" | "openai-compatible" | "open-ai-compatible"
-    );
-    if !supports_reasoning_effort {
-        return None;
+/// The effort levels a provider accepts, besides `default` (send nothing and
+/// let the provider decide). The composer offers exactly these, so a level the
+/// menu shows is a level the request carries.
+///
+/// DeepSeek's own scale is `none`/`low`/`high`/`max` (default `high`); it
+/// maps `minimal` to `low` and `medium` to `high` itself, so offering those
+/// would be two menu entries that do nothing new. OpenRouter accepts the full
+/// scale but rejects `none` for models whose reasoning is mandatory, so `none`
+/// is left out there. A provider id this table does not name (a user-defined
+/// `model_provider.<id>`) gets no effort at all: its API is unknown.
+pub fn supported_reasoning_levels(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "openai" | "openai-compatible" | "open-ai-compatible" => {
+            &["minimal", "low", "medium", "high"]
+        }
+        "deepseek" => &["none", "low", "high", "max"],
+        "openrouter" => &["minimal", "low", "medium", "high", "max"],
+        _ => &[],
     }
+}
+
+fn api_reasoning_effort(provider: &str, reasoning_level: &Option<String>) -> Option<&'static str> {
     let level = reasoning_level.as_deref()?.trim();
-    match level {
-        "" | "default" | "auto" => None,
-        "minimal" | "low" | "medium" | "high" => Some(level),
-        _ => None,
-    }
+    supported_reasoning_levels(provider)
+        .iter()
+        .copied()
+        .find(|supported| *supported == level)
 }
 
 /// What a provider reported about one call: the figures [`extract_usage`]

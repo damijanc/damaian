@@ -4696,6 +4696,63 @@ fn builds_openai_request_json_and_extracts_stream_tokens() {
     assert_eq!(extract_model_tokens(raw), vec!["Hello", " repo — ok"]);
 }
 
+fn effort_request(provider: &str, level: &str) -> String {
+    model_request_json(&ModelRequest {
+        provider: provider.to_string(),
+        model: "test-model".to_string(),
+        messages: vec![ModelMessage::user("hello")],
+        temperature: None,
+        reasoning_level: Some(level.to_string()),
+        stream: true,
+        tools: None,
+        max_tokens: None,
+        request_usage: false,
+        emit_cache_breakpoints: false,
+    })
+}
+
+#[test]
+fn deepseek_requests_carry_the_chosen_effort() {
+    for level in ["none", "low", "high", "max"] {
+        let body = effort_request("deepseek", level);
+        assert!(
+            body.contains(&format!("\"reasoning_effort\":\"{level}\"")),
+            "{level}: {body}"
+        );
+    }
+}
+
+#[test]
+fn openrouter_requests_nest_the_effort_in_a_reasoning_object() {
+    let body = effort_request("openrouter", "max");
+    assert!(
+        body.contains("\"reasoning\":{\"effort\":\"max\"}"),
+        "{body}"
+    );
+    assert!(!body.contains("reasoning_effort"), "{body}");
+}
+
+#[test]
+fn default_and_unsupported_levels_send_no_effort() {
+    for (provider, level) in [
+        ("deepseek", "default"),
+        ("openrouter", "default"),
+        ("openai", "default"),
+        // Each provider gets only the levels it takes.
+        ("deepseek", "medium"),
+        ("openai", "max"),
+        ("openrouter", "none"),
+        // A user-defined provider's API is unknown.
+        ("acme", "high"),
+    ] {
+        let body = effort_request(provider, level);
+        assert!(
+            !body.contains("reasoning_effort") && !body.contains("\"reasoning\":"),
+            "{provider} {level}: {body}"
+        );
+    }
+}
+
 #[test]
 fn reports_openai_compatible_error_payloads() {
     let request = ModelRequest {
@@ -4710,8 +4767,6 @@ fn reports_openai_compatible_error_payloads() {
         request_usage: false,
         emit_cache_breakpoints: false,
     };
-    let body = model_request_json(&request);
-    assert!(!body.contains("reasoning_effort"));
     let transport = MockModelTransport::new("{\"error\":{\"message\":\"Rate limit exceeded\"}}\n");
     let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
     let error = adapter
