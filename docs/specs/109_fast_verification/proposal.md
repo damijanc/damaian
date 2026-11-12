@@ -1,6 +1,6 @@
 # Feature Spec: Fast Verification
 
-Status: In progress (started 2026-11-11; Tasks 1–2 done; Tasks 1–7 in [tasks.md](tasks.md))
+Status: In progress (started 2026-11-11; Tasks 1–2 done; Tasks 1–8 in [tasks.md](tasks.md))
 Order: 109 of 109
 Plan: none. Written from the owner's spec 33 Task 1 run on Damaian v0.69.0
 (2026-11-11); the code survey and decisions are in [context.md](context.md).
@@ -50,10 +50,20 @@ check in the same task; and a result for an unchanged tree is already known.
    uses the plan's scoped required check for the root the patch touched when the
    plan declares one; the detected root check remains the completion floor and
    runs once when the task ends (spec 101/105 R15–R16, spec 107 D3).
-4. **One approval per check per task.** Approving a check that needs approval
-   covers that exact check (command and directory) for the rest of the task
-   chain, including continuations; it is never an "always allow", never covers
-   another command or directory, and ends with the task.
+4. **Approve for this session** (owner, 2026-11-11, revised 2026-11-12: "we
+   can add approve for this session option that user can pick as additional
+   option on the approve button, but only if it is a read only command"). The
+   approve button of a command, check or baseline card gets a second choice,
+   **Approve for this session**, offered only for a command that does not
+   change the repository (context D5 defines it). Choosing it approves that
+   exact command in that exact directory for the rest of the session; later
+   proposals of it run without a card. It is never an "always allow", never
+   covers another command, directory or session, and is checked after every run
+   it covers: a run that changed the repository revokes it. Which commands
+   qualify does not depend on a list of languages or tools (owner: "it is not a
+   definite list"): it follows from why the policy asks and from what each run
+   is seen to do. The user can admit more with their own command rules (spec
+   111); a repository cannot.
 5. **Reuse known results.** A check whose recorded run covered exactly the
    current tree (same file hashes and mutation generation) is not run again; the
    recorded result is used and shown as reused.
@@ -73,6 +83,12 @@ check in the same task; and a result for an unchanged tree is already known.
    stopped. Evidence: on 2026-11-11 the owner could not stop a post-apply
    `cargo test` of the whole crate (run for a one-line import patch) because
    only baselines had **Cancel**.
+
+8. **Every ecosystem gets verified** (owner, 2026-11-12: "it is not a definite
+   list"). A project whose files Damaian detects no check for is verified by
+   the checks its approved plan names (found in the repository's own CI files,
+   build targets or README) and by checks the user configures for it, not left
+   at "no checks available".
 
 ## 3. Non-goals
 

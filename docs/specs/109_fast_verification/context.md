@@ -108,13 +108,72 @@ partly fixed by spec 107 D3), 86 (main-checkout test-process overhead) and 89
     it is not reported as `required_check_stale` (a failed or missing one
     still is), so a worker's automatic continuation is not stopped by it. The
     answer-time completion run reruns it with the floor, as before.
-- **D5 — per-task approval (security; confirm before Task 5).** An approved
-  check identity is remembered on the task chain (a durable event), and later
-  proposals of the same identity in that chain are approved automatically and
-  audited as `approved_for_task`. Restrict-only: a repository cannot turn it on
-  for commands the policy refuses or blocks; it never applies to a different
-  command, directory, session or task; a declined check is not remembered as
-  approved. The approval card says "Run for this task".
+- **D5 — approve for this session, for commands that do not change the
+  repository (decided by the owner 2026-11-12, definition confirmed the same
+  day: "read only + check list but we need to have a configuration entry that
+  user can add more").** Replaces the 2026-11-11 per-task
+  proposal.
+  - *Why "read-only" needs a definition.* Commands the policy admits as
+    strictly read-only (`ls`, `git status`, `rg`, … — `is_low_risk_read_only`)
+    already run without a card in Code mode, so an option limited to them would
+    almost never appear. The commands that ask again and again are checks:
+    `cargo test`, `cargo nextest run …`, `cargo clippy …`, `cargo fmt --check`,
+    `typos`. They write build output (`target/`) but not the repository's
+    files.
+  - *Definition: no ecosystem list (owner, 2026-11-12: "we have haskel,
+    closure, GO ... point is that it is not a definite list").* Whether a
+    command qualifies is decided from what the command policy already says
+    about **any** command, plus what the run is seen to do — never from a list
+    of languages or tools:
+    1. **Why the policy asks.** The policy explains every approval with
+       `ApprovalCause`s. A command qualifies only when its causes are limited
+       to "Damaian does not know what `<program>` does" (`Unknown`) and the
+       ask-before-checks setting (`Setting`). Any other cause disqualifies it
+       in every language: `Blocklisted`, `Destructive`, `ShellControl` (so
+       `&&`, `|`, `;`, redirects never qualify), `Docker`, `Network`,
+       `HighRisk`, `OutsideRepository`, `RestrictedPath`, `ProfileBlocked`.
+    2. **No known writer.** `is_source_writing_command` (formatters without
+       `--check`, `--fix`, `--write`, …) disqualifies; it is a hint list that
+       may grow, not the definition.
+    3. **Seen not to change the repository.** The backstop below runs after
+       every covered run, so "read-only" is a property each run must keep, not
+       a promise from a list: a `stack test`, `lein test`, `go test`,
+       `phpunit`, `ctest` or in-house `bin/check` qualifies on the same terms,
+       and loses the approval the first time it changes a file.
+  - *User additions are spec 111 rules.* The separate
+    `session_approvable_commands` setting proposed earlier the same day is
+    dropped: spec 111 gives the user ordered `allow`/`ask`/`deny` command rules
+    with full authority, so a command the user wants to run without a card is a
+    user `allow` rule, and **Approve for this session** writes a session-scoped
+    rule of the exact parsed command and directory (spec 111 D2: session rules
+    only `allow`, never override a user `deny` or a built-in block). Task 5
+    builds on spec 111 Tasks 1–2.
+  - *Script runners.* `npm run lint`, `make test`, `rake test` and the like run
+    whatever the repository defines; the backstop is what catches a script that
+    writes files, and it loses its approval at once.
+  - *Backstop.* After each run covered by a session approval, the engine
+    compares the repository's state before and after (git status plus hashes of
+    changed and untracked files, ignoring git-ignored build output). If anything
+    changed, the session approval for that command is revoked, the change is
+    reported in the turn and the audit, and the next proposal asks again.
+  - *Scope.* Command text and working directory, exactly; this session only,
+    including its continuations and resumed turns; a durable session event
+    (`command_session_approved`, `command_session_approval_revoked`) so a
+    restart keeps it; ended by archive, delete or **Revoke session approvals**
+    (session ⋮). Never across sessions, never written to config, never "always
+    allow". A worker gets its own session and starts with none.
+  - *Trust.* Restrict-only: repository config may turn the option off
+    (`session_command_approval=false`) but cannot turn it on or extend the
+    list; a declined command is not remembered; a blocked command never gets
+    it.
+  - *Audit.* `command_approved_for_session` when chosen, each automatic run
+    audited with `approvedBy=session_approval`, revocations audited with the
+    reason.
+  - *UI.* The card's **Approve** button gets a chevron with **Approve for this
+    session**, only when the engine says the command qualifies (the card
+    payload carries `sessionApprovable` and the reason when not). A run that
+    happens under it shows "Approved for this session" in its row. Baseline and
+    check batch cards offer it per check.
 - **D6 — reuse (recommended).** Before proposing a check, if a `CheckRun` of the
   same identity is not stale, reuse it (no command, no card) and say so in the
   report.
@@ -131,3 +190,18 @@ partly fixed by spec 107 D3), 86 (main-checkout test-process overhead) and 89
 - **D7 — visibility.** One running-state component for checks and baselines:
   card header indicator, Cancel replacing the run button, the status line and the
   composer line from the same state (fixes OBSERVATIONS 89).
+- **D9 — verification with no detected check (owner, 2026-11-12: "it is not a
+  definite list").** Damaian detects checks from seven manifest files
+  (`PROJECT_MANIFESTS`), so a project in any other ecosystem (Haskell, Clojure,
+  PHP, C, C++, C#, …) ends verification "no checks available" (OBSERVATIONS
+  95). No fix may rest on listing ecosystems. Instead: (1) when a touched root
+  has no detected check, the approved plan's required checks covering it are
+  its completion floor, so the checks the model found in the repository's own
+  CI files, `Makefile`/`justfile` targets or README when it planned are what
+  verify the task; (2) a user-scope setting, `project_checks` (per repository
+  path: command and directory), adds a project's checks to its floor, edited in
+  Settings; a repository may only narrow it (spec 34); (3) the planning prompt
+  asks the model to name the repository's declared checks as single commands,
+  not `&&` chains, and to say where it found them. The manifest detection
+  stays as a fast path.
+
