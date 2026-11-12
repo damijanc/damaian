@@ -61,6 +61,7 @@ This build is a developer preview. Release builds are Developer ID signed and no
 
 **Reference**
 
+- [Configuration reference](CONFIGURATION.md): every config key
 - [Local Data](#local-data)
 - [The Command-Line Tool](#the-command-line-tool)
 - [Safety Model](#safety-model)
@@ -88,7 +89,7 @@ Configuration uses one `key=value` entry per line. Edit values directly and sele
 
 `model_api_key_env` is a reference field. The app rejects raw API keys in this field; use the **Model API Key** controls to store the secret in Keychain (see [Model Providers and API Keys](#model-providers-and-api-keys)).
 
-Common keys:
+Every key, with its default, the values it accepts and what a repository may do with it, is listed in the [Configuration reference](CONFIGURATION.md). Common keys:
 
 | Key | Default | What it does | Can a repository change it? |
 |---|---|---|---|

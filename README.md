@@ -116,6 +116,7 @@ detail. To build Damaian from source, see [Development](docs/DEVELOPMENT.md).
 ## Documentation
 
 - [User Guide](docs/USER_GUIDE.md) — day-to-day usage, settings, model providers
+- [Configuration reference](docs/CONFIGURATION.md) — every key in the config file, its default, and what a repository may change
 - [macOS Installation](docs/MACOS_INSTALLATION.md) — install and first-launch steps
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — config and log locations, diagnosing failures
 - [Security Policy](SECURITY.md) — safety model and vulnerability reporting
