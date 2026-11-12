@@ -10,6 +10,11 @@ did not change. Their logs (`session_18e6ada3…`, `session_18e69e39…`) record
 `session_archived` at 20:36:02.522 and .529: both clicks executed together
 when the turn ended. Local OBSERVATIONS 94.
 
+- 2026-11-12, spec 33 Task 1 restart: the owner tried to send a correction
+  while Damaian worked and got `Request failed:
+  {"code":"session_working",…,"label":"Reading AGENTS.md",…}`; the turn had
+  resumed after a question, so it showed no Stop.
+
 ## Survey
 
 - **Accept loop.** `serve` (`desktop-shell/src/lib.rs` ≈160) iterates
@@ -109,6 +114,28 @@ when the turn ended. Local OBSERVATIONS 94.
   atomic replace).
   Config writes: last write wins, as today. Two sessions in one checkout: the
   patch engine's hash check already refuses a stale patch; no new guarantee.
+- **D7 — messages to a working session are steering notes (decided by the
+  owner, 2026-11-12: "deliver it").** Spec 57 built this for workers: a
+  `TurnSteering` on the `TurnSink` queues notes, and the turn loop's round
+  boundary (`run_agentic_turn`, `chat.rs`) drains them into the conversation
+  as user messages, redacted on the way to the model, logged as written with a
+  `steering_note_added` event, and announced as `TurnProgress::NoteAdded`
+  (spec 57 §5.4). The shell passes `steering: None` today. Here every chat
+  turn gets one: the lane holds the running turn's `TurnSteering` beside its
+  cancel token; a UI-class route `POST /api/session-note {session_id, text}`
+  queues into it (409 `not_working` when the session has no running turn, and
+  the composer then sends an ordinary message); the relay forwards
+  `NoteAdded` as an SSE `note` event. Length is bounded as the worker socket
+  bounds a note. Notes left in the queue when the turn returns are handled by
+  how it returned: paused for an approval or a question, they are stored with
+  the paused turn and seeded into the resumed turn's `TurnSteering`, so its
+  first boundary delivers them (spec 57 Task 11 did the same for workers);
+  completed or failed, the UI sends them, oldest first and joined in one
+  message, as the next turn at once; stopped, they go back into the composer,
+  because the user asked the work to stop. A note never resolves a pending
+  approval or question: it only ever enters a running turn. Task 1b carries
+  the queue over the host's control socket (the worker host already has
+  `note {text}`).
 - **D5 — thread stacks.** Connection threads use `spawn_with_shell_stack` (the
   shell's larger stack).
 - **D6 — crash isolation.** A host that dies leaves the shell and other

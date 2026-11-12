@@ -18,6 +18,7 @@ survey are in [`context.md`](context.md).
 |---|---|---|
 | 1 · Thread per connection, route classes, a lane per session (D1a, D2, D3, D5) | Done 2026-11-12 | Split at a clean boundary: this task lands the shell side with each session's work still in the shell process behind an in-process lane; Task 1b moves the work into host processes. D1a (common host type, not the worker host as is) is recorded in context.md. `serve_listener` spawns a `damaian-connection` thread per connection (`spawn_with_shell_stack`). `routes.rs`: a `Route` enum, the `ROUTES` table (the only place a path is spelled), `Route::is_session_work` and the dispatch in `lib.rs` are exhaustive matches with no wildcard. `route_class` resolves the session from `session_id` (`parent_session_id` for `POST /api/workers`), else from a plain `proposal_id`'s paused turn (new `PausedTurns::session_id`); routes that name only a patch, batch, checkpoint or command proposal resolve to no session and run unlaned, as before — Task 1b must resolve them. `lanes.rs`: claim/label/cancel per session; a busy session gets 409 `session_working` with the running label; a turn started without a session adopts its new session's lane on the `session` event; phase labels update the lane. New UI routes `GET /api/working-sessions` and `POST /api/session-work-cancel` (D3; spec 109 Task 6 builds its Stop on them). Archive and delete refuse a working session with "Stop it first" (409). The recovery sweep skips a working session, since a first `/api/recovery` can now arrive mid-turn. Tests: `responsive_tests.rs` (a model gated per test by its model name: UI routes answer under 1 s during a turn, second turn 409, archive/delete 409, two sessions in one project work at once, cancel from a UI request, resume classification), `routes::tests`, `lanes::tests`, `recovery::tests::a_working_session_is_not_swept_until_its_work_ends`, engine `paused_turn_session_tests`. Checks: scoped clippy (desktop-shell, desktop-app, workspace-engine) clean; `cargo nextest run -p desktop-shell` 320 passed; fast checks ok. Deterministic eval tier not run: no turn entry point changed. Workspace clippy and tests left to CI. |
 | 1b · A host process per session (D1, D1a, D6) | Not started | — |
+| 1c · Messages to a working session reach the running turn (D7) | Not started | — |
 | 2 · Shared state across processes (D4) | Not started | — |
 | 3 · The UI with several working sessions | Not started | — |
 | 4 · Documentation and close-out | Not started | — |
@@ -63,7 +64,8 @@ has no loop of its own. Checks:
       the UI sends `session_id` on those routes or the shell resolves the id.
 - [ ] Each key the shell resolves goes to the host on stdin, never on the
       socket; a provider fallback works.
-- [ ] The lane's label and cancel come from the host (D3); the recovery sweep
+- [ ] The lane's label, cancel and steering notes (Task 1c) come from and go
+      to the host (D3, D7); the recovery sweep
       and `classify_session` skip a session whose host is alive (widen spec
       57 C12's live-worker check to session hosts).
 - [ ] Tests: two sessions in one project work at the same time in two
@@ -75,6 +77,31 @@ Files: `crates/desktop-shell/src/lib.rs`, `workers.rs`, `worker.rs`,
 `lanes.rs`, `desktop-app/src/main.rs` (exit hook), `workspace-engine`
 process registry and recovery, tests. Checks: scoped clippy for each crate
 touched; `cargo nextest run -p desktop-shell`; the deterministic eval tier.
+
+## Task 1c · Messages to a working session reach the running turn (D7)
+
+Depends on Task 1 (lanes) only; independent of Task 1b, which must carry it.
+
+- [ ] The lane holds the running turn's `TurnSteering`; every chat turn the
+      shell starts or resumes passes it as `TurnSink::steering`.
+- [ ] `POST /api/session-note` (UI class in `routes.rs`): queue a note, 409
+      `not_working` when the session has no running turn; the relay forwards
+      `NoteAdded` as an SSE `note` event.
+- [ ] Notes left at turn end: stored with a paused turn and seeded into the
+      resumed turn; returned on completion, failure or stop so the UI can send
+      or restore them.
+- [ ] `app.js`: while the current session works, Send posts a note; the
+      message shows as waiting and becomes an ordinary user message on
+      `note`; returned notes start the next turn (completed, failed) or refill
+      the composer (stopped); a 409 shows its message, not JSON.
+- [ ] Tests: a note during a turn reaches the next request and the log; a note
+      in the final round starts the next turn; a note before an approval
+      reaches the resumed turn; a note before a Stop is returned; a note never
+      resolves an approval or question; `not_working` when idle.
+
+Files: `crates/desktop-shell/src/lib.rs`, `lanes.rs`, `routes.rs`, the paused
+turn store, `static/app.js`, tests. Checks: scoped clippy (desktop-shell,
+workspace-engine if touched); `cargo nextest run -p desktop-shell`; web checks.
 
 ## Task 2 · Shared state across processes (D4)
 
@@ -101,6 +128,6 @@ Files: `app.js`, `style.css`, desktop-shell tests. Checks: web checks;
 ## Task 4 · Documentation and close-out
 
 - [ ] `USER_GUIDE.md` / `TROUBLESHOOTING.md`: several sessions at once; the
-      archive/delete exception.
+      archive/delete exception; messages sent while Damaian works.
 - [ ] Status Done in all four places only after CI is green; README row,
       CHANGELOG Unreleased item, dependency lines; `npm run specs:check -- --strict`.
