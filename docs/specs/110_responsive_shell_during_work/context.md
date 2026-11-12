@@ -49,6 +49,43 @@ when the turn ended. Local OBSERVATIONS 94.
   the running work's label. The shell relays the host's progress to the open
   window as today's stream does. Whether ordinary sessions and workers share
   one host type (a worker = a host in a worktree) is decided in Task 1.
+- **D1a — a common host type, not the worker host as is (Task 1, 2026-11-12).**
+  Ordinary sessions and workers share the host *plumbing* and not the worker's
+  *protocol*. The worker's control socket is a small command table built for
+  the Workers board (`message`, `approve`, `reject`, `answer_question`, `stop`,
+  `verify`, `checks`, …). An ordinary session reaches its work through about
+  thirty routes with their own form fields and SSE replies (every resume route,
+  baselines, patches, rewind, recovery decisions). Reusing the worker host as is
+  would re-express each of those as a worker command: a second resume path per
+  route, against "approvals and resume routes behave exactly as today" and spec
+  57's one-resume-path rule. So:
+  - **Shared plumbing** (factored out of `workers.rs` / `worker.rs` in Task
+    1b): re-entry of the app's own executable with a mode flag; the shell
+    registers the host with the process registry before handing it work; the
+    stdin handover (API key and control token) and stdin as the lifeline; the
+    hashed control-socket path, `0600` socket in a `0700` directory, token on
+    every line; shutdown on lifeline EOF, `shutdown` or a signal through
+    `sweep_own`; the clean-quit path (`shutdown_all_workers` becomes "all
+    hosts").
+  - **The session host's protocol** is one request kind: a classified
+    session-work HTTP request (method, path, query, body) is forwarded whole,
+    and the host runs **the same `handle_*` function** the shell runs today,
+    writing its response (JSON or SSE) back over the connection, which the shell
+    copies to the window. Approval and resume semantics are therefore the
+    shell's own code, not a translation. The host works in the session's own
+    checkout; the shell keeps every UI route.
+  - **Workers stay as they are**: a worker is a host whose session works in a
+    worktree and which speaks the worker command protocol on top.
+  - **Keys only on stdin.** A turn's provider comes from the request (and a
+    fallback offer switches provider), so one key at handover is not enough.
+    The shell writes each key it resolves to the host's stdin as a further
+    line, never on the control socket.
+  - **Recovery.** A live host is not crash debris: the engine's live-worker
+    check (spec 57 C12) is widened to a live session-host registry entry.
+  - **Split (recorded in tasks.md).** Task 1 lands the shell side with the work
+    still in the shell process, each session's work behind an in-process
+    per-session lane; Task 1b moves the lane's work into the host. The lane's
+    interface (claim, label, cancel, refusal) is what the host keeps.
 - **D2 — classification.** `RouteClass { SessionWork(session_id), Ui }` by an
   exhaustive match over the route table. Session work: turn streams and every
   resume route (answer, plan review, patch decision, command/check/baseline

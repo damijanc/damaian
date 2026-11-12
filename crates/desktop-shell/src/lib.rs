@@ -37,7 +37,9 @@ use workspace_engine::{
 };
 
 mod keychain;
+mod lanes;
 mod recovery;
+mod routes;
 pub mod terminal;
 mod worker;
 pub mod workers;
@@ -157,26 +159,38 @@ where
     }
     ready(actual_port);
 
+    serve_listener(listener, &options);
+    // A normal exit: servers get `shutdown` and `exit` before they are
+    // killed. A signal goes through `sweep_own` instead (spec 25 context.md §3).
+    workspace_engine::LanguageServerHub::shutdown_global();
+    Ok(())
+}
+
+/// Spec 110 D1/D5: every connection on its own thread, so a turn's stream
+/// never holds the accept loop and the UI answers while sessions work.
+fn serve_listener(listener: TcpListener, options: &ShellOptions) {
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 let options = options.clone();
-                if let Err(error) = handle_connection(&mut stream, &options) {
-                    let _ = write_basic_response(
-                        &mut stream,
-                        500,
-                        "application/json",
-                        &json_error(&error),
-                    );
+                if let Err(error) = spawn_with_shell_stack("damaian-connection", move || {
+                    serve_connection(stream, &options)
+                }) {
+                    eprintln!("start a connection thread: {error}");
                 }
             }
             Err(error) => eprintln!("connection failed: {error}"),
         }
     }
-    // A normal exit: servers get `shutdown` and `exit` before they are
-    // killed. A signal goes through `sweep_own` instead (spec 25 context.md §3).
-    workspace_engine::LanguageServerHub::shutdown_global();
-    Ok(())
+}
+
+/// Serves one connection; an error becomes a 500, as it always has.
+fn serve_connection(mut stream: TcpStream, options: &ShellOptions) {
+    if let Err(error) = handle_connection(&mut stream, options) {
+        let _ = write_basic_response(&mut stream, 500, "application/json", &json_error(&error));
+    }
+    // Whatever path the request took, its lane is free once it is answered.
+    lanes::release_current();
 }
 
 #[derive(Debug, Clone)]
@@ -248,219 +262,285 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             &json_error(&error),
         );
     }
-    match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") => write_response(
-            stream,
-            &request,
-            200,
-            "text/html; charset=utf-8",
-            &index_html(),
-        ),
-        ("GET", "/style.css") | ("GET", "/assets/style.css") => {
-            write_response(stream, &request, 200, "text/css; charset=utf-8", STYLE_CSS)
-        }
-        ("GET", "/app.js") | ("GET", "/assets/app.js") => write_response(
-            stream,
-            &request,
-            200,
-            "application/javascript; charset=utf-8",
-            APP_JS,
-        ),
-        ("GET", "/xterm.js") | ("GET", "/assets/xterm.js") => write_response(
-            stream,
-            &request,
-            200,
-            "application/javascript; charset=utf-8",
-            XTERM_JS,
-        ),
-        ("GET", "/xterm-addon-fit.js") | ("GET", "/assets/xterm-addon-fit.js") => write_response(
-            stream,
-            &request,
-            200,
-            "application/javascript; charset=utf-8",
-            XTERM_ADDON_FIT_JS,
-        ),
-        ("GET", "/xterm.css") | ("GET", "/assets/xterm.css") => {
-            write_response(stream, &request, 200, "text/css; charset=utf-8", XTERM_CSS)
-        }
-        ("GET", "/api/bootstrap") => {
-            let repo = options.default_repo.clone().unwrap_or_default();
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"defaultRepo\":\"{}\"}}", escape_json(&repo)),
-            )
-        }
-        ("GET", "/api/web-diagnostic-artifact") => handle_web_diagnostic_artifact(stream, &request),
-        ("GET", "/api/config") => handle_config(stream, &request),
-        ("GET", "/api/config-file") => handle_get_config_file(stream, &request),
-        ("GET", "/api/effective-policy") => handle_effective_policy(stream, &request),
-        ("GET", "/api/provider-token-defaults") => handle_provider_token_defaults(stream, &request),
-        ("POST", "/api/permission-profile") => handle_permission_profile(stream, &request),
-        ("GET", "/api/permission-profiles") => handle_permission_profiles(stream, &request),
-        ("GET", "/api/permission-profile-export") => {
-            handle_permission_profile_export(stream, &request)
-        }
-        ("POST", "/api/permission-profile-import") => {
-            handle_permission_profile_import(stream, &request)
-        }
-        ("GET", "/api/model-key-status") => handle_model_key_status(stream, &request),
-        ("GET", "/api/git-status") => handle_git_status(stream, &request),
-        ("POST", "/api/commit-message") => handle_commit_message(stream, &request),
-        ("GET", "/api/commit-status") => handle_commit_status(stream, &request),
-        // A preparation writes a durable record and an audit entry, so it is a
-        // `POST`: a safe-looking `GET` with side effects is a cache and retry
-        // hazard (review finding 3h).
-        ("POST", "/api/commit-preparation") => handle_commit_preparation(stream, &request),
-        ("POST", "/api/commit") => handle_commit(stream, &request),
-        // Spec 36: branch state, the prepared operation, its typed approval,
-        // and two read-only reports. There is deliberately no route that runs
-        // a merge, rebase, or cherry-pick, and no route takes a raw command.
-        ("GET", "/api/branch-info") => handle_branch_info(stream, &request),
-        ("POST", "/api/branch-suggestion") => handle_branch_suggestion(stream, &request),
-        ("POST", "/api/branch-prepare") => handle_branch_prepare(stream, &request),
-        ("POST", "/api/branch") => handle_branch_change(stream, &request),
-        ("GET", "/api/merge-preparation") => handle_merge_preparation(stream, &request),
-        ("GET", "/api/terminal-cwd") => handle_terminal_cwd(stream, &request),
-        ("POST", "/api/terminal-run") => handle_terminal_run(stream, &request),
-        ("GET", "/api/sessions") => handle_sessions(stream, &request),
-        ("GET", "/api/session-search") => handle_session_search(stream, &request),
-        ("GET", "/api/session-export") => handle_session_export(stream, &request),
-        // The launch sweep behind `docs/specs/45_crash_recovery_prompt.md`. It
-        // runs once per process; every call after the first serves the same
-        // snapshot, minus tasks the user has since dealt with.
-        ("GET", "/api/recovery") => handle_recovery(stream, &request),
-        // Resume, mark failed, or abandon one recovered task. The decision is
-        // re-classified server-side: see `recovery::decide`.
-        ("POST", "/api/recovery-decision") => handle_recovery_decision(stream, &request),
-        // Closes out a task whose reattached approval has been answered, so the
-        // next launch does not offer to run the same command again.
-        ("POST", "/api/recovery-approval-resolved") => {
-            handle_recovery_approval_resolved(stream, &request)
-        }
-        ("GET", "/api/checkpoints") => handle_checkpoints(stream, &request),
-        // Rewind. `files` and `conversation` are independent switches, and
-        // `path` narrows the file half to one file, which is the fourth of the
-        // restore operations rather than a fourth code path.
-        ("POST", "/api/rewind") => handle_rewind(stream, &request),
-        ("GET", "/api/session") => handle_session(stream, &request),
-        ("POST", "/api/session-create") => handle_session_create(stream, &request),
-        ("POST", "/api/session-rename") => handle_session_rename(stream, &request),
-        ("POST", "/api/session-archive") => handle_session_archive(stream, &request, true),
-        ("POST", "/api/session-unarchive") => handle_session_archive(stream, &request, false),
-        ("POST", "/api/session-mode") => handle_session_mode(stream, &request),
-        // Spec 98 Task 4: the user's explicit protected-path control. Every
-        // route is repository-bound, and writes go through the engine's
-        // canonicalising API rather than appending session events here.
-        ("POST", "/api/context-pin") => handle_context_pin(stream, &request),
-        ("POST", "/api/context-restriction") => handle_context_restriction(stream, &request),
-        ("POST", "/api/context-remove") => handle_context_remove(stream, &request),
-        ("POST", "/api/context-remove-summary") => handle_context_remove_summary(stream, &request),
-        // The manifest names memory entries but never their statements (spec 30
-        // C3); the panel resolves the rows it was shown through this read.
-        ("POST", "/api/context-memory") => handle_context_memory(stream, &request),
-        ("POST", "/api/resume-context-stream") => handle_resume_context_stream(stream, &request),
-        // Spec 29: the pending proposals and the two user actions. There is no
-        // accept-all route and no route that takes a statement.
-        ("GET", "/api/memory-proposals") => handle_memory_proposals(stream, &request),
-        ("POST", "/api/memory-confirm") => handle_memory_confirm(stream, &request),
-        ("POST", "/api/memory-dismiss") => handle_memory_dismiss(stream, &request),
-        // Spec 22 Task 10. Each findings route is its own function, so the
-        // engine it builds lives in that frame rather than this one: every
-        // arm's locals share `handle_connection`'s frame, and inlining three
-        // more `WorkspaceEngine`s overflowed a 2 MiB thread stack in a debug
-        // build, which is what the desktop app gives the server.
-        ("GET", "/api/findings") => handle_findings(stream, &request),
-        ("POST", "/api/finding-status") => handle_finding_status(stream, &request),
-        ("POST", "/api/findings-repair") => handle_findings_repair(stream, &request),
-        ("POST", "/api/session-delete") => handle_session_delete(stream, &request),
-        ("POST", "/api/compact") => handle_compact(stream, &request),
-        ("POST", "/api/open-vscode") => handle_open_vscode(stream, &request),
-        ("POST", "/api/reveal-in-finder") => handle_reveal_in_finder(stream, &request),
-        // Spec 58: takes `repo` only and opens the URL derived from `origin`.
-        ("POST", "/api/open-github") => handle_open_github(stream, &request),
-        ("POST", "/api/reveal-web-diagnostic-artifact") => {
-            handle_reveal_web_diagnostic_artifact(stream, &request)
-        }
-        ("POST", "/api/context-file") => handle_context_file(stream, &request),
-        ("POST", "/api/open-vscode-file") => handle_open_vscode_file(stream, &request),
-        ("POST", "/api/render-markdown") => handle_render_markdown(stream, &request),
-        ("POST", "/api/ask-stream") => handle_ask_stream(stream, &request),
-        ("POST", "/api/resume-command-stream") => handle_resume_command_stream(stream, &request),
-        ("POST", "/api/resume-fetch-stream") => handle_resume_fetch_stream(stream, &request),
-        ("POST", "/api/fetch-decision") => handle_fetch_decision(stream, &request),
-        ("POST", "/api/verify-stream") => handle_verify_stream(stream, &request),
-        ("POST", "/api/continue-repair-stream") => handle_continue_repair_stream(stream, &request),
-        ("POST", "/api/continue-task-stream") => handle_continue_task_stream(stream, &request),
-        ("POST", "/api/continue-worker-result-stream") => {
-            handle_continue_worker_result_stream(stream, &request)
-        }
-        ("POST", "/api/resume-checks-stream") => handle_resume_checks_stream(stream, &request),
-        ("POST", "/api/resume-plan-stream") => handle_resume_plan_stream(stream, &request),
-        ("POST", "/api/plan-worker-prompt") => handle_plan_worker_prompt(stream, &request),
-        ("POST", "/api/plan-to-worker") => handle_plan_to_worker(stream, &request),
-        ("POST", "/api/answer-question-stream") => handle_answer_question_stream(stream, &request),
-        ("POST", "/api/resume-fallback-stream") => handle_resume_fallback_stream(stream, &request),
-        ("POST", "/api/resume-round-budget-stream") => {
-            handle_resume_round_budget_stream(stream, &request)
-        }
-        ("POST", "/api/ask") => handle_ask(stream, &request),
-        ("POST", "/api/propose-edit") => handle_propose_edit(stream, &request),
-        ("POST", "/api/apply-patch") => handle_apply_patch(stream, &request),
-        ("POST", "/api/resume-baseline") => handle_resume_baseline(stream, &request),
-        ("POST", "/api/resume-baseline-stream") => handle_resume_baseline_stream(stream, &request),
-        ("POST", "/api/rollback-patch") => handle_rollback_patch(stream, &request),
-        ("POST", "/api/reject-patch-files") => handle_reject_patch_files(stream, &request),
-        ("POST", "/api/reject-patch") => handle_reject_patch(stream, &request),
-        ("POST", "/api/propose-command") => handle_propose_command(stream, &request),
-        ("POST", "/api/run-command") => handle_run_command(stream, &request),
-        ("POST", "/api/reject-command") => handle_reject_command(stream, &request),
-        ("GET", "/api/repository-map") => handle_repository_map(stream, &request),
-        ("POST", "/api/repository-roots") => handle_repository_roots(stream, &request),
-        // Spec 25 Task 10: symbol search, on-demand references, and the state
-        // of each configured language server. Each is its own function for the
-        // reason the findings routes are (spec 22 Task 10): the engine they
-        // build belongs to that frame, not to `handle_connection`'s.
-        ("GET", "/api/symbols") => handle_symbols(stream, &request),
-        ("GET", "/api/symbol-references") => handle_symbol_references(stream, &request),
-        ("GET", "/api/language-servers") => handle_language_servers(stream, &request),
-        ("GET", "/api/command-proposal") => handle_command_proposal(stream, &request),
-        ("GET", "/api/repository-config-review") => {
-            handle_repository_config_review(stream, &request)
-        }
-        ("POST", "/api/repository-config-allowlist") => {
-            handle_repository_config_allowlist(stream, &request)
-        }
-        // Spec 32 Task 9: the hooks the user can see, review, switch and test.
-        // None of these takes a config path: user config is the only file they
-        // can write, and its location comes from the data directory.
-        ("GET", "/api/hooks") => handle_hooks(stream, &request),
-        ("POST", "/api/hook-review") => handle_hook_review(stream, &request),
-        ("POST", "/api/hook-enabled") => handle_hook_enabled(stream, &request),
-        ("POST", "/api/hook-test") => handle_hook_test(stream, &request),
-        ("POST", "/api/config-set") => handle_config_set(stream, &request),
-        ("POST", "/api/config-file") => handle_post_config_file(stream, &request),
-        ("POST", "/api/model-key") => handle_model_key(stream, &request),
-        ("POST", "/api/provider-key") => handle_provider_key(stream, &request),
-        ("POST", "/api/model-key-delete") => handle_model_key_delete(stream, &request),
-        ("POST", "/api/mcp-test") => handle_mcp_test(stream, &request),
-        ("GET", "/api/workers-enabled")
-        | ("GET", "/api/worker-source-status")
-        | ("POST", "/api/workers")
-        | ("GET", "/api/workers")
-        | ("GET", "/api/worker-progress")
-        | ("POST", "/api/worker-control")
-        | ("POST", "/api/worker-restart")
-        | ("POST", "/api/worker-remove-worktree") => handle_worker_route(stream, &request),
-        _ => write_response(
+    let Some(route) = routes::route_for(&request.method, &request.path) else {
+        return write_response(
             stream,
             &request,
             404,
             "application/json",
             &json_error("not found"),
+        );
+    };
+    // Spec 110 D1–D2: a session's work holds that session's lane while it
+    // runs; a second piece of work for the same session is refused at once
+    // with what the first is doing, never queued. UI routes take no lane.
+    if let routes::RouteClass::SessionWork(Some(session_id)) = route_class(route, &request) {
+        match lanes::claim(&session_id, route.work_label()) {
+            Ok(guard) => lanes::hold_current(guard),
+            Err(running) => {
+                return write_response(
+                    stream,
+                    &request,
+                    409,
+                    "application/json",
+                    &session_working_json(&session_id, &running),
+                );
+            }
+        }
+    }
+    let outcome = dispatch(stream, &request, route, options);
+    lanes::release_current();
+    outcome
+}
+
+/// The class of one request, with the session it acts for when it names one
+/// (spec 110 D2). A resume route names only its paused turn, so the turn's
+/// snapshot says whose it is.
+fn route_class(route: routes::Route, request: &Request) -> routes::RouteClass {
+    if !route.is_session_work() {
+        return routes::RouteClass::Ui;
+    }
+    let form = parse_form(&request.body);
+    let field = routes::session_field(route);
+    let named = form
+        .get(field)
+        .or_else(|| request.query.get(field))
+        .filter(|value| !value.is_empty())
+        .cloned();
+    if named.is_some() {
+        return routes::RouteClass::SessionWork(named);
+    }
+    let paused = form
+        .get("proposal_id")
+        .filter(|id| is_plain_id(id))
+        .and_then(|id| {
+            let data_dir = effective_data_dir().ok()?;
+            PausedTurns::new(data_dir).session_id(id)
+        });
+    routes::RouteClass::SessionWork(paused)
+}
+
+/// An id that can name a file under the data directory without leaving it.
+fn is_plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 256
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+/// A refused request for a session that is already working (spec 110 req. 2).
+fn session_working_json(session_id: &str, running: &str) -> String {
+    serde_json::json!({
+        "error": format!("This session is already working: {running}. Wait for it to finish or stop it first."),
+        "code": "session_working",
+        "sessionId": session_id,
+        "label": running,
+    })
+    .to_string()
+}
+
+/// The handler for each route. Exhaustive, like [`routes::Route::is_session_work`].
+fn dispatch(
+    stream: &mut TcpStream,
+    request: &Request,
+    route: routes::Route,
+    options: &ShellOptions,
+) -> Result<(), String> {
+    use routes::Route;
+    match route {
+        Route::Index => write_response(
+            stream,
+            request,
+            200,
+            "text/html; charset=utf-8",
+            &index_html(),
         ),
+        Route::StyleCss => {
+            write_response(stream, request, 200, "text/css; charset=utf-8", STYLE_CSS)
+        }
+        Route::AppJs => write_response(
+            stream,
+            request,
+            200,
+            "application/javascript; charset=utf-8",
+            APP_JS,
+        ),
+        Route::XtermJs => write_response(
+            stream,
+            request,
+            200,
+            "application/javascript; charset=utf-8",
+            XTERM_JS,
+        ),
+        Route::XtermAddonFitJs => write_response(
+            stream,
+            request,
+            200,
+            "application/javascript; charset=utf-8",
+            XTERM_ADDON_FIT_JS,
+        ),
+        Route::XtermCss => {
+            write_response(stream, request, 200, "text/css; charset=utf-8", XTERM_CSS)
+        }
+        Route::Bootstrap => {
+            let repo = options.default_repo.clone().unwrap_or_default();
+            write_response(
+                stream,
+                request,
+                200,
+                "application/json",
+                &format!("{{\"defaultRepo\":\"{}\"}}", escape_json(&repo)),
+            )
+        }
+        Route::WebDiagnosticArtifact => handle_web_diagnostic_artifact(stream, request),
+        Route::Config => handle_config(stream, request),
+        Route::GetConfigFile => handle_get_config_file(stream, request),
+        Route::EffectivePolicy => handle_effective_policy(stream, request),
+        Route::ProviderTokenDefaults => handle_provider_token_defaults(stream, request),
+        Route::PermissionProfile => handle_permission_profile(stream, request),
+        Route::PermissionProfiles => handle_permission_profiles(stream, request),
+        Route::PermissionProfileExport => handle_permission_profile_export(stream, request),
+        Route::PermissionProfileImport => handle_permission_profile_import(stream, request),
+        Route::ModelKeyStatus => handle_model_key_status(stream, request),
+        Route::GitStatus => handle_git_status(stream, request),
+        Route::CommitMessage => handle_commit_message(stream, request),
+        Route::CommitStatus => handle_commit_status(stream, request),
+        // A preparation writes a durable record and an audit entry, so it is a
+        // `POST`: a safe-looking `GET` with side effects is a cache and retry
+        // hazard (review finding 3h).
+        Route::CommitPreparation => handle_commit_preparation(stream, request),
+        Route::Commit => handle_commit(stream, request),
+        // Spec 36: branch state, the prepared operation, its typed approval,
+        // and two read-only reports. There is deliberately no route that runs
+        // a merge, rebase, or cherry-pick, and no route takes a raw command.
+        Route::BranchInfo => handle_branch_info(stream, request),
+        Route::BranchSuggestion => handle_branch_suggestion(stream, request),
+        Route::BranchPrepare => handle_branch_prepare(stream, request),
+        Route::BranchChange => handle_branch_change(stream, request),
+        Route::MergePreparation => handle_merge_preparation(stream, request),
+        Route::TerminalCwd => handle_terminal_cwd(stream, request),
+        Route::TerminalRun => handle_terminal_run(stream, request),
+        Route::Sessions => handle_sessions(stream, request),
+        Route::SessionSearch => handle_session_search(stream, request),
+        Route::SessionExport => handle_session_export(stream, request),
+        // Spec 110 D3: which sessions are working, and a cancel for one.
+        Route::WorkingSessions => handle_working_sessions(stream, request),
+        Route::CancelSessionWork => handle_cancel_session_work(stream, request),
+        // The launch sweep behind `docs/specs/45_crash_recovery_prompt.md`. It
+        // runs once per process; every call after the first serves the same
+        // snapshot, minus tasks the user has since dealt with.
+        Route::Recovery => handle_recovery(stream, request),
+        // Resume, mark failed, or abandon one recovered task. The decision is
+        // re-classified server-side: see `recovery::decide`.
+        Route::RecoveryDecision => handle_recovery_decision(stream, request),
+        // Closes out a task whose reattached approval has been answered, so the
+        // next launch does not offer to run the same command again.
+        Route::RecoveryApprovalResolved => handle_recovery_approval_resolved(stream, request),
+        Route::Checkpoints => handle_checkpoints(stream, request),
+        // Rewind. `files` and `conversation` are independent switches, and
+        // `path` narrows the file half to one file, which is the fourth of the
+        // restore operations rather than a fourth code path.
+        Route::Rewind => handle_rewind(stream, request),
+        Route::Session => handle_session(stream, request),
+        Route::SessionCreate => handle_session_create(stream, request),
+        Route::SessionRename => handle_session_rename(stream, request),
+        Route::SessionArchive => handle_session_archive(stream, request, true),
+        Route::SessionUnarchive => handle_session_archive(stream, request, false),
+        Route::SessionMode => handle_session_mode(stream, request),
+        // Spec 98 Task 4: the user's explicit protected-path control. Every
+        // route is repository-bound, and writes go through the engine's
+        // canonicalising API rather than appending session events here.
+        Route::ContextPin => handle_context_pin(stream, request),
+        Route::ContextRestriction => handle_context_restriction(stream, request),
+        Route::ContextRemove => handle_context_remove(stream, request),
+        Route::ContextRemoveSummary => handle_context_remove_summary(stream, request),
+        // The manifest names memory entries but never their statements (spec 30
+        // C3); the panel resolves the rows it was shown through this read.
+        Route::ContextMemory => handle_context_memory(stream, request),
+        Route::ResumeContextStream => handle_resume_context_stream(stream, request),
+        // Spec 29: the pending proposals and the two user actions. There is no
+        // accept-all route and no route that takes a statement.
+        Route::MemoryProposals => handle_memory_proposals(stream, request),
+        Route::MemoryConfirm => handle_memory_confirm(stream, request),
+        Route::MemoryDismiss => handle_memory_dismiss(stream, request),
+        // Spec 22 Task 10. Each findings route is its own function, so the
+        // engine it builds lives in that frame rather than this one: every
+        // arm's locals share this function's frame, and inlining three more
+        // `WorkspaceEngine`s overflowed a 2 MiB thread stack in a debug build.
+        Route::Findings => handle_findings(stream, request),
+        Route::FindingStatus => handle_finding_status(stream, request),
+        Route::FindingsRepair => handle_findings_repair(stream, request),
+        Route::SessionDelete => handle_session_delete(stream, request),
+        Route::Compact => handle_compact(stream, request),
+        Route::OpenVscode => handle_open_vscode(stream, request),
+        Route::RevealInFinder => handle_reveal_in_finder(stream, request),
+        // Spec 58: takes `repo` only and opens the URL derived from `origin`.
+        Route::OpenGithub => handle_open_github(stream, request),
+        Route::RevealWebDiagnosticArtifact => {
+            handle_reveal_web_diagnostic_artifact(stream, request)
+        }
+        Route::ContextFile => handle_context_file(stream, request),
+        Route::OpenVscodeFile => handle_open_vscode_file(stream, request),
+        Route::RenderMarkdown => handle_render_markdown(stream, request),
+        Route::AskStream => handle_ask_stream(stream, request),
+        Route::ResumeCommandStream => handle_resume_command_stream(stream, request),
+        Route::ResumeFetchStream => handle_resume_fetch_stream(stream, request),
+        Route::FetchDecision => handle_fetch_decision(stream, request),
+        Route::VerifyStream => handle_verify_stream(stream, request),
+        Route::ContinueRepairStream => handle_continue_repair_stream(stream, request),
+        Route::ContinueTaskStream => handle_continue_task_stream(stream, request),
+        Route::ContinueWorkerResultStream => handle_continue_worker_result_stream(stream, request),
+        Route::ResumeChecksStream => handle_resume_checks_stream(stream, request),
+        Route::ResumePlanStream => handle_resume_plan_stream(stream, request),
+        Route::PlanWorkerPrompt => handle_plan_worker_prompt(stream, request),
+        Route::PlanToWorker => handle_plan_to_worker(stream, request),
+        Route::AnswerQuestionStream => handle_answer_question_stream(stream, request),
+        Route::ResumeFallbackStream => handle_resume_fallback_stream(stream, request),
+        Route::ResumeRoundBudgetStream => handle_resume_round_budget_stream(stream, request),
+        Route::Ask => handle_ask(stream, request),
+        Route::ProposeEdit => handle_propose_edit(stream, request),
+        Route::ApplyPatch => handle_apply_patch(stream, request),
+        Route::ResumeBaseline => handle_resume_baseline(stream, request),
+        Route::ResumeBaselineStream => handle_resume_baseline_stream(stream, request),
+        Route::RollbackPatch => handle_rollback_patch(stream, request),
+        Route::RejectPatchFiles => handle_reject_patch_files(stream, request),
+        Route::RejectPatch => handle_reject_patch(stream, request),
+        Route::ProposeCommand => handle_propose_command(stream, request),
+        Route::RunCommand => handle_run_command(stream, request),
+        Route::RejectCommand => handle_reject_command(stream, request),
+        Route::RepositoryMap => handle_repository_map(stream, request),
+        Route::RepositoryRoots => handle_repository_roots(stream, request),
+        // Spec 25 Task 10: symbol search, on-demand references, and the state
+        // of each configured language server. Each is its own function for the
+        // reason the findings routes are (spec 22 Task 10).
+        Route::Symbols => handle_symbols(stream, request),
+        Route::SymbolReferences => handle_symbol_references(stream, request),
+        Route::LanguageServers => handle_language_servers(stream, request),
+        Route::CommandProposal => handle_command_proposal(stream, request),
+        Route::RepositoryConfigReview => handle_repository_config_review(stream, request),
+        Route::RepositoryConfigAllowlist => handle_repository_config_allowlist(stream, request),
+        // Spec 32 Task 9: the hooks the user can see, review, switch and test.
+        // None of these takes a config path: user config is the only file they
+        // can write, and its location comes from the data directory.
+        Route::Hooks => handle_hooks(stream, request),
+        Route::HookReview => handle_hook_review(stream, request),
+        Route::HookEnabled => handle_hook_enabled(stream, request),
+        Route::HookTest => handle_hook_test(stream, request),
+        Route::ConfigSet => handle_config_set(stream, request),
+        Route::PostConfigFile => handle_post_config_file(stream, request),
+        Route::ModelKey => handle_model_key(stream, request),
+        Route::ProviderKey => handle_provider_key(stream, request),
+        Route::ModelKeyDelete => handle_model_key_delete(stream, request),
+        Route::McpTest => handle_mcp_test(stream, request),
+        Route::WorkersEnabled
+        | Route::WorkerSourceStatus
+        | Route::StartWorker
+        | Route::ListWorkers
+        | Route::WorkerProgress
+        | Route::WorkerControl
+        | Route::WorkerRestart
+        | Route::WorkerRemoveWorktree => handle_worker_route(stream, request),
     }
 }
 
@@ -1449,10 +1529,73 @@ fn handle_session_archive(
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
     let session_id = required_form(&form, "session_id")?;
+    if archive && let Some(refusal) = working_session_refusal(&session_id, "archive") {
+        return write_response(stream, request, 409, "application/json", &refusal);
+    }
     let engine = default_engine()?;
     // Only the supervisor knows whether a worker's process is still alive.
     let worker_running = archive && workers::global().is_alive(&session_id);
     let (status, body) = session_archive_answer(&engine, &session_id, archive, worker_running);
+    write_response(stream, request, status, "application/json", &body)
+}
+
+/// Spec 110 requirement 3: archive and delete are the only actions refused on
+/// a working session. The body names what it is doing, so the user knows what
+/// to stop. Checked before anything is read or written.
+fn working_session_refusal(session_id: &str, action: &str) -> Option<String> {
+    let running = lanes::working_label(session_id)?;
+    Some(
+        serde_json::json!({
+            "error": format!("This session is working ({running}). Stop it first, then {action} it."),
+            "code": "session_working",
+            "sessionId": session_id,
+            "label": running,
+        })
+        .to_string(),
+    )
+}
+
+/// `GET /api/working-sessions` (spec 110 D3): every session with work running,
+/// what it is doing, for how long, and whether it can be cancelled.
+fn handle_working_sessions(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let sessions = lanes::working()
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "sessionId": row.session_id,
+                "label": row.label,
+                "elapsedMs": row.elapsed_ms as u64,
+                "cancellable": row.cancellable,
+            })
+        })
+        .collect::<Vec<_>>();
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::json!({ "sessions": sessions }).to_string(),
+    )
+}
+
+/// `POST /api/session-work-cancel` (spec 110 D3): stops a session's running
+/// work at its next safe point, exactly as closing the window that started it
+/// does. A UI route, so it is answered while that work runs. It never resolves
+/// an approval: a turn paused for one is not running and holds no lane.
+fn handle_cancel_session_work(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let session_id = required_form(&form, "session_id")?;
+    let (status, body) = match lanes::cancel(&session_id) {
+        Ok(()) => (
+            200,
+            serde_json::json!({ "sessionId": session_id, "status": "cancelling" }).to_string(),
+        ),
+        Err(lanes::CancelRefusal::Idle) => (409, json_error("This session is not working.")),
+        Err(lanes::CancelRefusal::NotCancellable) => (
+            409,
+            json_error("This work cannot be stopped part-way; it ends by itself."),
+        ),
+    };
     write_response(stream, request, status, "application/json", &body)
 }
 
@@ -1489,6 +1632,9 @@ fn session_archive_answer(
 fn handle_session_delete(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let session_id = required_form(&form, "session_id")?;
+    if let Some(refusal) = working_session_refusal(&session_id, "delete") {
+        return write_response(stream, request, 409, "application/json", &refusal);
+    }
     // A `session_end` hook runs in the repository, and a session stores only
     // its repository id, so the caller says which checkout this session
     // belongs to (spec 32 Task 6).
@@ -3122,6 +3268,7 @@ fn handle_resume_baseline_stream(stream: &mut TcpStream, request: &Request) -> R
         let _ = sender.send(event);
     })
     .map_err(|error| format!("start the baseline thread: {error}"))?;
+    lanes::with_current(|lane| lane.set_cancel(&cancel));
     let outcome = relay_baseline_events(stream, &cancel, receiver, KEEPALIVE_INTERVAL);
     // Joined unconditionally: the worker owns the running check's process.
     let _ = worker.join();
@@ -4810,6 +4957,10 @@ fn chat_model_adapter(
     config: &Config,
     api_key: impl FnOnce() -> Result<String, String>,
 ) -> Result<Box<dyn ModelAdapter>, String> {
+    #[cfg(test)]
+    if let Some(adapter) = responsive_tests::gated_adapter_for(config) {
+        return Ok(adapter);
+    }
     if let Ok(response) = env::var("DAMAIAN_MOCK_MODEL_RESPONSE") {
         return Ok(Box::new(workspace_engine::MockModelAdapter::new(response)));
     }
@@ -6667,6 +6818,18 @@ fn relay_turn_events<W: Write>(
         match events.recv_timeout(keepalive) {
             Ok(event) => {
                 let finished = matches!(event, TurnEvent::Done(_) | TurnEvent::Failed(_));
+                // Spec 110 D3: the lane says what the session is doing, and a
+                // turn that created its session claims that lane now.
+                match &event {
+                    TurnEvent::Session(session_id) => {
+                        lanes::adopt_current(session_id, routes::Route::AskStream.work_label());
+                        lanes::with_current(|lane| lane.set_cancel(cancel));
+                    }
+                    TurnEvent::Phase(phase) if !phase.label.trim().is_empty() => {
+                        lanes::with_current(|lane| lane.set_label(&phase.label));
+                    }
+                    _ => {}
+                }
                 if !client_gone {
                     let written = match &event {
                         TurnEvent::Session(session_id) => write_sse_event(
@@ -6751,6 +6914,7 @@ where
     })
     .map_err(|error| format!("start the turn thread: {error}"))?;
 
+    lanes::with_current(|lane| lane.set_cancel(&cancel));
     let outcome = relay_turn_events(stream, &cancel, receiver, KEEPALIVE_INTERVAL);
     // Joined unconditionally: the worker owns the curl child, and leaving it
     // unreaped is how a stopped turn would keep billing tokens.
@@ -7844,6 +8008,8 @@ fn escape_json(value: &str) -> String {
 
 #[cfg(test)]
 mod acceptance_tests;
+#[cfg(test)]
+mod responsive_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7901,7 +8067,7 @@ mod tests {
     /// That leaves the environment as the only lever a test has, and without it
     /// these tests write sessions, patches, and checkpoints straight into the
     /// user's real `~/Library/Application Support/DamaianClient`.
-    fn isolated_data_dir() -> &'static std::path::Path {
+    pub(super) fn isolated_data_dir() -> &'static std::path::Path {
         static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
         DATA_DIR.get_or_init(|| {
             let dir = std::env::temp_dir().join(format!(

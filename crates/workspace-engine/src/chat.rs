@@ -15918,6 +15918,21 @@ impl PausedTurns {
         }
     }
 
+    /// The session a paused turn belongs to, or `None` when the id names no
+    /// paused turn (spec 110). The desktop shell reads it to know whose work a
+    /// resume request is before it runs anything, so a session that is already
+    /// working refuses the second request instead of running two at once.
+    pub fn session_id(&self, proposal_id: &str) -> Option<String> {
+        let path = PendingCommandStore::new(&self.data_dir).path_for(proposal_id);
+        let content = fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        value
+            .get("session")?
+            .get("id")?
+            .as_str()
+            .map(str::to_string)
+    }
+
     /// What a paused plan review is holding back, or `None` when the id names
     /// no paused turn, or one that is not a plan review.
     ///
@@ -23997,5 +24012,39 @@ mod memory_proposal_tests {
             audit.contains("memory_proposal_failed") && audit.contains("statement_too_long"),
             "the parser refusal is audited even though no proposal was created: {audit}"
         );
+    }
+}
+
+#[cfg(test)]
+mod paused_turn_session_tests {
+    use super::PausedTurns;
+    use std::fs;
+
+    /// Spec 110: the shell resolves a resume request's session from the paused
+    /// turn before running anything; an unknown id resolves to nothing.
+    #[test]
+    fn a_paused_turn_names_its_session_and_an_unknown_id_names_none() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "damaian-paused-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pending = data_dir.join("chat").join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(
+            pending.join("proposal_1.json"),
+            r#"{"session":{"id":"session_abc","title":"t"},"proposal_id":"proposal_1"}"#,
+        )
+        .unwrap();
+        let paused = PausedTurns::new(&data_dir);
+        assert_eq!(
+            paused.session_id("proposal_1").as_deref(),
+            Some("session_abc")
+        );
+        assert_eq!(paused.session_id("proposal_missing"), None);
+        let _ = fs::remove_dir_all(&data_dir);
     }
 }

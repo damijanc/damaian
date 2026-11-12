@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use workspace_engine::{
     AgentFetchProposal, CommandProposal, PausedTurns, PendingVerification, ProposedPatch,
     QUESTION_WAITING_HEADLINE, ReattachedApproval, RecoveredTask, TaskStatus, WorkspaceEngine,
-    allow_always_eligible, classify_all, classify_session, command_approval_prompt, headline,
+    allow_always_eligible, classify_session, command_approval_prompt, headline,
     pending_verifications, reattach_pending_approvals, resume_allowed, resume_blocked_reason,
 };
 
@@ -372,8 +372,24 @@ fn sweep_once(engine: &WorkspaceEngine) -> Result<&'static Mutex<Sweep>, String>
 }
 
 fn run_sweep(engine: &WorkspaceEngine) -> Result<Sweep, String> {
-    let classified = classify_all(&engine.session_store, &engine.audit_log)
-        .map_err(|error| error.to_string())?;
+    // Spec 110: the shell runs turns while it serves other requests, so the
+    // first sweep can come while a session works. Its tasks are running in
+    // this process, not left by a crash, so it is skipped before anything is
+    // classified or written (the same rule spec 57 C12 gives a live worker).
+    let mut classified = Vec::new();
+    for session in engine
+        .session_store
+        .list_sessions(None)
+        .map_err(|error| error.to_string())?
+    {
+        if crate::lanes::working_label(&session.id).is_some() {
+            continue;
+        }
+        classified.extend(
+            classify_session(&engine.session_store, &engine.audit_log, &session.id)
+                .map_err(|error| error.to_string())?,
+        );
+    }
 
     let sessions = engine
         .session_store
@@ -1766,6 +1782,37 @@ mod tests {
         let error = apply_decision(&engine, &decision(&session.id, &task.id, "mark_failed"))
             .expect_err("a live worker's task is not a recovered task");
         assert!(error.contains("is not a recovered task"), "got {error}");
+    }
+
+    /// Spec 110: the shell answers `/api/recovery` while a session works, so a
+    /// first sweep that lands mid-turn must not take that turn for crash
+    /// debris. Once the work ends, the same task is classified as before.
+    #[test]
+    fn a_working_session_is_not_swept_until_its_work_ends() {
+        let (engine, dir) = engine("working-session");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Working")
+            .unwrap();
+        let task = task_left_in(
+            &engine,
+            &session.id,
+            "add retries",
+            TaskStatus::PreparingContext,
+            Some(("model_call", "m", false)),
+        );
+        let lane = crate::lanes::claim(&session.id, "Waiting for the model").unwrap();
+
+        let (_, payload) = sweep(&engine);
+        assert!(!payload.contains(&task.id), "got {payload}");
+        assert!(
+            !audit_text(&dir).contains("task_recovered"),
+            "a working session's task is not crash debris"
+        );
+
+        drop(lane);
+        let (_, payload) = sweep(&engine);
+        assert!(payload.contains(&task.id), "got {payload}");
     }
 
     /// Spec 98: a reloaded session must not offer a patch card whose remaining
