@@ -6723,3 +6723,16 @@ body.worker-view #chat-model-menu {
 .context-overview-swatch[data-part="free"] {
   background: var(--line);
 }
+
+/* Spec 110 D7: a message sent while the session works, not yet read by the
+   turn. Dashed until the turn delivers it, then an ordinary user message. */
+.message.user.is-waiting .message-body {
+  border-style: dashed;
+  opacity: 0.75;
+}
+
+.message-waiting-label {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}

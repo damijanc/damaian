@@ -43,6 +43,7 @@ pub(crate) enum Route {
     SessionExport,
     WorkingSessions,
     CancelSessionWork,
+    SessionNote,
     Recovery,
     RecoveryDecision,
     RecoveryApprovalResolved,
@@ -184,6 +185,7 @@ pub(crate) const ROUTES: &[(&str, &str, Route)] = &[
     ("GET", "/api/session-export", Route::SessionExport),
     ("GET", "/api/working-sessions", Route::WorkingSessions),
     ("POST", "/api/session-work-cancel", Route::CancelSessionWork),
+    ("POST", "/api/session-note", Route::SessionNote),
     ("GET", "/api/recovery", Route::Recovery),
     ("POST", "/api/recovery-decision", Route::RecoveryDecision),
     (
@@ -433,6 +435,8 @@ impl Route {
             | Route::SessionExport
             | Route::WorkingSessions
             | Route::CancelSessionWork
+            // Reaches the running turn's queue; never claims the lane (D7).
+            | Route::SessionNote
             | Route::Recovery
             | Route::Checkpoints
             | Route::Session
@@ -593,6 +597,7 @@ mod tests {
             "/api/config-set",
             "/api/working-sessions",
             "/api/session-work-cancel",
+            "/api/session-note",
         ] {
             assert!(!session_work.contains(ui), "{ui} must stay a UI route");
         }

@@ -15592,14 +15592,203 @@ async function streamResumeChecksRequest(data, handlers) {
   return streamRequest("/api/resume-checks-stream", null, withChatModel(data), handlers);
 }
 
+// A refused request answers JSON (`{"error": …, "code": …}`); the user reads
+// its message, never the JSON (spec 110 Task 1c).
+async function streamRequestError(response) {
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = null;
+  }
+  const error = new Error(payload?.error || payload?.message || text || response.statusText);
+  error.payload = payload || {};
+  error.status = response.status;
+  return error;
+}
+
+// Every turn stream running in this window, so a message sent while one works
+// is delivered into it rather than refused (spec 110 D7). A stream's session
+// is the one it names, the current one for a resume that names only its
+// paused turn, or the one its `session` event announces.
+const runningTurnStreams = new Set();
+
+// Messages sent while a session worked that no turn has delivered yet, oldest
+// first: `{ sessionId, text, message, unsent }`. `unsent` marks one the shell
+// refused because the turn had just ended, so the window still owns it.
+const waitingNotes = [];
+
+function runningTurnStream(sessionId) {
+  if (!sessionId) return null;
+  for (const stream of runningTurnStreams) {
+    if (stream.sessionId === sessionId) return stream;
+  }
+  return null;
+}
+
+function markNoteWaiting(note, waiting) {
+  const { message, body } = note.message;
+  message.classList.toggle("is-waiting", waiting);
+  body.querySelector(".message-waiting-label")?.remove();
+  if (waiting) {
+    const label = document.createElement("p");
+    label.className = "message-waiting-label";
+    label.textContent = "Waiting — Damaian reads this before its next step.";
+    body.append(label);
+  }
+}
+
+// The composer's Send while the current session works: the message is shown
+// at once as waiting and queued into the running turn, which gives it to the
+// model at its next step. It never answers a question or approves anything.
+async function sendSteeringNote(sessionId) {
+  const field = $("chat-prompt");
+  const text = field.value.trim();
+  if (!text) return false;
+  field.value = "";
+  autoGrowPrompt();
+  const note = { sessionId, text, message: appendChatMessage("user", text), unsent: false };
+  markNoteWaiting(note, true);
+  waitingNotes.push(note);
+  try {
+    await api("/api/session-note", form({ session_id: sessionId, text }));
+  } catch (error) {
+    if (error.payload?.code === "not_working") {
+      // The turn ended as this was sent; the message is still the user's and
+      // goes with the others the turn left.
+      note.unsent = true;
+      if (!runningTurnStream(sessionId)) {
+        settleTurnNotes({ sessionId, outcome: "completed", returned: [] });
+      }
+      return true;
+    }
+    waitingNotes.splice(waitingNotes.indexOf(note), 1);
+    note.message.message.remove();
+    restorePrompt(text);
+    toast(error.message);
+    return false;
+  }
+  return true;
+}
+
+// A `note` event: the turn delivered the oldest waiting message, which is now
+// an ordinary user message. A note the window does not hold (carried over a
+// pause from before a reload) is shown as it arrives.
+function deliverTurnNote(stream, payload) {
+  const index = waitingNotes.findIndex(
+    (note) => note.sessionId === stream.sessionId && !note.unsent,
+  );
+  if (index < 0) {
+    if (payload.text && stream.sessionId === currentSessionId) {
+      appendChatMessage("user", payload.text);
+    }
+    return;
+  }
+  const [note] = waitingNotes.splice(index, 1);
+  if (note.message.message.isConnected) {
+    markNoteWaiting(note, false);
+    if (payload.messageId) note.message.message.dataset.messageId = payload.messageId;
+  } else if (note.sessionId === currentSessionId) {
+    appendChatMessage("user", note.text);
+  }
+}
+
+// What happens to the messages a turn ended without delivering (D7). The shell
+// says which it returned; one it kept is waiting for the turn that resumes a
+// pause and stays shown as waiting. Without a `done` or `error` (the window
+// stopped the stream), every waiting message of the session is left.
+function settleTurnNotes(stream) {
+  // A request refused because the session already works (a second stream)
+  // leaves the running turn's messages to that turn.
+  if (runningTurnStream(stream.sessionId)) return;
+  const mine = waitingNotes.filter((note) => note.sessionId === stream.sessionId);
+  if (!mine.length && !stream.returned?.length) return;
+  let left;
+  if (stream.outcome === "completed" || stream.outcome === "failed") {
+    left = [];
+    for (const text of stream.returned || []) {
+      const index = waitingNotes.findIndex(
+        (note) => note.sessionId === stream.sessionId && !note.unsent && note.text === text,
+      );
+      if (index >= 0) left.push(waitingNotes.splice(index, 1)[0]);
+      else left.push({ text, message: null });
+    }
+    for (const note of waitingNotes.filter(
+      (entry) => entry.sessionId === stream.sessionId && entry.unsent,
+    )) {
+      waitingNotes.splice(waitingNotes.indexOf(note), 1);
+      left.push(note);
+    }
+  } else {
+    left = mine;
+    for (const note of mine) waitingNotes.splice(waitingNotes.indexOf(note), 1);
+  }
+  if (!left.length) return;
+  for (const note of left) note.message?.message.remove();
+  const text = left.map((note) => note.text).join("\n\n");
+  if (stream.outcome === "completed" || stream.outcome === "failed") {
+    whenTurnsIdle(async () => {
+      if (stream.sessionId !== currentSessionId || !(await sendChatPrompt({ prompt: text }))) {
+        refillComposer(text);
+      }
+    });
+  } else {
+    // Stopped: the user asked the work to stop, so nothing is sent for them.
+    refillComposer(text);
+  }
+}
+
+function refillComposer(text) {
+  const field = $("chat-prompt");
+  const draft = field.value.trim();
+  field.value = draft ? `${text}\n\n${draft}` : text;
+  autoGrowPrompt();
+}
+
+// Runs `then` once no turn is running in this window: a returned message is
+// the next turn, so it waits for the one that just ended to finish its own
+// bookkeeping.
+function whenTurnsIdle(then) {
+  const started = Date.now();
+  const check = () => {
+    if (!chatSubmitting && !runningTurnStreams.size) {
+      void then();
+    } else if (Date.now() - started < 30000) {
+      setTimeout(check, 50);
+    } else {
+      void then();
+    }
+  };
+  setTimeout(check, 0);
+}
+
 async function streamRequest(streamPath, fallbackPath, data, handlers, signal) {
+  const turn = {
+    sessionId: data.session_id || data.parent_session_id || currentSessionId || "",
+    outcome: null,
+    returned: null,
+  };
+  runningTurnStreams.add(turn);
+  try {
+    await streamTurnRequest(streamPath, fallbackPath, data, handlers, signal, turn);
+  } catch (error) {
+    if (!turn.outcome) turn.outcome = error.name === "AbortError" ? "stopped" : "unknown";
+    throw error;
+  } finally {
+    runningTurnStreams.delete(turn);
+    settleTurnNotes(turn);
+  }
+}
+
+async function streamTurnRequest(streamPath, fallbackPath, data, handlers, signal, turn) {
   const options = withApiToken(streamPath, form(data));
   // Aborting closes the socket, which is what the server notices on its next
   // keepalive write. No cancel request is sent — and none could be, since the
   // shell serves one request at a time and this turn is holding it.
   const response = await fetch(apiUrl(streamPath), { ...options, signal });
   if (!response.ok) {
-    throw new Error(await response.text());
+    throw await streamRequestError(response);
   }
   if (!response.body) {
     if (!fallbackPath) {
@@ -15619,18 +15808,18 @@ async function streamRequest(streamPath, fallbackPath, data, handlers, signal) {
     buffer += decoder.decode(value, { stream: true });
     let separator = buffer.indexOf("\n\n");
     while (separator >= 0) {
-      processSseEvent(buffer.slice(0, separator), handlers);
+      processSseEvent(buffer.slice(0, separator), handlers, turn);
       buffer = buffer.slice(separator + 2);
       separator = buffer.indexOf("\n\n");
     }
   }
   buffer += decoder.decode();
   if (buffer.trim()) {
-    processSseEvent(buffer, handlers);
+    processSseEvent(buffer, handlers, turn);
   }
 }
 
-function processSseEvent(raw, handlers) {
+function processSseEvent(raw, handlers, turn = null) {
   let event = "message";
   const data = [];
   raw.split(/\r?\n/).forEach((line) => {
@@ -15642,7 +15831,14 @@ function processSseEvent(raw, handlers) {
   });
   const payload = data.length ? JSON.parse(data.join("\n")) : {};
   if (event === "token") handlers.token(payload.token || "");
+  if (event === "session" && turn && payload.sessionId) turn.sessionId = payload.sessionId;
   if (event === "session" && handlers.session) handlers.session(payload.sessionId || "");
+  // Spec 110 D7: handled here, not per call site, because a message sent
+  // while the session works can reach any kind of turn — a resume included.
+  if (event === "note" && turn) deliverTurnNote(turn, payload);
+  if (event === "notes_returned" && turn) turn.returned = payload.notes || [];
+  if (event === "done" && turn) turn.outcome = payload.cancelled ? "stopped" : "completed";
+  if (event === "error" && turn) turn.outcome = "failed";
   if (event === "phase" && handlers.phase) handlers.phase(payload);
   if (event === "plan" && handlers.plan) handlers.plan(payload);
   if (event === "web_diagnostic" && handlers.webDiagnostic) handlers.webDiagnostic(payload);
@@ -16148,6 +16344,10 @@ async function sendChatPrompt(options = {}) {
     await sendWorkerComposer(promptOverride);
     return true;
   }
+  // Spec 110 D7: while this session works, the composer's message goes into
+  // the running turn instead of starting a second one.
+  const working = !promptOverride && runningTurnStream(currentSessionId);
+  if (working) return sendSteeringNote(working.sessionId);
   if (chatSubmitting) return false;
   try {
     prompt = promptOverride || $("chat-prompt").value.trim();

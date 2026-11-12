@@ -136,6 +136,12 @@ when the turn ended. Local OBSERVATIONS 94.
   approval or question: it only ever enters a running turn. Task 1b carries
   the queue over the host's control socket (the worker host already has
   `note {text}`).
+  As built (Task 1c): carried notes are kept per session in
+  `<data_dir>/chat/pending-notes/<session_id>.json` beside the paused turns,
+  not inside a turn's snapshot, and the session's next turn takes them — the
+  resume, or a new message if the user sends one instead of resuming. The
+  stream reports returned notes as `notes_returned` before `done` or `error`,
+  and a delivered note as `note {messageId, text}`.
 - **D5 — thread stacks.** Connection threads use `spawn_with_shell_stack` (the
   shell's larger stack).
 - **D6 — crash isolation.** A host that dies leaves the shell and other

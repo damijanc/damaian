@@ -426,6 +426,7 @@ fn dispatch(
         // Spec 110 D3: which sessions are working, and a cancel for one.
         Route::WorkingSessions => handle_working_sessions(stream, request),
         Route::CancelSessionWork => handle_cancel_session_work(stream, request),
+        Route::SessionNote => handle_session_note(stream, request),
         // The launch sweep behind `docs/specs/45_crash_recovery_prompt.md`. It
         // runs once per process; every call after the first serves the same
         // snapshot, minus tasks the user has since dealt with.
@@ -1592,6 +1593,45 @@ fn handle_cancel_session_work(stream: &mut TcpStream, request: &Request) -> Resu
             409,
             json_error("This work cannot be stopped part-way; it ends by itself."),
         ),
+    };
+    write_response(stream, request, status, "application/json", &body)
+}
+
+/// `POST /api/session-note` (spec 110 D7): a message sent while the session
+/// works. It is queued into the running turn, which gives it to the model at
+/// its next round boundary as the user's own message. A UI route, so it is
+/// answered while that turn runs. It only ever enters a running turn: a turn
+/// paused for an approval or a question is not running, and gets
+/// `not_working` here, so a note can never answer or approve anything.
+fn handle_session_note(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let session_id = required_form(&form, "session_id")?;
+    let text = form.get("text").map(|text| text.trim()).unwrap_or_default();
+    let (status, body) = if text.is_empty() {
+        (400, json_error("A note needs text."))
+    } else if text.len() > worker::MAX_NOTE_BYTES {
+        (
+            400,
+            json_error(&format!(
+                "A note is limited to {} KB.",
+                worker::MAX_NOTE_BYTES / 1024
+            )),
+        )
+    } else if lanes::queue_note(&session_id, text.to_string()) {
+        (
+            200,
+            serde_json::json!({ "sessionId": session_id, "status": "queued" }).to_string(),
+        )
+    } else {
+        (
+            409,
+            serde_json::json!({
+                "error": "This session has no running turn to take the message.",
+                "code": "not_working",
+                "sessionId": session_id,
+            })
+            .to_string(),
+        )
     };
     write_response(stream, request, status, "application/json", &body)
 }
@@ -3650,11 +3690,12 @@ fn run_resume_command_request(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     engine
         .chat_orchestrator
@@ -3715,11 +3756,12 @@ fn run_fetch_decision_request_with(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     engine
         .chat_orchestrator
@@ -3756,11 +3798,12 @@ fn run_verify_request(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     engine
         .chat_orchestrator
@@ -3792,11 +3835,12 @@ fn run_continue_repair_request(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     engine
         .chat_orchestrator
@@ -3848,11 +3892,12 @@ fn run_continue_task_request_with(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     engine
         .chat_orchestrator
@@ -3906,11 +3951,12 @@ fn run_resume_checks_request(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     engine
         .chat_orchestrator
@@ -3996,11 +4042,12 @@ fn run_resume_plan_request(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     if let Some(changes) = changes {
         return engine
@@ -4074,11 +4121,12 @@ fn run_resume_context_request(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     engine
         .chat_orchestrator
@@ -4163,11 +4211,12 @@ fn run_answer_question_request(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     engine
         .chat_orchestrator
@@ -4264,11 +4313,12 @@ fn resume_fallback_decision(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     engine
         .chat_orchestrator
@@ -4330,11 +4380,12 @@ fn resume_round_budget_decision(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     engine
         .chat_orchestrator
@@ -4418,8 +4469,8 @@ fn parse_plan_revision(raw: &str, repository_root: &Path) -> Result<Vec<PlanRevi
 
 /// A send failure only means the relay has gone, and the cancel token is what
 /// stops the turn in that case, so the result is deliberately discarded.
-/// `None` for progress the shell never causes: it passes no steering, so a
-/// turn it hosts never pauses or takes a note (spec 57 §5.4).
+/// `None` for progress the shell never causes: it never pauses a turn
+/// (spec 57 §5.4). Notes it does take (spec 110 D7).
 fn turn_progress_event(progress: TurnProgress) -> Option<TurnEvent> {
     match progress {
         TurnProgress::Session(session_id) => Some(TurnEvent::Session(session_id)),
@@ -4437,10 +4488,8 @@ fn turn_progress_event(progress: TurnProgress) -> Option<TurnEvent> {
         // The desktop's protected-path panel reads the engine's control model
         // from `/api/session`, so the stream has no separate card to draw. A
         // worker's own progress sink still records the typed event.
-        TurnProgress::Paused
-        | TurnProgress::Resumed
-        | TurnProgress::NoteAdded { .. }
-        | TurnProgress::ProtectedPaths(_) => None,
+        TurnProgress::NoteAdded { message_id } => Some(TurnEvent::Note(message_id)),
+        TurnProgress::Paused | TurnProgress::Resumed | TurnProgress::ProtectedPaths(_) => None,
     }
 }
 
@@ -4597,11 +4646,12 @@ fn run_chat_request_with_task(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     let turn_options = ChatTurnOptions::interactive();
     engine
@@ -4669,11 +4719,12 @@ fn run_chat_request_with(
             let _ = events.send(event);
         }
     };
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     // The desktop app is an interactive executor: the question card and
     // `/api/answer-question-stream` deliver an answer, and `fetch_url` may ask
@@ -4761,11 +4812,12 @@ fn resume_chat_command(
     let never_cancelled = CancelToken::new();
     let mut on_token = |_token: &str| {};
     let mut on_progress = |_progress: TurnProgress| {};
+    let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &never_cancelled,
-        steering: None,
+        steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
     engine
         .chat_orchestrator
@@ -6330,6 +6382,14 @@ enum TurnEvent {
     /// carries every included ref and exclusion.
     Context(Box<ContextManifest>),
     Token(String),
+    /// A note the user sent while the turn worked entered the conversation
+    /// as this user message (spec 110 D7).
+    Note(String),
+    /// Notes the turn ended without delivering, oldest first, sent just before
+    /// its `Done` or `Failed` so the window can send them as the next turn or
+    /// put them back in the composer (D7). A turn that paused carries them
+    /// to the turn that resumes it instead, and sends none.
+    NotesReturned(Vec<String>),
     Done(Box<ChatTurnResult>),
     Failed(String),
 }
@@ -6567,6 +6627,7 @@ fn round_budget_proposal_json(proposal: Option<&AgentRoundBudgetProposal>) -> St
 fn relay_turn_events<W: Write>(
     out: &mut W,
     cancel: &CancelToken,
+    notes: Option<&std::sync::Arc<lanes::NoteQueue>>,
     events: std::sync::mpsc::Receiver<TurnEvent>,
     keepalive: Duration,
 ) -> Result<(), String> {
@@ -6580,7 +6641,12 @@ fn relay_turn_events<W: Write>(
                 match &event {
                     TurnEvent::Session(session_id) => {
                         lanes::adopt_current(session_id, routes::Route::AskStream.work_label());
-                        lanes::with_current(|lane| lane.set_cancel(cancel));
+                        lanes::with_current(|lane| {
+                            lane.set_cancel(cancel);
+                            if let Some(notes) = notes {
+                                lane.set_notes(notes);
+                            }
+                        });
                     }
                     TurnEvent::Phase(phase) if !phase.label.trim().is_empty() => {
                         lanes::with_current(|lane| lane.set_label(&phase.label));
@@ -6612,6 +6678,20 @@ fn relay_turn_events<W: Write>(
                             out,
                             "token",
                             &format!("{{\"token\":\"{}\"}}", escape_json(token)),
+                        ),
+                        TurnEvent::Note(message_id) => {
+                            let text = notes.and_then(|notes| notes.delivered());
+                            write_sse_event(
+                                out,
+                                "note",
+                                &serde_json::json!({ "messageId": message_id, "text": text })
+                                    .to_string(),
+                            )
+                        }
+                        TurnEvent::NotesReturned(returned) => write_sse_event(
+                            out,
+                            "notes_returned",
+                            &serde_json::json!({ "notes": returned }).to_string(),
                         ),
                         TurnEvent::Done(result) => {
                             write_sse_event(out, "done", &chat_result_json(result))
@@ -6660,8 +6740,25 @@ where
     let (sender, receiver) = std::sync::mpsc::channel();
     let cancel = CancelToken::new();
     let worker_cancel = cancel.clone();
+    // Spec 110 D7: the turn takes notes sent while it works. Notes a paused
+    // turn of this session left are queued first, so the turn that resumes it
+    // delivers them at its first boundary.
+    let notes = lanes::NoteQueue::new();
+    let data_dir = effective_data_dir().ok();
+    if let (Some(session_id), Some(data_dir)) = (lanes::current_session(), data_dir.as_deref()) {
+        for note in lanes::take_carried_notes(data_dir, &session_id) {
+            notes.queue(note);
+        }
+    }
+    let worker_notes = std::sync::Arc::clone(&notes);
     let worker = spawn_with_shell_stack("damaian-turn", move || {
-        let event = match turn(&worker_cancel, &sender) {
+        let outcome = lanes::with_turn_notes(&worker_notes, || turn(&worker_cancel, &sender));
+        let left = worker_notes.close();
+        let returned = settle_left_notes(&outcome, left, data_dir.as_deref());
+        if !returned.is_empty() {
+            let _ = sender.send(TurnEvent::NotesReturned(returned));
+        }
+        let event = match outcome {
             Ok(result) => TurnEvent::Done(Box::new(result)),
             Err(error) => TurnEvent::Failed(error),
         };
@@ -6671,12 +6768,57 @@ where
     })
     .map_err(|error| format!("start the turn thread: {error}"))?;
 
-    lanes::with_current(|lane| lane.set_cancel(&cancel));
-    let outcome = relay_turn_events(stream, &cancel, receiver, KEEPALIVE_INTERVAL);
+    lanes::with_current(|lane| {
+        lane.set_cancel(&cancel);
+        lane.set_notes(&notes);
+    });
+    let outcome = relay_turn_events(stream, &cancel, Some(&notes), receiver, KEEPALIVE_INTERVAL);
     // Joined unconditionally: the worker owns the curl child, and leaving it
     // unreaped is how a stopped turn would keep billing tokens.
     let _ = worker.join();
     outcome
+}
+
+/// Where the notes a turn ended without delivering go (spec 110 D7). A turn
+/// paused for an approval or a question carries them to the turn that resumes
+/// it, which delivers them at its first boundary; the window gets them back
+/// otherwise: completed or failed, it sends them as the next turn; stopped, it
+/// puts them back in the composer. If they cannot be carried, they are
+/// returned rather than lost.
+fn settle_left_notes(
+    outcome: &Result<ChatTurnResult, String>,
+    left: Vec<String>,
+    data_dir: Option<&Path>,
+) -> Vec<String> {
+    if left.is_empty() {
+        return left;
+    }
+    match (outcome, data_dir) {
+        (Ok(result), Some(data_dir)) if turn_is_paused(result) => {
+            match lanes::carry_notes(data_dir, &result.session.id, &left) {
+                Ok(()) => Vec::new(),
+                Err(_) => left,
+            }
+        }
+        _ => left,
+    }
+}
+
+/// A turn waiting on a decision that resumes the same turn. A patch proposal
+/// is not one: the turn is over, and applying the patch starts no resume.
+fn turn_is_paused(result: &ChatTurnResult) -> bool {
+    !result.cancelled
+        && (result
+            .command_proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.requires_approval)
+            || result.plan_proposal.is_some()
+            || result.question_proposal.is_some()
+            || result.fetch_proposal.is_some()
+            || result.fallback_proposal.is_some()
+            || result.round_budget_proposal.is_some()
+            || result.check_batch.is_some()
+            || result.context_review.is_some())
 }
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
@@ -7893,7 +8035,8 @@ mod tests {
             written: Vec::new(),
             writes_before_failure: usize::MAX,
         };
-        relay_turn_events(&mut out, &cancel, receiver, Duration::from_millis(25)).expect("relay");
+        relay_turn_events(&mut out, &cancel, None, receiver, Duration::from_millis(25))
+            .expect("relay");
 
         let text = String::from_utf8_lossy(&out.written);
         assert!(text.contains(": keepalive"), "got {text:?}");
@@ -8061,7 +8204,8 @@ mod tests {
             written: Vec::new(),
             writes_before_failure: usize::MAX,
         };
-        relay_turn_events(&mut out, &cancel, receiver, Duration::from_millis(25)).expect("relay");
+        relay_turn_events(&mut out, &cancel, None, receiver, Duration::from_millis(25))
+            .expect("relay");
 
         let text = String::from_utf8_lossy(&out.written);
         assert!(text.contains("event: plan"), "got {text:?}");
@@ -8910,7 +9054,8 @@ mod tests {
             written: Vec::new(),
             writes_before_failure: 2,
         };
-        relay_turn_events(&mut out, &cancel, receiver, Duration::from_millis(25)).expect("relay");
+        relay_turn_events(&mut out, &cancel, None, receiver, Duration::from_millis(25))
+            .expect("relay");
 
         assert!(
             cancel.is_cancelled(),
@@ -9112,7 +9257,8 @@ mod tests {
             written: Vec::new(),
             writes_before_failure: usize::MAX,
         };
-        relay_turn_events(&mut out, &cancel, receiver, Duration::from_millis(25)).expect("relay");
+        relay_turn_events(&mut out, &cancel, None, receiver, Duration::from_millis(25))
+            .expect("relay");
 
         let text = String::from_utf8_lossy(&out.written);
         assert!(text.contains("event: error"), "got {text:?}");
@@ -14368,19 +14514,20 @@ mod tests {
         assert!(used >= 4 * 1024 * 1024);
     }
 
-    /// The shell passes no steering, so these never happen in a turn it hosts;
-    /// were one to arrive, it must not become an SSE event the UI does not know.
+    /// The shell never pauses a turn, so these never happen in a turn it
+    /// hosts; were one to arrive, it must not become an SSE event the UI does
+    /// not know. A note does stream (spec 110 D7).
     #[test]
-    fn steering_progress_streams_nothing() {
-        for progress in [
-            TurnProgress::Paused,
-            TurnProgress::Resumed,
-            TurnProgress::NoteAdded {
-                message_id: "msg_1".to_string(),
-            },
-        ] {
+    fn pause_progress_streams_nothing_and_a_note_streams() {
+        for progress in [TurnProgress::Paused, TurnProgress::Resumed] {
             assert!(turn_progress_event(progress).is_none());
         }
+        assert!(matches!(
+            turn_progress_event(TurnProgress::NoteAdded {
+                message_id: "msg_1".to_string(),
+            }),
+            Some(TurnEvent::Note(id)) if id == "msg_1"
+        ));
     }
 
     #[test]
