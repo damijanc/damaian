@@ -8901,7 +8901,14 @@ function describeUncommittedFiles(status) {
 
 // "New worker" (§5.1 Dialog), built the way `showRewindDialog` is. Resolves
 // to the spawned worker's row, or null when cancelled.
-function showNewWorkerDialog({ prompt = "", parentSessionId = "", parentTaskId = "" } = {}) {
+// `planProposalId` names the plan review the user just approved (spec 108 D7):
+// the engine snapshots its steps, so the worker does not ask for them again.
+function showNewWorkerDialog({
+  prompt = "",
+  parentSessionId = "",
+  parentTaskId = "",
+  planProposalId = "",
+} = {}) {
   const repoPath = repo();
   return new Promise((resolve) => {
     const backdrop = document.createElement("div");
@@ -9004,6 +9011,7 @@ function showNewWorkerDialog({ prompt = "", parentSessionId = "", parentTaskId =
             include_uncommitted: include ? "true" : "false",
             parent_session_id: parentSessionId,
             parent_task_id: parentTaskId,
+            plan_proposal_id: planProposalId,
           }),
         );
         const row = {
@@ -13524,12 +13532,17 @@ function appendProposals(message, payload, repo) {
   const suggestionFor = (kind, cardId) =>
     suggestion && suggestion.kind === kind && suggestion.cardId === cardId ? suggestion : null;
   let pendingCard = null;
-  const place = (field, card) => {
+  let pendingMount = null;
+  // `mount` is what is shown when it is not the card itself: a patch with a
+  // worker suggestion is the suggestion card followed by the patch card, and
+  // the patch card stays the pending decision's card.
+  const place = (field, card, mount = card) => {
     if (field === pendingField && !pendingCard) {
       pendingCard = card;
+      pendingMount = mount;
       return;
     }
-    message.body.append(card);
+    message.body.append(mount);
   };
   if (payload.commandProposal) {
     place("commandProposal", createCommandApprovalPreview(payload.commandProposal, repo));
@@ -13544,16 +13557,29 @@ function appendProposals(message, payload, repo) {
         startVerification(repo);
       },
     });
+    // Spec 108 D7: one decision at a time. The suggestion is its own card,
+    // asked first; the patch card follows after Continue here, or after a
+    // worker started, so the user can reject the patch here.
     const patchSuggestion = suggestionFor("patch", payload.patchProposal.patchId);
     if (patchSuggestion) {
-      patchCard.prepend(
-        createWorkerSuggestion(patchSuggestion, {
-          parentTaskId: payload.taskId || "",
-          handedNote: "Reject this patch here if the worker makes the change instead.",
-        }),
-      );
+      const steps = document.createElement("div");
+      steps.className = "worker-suggestion-steps";
+      const showPatch = () => {
+        patchCard.hidden = false;
+      };
+      patchCard.hidden = true;
+      const suggestionCard = createWorkerSuggestion(patchSuggestion, {
+        parentTaskId: payload.taskId || "",
+        handedNote: "Reject this patch below if the worker makes the change instead.",
+        onContinue: showPatch,
+        onHanded: showPatch,
+      });
+      suggestionCard.classList.add("worker-suggestion-card");
+      steps.append(suggestionCard, patchCard);
+      place("patchProposal", patchCard, steps);
+    } else {
+      place("patchProposal", patchCard);
     }
-    place("patchProposal", patchCard);
   }
   if (payload.checkBatch) {
     place("checkBatch", createCheckBatchCard(payload.checkBatch, repo));
@@ -13586,7 +13612,7 @@ function appendProposals(message, payload, repo) {
   }
   // Every `done` passes through here, so a turn that ended with nothing
   // pending also clears whatever the previous turn was waiting on.
-  setPendingDecision(message, pendingCard, decision);
+  setPendingDecision(message, pendingCard, decision, pendingMount);
 }
 
 // Spec 107: the decision a paused turn waits on, and the card that answers it.
@@ -13618,7 +13644,7 @@ const PENDING_DECISION_FIELDS = {
 // `message` is the bubble that raised the decision; it keeps a one-line
 // pointer. `card` may be null (a reload that has no card for it): the composer
 // still names the decision, with nothing to focus.
-function setPendingDecision(message, card, decision) {
+function setPendingDecision(message, card, decision, mount = card) {
   settlePendingDecision();
   if (!decision) return;
   let frame = null;
@@ -13632,7 +13658,8 @@ function setPendingDecision(message, card, decision) {
     frame.setAttribute("aria-label", decision.label);
     // A reloaded question is its own `article.message.question`; it moves
     // whole rather than leaving an empty article behind.
-    frame.append(card.closest(".message.question") || card);
+    const shown = mount || card;
+    frame.append(shown.closest(".message.question") || shown);
     $("chat-log").append(frame);
     if (message?.body) appendPendingPointer(message.body, decision, frame);
   }
@@ -14280,7 +14307,6 @@ function createPlanReview(
     next = document.createElement("p");
     next.className = "plan-review-next";
     next.textContent = `Next: ${proposal.deferredAction}`;
-    next.title = proposal.deferredAction;
   }
 
   // Spec 103 Task 2: the budget arrives with its title, note, rows, labels and
@@ -14351,14 +14377,16 @@ function createPlanReview(
   declineButton.className = "btn-sm btn-quiet";
   declineButton.textContent = "Decline";
   actions.append(approveButton, declineButton);
-  // Spec 107 D3 (C), replacing spec 94's always-on button: the engine suggests
-  // a worker once, for a plan whose work changes code, and never in a worker,
-  // whose card is answered in its own process. Run in a worker is spec 94's
-  // handoff: the plan becomes the worker's prompt.
+  // Spec 107 D3 (C): the engine suggests a worker once, for a plan whose work
+  // changes code, and never in a worker, whose card is answered in its own
+  // process. Spec 108 D7: one decision at a time, so the suggestion is not
+  // beside Approve/Decline; Approve swaps the card's actions for it. Continue
+  // here sends the approval; Run in a worker hands the approved plan over
+  // (spec 94's handoff). Decline never shows it.
+  const offersWorker = Boolean(
+    workerSuggestion && !decideInWorker && workersEnabled && currentSessionId,
+  );
   let suggestionRow = null;
-  if (workerSuggestion && !decideInWorker && workersEnabled && currentSessionId) {
-    suggestionRow = createWorkerSuggestion(workerSuggestion, { onRun: runInWorker });
-  }
 
   // Spec 108 D6: Decline asks first. Nothing is sent until the user answers,
   // so the card stays the pending decision (spec 107) while the question is
@@ -14506,7 +14534,18 @@ function createPlanReview(
     decide(approved, changesText).catch((error) => toast(error.message));
   }
 
-  approveButton.addEventListener("click", () => run(true));
+  approveButton.addEventListener("click", () => {
+    if (!offersWorker) {
+      run(true);
+      return;
+    }
+    suggestionRow = createWorkerSuggestion(workerSuggestion, {
+      onRun: runInWorker,
+      onContinue: () => decide(true),
+    });
+    actions.replaceWith(suggestionRow);
+    suggestionRow.querySelector("button")?.focus();
+  });
   declineButton.addEventListener("click", () => {
     if (decideInWorker) {
       run(false);
@@ -14535,6 +14574,7 @@ function createPlanReview(
       prompt,
       parentSessionId: sessionId,
       parentTaskId: taskId || proposal.plan?.taskId || "",
+      planProposalId: proposal.proposalId,
     });
     if (!started) return null;
     await api(
@@ -14546,15 +14586,12 @@ function createPlanReview(
       }),
     );
     setControlsDisabled(true);
-    output.hidden = false;
-    output.replaceChildren(createWorkerLink(started, "Handed to"));
     await loadSessions(sessionId, false);
     return started;
   }
 
   wrapper.append(header, note);
   if (next) wrapper.append(next);
-  if (suggestionRow) wrapper.append(suggestionRow);
   if (budgetSection) wrapper.append(budgetSection);
   wrapper.append(list, actions, changes, output);
   return wrapper;
@@ -14564,11 +14601,13 @@ function createPlanReview(
 // worker, with the engine's labels. **Run in a worker** is spec 94's handoff —
 // the New worker dialog, prefilled — through `onRun` when the card has its own
 // (the plan review hands the plan over), else with the engine's prompt.
-// **Continue here** only dismisses the row: the engine records the offer, so
-// the task is not asked again, and continuing is what the session does anyway.
+// **Continue here** runs `onContinue` (the plan review sends its approval; a
+// patch shows its card) and removes the row; the engine records the offer, so
+// the task is not asked again. A failed `onContinue` leaves the row answerable.
+// `onHanded` runs once a worker has started.
 function createWorkerSuggestion(
   suggestion,
-  { onRun = null, parentTaskId = "", handedNote = "" } = {},
+  { onRun = null, onContinue = null, onHanded = null, parentTaskId = "", handedNote = "" } = {},
 ) {
   const row = document.createElement("section");
   row.className = "worker-suggestion";
@@ -14591,7 +14630,18 @@ function createWorkerSuggestion(
   actions.append(run, stay);
   row.append(title, note, actions);
 
-  stay.addEventListener("click", () => row.remove());
+  stay.addEventListener("click", async () => {
+    run.disabled = true;
+    stay.disabled = true;
+    try {
+      if (onContinue) await onContinue();
+      row.remove();
+    } catch (error) {
+      run.disabled = false;
+      stay.disabled = false;
+      toast(error.message);
+    }
+  });
   run.addEventListener("click", async () => {
     run.disabled = true;
     stay.disabled = true;
@@ -14613,6 +14663,7 @@ function createWorkerSuggestion(
       handed.append(createWorkerLink(started, "Handed to"));
       if (handedNote) handed.append(document.createTextNode(` ${handedNote}`));
       row.replaceChildren(handed);
+      onHanded?.(started);
       if (!onRun) await loadSessions(currentSessionId, false);
     } catch (error) {
       run.disabled = false;

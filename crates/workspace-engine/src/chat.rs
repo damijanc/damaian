@@ -71,8 +71,8 @@ use crate::request_preparation::{
 };
 use crate::secret_scanner::SecretScanner;
 use crate::session::{
-    CallModel, ChatMessage, PendingApprovalRef, Session, SessionStore, Task, TaskStatus, TaskUsage,
-    validate_plan_approval,
+    CallModel, ChatMessage, HandedPlan, PendingApprovalRef, Session, SessionStore, Task,
+    TaskStatus, TaskUsage, validate_plan_approval,
 };
 use crate::stagnation::{RepairStall, detect_repair_stall, repair_state_entry};
 use crate::steering::TurnSteering;
@@ -6108,10 +6108,13 @@ impl ChatOrchestrator {
             .unwrap_or_else(|| pending.task.user_prompt.clone());
         let mut prompt = request.trim().to_string();
         if !steps.is_empty() {
+            // Spec 108 D7: Run in a worker is offered only after Approve, so
+            // the plan is handed over approved. The engine, not this text,
+            // decides that: the spawn snapshots the approval, and a plan with
+            // other steps is reviewed in the worker as usual.
             prompt.push_str(
-                "\n\nThis work was handed over from another session, which drafted this plan. \
-                 The user has not approved it yet: they review it here, before your first change. \
-                 Propose it as your plan with propose_plan, these steps in this order, then work through it:\n",
+                "\n\nThis work was handed over from another session, where the user approved this plan. \
+                 Propose it as your plan with propose_plan, these steps with these exact titles in this order, then work through it:\n",
             );
             for (index, step) in steps.iter().enumerate() {
                 prompt.push_str(&format!("{}. {step}\n", index + 1));
@@ -6165,7 +6168,7 @@ impl ChatOrchestrator {
             &pending.session.id,
             Some(&pending.task.id),
             "assistant",
-            "Handed to a worker. It runs the plan in its own worktree and asks you to approve the plan there before its first change; nothing changed here.",
+            "Handed to a worker. It runs the approved plan in its own worktree; nothing changed here.",
         )?;
         self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
         // The review is resolved by the hand-off, so clear the durable pending
@@ -6186,6 +6189,119 @@ impl ChatOrchestrator {
         CompletionGateService::new(&self.session_store, &repository_root)
             .settle(&task, CompletionSettlement::Gate)?;
         Ok(())
+    }
+
+    /// The approved plan a worker started from a plan review is handed
+    /// (spec 108 D7): the review's outstanding step titles, as the engine
+    /// holds them. Read-only, like [`Self::plan_worker_prompt`], so a spawn
+    /// that fails leaves the review answerable.
+    ///
+    /// The card offers **Run in a worker** only after **Approve**, so the spawn
+    /// request that names the review is the user's approval of it, just as
+    /// `approved=true` on the plan decision route is. It must name the
+    /// session and task the review belongs to.
+    pub fn approved_plan_handoff(
+        &self,
+        proposal_id: &str,
+        parent_session_id: &str,
+        parent_task_id: &str,
+        approved_by: &str,
+    ) -> Result<HandedPlan> {
+        let pending = self.pending_commands.load(proposal_id)?;
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::PlanReview)?;
+        if pending.session.id != parent_session_id || pending.task.id != parent_task_id {
+            return Err(ClientError::InvalidInput(format!(
+                "{proposal_id} is not the plan review of that session and task"
+            )));
+        }
+        let steps: Vec<String> = self
+            .session_store
+            .read_task_plan(&pending.session.id, &pending.task.id)?
+            .map(|plan| {
+                plan.steps
+                    .into_iter()
+                    .filter(|step| !step.status.is_terminal())
+                    .map(|step| step.title)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if steps.is_empty() {
+            return Err(ClientError::InvalidInput(format!(
+                "{proposal_id} has no outstanding steps to hand over"
+            )));
+        }
+        Ok(HandedPlan {
+            parent_session_id: parent_session_id.to_string(),
+            parent_task_id: parent_task_id.to_string(),
+            proposal_id: proposal_id.to_string(),
+            steps,
+            approved_by: approved_by.to_string(),
+        })
+    }
+
+    /// Approves a worker's freshly proposed plan when it is the plan the user
+    /// approved before handing it over (spec 108 D7), and returns the note the
+    /// model gets with the `propose_plan` result. `None` leaves the plan to the
+    /// review gate as usual.
+    ///
+    /// Only a durable worker record and the spawn's [`HandedPlan`] snapshot
+    /// count — never the prompt — and only for the worker's first task, with
+    /// exactly the handed step titles in order. A worker plan is approved with
+    /// the budget its review would have offered, which the card returns
+    /// unchanged (spec 103), so the allowance is the one the review proposes.
+    fn approve_handed_plan(
+        &self,
+        session: &Session,
+        task: &Task,
+        plan: &crate::plan::TaskPlan,
+    ) -> Result<Option<String>> {
+        let Some(record) = self.session_store.worker_record(&session.id)? else {
+            return Ok(None);
+        };
+        let Some(handed) = self.session_store.handed_plan(&session.id)? else {
+            return Ok(None);
+        };
+        if record.parent_session_id.as_deref() != Some(handed.parent_session_id.as_str()) {
+            return Ok(None);
+        }
+        let first_task = self
+            .session_store
+            .read_tasks(&session.id)?
+            .first()
+            .map(|first| first.id == task.id)
+            .unwrap_or(false);
+        let titles: Vec<&str> = plan.steps.iter().map(|step| step.title.as_str()).collect();
+        if !first_task || titles != handed.steps {
+            return Ok(None);
+        }
+        let budget = self
+            .worker_task_budget_review(&session.id)?
+            .map(|review| review.budget);
+        match budget {
+            Some(budget) => {
+                self.session_store
+                    .approve_plan_with_budget(task, &handed.approved_by, &budget)?
+            }
+            None => self.session_store.approve_plan(task, &handed.approved_by)?,
+        }
+        self.audit_log.record(
+            "plan_review_decision",
+            &[
+                ("actor", handed.approved_by.clone()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
+                ("proposalId", handed.proposal_id.clone()),
+                ("parentSessionId", handed.parent_session_id.clone()),
+                ("decision", "approved_before_handoff".to_string()),
+            ],
+        )?;
+        let mut note = "The user approved this plan before handing it to you; it does not need another review. Work through it."
+            .to_string();
+        if let Some(budget) = budget {
+            note.push_str("\n\n");
+            note.push_str(&budget.approval_note());
+        }
+        Ok(Some(note))
     }
 
     /// Continues a chat turn that stopped to have its plan reviewed before
@@ -12009,17 +12125,25 @@ impl ChatOrchestrator {
                                 self.session_store.create_plan(&task, &proposed)?;
                                 // A replaced plan's approval was for the old steps.
                                 plan_approved = false;
+                                // Spec 108 D7: the plan the user approved before
+                                // handing it to this worker is not reviewed twice.
+                                let handed_note =
+                                    self.approve_handed_plan(&session, &task, &proposed)?;
+                                if handed_note.is_some() {
+                                    plan_approved = true;
+                                }
                                 sink.plan(&proposed);
                                 let summary = format!("Planned {} steps.", proposed.steps.len());
                                 let first = proposed.steps[0].title.clone();
                                 plan = Some(proposed);
-                                (
-                                    summary,
-                                    format!(
-                                        "Plan recorded. The current step is: {first}. Call complete_step when its work is done."
-                                    ),
-                                    ActionOutcome::Ok,
-                                )
+                                let mut result = format!(
+                                    "Plan recorded. The current step is: {first}. Call complete_step when its work is done."
+                                );
+                                if let Some(note) = handed_note {
+                                    result.push_str("\n\n");
+                                    result.push_str(&note);
+                                }
+                                (summary, result, ActionOutcome::Ok)
                             }
                         }
                         ToolAction::CompleteStep => match plan.as_mut() {

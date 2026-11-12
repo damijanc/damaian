@@ -856,3 +856,131 @@ fn a_plan_with_a_foreign_task_id_is_refused_before_the_write() {
     assert_eq!(worker.task.status, TaskStatus::WaitingForApproval);
     assert!(proposal.id.starts_with("planreview"));
 }
+
+// --- Spec 108 D7: a plan approved before the handoff --------------------------
+
+fn worker_session_of(engine: &WorkspaceEngine, repo: &Path, parent: &str) -> Session {
+    let session = engine
+        .session_store
+        .create_session(&repository_id_for_root(repo), "Worker")
+        .expect("a worker session should be created");
+    engine
+        .session_store
+        .record_worker_spawned(
+            &session.id,
+            &WorkerRecord {
+                parent_session_id: Some(parent.to_string()),
+                parent_task_id: None,
+                inherited_protected_paths: Vec::new(),
+                source_repository: repo.to_path_buf(),
+                worktree_path: repo.to_path_buf(),
+                branch: "main".to_string(),
+                base_commit: "0000000".to_string(),
+                included_uncommitted: false,
+                git_commands: Vec::new(),
+            },
+        )
+        .expect("the worker record should be written");
+    session
+}
+
+/// Approve, then Run in a worker: the worker proposes the plan it was handed
+/// and goes on to its first change without a second plan review, approved
+/// with the budget its review would have offered. The snapshot comes from the
+/// parent's paused review, never from the prompt.
+#[test]
+fn a_plan_approved_before_the_handoff_is_not_reviewed_again_in_the_worker() {
+    let repo = temp_repo("handed-approved");
+    let engine = engine_for(&repo, |_| {});
+    let parent = ask_in_new_session(&engine, &repo);
+    let proposal = parent
+        .plan_proposal
+        .clone()
+        .expect("the parent plan review");
+
+    let refused = engine.chat_orchestrator.approved_plan_handoff(
+        &proposal.id,
+        &parent.session.id,
+        "task_other",
+        "tester",
+    );
+    assert!(refused.is_err(), "another task's review is not handed over");
+
+    let handed = engine
+        .chat_orchestrator
+        .approved_plan_handoff(&proposal.id, &parent.session.id, &parent.task.id, "tester")
+        .expect("the approved plan is snapshotted");
+    assert_eq!(
+        handed.steps,
+        [
+            "Read the retry helper",
+            "Add a bounded backoff",
+            "Rewrite the scheduler"
+        ]
+    );
+
+    let worker = worker_session_of(&engine, &repo, &parent.session.id);
+    engine
+        .session_store
+        .record_handed_plan(&worker.id, &handed)
+        .unwrap();
+    let result = ask(&engine, &repo, Some(&worker.id));
+    assert!(
+        result.plan_proposal.is_none(),
+        "the handed plan is not reviewed again"
+    );
+    assert!(
+        result.patch_proposal.is_some(),
+        "the worker went on to its first change"
+    );
+    assert!(
+        engine
+            .session_store
+            .read_plan_approved(&worker.id, &result.task.id)
+            .unwrap()
+    );
+    let offered = engine.config.task_budget_policy();
+    assert_eq!(
+        engine
+            .session_store
+            .read_task_budget(&worker.id, &result.task.id)
+            .unwrap(),
+        Some(workspace_engine::TaskBudgetReview::from_policy(&offered).budget),
+        "approved with the budget its review would have offered"
+    );
+}
+
+/// A worker that proposes other steps than the ones handed to it meets the
+/// review gate as usual: the approval was for those steps only.
+#[test]
+fn a_worker_plan_other_than_the_handed_one_is_reviewed() {
+    let repo = temp_repo("handed-other");
+    let engine = engine_for(&repo, |_| {});
+    let parent = ask_in_new_session(&engine, &repo);
+    let proposal = parent
+        .plan_proposal
+        .clone()
+        .expect("the parent plan review");
+    let mut handed = engine
+        .chat_orchestrator
+        .approved_plan_handoff(&proposal.id, &parent.session.id, &parent.task.id, "tester")
+        .unwrap();
+    handed.steps.pop();
+
+    let worker = worker_session_of(&engine, &repo, &parent.session.id);
+    engine
+        .session_store
+        .record_handed_plan(&worker.id, &handed)
+        .unwrap();
+    let result = ask(&engine, &repo, Some(&worker.id));
+    assert!(
+        result.plan_proposal.is_some(),
+        "a different plan is reviewed"
+    );
+    assert!(
+        !engine
+            .session_store
+            .read_plan_approved(&worker.id, &result.task.id)
+            .unwrap()
+    );
+}

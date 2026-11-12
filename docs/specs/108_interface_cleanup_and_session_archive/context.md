@@ -120,4 +120,16 @@ sessions (2026-11-09/10, v0.64.0–v0.66.0) and their session logs.
   as today). The engine's suggest-once-per-task rule (spec 107 D3) is
   unchanged. Also on the same card: a hover tooltip ("Preparing an edit: …")
   covers the suggestion's first line; drop the redundant `title` causing it.
+  *As built (Task 9, 2026-11-12):* the handoff did need fixing — the worker's
+  prompt said "The user has not approved it yet" and its own plan gate paused
+  again. Now `/api/workers` takes `plan_proposal_id`; the engine's
+  `approved_plan_handoff` checks it names the parent session's and task's
+  paused plan review and snapshots its open step titles as a `HandedPlan`,
+  which the spawn writes to the worker's log (`worker_plan_handed`) before the
+  process starts. In the worker, a first-task `propose_plan` with exactly
+  those titles in order is approved at once (`approve_plan_with_budget` with
+  the policy budget the review would have offered, audited as
+  `plan_review_decision` `approved_before_handoff`), and the model is told in
+  the tool result. Other steps meet the review gate as usual. The prompt text
+  never grants anything.
 

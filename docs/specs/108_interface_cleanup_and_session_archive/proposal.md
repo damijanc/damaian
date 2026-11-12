@@ -1,6 +1,6 @@
 # Feature Spec: Interface Cleanup and Session Archive
 
-Status: In progress (started 2026-11-10; Tasks 1, 3, 4, 5, 6 and 8 done; Tasks 1–9 in [tasks.md](tasks.md))
+Status: In progress (started 2026-11-10; Tasks 1, 3, 4, 5, 6, 8 and 9 done; Tasks 1–9 in [tasks.md](tasks.md))
 Order: 108 of 108
 Plan: none. Written from the owner's 2026-11-09/10 dogfooding of spec 33; the
 decisions and code survey are in [context.md](context.md).

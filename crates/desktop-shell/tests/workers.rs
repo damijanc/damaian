@@ -79,6 +79,7 @@ fn spawn(supervisor: &Supervisor, config: &Config, repo: &Path, prompt: &str) ->
                 include_uncommitted: false,
                 parent_session_id: None,
                 parent_task_id: None,
+                handed_plan: None,
             },
             KEY,
         )

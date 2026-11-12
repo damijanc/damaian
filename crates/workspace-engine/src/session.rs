@@ -138,6 +138,26 @@ pub struct WorkerRecord {
     pub git_commands: Vec<String>,
 }
 
+/// A plan the user approved in a parent session and handed to a worker
+/// (spec 108 D7): **Approve**, then **Run in a worker**.
+///
+/// Snapshotted by the engine from the parent's paused plan review, never from
+/// the worker's prompt, which the user may edit and the model reads. The
+/// worker's first task counts its own plan as approved only when it proposes
+/// exactly these step titles, in this order; any other plan meets the review
+/// gate as usual.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandedPlan {
+    pub parent_session_id: String,
+    pub parent_task_id: String,
+    /// The parent's plan review the approval answered.
+    pub proposal_id: String,
+    /// The outstanding step titles the user approved, in order.
+    pub steps: Vec<String>,
+    pub approved_by: String,
+}
+
 /// One worker result returned to its parent session (spec 100).
 ///
 /// Built by the worker's turn driver from its own [`WorkerRecord`] and final
@@ -2397,6 +2417,37 @@ impl SessionStore {
             .iter()
             .filter(|event| event.event_type == "worker_spawned")
             .filter(|event| event.payload.get("workerSessionId").is_none())
+            .filter_map(|event| serde_json::from_value(event.payload.clone()).ok())
+            .next_back())
+    }
+
+    /// Records, in a worker's own log, the plan the user approved in the
+    /// parent session before handing it to this worker (spec 108 D7).
+    ///
+    /// Written by the spawn, before the worker process starts, so the worker's
+    /// first turn always finds it. A separate event rather than a field on
+    /// [`WorkerRecord`]: the record describes where the worker runs, this is a
+    /// decision the user took about its work.
+    pub fn record_handed_plan(&self, worker_session_id: &str, handed: &HandedPlan) -> Result<()> {
+        let mut payload = serde_json::to_value(handed)
+            .map_err(|error| crate::error::ClientError::InvalidInput(error.to_string()))?;
+        payload["sessionId"] = serde_json::Value::from(worker_session_id);
+        self.append_session_event(
+            worker_session_id,
+            "worker_plan_handed",
+            &payload.to_string(),
+        )
+    }
+
+    /// The plan the user approved before handing it to this worker, if any.
+    pub fn handed_plan(&self, session_id: &str) -> Result<Option<HandedPlan>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        Ok(parsed_events(&content)
+            .0
+            .iter()
+            .filter(|event| event.event_type == "worker_plan_handed")
             .filter_map(|event| serde_json::from_value(event.payload.clone()).ok())
             .next_back())
     }

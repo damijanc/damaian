@@ -138,6 +138,7 @@ fn run_through_real_worker(provider: &Provider) -> LiveRun {
                 include_uncommitted: false,
                 parent_session_id: Some(parent.id.clone()),
                 parent_task_id: None,
+                handed_plan: None,
             },
             &provider.api_key,
         )

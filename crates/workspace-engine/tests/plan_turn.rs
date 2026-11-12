@@ -3400,10 +3400,14 @@ fn a_plan_under_review_is_handed_to_a_worker() {
         prompt.contains("1. Read the retry helper\n2. Add a bounded backoff"),
         "{prompt}"
     );
-    // Handing over is not an approval: the worker's own review is the one
-    // that counts, so the prompt must not claim the user approved the plan.
-    assert!(prompt.contains("has not approved it yet"), "{prompt}");
-    assert!(!prompt.contains("user reviewed this plan"), "{prompt}");
+    // Spec 108 D7: Run in a worker is offered only after Approve, so the
+    // prompt says the plan was approved. The approval itself is the spawn's
+    // engine snapshot (`approved_plan_handoff`), not this text.
+    assert!(
+        prompt.contains("where the user approved this plan"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("has not approved it yet"), "{prompt}");
     let revised = engine
         .chat_orchestrator
         .plan_worker_prompt(
@@ -3459,7 +3463,7 @@ fn a_plan_under_review_is_handed_to_a_worker() {
         .expect("a hand-over note");
     assert!(
         note.content
-            .contains("asks you to approve the plan there before its first change"),
+            .contains("It runs the approved plan in its own worktree"),
         "{}",
         note.content
     );

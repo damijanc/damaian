@@ -265,7 +265,7 @@ pub use request_preparation::{
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
     ARCHIVE_RUNNING_WORKER_REFUSAL, ActionMarker, ArchivedFilter, CallModel, ChatMessage,
-    ConsumedWorkerReturn, ContextPin, ContinuedTask, DanglingAction, ExportFormat,
+    ConsumedWorkerReturn, ContextPin, ContinuedTask, DanglingAction, ExportFormat, HandedPlan,
     PatchFileDecision, PendingApprovalRef, PlanApproval, SearchOptions, Session, SessionSearchHit,
     SessionSearchResult, SessionStore, Task, TaskModel, TaskStatus, TaskTerminalSettlement,
     TaskUsage, TurnNotes, WorkerRecord, WorkerReturn, validate_plan_approval,

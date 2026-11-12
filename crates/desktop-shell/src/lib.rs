@@ -10170,7 +10170,7 @@ mod tests {
             "the plan card has no always-on worker button: {plan}"
         );
         assert!(
-            plan.contains("if (workerSuggestion && !decideInWorker && workersEnabled"),
+            plan.contains("workerSuggestion && !decideInWorker && workersEnabled"),
             "{plan}"
         );
         assert!(plan.contains("\"/api/plan-to-worker\""), "{plan}");
@@ -10190,6 +10190,91 @@ mod tests {
             !row.contains("Run in a worker") && !row.contains("Continue here"),
             "labels come from the engine: {row}"
         );
+    }
+
+    /// Spec 108 D7: one decision at a time. The plan card renders Approve and
+    /// Decline only; Approve with the engine's suggestion swaps the actions for
+    /// it (Continue here sends the approval, Run in a worker hands the plan
+    /// over named by its review), Approve without one resumes directly, and
+    /// Decline never shows it. At a patch the suggestion is its own card,
+    /// before the patch card, which is hidden until the user has answered.
+    #[test]
+    fn the_plan_card_asks_one_decision_at_a_time() {
+        let card = app_js_function("createPlanReview");
+        assert_eq!(
+            card.matches("createWorkerSuggestion(").count(),
+            1,
+            "the suggestion is built in one place: {card}"
+        );
+        assert!(
+            !card.contains("wrapper.append(suggestionRow")
+                && !card.contains("if (suggestionRow) wrapper.append"),
+            "never rendered with the card's own actions: {card}"
+        );
+        let approve = card
+            .split("approveButton.addEventListener(\"click\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  });").next())
+            .expect("the approve handler");
+        assert!(approve.contains("if (!offersWorker)"), "{approve}");
+        assert!(approve.contains("run(true)"), "{approve}");
+        assert!(
+            approve.contains("createWorkerSuggestion(workerSuggestion"),
+            "{approve}"
+        );
+        assert!(
+            approve.contains("actions.replaceWith(suggestionRow)"),
+            "{approve}"
+        );
+        assert!(
+            approve.contains("onContinue: () => decide(true)"),
+            "{approve}"
+        );
+        assert!(approve.contains("onRun: runInWorker"), "{approve}");
+        for handler in ["declineButton", "sendButton", "declineOnlyButton"] {
+            let body = card
+                .split(&format!("{handler}.addEventListener(\"click\""))
+                .nth(1)
+                .and_then(|rest| rest.split("});").next())
+                .expect("a decline handler");
+            assert!(
+                !body.contains("Suggestion") && !body.contains("suggestion"),
+                "{handler} never offers a worker: {body}"
+            );
+        }
+        assert!(
+            card.contains("planProposalId: proposal.proposalId"),
+            "the handoff names the approved review: {card}"
+        );
+        assert!(
+            !card.contains("next.title"),
+            "no tooltip over the Next line: {card}"
+        );
+        let dialog = app_js_function("showNewWorkerDialog");
+        assert!(
+            dialog.contains("plan_proposal_id: planProposalId"),
+            "{dialog}"
+        );
+
+        let row = app_js_function("createWorkerSuggestion");
+        assert!(row.contains("if (onContinue) await onContinue()"), "{row}");
+        assert!(row.contains("onHanded?.(started)"), "{row}");
+
+        let proposals = app_js_function("appendProposals");
+        assert!(!proposals.contains("patchCard.prepend("), "{proposals}");
+        assert!(proposals.contains("patchCard.hidden = true"), "{proposals}");
+        assert!(
+            proposals.contains("steps.append(suggestionCard, patchCard)"),
+            "the suggestion precedes the patch card: {proposals}"
+        );
+        assert!(proposals.contains("onContinue: showPatch"), "{proposals}");
+        assert!(proposals.contains("onHanded: showPatch"), "{proposals}");
+        assert!(
+            proposals.contains("place(\"patchProposal\", patchCard, steps)"),
+            "the patch card stays the pending decision's card: {proposals}"
+        );
+        let css = include_str!("../static/style.css");
+        assert!(css.contains(".worker-suggestion-steps > [hidden]"), "{css}");
     }
 
     /// Spec 108 D3, the UI half: Archive in both session menus and the
@@ -10373,7 +10458,9 @@ mod tests {
         }
         // The kind comes from the engine, and the call clears a stale one.
         assert!(append.contains("payload.turnPresentation?.pendingDecision"));
-        assert!(append.contains("setPendingDecision(message, pendingCard, decision)"));
+        assert!(
+            append.contains("setPendingDecision(message, pendingCard, decision, pendingMount)")
+        );
         // A verification report is a result, not a decision: it stays put.
         assert!(append.contains("message.body.append(\n      createVerificationReportCard("));
 
@@ -17745,6 +17832,7 @@ exec /bin/cat > /dev/null
                             include_uncommitted: false,
                             parent_session_id: parent.map(str::to_string),
                             parent_task_id: None,
+                            handed_plan: None,
                         },
                         KEY,
                     )
@@ -17987,6 +18075,7 @@ exec /bin/cat > /dev/null
                         include_uncommitted: false,
                         parent_session_id: Some(parent.clone()),
                         parent_task_id: Some(task.id.clone()),
+                        handed_plan: None,
                     },
                     KEY,
                 )
@@ -18031,6 +18120,7 @@ exec /bin/cat > /dev/null
                         include_uncommitted: false,
                         parent_session_id: Some(other_parent),
                         parent_task_id: Some(task.id),
+                        handed_plan: None,
                     },
                     KEY,
                 )
@@ -18072,6 +18162,7 @@ exec /bin/cat > /dev/null
                         include_uncommitted: false,
                         parent_session_id: Some(parent.clone()),
                         parent_task_id: Some(task.id.clone()),
+                        handed_plan: None,
                     },
                     KEY,
                 )
@@ -18157,6 +18248,96 @@ exec /bin/cat > /dev/null
             fixture.supervisor.shutdown_all();
         }
 
+        /// Spec 108 D7: Run in a worker after Approve names the plan review it
+        /// approved. The spawn records the engine's snapshot of that review's
+        /// steps in the worker's log before the worker starts; a review of
+        /// another task is refused before any worker state exists.
+        #[test]
+        fn a_worker_started_after_approve_carries_the_approved_plan() {
+            let fixture = Fixture::new();
+            let parent = fixture.parent("Parent");
+            let engine = workspace_engine::WorkspaceEngine::new(fixture.config.clone());
+            let call = |name: &str, arguments: &str| workspace_engine::ToolCall {
+                id: format!("call_{name}"),
+                name: name.to_string(),
+                arguments_json: arguments.to_string(),
+            };
+            let mut adapter = workspace_engine::MockModelAdapter::new_sequence_with_tool_calls(
+                vec![String::new(), String::new()],
+                vec![
+                    vec![call(
+                        "propose_plan",
+                        r#"{"steps":[{"title":"Read the README"},{"title":"Fix the typo"}]}"#,
+                    )],
+                    vec![call(
+                        "propose_patch",
+                        r#"{"summary":"Fix","files":[{"path":"README.md","content":"fixed\n"}]}"#,
+                    )],
+                ],
+            );
+            let cancel = workspace_engine::CancelToken::new();
+            let mut on_token = |_token: &str| {};
+            let mut on_progress = |_event: workspace_engine::TurnProgress| {};
+            let mut sink = super::turn_sink(&cancel, &mut on_token, &mut on_progress);
+            let paused = engine
+                .chat_orchestrator
+                .ask_with_session(
+                    &fixture.repo,
+                    "Fix the typo in the README",
+                    &[],
+                    Some(&parent),
+                    &mut adapter,
+                    &mut sink,
+                )
+                .expect("the turn pauses on its plan");
+            let proposal = paused.plan_proposal.expect("a plan review");
+            let repo = fixture.repo.to_str().unwrap();
+
+            let refused = fixture.route(
+                "POST",
+                "/api/workers",
+                &[],
+                &[
+                    ("repo", repo),
+                    ("prompt", "Fix the typo"),
+                    ("parent_session_id", &parent),
+                    ("parent_task_id", "task_other"),
+                    ("plan_proposal_id", &proposal.id),
+                ],
+            );
+            assert_eq!(refused.err().map(|refusal| refusal.status), Some(400));
+            assert!(
+                fixture.store().worker_children(&parent).unwrap().is_empty(),
+                "refused before any worker state"
+            );
+
+            let started = fixture
+                .route(
+                    "POST",
+                    "/api/workers",
+                    &[],
+                    &[
+                        ("repo", repo),
+                        ("prompt", "Fix the typo"),
+                        ("parent_session_id", &parent),
+                        ("parent_task_id", &paused.task.id),
+                        ("plan_proposal_id", &proposal.id),
+                    ],
+                )
+                .expect("the worker starts");
+            let worker = started["sessionId"].as_str().unwrap();
+            let handed = fixture
+                .store()
+                .handed_plan(worker)
+                .unwrap()
+                .expect("the approved plan is on the worker's log");
+            assert_eq!(handed.steps, ["Read the README", "Fix the typo"]);
+            assert_eq!(handed.proposal_id, proposal.id);
+            assert_eq!(handed.approved_by, "desktop_user");
+
+            fixture.supervisor.shutdown_all();
+        }
+
         /// A crafted handoff cannot move repository-relative protections from
         /// one repository into a worker for another. The check runs before the
         /// worktree, branch, session and audit records exist, and applies even
@@ -18192,6 +18373,7 @@ exec /bin/cat > /dev/null
                             include_uncommitted: false,
                             parent_session_id: Some(parent.clone()),
                             parent_task_id,
+                            handed_plan: None,
                         },
                         KEY,
                     )
@@ -18235,6 +18417,7 @@ exec /bin/cat > /dev/null
                         include_uncommitted: false,
                         parent_session_id: Some(parent.clone()),
                         parent_task_id: Some(task.id.clone()),
+                        handed_plan: None,
                     },
                     KEY,
                 )
@@ -18268,6 +18451,7 @@ exec /bin/cat > /dev/null
                     include_uncommitted: false,
                     parent_session_id: None,
                     parent_task_id: None,
+                    handed_plan: None,
                 },
                 KEY,
             );

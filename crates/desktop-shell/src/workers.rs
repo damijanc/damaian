@@ -27,9 +27,10 @@ use workspace_engine::worktree::{
     RemoveOutcome, create_worker_worktree, remove_worker_worktree, source_changes,
 };
 use workspace_engine::{
-    AuditLog, Config, ProcessIdentity, ProcessKind, ProcessRegistry, RegistrationHandle,
-    SecretScanner, Session, SessionMode, SessionStore, TaskControl, TaskControlService, TaskStatus,
-    WorkerBoardGroup, WorkerProcessState, WorkerRecord, WorkerTaskFacts,
+    AuditLog, Config, HandedPlan, ProcessIdentity, ProcessKind, ProcessRegistry,
+    RegistrationHandle, SecretScanner, Session, SessionMode, SessionStore, TaskControl,
+    TaskControlService, TaskStatus, WorkerBoardGroup, WorkerProcessState, WorkerRecord,
+    WorkerTaskFacts,
 };
 
 /// How long the supervisor waits at each step. Only tests change these.
@@ -70,6 +71,10 @@ pub struct SpawnRequest {
     /// protected paths are snapshotted for the worker; the prompt itself is
     /// never parsed (spec 98).
     pub parent_task_id: Option<String>,
+    /// The plan the user approved before handing it over (spec 108 D7),
+    /// snapshotted by the engine from the parent's plan review. Recorded in
+    /// the worker's log before its process starts.
+    pub handed_plan: Option<HandedPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +178,12 @@ impl Supervisor {
         } else if request.parent_task_id.is_some() {
             return Err("A worker's parent task needs a parent session.".to_string());
         }
+        if let Some(handed) = &request.handed_plan
+            && (request.parent_session_id.as_deref() != Some(handed.parent_session_id.as_str())
+                || request.parent_task_id.as_deref() != Some(handed.parent_task_id.as_str()))
+        {
+            return Err("A handed plan must come from the worker's parent task.".to_string());
+        }
         // Snapshot only the parent task's already-durable resolved paths. The
         // worker prompt may be model-generated, so it is never read for this.
         let inherited_protected_paths = match (&request.parent_session_id, &request.parent_task_id)
@@ -245,6 +256,11 @@ impl Supervisor {
         if let Some(parent) = &record.parent_session_id {
             store
                 .record_worker_child(parent, &session.id)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(handed) = &request.handed_plan {
+            store
+                .record_handed_plan(&session.id, handed)
                 .map_err(|error| error.to_string())?;
         }
 
@@ -832,20 +848,45 @@ pub(crate) fn route(
             Ok(json!({"paths": changes.paths, "mentioned": changes.mentioned}).to_string())
         }
         ("POST", "/api/workers") => {
+            let repo = required(request.form, "repo")?;
+            let optional = |name: &str| {
+                request
+                    .form
+                    .get(name)
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            };
+            let parent_session_id = optional("parent_session_id");
+            let parent_task_id = optional("parent_task_id");
+            // Spec 108 D7: Run in a worker after Approve names the plan
+            // review it approved; the engine snapshots that review's steps.
+            let handed_plan = match optional("plan_proposal_id") {
+                None => None,
+                Some(proposal_id) => {
+                    let (Some(parent), Some(task)) = (&parent_session_id, &parent_task_id) else {
+                        return Err(Refusal::new(
+                            400,
+                            "A handed plan needs its parent session and task.",
+                        ));
+                    };
+                    // The route's own config: the pending review lives in its
+                    // data directory, which repository config cannot move.
+                    let engine = workspace_engine::WorkspaceEngine::new(config.clone());
+                    Some(
+                        engine
+                            .chat_orchestrator
+                            .approved_plan_handoff(&proposal_id, parent, task, "desktop_user")
+                            .map_err(|error| Refusal::new(400, error.to_string()))?,
+                    )
+                }
+            };
             let spawn = SpawnRequest {
-                repo: PathBuf::from(required(request.form, "repo")?),
+                repo: PathBuf::from(repo),
                 prompt: required(request.form, "prompt")?,
                 include_uncommitted: is_true(request.form, "include_uncommitted"),
-                parent_session_id: request
-                    .form
-                    .get("parent_session_id")
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty()),
-                parent_task_id: request
-                    .form
-                    .get("parent_task_id")
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty()),
+                parent_session_id,
+                parent_task_id,
+                handed_plan,
             };
             let key = api_key(config).map_err(|error| Refusal::new(400, error))?;
             let spawned = supervisor

@@ -5666,6 +5666,22 @@ body.worker-view #chat-model-menu {
   gap: 6px;
 }
 
+/* Spec 108 D7: at a patch the suggestion is its own card, asked before the
+   patch card is shown. The patch card's own `display` would beat the UA
+   `[hidden]` rule, so hide it explicitly. */
+.worker-suggestion-steps {
+  display: grid;
+  gap: 8px;
+}
+
+.worker-suggestion-steps > .worker-suggestion {
+  margin-bottom: 0;
+}
+
+.worker-suggestion-steps > [hidden] {
+  display: none;
+}
+
 .plan-budget-review {
   display: grid;
   gap: 4px;

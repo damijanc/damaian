@@ -8,6 +8,16 @@ Plan: none. A gap reported in use, like #73–#93: an exception to the rule in
 Depends on: [#21](21_task_plan_progress_and_budget/proposal.md) (plan review)
 and [#57](57_worker_sessions/proposal.md) (workers), both built.
 
+> **2026-11-12, spec 108 D7:** **Run in a worker** is no longer beside
+> Approve and Decline. It is offered only after **Approve**, when the engine
+> suggests a worker (spec 107 D3), so the plan is handed over approved: the
+> prompt says the user approved it, the spawn records the engine's snapshot of
+> the review's open steps in the worker's log (`worker_plan_handed`), and the
+> worker's first plan with exactly those step titles is approved without a
+> second review (with the budget its review would have offered). Any other
+> plan is reviewed in the worker as before. Step 2's "has not approved it yet"
+> and step 4's note text below are superseded.
+
 ## 1. Motivation
 
 On 2026-10-31 a spec-sized task ran in the user's main checkout instead of in
@@ -32,7 +42,8 @@ worker.
    - the plan's open steps, as the card has them, edits included;
    - an instruction to propose them as the worker's plan and work through
      them. It says the plan was drafted in another session and that the user
-     has not approved it yet.
+     has not approved it yet. *(Superseded 2026-11-12 by spec 108 D7: the
+     plan is handed over approved; see the note at the top.)*
 3. The dialog is the user's click (#57 §5.1). Cancelling it leaves the card
    waiting, and nothing is recorded.
 4. Once the worker has started:
