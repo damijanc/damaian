@@ -276,6 +276,49 @@ partly fixed by spec 107 D3), 86 (main-checkout test-process overhead) and 89
 - **D7 — visibility.** One running-state component for checks and baselines:
   card header indicator, Cancel replacing the run button, the status line and the
   composer line from the same state (fixes OBSERVATIONS 89).
+- **D10 — a build check after every change (owner, 2026-11-13).** Evidence:
+  spec 33 Task 1 restart (session `session_18e7536110829758_18676_13`): step 1
+  took nine patches over about two hours and 440 model calls; every
+  per-change verification ended `nothing_verified` because the step's check
+  (`cargo nextest run -p workspace-engine --test permission_profiles`) was
+  deferred to the open step (D4, "deferral wins"); compiled out of band, the
+  tree had 7 errors (functions called but never written, a destructure missing
+  the new fields). D4 stays: a step's tests still wait for its end. Added
+  beside it:
+  - **What it is.** A plan step may name a `build` check beside its
+    `check`: the same `PlannedCheck` shape (command, working directory,
+    purpose), compile or type-check only, expected to take seconds on an
+    incremental build. The planning prompt asks for one per step whenever the
+    project has such a command, found the way D9 finds checks (CI files, build
+    targets, README) and written as one command (`cargo check -p <crate>
+    --tests`, `tsc --noEmit`, `go build ./...`, `mvn -q compile`, `make
+    build`). Fast path: when the step names none and the touched root has a
+    detected Cargo manifest, Damaian uses `cargo check --tests` for the owning
+    package; any other detected manifest may add its own later. No language
+    list decides anything (D9).
+  - **When it runs.** In every per-change verification, first, for each root
+    the change touched that has a build check (the current step's, else the
+    fast path), whatever D4 then defers or runs. Reuse (D6) applies: an
+    unchanged tree does not build twice. It is not run at completion, where
+    the floor compiles anyway.
+  - **What it records.** Its own event, `verification_build {check,
+    outcome, errors}`, and no `CheckRun`, so the completion gate, D4's
+    deferral, the step's later `CommandExit` and provenance never read it. The
+    report and panel show a "Build" row ("builds", or "does not build: N
+    errors").
+  - **On failure.** The verification ends with the new outcome
+    `build_failed`; no baseline (D1 is for checks whose provenance matters; a
+    build error after a change is the change's to fix). The continuation turn
+    gets the compiler's errors — secret-redacted, the first errors in full and
+    a count of the rest, bounded like command output — with "your change does
+    not build"; errors located only in files the task never changed are
+    marked as such, since they may be pre-existing. The turn continues; no card
+    is shown for a failure.
+  - **Approval.** The build command goes through the command policy like any
+    check; it asks the first time, and D5's **Approve for this session**
+    covers the rest of the session once Task 5 lands (a build writes only
+    ignored build output, so it qualifies). Until then it may ask per patch,
+    which is still cheaper than two hours without a compiler.
 - **D9 — verification with no detected check (owner, 2026-11-12: "it is not a
   definite list").** Damaian detects checks from seven manifest files
   (`PROJECT_MANIFESTS`), so a project in any other ecosystem (Haskell, Clojure,

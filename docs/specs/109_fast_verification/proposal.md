@@ -1,6 +1,6 @@
 # Feature Spec: Fast Verification
 
-Status: In progress (started 2026-11-11; Tasks 1–3 done; Tasks 1–8 in [tasks.md](tasks.md))
+Status: In progress (started 2026-11-11; Tasks 1–3 done; Tasks 1–9 in [tasks.md](tasks.md))
 Order: 109 of 109
 Plan: none. Written from the owner's spec 33 Task 1 run on Damaian v0.69.0
 (2026-11-11); the code survey and decisions are in [context.md](context.md).
@@ -90,6 +90,20 @@ check in the same task; and a result for an unchanged tree is already known.
    build targets or README) and by checks the user configures for it, not left
    at "no checks available".
 
+9. **Every change is compiled at once** (owner, 2026-11-13: "write up the
+   compile check"). Deferring a step's tests to the end of the step (D4) left
+   the model with no compiler feedback at all while it worked: in the spec 33
+   Task 1 restart, nine patches over two hours went in without one build, and
+   the tree had seven compile errors the model did not know about. After every
+   applied change, a fast **build check** for the root the change touched runs
+   — compile only, no tests — and a failure goes straight back to the model as
+   "your change does not build", with the compiler's errors. Which command is
+   the build check is named by the plan (the model knows the project), with a
+   fast path where Damaian detects the project; never from a list of languages
+   (context D10). A build check is feedback, never evidence: it does not
+   satisfy a required check, does not take a baseline, and does not change what
+   the completion gate requires.
+
 ## 3. Non-goals
 
 - Changing what the completion gate requires or how provenance is classified.
@@ -110,6 +124,11 @@ check in the same task; and a result for an unchanged tree is already known.
 - A second run of the same check in the same task asks no approval; a different
   command or directory still asks; a new task asks again.
 - An unchanged tree reuses the recorded result.
+- After every applied patch in a planned task, the step's build check runs
+  before anything else; a build failure reaches the model in the same turn with
+  the compiler's errors and no baseline; a passing build is shown as "builds"
+  and is never counted as a required check's evidence (engine test, and a
+  deterministic eval scenario whose second patch breaks the build).
 - On Damaian's own repository, the spec 33 Task 1 shape (one small engine patch)
   costs one scoped check run per patch and one floor run at the end — measured
   and recorded in tasks.md against the 2026-11-11 run.

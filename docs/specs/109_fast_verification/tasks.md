@@ -26,6 +26,7 @@ survey are in [`context.md`](context.md).
 | 4 · Rerun only the failing tests (D3) | Not started | — |
 | 5 · Approve for this session (D5) | Not started | — |
 | 6 · Running state and Stop for every running action (D7, D8) | Not started | — |
+| 9 · A build check after every change (D10) | Not started | — |
 | 8 · Verification with no detected check (D9) | Not started | — |
 | 7 · Measurement, documentation and close-out | Not started | — |
 
@@ -128,6 +129,36 @@ Checks: scoped clippy; the policy tests and `--test plan_turn`;
 
 Files: `app.js`, `style.css`, `lib.rs` (if the stream needs a field), tests.
 Checks: web checks; `cargo nextest run -p desktop-shell`.
+
+## Task 9 · A build check after every change (D10)
+
+Ready now: depends only on Task 2 (done). Highest value of the open tasks for a
+running Damaian; build it before Tasks 4, 6 and 8 unless one of them is already
+in progress. Task 5 later removes its per-patch approval.
+
+- [ ] `PlannedCheck` gains an optional per-step `build` (plan format version
+      bump, old plans load without one); `propose_plan` and the plan review
+      card carry and show it; the planning prompt asks for one per step.
+- [ ] Fast path: no step build check and a detected Cargo root → `cargo check
+      --tests` for the owning package.
+- [ ] `verify_due`'s per-change branch runs the build checks first, with reuse
+      (D6), recording `verification_build` (no `CheckRun`); a failure ends the
+      verification `build_failed` with no baseline and hands the bounded,
+      redacted errors to the continuation turn, marking errors outside the
+      task's changed files.
+- [ ] Report and panel: a "Build" row.
+- [ ] Tests: a passing build is never gate or `complete_step` evidence; a
+      failing build reaches the next model request with its errors and takes no
+      baseline; an unchanged tree builds once; a step without a build check on a
+      Cargo root uses the fast path; a non-Cargo root without one runs none; a
+      deterministic eval scenario whose second patch breaks the build (update
+      both scenario counts in `eval-harness/tests/harness.rs`).
+
+Files: `plan.rs`, `chat.rs` (`verify_due`, the planning prompt),
+`verification.rs`, `validation.rs`, `app.js` (plan card, report row), tests,
+eval scenario. Checks: scoped clippy; `cargo nextest run -p workspace-engine
+--test verification_loop --test plan_turn --test closed_task_completion`;
+`cargo nextest run -p desktop-shell`; deterministic eval; web checks.
 
 ## Task 8 · Verification with no detected check (D9)
 
