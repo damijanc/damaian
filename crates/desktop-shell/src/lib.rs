@@ -9732,20 +9732,38 @@ mod tests {
             list.contains("(workers || []).filter((row) => !row.archived)"),
             "{list}"
         );
-        assert!(
-            list.contains("renderArchivedEntry(projectPath, archived)"),
-            "{list}"
-        );
 
-        let entry = app_js_function("renderArchivedEntry");
-        assert!(entry.contains("`Archived (${entries.length})`"), "{entry}");
-        assert!(entry.contains("if (!open) return [toggle];"), "{entry}");
-        let archived_row = app_js_function("renderArchivedSession");
-        assert!(archived_row.contains("loadSession(id)"), "{archived_row}");
-        assert!(archived_row.contains("\"Unarchive\""), "{archived_row}");
+        // Moved into the project's own ⋮ menu (2026-11-13): the Archived
+        // entry no longer sits as its own row in the session list, even
+        // collapsed. Opening one is still Open; unarchiving it is the thread
+        // header's own menu, which `sessionArchiveMenuItem` already covers,
+        // so the drilled-in row itself only opens the session.
         assert!(
-            archived_row.contains("setSessionArchived(projectPath, { id, title }, false)"),
-            "{archived_row}"
+            !list.contains("Archived ("),
+            "the session list must not render the Archived entry inline: {list}"
+        );
+        let project_menu = app_js_function("toggleProjectMenu");
+        assert!(
+            project_menu.contains("archivedProjectMenuItem(projectPath)"),
+            "{project_menu}"
+        );
+        let item = app_js_function("archivedProjectMenuItem");
+        assert!(item.contains("`Archived (${entries.length})`"), "{item}");
+        assert!(
+            item.contains("hidden: entries.length === 0"),
+            "an empty project shows no Archived row: {item}"
+        );
+        assert!(
+            item.contains(
+                "if (!sessions && !workers) return { label: \"Archived\", hidden: true };"
+            ),
+            "a project never expanded this session has no count to show: {item}"
+        );
+        let row = app_js_function("archivedProjectMenuRow");
+        assert!(row.contains("loadSession(id)"), "{row}");
+        assert!(
+            !row.contains("\"Unarchive\""),
+            "unarchiving an opened archived session is the thread menu's job, not this row's: {row}"
         );
 
         let search = app_js_function("renderSessionSearchResults");

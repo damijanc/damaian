@@ -1197,8 +1197,50 @@ function toggleProjectMenu(projectPath, anchorEl) {
       // §5.1 Entry points: from the sidebar, empty and without a parent. The
       // board is the header ⋮'s Workers, for every project (spec 95).
       [{ label: "New worker", action: "new-worker", hidden: !workersEnabled }],
+      [archivedProjectMenuItem(projectPath)],
     ],
   });
+}
+
+// Spec 108 D3 moved here (2026-11-13): the Archived entry no longer sits as
+// its own row in the session list, even collapsed — it drills into the
+// project's own menu instead, beside Rename and Delete. Hidden (not shown
+// disabled) until the project has been expanded at least once, the same
+// condition the old inline toggle had: `projectSessionsByPath` is only
+// populated then (loadProjectSessions runs from the expanded branch of
+// renderProjectList). A row opens that session or worker; unarchiving it is
+// the thread header's own ⋮ menu once it is open (`sessionArchiveMenuItem`,
+// already session-aware), so this menu does not duplicate that action.
+function archivedProjectMenuItem(projectPath) {
+  const sessions = projectSessionsByPath.get(projectPath);
+  const workers = workerRowsByProject.get(projectPath);
+  if (!sessions && !workers) return { label: "Archived", hidden: true };
+  const entries = archivedSidebarEntries(sessions || [], workers || []);
+  return {
+    label: `Archived (${entries.length})`,
+    action: "archived",
+    hidden: entries.length === 0,
+    items: [entries.map((entry) => archivedProjectMenuRow(projectPath, entry))],
+  };
+}
+
+function archivedProjectMenuRow(projectPath, entry) {
+  const id = entry.session ? entry.session.id : entry.row.sessionId;
+  const title = entry.session ? entry.session.title : entry.row.title;
+  return {
+    label: title,
+    action: `archived-${id}`,
+    onSelect: entry.session
+      ? runSessionAction(async () => {
+          await switchProject(projectPath, {
+            preferredSessionId: id,
+            reloadSelected: false,
+          });
+          await loadSession(id);
+          renderProjectList();
+        })
+      : () => openWorkerSession(id, { source: projectPath }),
+  };
 }
 
 async function handleProjectMenuAction(action, projectPath) {
@@ -11641,8 +11683,7 @@ function renderProjectList() {
           sessions.filter((session) => !session.archived),
           (workers || []).filter((row) => !row.archived),
         );
-        const archived = archivedSidebarEntries(sessions, workers || []);
-        if (!entries.length && !archived.length) {
+        if (!entries.length && !archivedSidebarEntries(sessions, workers || []).length) {
           const empty = document.createElement("p");
           empty.className = "project-session-empty";
           empty.textContent = "No sessions yet";
@@ -11655,9 +11696,6 @@ function renderProjectList() {
               : renderProjectWorker(projectPath, entry.row, { nested: entry.nested }),
           );
         });
-        if (archived.length) {
-          sessionsList.append(...renderArchivedEntry(projectPath, archived));
-        }
       }
       group.append(sessionsList);
     }
@@ -11720,75 +11758,12 @@ function renderProjectSession(projectPath, session) {
   return row;
 }
 
-// Projects whose Archived entry is open. Not stored: the entry starts
-// collapsed in every window, as D3 asks.
-const expandedArchivedProjects = new Set();
-
 // A project's archived sessions and workers, most recently active first.
 function archivedSidebarEntries(sessions, rows) {
   return [
     ...sessions.filter((session) => session.archived).map((session) => ({ session })),
     ...rows.filter((row) => row.archived).map((row) => ({ row })),
   ].sort((a, b) => (b.session || b.row).updatedAtMs - (a.session || a.row).updatedAtMs);
-}
-
-// The collapsed "Archived (N)" toggle and, when open, one row per archived
-// session with Open (its title) and Unarchive.
-function renderArchivedEntry(projectPath, entries) {
-  const open = expandedArchivedProjects.has(projectPath);
-  const toggle = document.createElement("button");
-  toggle.type = "button";
-  toggle.className = "project-archived-toggle";
-  toggle.setAttribute("aria-expanded", String(open));
-  toggle.textContent = `Archived (${entries.length})`;
-  toggle.addEventListener("click", () => {
-    if (open) expandedArchivedProjects.delete(projectPath);
-    else expandedArchivedProjects.add(projectPath);
-    renderProjectList();
-  });
-  if (!open) return [toggle];
-  return [toggle, ...entries.map((entry) => renderArchivedSession(projectPath, entry))];
-}
-
-function renderArchivedSession(projectPath, entry) {
-  const id = entry.session ? entry.session.id : entry.row.sessionId;
-  const title = entry.session ? entry.session.title : entry.row.title;
-  const row = document.createElement("div");
-  row.className = "session-item project-session-item project-archived-item";
-  row.dataset.sessionId = id;
-  row.dataset.projectPath = projectPath;
-  if (projectPath === repo() && id === currentSessionId && !workersBoardOpen) {
-    row.classList.add("active");
-  }
-  const openButton = document.createElement("button");
-  openButton.type = "button";
-  openButton.className = "project-session-open";
-  openButton.textContent = title;
-  openButton.title = `Open ${title}`;
-  openButton.addEventListener(
-    "click",
-    entry.session
-      ? runSessionAction(async () => {
-          await switchProject(projectPath, {
-            preferredSessionId: id,
-            reloadSelected: false,
-          });
-          await loadSession(id);
-          renderProjectList();
-        })
-      : () => openWorkerSession(id, { source: projectPath }),
-  );
-  const unarchive = document.createElement("button");
-  unarchive.type = "button";
-  unarchive.className = "btn-sm project-unarchive-btn";
-  unarchive.textContent = "Unarchive";
-  unarchive.setAttribute("aria-label", `Unarchive ${title}`);
-  unarchive.addEventListener(
-    "click",
-    runSessionAction(() => setSessionArchived(projectPath, { id, title }, false)),
-  );
-  row.append(openButton, unarchive);
-  return row;
 }
 
 // Spec 108 D3: archive or unarchive through the shell, which keeps the
