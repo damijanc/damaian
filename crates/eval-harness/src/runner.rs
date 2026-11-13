@@ -61,6 +61,10 @@ pub struct Run {
     /// review was answered with changes (spec 108 D6). Deterministic tier only,
     /// like `answer_request`.
     pub plan_changes_request: Option<String>,
+    /// The message contents of the first model request made after a build
+    /// check failed (spec 109 D10). `None` when no build failed. Deterministic
+    /// tier only, like `answer_request`.
+    pub build_failure_request: Option<String>,
     /// The report the verification continuation produced, when the scenario
     /// asked for one (spec 23 Task 9). `None` for every other scenario.
     pub verification: Option<VerificationReport>,
@@ -168,17 +172,21 @@ fn apply_eval_patch(
 
 /// The harness's answer to a check card. A failed check's baseline card (spec
 /// 109 D1, the card with its own title) follows [`baseline_approved`]; an
-/// ordinary check card follows the scenario's check decisions, and a check it
-/// does not name is declined.
+/// ordinary check card and a build card (spec 109 D10) follow the scenario's
+/// check decisions, and a check it does not name is declined.
 fn card_decisions(
     scenario: &Scenario,
     batch: &workspace_engine::AgentCheckBatch,
 ) -> Vec<(String, bool)> {
+    let baseline_card = batch
+        .title
+        .as_deref()
+        .is_some_and(|title| title != workspace_engine::BUILD_CHECK_CARD_TITLE);
     batch
         .checks
         .iter()
         .map(|check| {
-            let approved = if batch.title.is_some() {
+            let approved = if baseline_card {
                 baseline_approved(scenario, &check.command)
             } else {
                 scenario
@@ -312,6 +320,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     run.continuation_request = continuation_request(&run.trace, &adapter.requests);
     run.answer_request = answer_request(&run.trace, &adapter.requests);
     run.plan_changes_request = plan_changes_request(&run.trace, &adapter.requests);
+    run.build_failure_request = build_failure_request(&run.trace, &adapter.requests);
     (run.compacted_request, run.compacted_system_prompt) = compacted_requests(&adapter.requests);
     run.pinned_state_unchanged = pinned_state_survived(&run.trace, &adapter.requests);
     run.request = adapter.requests.first().map(flattened_request);
@@ -434,6 +443,23 @@ fn plan_changes_request(trace: &Trace, requests: &[ModelRequest]) -> Option<Stri
             && event.field("decision") == Some("changes_requested")
     })?;
     let index = trace.events[..answered_at]
+        .iter()
+        .filter(|event| event.event_type == "model_request_prepared")
+        .count();
+    requests.get(index).map(flattened_request)
+}
+
+/// The request that followed the first failed build check, flattened. Located
+/// by the engine's own `verification_build_recorded` audit event whose
+/// `result` names a build failure (spec 109 D10). `None` when no build failed.
+fn build_failure_request(trace: &Trace, requests: &[ModelRequest]) -> Option<String> {
+    let failed_at = trace.events.iter().position(|event| {
+        event.event_type == "verification_build_recorded"
+            && event
+                .field("result")
+                .is_some_and(|result| result.starts_with("does not build"))
+    })?;
+    let index = trace.events[..failed_at]
         .iter()
         .filter(|event| event.event_type == "model_request_prepared")
         .count();
@@ -742,6 +768,7 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
         continuation_request: None,
         answer_request: None,
         plan_changes_request: None,
+        build_failure_request: None,
         verification: None,
         verification_baselines: BTreeMap::new(),
         last_assistant_message: None,
@@ -1638,7 +1665,10 @@ fn drive(
         }
         let session_id = result.session.id.clone();
         let mut current = None;
-        for _ in 0..8 {
+        // Each card answered takes one pass, and since spec 109 D10 every
+        // per-change verification in a Cargo fixture may ask for its build
+        // check first, so a repair loop needs twice the passes it did.
+        for _ in 0..16 {
             let turn = match current.take() {
                 Some(turn) => turn,
                 None => {
@@ -1689,7 +1719,7 @@ fn drive(
         }
         if verification.is_none() {
             return Err(ClientError::InvalidInput(format!(
-                "{}: verification did not reach a report in 8 continuations",
+                "{}: verification did not reach a report in 16 continuations",
                 scenario.name
             )));
         }
@@ -2097,6 +2127,7 @@ fn drive(
         continuation_request: None,
         answer_request: None,
         plan_changes_request: None,
+        build_failure_request: None,
         verification,
         verification_baselines,
         last_assistant_message,

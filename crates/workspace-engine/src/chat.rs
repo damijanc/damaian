@@ -98,10 +98,11 @@ use crate::validation::{
 };
 use crate::vector_index::VectorIndexCache;
 use crate::verification::{
-    CheckId, CheckOutcome, CheckReuse, CheckTermination, FailureProvenance, FindingEvidence,
-    Selection, SkipReason, VerificationEvent, VerificationOutcome, VerificationReport,
-    detected_checks_of_roots, environment_termination, fold_verification, propose_checks_exactly,
-    propose_completion_checks, propose_scoped_checks, scoped_selection, with_plan_checks,
+    BuildErrors, BuildRecord, CheckId, CheckOutcome, CheckReuse, CheckTermination,
+    FailureProvenance, FindingEvidence, Selection, SkipReason, VerificationEvent,
+    VerificationOutcome, VerificationReport, build_checks_for_change, detected_checks_of_roots,
+    environment_termination, fold_verification, propose_checks_exactly, propose_completion_checks,
+    propose_scoped_checks, scoped_selection, with_plan_checks,
 };
 use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
@@ -2597,18 +2598,6 @@ impl ChatOrchestrator {
                 "No verification is due in this session".to_string(),
             ));
         };
-        // Requirement 9's "once per batch" skip compares against checks from
-        // this task's own continuation chain, never every task in the session:
-        // two independent plans can both sit at generation 0, and a check an
-        // unrelated task ran must not suppress this one.
-        let chain = self
-            .session_store
-            .task_continuation_chain(session_id, &due.task_id)?;
-        let scoped_state = fold_verification(
-            events
-                .iter()
-                .filter(|event| chain.contains(event.task_id())),
-        );
         // A repair patch whose every file the user rejected left the failing
         // attempt open and nothing to verify. It closes as
         // `no_repair_applied`, and the attempt count does not increase: no
@@ -2683,7 +2672,50 @@ impl ChatOrchestrator {
             .session_store
             .update_task_status(&task, TaskStatus::Validating, None)?;
         sink.session(&session.id);
+        self.verify_with_task(
+            repository_root,
+            session,
+            task,
+            due,
+            attempt,
+            Vec::new(),
+            model_adapter,
+            sink,
+        )
+    }
 
+    /// Selects and runs a due verification's checks in its verification task:
+    /// the build checks first for a per-change run (spec 109 D10), then the
+    /// checks. `builds_done` are build checks already decided on a build card
+    /// and run, so a resumed verification does not ask for them again.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_with_task(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        due: crate::verification::VerificationDue,
+        attempt: u32,
+        builds_done: Vec<BuildRecord>,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let session_id = session.id.as_str();
+        let events = self
+            .session_store
+            .read_verification_events(session_id, &[])?;
+        // Requirement 9's "once per batch" skip compares against checks from
+        // this task's own continuation chain, never every task in the session:
+        // two independent plans can both sit at generation 0, and a check an
+        // unrelated task ran must not suppress this one.
+        let chain = self
+            .session_store
+            .task_continuation_chain(session_id, &due.task_id)?;
+        let scoped_state = fold_verification(
+            events
+                .iter()
+                .filter(|event| chain.contains(event.task_id())),
+        );
         let changed = self.verification_changed_files(session_id, &task.id, Some(&due))?;
         let file_hashes = hash_existing_files(repository_root, &changed);
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
@@ -2717,6 +2749,54 @@ impl ChatOrchestrator {
         // run stands, passed or failed. A check the plan defers to an open step
         // is left to that step, as it would be if it were proposed.
         let generation = plan.as_ref().map_or(0, TaskPlan::mutation_generation);
+        // Spec 109 D10: a per-change run compiles first, for each root the
+        // change touched that has a build check (the current step's, else the
+        // Cargo fast path), whatever D4 then defers or runs. Not at
+        // completion, where the floor compiles anyway. A build that fails ends
+        // the verification here: nothing else is proposed or run, and no
+        // baseline is taken.
+        let mut builds = Vec::new();
+        if !at_completion && due.checks.is_empty() {
+            let step_build = match plan.as_ref() {
+                Some(plan)
+                    if self
+                        .session_store
+                        .read_plan_approved(session_id, &task.id)? =>
+                {
+                    plan_current_step_build(repository_root, plan)
+                }
+                _ => None,
+            };
+            let build_checks = build_checks_for_change(&map, &changed, step_build.as_ref());
+            match self.run_build_checks(
+                repository_root,
+                &session,
+                &task,
+                &due,
+                attempt,
+                &build_checks,
+                builds_done,
+                &scoped_state,
+                &changed,
+                &file_hashes,
+                generation,
+                sink,
+            )? {
+                BuildStage::Paused(result) => return Ok(*result),
+                BuildStage::Done(records) => builds = records,
+            }
+            if builds.iter().any(BuildRecord::failed) {
+                return self.finish_build_failed(
+                    repository_root,
+                    session,
+                    task,
+                    attempt,
+                    &builds,
+                    changed,
+                    file_hashes,
+                );
+            }
+        }
         let mut reuse = CheckReuse::from_state(&scoped_state, &file_hashes, generation);
         if let Some(plan) = plan.as_ref() {
             reuse.retain(|check| !plan_defers_check(repository_root, plan, check));
@@ -2819,6 +2899,7 @@ impl ChatOrchestrator {
                     task,
                     attempt,
                     VerificationOutcome::OnlyDocumentationChanged,
+                    &builds,
                     changed,
                     file_hashes,
                 ),
@@ -2828,6 +2909,7 @@ impl ChatOrchestrator {
                     task,
                     attempt,
                     VerificationOutcome::NoChecksAvailable,
+                    &builds,
                     changed,
                     file_hashes,
                 ),
@@ -2838,6 +2920,7 @@ impl ChatOrchestrator {
                     due,
                     attempt,
                     checks,
+                    &builds,
                     reused,
                     displaced_deferred,
                     left_to_completion,
@@ -2863,6 +2946,7 @@ impl ChatOrchestrator {
             due,
             attempt,
             checks,
+            &builds,
             reused,
             displaced_deferred,
             left_to_completion,
@@ -3152,6 +3236,20 @@ impl ChatOrchestrator {
             .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
         let generation = plan.mutation_generation();
 
+        if let Some(stage) = batch.builds.clone() {
+            return self.resume_build_stage(
+                &pending,
+                &batch,
+                stage,
+                decisions,
+                approved_by,
+                task,
+                generation,
+                model_adapter,
+                sink,
+            );
+        }
+
         for pending_check in &batch.checks {
             let Some((_, approved)) = decisions
                 .iter()
@@ -3230,6 +3328,9 @@ impl ChatOrchestrator {
         due: crate::verification::VerificationDue,
         attempt: u32,
         checks: Vec<(CheckId, CommandProposal)>,
+        // Build checks that ran (or were reused) before this selection, all
+        // of which built (spec 109 D10). Recorded after `Started`.
+        builds: &[BuildRecord],
         // Checks not proposed because their recorded run covered exactly the
         // current tree (spec 109 D6). Recorded, never run.
         reused: Vec<CheckId>,
@@ -3302,6 +3403,7 @@ impl ChatOrchestrator {
                 checks: selected,
             },
         )?;
+        self.record_builds(&session, &task, builds)?;
         for check in &reused {
             self.session_store.append_verification_event(
                 &session.id,
@@ -3372,6 +3474,7 @@ impl ChatOrchestrator {
                     completed_at_ms: None,
                     evidence: Vec::new(),
                     check: None,
+                    build: None,
                 });
                 step_id
             };
@@ -3392,6 +3495,7 @@ impl ChatOrchestrator {
                     completed_at_ms: None,
                     evidence: Vec::new(),
                     check: None,
+                    build: None,
                 }),
             }
             reset_verify_step(&mut plan, &step_id);
@@ -3489,6 +3593,7 @@ impl ChatOrchestrator {
                 awaiting,
                 changed,
                 file_hashes,
+                None,
             );
         }
         self.finish_verification(
@@ -3752,6 +3857,362 @@ impl ChatOrchestrator {
         Ok(())
     }
 
+    /// Runs a per-change verification's build checks before anything else
+    /// (spec 109 D10).
+    ///
+    /// Each check in `checks` is taken from `done` (decided on a build card
+    /// and run for this same tree), reused when its latest run in the task
+    /// chain covered exactly this tree (D6), recorded as not run when the
+    /// policy blocks it, or run now. One that needs approval parks the turn on
+    /// a build card before anything else is proposed; the resume comes back
+    /// here through [`Self::verify_with_task`]. The first failure stops the
+    /// stage: nothing after it is proposed.
+    #[allow(clippy::too_many_arguments)]
+    fn run_build_checks(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        due: &crate::verification::VerificationDue,
+        attempt: u32,
+        checks: &[CheckId],
+        mut done: Vec<BuildRecord>,
+        scoped_state: &crate::verification::VerificationState,
+        changed: &[String],
+        file_hashes: &BTreeMap<String, String>,
+        generation: u32,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<BuildStage> {
+        let mut records: Vec<BuildRecord> = Vec::new();
+        let mut awaiting = Vec::new();
+        for check in checks {
+            if records.iter().any(BuildRecord::failed) {
+                break;
+            }
+            // A decided build for a tree that has changed since is built again.
+            if let Some(position) = done
+                .iter()
+                .position(|record| &record.check == check && &record.file_hashes == file_hashes)
+            {
+                records.push(done.remove(position));
+                continue;
+            }
+            if let Some(previous) =
+                crate::verification::reusable_build(scoped_state, check, file_hashes, generation)
+            {
+                let mut record = previous.clone();
+                record.reused = true;
+                self.audit_log.record(
+                    "verification_build_reused",
+                    &[
+                        ("actor", "system".to_string()),
+                        ("sessionId", session.id.clone()),
+                        ("taskId", task.id.clone()),
+                        ("command", check.command.clone()),
+                        ("workingDirectory", check.working_directory.clone()),
+                    ],
+                )?;
+                records.push(record);
+                continue;
+            }
+            let working_directory = if check.working_directory.is_empty() {
+                repository_root.to_path_buf()
+            } else {
+                repository_root.join(&check.working_directory)
+            };
+            let proposal = self.validation_orchestrator.propose_build_check(
+                repository_root,
+                &working_directory,
+                &check.command,
+            )?;
+            if proposal.blocked {
+                let reason = if proposal.reasons.is_empty() {
+                    "blocked by command policy".to_string()
+                } else {
+                    proposal.reasons.join("; ")
+                };
+                records.push(BuildRecord {
+                    check: check.clone(),
+                    outcome: CheckOutcome::Skipped(SkipReason::Blocked { reason }),
+                    file_hashes: file_hashes.clone(),
+                    generation,
+                    errors: None,
+                    reused: false,
+                });
+                continue;
+            }
+            if proposal.requires_approval {
+                awaiting.push(PendingCheckDecision {
+                    proposal_id: proposal.id.clone(),
+                    // A build check owns no plan step: it is never evidence.
+                    step_id: String::new(),
+                    working_directory: check.working_directory.clone(),
+                    command: check.command.clone(),
+                });
+                continue;
+            }
+            records.push(self.run_build_check(
+                repository_root,
+                task,
+                check,
+                &proposal,
+                false,
+                "policy",
+                changed,
+                file_hashes,
+                generation,
+                sink,
+            )?);
+        }
+        if !awaiting.is_empty() && !records.iter().any(BuildRecord::failed) {
+            let result = self.pause_for_check_batch(
+                repository_root,
+                session.clone(),
+                task.clone(),
+                due.clone(),
+                attempt,
+                awaiting,
+                changed.to_vec(),
+                file_hashes.clone(),
+                Some(PendingBuildStage { done: records }),
+            )?;
+            return Ok(BuildStage::Paused(Box::new(result)));
+        }
+        Ok(BuildStage::Done(records))
+    }
+
+    /// Runs one build check and reads the compiler's errors from its output
+    /// (spec 109 D10). No plan step, no findings in the log, no `CheckRun`: a
+    /// build is feedback for the model, never evidence. The errors come from
+    /// the same parsers a check's findings do, so they are secret-redacted
+    /// and bounded the same way.
+    #[allow(clippy::too_many_arguments)]
+    fn run_build_check(
+        &self,
+        repository_root: &Path,
+        task: &Task,
+        check: &CheckId,
+        proposal: &CommandProposal,
+        approved: bool,
+        approved_by: &str,
+        changed: &[String],
+        file_hashes: &BTreeMap<String, String>,
+        generation: u32,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<BuildRecord> {
+        sink.phase(
+            PhaseKind::Tool,
+            running_command_label(&proposal.command),
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        let record = |outcome: CheckOutcome, errors: Option<BuildErrors>| BuildRecord {
+            check: check.clone(),
+            outcome,
+            file_hashes: file_hashes.clone(),
+            generation,
+            errors,
+            reused: false,
+        };
+        let cancel = sink.cancel;
+        let on_progress = &mut *sink.on_progress;
+        let mut on_output = |line: &str| {
+            on_progress(TurnProgress::Phase(TurnPhase::new(
+                PhaseKind::Output,
+                line,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )));
+        };
+        let run = match self.validation_orchestrator.run_proposal(
+            &proposal.id,
+            approved,
+            approved_by,
+            Some(&task.id),
+            cancel,
+            &mut on_output,
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                let Some(termination) = environment_termination(&error) else {
+                    return Err(error);
+                };
+                return Ok(record(CheckOutcome::Environment { termination }, None));
+            }
+        };
+        let execution = &run.execution;
+        let exit_code = execution.exit_code;
+        let outcome = CheckOutcome::Ran {
+            exit_code,
+            marker_id: execution.id.clone(),
+            termination: Some(CheckTermination::from_command(
+                execution.termination,
+                exit_code,
+            )),
+        };
+        let errors = (!outcome.is_passed()).then(|| {
+            let findings = findings_from_execution(execution, &default_parsers(), &self.scanner);
+            BuildErrors::from_findings(
+                repository_root,
+                Path::new(&execution.working_directory),
+                &findings,
+                changed,
+            )
+        });
+        Ok(record(outcome, errors))
+    }
+
+    /// Appends a `verification_build` event for each build, after the
+    /// verification's `Started` (spec 109 D10).
+    fn record_builds(&self, session: &Session, task: &Task, builds: &[BuildRecord]) -> Result<()> {
+        for build in builds {
+            self.session_store.append_verification_event(
+                &session.id,
+                &VerificationEvent::build(&task.id, build),
+            )?;
+            self.audit_log.record(
+                "verification_build_recorded",
+                &[
+                    ("actor", "system".to_string()),
+                    ("sessionId", session.id.clone()),
+                    ("taskId", task.id.clone()),
+                    ("check", build.check.label()),
+                    ("result", build.label()),
+                    ("reused", build.reused.to_string()),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Ends a per-change verification whose change does not build (spec 109
+    /// D10): nothing else was selected or run, no baseline is taken, and the
+    /// outcome is `build_failed`. The continuation turn receives the errors
+    /// (`continue_task_after_verification`); no card is shown.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_build_failed(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        attempt: u32,
+        builds: &[BuildRecord],
+        changed: Vec<String>,
+        file_hashes: BTreeMap<String, String>,
+    ) -> Result<ChatTurnResult> {
+        self.finish_verification_without_checks(
+            repository_root,
+            session,
+            task,
+            attempt,
+            VerificationOutcome::BuildFailed,
+            builds,
+            changed,
+            file_hashes,
+        )
+    }
+
+    /// Answers a build card (spec 109 D10): runs the approved build checks,
+    /// records the declined ones as not run, and carries on with the same
+    /// verification, which now selects its checks.
+    #[allow(clippy::too_many_arguments)]
+    fn resume_build_stage(
+        &self,
+        pending: &PendingChatTurn,
+        batch: &PendingCheckBatch,
+        stage: PendingBuildStage,
+        decisions: &[(String, bool)],
+        approved_by: &str,
+        task: Task,
+        generation: u32,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        // Every build needs an answer before any of them runs.
+        for pending_check in &batch.checks {
+            if !decisions
+                .iter()
+                .any(|(proposal_id, _)| proposal_id == &pending_check.proposal_id)
+            {
+                self.pending_commands.save(pending)?;
+                return Err(ClientError::InvalidInput(format!(
+                    "No decision was given for check {}",
+                    pending_check.proposal_id
+                )));
+            }
+        }
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let mut done = stage.done;
+        for pending_check in &batch.checks {
+            let approved = decisions
+                .iter()
+                .find(|(proposal_id, _)| proposal_id == &pending_check.proposal_id)
+                .is_some_and(|(_, approved)| *approved);
+            let check = pending_check.check();
+            if approved {
+                let proposal = self
+                    .command_store
+                    .load_proposal(&pending_check.proposal_id)?;
+                let record = self.run_build_check(
+                    &repository_root,
+                    &task,
+                    &check,
+                    &proposal,
+                    true,
+                    approved_by,
+                    &batch.files_changed,
+                    &batch.file_hashes,
+                    generation,
+                    sink,
+                )?;
+                let failed = record.failed();
+                done.push(record);
+                if failed {
+                    // Nothing after a failed build runs; the rest stay
+                    // undecided proposals, as a stopped card's would.
+                    break;
+                }
+            } else {
+                self.validation_orchestrator
+                    .reject_proposal(&pending_check.proposal_id, approved_by)?;
+                done.push(BuildRecord {
+                    check,
+                    outcome: CheckOutcome::Skipped(SkipReason::DeclinedByUser),
+                    file_hashes: batch.file_hashes.clone(),
+                    generation,
+                    errors: None,
+                    reused: false,
+                });
+            }
+        }
+        let state = fold_verification(
+            self.session_store
+                .read_verification_events(&pending.session.id, &[])?
+                .iter(),
+        );
+        let Some(due) = state.due else {
+            return Err(ClientError::InvalidInput(
+                "No verification is due in this session".to_string(),
+            ));
+        };
+        self.verify_with_task(
+            &repository_root,
+            pending.session.clone(),
+            task,
+            due,
+            batch.attempt,
+            done,
+            model_adapter,
+            sink,
+        )
+    }
+
     /// Parks the verification turn on one card for every check that needs
     /// approval (proposal §5.3).
     #[allow(clippy::too_many_arguments)]
@@ -3765,6 +4226,7 @@ impl ChatOrchestrator {
         awaiting: Vec<PendingCheckDecision>,
         changed: Vec<String>,
         file_hashes: BTreeMap<String, String>,
+        build_stage: Option<PendingBuildStage>,
     ) -> Result<ChatTurnResult> {
         let batch_id = create_id("checkbatch");
         let mut entries = Vec::new();
@@ -3772,11 +4234,12 @@ impl ChatOrchestrator {
             let proposal = self.command_store.load_proposal(&pending.proposal_id)?;
             entries.push(agent_command_proposal(&self.config, &proposal));
         }
+        let is_build = build_stage.is_some();
         let batch = AgentCheckBatch {
             id: batch_id.clone(),
             checks: entries,
-            title: None,
-            note: None,
+            title: is_build.then(|| BUILD_CHECK_CARD_TITLE.to_string()),
+            note: is_build.then(|| BUILD_CHECK_CARD_NOTE.to_string()),
         };
         self.pending_commands.save(&PendingChatTurn {
             proposal_id: batch_id.clone(),
@@ -3812,6 +4275,7 @@ impl ChatOrchestrator {
                 attempt,
                 files_changed: changed.clone(),
                 file_hashes,
+                builds: build_stage,
             }),
             failure_baseline: None,
             fetch_call: None,
@@ -3845,7 +4309,11 @@ impl ChatOrchestrator {
         self.verification_turn_result(
             session,
             task,
-            CHECK_BATCH_PAUSED_RESPONSE.to_string(),
+            if is_build {
+                BUILD_CHECK_PAUSED_RESPONSE.to_string()
+            } else {
+                CHECK_BATCH_PAUSED_RESPONSE.to_string()
+            },
             Some(batch),
             None,
             changed,
@@ -3862,6 +4330,7 @@ impl ChatOrchestrator {
         task: Task,
         attempt: u32,
         outcome: VerificationOutcome,
+        builds: &[BuildRecord],
         changed: Vec<String>,
         file_hashes: BTreeMap<String, String>,
     ) -> Result<ChatTurnResult> {
@@ -3873,6 +4342,7 @@ impl ChatOrchestrator {
                 checks: Vec::new(),
             },
         )?;
+        self.record_builds(&session, &task, builds)?;
         self.finish_verification_with_outcome(
             repository_root,
             session,
@@ -5054,7 +5524,10 @@ impl ChatOrchestrator {
             | VerificationOutcome::NothingVerified
             | VerificationOutcome::NoChecksAvailable
             | VerificationOutcome::OnlyDocumentationChanged
-            | VerificationOutcome::OnlyPreExistingFailures => CompletionSettlement::Gate,
+            | VerificationOutcome::OnlyPreExistingFailures
+            // A change that does not build goes back to the model (spec 109
+            // D10). The gate cannot pass it: nothing verified this tree.
+            | VerificationOutcome::BuildFailed => CompletionSettlement::Gate,
             VerificationOutcome::Failed
             | VerificationOutcome::RepairLimitExhausted
             | VerificationOutcome::RepairStalled
@@ -5217,6 +5690,12 @@ impl ChatOrchestrator {
                     report.summary(&empty.report()),
                 )
             }
+        };
+        // Spec 109 D10: a change that does not build comes back to the model
+        // in this same turn with the compiler's errors, redacted and bounded.
+        let prompt = match report.build_failure_prompt() {
+            Some(errors) => format!("{prompt}\n\n{errors}"),
+            None => prompt,
         };
         let task = result.task.clone();
         let changed = report.files_changed.clone();
@@ -12176,6 +12655,10 @@ impl ChatOrchestrator {
                                             repository_root,
                                             step.check.clone(),
                                         ),
+                                        build: normalized_proposed_check(
+                                            repository_root,
+                                            step.build.clone(),
+                                        ),
                                     });
                                 }
                                 self.session_store.create_plan(&task, &proposed)?;
@@ -15959,6 +16442,26 @@ struct PendingCheckBatch {
     attempt: u32,
     files_changed: Vec<String>,
     file_hashes: BTreeMap<String, String>,
+    /// Set when the card is for build checks (spec 109 D10): they are decided
+    /// and run before the verification selects anything else, which it then
+    /// does on resume. Absent from every pause written before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    builds: Option<PendingBuildStage>,
+}
+
+/// The build checks a build card's verification already has: run or reused
+/// before the card, so the resumed verification does not run them again.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingBuildStage {
+    done: Vec<BuildRecord>,
+}
+
+/// Where a verification's build stage left it (spec 109 D10).
+enum BuildStage {
+    /// A build check needs approval; the turn is parked on its card.
+    Paused(Box<ChatTurnResult>),
+    /// Every build check ran, was reused, or could not run.
+    Done(Vec<BuildRecord>),
 }
 
 /// One check waiting on the user's decision.
@@ -16496,6 +16999,13 @@ const CONTINUE_AFTER_VERIFICATION_PROMPT: &str = "The patch was applied and its 
 const CHECK_BATCH_PAUSED_RESPONSE: &str =
     "These checks need your approval before verification can continue.";
 
+/// What a verification turn says when it parks on a build check's card
+/// (spec 109 D10), and the card's engine title and note.
+const BUILD_CHECK_PAUSED_RESPONSE: &str =
+    "The build check needs your approval before verification can continue.";
+pub const BUILD_CHECK_CARD_TITLE: &str = "Build check";
+const BUILD_CHECK_CARD_NOTE: &str = "Damaian compiles each change before anything else checks it, so a change that does not build goes straight back to the model with the compiler's errors. It runs no tests and does not count as a required check.";
+
 /// The selected checks of the latest verification that failed with a code
 /// result: what a failure-time baseline is for (spec 109 D1). A passed,
 /// skipped or declined check, an environment failure, a run the user
@@ -16596,6 +17106,19 @@ fn plan_deferring_step<'a>(
         };
         CheckId::new(directory, planned.command.as_str()) == *check
     })
+}
+
+/// The in-progress primary step's build check (spec 109 D10), its directory in
+/// `CheckId` form; `None` when the step has none or its directory leaves the
+/// repository. The caller passes only an approved plan, as for D4's checks.
+fn plan_current_step_build(repository_root: &Path, plan: &TaskPlan) -> Option<CheckId> {
+    let planned = plan
+        .steps
+        .iter()
+        .filter(|step| !step.id.starts_with("verify_") && step.status == StepStatus::InProgress)
+        .find_map(|step| step.build.as_ref())?;
+    let directory = normalize_planned_check_directory(repository_root, &planned.working_directory)?;
+    Some(CheckId::new(directory, planned.command.as_str()))
 }
 
 /// The `required` checks of the plan's in-progress primary steps — the step a
@@ -17650,6 +18173,44 @@ pub(crate) struct ProposedStep {
     title: String,
     detail: Option<String>,
     check: Option<PlannedCheck>,
+    /// The step's build check (spec 109 D10), proposed for review like `check`.
+    build: Option<PlannedCheck>,
+}
+
+/// A planned check from a `propose_plan` step's `check` or `build` object. A
+/// check is optional, and a proposed check authorises nothing on its own (spec
+/// 105 §2): it only becomes authoritative once the user approves the plan. A
+/// check without a command is not a check, so it is dropped the same way a
+/// step with no title is. `required_default` is what a missing `required`
+/// means; a build check passes `false` and ignores the key.
+fn planned_check_from_json(
+    value: &serde_json::Value,
+    required_default: bool,
+) -> Option<PlannedCheck> {
+    let command = value
+        .get("command")
+        .and_then(|command| command.as_str())
+        .map(str::trim)
+        .filter(|command| !command.is_empty())?;
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(|text| text.as_str())
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(PlannedCheck {
+        version: PLANNED_CHECK_VERSION,
+        command: command.to_string(),
+        working_directory: text("workingDirectory"),
+        purpose: text("purpose"),
+        required: required_default
+            && value
+                .get("required")
+                .and_then(|required| required.as_bool())
+                .unwrap_or(true),
+    })
 }
 
 /// What a matched tool call (native `tools`/`tool_calls`, or the
@@ -18552,8 +19113,8 @@ fn propose_patch_tool_definition() -> ToolDefinition {
 fn propose_plan_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "propose_plan".to_string(),
-        description: "Propose an ordered plan for non-trivial work, before starting it. Use this when the task needs more than one step — a single question or a single file read needs no plan. Do not report a step's outcome here; call complete_step when a step's work is done and Damaian will record how it ended from what it observed. If the context shows a plan carried forward from an earlier turn and the user has moved on to different work, propose a new plan before starting on the old one; the earlier plan stays recorded.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"steps\":{\"type\":\"array\",\"minItems\":2,\"items\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"Short imperative title for the step\"},\"detail\":{\"type\":\"string\",\"description\":\"Optional longer description\"},\"check\":{\"type\":\"object\",\"description\":\"An optional required check for this step: a command that must pass before the task completes. Proposed for review only; it authorises nothing on its own.\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The exact command to run\"},\"workingDirectory\":{\"type\":\"string\",\"description\":\"Repository-relative directory to run it in; empty or omitted means the repository root\"},\"purpose\":{\"type\":\"string\",\"description\":\"Why this check is required\"},\"required\":{\"type\":\"boolean\",\"description\":\"Whether the task may not complete until this check passes; defaults to true\"}},\"required\":[\"command\"]}},\"required\":[\"title\"]}}},\"required\":[\"steps\"]}".to_string(),
+        description: "Propose an ordered plan for non-trivial work, before starting it. Use this when the task needs more than one step — a single question or a single file read needs no plan. Do not report a step's outcome here; call complete_step when a step's work is done and Damaian will record how it ended from what it observed. If the context shows a plan carried forward from an earlier turn and the user has moved on to different work, propose a new plan before starting on the old one; the earlier plan stays recorded. Give each step that changes code a `build` check when the project has a compile command.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"steps\":{\"type\":\"array\",\"minItems\":2,\"items\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"Short imperative title for the step\"},\"detail\":{\"type\":\"string\",\"description\":\"Optional longer description\"},\"check\":{\"type\":\"object\",\"description\":\"An optional required check for this step: a command that must pass before the task completes. Proposed for review only; it authorises nothing on its own.\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The exact command to run\"},\"workingDirectory\":{\"type\":\"string\",\"description\":\"Repository-relative directory to run it in; empty or omitted means the repository root\"},\"purpose\":{\"type\":\"string\",\"description\":\"Why this check is required\"},\"required\":{\"type\":\"boolean\",\"description\":\"Whether the task may not complete until this check passes; defaults to true\"}},\"required\":[\"command\"]},\"build\":{\"type\":\"object\",\"description\":\"Optional build check: one compile or type-check command (no tests) from the repository's CI files, build targets or README, run after each change; never a required check\",\"properties\":{\"command\":{\"type\":\"string\"},\"workingDirectory\":{\"type\":\"string\"},\"purpose\":{\"type\":\"string\"}},\"required\":[\"command\"]}},\"required\":[\"title\"]}}},\"required\":[\"steps\"]}".to_string(),
     }
 }
 
@@ -18737,33 +19298,14 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
                     // authoritative once the user approves the plan. A check
                     // without a command is not a check, so it is dropped the
                     // same way a step with no title is.
-                    let check = entry.get("check").and_then(|value| {
-                        let command = value
-                            .get("command")
-                            .and_then(|command| command.as_str())
-                            .map(str::trim)
-                            .filter(|command| !command.is_empty())?;
-                        Some(PlannedCheck {
-                            version: PLANNED_CHECK_VERSION,
-                            command: command.to_string(),
-                            working_directory: value
-                                .get("workingDirectory")
-                                .and_then(|dir| dir.as_str())
-                                .map(str::trim)
-                                .unwrap_or_default()
-                                .to_string(),
-                            purpose: value
-                                .get("purpose")
-                                .and_then(|purpose| purpose.as_str())
-                                .map(str::trim)
-                                .unwrap_or_default()
-                                .to_string(),
-                            required: value
-                                .get("required")
-                                .and_then(|required| required.as_bool())
-                                .unwrap_or(true),
-                        })
-                    });
+                    let check = entry
+                        .get("check")
+                        .and_then(|value| planned_check_from_json(value, true));
+                    // A build check (spec 109 D10) has the same shape and is
+                    // feedback only, so it is never required.
+                    let build = entry
+                        .get("build")
+                        .and_then(|value| planned_check_from_json(value, false));
                     Some(ProposedStep {
                         title: title.to_string(),
                         detail: entry
@@ -18773,6 +19315,7 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
                             .filter(|value| !value.is_empty())
                             .map(str::to_string),
                         check,
+                        build,
                     })
                 })
                 .collect();
@@ -20611,6 +21154,7 @@ mod plan_deferral_tests {
                 purpose: "validates the final tree".to_string(),
                 required: true,
             }),
+            build: None,
         });
         plan
     }
@@ -21572,6 +22116,50 @@ mod clarification_tests {
         assert!(parsed.allow_free_text);
         assert!(properties.get("allowFreeText").is_some());
         assert!(definition.description.contains("authorises nothing"));
+    }
+
+    #[test]
+    fn propose_plan_parses_a_build_check_that_is_never_required() {
+        let parsed = tool_action_from_call(&ToolCall {
+            id: "call_1".to_string(),
+            name: "propose_plan".to_string(),
+            arguments_json: serde_json::json!({
+                "steps": [
+                    {
+                        "title": "Change the engine",
+                        "build": {
+                            "command": " cargo check -p workspace-engine --tests ",
+                            "workingDirectory": "crates/workspace-engine",
+                            "purpose": "from CI",
+                            "required": true,
+                        },
+                    },
+                    { "title": "Write the report", "build": { "purpose": "no command" } },
+                ],
+            })
+            .to_string(),
+        })
+        .unwrap()
+        .expect("a decoded plan");
+
+        let ToolAction::ProposePlan(steps) = parsed else {
+            panic!("expected a plan");
+        };
+        let build = steps[0].build.as_ref().expect("the first step's build");
+        assert_eq!(build.version, PLANNED_CHECK_VERSION);
+        assert_eq!(build.command, "cargo check -p workspace-engine --tests");
+        assert_eq!(build.working_directory, "crates/workspace-engine");
+        assert_eq!(build.purpose, "from CI");
+        assert!(!build.required, "a build check is feedback, never required");
+        assert!(steps[0].check.is_none());
+        assert!(
+            steps[1].build.is_none(),
+            "a build without a command is dropped"
+        );
+        // The tool asks for one per step.
+        let definition = propose_plan_tool_definition();
+        assert!(definition.parameters_json.contains("\"build\""));
+        assert!(definition.description.contains("a `build` check"));
     }
 
     #[test]
@@ -23905,6 +24493,7 @@ mod approval_prompt_wording_tests {
             completed_at_ms: None,
             evidence: Vec::new(),
             check: None,
+            build: None,
         });
         plan.steps.push(crate::plan::PlanStep {
             id: "step_2".to_string(),
@@ -23916,6 +24505,7 @@ mod approval_prompt_wording_tests {
             completed_at_ms: Some(2),
             evidence: Vec::new(),
             check: None,
+            build: None,
         });
         plan.steps.push(crate::plan::PlanStep {
             id: "step_3".to_string(),
@@ -23927,6 +24517,7 @@ mod approval_prompt_wording_tests {
             completed_at_ms: None,
             evidence: Vec::new(),
             check: None,
+            build: None,
         });
 
         let text = plan_reminder_message(&plan);

@@ -32,6 +32,7 @@ fn step(id: &str, status: StepStatus) -> PlanStep {
         completed_at_ms: None,
         evidence: Vec::new(),
         check: None,
+        build: None,
     }
 }
 
@@ -121,6 +122,7 @@ fn a_plan_round_trips_through_json_unchanged() {
                 working_directory: String::new(),
             }],
             check: None,
+            build: None,
         }],
     };
 
@@ -183,6 +185,7 @@ fn a_plan_with_a_structured_check_round_trips() {
             completed_at_ms: None,
             evidence: Vec::new(),
             check: Some(check.clone()),
+            build: None,
         }],
     };
 
@@ -199,6 +202,31 @@ fn a_plan_with_a_structured_check_round_trips() {
         "got: {text}"
     );
     assert!(text.contains("\"required\":true"), "got: {text}");
+}
+
+#[test]
+fn a_plan_written_before_build_checks_loads_without_one() {
+    // Spec 109 D10: plan format version 2 adds a step's `build`. A version 1
+    // step has no `build` key and reads as none; a step without one keeps the
+    // old wire shape, and a step with one round-trips.
+    let old = r#"{"taskId":"task_1","createdAtMs":1,"steps":[{"id":"step_1","title":"Old","detail":null,"status":"pending","dependsOn":[],"startedAtMs":null,"completedAtMs":null,"evidence":[],"check":{"version":1,"command":"cargo test","workingDirectory":"","purpose":"p","required":true}}]}"#;
+    let plan: TaskPlan = serde_json::from_str(old).expect("a version 1 plan reads");
+    assert!(plan.steps[0].build.is_none());
+    assert_eq!(plan.steps[0].check.as_ref().unwrap().version, 1);
+    let text = serde_json::to_string(&plan).unwrap();
+    assert!(!text.contains("\"build\""), "got: {text}");
+
+    let mut with_build = plan.clone();
+    with_build.steps[0].build = Some(PlannedCheck {
+        version: PLANNED_CHECK_VERSION,
+        command: "cargo check --tests".to_string(),
+        working_directory: "crates/demo".to_string(),
+        purpose: "compile".to_string(),
+        required: false,
+    });
+    let text = serde_json::to_string(&with_build).unwrap();
+    assert!(text.contains("\"build\":{"), "got: {text}");
+    assert_eq!(serde_json::from_str::<TaskPlan>(&text).unwrap(), with_build);
 }
 
 #[test]

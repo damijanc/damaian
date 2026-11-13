@@ -204,6 +204,10 @@ pub struct Asserts {
     /// changes must contain (spec 108 D6): the user's words reached the model.
     /// Script-derived, so `deterministic_only`.
     pub plan_changes_request_contains: Option<Vec<String>>,
+    /// Strings the first model request after a build check failed must
+    /// contain (spec 109 D10): the compiler's errors reached the model in the
+    /// same turn. Script-derived, so `deterministic_only`.
+    pub build_failure_request_contains: Option<Vec<String>>,
     /// How many times the run paused on a plan review. Two for a review
     /// answered with changes and a revised plan reviewed again.
     pub plan_reviews: Option<u64>,

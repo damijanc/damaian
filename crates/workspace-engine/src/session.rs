@@ -3998,6 +3998,7 @@ impl SessionStore {
             VerificationEvent::Reused { .. } => "verification_reused",
             VerificationEvent::Deferred { .. } => "verification_deferred",
             VerificationEvent::DeferredToCompletion { .. } => "verification_deferred_to_completion",
+            VerificationEvent::Build { .. } => "verification_build",
             VerificationEvent::Finished { .. } => "verification_finished",
             VerificationEvent::Baseline { .. } => "verification_baseline",
             VerificationEvent::Provenance { .. } => "verification_provenance",
@@ -4231,6 +4232,7 @@ impl SessionStore {
                     | "verification_reused"
                     | "verification_deferred"
                     | "verification_deferred_to_completion"
+                    | "verification_build"
                     | "verification_finished"
                     | "verification_baseline"
                     | "verification_provenance"

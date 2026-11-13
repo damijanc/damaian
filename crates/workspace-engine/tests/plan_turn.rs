@@ -4960,7 +4960,11 @@ fn a_finished_steps_check_is_not_rerun_per_change_only_once_at_completion() {
 #[test]
 fn a_scoped_check_deferred_to_its_open_step_displaces_the_detected_check() {
     let (repo, shell) = r16_workspace_fixture("d4-scoped-deferred");
-    let engine = check_engine(&repo, &shell, &["cargo test"]);
+    let engine = check_engine(
+        &repo,
+        &shell,
+        &["cargo test", "cd crates/member && cargo check --tests"],
+    );
     let scoped = CheckId::new("crates/member", D4_SCOPED_COMMAND);
     let member_check = CheckId::new("crates/member", "cargo test");
     let root_check = CheckId::new("", "cargo test");
@@ -5251,7 +5255,12 @@ fn a_command_first_task_takes_a_failure_time_baseline_and_repairs_its_regression
     let engine = check_engine(
         &repo,
         &shell,
-        &["cargo test", "cd crates/foo && cargo test"],
+        &[
+            "cargo test",
+            "cd crates/foo && cargo test",
+            "cargo check --tests",
+            "cd crates/foo && cargo check --tests",
+        ],
     );
     let command = run_command_call("break-foo");
     let mut first = scripted(vec![

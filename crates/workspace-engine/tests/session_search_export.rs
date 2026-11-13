@@ -234,6 +234,7 @@ fn export_markdown_redacts_with_a_count_and_includes_tasks_and_plans() {
                         hash: "abc".to_string(),
                     }],
                     check: None,
+                    build: None,
                 }],
             },
         )

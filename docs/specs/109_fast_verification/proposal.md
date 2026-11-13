@@ -1,6 +1,6 @@
 # Feature Spec: Fast Verification
 
-Status: In progress (started 2026-11-11; Tasks 1–3 done; Tasks 1–9 in [tasks.md](tasks.md))
+Status: In progress (started 2026-11-11; Tasks 1–3 and 9 done; Tasks 1–9 in [tasks.md](tasks.md))
 Order: 109 of 109
 Plan: none. Written from the owner's spec 33 Task 1 run on Damaian v0.69.0
 (2026-11-11); the code survey and decisions are in [context.md](context.md).

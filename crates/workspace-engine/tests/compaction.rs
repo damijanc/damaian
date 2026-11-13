@@ -380,6 +380,7 @@ fn seed_facts(engine: &WorkspaceEngine, session: &Session, task: &Task) {
         completed_at_ms: Some(2),
         evidence: Vec::new(),
         check: None,
+        build: None,
     });
     engine.session_store.create_plan(task, &plan).unwrap();
     engine

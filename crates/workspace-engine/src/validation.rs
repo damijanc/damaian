@@ -323,6 +323,26 @@ impl ValidationOrchestrator {
         )
     }
 
+    /// Proposes a build check — the plan step's compile or type-check command,
+    /// or the Cargo fast path — that a per-change verification runs before
+    /// anything else (spec 109 D10). The same policy path as every check; it
+    /// asks where the policy asks.
+    pub fn propose_build_check(
+        &self,
+        repository_root: impl AsRef<Path>,
+        working_directory: impl AsRef<Path>,
+        command: &str,
+    ) -> Result<CommandProposal> {
+        self.store_proposal(
+            repository_root,
+            working_directory,
+            command,
+            "Build check after a change: compile only, so a change that does not build is caught at once",
+            true,
+            Vec::new(),
+        )
+    }
+
     /// `detected` marks a proposal from [`Self::propose_detected_validations`],
     /// whose purpose is `Check` whatever its text.
     fn store_proposal(

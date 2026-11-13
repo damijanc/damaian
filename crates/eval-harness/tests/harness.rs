@@ -1430,12 +1430,12 @@ fn every_scenario_runs_and_none_is_blocked() {
     );
     assert_eq!(
         all.len(),
-        64,
-        "sixty-four scenarios should run: the two compaction scenarios, thirteen memory \
+        65,
+        "sixty-five scenarios should run: the two compaction scenarios, thirteen memory \
          scenarios (six consent, seven recall), three external-reference injection scenarios, \
          the live injection twin, five spec 102 verification scenarios, ten spec 103 \
-         bounded worker-continuation scenarios, one spec 105 required-check scenario and \
-         spec 108's plan-changes-requested scenario"
+         bounded worker-continuation scenarios, one spec 105 required-check scenario, \
+         spec 108's plan-changes-requested scenario and spec 109's build-check scenario"
     );
 }
 
@@ -1745,8 +1745,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        63,
-        "all sixty-three deterministic scenario files should be accounted for; the live \
+        64,
+        "all sixty-four deterministic scenario files should be accounted for; the live \
          injection twin is credential-gated"
     );
     assert_eq!(

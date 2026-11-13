@@ -1010,6 +1010,7 @@ fn the_plan_survives_an_approved_switch() {
         completed_at_ms: None,
         evidence: Vec::new(),
         check: None,
+        build: None,
     });
     engine.session_store.create_plan(&task, &plan).unwrap();
     let fallback = fallback_engine(&repo, vec![provider("fallback")]);

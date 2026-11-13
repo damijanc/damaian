@@ -6184,6 +6184,11 @@ body.worker-view #chat-model-menu {
   color: #7a4b12;
 }
 
+/* Spec 109 D10: a change that does not build. */
+.verification-report-value.has-build-failure {
+  color: var(--danger);
+}
+
 .verification-stale {
   border: 1px dashed #d8b985;
   border-radius: 4px;

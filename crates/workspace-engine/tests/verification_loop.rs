@@ -147,6 +147,7 @@ fn complete_plan() -> TaskPlan {
             hash: "sha256:abc".to_string(),
         }],
         check: None,
+        build: None,
     });
     plan
 }
@@ -546,6 +547,7 @@ fn step(id: &str, title: &str, status: StepStatus) -> PlanStep {
         completed_at_ms: None,
         evidence: Vec::new(),
         check: None,
+        build: None,
     }
 }
 
@@ -973,7 +975,10 @@ fn a_member_change_runs_only_the_members_check_per_change() {
         data_dir: repo.data_dir.clone(),
         enable_index_watcher: false,
         shell: "/usr/bin/true".to_string(),
-        command_allowlist: vec!["cargo test".to_string()],
+        command_allowlist: vec![
+            "cargo test".to_string(),
+            "cd crates/engine && cargo check --tests".to_string(),
+        ],
         ..Config::default()
     });
     let (session, task) = applied_change(
@@ -1059,7 +1064,7 @@ fn a_root_owned_change_still_runs_the_root_check_per_change() {
         data_dir: repo.data_dir.clone(),
         enable_index_watcher: false,
         shell: "/usr/bin/true".to_string(),
-        command_allowlist: vec!["cargo test".to_string()],
+        command_allowlist: vec!["cargo test".to_string(), "cargo check --tests".to_string()],
         ..Config::default()
     });
     let (session, task) = applied_change(
@@ -2240,7 +2245,13 @@ fn verification_defers_a_planned_final_check_without_two_steps_in_progress() {
     let root = temp_dir("planned-check-invariant");
     let data_dir = temp_dir("planned-check-invariant-data");
     cargofile(&root);
-    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let engine = verify_engine(
+        &root,
+        &data_dir,
+        "/usr/bin/true",
+        &["cargo test", "cargo check --tests"],
+        &[],
+    );
     let (session, task_id) = applied_change(
         &engine,
         &root,
@@ -2265,6 +2276,7 @@ fn verification_defers_a_planned_final_check_without_two_steps_in_progress() {
             completed_at_ms: None,
             evidence: Vec::new(),
             check: None,
+            build: None,
         },
         PlanStep {
             id: "test".to_string(),
@@ -2282,6 +2294,7 @@ fn verification_defers_a_planned_final_check_without_two_steps_in_progress() {
                 purpose: "validates the final tree".to_string(),
                 required: true,
             }),
+            build: None,
         },
     ]);
     engine.session_store.create_plan(&task, &plan).unwrap();
@@ -2396,7 +2409,13 @@ fn a_planned_check_with_a_different_directory_or_command_is_not_deferred() {
         let root = temp_dir("planned-check-counter");
         let data_dir = temp_dir("planned-check-counter-data");
         cargofile(&root);
-        let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+        let engine = verify_engine(
+            &root,
+            &data_dir,
+            "/usr/bin/true",
+            &["cargo test", "cargo check --tests"],
+            &[],
+        );
         let (session, task_id) = applied_change(
             &engine,
             &root,
@@ -2421,6 +2440,7 @@ fn a_planned_check_with_a_different_directory_or_command_is_not_deferred() {
                 completed_at_ms: None,
                 evidence: Vec::new(),
                 check: None,
+                build: None,
             },
             PlanStep {
                 id: "test".to_string(),
@@ -2432,6 +2452,7 @@ fn a_planned_check_with_a_different_directory_or_command_is_not_deferred() {
                 completed_at_ms: None,
                 evidence: Vec::new(),
                 check: Some(planned),
+                build: None,
             },
         ]);
         engine.session_store.create_plan(&task, &plan).unwrap();
@@ -2464,7 +2485,13 @@ fn the_deferral_follows_the_settled_plan_not_the_proposed_plan() {
     let root = temp_dir("planned-check-approval");
     let data_dir = temp_dir("planned-check-approval-data");
     cargofile(&root);
-    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let engine = verify_engine(
+        &root,
+        &data_dir,
+        "/usr/bin/true",
+        &["cargo test", "cargo check --tests"],
+        &[],
+    );
     let (session, task_id) = applied_change(
         &engine,
         &root,
@@ -2498,6 +2525,7 @@ fn the_deferral_follows_the_settled_plan_not_the_proposed_plan() {
             completed_at_ms: None,
             evidence: Vec::new(),
             check: None,
+            build: None,
         },
         PlanStep {
             id: "test".to_string(),
@@ -2509,6 +2537,7 @@ fn the_deferral_follows_the_settled_plan_not_the_proposed_plan() {
             completed_at_ms: None,
             evidence: Vec::new(),
             check: Some(required),
+            build: None,
         },
     ]);
     engine.session_store.create_plan(&task, &proposed).unwrap();
@@ -4980,6 +5009,7 @@ fn open_plan(engine: &WorkspaceEngine, session_id: &str, task_id: &str, open: &[
             completed_at_ms: None,
             evidence: Vec::new(),
             check: None,
+            build: None,
         });
     }
     engine.session_store.create_plan(&task, &plan).unwrap();
@@ -5003,7 +5033,13 @@ fn a_passed_verification_with_open_steps_continues_the_task() {
     let root = temp_dir("continue-open-plan");
     let data_dir = temp_dir("continue-open-plan-data");
     cargofile(&root);
-    let engine = verify_engine(&root, &data_dir, "/usr/bin/true", &["cargo test"], &[]);
+    let engine = verify_engine(
+        &root,
+        &data_dir,
+        "/usr/bin/true",
+        &["cargo test", "cargo check --tests"],
+        &[],
+    );
     let (session, task) = applied_change(
         &engine,
         &root,
@@ -5105,7 +5141,13 @@ fn a_failed_verification_is_not_continued() {
     let data_dir = temp_dir("continue-failed-data");
     cargofile(&root);
     // Retry limit 0: a failure reports at once instead of starting a repair.
-    let engine = verify_engine(&root, &data_dir, "/usr/bin/false", &["cargo test"], &[]);
+    let engine = verify_engine(
+        &root,
+        &data_dir,
+        "/usr/bin/false",
+        &["cargo test"],
+        &["cargo check"],
+    );
     let (session, task) = applied_change(
         &engine,
         &root,
@@ -6742,4 +6784,519 @@ fn a_failed_run_is_reused_as_failed() {
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&data_dir);
+}
+
+// Spec 109 D10: a build check after every change.
+
+/// A fake shell for build checks. Every command it is asked to run is logged
+/// one per line to `log`; a command naming `cargo check` or `make build` prints
+/// `stderr` (when given) and exits 101, and anything else exits 0.
+fn build_shell(dir: &std::path::Path, stderr: Option<&str>) -> (PathBuf, PathBuf) {
+    let shell = dir.join("build-shell.sh");
+    let log = dir.join("commands.log");
+    let failure = match stderr {
+        Some(text) => {
+            let path = dir.join("build-stderr.txt");
+            fs::write(&path, text).unwrap();
+            format!("cat '{}' >&2; exit 101", path.display())
+        }
+        None => "exit 0".to_string(),
+    };
+    let script = format!(
+        "#!/bin/sh\n\
+         command=\"$2\"\n\
+         printf '%s\\n' \"$command\" >> '{}'\n\
+         case \"$command\" in\n\
+           *\"cargo check\"*|*\"make build\"*) {failure} ;;\n\
+         esac\n\
+         exit 0\n",
+        log.display()
+    );
+    fs::write(&shell, script).unwrap();
+    let mut permissions = fs::metadata(&shell).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&shell, permissions).unwrap();
+    (shell, log)
+}
+
+fn logged_commands(log: &std::path::Path, needle: &str) -> usize {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(needle))
+        .count()
+}
+
+fn build_events(engine: &WorkspaceEngine, session_id: &str) -> Vec<VerificationEvent> {
+    outcome_events(engine, session_id)
+        .into_iter()
+        .filter(|event| matches!(event, VerificationEvent::Build { .. }))
+        .collect()
+}
+
+/// Seven rustc errors: two in the changed `src/a.rs`, one in `src/other.rs`,
+/// which the task never changed, then four more in `src/a.rs`.
+fn seven_rust_errors() -> String {
+    let mut text = String::from("    Checking demo v0.1.0 (/repo)\n");
+    for index in 0..7 {
+        let path = if index == 1 {
+            "src/other.rs"
+        } else {
+            "src/a.rs"
+        };
+        text.push_str(&format!(
+            "error[E0425]: cannot find function `missing_{index}` in this scope\n --> {path}:1:9\n  |\n1 | let a = missing_{index}();\n  |         ^^^^^^^^^ not found in this scope\n\n"
+        ));
+    }
+    text.push_str("error: could not compile `demo` (lib) due to 7 previous errors\n");
+    text
+}
+
+/// A plan whose first step is in progress with `build` as its build check,
+/// approved, so the verification reads the step's build check.
+fn approved_plan_with_build(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    task_id: &str,
+    build: Option<PlannedCheck>,
+    check: Option<PlannedCheck>,
+) {
+    let task = engine
+        .session_store
+        .read_tasks(session_id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .expect("the patch's task");
+    let mut plan = TaskPlan::new(task_id, 1);
+    for (index, title) in ["Change the code", "Document it"].iter().enumerate() {
+        plan.steps.push(PlanStep {
+            id: format!("step_{}", index + 1),
+            title: (*title).to_string(),
+            detail: None,
+            status: if index == 0 {
+                StepStatus::InProgress
+            } else {
+                StepStatus::Pending
+            },
+            depends_on: Vec::new(),
+            started_at_ms: (index == 0).then_some(1),
+            completed_at_ms: None,
+            evidence: Vec::new(),
+            check: if index == 0 { check.clone() } else { None },
+            build: if index == 0 { build.clone() } else { None },
+        });
+    }
+    engine.session_store.create_plan(&task, &plan).unwrap();
+    engine.session_store.approve_plan(&task, "tester").unwrap();
+}
+
+fn planned(command: &str, directory: &str, required: bool) -> PlannedCheck {
+    PlannedCheck {
+        version: PLANNED_CHECK_VERSION,
+        command: command.to_string(),
+        working_directory: directory.to_string(),
+        purpose: "test".to_string(),
+        required,
+    }
+}
+
+/// A failing build ends the verification `build_failed` before any check is
+/// selected, takes no baseline, and its errors reach the next model request:
+/// the first five in full, a count of the rest, and the error in a file the
+/// task never changed marked as such. A step with no build check on a Cargo
+/// root uses the fast path.
+#[test]
+fn a_failing_build_reaches_the_next_model_request_and_takes_no_baseline() {
+    let root = temp_dir("build-fails");
+    let data_dir = temp_dir("build-fails-data");
+    let tools = temp_dir("build-fails-tools");
+    cargofile(&root);
+    write(&root, "src/other.rs", "pub fn other() {}\n");
+    let (shell, log) = build_shell(&tools, Some(&seven_rust_errors()));
+    let engine = verify_engine(
+        &root,
+        &data_dir,
+        &shell.to_string_lossy(),
+        &["cargo test", "cargo check --tests"],
+        &[],
+    );
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    open_plan(&engine, &session, &task, &["Keep working"]);
+    let mut adapter = MockModelAdapter::new("I will fix the build.");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert!(result.check_batch.is_none(), "no card for a build failure");
+    let report = result.verification_report.as_ref().expect("a report");
+    assert_eq!(report.outcome, Some(VerificationOutcome::BuildFailed));
+    let fast_path = CheckId::new("", "cargo check --tests");
+    assert_eq!(report.builds.len(), 1, "{report:?}");
+    assert_eq!(report.builds[0].check, fast_path);
+    assert_eq!(report.builds[0].status, "does_not_build");
+    assert_eq!(report.builds[0].label, "does not build: 7 errors");
+    let errors = report.builds[0].errors.as_ref().expect("the errors");
+    assert_eq!(errors.total, 7);
+    assert_eq!(errors.shown.len(), 5);
+    assert!(!errors.shown[0].outside_task, "src/a.rs is the task's");
+    assert_eq!(errors.shown[1].path.as_deref(), Some("src/other.rs"));
+    assert!(errors.shown[1].outside_task, "src/other.rs is not");
+    assert!(report.render().contains("Build"), "{}", report.render());
+
+    // Nothing else was selected or run, and no baseline was taken. The
+    // fixture's own task-start baseline is written before the verification
+    // starts, so only what follows `Started` is the verification's.
+    assert_eq!(logged_commands(&log, "cargo check --tests"), 1);
+    assert_eq!(logged_commands(&log, "cargo test"), 0, "no check ran");
+    let all = outcome_events(&engine, &session);
+    let start = all
+        .iter()
+        .position(|event| matches!(event, VerificationEvent::Started { .. }))
+        .expect("the verification started");
+    let events = all[start..].to_vec();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            VerificationEvent::Check { .. } | VerificationEvent::Baseline { .. }
+        )),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        VerificationEvent::Started { checks, .. } if checks.is_empty()
+    )));
+
+    // The continuation request carries the errors.
+    let prompt = first_user_message(&adapter);
+    assert!(prompt.contains("Your change does not build"), "{prompt}");
+    assert!(
+        prompt.contains("src/a.rs:1: cannot find function `missing_0`"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(
+            "src/other.rs:1: cannot find function `missing_1` in this scope (in a file this task has not changed"
+        ),
+        "{prompt}"
+    );
+    assert!(prompt.contains("…and 2 more errors not shown."), "{prompt}");
+    assert!(
+        !prompt.contains("missing_5"),
+        "only the first errors in full"
+    );
+    assert_ne!(result.task.status, TaskStatus::Complete);
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+    let _ = fs::remove_dir_all(&tools);
+}
+
+/// The step's own build check runs instead of the fast path, and a passing
+/// build is never evidence: no `Check` event, no `CheckRun`, no plan step
+/// evidence, even when the build command is also the step's required check.
+#[test]
+fn a_passing_build_is_never_gate_or_complete_step_evidence() {
+    let root = temp_dir("build-not-evidence");
+    let data_dir = temp_dir("build-not-evidence-data");
+    let tools = temp_dir("build-not-evidence-tools");
+    cargofile(&root);
+    let (shell, log) = build_shell(&tools, None);
+    let engine = verify_engine(
+        &root,
+        &data_dir,
+        &shell.to_string_lossy(),
+        &["cargo test", "make build"],
+        &[],
+    );
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    approved_plan_with_build(
+        &engine,
+        &session,
+        &task,
+        Some(planned("make build", "", false)),
+        Some(planned("make build", "", true)),
+    );
+    let mut adapter = MockModelAdapter::new("Continuing.");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    let report = result.verification_report.as_ref().expect("a report");
+    let build = CheckId::new("", "make build");
+    assert_eq!(report.builds.len(), 1, "{report:?}");
+    assert_eq!(
+        report.builds[0].check, build,
+        "the step's build, not the fast path"
+    );
+    assert_eq!(report.builds[0].label, "builds");
+    assert_eq!(logged_commands(&log, "make build"), 1);
+    assert_eq!(logged_commands(&log, "cargo check"), 0);
+    assert!(
+        report
+            .render()
+            .contains("make build (repository root) — builds")
+            || report.render().contains("— builds"),
+        "{}",
+        report.render()
+    );
+
+    let state = fold_verification(outcome_events(&engine, &session).iter());
+    assert!(!state.checks.contains_key(&build), "never a CheckRun");
+    assert!(!state.selected.contains(&build));
+    assert!(state.builds.contains_key(&build));
+    assert!(!report.passed.contains(&build));
+    for plan_task in engine.session_store.read_tasks(&session).unwrap() {
+        if let Some(plan) = engine
+            .session_store
+            .read_task_plan(&session, &plan_task.id)
+            .unwrap()
+        {
+            for step in &plan.steps {
+                assert!(
+                    !step
+                        .evidence
+                        .iter()
+                        .any(|evidence| matches!(evidence, Evidence::CommandExit { .. })),
+                    "no plan step holds the build's exit: {step:?}"
+                );
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+    let _ = fs::remove_dir_all(&tools);
+}
+
+/// An unchanged tree builds once: the second verification reuses the build
+/// (D6) and says so; a changed file builds again.
+#[test]
+fn an_unchanged_tree_builds_once() {
+    let root = temp_dir("build-once");
+    let data_dir = temp_dir("build-once-data");
+    let tools = temp_dir("build-once-tools");
+    cargofile(&root);
+    let (shell, log) = build_shell(&tools, None);
+    let engine = verify_engine(
+        &root,
+        &data_dir,
+        &shell.to_string_lossy(),
+        &["cargo test", "cargo check --tests"],
+        &[],
+    );
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+    );
+    open_plan(&engine, &session, &task, &["Keep working"]);
+    let mut adapter = MockModelAdapter::new("");
+    run_verification(&engine, &root, &session, &mut adapter);
+    assert_eq!(logged_commands(&log, "cargo check --tests"), 1);
+
+    due_again(&engine, &session);
+    let second = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert_eq!(
+        logged_commands(&log, "cargo check --tests"),
+        1,
+        "built once"
+    );
+    let report = second.verification_report.as_ref().expect("a report");
+    assert_eq!(report.builds.len(), 1);
+    assert!(report.builds[0].reused, "{report:?}");
+    assert!(
+        build_events(&engine, &session)
+            .iter()
+            .any(|event| matches!(event, VerificationEvent::Build { reused: true, .. }))
+    );
+
+    write(&root, "src/a.rs", "let a = 3;\n");
+    due_again(&engine, &session);
+    run_verification(&engine, &root, &session, &mut adapter);
+    assert_eq!(
+        logged_commands(&log, "cargo check --tests"),
+        2,
+        "a change builds again"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+    let _ = fs::remove_dir_all(&tools);
+}
+
+/// A root with no detected Cargo manifest and no build check from its plan
+/// runs no build: no language list adds one (D9).
+#[test]
+fn a_non_cargo_root_without_a_build_check_runs_none() {
+    let root = temp_dir("build-none");
+    let data_dir = temp_dir("build-none-data");
+    let tools = temp_dir("build-none-tools");
+    let (shell, log) = build_shell(&tools, None);
+    let engine = verify_engine(&root, &data_dir, &shell.to_string_lossy(), &[], &[]);
+    let (session, task) = applied_change(
+        &engine,
+        &root,
+        &[("src/a.hs", "main = pure ()\n", "main = print 1\n")],
+    );
+    open_plan(&engine, &session, &task, &["Keep working"]);
+    let mut adapter = MockModelAdapter::new("");
+
+    let result = run_verification(&engine, &root, &session, &mut adapter);
+
+    assert!(build_events(&engine, &session).is_empty());
+    assert_eq!(logged_commands(&log, "cargo check"), 0);
+    let report = result.verification_report.as_ref().expect("a report");
+    assert!(report.builds.is_empty());
+    assert!(!report.render().contains("Build "), "{}", report.render());
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&data_dir);
+    let _ = fs::remove_dir_all(&tools);
+}
+
+/// A build check that needs approval parks the verification on a build card
+/// before anything else is proposed; approving it runs the build and then the
+/// change's checks in the same verification. Declining it skips only the build.
+#[test]
+fn a_build_that_needs_approval_asks_first_and_the_verification_continues() {
+    for approve in [true, false] {
+        let root = temp_dir("build-card");
+        let data_dir = temp_dir("build-card-data");
+        let tools = temp_dir("build-card-tools");
+        cargofile(&root);
+        let (shell, log) = build_shell(&tools, None);
+        let engine = verify_engine(
+            &root,
+            &data_dir,
+            &shell.to_string_lossy(),
+            &["cargo test"],
+            &[],
+        );
+        let (session, task) = applied_change(
+            &engine,
+            &root,
+            &[("src/a.rs", "let a = 1;\n", "let a = 2;\n")],
+        );
+        open_plan(&engine, &session, &task, &["Keep working"]);
+        let mut adapter = MockModelAdapter::new("");
+
+        let paused = run_verification(&engine, &root, &session, &mut adapter);
+        let card = paused.check_batch.as_ref().expect("a build card");
+        assert_eq!(card.title.as_deref(), Some("Build check"));
+        assert_eq!(card.checks.len(), 1);
+        assert_eq!(card.checks[0].command, "cargo check --tests");
+        assert_eq!(
+            logged_commands(&log, "cargo"),
+            0,
+            "nothing ran before the answer"
+        );
+        assert!(
+            !outcome_events(&engine, &session)
+                .iter()
+                .any(|event| matches!(event, VerificationEvent::Started { .. })),
+            "no check was selected before the build was decided"
+        );
+
+        let decisions = vec![(card.checks[0].id.clone(), approve)];
+        let resumed = resume_checks(&engine, &card.id, &decisions, &mut adapter);
+
+        let report = resumed.verification_report.as_ref().expect("a report");
+        assert_eq!(report.builds.len(), 1);
+        if approve {
+            assert_eq!(report.builds[0].label, "builds");
+            assert_eq!(logged_commands(&log, "cargo check --tests"), 1);
+        } else {
+            assert_eq!(report.builds[0].status, "not_run");
+            assert_eq!(logged_commands(&log, "cargo check --tests"), 0);
+        }
+        assert_eq!(
+            report.passed,
+            vec![CheckId::new("", "cargo test")],
+            "{report:?}"
+        );
+        assert_eq!(logged_commands(&log, "cargo test"), 1);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&tools);
+    }
+}
+
+/// The build event's wire shape, the fold, and the report's "Build" row.
+#[test]
+fn a_build_event_folds_into_the_report_and_never_into_the_checks() {
+    let build = CheckId::new("crates/demo", "cargo check --tests");
+    let errors = workspace_engine::BuildErrors {
+        total: 3,
+        shown: vec![workspace_engine::BuildError {
+            summary: "mismatched types".to_string(),
+            details: None,
+            path: Some("crates/demo/src/lib.rs".to_string()),
+            line: Some(8),
+            outside_task: false,
+        }],
+    };
+    let event = VerificationEvent::Build {
+        task_id: "task".to_string(),
+        check: build.clone(),
+        outcome: CheckOutcome::Ran {
+            exit_code: Some(101),
+            marker_id: "cmd_1".to_string(),
+            termination: None,
+        },
+        file_hashes: BTreeMap::new(),
+        generation: 0,
+        errors: Some(errors),
+        reused: false,
+    };
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["kind"], "verification_build");
+    assert_eq!(json["errors"]["total"], 3);
+    assert!(json.get("reused").is_none(), "false is omitted");
+    let back: VerificationEvent = serde_json::from_value(json).unwrap();
+    assert_eq!(back, event);
+
+    let events = [
+        started(0, &[]),
+        event,
+        finished(VerificationOutcome::BuildFailed),
+    ];
+    let state = state(&events);
+    assert!(state.checks.is_empty() && state.selected.is_empty());
+    let report = report_for(&events);
+    assert_eq!(report.builds[0].label, "does not build: 3 errors");
+    assert!(report.failed.is_empty(), "a build is not a failed check");
+    assert!(
+        report
+            .summary(&complete_plan_report())
+            .starts_with("The change does not build: cargo check --tests (crates/demo) reported 3 errors. No other check ran."),
+        "{}",
+        report.summary(&complete_plan_report())
+    );
+    let rendered = report.render();
+    assert!(rendered.contains("Build"), "{rendered}");
+    assert!(rendered.contains("does not build: 3 errors"), "{rendered}");
+    let prompt = report
+        .build_failure_prompt()
+        .expect("a build failure prompt");
+    assert!(
+        prompt.contains("1. crates/demo/src/lib.rs:8: mismatched types"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("…and 2 more errors not shown."), "{prompt}");
+
+    // A later `Started` clears the attempt's builds but keeps them for reuse.
+    let mut later = events.to_vec();
+    later.push(started(1, &[]));
+    let state = fold_verification(later.iter());
+    assert!(state.build_results.is_empty());
+    assert!(state.builds.contains_key(&build));
 }

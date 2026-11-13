@@ -1008,6 +1008,7 @@ mod tests {
             completed_at_ms: None,
             evidence: Vec::new(),
             check: None,
+            build: None,
         });
         plan
     }

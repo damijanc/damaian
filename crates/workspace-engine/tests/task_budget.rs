@@ -45,6 +45,7 @@ fn step(id: &str) -> PlanStep {
         completed_at_ms: None,
         evidence: Vec::new(),
         check: None,
+        build: None,
     }
 }
 
@@ -814,6 +815,7 @@ mod budget_usage_chain {
             completed_at_ms: None,
             evidence: Vec::new(),
             check: None,
+            build: None,
         }];
         plan
     }

@@ -985,6 +985,265 @@ pub struct DeferredCheck {
     pub step: String,
 }
 
+/// The fast-path build check for a detected Cargo root that no plan step names
+/// a build check for (spec 109 D10). Run in the owning root's directory, so a
+/// member crate builds only its own package, with its tests, without running
+/// them.
+pub const CARGO_BUILD_CHECK: &str = "cargo check --tests";
+
+/// The most compiler errors a build check hands the model in full; the rest
+/// are counted (spec 109 D10).
+pub const MAX_BUILD_ERRORS_SHOWN: usize = 5;
+
+/// The most characters of one error's details the model receives.
+pub const MAX_BUILD_ERROR_DETAIL_CHARS: usize = 2_000;
+
+/// One compiler error from a failed build check (spec 109 D10). Built from
+/// the run's findings, so its text is already secret-redacted and bounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildError {
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    /// Repository-relative file the error is located in, when the compiler
+    /// named one that exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// The error is located in a file the task never changed, so it may have
+    /// been there before the task. An error with no location is never marked.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub outside_task: bool,
+}
+
+/// A failed build check's errors: the first [`MAX_BUILD_ERRORS_SHOWN`] in
+/// full and how many there were in all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildErrors {
+    pub total: usize,
+    pub shown: Vec<BuildError>,
+}
+
+impl BuildErrors {
+    /// The errors of a failed run, from its error findings. `changed` is every
+    /// file the task changed; an error located elsewhere is marked
+    /// [`BuildError::outside_task`]. Paths are resolved the way a check's
+    /// findings are (`resolve_finding_path`), against `working_directory`.
+    pub fn from_findings(
+        repository_root: &Path,
+        working_directory: &Path,
+        findings: &[Finding],
+        changed: &[String],
+    ) -> Self {
+        let errors: Vec<&Finding> = findings
+            .iter()
+            .filter(|finding| finding.severity() == Severity::Error)
+            .collect();
+        let shown = errors
+            .iter()
+            .take(MAX_BUILD_ERRORS_SHOWN)
+            .map(|finding| {
+                let path = finding.range().and_then(|range| {
+                    crate::finding::resolve_finding_path(
+                        repository_root,
+                        working_directory,
+                        &range.path,
+                    )
+                });
+                BuildError {
+                    summary: finding.summary().to_string(),
+                    details: finding
+                        .details()
+                        .map(|details| bounded_chars(details, MAX_BUILD_ERROR_DETAIL_CHARS)),
+                    line: path
+                        .as_ref()
+                        .and(finding.range().map(|range| range.start_line)),
+                    outside_task: path
+                        .as_ref()
+                        .is_some_and(|path| !changed.iter().any(|changed| changed == path)),
+                    path,
+                }
+            })
+            .collect();
+        Self {
+            total: errors.len(),
+            shown,
+        }
+    }
+}
+
+fn bounded_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut bounded: String = text.chars().take(limit).collect();
+    bounded.push_str("\n… (cut)");
+    bounded
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One build check's result in a verification (spec 109 D10): the payload of
+/// a `verification_build` event. Never a [`CheckRun`]: the completion gate,
+/// `complete_step`, a plan step's evidence and provenance never read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildRecord {
+    pub check: CheckId,
+    pub outcome: CheckOutcome,
+    pub file_hashes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: u32,
+    /// The compiler's errors when the build failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errors: Option<BuildErrors>,
+    /// Not run again: an earlier run covered exactly this tree (spec 109 D6).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reused: bool,
+}
+
+impl BuildRecord {
+    /// The build ran to an exit and did not pass: the change does not build.
+    /// A build that could not run, was declined, blocked, cancelled or killed
+    /// says nothing about the code and is not a build failure.
+    pub fn failed(&self) -> bool {
+        matches!(self.outcome, CheckOutcome::Ran { .. })
+            && !self.outcome.is_passed()
+            && matches!(
+                self.outcome.termination(),
+                Some(CheckTermination::Exited { .. })
+            )
+    }
+
+    /// The same rule as a check's reuse (spec 109 D6): an exited run that
+    /// covered exactly the current tree.
+    fn reusable_for(&self, current_hashes: &BTreeMap<String, String>, generation: u32) -> bool {
+        CheckRun {
+            outcome: self.outcome.clone(),
+            file_hashes: self.file_hashes.clone(),
+            generation: self.generation,
+        }
+        .reusable_for(current_hashes, generation)
+    }
+
+    /// The engine's wording for the report's "Build" row.
+    pub fn label(&self) -> String {
+        if self.outcome.is_passed() {
+            return "builds".to_string();
+        }
+        if self.failed() {
+            let total = self.errors.as_ref().map_or(0, |errors| errors.total);
+            return if total == 0 {
+                "does not build".to_string()
+            } else {
+                format!("does not build: {}", count(total, "error"))
+            };
+        }
+        match &self.outcome {
+            CheckOutcome::Skipped(reason) => format!("not run: {}", reason.description()),
+            CheckOutcome::Environment { termination } => {
+                format!("not run: {}", termination.description())
+            }
+            CheckOutcome::Ran { .. } => match self.outcome.termination() {
+                Some(termination) => format!("did not finish: {}", termination.description()),
+                None => "did not finish".to_string(),
+            },
+        }
+    }
+}
+
+/// A build check as the report shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildReport {
+    pub check: CheckId,
+    /// `builds`, `does_not_build` or `not_run`.
+    pub status: String,
+    /// The engine's wording, which a renderer prints as it is.
+    pub label: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errors: Option<BuildErrors>,
+}
+
+impl BuildReport {
+    fn from_record(record: &BuildRecord) -> Self {
+        let status = if record.outcome.is_passed() {
+            "builds"
+        } else if record.failed() {
+            "does_not_build"
+        } else {
+            "not_run"
+        };
+        Self {
+            check: record.check.clone(),
+            status: status.to_string(),
+            label: record.label(),
+            reused: record.reused,
+            errors: record.errors.clone(),
+        }
+    }
+}
+
+/// The build checks a per-change verification runs first (spec 109 D10): for
+/// each root the change touched ([`select_roots`]), the current plan step's
+/// build check when it covers that root (its directory is the root or one
+/// enclosing it, as D4's coverage rule), else [`CARGO_BUILD_CHECK`] when the
+/// root has a Cargo manifest, else none. No list of languages decides
+/// anything (D9): a project of any other kind gets a build check only from
+/// its plan. De-duplicated, in root order.
+pub fn build_checks_for_change(
+    map: &RepositoryMap,
+    changed: &[String],
+    step_build: Option<&CheckId>,
+) -> Vec<CheckId> {
+    let mut checks: Vec<CheckId> = Vec::new();
+    for root in select_roots(map, changed) {
+        let enclosing = map.enclosing_roots(&root);
+        let check = match step_build.filter(|check| {
+            check.working_directory == root || enclosing.contains(&check.working_directory.as_str())
+        }) {
+            Some(check) => check.clone(),
+            None if is_cargo_root(map, &root) => CheckId::new(root.as_str(), CARGO_BUILD_CHECK),
+            None => continue,
+        };
+        if !checks.contains(&check) {
+            checks.push(check);
+        }
+    }
+    checks
+}
+
+fn is_cargo_root(map: &RepositoryMap, root: &str) -> bool {
+    map.roots.iter().any(|candidate| {
+        candidate.path == root
+            && candidate
+                .manifests
+                .iter()
+                .any(|manifest| manifest.rsplit('/').next() == Some("Cargo.toml"))
+    })
+}
+
+/// A build check's latest run in the task chain that covered exactly the
+/// current tree, to reuse instead of building again (spec 109 D6).
+pub fn reusable_build<'a>(
+    state: &'a VerificationState,
+    check: &CheckId,
+    current_hashes: &BTreeMap<String, String>,
+    generation: u32,
+) -> Option<&'a BuildRecord> {
+    state
+        .builds
+        .get(check)
+        .filter(|record| record.reusable_for(current_hashes, generation))
+}
+
 /// What the whole verification came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1009,6 +1268,11 @@ pub enum VerificationOutcome {
     /// requirement 11). Never a pass; it settles through the completion gate,
     /// which names each such check in `accepted_failures`.
     OnlyPreExistingFailures,
+    /// A build check after the change failed (spec 109 D10): nothing else
+    /// ran and no baseline was taken. The compiler's errors go to the
+    /// continuation turn; it settles through the completion gate, which an
+    /// unbuilt change cannot pass.
+    BuildFailed,
 }
 
 impl VerificationOutcome {
@@ -1024,6 +1288,7 @@ impl VerificationOutcome {
             Self::NoChecksAvailable => "no_checks_available",
             Self::OnlyDocumentationChanged => "only_documentation_changed",
             Self::OnlyPreExistingFailures => "only_pre_existing_failures",
+            Self::BuildFailed => "build_failed",
         }
     }
 }
@@ -1098,6 +1363,23 @@ pub enum VerificationEvent {
         rename_all = "camelCase"
     )]
     DeferredToCompletion { task_id: String, check: CheckId },
+    /// A build check's result (spec 109 D10), run (or reused) before anything
+    /// else in a per-change verification. Never a `Check`: no `CheckRun` is
+    /// written, so the completion gate, `complete_step`, a plan step's later
+    /// command exit and provenance never read it.
+    #[serde(rename = "verification_build", rename_all = "camelCase")]
+    Build {
+        task_id: String,
+        check: CheckId,
+        outcome: CheckOutcome,
+        file_hashes: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        generation: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        errors: Option<BuildErrors>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        reused: bool,
+    },
     #[serde(rename = "verification_finished", rename_all = "camelCase")]
     Finished {
         task_id: String,
@@ -1138,6 +1420,19 @@ pub enum VerificationEvent {
 }
 
 impl VerificationEvent {
+    /// A `verification_build` event for `record`.
+    pub fn build(task_id: impl Into<String>, record: &BuildRecord) -> Self {
+        Self::Build {
+            task_id: task_id.into(),
+            check: record.check.clone(),
+            outcome: record.outcome.clone(),
+            file_hashes: record.file_hashes.clone(),
+            generation: record.generation,
+            errors: record.errors.clone(),
+            reused: record.reused,
+        }
+    }
+
     /// The task this event belongs to. A `Due` names the task that proposed the
     /// patch; a `Started`/`Check`/`Finished` names the verification turn's own
     /// task, which is why readers take a task chain.
@@ -1149,6 +1444,7 @@ impl VerificationEvent {
             | Self::Reused { task_id, .. }
             | Self::Deferred { task_id, .. }
             | Self::DeferredToCompletion { task_id, .. }
+            | Self::Build { task_id, .. }
             | Self::Finished { task_id, .. }
             | Self::Baseline { task_id, .. }
             | Self::Provenance { task_id, .. }
@@ -1225,6 +1521,12 @@ pub struct VerificationState {
     /// a plan check covers their root and the change's step has none (spec 109
     /// D4); cleared like `deferred`. Never evidence.
     pub deferred_to_completion: BTreeSet<CheckId>,
+    /// The latest run of each build check (spec 109 D10), for reuse. Kept
+    /// apart from `checks`: a build is never a check run.
+    pub builds: BTreeMap<CheckId, BuildRecord>,
+    /// The build checks of the latest attempt, in the order recorded; cleared
+    /// by a new `Started`.
+    pub build_results: Vec<BuildRecord>,
     /// Private so the state cannot be constructed by hand into a shape the
     /// events do not support; the report's honesty rests on the fold.
     passed_before: BTreeSet<CheckId>,
@@ -1273,6 +1575,7 @@ impl VerificationState {
                 self.reused.clear();
                 self.deferred.clear();
                 self.deferred_to_completion.clear();
+                self.build_results.clear();
                 for check in checks {
                     if !self.selected.contains(check) {
                         self.selected.push(check.clone());
@@ -1318,6 +1621,30 @@ impl VerificationState {
             }
             VerificationEvent::DeferredToCompletion { check, .. } => {
                 self.deferred_to_completion.insert(check.clone());
+            }
+            VerificationEvent::Build {
+                check,
+                outcome,
+                file_hashes,
+                generation,
+                errors,
+                reused,
+                ..
+            } => {
+                // Not selected and not a `CheckRun`: the gate, provenance and
+                // baselines never see a build.
+                let record = BuildRecord {
+                    check: check.clone(),
+                    outcome: outcome.clone(),
+                    file_hashes: file_hashes.clone(),
+                    generation: *generation,
+                    errors: errors.clone(),
+                    reused: *reused,
+                };
+                self.build_results
+                    .retain(|existing| &existing.check != check);
+                self.build_results.push(record.clone());
+                self.builds.insert(check.clone(), record);
             }
             VerificationEvent::Finished { outcome, .. } => {
                 self.due = None;
@@ -1445,6 +1772,10 @@ pub struct VerificationReport {
     /// (spec 109 D4). Not run, never evidence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deferred_to_completion: Vec<CheckId>,
+    /// The build checks the latest verification ran or reused first (spec
+    /// 109 D10). Feedback, never evidence: not one of the partitions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub builds: Vec<BuildReport>,
     pub behaviour_verified: Vec<String>,
     pub unverified_steps: Vec<String>,
     pub regressions: Vec<CheckId>,
@@ -1506,6 +1837,11 @@ impl VerificationReport {
                 })
                 .collect(),
             deferred_to_completion: state.deferred_to_completion.iter().cloned().collect(),
+            builds: state
+                .build_results
+                .iter()
+                .map(BuildReport::from_record)
+                .collect(),
             behaviour_verified: Vec::new(),
             unverified_steps: plan
                 .steps
@@ -1666,6 +2002,12 @@ impl VerificationReport {
         if self.due {
             return format!("Verification is due and has not run. {plan_note}");
         }
+        if let Some(VerificationOutcome::BuildFailed) = self.outcome {
+            return format!(
+                "The change does not build: {}. No other check ran. {plan_note}",
+                self.build_failure_phrase()
+            );
+        }
         if let Some(VerificationOutcome::NoChecksAvailable) = self.outcome {
             return format!("No checks were available, so nothing was verified. {plan_note}");
         }
@@ -1743,6 +2085,80 @@ impl VerificationReport {
         }
     }
 
+    /// "`cmd` in `dir` reported 3 errors", for each failed build.
+    fn build_failure_phrase(&self) -> String {
+        self.builds
+            .iter()
+            .filter(|build| build.status == "does_not_build")
+            .map(
+                |build| match build.errors.as_ref().map(|errors| errors.total) {
+                    Some(total) if total > 0 => {
+                        format!("{} reported {}", build.check.label(), count(total, "error"))
+                    }
+                    _ => format!("{} failed", build.check.label()),
+                },
+            )
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// What the continuation turn is told when the change does not build
+    /// (spec 109 D10): each failed build's first errors in full, a count of
+    /// the rest, and a mark on errors located only in files the task never
+    /// changed. `None` unless the verification ended `build_failed`.
+    pub fn build_failure_prompt(&self) -> Option<String> {
+        if self.outcome != Some(VerificationOutcome::BuildFailed) {
+            return None;
+        }
+        let mut text = vec![
+            "Your change does not build. Fix the build errors below before anything else; no other check ran.".to_string(),
+        ];
+        for build in self
+            .builds
+            .iter()
+            .filter(|build| build.status == "does_not_build")
+        {
+            let Some(errors) = build.errors.as_ref().filter(|errors| errors.total > 0) else {
+                text.push(format!(
+                    "{} failed and printed no error Damaian could read.",
+                    build.check.label()
+                ));
+                continue;
+            };
+            text.push(format!(
+                "{} reported {}:",
+                build.check.label(),
+                count(errors.total, "error")
+            ));
+            for (index, error) in errors.shown.iter().enumerate() {
+                let location = match (&error.path, error.line) {
+                    (Some(path), Some(line)) => format!("{path}:{line}: "),
+                    (Some(path), None) => format!("{path}: "),
+                    _ => String::new(),
+                };
+                let mut entry = format!("{}. {location}{}", index + 1, error.summary);
+                if error.outside_task {
+                    entry.push_str(
+                        " (in a file this task has not changed: it may have been broken before the task)",
+                    );
+                }
+                if let Some(details) = &error.details {
+                    entry.push('\n');
+                    entry.push_str(details);
+                }
+                text.push(entry);
+            }
+            let rest = errors.total.saturating_sub(errors.shown.len());
+            if rest > 0 {
+                text.push(format!(
+                    "…and {rest} more {} not shown.",
+                    if rest == 1 { "error" } else { "errors" }
+                ));
+            }
+        }
+        Some(text.join("\n\n"))
+    }
+
     /// "`cmd` in `dir` is left to its plan step \"Title\"" and "`cmd` in `dir`
     /// is left to task completion", joined.
     fn deferred_phrase(&self) -> String {
@@ -1803,6 +2219,23 @@ impl VerificationReport {
     pub fn render(&self) -> String {
         let mut lines = Vec::new();
         lines.push(section("Files changed", &list_or_none(&self.files_changed)));
+        // Only when a build check ran or was reused (spec 109 D10), so every
+        // other report renders exactly as it did.
+        if !self.builds.is_empty() {
+            let builds: Vec<String> = self
+                .builds
+                .iter()
+                .map(|build| {
+                    let reused = if build.reused {
+                        "   (not run again: the files are unchanged since the recorded run)"
+                    } else {
+                        ""
+                    };
+                    format!("{} — {}{reused}", build.check.label(), build.label)
+                })
+                .collect();
+            lines.push(section("Build", &builds.join("\n                     ")));
+        }
 
         let passed = if !self.passed.is_empty() {
             // "all ran" would be false for a reused result, which did not run
@@ -1969,6 +2402,9 @@ impl VerificationReport {
         }
         if self.repair_stall.is_some() {
             notes.push("automatic repair stopped because it stalled".to_string());
+        }
+        if self.outcome == Some(VerificationOutcome::BuildFailed) {
+            notes.push("the change does not build".to_string());
         }
         if notes.is_empty() {
             "none".to_string()

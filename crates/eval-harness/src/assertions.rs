@@ -704,6 +704,35 @@ pub fn evaluate(
             }
         }
 
+        // Spec 109 D10: the compiler's errors reached the model in the same
+        // turn as the build failure.
+        if let Some(wanted) = &asserts.build_failure_request_contains {
+            match &run.build_failure_request {
+                Some(request) => {
+                    let missing: Vec<&String> = wanted
+                        .iter()
+                        .filter(|needle| !request.contains(needle.as_str()))
+                        .collect();
+                    push(
+                        "build_failure_request_contains",
+                        missing.is_empty(),
+                        format!("{wanted:?}"),
+                        if missing.is_empty() {
+                            "all present".to_string()
+                        } else {
+                            format!("missing from the post-build-failure request: {missing:?}")
+                        },
+                    );
+                }
+                None => push(
+                    "build_failure_request_contains",
+                    false,
+                    format!("{wanted:?}"),
+                    "no build check failed".to_string(),
+                ),
+            }
+        }
+
         if let Some(expected) = asserts.plan_reviews {
             let actual = run
                 .trace

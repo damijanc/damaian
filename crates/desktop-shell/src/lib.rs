@@ -6435,7 +6435,7 @@ pub(crate) fn plan_json_with_waiting(plan: &TaskPlan, active: bool, waiting: boo
         .zip(report.steps.iter())
         .map(|(step, reported)| {
             format!(
-                "{{\"id\":\"{}\",\"title\":\"{}\",\"detail\":{},\"status\":\"{}\",\"outcome\":\"{}\",\"evidence\":{},\"check\":{}}}",
+                "{{\"id\":\"{}\",\"title\":\"{}\",\"detail\":{},\"status\":\"{}\",\"outcome\":\"{}\",\"evidence\":{},\"check\":{},\"build\":{}}}",
                 escape_json(&step.id),
                 escape_json(&step.title),
                 step.detail
@@ -6445,7 +6445,10 @@ pub(crate) fn plan_json_with_waiting(plan: &TaskPlan, active: bool, waiting: boo
                 serde_status(step.status),
                 reported.outcome.as_str(),
                 serde_json::to_string(&step.evidence).unwrap_or_else(|_| "[]".to_string()),
-                check_json(&step.check)
+                check_json(&step.check),
+                // Spec 109 D10: shown on the card, never edited there; a
+                // revision keeps the step's build check as it is.
+                check_json(&step.build)
             )
         })
         .collect::<Vec<_>>()
@@ -8063,6 +8066,7 @@ mod tests {
                 working_directory: String::new(),
             }],
             check: None,
+            build: None,
         });
         plan.steps.push(PlanStep {
             id: "step_2".to_string(),
@@ -8074,6 +8078,7 @@ mod tests {
             completed_at_ms: None,
             evidence: Vec::new(),
             check: None,
+            build: None,
         });
         plan
     }
@@ -8103,6 +8108,22 @@ mod tests {
         assert_eq!(check["version"], PLANNED_CHECK_VERSION);
         // A step without a check reads as null, not an absent key.
         assert_eq!(value["steps"][0]["check"], serde_json::Value::Null);
+        // Spec 109 D10: the card also shows a step's build check, and a step
+        // without one reads as null.
+        assert_eq!(value["steps"][1]["build"], serde_json::Value::Null);
+        plan.steps[0].build = Some(PlannedCheck {
+            version: PLANNED_CHECK_VERSION,
+            command: "cargo check -p workspace-engine --tests".to_string(),
+            working_directory: "crates/workspace-engine".to_string(),
+            purpose: "from CI".to_string(),
+            required: false,
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&plan_json(&plan, true)).expect("valid plan JSON");
+        let build = &value["steps"][0]["build"];
+        assert_eq!(build["command"], "cargo check -p workspace-engine --tests");
+        assert_eq!(build["workingDirectory"], "crates/workspace-engine");
+        assert_eq!(build["required"], false);
     }
 
     #[test]
@@ -11271,6 +11292,7 @@ mod tests {
                 completed_at_ms: None,
                 evidence: Vec::new(),
                 check: None,
+                build: None,
             });
         }
         engine.session_store.create_plan(&reviewing, &plan).unwrap();
@@ -11480,6 +11502,7 @@ mod tests {
                         hash: "sha256:0".to_string(),
                     }],
                     check: None,
+                    build: None,
                 },
                 workspace_engine::PlanStep {
                     id: "step_2".to_string(),
@@ -11491,6 +11514,7 @@ mod tests {
                     completed_at_ms: Some(3),
                     evidence: Vec::new(),
                     check: None,
+                    build: None,
                 },
                 workspace_engine::PlanStep {
                     id: "step_3".to_string(),
@@ -11502,6 +11526,7 @@ mod tests {
                     completed_at_ms: None,
                     evidence: Vec::new(),
                     check: None,
+                    build: None,
                 },
             ],
         };
@@ -16898,6 +16923,7 @@ mod tests {
                 completed_at_ms: None,
                 evidence: Vec::new(),
                 check: None,
+                build: None,
             });
             store().create_plan(&task, &plan).unwrap();
             store()
@@ -18573,6 +18599,7 @@ exec /bin/cat > /dev/null
                 completed_at_ms: None,
                 evidence: Vec::new(),
                 check: None,
+                build: None,
             });
             store.create_plan(&task, &plan).unwrap();
             let report = workspace_engine::CompletionGateReport {
@@ -20134,6 +20161,7 @@ mod commit_message_tests {
             completed_at_ms: None,
             evidence: Vec::new(),
             check: None,
+            build: None,
         });
         engine.session_store.create_plan(&task, &plan).unwrap();
         Fixture {

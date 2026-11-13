@@ -149,7 +149,12 @@ pub enum Evidence {
 
 /// The current [`PlannedCheck`] wire format. A plan written with a later
 /// version can be detected rather than silently misread as the current shape.
-pub const PLANNED_CHECK_VERSION: u32 = 1;
+///
+/// Version 2 (spec 109 D10) is the plan format in which a step may also carry
+/// a [`PlanStep::build`] check. The check's own fields are unchanged, so a
+/// version 1 check reads exactly as before and a plan written before version 2
+/// simply has no build check on any step.
+pub const PLANNED_CHECK_VERSION: u32 = 2;
 
 /// A structured check a plan step requires (spec 105).
 ///
@@ -238,6 +243,15 @@ pub struct PlanStep {
     /// (context.md §10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<PlannedCheck>,
+    /// A fast compile or type-check command for this step (spec 109 D10): run
+    /// after every change the step makes, before anything else verifies it,
+    /// so a change that does not build reaches the model at once. It is
+    /// feedback, never evidence: it satisfies no required check, takes no
+    /// baseline and changes nothing the completion gate requires, so its
+    /// `required` flag means nothing and is stored `false`. Omitted from the
+    /// wire when absent; a plan written before plan format version 2 has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<PlannedCheck>,
 }
 
 impl PlanStep {

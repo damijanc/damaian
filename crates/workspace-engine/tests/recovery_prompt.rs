@@ -70,6 +70,7 @@ fn task_awaiting_plan_review(
         completed_at_ms: None,
         evidence: Vec::new(),
         check: None,
+        build: None,
     });
     fixture.store.create_plan(&task, &plan).unwrap();
     if paused_turn_survives {

@@ -13190,6 +13190,22 @@ function createVerificationReportCard(report, reportRepo, { onContinueRepair = n
     return button;
   });
   section("Files changed", files);
+  // Spec 109 D10: the build checks that ran first. The label ("builds",
+  // "does not build: 3 errors", "not run: …") is the engine's wording. Only
+  // shown when a build check ran or was reused.
+  if (report.builds?.length) {
+    const build = section(
+      "Build",
+      report.builds.map((item) =>
+        document.createTextNode(
+          `${checkLabel(item.check)} — ${item.label}${item.reused ? " (files unchanged, not run again)" : ""}`,
+        ),
+      ),
+    );
+    if (report.builds.some((item) => item.status === "does_not_build")) {
+      build.classList.add("has-build-failure");
+    }
+  }
   section(
     "Checks passed",
     (report.passed || []).map((check) => document.createTextNode(checkLabel(check))),
@@ -14232,6 +14248,11 @@ function planCheckTitle(check) {
   return `${kind}: ${checkLabel(check)}`;
 }
 
+// A step's build check (spec 109 D10) on the review card.
+function planBuildTitle(build) {
+  return `Build check: ${checkLabel(build)}`;
+}
+
 function createPlanReview(
   proposal,
   proposalRepo,
@@ -14322,6 +14343,14 @@ function createPlanReview(
       check.className = "plan-review-check";
       check.textContent = planCheckTitle(step.check);
       row.append(check);
+    }
+    // Spec 109 D10: the step's build check, run after each of its changes.
+    // Feedback only, so it is shown but never marked required.
+    if (step.build) {
+      const build = document.createElement("span");
+      build.className = "plan-review-check plan-review-build";
+      build.textContent = planBuildTitle(step.build);
+      row.append(build);
     }
     list.append(row);
   }

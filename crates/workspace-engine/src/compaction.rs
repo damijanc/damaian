@@ -1064,6 +1064,7 @@ mod tests {
             completed_at_ms: Some(2),
             evidence: Vec::new(),
             check: None,
+            build: None,
         });
         let plans: HashMap<String, TaskPlan> = [("task_1".to_string(), plan)].into();
         let decisions = vec![

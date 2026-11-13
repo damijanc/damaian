@@ -86,11 +86,11 @@ pub use cancel::CancelToken;
 pub use chat::{
     AgentCheckBatch, AgentCommandProposal, AgentContextReview, AgentFallbackProposal,
     AgentFetchProposal, AgentPatchProposal, AgentPlanProposal, AgentQuestionProposal,
-    AgentRoundBudgetProposal, ChatOrchestrator, ChatTurnOptions, ChatTurnResult, ContextDecision,
-    FetchComponentFlag, FetchDecision, McpTokenResolver, MemoryDisplayEntry, PausedTurns,
-    PendingFetchCall, PhaseKind, PlanRevisionCheck, PlanRevisionStep, PlanWorkerPrompt,
-    ResumeDecisionOptions, RoundBudgetDecision, RoundBudgetPause, TurnPhase, TurnProgress,
-    TurnSink,
+    AgentRoundBudgetProposal, BUILD_CHECK_CARD_TITLE, ChatOrchestrator, ChatTurnOptions,
+    ChatTurnResult, ContextDecision, FetchComponentFlag, FetchDecision, McpTokenResolver,
+    MemoryDisplayEntry, PausedTurns, PendingFetchCall, PhaseKind, PlanRevisionCheck,
+    PlanRevisionStep, PlanWorkerPrompt, ResumeDecisionOptions, RoundBudgetDecision,
+    RoundBudgetPause, TurnPhase, TurnProgress, TurnSink,
 };
 pub use checkpoint::{
     CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,
@@ -316,13 +316,15 @@ pub use validation::{
     command_approval_prompt, resolve_command_directory,
 };
 pub use verification::{
-    BROWSER_CHECK_PREFIX, CheckBaseline, CheckId, CheckOutcome, CheckProvenanceRecord, CheckReuse,
-    CheckRun, CheckTermination, DeferredCheck, FAILURE_FINGERPRINT_VERSION, FailedCheck,
-    FailureFingerprint, FailureProvenance, FindingEvidence, GENERIC_IDENTITY_TAIL_TRUNCATED,
+    BROWSER_CHECK_PREFIX, BuildError, BuildErrors, BuildRecord, BuildReport, CARGO_BUILD_CHECK,
+    CheckBaseline, CheckId, CheckOutcome, CheckProvenanceRecord, CheckReuse, CheckRun,
+    CheckTermination, DeferredCheck, FAILURE_FINGERPRINT_VERSION, FailedCheck, FailureFingerprint,
+    FailureProvenance, FindingEvidence, GENERIC_IDENTITY_TAIL_TRUNCATED,
     MAX_GENERIC_IDENTITY_TAIL_BYTES, MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, ScopedSelection,
     Selection, SkipReason, SkippedCheck, VerificationDue, VerificationEvent, VerificationOutcome,
-    VerificationReport, VerificationState, detected_checks_of_roots, fold_verification,
-    is_documentation, propose_checks, propose_scoped_checks, scoped_selection, select_roots,
+    VerificationReport, VerificationState, build_checks_for_change, detected_checks_of_roots,
+    fold_verification, is_documentation, propose_checks, propose_scoped_checks, scoped_selection,
+    select_roots,
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,
