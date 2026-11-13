@@ -844,10 +844,28 @@ mod budget_usage_chain {
             .unwrap();
         store.resume_plan(&continued, &first.id).unwrap();
 
+        // Failed once on CI (2026-11-13, OBSERVATIONS 101) and never in 1,100
+        // local runs, 800 of them 24 at a time. A failure prints what the
+        // store saw, so the next one names its cause.
         let total = store
             .read_budget_usage(&session.id, &continued.id)
             .unwrap()
-            .expect("the chain's usage is known before the continuation's first call");
+            .unwrap_or_else(|| {
+                let log = root
+                    .join(".damaian")
+                    .join("sessions")
+                    .join(format!("{}.jsonl", session.id));
+                panic!(
+                    "the chain's usage is known before the continuation's first call\n\
+                     first = {}\ncontinued = {}\nchain = {:?}\nlog {} =\n{}",
+                    first.id,
+                    continued.id,
+                    store.task_continuation_chain(&session.id, &continued.id),
+                    log.display(),
+                    std::fs::read_to_string(&log)
+                        .unwrap_or_else(|error| format!("<unreadable: {error}>")),
+                )
+            });
         assert_eq!((total.input_tokens, total.output_tokens), (100, 10));
 
         store
