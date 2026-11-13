@@ -4500,13 +4500,65 @@ body.worker-view #chat-model-menu {
   color: var(--danger);
 }
 
+/* A full panel (spec 35, 2026-11-13), not a small centered card: reviewing a
+   commit means reading diffs, and a diff needs room. Overrides `.app-dialog`'s
+   centered-card sizing with its own fixed, full-viewport layout. */
 .app-dialog-commit {
-  width: min(720px, calc(100vw - 32px));
-  max-height: calc(100vh - 64px);
+  position: fixed;
+  inset: 0;
+  width: auto;
+  max-height: none;
+  overflow-y: visible;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 0;
+  border-radius: 0;
+}
+
+.commit-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.commit-panel-close {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.commit-panel-close:hover {
+  background: var(--surface-soft);
+  color: var(--ink);
+}
+
+/* The one scroll area: no more dialog-within-list-within-diff nesting. */
+.commit-panel-body {
+  min-height: 0;
   overflow-y: auto;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 14px 20px;
+}
+
+.commit-panel-footer {
+  display: grid;
+  gap: 8px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
 }
 
 .commit-summary {
+  margin: 2px 0 0;
   font-variant-numeric: tabular-nums;
 }
 
@@ -4522,14 +4574,10 @@ body.worker-view #chat-model-menu {
   font-size: 12px;
 }
 
+/* No height cap or scroll of its own: the panel body is the one scroll area. */
 .commit-file-list {
   display: grid;
-  gap: 6px;
-  max-height: 240px;
-  overflow-y: auto;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 8px;
+  gap: 14px;
 }
 
 .commit-file {
@@ -4562,24 +4610,18 @@ body.worker-view #chat-model-menu {
   font-size: 11px;
 }
 
-.commit-file-diff summary {
-  color: var(--muted);
-  cursor: pointer;
-  font-size: 11px;
-  padding-left: 22px;
-}
-
-.commit-file-diff pre {
-  margin: 4px 0 0;
-  max-height: 180px;
-  overflow: auto;
+/* Expanded by default, colored (`renderColoredDiff`, `.diff-view`/`.diff-line`
+   — the same rendering a proposed patch gets), not a plain-text `<pre>` behind
+   a disclosure. */
+.commit-file-diff {
+  margin: 6px 0 0 22px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  padding: 6px 8px;
-  background: var(--surface-soft);
-  font-size: 11px;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+}
+
+.commit-file-diff .diff-view {
+  max-height: min(420px, 48vh);
 }
 
 .commit-secret-warning {
@@ -4642,13 +4684,32 @@ body.worker-view #chat-model-menu {
 }
 
 .commit-hooks {
-  border-top: 1px solid var(--line);
   padding-top: 6px;
 }
 
 .commit-verification {
   border-top: 1px solid var(--line);
   padding-top: 6px;
+  margin-top: 6px;
+}
+
+/* Secondary to the diffs: collapsed by default so it does not compete with
+   them for space, open with one click when it matters. */
+.commit-extra {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.commit-extra summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.commit-extra[open] summary {
+  margin-bottom: 6px;
 }
 
 .commit-note-warn {

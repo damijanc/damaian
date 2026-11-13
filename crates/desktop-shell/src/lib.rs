@@ -9899,6 +9899,49 @@ mod tests {
         assert!(narrow_app.contains("overflow: visible;"), "{narrow_app}");
     }
 
+    /// The commit panel is a full-viewport panel, not a small centered card;
+    /// a file's diff renders expanded and colored, through the same
+    /// `renderColoredDiff` a proposed patch uses, not a plain-text `<pre>`
+    /// behind a disclosure; hooks and checks are collapsed into one
+    /// secondary disclosure so they do not compete with the diffs for space;
+    /// the redaction note stays outside any disclosure (spec 35 §5.4).
+    #[test]
+    fn app_js_shows_the_commit_review_as_a_full_panel_with_expanded_diffs() {
+        let show = app_js_function("showCommitDialog");
+        assert!(
+            show.contains("renderColoredDiff(candidate.diff)"),
+            "a file's diff must use the colored renderer: {show}"
+        );
+        assert!(
+            !show.contains("<details") || !show.contains("Diff (redacted)"),
+            "a file's diff must not be collapsed behind its own disclosure: {show}"
+        );
+        assert!(
+            show.contains(r#"<details class="commit-extra">"#),
+            "hooks and checks must be one collapsed, secondary disclosure: {show}"
+        );
+        assert!(
+            show.contains("commit-redaction")
+                && !show.contains(r#"<details class="commit-redaction"#),
+            "the redaction note must stay outside any disclosure: {show}"
+        );
+
+        let css = super::STYLE_CSS;
+        let start = css
+            .find(
+                "
+.app-dialog-commit {",
+            )
+            .expect("style.css should have an .app-dialog-commit rule");
+        let rule = &css[start..start + css[start..].find('}').unwrap()];
+        for declaration in ["position: fixed;", "inset: 0;"] {
+            assert!(
+                rule.contains(declaration),
+                "the .app-dialog-commit rule lacks {declaration}: {rule}"
+            );
+        }
+    }
+
     fn app_js_function(name: &str) -> &'static str {
         let app = super::APP_JS;
         let start = app

@@ -1659,35 +1659,66 @@ function commitSize(bytes) {
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+// A candidate with no textual diff (binary content, a mode-only change): the
+// same note `renderColoredDiff` would show for an empty string, kept as its
+// own function so the empty-diff case reads the same way everywhere a diff is
+// rendered.
+function noDiffNote() {
+  const note = document.createElement("div");
+  note.className = "diff-view";
+  const line = document.createElement("div");
+  line.className = "diff-line context";
+  line.textContent = "No diff is shown for this file.";
+  note.append(line);
+  return note;
+}
+
 function showCommitDialog(preparation, repoPath, sessionId) {
+  // A full panel, not a small centered card: reviewing a commit means reading
+  // diffs, and a diff needs room. Header and footer stay put; the body is the
+  // one scroll area (no more dialog-within-list-within-diff nesting).
   const backdrop = document.createElement("div");
   backdrop.className = "app-dialog-backdrop";
   backdrop.innerHTML = `
     <div class="app-dialog app-dialog-commit" role="dialog" aria-modal="true" aria-label="Commit changes">
-      <p class="app-dialog-title">Commit changes</p>
-      <p class="app-dialog-message commit-summary"></p>
-      <p class="commit-redaction">The diffs below are redacted for display. The commit contains
-        the real file content.</p>
-      <div class="commit-file-list"></div>
-      <p class="commit-secret-warning" hidden></p>
-      <label class="commit-secret-override" hidden>
-        <input type="checkbox" />
-        <span>I understand these files contain the real content the scanner flagged, and I
-          want to commit it.</span>
-      </label>
-      <label class="commit-message-label" for="commit-message-input">Commit message</label>
-      <textarea id="commit-message-input" class="commit-message" rows="4"></textarea>
-      <p class="commit-draft-notice" hidden></p>
-      <div class="commit-hooks"></div>
-      <div class="commit-verification"></div>
-      <p class="commit-refusal" hidden></p>
-      <p class="commit-error" hidden></p>
-      <div class="app-dialog-actions">
-        <button type="button" class="app-dialog-btn app-dialog-cancel">Cancel</button>
-        <button type="button" class="app-dialog-btn commit-draft">Draft with model</button>
-        <button type="button" class="app-dialog-btn app-dialog-confirm commit-submit" disabled>
-          Commit
+      <div class="commit-panel-header">
+        <div>
+          <p class="app-dialog-title">Commit changes</p>
+          <p class="app-dialog-message commit-summary"></p>
+        </div>
+        <button type="button" class="commit-panel-close app-dialog-cancel" aria-label="Cancel">
+          &times;
         </button>
+      </div>
+      <div class="commit-panel-body">
+        <p class="commit-redaction">The diffs below are redacted for display. The commit
+          contains the real file content.</p>
+        <p class="commit-secret-warning" hidden></p>
+        <label class="commit-secret-override" hidden>
+          <input type="checkbox" />
+          <span>I understand these files contain the real content the scanner flagged, and I
+            want to commit it.</span>
+        </label>
+        <div class="commit-file-list"></div>
+        <details class="commit-extra">
+          <summary>Hooks &amp; checks</summary>
+          <div class="commit-hooks"></div>
+          <div class="commit-verification"></div>
+        </details>
+        <p class="commit-refusal" hidden></p>
+        <p class="commit-error" hidden></p>
+      </div>
+      <div class="commit-panel-footer">
+        <label class="commit-message-label" for="commit-message-input">Commit message</label>
+        <textarea id="commit-message-input" class="commit-message" rows="3"></textarea>
+        <p class="commit-draft-notice" hidden></p>
+        <div class="app-dialog-actions">
+          <button type="button" class="app-dialog-btn app-dialog-cancel">Cancel</button>
+          <button type="button" class="app-dialog-btn commit-draft">Draft with model</button>
+          <button type="button" class="app-dialog-btn app-dialog-confirm commit-submit" disabled>
+            Commit
+          </button>
+        </div>
       </div>
     </div>
   `;
@@ -1807,14 +1838,12 @@ function showCommitDialog(preparation, repoPath, sessionId) {
     label.textContent = `${candidate.status} · ${candidate.label}`;
     head.append(checkbox, path, label);
     row.append(head);
-    const details = document.createElement("details");
-    details.className = "commit-file-diff";
-    const caption = document.createElement("summary");
-    caption.textContent = "Diff (redacted)";
-    const pre = document.createElement("pre");
-    pre.textContent = candidate.diff || "No diff is shown for this file.";
-    details.append(caption, pre);
-    row.append(details);
+    // Expanded by default and colored: reviewing the diff is the point of
+    // this panel, not a disclosure the user has to open per file.
+    const diffWrap = document.createElement("div");
+    diffWrap.className = "commit-file-diff";
+    diffWrap.append(candidate.diff ? renderColoredDiff(candidate.diff) : noDiffNote());
+    row.append(diffWrap);
     list.append(row);
   });
 
@@ -1981,7 +2010,10 @@ function showCommitDialog(preparation, repoPath, sessionId) {
   const onKeydown = (event) => {
     if (event.key === "Escape") cleanup();
   };
-  backdrop.querySelector(".app-dialog-cancel").addEventListener("click", cleanup);
+  // Two Cancel controls now: the header's × and the footer button.
+  backdrop.querySelectorAll(".app-dialog-cancel").forEach((button) => {
+    button.addEventListener("click", cleanup);
+  });
   document.addEventListener("keydown", onKeydown, true);
   refresh();
   dialog.querySelector(".commit-message").focus();
