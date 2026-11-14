@@ -6127,6 +6127,7 @@ async function loadConfigFile() {
   // that content is the file's: saving an empty editor would empty the file.
   $("worker-sessions-input").disabled = false;
   void refreshConversationAutoCompact();
+  void refreshSemanticSearchEnabled();
   void refreshPauseForContextReview();
   void refreshTaskBudgetSettings();
   void refreshModelKeyStatus().catch((error) => setModelKeyStatus(error.message, "error"));
@@ -8462,6 +8463,21 @@ async function refreshConversationAutoCompact() {
   } catch {
     // Unknown reads as unchecked and disabled: a control must not appear to
     // hold a setting it could not read.
+    input.checked = false;
+    input.disabled = true;
+  }
+}
+
+// Spec 2 (2026-11-14): default off, so an absent key reads as unchecked,
+// the opposite of conversation_auto_compact's default-on reading above.
+async function refreshSemanticSearchEnabled() {
+  const input = $("semantic-search-input");
+  try {
+    const payload = await api(`/api/effective-policy?repo=${encodeURIComponent(repo() || "")}`);
+    const rule = (payload.rules || []).find((entry) => entry.key === "enable_semantic_search");
+    input.checked = rule?.value === "true";
+    input.disabled = false;
+  } catch {
     input.checked = false;
     input.disabled = true;
   }
@@ -16901,6 +16917,26 @@ $("conversation-auto-compact-input").addEventListener("change", async (event) =>
   } catch (error) {
     toast(errorMessage(error));
     await refreshConversationAutoCompact();
+  }
+});
+
+$("semantic-search-input").addEventListener("change", async (event) => {
+  const enabled = event.target.checked;
+  try {
+    await api(
+      "/api/config-set",
+      form({ key: "enable_semantic_search", value: enabled ? "true" : "false" }),
+    );
+    await loadConfigFile();
+    await refreshSemanticSearchEnabled();
+    toast(
+      enabled
+        ? "Semantic search on — the embedding model downloads on first use"
+        : "Semantic search off",
+    );
+  } catch (error) {
+    toast(errorMessage(error));
+    await refreshSemanticSearchEnabled();
   }
 });
 

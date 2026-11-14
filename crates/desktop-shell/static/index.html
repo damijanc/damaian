@@ -554,6 +554,18 @@
               own session and git worktree.
             </p>
           </section>
+          <section class="settings-section" id="semantic-search-section">
+            <label class="field-checkbox">
+              <input id="semantic-search-input" type="checkbox" disabled />
+              <span>Semantic search</span>
+            </label>
+            <p class="settings-page-hint semantic-search-hint">
+              Finds relevant files by meaning, not just matching words, using a local embedding
+              model (<code>all-MiniLM-L6-v2</code>). The first time it runs, it downloads the
+              model (about 90&nbsp;MB) from huggingface.co; off, Damaian keeps using keyword and
+              term-overlap search, as it does by default.
+            </p>
+          </section>
           <section class="settings-section" id="conversation-section">
             <h3>Conversation</h3>
             <label class="field-checkbox">

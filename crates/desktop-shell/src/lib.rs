@@ -9976,6 +9976,39 @@ mod tests {
         );
     }
 
+    /// A Settings toggle for spec 2's semantic search, same shape as the
+    /// other config-backed checkboxes: reads the effective value (default
+    /// off, the opposite reading of `conversation_auto_compact`'s default-on
+    /// one) and writes through `/api/config-set`.
+    #[test]
+    fn app_js_has_a_semantic_search_settings_toggle() {
+        assert!(
+            super::APP_JS.contains(r#"<input id="semantic-search-input""#)
+                || super::INDEX_HTML.contains(r#"<input id="semantic-search-input""#),
+            "the Settings page must have the checkbox"
+        );
+        let refresh = app_js_function("refreshSemanticSearchEnabled");
+        assert!(
+            refresh.contains(r#"entry.key === "enable_semantic_search""#),
+            "{refresh}"
+        );
+        assert!(
+            refresh.contains(r#"rule?.value === "true""#),
+            "default off: an absent key must read as unchecked: {refresh}"
+        );
+        assert!(
+            super::APP_JS.contains(
+                r#"form({ key: "enable_semantic_search", value: enabled ? "true" : "false" })"#
+            ),
+            "the toggle must write through the same route every other config checkbox uses"
+        );
+        let load = app_js_function("loadConfigFile");
+        assert!(
+            load.contains("refreshSemanticSearchEnabled();"),
+            "opening Settings must refresh the toggle: {load}"
+        );
+    }
+
     fn app_js_function(name: &str) -> &'static str {
         let app = super::APP_JS;
         let start = app

@@ -140,7 +140,7 @@ Because that file arrives with a clone, a repository can only make Damaian *more
 
 ### Semantic search
 
-`enable_semantic_search` is off by default. Off, Damaian finds relevant files for a request, and answers the assistant's `search_codebase` tool, by keyword and term overlap. On, it also uses an embedding model for that search, which can find files that use different words for the same idea.
+**Settings → General → Semantic search** turns it on or off (`enable_semantic_search`, off by default). Off, Damaian finds relevant files for a request, and answers the assistant's `search_codebase` tool, by keyword and term overlap. On, it also uses an embedding model for that search, which can find files that use different words for the same idea.
 
 Turning it on downloads the embedding model on first use, into `models/all-MiniLM-L6-v2/` inside the [data directory](#local-data), so the first search afterwards is slower. If it seems to do nothing, see [Troubleshooting](TROUBLESHOOTING.md#semantic-search-does-nothing).
 
