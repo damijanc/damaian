@@ -4,7 +4,7 @@
 
 use workspace_engine::{
     ConfigOverlay, HookConfigOverlay, HookEvent, LANGUAGE_SERVER_LANGUAGES, McpServerConfigOverlay,
-    ModelProviderConfigOverlay, overlay_field_kinds,
+    McpToolConfigOverlay, ModelProviderConfigOverlay, overlay_field_kinds,
 };
 
 fn reference() -> String {
@@ -29,9 +29,10 @@ fn key_for_overlay_field(field: &str) -> String {
         "permission_profile_by_repository" => "permission_profile.<repository_id>",
         "hook_reviews_by_repository" => "hook_review.<repository_id>.<hook_id>",
         "language_servers" => "language_server.<language>",
-        // The three definition families are checked field by field below.
+        // The four definition families are checked field by field below.
         "model_providers" => "model_provider.<id>.",
         "mcp_servers" => "mcp_server.<id>.",
+        "mcp_tools" => "mcp_server.<server>.tool.<tool>.",
         "hooks" => "hook.<id>.",
         other => other,
     }
@@ -49,7 +50,11 @@ fn debug_field_names(debug: &str) -> Vec<String> {
         .expect("a struct's Debug output has braces");
     body.split(", ")
         .filter_map(|field| field.split_once(':').map(|(name, _)| name.trim()))
-        .filter(|name| *name != "id")
+        .filter(|name| {
+            // `server_id` and `tool_name` identify which entry the overlay
+            // addresses, not a field of it.
+            *name != "id" && *name != "server_id" && *name != "tool_name"
+        })
         .map(str::to_string)
         .collect()
 }
@@ -62,6 +67,8 @@ fn concrete_key(pattern: &str) -> String {
         .replace("<hook_id>", "example")
         .replace("<language>", "rust")
         .replace("<category>", "pinned")
+        .replace("<server>", "example")
+        .replace("<tool>", "example")
         .replace("<id>", "example")
 }
 
@@ -117,6 +124,10 @@ fn every_definition_field_is_documented() {
         (
             "mcp_server.<id>.",
             format!("{:?}", McpServerConfigOverlay::default()),
+        ),
+        (
+            "mcp_server.<server>.tool.<tool>.",
+            format!("{:?}", McpToolConfigOverlay::default()),
         ),
         ("hook.<id>.", format!("{:?}", HookConfigOverlay::default())),
     ];

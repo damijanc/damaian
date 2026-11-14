@@ -420,6 +420,11 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         mcp_enabled,
         mcp_server_allowlist,
         mcp_servers,
+        mcp_deferral_ceiling_tokens,
+        mcp_connect_timeout_ms,
+        mcp_list_timeout_ms,
+        mcp_call_timeout_ms,
+        mcp_tools,
         hooks,
         hook_reviews_by_repository,
         language_servers,
@@ -470,6 +475,11 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         ("model_base_url", model_base_url.is_some()),
         ("model_api_key_env", model_api_key_env.is_some()),
         ("model_reasoning_level", model_reasoning_level.is_some()),
+        // Spec 33 D6: timeouts control process and network behaviour, which a
+        // profile may not set in either direction.
+        ("mcp_connect_timeout_ms", mcp_connect_timeout_ms.is_some()),
+        ("mcp_list_timeout_ms", mcp_list_timeout_ms.is_some()),
+        ("mcp_call_timeout_ms", mcp_call_timeout_ms.is_some()),
         (
             "checkpoint_max_total_bytes",
             checkpoint_max_total_bytes.is_some(),
@@ -612,6 +622,18 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         }
     }
 
+    // A profile may disable or gate a tool the user has, and clear a pin, but
+    // never enable, ungate or pin one (spec 33 §5.2). All three fields are
+    // restrict-only, so — like a server's enabled/require_approval — the split
+    // carries them unchanged and leaves the widening direction to the scope
+    // merge, which refuses it with `RestrictOnly`.
+    let mut carried_tools = Vec::new();
+    for tool in mcp_tools {
+        if !tool.present_fields().is_empty() {
+            carried_tools.push(tool);
+        }
+    }
+
     // A profile may lower the conversation window, but not below the floor a
     // repository is held to: below it every turn exceeds the threshold, so the
     // summarisation call bills the user's provider on every turn (spec 55
@@ -680,6 +702,8 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         mcp_enabled,
         mcp_server_allowlist,
         mcp_servers: carried_servers,
+        mcp_deferral_ceiling_tokens,
+        mcp_tools: carried_tools,
         ..ConfigOverlay::default()
     };
     (carried, refused)
@@ -854,6 +878,9 @@ fn equals_base_limit(key: &str, carried: &ConfigOverlay, base: &Config) -> bool 
         }
         "web_fetch_max_per_turn" => {
             carried.web_fetch_max_per_turn == Some(base.web_fetch_max_per_turn)
+        }
+        "mcp_deferral_ceiling_tokens" => {
+            carried.mcp_deferral_ceiling_tokens == Some(base.mcp_deferral_ceiling_tokens)
         }
         "agent_max_task_tokens" => {
             carried.agent_max_task_tokens.is_some()

@@ -67,7 +67,7 @@ manages. `crates/workspace-engine/src/chat.rs` (23,166 lines) is the orchestrato
   `mcp_server.<id>.enabled`/`require_approval` at repository scope and records
   `mcp_server.<id>.<field>` in `OverlayOutcome`. `Config::set` dispatches the
   `mcp_server.` prefix (`config.rs` ≈3949) and `to_policy_text` serialises it
-  (`config.rs` ≈5446–5524). `mcp_tool.` keys do not exist, and an unknown prefix
+  (`config.rs` ≈5446–5524). `mcp_server.<server>.tool.<tool>.` keys do not exist, and an unknown prefix
   in an untrusted scope is reported as `Unparsable` (`config.rs` ≈3920) — the
   exhaustive classification in AGENTS.md must be extended for every new key.
 - **UI.** Only `/api/mcp-test` exists (`crates/desktop-shell/src/lib.rs`), a

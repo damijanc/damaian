@@ -211,6 +211,10 @@ pub fn rule_label(key: &str) -> Option<String> {
         "model_reasoning_level" => "Reasoning level",
         "mcp_enabled" => "MCP servers on",
         "mcp_server_allowlist" => "MCP servers allowed",
+        "mcp_deferral_ceiling_tokens" => "Schema size that defers MCP discovery (tokens)",
+        "mcp_connect_timeout_ms" => "Startup time limit per MCP server (milliseconds)",
+        "mcp_list_timeout_ms" => "Tool-listing time limit per MCP server (milliseconds)",
+        "mcp_call_timeout_ms" => "Time limit per MCP tool call (milliseconds)",
         _ => "",
     };
     if !fixed.is_empty() {
@@ -226,7 +230,21 @@ pub fn rule_label(key: &str) -> Option<String> {
         "hook_review" => return Some("Your review of a repository hook".to_string()),
         "language_server" => return Some(format!("Language server for {rest}")),
         "model_provider" => "Model provider",
-        "mcp_server" => "MCP server",
+        "mcp_server" => {
+            if let Some((server, tool_and_field)) = rest.split_once(".tool.") {
+                let Some((tool, field)) = tool_and_field.rsplit_once('.') else {
+                    return Some(format!("MCP server {server}: {tool_and_field} tool"));
+                };
+                let field = match field {
+                    "enabled" => "on",
+                    "require_approval" => "ask before each call",
+                    "pinned" => "always sent",
+                    other => other,
+                };
+                return Some(format!("MCP server {server}: {tool} tool {field}"));
+            }
+            "MCP server"
+        }
         "hook" => "Hook",
         _ => return None,
     };

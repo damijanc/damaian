@@ -6266,6 +6266,73 @@ fn mcp_server_config_round_trips_through_overlay() {
 }
 
 #[test]
+fn mcp_tool_config_round_trips_through_overlay() {
+    let overlay = ConfigOverlay::parse(
+        "mcp_server.github.tool.create_issue.enabled=false\n\
+         mcp_server.github.tool.create_issue.require_approval=true\n\
+         mcp_server.github.tool.search_code.require_approval=false\n\
+         mcp_server.github.tool.search_code.pinned=true\n",
+    )
+    .unwrap();
+
+    let mut config = Config::default();
+    config.apply_overlay(overlay);
+
+    let create_issue = config.mcp_tool_config("github", "create_issue").unwrap();
+    assert!(!create_issue.enabled);
+    assert!(create_issue.require_approval);
+    assert!(!create_issue.pinned);
+
+    let search_code = config.mcp_tool_config("github", "search_code").unwrap();
+    assert!(search_code.enabled);
+    assert!(!search_code.require_approval);
+    assert!(search_code.pinned);
+
+    // Serialization is loadable again and preserves the per-tool entries.
+    let policy = config.to_policy_text();
+    assert!(policy.contains("mcp_server.github.tool.create_issue.enabled=false"));
+    assert!(policy.contains("mcp_server.github.tool.search_code.pinned=true"));
+    let reparsed = ConfigOverlay::parse(&policy).unwrap();
+    let mut reloaded = Config::default();
+    reloaded.apply_overlay(reparsed);
+    assert_eq!(
+        reloaded.mcp_tool_config("github", "create_issue"),
+        config.mcp_tool_config("github", "create_issue")
+    );
+    assert_eq!(
+        reloaded.mcp_tool_config("github", "search_code"),
+        config.mcp_tool_config("github", "search_code")
+    );
+}
+
+#[test]
+fn unknown_mcp_tools_default_to_enabled_approval_gated_and_unpinned() {
+    let config = Config::default();
+    let settings = config.mcp_tool_settings("github", "never_seen");
+    assert!(settings.enabled);
+    assert!(settings.require_approval);
+    assert!(!settings.pinned);
+}
+
+#[test]
+fn mcp_tool_keys_parse_as_untrusted_config() {
+    let (overlay, rejected) = ConfigOverlay::parse_untrusted(
+        "mcp_server.github.tool.create_issue.enabled=false\n\
+         mcp_server.github.tool.create_issue.pinned=false\n",
+    );
+    assert!(
+        rejected.is_empty(),
+        "mcp_server.<server>.tool.<tool>.* keys are known config, not Unparsable: {rejected:?}"
+    );
+    assert_eq!(overlay.mcp_tools.len(), 1);
+    let tool = &overlay.mcp_tools[0];
+    assert_eq!(tool.server_id, "github");
+    assert_eq!(tool.tool_name, "create_issue");
+    assert_eq!(tool.enabled, Some(false));
+    assert_eq!(tool.pinned, Some(false));
+}
+
+#[test]
 fn mcp_stdio_client_handshakes_lists_and_calls_tools() {
     // A tiny stdio MCP server: reads newline-delimited JSON-RPC requests and
     // replies with canned results, echoing back the request id.

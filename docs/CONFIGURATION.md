@@ -230,6 +230,10 @@ See [MCP Servers](USER_GUIDE.md#mcp-servers). `allow_mutating_mcp_tools` is unde
 |---|---|---|---|---|
 | `mcp_enabled` | `true` | `true`, `false` | Turns every MCP server on or off | Turn off only |
 | `mcp_server_allowlist` | Empty (no restriction) | Server ids, separated by `\|` | When set, only the listed servers are offered, even if others are enabled | Narrow only; a repository may also set one where you have none |
+| `mcp_deferral_ceiling_tokens` | `8000` | A whole number; `0` defers discovery every turn | Estimated total schema size, in tokens, under which every tool is sent directly and above which discovery is deferred | Lower only |
+| `mcp_connect_timeout_ms` | `15000` | A whole number, 1 or more | Startup (connect + initialize) timeout for one MCP server, in milliseconds | No |
+| `mcp_list_timeout_ms` | `15000` | A whole number, 1 or more | `tools/list` timeout for one MCP server, in milliseconds | No |
+| `mcp_call_timeout_ms` | `60000` | A whole number, 1 or more | `tools/call` timeout for one MCP server, in milliseconds | No |
 
 ### Server definitions: `mcp_server.<id>.<field>`
 
@@ -246,6 +250,16 @@ See [MCP Servers](USER_GUIDE.md#mcp-servers). `allow_mutating_mcp_tools` is unde
 | `mcp_server.<id>.auth_token_env` | Empty (no token) | `keychain:<account>` or an environment variable name | http: where the bearer token is read from | Only for a new server |
 | `mcp_server.<id>.enabled` | `false` | `true`, `false` | Offer this server's tools to the assistant. The Settings form ticks it for a new server | Turn off only |
 | `mcp_server.<id>.require_approval` | `true` | `true`, `false` | Ask before each tool call on this server | Turn on only |
+
+### Per-tool overrides: `mcp_server.<server>.tool.<tool>.<field>`
+
+`<server>` is a server id as above and `<tool>` is a tool name. A repository may disable a tool, make it ask, or clear a pin, but never enable, un-gate, or pin one — pinning always sends a tool's schema, which only you or an admin may opt into.
+
+| Key | Default | Values | What it does | Repository may change it? |
+|---|---|---|---|---|
+| `mcp_server.<server>.tool.<tool>.enabled` | `true` | `true`, `false` | Offer this tool when its server is enabled | Turn off only |
+| `mcp_server.<server>.tool.<tool>.require_approval` | `true` | `true`, `false` | Ask before each call to this tool | Turn on only |
+| `mcp_server.<server>.tool.<tool>.pinned` | `false` | `true`, `false` | Always send this tool's schema, even when discovery is deferred | Clear only (a repository may set `false`, never `true`) |
 
 ## Hooks
 

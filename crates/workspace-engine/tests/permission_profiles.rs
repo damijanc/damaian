@@ -741,6 +741,43 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "memory_retention_days=365\n",
             Reported("memory_retention_days"),
         ),
+        // Spec 33 D2: the deferral ceiling spends context budget, so a clone
+        // may lower it and never raise it (raising is the weakening direction).
+        case(
+            "mcp_deferral_ceiling_tokens",
+            "mcp_deferral_ceiling_tokens=5000\n",
+            "mcp_deferral_ceiling_tokens=20000\n",
+            Reported("mcp_deferral_ceiling_tokens"),
+        ),
+        // Spec 33 D6: timeouts control process and network behaviour, so a
+        // repository may not set them in either direction.
+        case(
+            "mcp_connect_timeout_ms",
+            "",
+            "mcp_connect_timeout_ms=1000\n",
+            Reported("mcp_connect_timeout_ms"),
+        ),
+        case(
+            "mcp_list_timeout_ms",
+            "",
+            "mcp_list_timeout_ms=1000\n",
+            Reported("mcp_list_timeout_ms"),
+        ),
+        case(
+            "mcp_call_timeout_ms",
+            "",
+            "mcp_call_timeout_ms=1000\n",
+            Reported("mcp_call_timeout_ms"),
+        ),
+        // Spec 33 §5.2: pinning always sends a tool's schema and spends
+        // context budget, so only user or admin config may opt into it. A
+        // repository may clear a pin but never set one.
+        case(
+            "mcp_tools",
+            "",
+            "mcp_server.github.tool.create_issue.pinned=true\n",
+            Reported("mcp_server.github.tool.create_issue.pinned"),
+        ),
     ]
 }
 
@@ -786,6 +823,89 @@ fn every_capability_key_resists_weakening_from_repository_scope() {
                 );
             }
         }
+    }
+}
+
+/// Spec 33 §5.2: pinning always sends a tool's schema and spends context
+/// budget, so a repository may clear a pin the user set but never pin a tool
+/// itself.
+#[test]
+fn a_repository_may_clear_an_mcp_tool_pin_but_never_set_one() {
+    let (cleared, report) = load(
+        "mcp-tool-pin-clear",
+        "mcp_server.github.tool.create_issue.pinned=true\n",
+        "mcp_server.github.tool.create_issue.pinned=false\n",
+    );
+    assert!(
+        !cleared.mcp_tool_settings("github", "create_issue").pinned,
+        "a repository should be able to clear a pin the user set"
+    );
+    assert!(report.rejected_keys.is_empty(), "{report:?}");
+
+    let (pinned, report) = load(
+        "mcp-tool-pin-set",
+        "",
+        "mcp_server.github.tool.create_issue.pinned=true\n",
+    );
+    assert!(
+        !pinned.mcp_tool_settings("github", "create_issue").pinned,
+        "a repository must not be able to pin a tool"
+    );
+    assert!(
+        report.rejected_keys.iter().any(|rejected| {
+            rejected.key == "mcp_server.github.tool.create_issue.pinned"
+                && rejected.class == RepositoryKeyClass::RestrictOnly
+        }),
+        "{report:?}"
+    );
+}
+
+/// Spec 33 D2: the deferral ceiling spends context budget, so a repository may
+/// lower it but never raise it.
+#[test]
+fn a_repository_may_lower_the_mcp_deferral_ceiling_but_not_raise_it() {
+    let (lowered, report) = load(
+        "mcp-ceiling-lower",
+        "mcp_deferral_ceiling_tokens=8000\n",
+        "mcp_deferral_ceiling_tokens=5000\n",
+    );
+    assert_eq!(lowered.mcp_deferral_ceiling_tokens, 5000);
+    assert!(report.rejected_keys.is_empty(), "{report:?}");
+
+    let (raised, report) = load(
+        "mcp-ceiling-raise",
+        "mcp_deferral_ceiling_tokens=8000\n",
+        "mcp_deferral_ceiling_tokens=20000\n",
+    );
+    assert_eq!(raised.mcp_deferral_ceiling_tokens, 8000);
+    assert!(
+        report.rejected_keys.iter().any(|rejected| {
+            rejected.key == "mcp_deferral_ceiling_tokens"
+                && rejected.class == RepositoryKeyClass::RestrictOnly
+        }),
+        "{report:?}"
+    );
+}
+
+/// Spec 33 D6: the MCP timeouts control process and network behaviour, so a
+/// repository may not set them in either direction.
+#[test]
+fn the_mcp_timeout_keys_are_forbidden_to_repository_scope() {
+    for key in [
+        "mcp_connect_timeout_ms",
+        "mcp_list_timeout_ms",
+        "mcp_call_timeout_ms",
+    ] {
+        let (_, report) = load("mcp-timeout", "", &format!("{key}=1000\n"));
+        assert!(
+            report
+                .rejected_keys
+                .iter()
+                .any(|rejected| rejected.key == key
+                    && rejected.class == RepositoryKeyClass::Forbidden),
+            "{key}: expected Forbidden, got {:?}",
+            report.rejected_keys
+        );
     }
 }
 

@@ -23,7 +23,7 @@ the code survey they rest on are in [`context.md`](context.md).
 
 | Task | State | Durable result |
 |---|---|---|
-| 1 · Per-tool and MCP-management config surface | Not started | — |
+| 1 · Per-tool and MCP-management config surface | Done | Per-tool overrides `mcp_server.<server>.tool.<tool>.<field>` (enabled, require_approval, pinned) and MCP-management keys (`mcp_deferral_ceiling_tokens`, three timeouts) with restrict-only/forbidden scope rules; round-trip and weakening tests; CONFIGURATION.md docs. |
 | 2 · Bounded, independently configurable timeouts (defines `McpServerHealth`) | Not started | — |
 | 3 · Tool inventory, token measurement, deferral ceiling | Not started | — |
 | 4 · Deferred discovery surface and `mcp_tool_search` | Not started | — |
@@ -38,24 +38,26 @@ the code survey they rest on are in [`context.md`](context.md).
 
 Requirements 1, 5.2, 5.4, 6; context D1, D2, D6.
 
-- [ ] Add `McpToolConfig` keys `mcp_tool.<server>.<tool>.enabled`,
-      `mcp_tool.<server>.<tool>.require_approval`, and
-      `mcp_tool.<server>.<tool>.pinned`, parsed through
-      `parse_namespaced_tool_name` so the two-part server/tool name is reused.
-- [ ] Give `pinned` its scope rule: it defaults to `false` and is restrict-only
+- [x] Add `McpToolConfig` keys `mcp_server.<server>.tool.<tool>.enabled`,
+      `mcp_server.<server>.tool.<tool>.require_approval`, and
+      `mcp_server.<server>.tool.<tool>.pinned`, parsed by stripping the
+      `mcp_server.` prefix, splitting the remainder on the first `.tool.`,
+      and keying the map by `namespaced_tool_name(server, tool)`; reject a
+      server id containing `.tool.`.
+- [x] Give `pinned` its scope rule: it defaults to `false` and is restrict-only
       — repository and profile scopes may clear it (`false`) but never pin
       (`true`), because pinning always sends a schema and spends context budget,
       which only the user or admin may opt into.
-- [ ] Add the management keys from D2 and D6 (`mcp_deferral_ceiling_tokens`,
+- [x] Add the management keys from D2 and D6 (`mcp_deferral_ceiling_tokens`,
       `mcp_connect_timeout_ms`, `mcp_list_timeout_ms`, `mcp_call_timeout_ms`)
       with explicit scope rules: repository and profile may lower the ceiling,
       never raise it; timeouts are user/admin only (repository forbidden).
-- [ ] Extend `Config::set` dispatch and `to_policy_text` for every new key; keep
+- [x] Extend `Config::set` dispatch and `to_policy_text` for every new key; keep
       the exhaustive overlay classification (AGENTS.md) for repository scope.
-- [ ] Tests: round-trip parse/save, default `enabled`/`require_approval=true`
+- [x] Tests: round-trip parse/save, default `enabled`/`require_approval=true`
       and `pinned=false` for unknown tools, restrict-only ceiling and `pinned`,
-      repository forbidden from the timeout keys, and `mcp_tool.` keys are not
-      reported `Unparsable`.
+      repository forbidden from the timeout keys, and
+      `mcp_server.<server>.tool.<tool>.` keys are not reported `Unparsable`.
 
 Files: `crates/workspace-engine/src/config.rs`,
 `crates/workspace-engine/tests/permission_profiles.rs`,
@@ -116,7 +118,7 @@ Requirements 2, 5.1, 5.2; context D3.
 - [ ] Add the `mcp_tool_search(query)` tool (name, server, one-line
       description matches) always present when any MCP server is enabled.
 - [ ] Replace the unconditional `mcp.tool_definitions()` extension with a
-      surface that sends: tools whose `mcp_tool.<server>.<tool>.pinned` is
+      surface that sends: tools whose `mcp_server.<server>.tool.<tool>.pinned` is
       `true`; all enabled tools when under the ceiling; and, once called, the
       schema of any tool matched this turn.
 - [ ] A disabled tool is absent from the tool list, not refused on call.

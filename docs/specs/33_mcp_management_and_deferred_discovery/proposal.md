@@ -160,13 +160,20 @@ context-size test comparing tokens with and without deferral, per the roadmap.
 
 ### 5.2 Per-tool control
 
-`mcp_tool.<server_id>.<tool_name>` config keys, reusing the existing namespacing
-that `parse_namespaced_tool_name` already parses:
+`mcp_server.<server_id>.tool.<tool_name>` config keys, nested under the server
+whose tools they govern, reusing `parse_namespaced_tool_name` and
+`namespaced_tool_name` for the internal `mcp__<server>__<tool>` map key:
 
 ```text
-mcp_tool.github.create_issue.enabled=false
-mcp_tool.github.search_code.require_approval=false
+mcp_server.github.tool.create_issue.enabled=false
+mcp_server.github.tool.search_code.require_approval=false
 ```
+
+A key is parsed by stripping the `mcp_server.` prefix, taking the field after
+the last `.`, and splitting the remainder on the first `.tool.`
+(`mcp_server.<server>.tool.<tool>.<field>`). A server id containing `.tool.` is
+rejected, so the split is unambiguous even though server ids may otherwise
+contain dots.
 
 Requirement 1's per-tool enable and disable, with the essential property from the
 roadmap's acceptance criteria: **a disabled tool is absent from the model's tool
