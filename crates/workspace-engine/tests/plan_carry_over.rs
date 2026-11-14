@@ -481,7 +481,7 @@ fn verification_after_a_typed_turn_continues_the_open_plan() {
         data_dir: repo.join(".damaian"),
         enable_index_watcher: false,
         shell: "/usr/bin/true".to_string(),
-        command_allowlist: vec!["cargo test".to_string()],
+        command_allowlist: vec!["cargo test".to_string(), "cargo check --tests".to_string()],
         ..Config::default()
     });
     let first = leave_a_plan_open(&engine, &repo, None, &["Add the helper", "Document it"]);
