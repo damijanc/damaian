@@ -126,9 +126,9 @@ pub use config::{
     AppliedKey, CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, CostEstimate,
     DEFAULT_CONTEXT_TOKEN_BUDGET, HookConfig, HookConfigOverlay, HookEvent, HookMode, HookReview,
     HookSource, LANGUAGE_SERVER_LANGUAGES, MAX_HOOK_TIMEOUT_MS, McpServerConfig,
-    McpServerConfigOverlay, McpTransport, ModelProviderConfig, ModelProviderConfigOverlay,
-    OverlayOutcome, RejectedConfigKey, RepositoryConfigReport, RepositoryKeyClass,
-    builtin_context_window, builtin_token_defaults, normalize_mcp_server_id,
+    McpServerConfigOverlay, McpToolConfig, McpToolConfigOverlay, McpTransport, ModelProviderConfig,
+    ModelProviderConfigOverlay, OverlayOutcome, RejectedConfigKey, RepositoryConfigReport,
+    RepositoryKeyClass, builtin_context_window, builtin_token_defaults, normalize_mcp_server_id,
     normalize_model_provider, normalize_model_reasoning_level, overlay_field_kinds,
     parse_mcp_transport,
 };

@@ -2,6 +2,7 @@ use crate::clarification::MAX_QUESTIONS_PER_TURN_CEILING;
 use crate::context_manager::{ContextBudget, ContextCategory};
 use crate::error::{ClientError, Result};
 use crate::hash::repository_id_for_root;
+use crate::mcp::{namespaced_tool_name, parse_namespaced_tool_name};
 use crate::model::TokenUsage;
 use crate::profile::{ProfileCapabilities, ProfileId};
 use crate::task_budget::{TaskBudgetPolicy, TaskExecutionBudget};
@@ -506,6 +507,22 @@ pub struct Config {
     /// only listed servers are offered even if the user enabled others.
     pub mcp_server_allowlist: Vec<String>,
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Tokens of MCP tool schemas (estimated, spec 33 D7) under which every
+    /// enabled tool is sent directly; at or above it, discovery defers to the
+    /// search tool. Restrict-only, lower wins: a repository or profile may
+    /// lower the ceiling and never raise it, because raising it spends context
+    /// budget on the repository's say-so.
+    pub mcp_deferral_ceiling_tokens: usize,
+    /// Startup (connect + initialize) timeout for an MCP server, in
+    /// milliseconds. User and admin config only.
+    pub mcp_connect_timeout_ms: u64,
+    /// `tools/list` timeout, in milliseconds. User and admin config only.
+    pub mcp_list_timeout_ms: u64,
+    /// `tools/call` timeout, in milliseconds. User and admin config only.
+    pub mcp_call_timeout_ms: u64,
+    /// Per-tool overrides, keyed by the namespaced tool name
+    /// `mcp__<server>__<tool>`.
+    pub mcp_tools: BTreeMap<String, McpToolConfig>,
     /// Lifecycle hooks (spec 32). A repository may define one of its own but
     /// never touch a user's or an admin's, and a profile may carry none.
     pub hooks: Vec<HookConfig>,
@@ -720,6 +737,106 @@ pub struct McpServerConfigOverlay {
     pub auth_token_env: Option<String>,
     pub enabled: Option<bool>,
     pub require_approval: Option<bool>,
+}
+
+/// Per-tool MCP settings for one `mcp__<server>__<tool>` (spec 33 §5.2). A
+/// tool is identified by its namespaced name so the two-part server/tool name
+/// is the one [`parse_namespaced_tool_name`] already splits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolConfig {
+    /// Default true: a tool the user has not overridden is offered when its
+    /// server is enabled.
+    pub enabled: bool,
+    /// Default true: MCP tools can have arbitrary external side effects.
+    pub require_approval: bool,
+    /// Default false: pinning always sends a tool's schema, so only user or
+    /// admin config may opt into it.
+    pub pinned: bool,
+}
+
+impl Default for McpToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            require_approval: true,
+            pinned: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpToolConfigOverlay {
+    /// The server id this entry addresses, already normalised.
+    pub server_id: String,
+    /// The tool name this entry addresses.
+    pub tool_name: String,
+    pub enabled: Option<bool>,
+    pub require_approval: Option<bool>,
+    pub pinned: Option<bool>,
+}
+
+impl McpToolConfigOverlay {
+    /// The fields this overlay sets, by the names `to_policy_text` prints
+    /// after `mcp_server.<server>.tool.<tool>.`.
+    pub(crate) fn present_fields(&self) -> Vec<&'static str> {
+        let Self {
+            server_id: _,
+            tool_name: _,
+            enabled,
+            require_approval,
+            pinned,
+        } = self;
+        [
+            ("enabled", enabled.is_some()),
+            ("require_approval", require_approval.is_some()),
+            ("pinned", pinned.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, present)| present.then_some(field))
+        .collect()
+    }
+
+    /// The `mcp_server.<server>.tool.<tool>` prefix this entry prints and is
+    /// reported under.
+    pub(crate) fn key_prefix(&self) -> String {
+        format!("mcp_server.{}.tool.{}", self.server_id, self.tool_name)
+    }
+
+    /// Splits an untrusted (repository or profile) per-tool overlay into the
+    /// fields it may keep — the restrictive direction — and the fields it may
+    /// not. Disabling, requiring approval, and clearing a pin are
+    /// restrictions; enabling, dropping approval, and pinning are not.
+    pub(crate) fn split_untrusted(&self) -> (Self, Vec<(&'static str, RepositoryKeyClass)>) {
+        let Self {
+            server_id,
+            tool_name,
+            enabled,
+            require_approval,
+            pinned,
+        } = self;
+        let mut kept = McpToolConfigOverlay {
+            server_id: server_id.clone(),
+            tool_name: tool_name.clone(),
+            ..McpToolConfigOverlay::default()
+        };
+        let mut refused = Vec::new();
+        match enabled {
+            Some(false) => kept.enabled = Some(false),
+            Some(true) => refused.push(("enabled", RepositoryKeyClass::RestrictOnly)),
+            None => {}
+        }
+        match require_approval {
+            Some(true) => kept.require_approval = Some(true),
+            Some(false) => refused.push(("require_approval", RepositoryKeyClass::RestrictOnly)),
+            None => {}
+        }
+        match pinned {
+            Some(false) => kept.pinned = Some(false),
+            Some(true) => refused.push(("pinned", RepositoryKeyClass::RestrictOnly)),
+            None => {}
+        }
+        (kept, refused)
+    }
 }
 
 /// Longest a hook may run before it is killed and counted as failed (spec 32
@@ -1328,6 +1445,11 @@ impl Config {
             mcp_enabled,
             mcp_server_allowlist,
             mcp_servers,
+            mcp_deferral_ceiling_tokens,
+            mcp_connect_timeout_ms,
+            mcp_list_timeout_ms,
+            mcp_call_timeout_ms,
+            mcp_tools,
             hooks,
             hook_reviews_by_repository,
             language_servers,
@@ -1723,6 +1845,66 @@ impl Config {
             let (id, fields) = fields;
             for (field, loosened) in fields {
                 outcome.record(scope, format!("mcp_server.{id}.{field}"), None, loosened);
+            }
+        }
+        // Spec 33 D2: the deferral ceiling spends context budget, so a clone
+        // may lower it and never raise it.
+        if let Some(value) = mcp_deferral_ceiling_tokens
+            && let Some(loosened) = restrict_only_limit(
+                &mut self.mcp_deferral_ceiling_tokens,
+                value,
+                "mcp_deferral_ceiling_tokens",
+                trusted,
+                rejected,
+            )
+        {
+            outcome.record(scope, "mcp_deferral_ceiling_tokens", None, loosened);
+        }
+        // Spec 33 D6: timeouts control process and network behaviour, which a
+        // repository or profile may not set in either direction.
+        for (key, value) in [
+            ("mcp_connect_timeout_ms", mcp_connect_timeout_ms),
+            ("mcp_list_timeout_ms", mcp_list_timeout_ms),
+            ("mcp_call_timeout_ms", mcp_call_timeout_ms),
+        ] {
+            if let Some(value) = scoped(value, key, trusted, forbidden, rejected) {
+                match key {
+                    "mcp_connect_timeout_ms" => self.mcp_connect_timeout_ms = value,
+                    "mcp_list_timeout_ms" => self.mcp_list_timeout_ms = value,
+                    "mcp_call_timeout_ms" => self.mcp_call_timeout_ms = value,
+                    _ => unreachable!("the loop names exactly three timeout keys"),
+                }
+                outcome.record(scope, key, None, false);
+            }
+        }
+        // Spec 33 §5.2: per-tool overrides are restrict-only, exactly like the
+        // server flags they refine. A repository or profile may disable a
+        // tool, gate it, or clear a pin; it may not enable, ungate, or pin.
+        for tool in mcp_tools {
+            let prefix = tool.key_prefix();
+            match scope {
+                ConfigScope::User | ConfigScope::Admin => {
+                    let fields = tool.present_fields();
+                    if !fields.is_empty() {
+                        self.upsert_mcp_tool(tool);
+                    }
+                    for field in fields {
+                        outcome.record(scope, format!("{prefix}.{field}"), None, false);
+                    }
+                }
+                ConfigScope::Repository | ConfigScope::Profile => {
+                    let (kept, refused) = tool.split_untrusted();
+                    for (field, class) in refused {
+                        rejected.push(RejectedConfigKey::new(format!("{prefix}.{field}"), class));
+                    }
+                    let fields = kept.present_fields();
+                    if !fields.is_empty() {
+                        self.upsert_mcp_tool(kept);
+                    }
+                    for field in fields {
+                        outcome.record(scope, format!("{prefix}.{field}"), None, false);
+                    }
+                }
             }
         }
         // Spec 32 `context.md` §7.1. A repository may define a hook of its
@@ -2675,6 +2857,20 @@ impl Config {
         self.mcp_servers.iter().find(|server| server.id == id)
     }
 
+    /// The per-tool override for one `mcp__<server>__<tool>`, if one exists.
+    pub fn mcp_tool_config(&self, server_id: &str, tool_name: &str) -> Option<&McpToolConfig> {
+        self.mcp_tools
+            .get(&namespaced_tool_name(server_id, tool_name))
+    }
+
+    /// The effective per-tool settings: the override when present, otherwise
+    /// the defaults — enabled and approval-gated, never pinned.
+    pub fn mcp_tool_settings(&self, server_id: &str, tool_name: &str) -> McpToolConfig {
+        self.mcp_tool_config(server_id, tool_name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// The MCP servers whose tools should actually be offered to the model:
     /// requires the global switch on, the server enabled, and — when an admin
     /// allowlist is set — the server to appear on it.
@@ -2741,6 +2937,32 @@ impl Config {
             require_approval: overlay.require_approval.unwrap_or(true),
             id,
         });
+    }
+
+    /// Upserts a per-tool override by its `mcp__<server>__<tool>` map key.
+    /// Only the fields present in `overlay` are changed, so a repository that
+    /// may only clear a pin cannot also reset the other fields.
+    fn upsert_mcp_tool(&mut self, overlay: McpToolConfigOverlay) {
+        let McpToolConfigOverlay {
+            server_id,
+            tool_name,
+            enabled,
+            require_approval,
+            pinned,
+        } = overlay;
+        let entry = self
+            .mcp_tools
+            .entry(namespaced_tool_name(&server_id, &tool_name))
+            .or_default();
+        if let Some(value) = enabled {
+            entry.enabled = value;
+        }
+        if let Some(value) = require_approval {
+            entry.require_approval = value;
+        }
+        if let Some(value) = pinned {
+            entry.pinned = value;
+        }
     }
 
     /// Upserts a hook by id. `source` is kept only for a new hook: admin
@@ -3356,6 +3578,31 @@ impl Config {
         for server in &self.mcp_servers {
             push_mcp_server_config(&mut output, server);
         }
+        push_line(
+            &mut output,
+            "mcp_deferral_ceiling_tokens",
+            &self.mcp_deferral_ceiling_tokens.to_string(),
+        );
+        push_line(
+            &mut output,
+            "mcp_connect_timeout_ms",
+            &self.mcp_connect_timeout_ms.to_string(),
+        );
+        push_line(
+            &mut output,
+            "mcp_list_timeout_ms",
+            &self.mcp_list_timeout_ms.to_string(),
+        );
+        push_line(
+            &mut output,
+            "mcp_call_timeout_ms",
+            &self.mcp_call_timeout_ms.to_string(),
+        );
+        for (namespaced, tool) in &self.mcp_tools {
+            if let Some((server_id, tool_name)) = parse_namespaced_tool_name(namespaced) {
+                push_mcp_tool_config(&mut output, &server_id, &tool_name, tool);
+            }
+        }
         // Not the reviews: like the other per-repository maps, they are the
         // user's decisions about every checkout, not policy of this one.
         for hook in &self.hooks {
@@ -3504,6 +3751,14 @@ impl Default for Config {
             mcp_enabled: true,
             mcp_server_allowlist: Vec::new(),
             mcp_servers: Vec::new(),
+            // Spec 33 D2: a placeholder until §7's measurement replaces it.
+            mcp_deferral_ceiling_tokens: 8_000,
+            // Spec 33 D6: the current hardcoded CONNECT_TIMEOUT/CALL_TIMEOUT
+            // defaults, preserved as separate budgets.
+            mcp_connect_timeout_ms: 15_000,
+            mcp_list_timeout_ms: 15_000,
+            mcp_call_timeout_ms: 60_000,
+            mcp_tools: BTreeMap::new(),
             hooks: Vec::new(),
             hook_reviews_by_repository: BTreeMap::new(),
             // None: with nothing configured no server is ever spawned, and the
@@ -3634,6 +3889,11 @@ pub struct ConfigOverlay {
     pub mcp_enabled: Option<bool>,
     pub mcp_server_allowlist: Option<Vec<String>>,
     pub mcp_servers: Vec<McpServerConfigOverlay>,
+    pub mcp_deferral_ceiling_tokens: Option<usize>,
+    pub mcp_connect_timeout_ms: Option<u64>,
+    pub mcp_list_timeout_ms: Option<u64>,
+    pub mcp_call_timeout_ms: Option<u64>,
+    pub mcp_tools: Vec<McpToolConfigOverlay>,
     pub hooks: Vec<HookConfigOverlay>,
     /// `hook_review.<repository_id>.<hook_id>` entries, from user or admin
     /// config.
@@ -3849,6 +4109,17 @@ classify_overlay_fields! {
     mcp_enabled => Capability,
     mcp_server_allowlist => Capability,
     mcp_servers => Capability,
+    // Spec 33 D2: the deferral ceiling spends context budget, so a clone may
+    // lower it and never raise it.
+    mcp_deferral_ceiling_tokens => Capability,
+    // Spec 33 D6: timeouts control process and network behaviour, which a
+    // clone may not set in either direction.
+    mcp_connect_timeout_ms => Capability,
+    mcp_list_timeout_ms => Capability,
+    mcp_call_timeout_ms => Capability,
+    // Spec 33 §5.2: per-tool overrides are restrict-only like the server
+    // flags beside them.
+    mcp_tools => Capability,
     // A hook is an executable Damaian runs, so its definition is capability
     // whatever it can answer, and a review is the user's own decision about
     // one repository (spec 32, context.md §7.1).
@@ -3952,6 +4223,9 @@ impl ConfigOverlay {
             return self.set_model_provider_config(provider_key, value);
         }
         if let Some(server_key) = key.strip_prefix("mcp_server.") {
+            if server_key.contains(".tool.") {
+                return self.set_mcp_tool_config(server_key, value);
+            }
             return self.set_mcp_server_config(server_key, value);
         }
         if let Some(hook_key) = key.strip_prefix("hook.") {
@@ -4234,6 +4508,19 @@ impl ConfigOverlay {
                         .collect::<Result<Vec<_>>>()?,
                 )
             }
+            "mcp_deferral_ceiling_tokens" => {
+                self.mcp_deferral_ceiling_tokens =
+                    Some(parse_mcp_deferral_ceiling_tokens(key, value)?);
+            }
+            "mcp_connect_timeout_ms" => {
+                self.mcp_connect_timeout_ms = Some(parse_mcp_timeout_ms(key, value)?);
+            }
+            "mcp_list_timeout_ms" => {
+                self.mcp_list_timeout_ms = Some(parse_mcp_timeout_ms(key, value)?);
+            }
+            "mcp_call_timeout_ms" => {
+                self.mcp_call_timeout_ms = Some(parse_mcp_timeout_ms(key, value)?);
+            }
             _ => {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown config key: {key}"
@@ -4412,6 +4699,57 @@ impl ConfigOverlay {
             _ => {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown mcp server config key: mcp_server.{server_key}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `mcp_server.<server>.tool.<tool>.<field>=value`. The field may be
+    /// `enabled`, `require_approval` or `pinned`. Whether the scope may set it
+    /// in its direction is decided when the overlay is applied.
+    fn set_mcp_tool_config(&mut self, server_key: &str, value: &str) -> Result<()> {
+        let Some((server_tool, field)) = server_key.rsplit_once('.') else {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid mcp tool config key: mcp_server.{server_key}"
+            )));
+        };
+        // The server id precedes the first `.tool.`; the rest is the tool
+        // name, which contains no dots, so the split is unambiguous once a
+        // server id containing `.tool.` is rejected.
+        let Some((server_id, tool_name)) = server_tool.split_once(".tool.") else {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid mcp tool config key: mcp_server.{server_key}"
+            )));
+        };
+        let server_id = normalize_mcp_server_id(server_id)?;
+        if tool_name.is_empty() {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid mcp tool config key: mcp_server.{server_key}"
+            )));
+        }
+        let index = if let Some(index) = self
+            .mcp_tools
+            .iter()
+            .position(|tool| tool.server_id == server_id && tool.tool_name == tool_name)
+        {
+            index
+        } else {
+            self.mcp_tools.push(McpToolConfigOverlay {
+                server_id: server_id.clone(),
+                tool_name: tool_name.to_string(),
+                ..McpToolConfigOverlay::default()
+            });
+            self.mcp_tools.len() - 1
+        };
+        let tool = &mut self.mcp_tools[index];
+        match field {
+            "enabled" => tool.enabled = Some(parse_bool(field, value)?),
+            "require_approval" => tool.require_approval = Some(parse_bool(field, value)?),
+            "pinned" => tool.pinned = Some(parse_bool(field, value)?),
+            _ => {
+                return Err(ClientError::InvalidInput(format!(
+                    "Unknown mcp tool config key: mcp_server.{server_key}"
                 )));
             }
         }
@@ -4635,6 +4973,11 @@ impl ConfigOverlay {
             mcp_enabled,
             mcp_server_allowlist,
             mcp_servers,
+            mcp_deferral_ceiling_tokens,
+            mcp_connect_timeout_ms,
+            mcp_list_timeout_ms,
+            mcp_call_timeout_ms,
+            mcp_tools,
             hooks,
             hook_reviews_by_repository,
             language_servers,
@@ -4999,6 +5342,25 @@ impl ConfigOverlay {
         }
         for server in mcp_servers {
             push_mcp_server_overlay(&mut output, server);
+        }
+        if let Some(value) = mcp_deferral_ceiling_tokens {
+            push_line(
+                &mut output,
+                "mcp_deferral_ceiling_tokens",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = mcp_connect_timeout_ms {
+            push_line(&mut output, "mcp_connect_timeout_ms", &value.to_string());
+        }
+        if let Some(value) = mcp_list_timeout_ms {
+            push_line(&mut output, "mcp_list_timeout_ms", &value.to_string());
+        }
+        if let Some(value) = mcp_call_timeout_ms {
+            push_line(&mut output, "mcp_call_timeout_ms", &value.to_string());
+        }
+        for tool in mcp_tools {
+            push_mcp_tool_overlay(&mut output, tool);
         }
         for hook in hooks {
             push_hook_overlay(&mut output, hook);
@@ -5532,6 +5894,60 @@ fn push_mcp_server_overlay(output: &mut String, server: &McpServerConfigOverlay)
     }
 }
 
+fn push_mcp_tool_config(
+    output: &mut String,
+    server_id: &str,
+    tool_name: &str,
+    tool: &McpToolConfig,
+) {
+    push_line(
+        output,
+        &format!("mcp_server.{server_id}.tool.{tool_name}.enabled"),
+        &tool.enabled.to_string(),
+    );
+    push_line(
+        output,
+        &format!("mcp_server.{server_id}.tool.{tool_name}.require_approval"),
+        &tool.require_approval.to_string(),
+    );
+    push_line(
+        output,
+        &format!("mcp_server.{server_id}.tool.{tool_name}.pinned"),
+        &tool.pinned.to_string(),
+    );
+}
+
+fn push_mcp_tool_overlay(output: &mut String, tool: &McpToolConfigOverlay) {
+    let McpToolConfigOverlay {
+        server_id,
+        tool_name,
+        enabled,
+        require_approval,
+        pinned,
+    } = tool;
+    if let Some(value) = enabled {
+        push_line(
+            output,
+            &format!("mcp_server.{server_id}.tool.{tool_name}.enabled"),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = require_approval {
+        push_line(
+            output,
+            &format!("mcp_server.{server_id}.tool.{tool_name}.require_approval"),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = pinned {
+        push_line(
+            output,
+            &format!("mcp_server.{server_id}.tool.{tool_name}.pinned"),
+            &value.to_string(),
+        );
+    }
+}
+
 /// Validates and normalizes an MCP server id. Kept to the same charset as
 /// model-provider ids (lowercase alphanumeric plus `-`/`.`); notably `_` is
 /// disallowed so the `mcp__<id>__<tool>` tool namespace stays unambiguous to
@@ -5541,6 +5957,11 @@ pub fn normalize_mcp_server_id(value: &str) -> Result<String> {
     if id.is_empty() {
         return Err(ClientError::InvalidInput(
             "mcp server id is required".to_string(),
+        ));
+    }
+    if id.contains(".tool.") {
+        return Err(ClientError::InvalidInput(
+            "mcp server id cannot contain `.tool.`".to_string(),
         ));
     }
     if id
@@ -6021,6 +6442,26 @@ fn parse_u64(key: &str, value: &str) -> Result<u64> {
     value
         .parse()
         .map_err(|_| ClientError::InvalidInput(format!("{key} must be an unsigned integer")))
+}
+
+/// `mcp_deferral_ceiling_tokens` (spec 33 D2): an estimated token count, so
+/// zero is valid and means always defer discovery.
+fn parse_mcp_deferral_ceiling_tokens(key: &str, value: &str) -> Result<usize> {
+    let parsed = parse_u64(key, value)?;
+    usize::try_from(parsed)
+        .map_err(|_| ClientError::InvalidInput(format!("{key} must fit in a usize")))
+}
+
+/// `mcp_connect_timeout_ms`, `mcp_list_timeout_ms` and `mcp_call_timeout_ms`
+/// (spec 33 D6): a positive number of milliseconds.
+fn parse_mcp_timeout_ms(key: &str, value: &str) -> Result<u64> {
+    let parsed = parse_u64(key, value)?;
+    if parsed == 0 {
+        return Err(ClientError::InvalidInput(format!(
+            "{key} must be greater than zero"
+        )));
+    }
+    Ok(parsed)
 }
 
 fn parse_round_count(key: &str, value: &str) -> Result<u32> {
