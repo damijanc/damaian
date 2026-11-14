@@ -10516,7 +10516,12 @@ async function sendWorkerComposer(override = "") {
 function workerApprovalToShow(view) {
   const approval = view.approval;
   if (!view.caughtUp || !approval?.proposal) return null;
-  if (approval.kind === "command" || approval.kind === "plan" || approval.kind === "checks") {
+  if (
+    approval.kind === "command" ||
+    approval.kind === "plan" ||
+    approval.kind === "checks" ||
+    approval.kind === "round_budget"
+  ) {
     return view.alive && view.state === "waiting_for_approval" ? approval : null;
   }
   if (approval.kind === "patch" || approval.kind === "fallback") {
@@ -10549,14 +10554,16 @@ function renderWorkerApproval(view) {
           ? createCheckBatchCard(proposal, worktree, {
               decide: (decisions) => sendWorkerChecks(view, proposal, decisions),
             })
-          : approval.kind === "patch"
-            ? createPatchPreview(proposal, worktree, {
-                // The shell applies a worker's patch; the worker verifies it
-                // and carries on with its plan (spec 80), as a turn of the
-                // shell's own does after spec 77.
-                onResolved: () => verifyWorker(view),
-              })
-            : createFallbackOffer(proposal, worktree);
+          : approval.kind === "round_budget"
+            ? createWorkerRoundBudgetOffer(proposal, { decide })
+            : approval.kind === "patch"
+              ? createPatchPreview(proposal, worktree, {
+                  // The shell applies a worker's patch; the worker verifies it
+                  // and carries on with its plan (spec 80), as a turn of the
+                  // shell's own does after spec 77.
+                  onResolved: () => verifyWorker(view),
+                })
+              : createFallbackOffer(proposal, worktree);
   card.dataset.workerApproval = key;
   // Beside the last answer's body, not in it: the body is re-rendered once
   // its markdown is finalized, which would take the card with it.
@@ -14278,6 +14285,68 @@ function createRoundBudgetOffer(proposal, proposalRepo) {
   return wrapper;
 }
 
+// A worker's own round-budget pause (spec 61/103): decided through the
+// worker's control route (`decide`, same as its command/plan/checks cards)
+// rather than a chat turn resumed by this shell, since the turn is running
+// in the worker's own process.
+function createWorkerRoundBudgetOffer(proposal, { decide }) {
+  const more = proposal.roundsMore;
+  const atHardCap = proposal.atHardCap === true || (proposal.roundsUsed ?? 0) >= 64;
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "command-approval round-budget-offer";
+
+  const note = document.createElement("p");
+  note.className = "plan-review-note";
+  note.textContent = atHardCap
+    ? "This turn has reached its hard cap: it can be answered now, but not continued."
+    : "Continue grants this same turn another segment of tool rounds; Answer now makes the final call with tools dropped.";
+
+  const actions = document.createElement("div");
+  actions.className = "command-approval-actions";
+
+  const output = document.createElement("pre");
+  output.className = "command-approval-output";
+  output.hidden = true;
+
+  const answerButton = document.createElement("button");
+  answerButton.type = "button";
+  answerButton.className = "btn-sm btn-primary";
+  answerButton.textContent = "Answer now";
+  actions.append(answerButton);
+
+  const continueButton = document.createElement("button");
+  if (!atHardCap) {
+    continueButton.type = "button";
+    continueButton.className = "btn-sm btn-quiet";
+    continueButton.textContent = typeof more === "number" ? `Continue — ${more} more` : "Continue";
+    actions.append(continueButton);
+  }
+
+  async function run(approved) {
+    answerButton.disabled = true;
+    continueButton.disabled = true;
+    actions.hidden = true;
+    output.hidden = false;
+    output.textContent = approved ? "Continuing…" : "Answering now…";
+    try {
+      output.textContent = await decide(approved);
+    } catch (error) {
+      actions.hidden = false;
+      answerButton.disabled = false;
+      if (!atHardCap) continueButton.disabled = false;
+      output.hidden = true;
+      toast(error.message);
+    }
+  }
+
+  answerButton.addEventListener("click", () => void run(false));
+  if (!atHardCap) continueButton.addEventListener("click", () => void run(true));
+
+  wrapper.append(note, actions, output);
+  return wrapper;
+}
+
 // The plan review gate, per spec 21 §5.5: the turn has stopped before its
 // first mutating step. Since spec 108 D6 the card is read-only: the steps and
 // their checks are shown as text, and the plan is changed through the
@@ -15536,11 +15605,15 @@ async function loadSession(sessionId) {
   // Before rendering: the messages' *Start worker* actions depend on it.
   await refreshWorkerIndex();
   renderThreadHeader();
+  // A worker runs one continuous turn in its own process (spec 57); the
+  // "earlier messages… Compact now" boundary is a multi-turn chat concept
+  // that this shell cannot act on for a worker's conversation.
+  const isWorker = isWorkerSession(currentSessionId);
   const rendered = renderMessages(
     payload.messages,
     payload.tasks || [],
-    payload.conversationView?.compactions || [],
-    payload.conversationView?.conversation || null,
+    isWorker ? [] : payload.conversationView?.compactions || [],
+    isWorker ? null : payload.conversationView?.conversation || null,
   );
   renderSpawnedWorkerEntries(rendered, currentSessionId);
   // Spec 100: a completed worker's durable result follows the conversation it
