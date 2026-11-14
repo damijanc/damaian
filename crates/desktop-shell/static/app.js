@@ -15494,6 +15494,10 @@ async function loadSession(sessionId) {
     sessionCheckpoints = [];
     clearChat();
     void refreshRepoBar();
+    // A fresh session to track, not a transition within one: no reload-on-
+    // cleared belongs to whatever session was open before this.
+    invisibleWorkWasVisible = false;
+    syncInvisibleWork();
     return;
   }
   // A rewind reloads the session through here, so it refreshes the bar too.
@@ -15506,6 +15510,11 @@ async function loadSession(sessionId) {
   localStorage.setItem(lastSessionStorageKey(), currentSessionId);
   $("session-select").value = currentSessionId;
   syncSessionListActive();
+  // A fresh session to track, not a transition within one: show what the
+  // poller already knows at once, without reloading on behalf of whatever
+  // session was open before this.
+  invisibleWorkWasVisible = false;
+  syncInvisibleWork();
   loadPinnedContextFiles(currentSessionId);
   await loadSessionCheckpoints(currentSessionId);
   // Before rendering: the messages' *Start worker* actions depend on it.
@@ -15665,6 +15674,64 @@ const runningTurnStreams = new Set();
 // first: `{ sessionId, text, message, unsent }`. `unsent` marks one the shell
 // refused because the turn had just ended, so the window still owns it.
 const waitingNotes = [];
+
+// Server-reported work for every session (spec 110 D3, polled — 2026-11-14):
+// the one source that still says a session is busy when nothing this window
+// streamed says so, such as a crash-recovered command's own resumed turn
+// (observation 103), or a reload that lost a stream this tab started. Keyed
+// by session id; a session absent here is not reported as working.
+let workingSessionsById = new Map();
+let workingSessionsPollTimer = null;
+// Whether `currentSessionId` was shown as invisibly working on the last sync,
+// so the transition to "not working any more" can be told from "never was".
+let invisibleWorkWasVisible = false;
+
+function startWorkingSessionsPoll() {
+  clearInterval(workingSessionsPollTimer);
+  workingSessionsPollTimer = setInterval(() => void pollWorkingSessions(), 2000);
+  void pollWorkingSessions();
+}
+
+async function pollWorkingSessions() {
+  let payload;
+  try {
+    payload = await api("/api/working-sessions");
+  } catch {
+    // Transient (the window is mid-reconnect, say): keep the last known
+    // state rather than flicker the banner off on one failed poll.
+    return;
+  }
+  workingSessionsById = new Map((payload.sessions || []).map((row) => [row.sessionId, row]));
+  syncInvisibleWork();
+}
+
+// Shows a session's server-reported work when this window has no stream of
+// its own that already says so (`runningTurnStream`), so "something is
+// running and blocks you" is never silent just because of which code path is
+// driving it. Clears itself, and reloads the session once, the first poll
+// after the work it was showing is gone — that reload is the only way this
+// window learns what the invisible work actually did.
+function syncInvisibleWork() {
+  const line = $("composer-invisible-work");
+  if (!line) return;
+  const info = currentSessionId && !workerView ? workingSessionsById.get(currentSessionId) : null;
+  const visible = Boolean(info) && !runningTurnStream(currentSessionId);
+  line.hidden = !visible;
+  const stopButton = $("composer-invisible-work-stop-btn");
+  if (visible) {
+    const seconds = Math.round((info.elapsedMs || 0) / 1000);
+    $("composer-invisible-work-label").textContent =
+      `Working: ${info.label} · ${seconds}s — not visible here, but it blocks your next message`;
+    stopButton.hidden = !info.cancellable;
+  }
+  if (invisibleWorkWasVisible && !visible) {
+    // The server stopped reporting it; this window never saw a `done` for
+    // it, so reloading is the only way to pick up what it left behind (a
+    // patch proposal, a new assistant message, a failure).
+    void loadSession(currentSessionId);
+  }
+  invisibleWorkWasVisible = visible;
+}
 
 function runningTurnStream(sessionId) {
   if (!sessionId) return null;
@@ -16395,6 +16462,13 @@ async function sendChatPrompt(options = {}) {
   // the running turn instead of starting a second one.
   const working = !promptOverride && runningTurnStream(currentSessionId);
   if (working) return sendSteeringNote(working.sessionId);
+  // Work this window has no stream for (observation 103) cannot take a note
+  // — it is not a chat turn this tab is driving — so sending here would just
+  // repeat the 409 the shell already refused once. Say why instead of trying.
+  if (!promptOverride && workingSessionsById.has(currentSessionId)) {
+    toast("Damaian is still working on this session — wait for it to finish or stop it.");
+    return false;
+  }
   if (chatSubmitting) return false;
   try {
     prompt = promptOverride || $("chat-prompt").value.trim();
@@ -16619,6 +16693,19 @@ async function askAgainFromExhausted(sessionId, taskId) {
 }
 
 $("composer-decision-btn").addEventListener("click", focusPendingDecision);
+
+$("composer-invisible-work-stop-btn").addEventListener("click", async () => {
+  const button = $("composer-invisible-work-stop-btn");
+  button.disabled = true;
+  try {
+    await api("/api/session-work-cancel", form({ session_id: currentSessionId }));
+    await pollWorkingSessions();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
 
 $("ask-btn").addEventListener("click", () => {
   if (chatSubmitting) {
@@ -16882,3 +16969,7 @@ bootstrapPromise = startBootstrap();
 // is what authorizes the tasks that were safe to pick up again.
 void loadRecoverySweep();
 void setupContextFileDragDrop();
+// Observation 103: a session can be busy on work this window never
+// streamed (a crash-recovered command's own resumed turn, a lost
+// reconnect). Polling is the one source that still says so.
+startWorkingSessionsPoll();

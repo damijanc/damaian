@@ -9942,6 +9942,40 @@ mod tests {
         }
     }
 
+    /// Observation 103: a session can be busy on work this window never
+    /// streamed (a crash-recovered command's own resumed turn). The poller
+    /// is the one thing that still says so, the banner shows it, and Send
+    /// refuses rather than repeating the 409 the shell already gave once.
+    #[test]
+    fn app_js_shows_work_this_window_never_streamed() {
+        let poll = app_js_function("pollWorkingSessions");
+        assert!(poll.contains(r#"api("/api/working-sessions")"#), "{poll}");
+        assert!(poll.contains("syncInvisibleWork();"), "{poll}");
+
+        let sync = app_js_function("syncInvisibleWork");
+        assert!(
+            sync.contains("!runningTurnStream(currentSessionId)"),
+            "a stream this window already knows about must not double up with the banner: {sync}"
+        );
+        assert!(
+            sync.contains("void loadSession(currentSessionId);"),
+            "the only way to learn what invisible work left behind is a reload: {sync}"
+        );
+
+        let send = app_js_function("sendChatPrompt");
+        assert!(
+            send.contains("workingSessionsById.has(currentSessionId)"),
+            "Send must refuse rather than repeat a 409 the shell already gave: {send}"
+        );
+
+        assert!(
+            super::APP_JS.contains(
+                r#"api("/api/session-work-cancel", form({ session_id: currentSessionId }));"#
+            ),
+            "the Stop button must cancel the session the banner names"
+        );
+    }
+
     fn app_js_function(name: &str) -> &'static str {
         let app = super::APP_JS;
         let start = app

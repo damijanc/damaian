@@ -318,6 +318,21 @@
             <span id="composer-decision-label" class="composer-decision-label"></span>
             <button id="composer-decision-btn" class="btn-sm" type="button">Show</button>
           </div>
+          <!-- A session can be busy on a request this window never streamed
+               (a crash-recovered command's own resumed turn, say): polled
+               from /api/working-sessions rather than a local stream, so the
+               user is never left thinking nothing is happening (2026-11-14). -->
+          <div
+            id="composer-invisible-work"
+            class="composer-decision composer-invisible-work"
+            role="status"
+            hidden
+          >
+            <span id="composer-invisible-work-label" class="composer-decision-label"></span>
+            <button id="composer-invisible-work-stop-btn" class="btn-sm" type="button" hidden>
+              Stop
+            </button>
+          </div>
           <div class="prompt-box">
             <div id="composer-context" class="composer-context" hidden>
               <div id="pinned-context-files" class="pinned-context-files"></div>

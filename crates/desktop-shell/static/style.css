@@ -1489,6 +1489,14 @@ button:disabled {
   min-width: 0;
 }
 
+/* Informational, not a decision: muted rather than the accent edge
+   `.composer-decision` uses for something waiting on the user. */
+.composer-invisible-work {
+  border-color: var(--line);
+  background: var(--surface-soft);
+  font-weight: 500;
+}
+
 /* The pending card, last in the conversation. It keeps the card's own look;
    the accent edge marks it as the one waiting, and goes once it is decided. */
 .pending-decision {
