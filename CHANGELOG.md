@@ -39,6 +39,7 @@ harness, and **Release** covers packaging, signing and distribution.
 
 | | |
 |---|---|
+| **v0.77.0** | **Engine**<br>- Small bug fix.<br>- Add MCP per-tool overrides and management config fields.<br><br>**App**<br>- Show a worker's round-budget decision and drop the compaction banner from worker view.<br>- Add a Settings toggle for semantic search.<br>- Show when a session is busy on work this window never streamed. |
 | **v0.76.0** | **Engine**<br>- Allow the build check's cargo check in a test that writes its own Cargo root.<br>- Compile every change before its tests run (spec 109 Task 9).<br>- Dump the session log when the continuation-chain usage test fails.<br><br>**App**<br>- Review a commit as a full panel with expanded, colored diffs.<br>- Move Archived sessions into the project's own menu, off the sidebar. |
 | **v0.75.0** | **Engine**<br>- Document every configuration key, with a test that keeps the reference complete.<br>- Parse commands into chain parts, normalised options and resolved paths (spec 111 Task 1).<br>- Send the chosen effort to DeepSeek and OpenRouter, and offer each provider only its levels.<br><br>**App**<br>- Pin the app to the window so a card scrolled into view cannot push the header off screen.<br>- Clear a decision as soon as it is answered, and hide a decided command's buttons.<br>- Deliver a message sent while a session works into its running turn (spec 110 Task 1c). |
 | **v0.74.0** | **Engine**<br>- Make the cancelled-baseline test stop a run that is still in progress. |
