@@ -77,6 +77,10 @@ starts the real worker binary against a provider; it is in
 [Troubleshooting](TROUBLESHOOTING.md#a-single-worker-acceptance-run-failed),
 with how to read its report. Its deterministic tier runs in the workspace suite.
 
+Comparing Damaian with another client on the same model (opencode) is a
+separate, manual method with its own scorecard; see
+[Client comparison](CLIENT_COMPARISON.md).
+
 ### Adding a scenario
 
 Add a `.toml` file under `crates/eval-harness/scenarios/`. Each declares a
