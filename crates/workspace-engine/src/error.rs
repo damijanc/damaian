@@ -97,6 +97,12 @@ pub enum ClientError {
     /// A provider refused the call, classified by [`ProviderRefusal`], with the
     /// provider's own message carried verbatim so the user learns what to fix.
     Provider(ProviderRefusal, String),
+    /// An MCP phase (startup, `tools/list`, or `tools/call`) exceeded its
+    /// configured timeout (spec 33 §5.4). Distinct from [`Self::Io`] on
+    /// purpose: `is_retryable_message` classifies "timed out" as transient,
+    /// but a timed-out MCP call is an *unknown outcome* — the server may have
+    /// received and acted on it — so it must never be retried automatically.
+    McpTimeout(String),
     /// The user stopped an in-flight turn. An internal control signal, not a
     /// failure: `run_agentic_turn` catches it and reports a cancelled result.
     Cancelled,
@@ -117,6 +123,7 @@ impl ClientError {
             Self::InvalidInput(_) => "invalid_input",
             Self::RequestPreparation(_) => "request_preparation_failed",
             Self::Provider(refusal, _) => refusal.code(),
+            Self::McpTimeout(_) => "mcp_timeout",
             Self::Cancelled => "cancelled",
         }
     }
@@ -162,7 +169,8 @@ impl Display for ClientError {
             | Self::Git(message)
             | Self::InvalidInput(message)
             | Self::RequestPreparation(message)
-            | Self::Provider(_, message) => formatter.write_str(message),
+            | Self::Provider(_, message)
+            | Self::McpTimeout(message) => formatter.write_str(message),
             Self::Cancelled => formatter.write_str("Stopped by user"),
         }
     }

@@ -6371,8 +6371,14 @@ done
     };
 
     let registry = workspace_engine::ProcessRegistry::open(&root).expect("registry");
-    let mut client =
-        McpClient::connect(&config, None, &registry, "ses_1").expect("connect + initialize");
+    let mut client = McpClient::connect(
+        &config,
+        None,
+        &registry,
+        "ses_1",
+        std::time::Duration::from_secs(5),
+    )
+    .expect("connect + initialize");
     assert_eq!(
         registry.entries().unwrap().len(),
         1,
@@ -6383,13 +6389,19 @@ done
         workspace_engine::ProcessKind::McpServer.as_str()
     );
 
-    let tools = client.list_tools().expect("tools/list");
+    let tools = client
+        .list_tools(std::time::Duration::from_secs(5))
+        .expect("tools/list");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "echo");
     assert_eq!(tools[0].to_tool_definition("fake").name, "mcp__fake__echo");
 
     let result = client
-        .call_tool("echo", "{\"text\":\"hi\"}")
+        .call_tool(
+            "echo",
+            "{\"text\":\"hi\"}",
+            std::time::Duration::from_secs(5),
+        )
         .expect("tools/call");
     assert!(!result.is_error);
     assert_eq!(result.text, "echoed: hi");

@@ -5123,6 +5123,7 @@ impl McpBrowserDiagnosticsRunner {
                 server.auth_token.clone(),
                 &registry,
                 "",
+                Duration::from_secs(15),
             ) {
                 Ok(client) => client,
                 Err(error) => {
@@ -5130,7 +5131,7 @@ impl McpBrowserDiagnosticsRunner {
                     continue;
                 }
             };
-            let tools = match client.list_tools() {
+            let tools = match client.list_tools(Duration::from_secs(15)) {
                 Ok(tools) => tools,
                 Err(error) => {
                     last_error = Some(format!("{}: {error}", server.config.id));
@@ -5144,7 +5145,7 @@ impl McpBrowserDiagnosticsRunner {
                 continue;
             };
             let arguments = mcp_browser_arguments(tool_name, call)?;
-            match client.call_tool(tool_name, &arguments) {
+            match client.call_tool(tool_name, &arguments, Duration::from_secs(60)) {
                 Ok(result) => {
                     return Ok(browser_report_from_tool_result(
                         WebDiagnosticReport::from_text(result.text, result.is_error),
@@ -5458,9 +5459,11 @@ fn mcp_test_connection(
     // Testing a server still spawns one, so it is registered like any other.
     // No session: the user is on the settings screen, not in a turn.
     let registry = ProcessRegistry::open(data_dir).map_err(|error| error.to_string())?;
-    let mut client =
-        McpClient::connect(&config, token, &registry, "").map_err(|error| error.to_string())?;
-    let tools = client.list_tools().map_err(|error| error.to_string())?;
+    let mut client = McpClient::connect(&config, token, &registry, "", Duration::from_secs(15))
+        .map_err(|error| error.to_string())?;
+    let tools = client
+        .list_tools(Duration::from_secs(15))
+        .map_err(|error| error.to_string())?;
     Ok(tools.into_iter().map(|tool| tool.name).collect())
 }
 

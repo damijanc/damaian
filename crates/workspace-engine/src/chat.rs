@@ -1343,6 +1343,9 @@ impl ChatOrchestrator {
                 self.audit_log.clone(),
                 self.config.data_dir.clone(),
                 session_id,
+                std::time::Duration::from_millis(self.config.mcp_connect_timeout_ms),
+                std::time::Duration::from_millis(self.config.mcp_list_timeout_ms),
+                std::time::Duration::from_millis(self.config.mcp_call_timeout_ms),
             )
         }
     }

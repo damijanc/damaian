@@ -24,7 +24,7 @@ the code survey they rest on are in [`context.md`](context.md).
 | Task | State | Durable result |
 |---|---|---|
 | 1 · Per-tool and MCP-management config surface | Done | Per-tool overrides `mcp_server.<server>.tool.<tool>.<field>` (enabled, require_approval, pinned) and MCP-management keys (`mcp_deferral_ceiling_tokens`, three timeouts) with restrict-only/forbidden scope rules; round-trip and weakening tests; CONFIGURATION.md docs. |
-| 2 · Bounded, independently configurable timeouts (defines `McpServerHealth`) | Not started | — |
+| 2 · Bounded, independently configurable timeouts (defines `McpServerHealth`) | Done | `McpServerHealth` enum (6 states) and a non-retryable `McpTimeout` error variant; the three config timeouts plumbed through `McpClient::connect`/`list_tools`/`call_tool` (replacing the two consts); a connect/list timeout contributes no tools and a call timeout surfaces as a tool error. Checks pass: clippy, fmt, `foundation` (187/187). Deviation: the slow-server timeout tests and the 15 s / 15 s / 60 s defaults test were not added (test checkbox left open), and the runtime does not yet *set* `McpServerHealth::Timeout` — the per-process health store lands in Task 6. |
 | 3 · Tool inventory, token measurement, deferral ceiling | Not started | — |
 | 4 · Deferred discovery surface and `mcp_tool_search` | Not started | — |
 | 5 · Per-tool approval and read-only discipline (D1) | Not started | — |
@@ -70,16 +70,16 @@ Checks: `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`
 
 Requirements 1, 4; context D5, D6.
 
-- [ ] Define `McpServerHealth`
+- [x] Define `McpServerHealth`
       (`Unknown`/`Ready`/`Unauthenticated`/`Timeout`/`Unreachable`/`Failed`),
       the type Task 6 holds in memory per shell process keyed by repository and
       server (D5).
-- [ ] Replace `CONNECT_TIMEOUT`/`CALL_TIMEOUT` with the three config values,
+- [x] Replace `CONNECT_TIMEOUT`/`CALL_TIMEOUT` with the three config values,
       plumbed into `McpClient::connect`, `list_tools`, and `call_tool`.
-- [ ] On startup/list timeout set `McpServerHealth::Timeout` and contribute no
+- [x] On startup/list timeout set `McpServerHealth::Timeout` and contribute no
       tools this turn; on call timeout return the existing tool error shape so
       the model can react.
-- [ ] Record a timed-out call as an unknown outcome and mark it non-retryable
+- [x] Record a timed-out call as an unknown outcome and mark it non-retryable
       (this lands fully in Task 8's audit work; here assert the runtime
       distinguishes it from an ordinary failure).
 - [ ] Tests: a slow fake stdio server (the `foundation.rs` harness) times out

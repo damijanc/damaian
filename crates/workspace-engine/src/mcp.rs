@@ -13,6 +13,7 @@ use crate::config::{McpServerConfig, McpTransport};
 use crate::error::{ClientError, Result};
 use crate::model::{ToolDefinition, escape_curl_config_value};
 use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -26,8 +27,28 @@ use std::time::{Duration, Instant};
 /// Protocol revision we advertise in `initialize`. Servers negotiate down if
 /// they only speak an older one.
 const PROTOCOL_VERSION: &str = "2025-06-18";
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Health of one MCP server within this session (spec 33 §5.3, context D5).
+/// Held in memory, keyed by repository and server, and never persisted: the
+/// states are defined in terms of *this session* (`Unknown` = "never contacted
+/// this session", `Failed` = "not retried automatically this session"), so
+/// persisting them would contradict their own semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerHealth {
+    /// Never contacted this session.
+    Unknown,
+    /// Reachable and handshaked successfully.
+    Ready,
+    /// Reachable, but authentication failed.
+    Unauthenticated,
+    /// Startup, `tools/list`, or `tools/call` exceeded its timeout.
+    Timeout,
+    /// Could not be reached (spawn, network, or handshake failure).
+    Unreachable,
+    /// Failed repeatedly; not retried automatically this session.
+    Failed,
+}
 
 /// The `mcp__` namespace prefix. Every MCP tool offered to the model is named
 /// `mcp__<server_id>__<tool_name>` so it can't collide with a built-in tool or
@@ -155,6 +176,7 @@ impl McpClient {
         auth_token: Option<String>,
         registry: &ProcessRegistry,
         session_id: &str,
+        connect_timeout: Duration,
     ) -> Result<Self> {
         let transport: Box<dyn RpcTransport> = match config.transport {
             McpTransport::Stdio => Box::new(StdioTransport::spawn(config, registry, session_id)?),
@@ -164,27 +186,28 @@ impl McpClient {
             transport,
             next_id: 0,
         };
-        client.initialize()?;
+        client.initialize(connect_timeout)?;
         Ok(client)
     }
 
-    fn initialize(&mut self) -> Result<()> {
+    fn initialize(&mut self, connect_timeout: Duration) -> Result<()> {
         let params = json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": { "name": "damaian-client", "version": env!("CARGO_PKG_VERSION") },
         });
-        self.request("initialize", params, CONNECT_TIMEOUT)?;
+        self.request("initialize", params, connect_timeout)?;
         // Best-effort readiness notification. A server that rejects or ignores
         // it but is otherwise healthy should not be treated as unusable.
-        let _ = self
-            .transport
-            .notify(&notification_payload("notifications/initialized"));
+        let _ = self.transport.notify(
+            &notification_payload("notifications/initialized"),
+            connect_timeout,
+        );
         Ok(())
     }
 
-    pub fn list_tools(&mut self) -> Result<Vec<McpTool>> {
-        let result = self.request("tools/list", json!({}), CONNECT_TIMEOUT)?;
+    pub fn list_tools(&mut self, list_timeout: Duration) -> Result<Vec<McpTool>> {
+        let result = self.request("tools/list", json!({}), list_timeout)?;
         let tools = result
             .get("tools")
             .and_then(Value::as_array)
@@ -193,10 +216,15 @@ impl McpClient {
         Ok(tools)
     }
 
-    pub fn call_tool(&mut self, tool_name: &str, arguments_json: &str) -> Result<McpToolResult> {
+    pub fn call_tool(
+        &mut self,
+        tool_name: &str,
+        arguments_json: &str,
+        call_timeout: Duration,
+    ) -> Result<McpToolResult> {
         let arguments: Value = serde_json::from_str(arguments_json).unwrap_or_else(|_| json!({}));
         let params = json!({ "name": tool_name, "arguments": arguments });
-        let result = self.request("tools/call", params, CALL_TIMEOUT)?;
+        let result = self.request("tools/call", params, call_timeout)?;
         Ok(flatten_tool_result(&result))
     }
 
@@ -205,7 +233,18 @@ impl McpClient {
         let id = self.next_id;
         let payload =
             json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
-        let response = self.transport.call(&payload, id, timeout)?;
+        let response = match self.transport.call(&payload, id, timeout) {
+            Ok(response) => response,
+            // Re-tag a transport-level timeout with the phase that hit it, so
+            // the error names connect/list/call rather than the shared
+            // transport wording.
+            Err(ClientError::McpTimeout(_)) => {
+                return Err(ClientError::McpTimeout(format!(
+                    "Timed out waiting for MCP server response ({method})"
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(error) = response.get("error") {
             let message = error
                 .get("message")
@@ -296,7 +335,7 @@ fn flatten_tool_result(result: &Value) -> McpToolResult {
 /// notification.
 trait RpcTransport: Send {
     fn call(&mut self, payload: &str, id: u64, timeout: Duration) -> Result<Value>;
-    fn notify(&mut self, payload: &str) -> Result<()>;
+    fn notify(&mut self, payload: &str, timeout: Duration) -> Result<()>;
 }
 
 /// Local server: a child process speaking newline-delimited JSON-RPC over
@@ -407,9 +446,11 @@ impl RpcTransport for StdioTransport {
         loop {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
-                .ok_or_else(|| ClientError::Io("Timed out waiting for MCP server".to_string()))?;
+                .ok_or_else(|| {
+                    ClientError::McpTimeout("Timed out waiting for MCP server response".to_string())
+                })?;
             let line = self.lines.recv_timeout(remaining).map_err(|_| {
-                ClientError::Io("Timed out waiting for MCP server response".to_string())
+                ClientError::McpTimeout("Timed out waiting for MCP server response".to_string())
             })?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -425,7 +466,7 @@ impl RpcTransport for StdioTransport {
         }
     }
 
-    fn notify(&mut self, payload: &str) -> Result<()> {
+    fn notify(&mut self, payload: &str, _timeout: Duration) -> Result<()> {
         self.write_line(payload)
     }
 }
@@ -514,6 +555,14 @@ impl HttpTransport {
             pipe.read_to_string(&mut stderr)?;
         }
         if !status.success() {
+            // curl exit 28 is "operation timed out": the request may or may
+            // not have reached the server, so it is an unknown outcome rather
+            // than an ordinary transport failure.
+            if status.code() == Some(28) {
+                return Err(ClientError::McpTimeout(
+                    "Timed out waiting for MCP server response".to_string(),
+                ));
+            }
             return Err(ClientError::Io(format!(
                 "MCP server request failed: {}",
                 stderr.trim()
@@ -533,8 +582,8 @@ impl RpcTransport for HttpTransport {
             .ok_or_else(|| ClientError::Io("Empty response from MCP server".to_string()))
     }
 
-    fn notify(&mut self, payload: &str) -> Result<()> {
-        let _ = self.post(payload, CONNECT_TIMEOUT)?;
+    fn notify(&mut self, payload: &str, timeout: Duration) -> Result<()> {
+        let _ = self.post(payload, timeout)?;
         Ok(())
     }
 }
@@ -633,6 +682,9 @@ pub struct McpRuntime {
     data_dir: Option<PathBuf>,
     /// Attribution for any server this runtime spawns.
     session_id: String,
+    connect_timeout: Duration,
+    list_timeout: Duration,
+    call_timeout: Duration,
 }
 
 impl McpRuntime {
@@ -641,6 +693,9 @@ impl McpRuntime {
         audit_log: AuditLog,
         data_dir: PathBuf,
         session_id: &str,
+        connect_timeout: Duration,
+        list_timeout: Duration,
+        call_timeout: Duration,
     ) -> Self {
         Self {
             servers,
@@ -649,6 +704,9 @@ impl McpRuntime {
             audit_log: Some(audit_log),
             data_dir: Some(data_dir),
             session_id: session_id.to_string(),
+            connect_timeout,
+            list_timeout,
+            call_timeout,
         }
     }
 
@@ -662,6 +720,9 @@ impl McpRuntime {
             audit_log: None,
             data_dir: None,
             session_id: String::new(),
+            connect_timeout: Duration::ZERO,
+            list_timeout: Duration::ZERO,
+            call_timeout: Duration::ZERO,
         }
     }
 
@@ -724,6 +785,7 @@ impl McpRuntime {
                 server.auth_token.clone(),
                 &registry,
                 &self.session_id,
+                self.connect_timeout,
             )?;
             self.connections.insert(server_id.to_string(), client);
         }
@@ -741,7 +803,11 @@ impl McpRuntime {
         let mut definitions = Vec::new();
         for server_id in server_ids {
             if !self.tools.contains_key(&server_id) {
-                match self.connection(&server_id).and_then(McpClient::list_tools) {
+                let list_timeout = self.list_timeout;
+                match self
+                    .connection(&server_id)
+                    .and_then(|client| client.list_tools(list_timeout))
+                {
                     Ok(tools) => {
                         self.record(
                             "mcp_tools_listed",
@@ -780,9 +846,10 @@ impl McpRuntime {
         tool_name: &str,
         arguments_json: &str,
     ) -> Result<McpToolResult> {
+        let call_timeout = self.call_timeout;
         let result = self
             .connection(server_id)
-            .and_then(|client| client.call_tool(tool_name, arguments_json));
+            .and_then(|client| client.call_tool(tool_name, arguments_json, call_timeout));
         match &result {
             Ok(value) => self.record(
                 "mcp_tool_called",
