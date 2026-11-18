@@ -167,15 +167,47 @@ fn sweep_payload(engine: &WorkspaceEngine, sweep: &Sweep) -> Result<String, Stri
         }
     }
 
+    // A reattached approval is a one-time sweep result too, but unlike a
+    // recovered task it was never rechecked here: once captured, it was
+    // offered on every poll for the rest of the process's life, even after
+    // the task it belongs to finished, was cancelled, or was superseded by a
+    // later turn (observation 103's follow-up, 2026-11-14) — the exact same
+    // staleness the `recovered` loop above already guards against.
+    //
+    // "unavailable" is excluded: it carries no Approve/Reject of its own (the
+    // card is pure explanation — "a command from before the crash could not
+    // be restored"), and resume()'s own classification above can finalize
+    // such a task as terminal in this same sweep, before the card is ever
+    // shown once. Checking it the same way as a decidable approval would
+    // drop the one card whose entire job is to explain that outcome.
+    let mut approvals_open = Vec::new();
+    for approval in &sweep.approvals {
+        if approval.kind == "unavailable" {
+            approvals_open.push(approval_json(approval));
+            continue;
+        }
+        if !facts.contains_key(&approval.session_id) {
+            facts.insert(
+                approval.session_id.clone(),
+                SessionFacts::read(engine, &approval.session_id)?,
+            );
+        }
+        let session = &facts[&approval.session_id];
+        let settled = session
+            .statuses
+            .get(&approval.task_id)
+            .and_then(|status| TaskStatus::parse(status))
+            .is_some_and(|status| status.is_terminal())
+            || session.superseded.contains(&approval.task_id);
+        if !settled {
+            approvals_open.push(approval_json(approval));
+        }
+    }
+
     Ok(format!(
         "{{\"tasks\":[{}],\"approvals\":[{}],\"verifications\":[{}]}}",
         open.join(","),
-        sweep
-            .approvals
-            .iter()
-            .map(approval_json)
-            .collect::<Vec<_>>()
-            .join(","),
+        approvals_open.join(","),
         sweep
             .verifications
             .iter()
@@ -1224,6 +1256,54 @@ mod tests {
                 .status,
             "pending"
         );
+    }
+
+    /// Observation 103's follow-up (2026-11-14): unlike a recovered task, a
+    /// reattached approval was never rechecked against the task's current
+    /// status, so once offered it stayed in every sweep for the rest of the
+    /// process's life even after the task it belonged to settled on its own
+    /// (completed, cancelled, or superseded) without the user ever deciding
+    /// this specific card.
+    #[test]
+    fn a_settled_tasks_reattached_approval_drops_from_the_next_payload() {
+        let (engine, dir) = engine("approval-settled");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Recovery")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "list the files", "mock", "m")
+            .unwrap();
+        let proposal = engine
+            .validation_orchestrator
+            .propose_command(&dir, "ls -la", "Desktop command proposal")
+            .unwrap();
+        engine
+            .session_store
+            .await_approval(
+                &task,
+                &PendingApprovalRef {
+                    kind: "command".to_string(),
+                    proposal_id: proposal.id.clone(),
+                },
+            )
+            .unwrap();
+
+        let (swept, before) = sweep(&engine);
+        assert!(before.contains(&proposal.id), "got {before}");
+
+        // The task settles on its own — cancelled by the user, say, from a
+        // later turn — without the reattached card itself ever being decided.
+        engine
+            .session_store
+            .update_task_status(&task, TaskStatus::Cancelled, None)
+            .unwrap();
+
+        // The same snapshot, re-rendered: the status filter is what keeps the
+        // now-settled approval off the screen when the webview reloads.
+        let after = sweep_payload(&engine, &swept).unwrap();
+        assert!(!after.contains(&proposal.id), "got {after}");
     }
 
     /// Spec 21 made plan review a third kind of pending approval. Before this,
