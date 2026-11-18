@@ -705,11 +705,13 @@ Damaian keeps AI orchestration, context assembly, patch preview, settings, and a
 
 ### Project and session menus
 
-**A project's ⋮ menu** in the sidebar offers **Open in › VS Code** or **Open in › Finder**, **Rename** and **Delete**, plus **New worker** when [Worker Sessions](#worker-sessions) are on. **Rename** changes only the name shown in the sidebar; an empty name goes back to the folder name. **Delete** asks first, then removes the project from the list only. Nothing on disk is deleted, and you can add the folder again later.
+**A project's ⋮ menu** in the sidebar offers **Open in › VS Code** or **Open in › Finder**, **Rename** and **Delete**, plus **New worker** when [Worker Sessions](#worker-sessions) are on, and **Archived (N)** when the project has [archived sessions](#project-and-session-menus). **Rename** changes only the name shown in the sidebar; an empty name goes back to the folder name. **Delete** asks first, then removes the project from the list only. Nothing on disk is deleted, and you can add the folder again later.
 
-**A session's ⋮ menu**, shown on the open session and when you hover over or tab to a row, has **Rename**, **Export as Markdown** and **Delete** (which asks for confirmation). Double-clicking a session also renames it. Select an existing session to reload its conversation.
+**A session's ⋮ menu**, shown on the open session and when you hover over or tab to a row, has **Rename**, **Export as Markdown**, **Archive** and **Delete** (which asks for confirmation). Double-clicking a session also renames it. Select an existing session to reload its conversation.
 
-**The conversation header** holds only the session title, the terminal toggle and a ⋮ menu. The ⋮ menu's **Open in** submenu opens the selected working folder in **VS Code**, reveals it in **Finder**, or opens the **Terminal** panel there. Below it are **Rename session**, **Export as Markdown** and, last, **Delete session**, which asks for confirmation: the same actions as the open session's own menu.
+**The conversation header** holds only the session title, the terminal toggle and a ⋮ menu. The ⋮ menu's **Open in** submenu opens the selected working folder in **VS Code**, reveals it in **Finder**, or opens the **Terminal** panel there. Below it are **Rename session**, **Export as Markdown**, **Archive** and, last, **Delete session**, which asks for confirmation: the same actions as the open session's own menu.
+
+**Archiving a session** tidies the sidebar without losing anything. **Archive** takes the session out of the project's list. The project's own ⋮ menu then has **Archived (N)**, listing its archived sessions and workers, newest first; it appears once the project has archived sessions and you have expanded the project in the sidebar. Select a title to open that session. Its header ⋮ menu then offers **Unarchive**, which returns it to the list in its old place. Archiving keeps the conversation, and a worker's worktree and branch, exactly as they were, and it lasts across a reload and a restart. Search still finds an archived session's messages and labels those hits **Archived**. A worker can be archived from its ⋮ menu in the sidebar or on the [Workers board](#worker-sessions), but not while it is running: stop it first. **Delete** remains the action that removes a session.
 
 ### The repo bar
 
@@ -808,7 +810,7 @@ A turn reaches a checkpoint at its action-round limit (`agent_max_tool_rounds`, 
 
 The pause names the action rounds the turn used against the limit and how many read-only rounds it had used. Select **Continue — N more** to give the same turn another segment of action rounds, keeping every message, tool result and plan step it had, or **Answer now** to have the assistant answer with what it has, with no tools. The pause comes before that final call, so nothing is spent until you choose. **Continue** can extend a stretch of the turn up to 64 action rounds; at that cap only **Answer now** is offered. If the card keeps appearing because a task-budget total ran out (the audit reason is `input_tokens_exhausted`, say), raise that total under **Settings → General → Task budget**. The pause is saved, so after a restart the same offer is still waiting. A worker that approved a [task budget](#worker-sessions) crosses the checkpoint on its own under that budget. With a token cap set (`agent_max_task_tokens`), the turn follows that cap instead (see [Capping What One Turn May Spend](#capping-what-one-turn-may-spend)).
 
-**The worker suggestion.** With Worker sessions on, an ordinary Code-mode task that is about to change code suggests a worker once: on its plan review, or on its first patch when it has no plan, a row reads **This task changes code** with **Run in a worker** and **Continue here**. **Run in a worker** opens the New worker dialog with your request (and, on a plan, the plan as the card shows it); see [Reviewing a plan before it runs](#reviewing-a-plan-before-it-runs). On a patch, the patch card stays here: reject it if the worker is to make the change instead. **Continue here** dismisses the row, and the task carries on in this checkout as described above. The row is not shown for a planning- or documentation-only task, inside a worker, or a second time for the same task.
+**The worker suggestion.** With Worker sessions on, an ordinary Code-mode task that is about to change code suggests a worker once, and never at the same time as another decision. On a plan review it comes after you select **Approve**; on the first patch of a task with no plan it is its own card, shown before the patch card. It reads **This task changes code**, with **Run in a worker** and **Continue here**. **Run in a worker** opens the New worker dialog with your request (and, on a plan, the approved plan); see [Reviewing a plan before it runs](#reviewing-a-plan-before-it-runs). On a patch, the patch card then appears here: reject it if the worker is to make the change instead. **Continue here** removes the suggestion: on a plan it sends your approval, on a patch it shows the patch card, and the task carries on in this checkout as described above. The row is not shown for a planning- or documentation-only task, inside a worker, or a second time for the same task.
 
 A turn that ends any other way leaves a mark on its message: **Stopped by you**, **Tool budget exhausted** (after **Answer now**; the reply names the action and read-only rounds it had used, and **Ask again** starts a new turn from the stopped task's own request, carrying its plan forward), **Token budget exhausted**, **Stopped before finishing**, or the error itself when the request failed. The stop and budget marks are still there when you reopen the session. **Stopped before finishing** and a failure's error are shown only in the window where the turn ran; after a reload, a stopped turn reads **Stopped by you** and a failed one has no mark.
 
@@ -1000,11 +1002,12 @@ worker. A new task does not inherit it unless you set it again. Only your own
 request or the explicit control establishes a path: model output, fetched pages,
 repository files and tool output cannot.
 
-To add paths after the task starts, use the **Protected paths** panel below the
-conversation: type one repository-relative path per line and select **Protect
-paths**. Each row says whether it is a file or a directory. **Stop protecting**
-removes it as an explicit change; the earlier decision stays in the session log.
-From the CLI:
+The main window has no control for editing a task's protected paths; they show
+where they explain something. A refused patch names the protected path, and a
+worker started from a protected task lists what it was handed, as "Protected:
+README.md, docs/", on its Workers board row and in its session's header.
+Removing a path is an explicit change; the earlier decision stays in the
+session log. To add or remove paths after the task starts, use the CLI:
 
 ```text
 damaian protect-paths <repo> <session> <task> list
@@ -1036,7 +1039,7 @@ From the CLI, `damaian apply-patch` prints the same findings and re-runs with `-
 
 The assistant reads files with detected credentials replaced by markers such as `[REDACTED_AWS_ACCESS_KEY_…]`. It cannot write one of those markers back into a file: a patch that would do so is refused before you see it, and the assistant is told to leave those lines alone. Otherwise the marker would replace your real value.
 
-After files are applied, Damaian prints a concise Git status summary in the conversation.
+After files are applied, Damaian prints a concise Git status summary in the conversation: each changed path once, after its two-letter Git status, such as ` M src/lib.rs`, ` D old.md` or `?? newdir/`.
 
 ## Verification
 
@@ -1454,46 +1457,52 @@ what a turn came to.
 
 Before the first step that changes anything, Damaian stops and shows you the
 plan. Nothing has happened yet at that point — no file written, no command run.
-You can:
+The card is for reading: its steps are a numbered list you cannot edit, each
+open step with its check underneath, and a short muted **Next: …** line names
+the action the plan is waiting to take. It asks one thing at a time:
 
-- **Reorder** steps with the arrows.
-- **Retitle** a step by typing in its box.
-- **Delete** a step with **×**.
-- **Approve** the plan as it stands, or **Decline** it.
+- **Approve** the plan as it stands.
+- **Decline** asks **How should the plan be changed?** with a text field.
+  Type what should be different and select **Send** (or press ⌘/Ctrl+Enter):
+  the steps stay open, the assistant gets your answer, and it proposes a
+  revised plan, which comes back to you as a new review card before anything
+  changes. **Decline without changes** declines the plan as it is: nothing
+  changes, its steps are marked skipped, and the turn explains. Nothing is sent
+  until you press one of the two, so the card stays the decision waiting for
+  you. In a worker's own session, **Decline** declines at once.
 
-When the plan changes code and Worker sessions are on, the card also carries
-the one-time [worker suggestion](#while-a-turn-runs-and-how-it-ended), **This
-task changes code**, with **Run in a worker** and **Continue here**. It is not
-offered for a plan that only plans or edits documentation, inside a worker, or
-again once the task has been offered it. **Run in a worker** opens the New
-worker dialog with your request and the plan as the card shows it, edits
-included. Once the worker starts, this turn ends here with nothing changed, its
-steps are marked skipped, and the card links to the worker. Handing over is not
-an approval: the worker puts the plan up for review again before its first
-change, and that is where you approve it. Cancel the dialog and the card is
-still waiting for an answer. **Continue here** removes the row and leaves
-**Approve** and **Decline**.
+When the plan changes code and Worker sessions are on, **Approve** is followed
+by the one-time [worker suggestion](#while-a-turn-runs-and-how-it-ended): the
+card's buttons become **This task changes code**, with **Run in a worker** and
+**Continue here**. It is never shown beside **Approve** and **Decline**, after
+a decline, for a plan that only plans or edits documentation, inside a worker,
+or again once the task has been offered it. **Continue here** sends your
+approval, and the task carries on here. **Run in a worker** opens the New worker
+dialog with your request and the plan's open steps. Once the worker starts, this
+turn ends here with nothing changed, its steps are marked skipped, and the card
+links to the worker. The worker receives the plan as approved: its first plan
+with exactly those steps runs without a second review. A different plan is
+reviewed in the worker as usual. Cancel the dialog and the suggestion is still
+waiting for an answer.
 
 **Required checks on the card.** A step may carry a **required check** — a
 command the plan says must pass before the task can complete, such as `cargo
-test` at the repository root. The card lists each one as its command and the
-directory it runs in, with why it is required. Like the steps themselves, a
+test` at the repository root. The card shows each one as its command and the
+directory it runs in, marked **Required check** or **Check (optional)**. A
 check is only a proposal here: the model named it (often because your task
-instructions or an `AGENTS.md` file named it), but nothing has run it. You can
-change its command or directory, edit its purpose, mark it optional, or remove
-it, and the plan you approve records exactly the check you kept. **Approving the
-plan does not run the check.** When the worker reaches that step, the command
-goes through the ordinary command-approval path and asks for its own decision,
-exactly as if the plan had never mentioned it.
+instructions or an `AGENTS.md` file named it), but nothing has run it. If it is
+wrong, **Decline** and say so, and the revised plan comes back for review.
+**Approving the plan does not run the check.** When the task reaches that step,
+the command goes through the ordinary command-approval path and asks for its
+own decision, exactly as if the plan had never mentioned it.
 
 A plan whose steps only read things — listing files, searching, reading source
 — is never put up for approval, because there is nothing to undo.
 
-A step that has already run is shown but has no controls. Its result is tied to
-the state of your repository, and deleting it would leave a plan whose history
-no longer describes what actually happened. If you want a genuinely different
-plan mid-task, stop the task and start another — [Rewind](#rewind) can take the
-repository back first.
+A step that has already run is shown with its outcome. Its result is tied to
+the state of your repository, so a revised plan cannot undo it. If you want a
+genuinely different plan mid-task, stop the task and start another —
+[Rewind](#rewind) can take the repository back first.
 
 Approving is remembered for that task, so you are asked once, not before every
 edit. A [rewind](#rewind) past the point where you approved takes the approval
@@ -2028,7 +2037,7 @@ A **worker** is a session that runs on its own: it gets a prompt, works in a new
 
 **Working in another branch or worktree.** A session's edits and commands always apply to its own checkout. It can read another worktree of the repository, but it cannot change one: an edit to a path inside a worktree is refused. With Worker sessions on, asking for work "on a new branch" or "in a separate worktree" makes the assistant recommend a `worker-prompt` handoff instead of creating a worktree itself, and the worker does the work in a worktree of its own. You can still choose **Work here instead**: the work then happens in the current checkout, and no worktree is created or selected. With them off, the assistant tells you the setting is needed or asks whether to make the change in your checkout.
 
-**Starting a worker.** A `worker-prompt` block in an assistant's answer gets a **Start worker** button once the answer has finished, and a secondary **Work here instead** button. No other block gets either. Clicking **Start worker** opens the New worker dialog with the block's text, which you can still edit. Confirm with **Start worker**. **Work here instead** sends the block to the current conversation as an ordinary turn, with an instruction that you chose this checkout rather than a worker; it does not create, switch to, or write in another worktree. The session holding the block becomes the worker's parent: the block then shows "Started *‹title›* →", and the conversation gets a one-line "Spawned worker" link. An ordinary Code-mode task that is about to change code also suggests **Run in a worker** once, on its plan review or its first patch, so you do not depend on the assistant writing a block (see [the worker suggestion](#while-a-turn-runs-and-how-it-ended) and [Reviewing a plan before it runs](#reviewing-a-plan-before-it-runs)). **New worker** on a project's ⋮ menu or on the Workers board opens the same dialog empty, for a worker with no parent. A worker cannot start workers of its own.
+**Starting a worker.** A `worker-prompt` block in an assistant's answer gets a **Start worker** button once the answer has finished, and a secondary **Work here instead** button. No other block gets either. Clicking **Start worker** opens the New worker dialog with the block's text, which you can still edit. Confirm with **Start worker**. **Work here instead** sends the block to the current conversation as an ordinary turn, with an instruction that you chose this checkout rather than a worker; it does not create, switch to, or write in another worktree. The session holding the block becomes the worker's parent: the block then shows "Started *‹title›* →", and the conversation gets a one-line "Spawned worker" link. An ordinary Code-mode task that is about to change code also suggests **Run in a worker** once, after you approve its plan or before its first patch, so you do not depend on the assistant writing a block (see [the worker suggestion](#while-a-turn-runs-and-how-it-ended) and [Reviewing a plan before it runs](#reviewing-a-plan-before-it-runs)). **New worker** on a project's ⋮ menu or on the Workers board opens the same dialog empty, for a worker with no parent. A worker cannot start workers of its own.
 
 **When a worker finishes.** A worker with a parent leaves one redacted result in that parent when its task reaches a terminal outcome: complete, incomplete, stopped, failed, or out of budget. The parent shows a **Worker result** card naming the task outcome, branch, worktree and the worker's final response, with a link to the worker. Its next action is **Continue with result**. That starts an ordinary turn in the parent with the result as a delimited user message; it never starts a turn by itself, and it does not merge the branch, apply a patch, or approve anything. An incomplete result is labelled **Task incomplete** and names the completion reasons; it is never presented as success. A task waiting on a command, patch, plan, check card or provider choice returns only after that decision produces a terminal outcome. A worker started from **New worker**, with no parent, returns nothing.
 
@@ -2036,7 +2045,7 @@ A **worker** is a session that runs on its own: it gets a prompt, works in a new
 
 **What a worker creates.** A branch `damaian/<name>` and a worktree at `<repository>/.damaian/worktrees/<name>`, the name taken from the prompt's first line. Damaian adds `.damaian/worktrees/` to `.git/info/exclude` once, so worktrees never show as untracked files. `.gitignore` is never edited. Clicking **Start worker** is your approval of those Git commands. They are recorded in the audit log and in the worker's session.
 
-**The Workers board.** **Workers** on the ⋮ menu at the top right opens one board for every project's workers; it does not switch project. Each row names its project, and its actions act on that project: **Open** opens the worker under it. **New worker** on the board starts a worker in the open project. In the sidebar, workers are listed under the session that started them, with a status dot, and **New worker** is on the project's ⋮ menu. The board groups workers under *Needs you* (waiting for approval or an answer, or paused), *Running* and *Finished*, newest first. Each row shows the planner it came from, its rounds, what it is doing and how long it has run. Finished rows show files changed and commits ahead of where the worker started. Each row has one action — **Review** for an approval or question, **Pause** while running, **Open** otherwise — and a ⋯ menu with **Stop**, **Reveal worktree in Finder**, **Remove worktree**, **Delete session** and **Dismiss from board**. Dismissing only hides the row. The session stays in the sidebar.
+**The Workers board.** **Workers** on the ⋮ menu at the top right opens one board for every project's workers; it does not switch project. Each row names its project, and its actions act on that project: **Open** opens the worker under it. **New worker** on the board starts a worker in the open project. In the sidebar, workers are listed under the session that started them, with a status dot, and **New worker** is on the project's ⋮ menu. The board groups workers under *Needs you* (waiting for approval or an answer, or paused), *Running* and *Finished*, newest first. Each row shows the planner it came from, its rounds, what it is doing and how long it has run. Finished rows show files changed and commits ahead of where the worker started. A worker started from a task with [protected paths](#protecting-paths-from-a-tasks-patches) lists them under its branch. Each row has one action — **Review** for an approval or question, **Pause** while running, **Open** otherwise — and a ⋯ menu with **Stop**, **Reveal worktree in Finder**, **Archive**, **Remove worktree**, **Delete session** and **Dismiss from board**. Dismissing only hides the row. The session stays in the sidebar. [Archived](#project-and-session-menus) workers are hidden from the board; **Show archived (N)** in its header lists them again, and **Hide archived** hides them.
 
 **In a worker's session** a control strip under the header shows its state and round, with **Pause** and **Stop** while it runs, **Resume** and **Stop** while it is paused, and **Stop** while it waits or sits idle. The header says which session it came from and which branch it is on.
 
@@ -2631,6 +2640,14 @@ The count covers the whole turn, not the last request. A turn that used tools
 makes several model calls, and each one re-sends the assembled context, so
 three calls cost roughly three times what one does. The line survives a reload,
 so you can look back at what an old conversation spent.
+
+The line also names the model the task ran on, for example `12,714 tokens · 3
+model calls · deepseek-v4-flash`. If you switched models in the
+[model picker](#choosing-the-model-and-effort) partway through a task, it lists
+each one in the order they were first used, `deepseek-v4-flash →
+deepseek-v4-pro`, rather than only the model the task started on. A task
+recorded before Damaian kept the model of each call shows only its starting
+model.
 
 **"Estimated" means Damaian counted the tokens itself** rather than being told.
 Most providers report exact usage and the figure is then shown without the `~`

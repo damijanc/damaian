@@ -47,7 +47,9 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | Rewind did not restore a file, or reports a conflict | [Checkpoints and rewind](#checkpoints-and-rewind) |
 | The assistant replies but never proposes a patch | [The assistant replies but never proposes a patch](#the-assistant-replies-but-never-proposes-a-patch) |
 | Applying a patch fails with a conflict | [Patch apply fails with a conflict](#patch-apply-fails-with-a-conflict) |
-| A patch is refused as modifying a protected task path | [A patch was refused because a task path is protected](#a-patch-was-refused-because-a-task-path-is-protected) |
+| A patch is refused as modifying a protected task path, and there is no panel to change it | [A patch was refused because a task path is protected](#a-patch-was-refused-because-a-task-path-is-protected) |
+| A session or worker is missing from the sidebar or the Workers board | [A session is missing from the sidebar](#a-session-is-missing-from-the-sidebar) |
+| A plan was declined with changes, but no revised plan came back | [Declining a plan with changes](#declining-a-plan-with-changes) |
 | An `edit_file` proposal is refused | [An `edit_file` proposal is refused](#an-edit_file-proposal-is-refused) |
 | `Refused: …` from a mode, a profile or the command policy | [The assistant was refused](#the-assistant-was-refused-the-session-mode-the-permission-profile-or-the-command-policy) |
 | `Refused by hook …`, or a hook blocked, warned, timed out or did not run | [A hook refused, blocked, or did not run](#a-hook-refused-blocked-or-did-not-run) |
@@ -1176,7 +1178,8 @@ Event types: `session_created`, `session_renamed`, `task_created`,
 `question_asked`, `question_answered`, `provider_fallback`,
 `session_mode_set`, `web_diagnostic_recorded`, `finding_recorded`,
 `finding_status_changed`, `worker_spawned`, `worker_returned`,
-`worker_return_consumed`.
+`worker_return_consumed`, `worker_plan_handed`, `session_archived`,
+`session_unarchived`, `plan_changes_requested`.
 
 Every event carries a monotonic `seq`. Events written before that field existed
 are numbered by line order on read, which is their append order, so old
@@ -2923,8 +2926,11 @@ as a tool result, so it can retry within the same turn.
 
 The refusal reads `Patch would modify protected task path: <path>` (or names
 several). The task has a user-established exclusion covering that file, from a
-`do not touch` / `do not modify` prompt, the **Protected paths** panel, or
-`damaian protect-paths`. A protected directory covers everything under it. The
+`do not touch` / `do not modify` prompt, `damaian protect-paths`, a parent task
+it was handed from as a worker, or, in a session from before spec 108, the
+**Protected paths** panel. The main window no longer has that panel: protection
+is unchanged, the refusal is where it shows, and a worker's board row and header
+list the paths it was handed. A protected directory covers everything under it. The
 engine refuses the whole proposal before it is stored, so no review card
 appears, and apply refuses a selected protected file before writing,
 checkpointing or marking a decision.
@@ -2936,16 +2942,16 @@ jq -r 'select(.eventType=="task_protected_paths") |
   "\(.seq) \(.payload.action) \(.payload.source) \([.payload.paths[].path] | join(", "))"' "$SESSION_FILE"
 ```
 
-`source` is `prompt` for the user's message, `explicit_control` for the panel or
-CLI, and `inherited_worker_handoff` for the first task of a worker started from
+`source` is `prompt` for the user's message, `explicit_control` for the CLI (or
+the former panel), and `inherited_worker_handoff` for the first task of a worker started from
 a protected parent task. A verification or repair task does not get its own add
 event: it inherits through `plan_resumed` or the
 `verification_due`/`verification_started` pair, so only the origin task's add
 appears here.
 
 To continue, ask for an in-scope alternative, or remove the protection with
-**Stop protecting** or
-`damaian protect-paths <repo> <session> <task> remove <path>`. Removing is a
+`damaian protect-paths <repo> <session> <task> remove <path>` (`list` shows what
+is protected; the session and task ids are in the session log). Removing is a
 new event and keeps the earlier add in the log. A file you rejected in review is
 *not* a protection; if a path was never named in a prompt or the explicit
 control, the refusal is a defect. Every refusal is audited as
@@ -2953,6 +2959,56 @@ control, the refusal is a defect. Every refusal is audited as
 became protected is failed with that reason instead of being offered again.
 This fence covers patch and edit-tool targets only: a shell command still needs
 its ordinary approval under the command policy.
+
+### A session is missing from the sidebar
+
+It is most likely archived. Expand its project in the sidebar, then open the
+project's ⋮ menu: **Archived (N)** lists its archived sessions and workers
+(the entry is not shown until the project has been expanded once, or when
+nothing is archived). Select one to open it; **Unarchive** in the
+conversation header's ⋮ menu returns it to the list. Search also finds an
+archived session and labels its hits **Archived**. A
+worker that is archived is also hidden from the Workers board until you select
+**Show archived (N)** there. Archiving never deletes the session log, a
+worktree or a branch.
+
+The session log records each change, and the latest one decides:
+
+```bash
+jq -r 'select(.eventType=="session_archived" or .eventType=="session_unarchived") |
+  "\(.seq) \(.eventType)"' "$SESSION_FILE"
+```
+
+A session with neither event, including every session from before spec 108, is
+not archived. Archiving a worker that is still running is refused with "Stop
+the worker first…"; stop it, then archive. If the session log itself is gone,
+the session was deleted, not archived.
+
+### Declining a plan with changes
+
+**Decline** on a plan review card asks how the plan should change; **Send**
+resumes the paused turn with your text, and the assistant is asked to propose a
+revised plan, which comes back as a new review card. Nothing is applied in
+between, and the plan's open steps are not skipped. **Decline without changes**
+is the old decline: the steps are marked skipped. A worker's own plan card
+declines at once, without the question.
+
+The audit log records the decision as `plan_review_decision` with `decision`
+`changes_requested` and `changesLength`, the length of your text, never the
+text itself (`approved` and `declined` are the other two; a worker that ran a
+plan handed to it already approved records `approved_before_handoff`). The
+session log records `plan_changes_requested`, which lets the assistant replace
+the plan:
+
+```bash
+jq -r 'select(.eventType=="plan_review_decision") |
+  "\(.timestampMs) \(.decision) \(.changesLength // "")"' "$DATA_DIR/audit/events.jsonl"
+```
+
+If the turn ended without a new review card, the assistant answered without
+proposing a revised plan; the steps are still open, so ask again in the
+conversation. If **Send** fails, the card comes back with your text kept and
+can be answered again.
 
 ### A command that used to run unasked now asks
 

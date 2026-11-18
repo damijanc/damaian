@@ -1,6 +1,6 @@
 # Feature Spec: Interface Cleanup and Session Archive
 
-Status: In progress (started 2026-11-10; Tasks 1, 3, 4, 5, 6, 8 and 9 done; Tasks 1–9 in [tasks.md](tasks.md))
+Status: Done 2026-11-18 (started 2026-11-10; Tasks 1–9 in [tasks.md](tasks.md))
 Order: 108 of 108
 Plan: none. Written from the owner's 2026-11-09/10 dogfooding of spec 33; the
 decisions and code survey are in [context.md](context.md).
@@ -45,6 +45,11 @@ harder to use without adding anything he needed:
    listed under a collapsed **Archived** entry from which it can be opened or
    **Unarchived** (context D3). Archiving keeps the history, worktree and
    branch; **Delete** stays the destructive action.
+   *(2026-11-13, after Task 4: the **Archived (N)** entry moved from the
+   bottom of the project's session list into the project's own ⋮ menu, shown
+   once the project has been expanded and has archived sessions. Its rows open
+   the session or worker; **Unarchive** is on the open session's header ⋮ menu
+   and on the Workers board row's ⋯ menu, not in that list.)*
 4. **The Git status card names each path once**, with its status.
 5. **A task records the model each call used**, and shows every model a task
    used where it shows the model.
