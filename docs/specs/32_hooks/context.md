@@ -186,8 +186,10 @@ per-event mapping: `deny` > `request_approval` > `warn` > `allow`.
   stderr is different. It is diagnostic, so it is kept to its last 8 KiB,
   redacted, and never a failure.
 - **Failure kinds:** `spawn_failed`, `non_zero_exit`, `timeout`, `malformed`,
-  `version_mismatch`, `output_too_large`, `changed_since_review` (§7). Every
-  one is audited by name.
+  `version_mismatch`, `output_too_large`, `changed_since_review` (§7), and
+  `cancelled` (spec 109 D8: the user stopped the turn while the hook ran; its
+  process group is ended like a timed-out hook's). Every one is audited by
+  name.
 
 `findings` entries are `{ severity, summary, details?, path?, line? }`,
 mapped onto `FindingDraft` with source `FindingSource::Hook`. A path is kept

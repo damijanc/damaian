@@ -3121,8 +3121,9 @@ jq -c 'select(.eventType=="hook_invoked") | {event: .event, hookId: .hookId, ver
 ```
 
 The failure kinds are `spawn_failed`, `non_zero_exit`, `timeout`,
-`malformed`, `version_mismatch`, `output_too_large` and
-`changed_since_review`. A denial or a request also carries its `reason`; a
+`malformed`, `version_mismatch`, `output_too_large`, `changed_since_review`
+and `cancelled` (you pressed Stop while the hook ran; it was ended with its
+process group). A denial or a request also carries its `reason`; a
 successful `deny` response is `outcome: ok`. Three related records explain the
 rest:
 

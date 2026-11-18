@@ -314,6 +314,13 @@
               </div>
             </section>
           </div>
+          <!-- Spec 109 D7: what this window is running for the session, from
+               the same state as the turn's status line and a card's running
+               row, with the one Stop every running action has (D8). -->
+          <div id="composer-running" class="composer-decision composer-running" role="status" hidden>
+            <span id="composer-running-label" class="composer-decision-label"></span>
+            <button id="composer-running-stop-btn" class="btn-sm" type="button">Stop</button>
+          </div>
           <div id="composer-decision" class="composer-decision" role="status" hidden>
             <span id="composer-decision-label" class="composer-decision-label"></span>
             <button id="composer-decision-btn" class="btn-sm" type="button">Show</button>

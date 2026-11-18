@@ -6512,9 +6512,13 @@ function restoreWaitingIndicator(body, label) {
 }
 
 // A live "something is happening" row inside an assistant bubble: the current
-// activity with its own clock, the turn's total beside it, and a Stop button
-// when `onStop` is given. A path with no working cancel passes none, and gets
-// no button that would do nothing.
+// activity with its own clock, the turn's total beside it, and a Stop button.
+// Every turn has one (spec 109 D8): `onStop` is the main composer turn's own
+// abort; any other stream stops through the shell's session-work cancel,
+// which every streamed turn's lane carries. Its state is a running action
+// (D7), so the composer line and a card's running row say the same thing.
+// `false` is only the legacy one-shot patch request, which has no lane to
+// cancel (see `proposePatchFromChat`).
 //
 // Owns its DOM, its interval, and its teardown so nothing outside has to track
 // them. `finish` is idempotent, which lets error paths call it blindly.
@@ -6556,14 +6560,21 @@ function startTurnIndicator(target, onStop = null) {
   total.setAttribute("aria-hidden", "true");
 
   row.append(dot, label, elapsed, total, output);
+  const running = beginRunningAction({ stop: onStop || null });
   let stop = null;
-  if (onStop) {
+  if (onStop !== false) {
     stop = document.createElement("button");
     stop.type = "button";
     stop.className = "turn-indicator-stop";
     stop.textContent = "Stop";
-    stop.addEventListener("click", () => onStop());
+    stop.addEventListener("click", () => {
+      stop.disabled = true;
+      label.textContent = "Stopping";
+      running.stop();
+    });
     row.append(stop);
+  } else {
+    running.unstoppable = true;
   }
   target.body.after(row);
 
@@ -6586,6 +6597,7 @@ function startTurnIndicator(target, onStop = null) {
   // lines belong to the activity already running and do not restart it.
   const beginActivity = () => {
     stepStartedAt = Date.now();
+    running.stepStartedAt = stepStartedAt;
     tick();
   };
 
@@ -6636,19 +6648,27 @@ function startTurnIndicator(target, onStop = null) {
         payload.phase !== "context" && payload.notesChars > 0
           ? ` · notes ${formatCharCount(payload.notesChars)}`
           : "";
+      if (running.stopRequested) return;
       label.textContent = `${text}${rounds}${reads}${notes}`;
+      running.setLabel(text);
     },
     streaming() {
       if (done || streaming) return;
       streaming = true;
-      label.textContent = "Streaming";
       beginActivity();
+      if (running.stopRequested) return;
+      label.textContent = "Streaming";
+      running.setLabel("Streaming");
     },
     // "stopped" | "pending" | "complete" | "incomplete" | "failed"
-    finish(state) {
+    finish(requested) {
       if (done) return;
       done = true;
       clearInterval(timer);
+      running.end();
+      // A turn the user stopped ends however the route reports it; the line
+      // says it was stopped (spec 109 D8). A pause still says what it waits on.
+      const state = running.stopRequested && requested !== "pending" ? "stopped" : requested;
       if (state === "stopped") {
         row.dataset.state = "stopped";
         label.textContent = "Stopped by you";
@@ -13166,12 +13186,23 @@ function createCheckBatchCard(
       .map(({ check }) => check.proposalId)
       .join("\n");
     card.classList.add("submitted");
+    // Spec 109 D7: while the checks run, the card shows the turn's running
+    // state with Cancel where its buttons were. The row follows the running
+    // action the stream's status line starts, and leaves when it ends.
+    const showRunning = () => {
+      const action = runningActionFor(currentSessionId);
+      if (!action || card.querySelector(".running-row")) return;
+      runningListeners.delete(showRunning);
+      actions.hidden = true;
+      card.append(createRunningRow(action));
+    };
     try {
       if (onSubmitted) onSubmitted();
       if (decide) {
         await decide(decisions);
         return;
       }
+      if (decisions.some((decision) => decision.approved)) runningListeners.add(showRunning);
       await runVerificationStream(
         (handlers) =>
           streamResumeChecksRequest(
@@ -13188,8 +13219,11 @@ function createCheckBatchCard(
     } catch (error) {
       submit.disabled = false;
       runAll.disabled = false;
+      actions.hidden = false;
       card.classList.remove("submitted");
       toast(error.message);
+    } finally {
+      runningListeners.delete(showRunning);
     }
   }
 
@@ -13804,7 +13838,10 @@ function focusPendingDecision() {
 function syncComposerDecision() {
   const current = pendingDecision;
   const inWorker = Boolean(workerView) || isWorkerSession(currentSessionId);
-  const visible = Boolean(current) && !chatSubmitting && !inWorker;
+  // Observation 89: once answered, the work it started is what the composer
+  // shows (`syncComposerRunning`), not the decision any more.
+  const running = Boolean(runningActionFor(currentSessionId));
+  const visible = Boolean(current) && !chatSubmitting && !inWorker && !running;
   const line = $("composer-decision");
   line.hidden = !visible;
   if (visible) {
@@ -13907,8 +13944,6 @@ function createFallbackOffer(proposal, proposalRepo) {
       appendChatMessage("system", `Switched to ${fallback} for this turn${after}.`);
     }
     const assistantMessage = approved ? appendChatMessage("assistant", "") : null;
-    // No Stop: this stream is sent without an abort signal, so nothing on this
-    // path can cancel it.
     const indicator = assistantMessage ? startTurnIndicator(assistantMessage) : null;
     let assistantText = "";
     let streamError = null;
@@ -14559,8 +14594,6 @@ function createPlanReview(
     }
 
     const assistantMessage = appendChatMessage("assistant", "");
-    // No Stop: this stream is sent without an abort signal, so nothing on this
-    // path can cancel it.
     const indicator = startTurnIndicator(assistantMessage);
     let assistantText = "";
     let streamError = null;
@@ -15382,17 +15415,48 @@ function createCommandApprovalPreview(
     // endpoints and its output lands in this card instead of in an answer
     // from a model that was never asked anything.
     if (detached) {
-      const payload = await api(
-        approved ? "/api/run-command" : "/api/reject-command",
-        form({
-          repo: proposalRepo,
-          proposal_id: proposal.proposalId,
-          always: always ? "true" : "false",
-        }),
-      );
-      output.textContent = approved
-        ? `exit ${payload.exitCode}\n${payload.stdout || ""}${payload.stderr || ""}`.trimEnd()
-        : "Command rejected. The turn that proposed it ended with the crash, so nothing continues.";
+      // Spec 109 D7/D8 (observation 103): this plain request can run the
+      // command for minutes, or — when its turn is still resumable — drive
+      // the rest of that turn. It names the session so the shell gives it the
+      // session's lane, whose cancel token is what Stop fires, and the card
+      // and composer show it running from the lane's label, polled.
+      const running = beginRunningAction({
+        label: approved ? "Running a command" : "Rejecting the command",
+      });
+      running.followsServerLabel = true;
+      output.hidden = true;
+      output.after(createRunningRow(running, { stopLabel: "Stop" }));
+      let payload;
+      try {
+        payload = await api(
+          approved ? "/api/run-command" : "/api/reject-command",
+          form({
+            repo: proposalRepo,
+            proposal_id: proposal.proposalId,
+            session_id: currentSessionId || "",
+            always: always ? "true" : "false",
+          }),
+        );
+      } finally {
+        running.end();
+        output.hidden = false;
+      }
+      // A resumable turn answers with the turn's result rather than the
+      // command's exit; its messages are in the session, so reload it.
+      const resumedTurn = typeof payload.response === "string";
+      if (resumedTurn) {
+        output.textContent = payload.cancelled
+          ? "Stopped by you. The turn's report is in the conversation."
+          : "The resumed turn finished. Its answer is in the conversation.";
+        void loadSession(currentSessionId);
+      } else if (approved && payload.termination === "cancelled") {
+        output.textContent =
+          "Stopped by you. The command was ended part-way, so its outcome is unknown; it was not retried.";
+      } else {
+        output.textContent = approved
+          ? `exit ${payload.exitCode}\n${payload.stdout || ""}${payload.stderr || ""}`.trimEnd()
+          : "Command rejected. The turn that proposed it ended with the crash, so nothing continues.";
+      }
       if (onResolved) await onResolved(approved);
       await loadSessions(currentSessionId, false);
       await refreshFindings();
@@ -15406,11 +15470,10 @@ function createCommandApprovalPreview(
     }
 
     const assistantMessage = appendChatMessage("assistant", "");
-    // No Stop: this stream is sent without an abort signal, so nothing on this
-    // path can cancel it.
     const indicator = startTurnIndicator(assistantMessage);
     let assistantText = "";
     let streamError = null;
+    let stoppedTurn = false;
     try {
       await streamResumeCommandRequest(
         {
@@ -15452,6 +15515,7 @@ function createCommandApprovalPreview(
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
+            stoppedTurn = payload.cancelled === true;
             indicator.finish(payload.turnPresentation?.indicatorState || "pending");
             markMessageTurnStop(assistantMessage, payload);
           },
@@ -15470,7 +15534,10 @@ function createCommandApprovalPreview(
       renderChatMessageError(assistantMessage, streamError);
       throw streamError;
     }
-    if (!approved) {
+    if (stoppedTurn) {
+      // Spec 109 D8: the turn's report above names what was stopped.
+      output.textContent = "Stopped by you — see the report above.";
+    } else if (!approved) {
       output.textContent = isBrowserDiagnostic
         ? "Diagnostic rejected — see the assistant's answer above."
         : "Command rejected — see the assistant's answer above.";
@@ -15488,6 +15555,7 @@ function createCommandApprovalPreview(
     await loadSessions(currentSessionId, false);
     await refreshFindings();
     void refreshRepoBar();
+    return stoppedTurn;
   }
 
   // Re-enable after a failure so the user can retry or pick a different
@@ -15514,8 +15582,8 @@ function createCommandApprovalPreview(
 
   runButton.addEventListener("click", async () => {
     try {
-      await resolveCommandProposal(true);
-      toast(decide ? "Command approved" : "Command completed");
+      const stopped = await resolveCommandProposal(true);
+      toast(decide ? "Command approved" : stopped ? "Stopped" : "Command completed");
     } catch (error) {
       restoreActions();
       output.textContent = error.message;
@@ -15791,6 +15859,14 @@ async function pollWorkingSessions() {
     return;
   }
   workingSessionsById = new Map((payload.sessions || []).map((row) => [row.sessionId, row]));
+  // A plain request's running action has no stream to say what it is doing;
+  // the shell's lane label does (spec 109 D7).
+  for (const action of runningActions) {
+    const row = workingSessionsById.get(action.sessionId);
+    if (action.followsServerLabel && row?.label && row.label !== action.label) {
+      action.setLabel(row.label, true);
+    }
+  }
   syncInvisibleWork();
 }
 
@@ -15804,7 +15880,8 @@ function syncInvisibleWork() {
   const line = $("composer-invisible-work");
   if (!line) return;
   const info = currentSessionId && !workerView ? workingSessionsById.get(currentSessionId) : null;
-  const visible = Boolean(info) && !runningTurnStream(currentSessionId);
+  const visible =
+    Boolean(info) && !runningTurnStream(currentSessionId) && !runningActionFor(currentSessionId);
   line.hidden = !visible;
   const stopButton = $("composer-invisible-work-stop-btn");
   if (visible) {
@@ -16439,10 +16516,11 @@ function looksLikeEditRequest(prompt) {
 
 async function proposePatchFromChat(prompt, assistantMessage) {
   setChatMessagePlaceholder(assistantMessage, "Generating a patch preview...");
-  // No Stop: this is a plain request with no abort signal, so `currentTurn` is
-  // never set and nothing could cancel it. No phase events either, so the
-  // label stays put while the clock runs.
-  const indicator = startTurnIndicator(assistantMessage);
+  // No Stop: this is a plain request with no abort signal and no lane to
+  // cancel (patch generation is not stoppable, spec 08 §8). With native tools
+  // no turn takes this path (spec 72). No phase events either, so the label
+  // stays put while the clock runs.
+  const indicator = startTurnIndicator(assistantMessage, false);
   indicator.phase({ phase: "tool", label: "Generating patch" });
   const patchRepo = requireRepo();
   let payload;
@@ -16496,6 +16574,141 @@ function stopCurrentTurn() {
   if (!currentTurn) return;
   currentTurn.stopped = true;
   currentTurn.controller.abort();
+}
+
+// Spec 109 D7: one running state for every action this window runs — a turn
+// stream (model call, command, check, baseline, hook, MCP call, browser
+// diagnostic) or a plain request that runs one (a recovered command). The
+// turn's status line, a card's running row and the composer line all read it,
+// so they cannot disagree, and each offers the same Stop (D8).
+//
+// `stop` defaults to cancelling the session's work on the shell (spec 110
+// D3): the turn ends at once with its own report of what was stopped, which
+// the still-open stream then delivers, so nothing is lost by stopping.
+const runningActions = new Set();
+const runningListeners = new Set();
+let runningTicker = null;
+
+function beginRunningAction({ label = "Starting", stop = null } = {}) {
+  // A first turn learns its session from its `session` event; until then the
+  // action follows the window's current session.
+  const sessionAtStart = currentSessionId;
+  const now = Date.now();
+  const action = {
+    get sessionId() {
+      return sessionAtStart || currentSessionId || "";
+    },
+    label,
+    startedAt: now,
+    stepStartedAt: now,
+    stopRequested: false,
+    stop() {
+      if (action.stopRequested) return;
+      action.stopRequested = true;
+      syncRunningState();
+      if (stop) stop();
+      else void stopSessionWork(action.sessionId);
+    },
+    setLabel(text, newStep = false) {
+      action.label = text;
+      if (newStep) action.stepStartedAt = Date.now();
+      syncRunningState();
+    },
+    end() {
+      runningActions.delete(action);
+      syncRunningState();
+    },
+  };
+  runningActions.add(action);
+  if (!runningTicker) runningTicker = setInterval(syncRunningState, 1000);
+  syncRunningState();
+  return action;
+}
+
+// The newest action running for `sessionId`, or null.
+function runningActionFor(sessionId) {
+  let found = null;
+  for (const action of runningActions) {
+    if (sessionId && action.sessionId === sessionId) found = action;
+  }
+  return found;
+}
+
+// "Running cargo test (crates/x) · 1m 12s", or "Stopping …" once asked.
+function runningActionText(action) {
+  if (action.stopRequested) return `Stopping: ${action.label}`;
+  return `${action.label} · ${formatClock(Date.now() - action.stepStartedAt)}`;
+}
+
+async function stopSessionWork(sessionId) {
+  if (!sessionId) return;
+  try {
+    await api("/api/session-work-cancel", form({ session_id: sessionId }));
+  } catch (error) {
+    // Already finished between the click and the request: nothing to stop.
+    if (error.message !== "This session is not working.") toast(error.message);
+  }
+}
+
+function syncRunningState() {
+  if (!runningActions.size && runningTicker) {
+    clearInterval(runningTicker);
+    runningTicker = null;
+  }
+  for (const listener of runningListeners) listener();
+  syncComposerRunning();
+}
+
+// The composer line (observation 89): while this session runs something, it
+// says what, not the decision that started it.
+function syncComposerRunning() {
+  const line = $("composer-running");
+  if (!line) return;
+  const action = workerView ? null : runningActionFor(currentSessionId);
+  // The main composer turn has its own Stop in the send button.
+  const visible = Boolean(action) && !chatSubmitting;
+  const wasVisible = !line.hidden;
+  line.hidden = !visible;
+  if (visible) {
+    $("composer-running-label").textContent = runningActionText(action);
+    const stop = $("composer-running-stop-btn");
+    stop.hidden = Boolean(action.unstoppable);
+    stop.disabled = action.stopRequested;
+  }
+  if (visible !== wasVisible) {
+    syncComposerDecision();
+    syncInvisibleWork();
+  }
+}
+
+// A card's running row (spec 109 D7): the action's state in place of the
+// card's buttons, with Cancel. Detaches itself when the action ends.
+function createRunningRow(action, { stopLabel = "Cancel" } = {}) {
+  const row = document.createElement("div");
+  row.className = "running-row";
+  const dot = document.createElement("span");
+  dot.className = "turn-indicator-dot";
+  dot.setAttribute("aria-hidden", "true");
+  const label = document.createElement("span");
+  label.className = "running-row-label";
+  const stop = document.createElement("button");
+  stop.type = "button";
+  stop.className = "btn-sm running-row-stop";
+  stop.textContent = stopLabel;
+  stop.addEventListener("click", () => action.stop());
+  row.append(dot, label, stop);
+  const render = () => {
+    if (!runningActions.has(action)) {
+      runningListeners.delete(render);
+      row.remove();
+      return;
+    }
+    label.textContent = runningActionText(action);
+    stop.disabled = action.stopRequested;
+  };
+  runningListeners.add(render);
+  render();
+  return row;
 }
 
 function setComposerBusy(busy) {
@@ -16782,6 +16995,10 @@ async function askAgainFromExhausted(sessionId, taskId) {
 }
 
 $("composer-decision-btn").addEventListener("click", focusPendingDecision);
+
+$("composer-running-stop-btn").addEventListener("click", () => {
+  runningActionFor(currentSessionId)?.stop();
+});
 
 $("composer-invisible-work-stop-btn").addEventListener("click", async () => {
   const button = $("composer-invisible-work-stop-btn");

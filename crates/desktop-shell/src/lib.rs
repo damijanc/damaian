@@ -3336,9 +3336,12 @@ fn handle_run_command(stream: &mut TcpStream, request: &Request) -> Result<(), S
         )
     } else {
         let record = {
-            // A command run from this endpoint has no turn behind it,
-            // so it has no stop to honour and no progress to stream.
+            // A command run from this endpoint has no turn behind it and
+            // no progress to stream, but it can still run for minutes, so
+            // it is stoppable (spec 109 D8): the window names its session,
+            // which holds the lane this token is set on.
             let cancel = CancelToken::new();
+            lanes::with_current(|lane| lane.set_cancel(&cancel));
             let mut on_output = |_line: &str| {};
             engine.validation_orchestrator.run_proposal(
                 &proposal_id,
@@ -3356,10 +3359,13 @@ fn handle_run_command(stream: &mut TcpStream, request: &Request) -> Result<(), S
             200,
             "application/json",
             &format!(
-                "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"stdout\":\"{}\",\"stderr\":\"{}\",\"allowlistPath\":{}}}",
+                "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"termination\":\"{}\",\"stdout\":\"{}\",\"stderr\":\"{}\",\"allowlistPath\":{}}}",
                 escape_json(&record.proposal_id),
                 escape_json(&record.execution.id),
                 record.execution.exit_code.unwrap_or(-1),
+                // Spec 109 D8: `-1` is any run without an exit code; the card
+                // tells a stopped run from a timed-out one by this.
+                record.execution.termination.as_str(),
                 escape_json(&record.execution.stdout),
                 escape_json(&record.execution.stderr),
                 json_optional_string(allowlist_path.as_deref())
@@ -4790,6 +4796,12 @@ fn chat_model_adapter(
 /// Tokens aren't streamed back here (these endpoints are plain JSON POSTs,
 /// not SSE), so they're discarded; the final answer still comes back in the
 /// response body.
+///
+/// It can drive the rest of a turn (observation 103: a crash-recovered card
+/// whose turn is still resumable), so it is stoppable like a streamed turn
+/// (spec 109 D8): its token is the session lane's, which the composer's Stop
+/// fires through `/api/session-work-cancel`, and each phase becomes the
+/// lane's label, which is what that line shows.
 fn resume_chat_command(
     engine: &mut WorkspaceEngine,
     proposal_id: &str,
@@ -4809,27 +4821,36 @@ fn resume_chat_command(
         &engine.config.model_name,
         transport,
     );
-    let never_cancelled = CancelToken::new();
+    let cancel = CancelToken::new();
+    lanes::with_current(|lane| lane.set_cancel(&cancel));
     let mut on_token = |_token: &str| {};
-    let mut on_progress = |_progress: TurnProgress| {};
+    let mut on_progress = |progress: TurnProgress| {
+        if let TurnProgress::Phase(phase) = progress
+            && !phase.label.trim().is_empty()
+        {
+            lanes::with_current(|lane| lane.set_label(&phase.label));
+        }
+    };
     let notes = lanes::turn_notes();
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
-        cancel: &never_cancelled,
+        cancel: &cancel,
         steering: notes.as_deref().map(lanes::NoteQueue::steering),
     };
-    engine
-        .chat_orchestrator
-        .resume_after_command_decision_with_options(
-            proposal_id,
-            approved,
-            "desktop_user",
-            &mut adapter,
-            &mut sink,
-            decision_options,
-        )
-        .map_err(|error| error.to_string())
+    cancel.scope(|| {
+        engine
+            .chat_orchestrator
+            .resume_after_command_decision_with_options(
+                proposal_id,
+                approved,
+                "desktop_user",
+                &mut adapter,
+                &mut sink,
+                decision_options,
+            )
+            .map_err(|error| error.to_string())
+    })
 }
 
 fn resume_decision_options(form: &HashMap<String, String>) -> ResumeDecisionOptions {
@@ -6758,7 +6779,10 @@ where
     }
     let worker_notes = std::sync::Arc::clone(&notes);
     let worker = spawn_with_shell_stack("damaian-turn", move || {
-        let outcome = lanes::with_turn_notes(&worker_notes, || turn(&worker_cancel, &sender));
+        // Spec 109 D8: hooks, MCP calls and browser diagnostics reach the
+        // turn's Stop through the thread's scoped token.
+        let outcome = worker_cancel
+            .scope(|| lanes::with_turn_notes(&worker_notes, || turn(&worker_cancel, &sender)));
         let left = worker_notes.close();
         let returned = settle_left_notes(&outcome, left, data_dir.as_deref());
         if !returned.is_empty() {
@@ -9976,6 +10000,88 @@ mod tests {
                 r#"api("/api/session-work-cancel", form({ session_id: currentSessionId }));"#
             ),
             "the Stop button must cancel the session the banner names"
+        );
+    }
+
+    /// Spec 109 D7/D8: every turn's status line has Stop, the composer line
+    /// and a check card's running row read the same running state, and the
+    /// composer stops claiming a decision once it has been answered
+    /// (observation 89).
+    #[test]
+    fn app_js_gives_every_running_action_one_state_and_a_stop() {
+        let indicator = app_js_function("startTurnIndicator");
+        assert!(
+            indicator.contains("beginRunningAction({ stop: onStop || null })"),
+            "a turn's line is a running action: {indicator}"
+        );
+        assert!(
+            indicator.contains("if (onStop !== false)"),
+            "only an explicit `false` leaves a line without Stop: {indicator}"
+        );
+        // The one turn line without Stop is the legacy one-shot patch request.
+        assert_eq!(
+            super::APP_JS
+                .matches("startTurnIndicator(assistantMessage, false)")
+                .count(),
+            1
+        );
+        let begin = app_js_function("beginRunningAction");
+        assert!(
+            begin.contains("void stopSessionWork(action.sessionId)"),
+            "a stream's default Stop is the shell's session-work cancel: {begin}"
+        );
+        let stop = app_js_function("stopSessionWork");
+        assert!(stop.contains(r#"api("/api/session-work-cancel""#), "{stop}");
+
+        let composer = app_js_function("syncComposerRunning");
+        assert!(
+            composer.contains("runningActionFor(currentSessionId)"),
+            "{composer}"
+        );
+        assert!(super::INDEX_HTML.contains(r#"id="composer-running""#));
+        let decision = app_js_function("syncComposerDecision");
+        assert!(
+            decision.contains("&& !running"),
+            "an answered decision gives way to what it started: {decision}"
+        );
+
+        let card = app_js_function("createCheckBatchCard");
+        assert!(
+            card.contains("card.append(createRunningRow(action));"),
+            "checks that run show Cancel in place of the card's buttons: {card}"
+        );
+        let invisible = app_js_function("syncInvisibleWork");
+        assert!(
+            invisible.contains("!runningActionFor(currentSessionId)"),
+            "{invisible}"
+        );
+    }
+
+    /// Observation 103: a recovered command card names its session, so the
+    /// shell gives the request the session's lane (and its cancel token), and
+    /// the card shows it running with Stop, following the lane's label.
+    #[test]
+    fn app_js_makes_a_recovered_command_visible_and_stoppable() {
+        let card = app_js_function("createCommandApprovalPreview");
+        assert!(
+            card.contains(r#"session_id: currentSessionId || "","#),
+            "{card}"
+        );
+        assert!(
+            card.contains("running.followsServerLabel = true;"),
+            "{card}"
+        );
+        assert!(
+            card.contains(r#"createRunningRow(running, { stopLabel: "Stop" })"#),
+            "{card}"
+        );
+        let poll = app_js_function("pollWorkingSessions");
+        assert!(poll.contains("action.followsServerLabel"), "{poll}");
+        // `exitCode` is -1 for a timed-out run too; only the termination the
+        // route returns says the user's Stop ended it.
+        assert!(
+            card.contains(r#"payload.termination === "cancelled""#),
+            "{card}"
         );
     }
 

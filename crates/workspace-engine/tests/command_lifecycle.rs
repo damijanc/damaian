@@ -162,6 +162,60 @@ fn a_stop_mid_command_takes_effect_before_it_would_have_exited() {
     assert_eq!(execution.exit_code, None);
 }
 
+/// Spec 109 D8: Stop ends the command's whole process group — a background
+/// child the shell started dies with it — and the process registry is empty
+/// afterwards, so nothing is left running.
+///
+/// ```sh
+/// cargo test -p workspace-engine --test command_lifecycle -- --ignored --exact \
+///   a_stop_ends_the_commands_process_group_and_leaves_no_registered_process
+/// ```
+#[test]
+#[ignore]
+fn a_stop_ends_the_commands_process_group_and_leaves_no_registered_process() {
+    let (runner, data_dir) = runner_with_timeout("cancel-group", 600);
+    let pids = data_dir.join("pids");
+    let cancel = CancelToken::new();
+    let stopper = {
+        let cancel = cancel.clone();
+        let pids = pids.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !fs::read_to_string(&pids).is_ok_and(|text| !text.trim().is_empty())
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            cancel.cancel();
+        })
+    };
+    let mut on_output = |_line: &str| {};
+    let execution = runner
+        .run(
+            &format!("sleep 30 & echo $! > '{}'; wait", pids.to_string_lossy()),
+            &data_dir,
+            "group cancel test",
+            options(&cancel, &mut on_output),
+        )
+        .unwrap();
+    stopper.join().unwrap();
+
+    assert_eq!(execution.termination, CommandTermination::Cancelled);
+    assert_eq!(execution.exit_code, None);
+    let child: i32 = fs::read_to_string(&pids).unwrap().trim().parse().unwrap();
+    let settle = Instant::now() + Duration::from_secs(1);
+    // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
+    while unsafe { libc::kill(child, 0) == 0 } && Instant::now() < settle {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        unsafe { libc::kill(child, 0) != 0 },
+        "the command's background child outlived the stop"
+    );
+    let registry = workspace_engine::ProcessRegistry::open(&data_dir).unwrap();
+    assert!(registry.entries().unwrap().is_empty());
+}
+
 /// ```sh
 /// cargo test -p workspace-engine --test command_lifecycle -- --ignored --exact \
 ///   output_is_streamed_before_the_command_exits

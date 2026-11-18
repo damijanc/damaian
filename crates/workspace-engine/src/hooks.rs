@@ -219,6 +219,9 @@ pub enum HookFailureKind {
     OutputTooLarge,
     /// A repository hook whose definition no longer matches the reviewed one.
     ChangedSinceReview,
+    /// The user stopped the turn while the hook ran (spec 109 D8): its
+    /// process group was ended, so what it did is unknown.
+    Cancelled,
 }
 
 impl HookFailureKind {
@@ -231,6 +234,7 @@ impl HookFailureKind {
             HookFailureKind::VersionMismatch => "version_mismatch",
             HookFailureKind::OutputTooLarge => "output_too_large",
             HookFailureKind::ChangedSinceReview => "changed_since_review",
+            HookFailureKind::Cancelled => "cancelled",
         }
     }
 }
@@ -601,6 +605,8 @@ pub fn run_hook(
     );
 
     let deadline = started + timeout;
+    // The turn's Stop (spec 109 D8) ends a hook as it ends a command.
+    let cancel = CancelToken::current();
     let mut status: Option<ExitStatus> = None;
     let mut failure = loop {
         if lock(&stdout).len() > MAX_HOOK_STDOUT_BYTES {
@@ -615,6 +621,9 @@ pub fn run_hook(
         // pipes must have closed too.
         if status.is_some() && stdout_reader.is_finished() && stderr_reader.is_finished() {
             break None;
+        }
+        if cancel.is_cancelled() {
+            break Some(HookFailureKind::Cancelled);
         }
         if Instant::now() >= deadline {
             break Some(HookFailureKind::Timeout);
@@ -1783,7 +1792,9 @@ impl HookDispatcher {
             }
         };
 
-        let cancel = CancelToken::new();
+        // The turn's Stop ends a hook's requested command too (spec 109 D8);
+        // a stopped one has no exit code, so its marker finishes `unknown`.
+        let cancel = CancelToken::current();
         match self.validation.run_proposal(
             &proposal.id,
             false,

@@ -3390,7 +3390,16 @@ impl SessionStore {
 
     /// Records `action_finished`, consuming the marker.
     pub fn finish_action(&self, marker: ActionMarker, outcome: &str) -> Result<()> {
-        self.write_action_finished(&marker, outcome, None)
+        self.write_action_finished(&marker, outcome, None, false)
+    }
+
+    /// Finishes an action the user's Stop ended part-way (spec 109 D8): its
+    /// outcome is `unknown`, and `stoppedByUser` says the stop is why. Only
+    /// the code that saw its own action cut short calls this, so a command
+    /// that timed out by itself (also `unknown`) is never mistaken for one
+    /// the user stopped.
+    pub fn finish_action_stopped_by_user(&self, marker: ActionMarker) -> Result<()> {
+        self.write_action_finished(&marker, "unknown", None, true)
     }
 
     /// Finishes an action from its durable record rather than an in-memory
@@ -3446,7 +3455,7 @@ impl SessionStore {
             Some(_) => "failed",
             None => "unknown",
         };
-        self.write_action_finished(&marker, outcome, exit_code)
+        self.write_action_finished(&marker, outcome, exit_code, false)
     }
 
     fn write_action_finished(
@@ -3454,11 +3463,15 @@ impl SessionStore {
         marker: &ActionMarker,
         outcome: &str,
         exit_code: Option<i32>,
+        stopped_by_user: bool,
     ) -> Result<()> {
-        let code = match exit_code {
+        let mut code = match exit_code {
             Some(code) => format!(",\"exitCode\":{code}"),
             None => String::new(),
         };
+        if stopped_by_user {
+            code.push_str(",\"stoppedByUser\":true");
+        }
         self.append_session_event(
             &marker.session_id,
             "action_finished",
@@ -4873,6 +4886,40 @@ impl SessionStore {
             .collect())
     }
 
+    /// The action the user's Stop ended part-way, as `(action, reference)`
+    /// from its start: `task_id`'s most recently finished action, when it was
+    /// finished by [`Self::finish_action_stopped_by_user`] (spec 109 D8). A
+    /// stop between actions — during a model call, say — names nothing, even
+    /// when an earlier action of the task ended `unknown` by itself.
+    pub fn action_stopped_by_user(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        let (events, _) = parsed_events(&content);
+        Ok(events
+            .iter()
+            .rev()
+            .filter(|event| event.event_type == "action_finished")
+            .find(|event| event.text("taskId").as_deref() == Some(task_id))
+            .filter(|event| {
+                event
+                    .payload
+                    .get("stoppedByUser")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+            })
+            .map(|event| {
+                (
+                    event.text("action").unwrap_or_default(),
+                    event.text("ref").unwrap_or_default(),
+                )
+            }))
+    }
+
     /// How many lines of the session log did not parse as a complete event.
     ///
     /// A non-zero count means a write was interrupted — the tail is torn — and
@@ -6201,6 +6248,58 @@ mod tests {
         let store = SessionStore::new(temp_data_dir(&format!("findings-{name}")));
         let session = store.create_session("repo_1", "Findings").unwrap();
         (store, session)
+    }
+
+    /// Spec 109 D8: a stopped turn names the action the stop ended, and only
+    /// that one — not an earlier action that ended `unknown` by itself.
+    #[test]
+    fn only_an_action_the_stop_ended_is_named() {
+        let (store, session) = store_and_session("stopped-action");
+        let task = store
+            .create_task(&session.id, "run the tests", "mock", "mock")
+            .unwrap();
+        assert_eq!(
+            store.action_stopped_by_user(&session.id, &task.id).unwrap(),
+            None
+        );
+
+        // A command that timed out by itself: `unknown`, but not a stop.
+        let timed_out = store
+            .start_action(&task, "run_command", "cargo build", true)
+            .unwrap();
+        store.finish_command_action(timed_out, None).unwrap();
+        assert_eq!(
+            store.action_stopped_by_user(&session.id, &task.id).unwrap(),
+            None
+        );
+        // The turn moves on to a model call, and the user stops that.
+        let call = store
+            .start_action(&task, "model_call", "gpt", false)
+            .unwrap();
+        store.finish_action(call, "ok").unwrap();
+        assert_eq!(
+            store.action_stopped_by_user(&session.id, &task.id).unwrap(),
+            None
+        );
+
+        // A command the stop ended part-way is named.
+        let stopped = store
+            .start_action(&task, "run_command", "cargo test", true)
+            .unwrap();
+        store.finish_action_stopped_by_user(stopped).unwrap();
+        assert_eq!(
+            store.action_stopped_by_user(&session.id, &task.id).unwrap(),
+            Some(("run_command".to_string(), "cargo test".to_string()))
+        );
+        let other = store
+            .create_task(&session.id, "something else", "mock", "mock")
+            .unwrap();
+        assert_eq!(
+            store
+                .action_stopped_by_user(&session.id, &other.id)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

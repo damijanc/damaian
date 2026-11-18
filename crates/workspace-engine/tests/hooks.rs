@@ -655,6 +655,7 @@ fn every_failure_kind_has_its_audited_name() {
         (HookFailureKind::VersionMismatch, "version_mismatch"),
         (HookFailureKind::OutputTooLarge, "output_too_large"),
         (HookFailureKind::ChangedSinceReview, "changed_since_review"),
+        (HookFailureKind::Cancelled, "cancelled"),
     ];
     for (kind, name) in kinds {
         assert_eq!(kind.as_str(), name);
@@ -1252,6 +1253,70 @@ fn a_hook_past_its_deadline_is_killed_with_its_group_and_unregistered() {
         !is_alive(pids[1]),
         "the hook's child outlived its group kill"
     );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Spec 109 D8: the turn's Stop ends a running hook as it ends a command —
+/// its whole process group, long before its deadline — and leaves nothing in
+/// the process registry.
+#[test]
+fn a_stopped_turn_ends_its_running_hook_with_its_group_and_unregisters_it() {
+    let (root, data_dir) = runner_fixture("runner-cancelled");
+    let pids = root.join("pids");
+    let hook = sh_hook(
+        "hangs",
+        &script(
+            &root,
+            "hang",
+            &format!(
+                "sleep 30 &\necho $$ $! > '{}'\nwait\n",
+                pids.to_string_lossy()
+            ),
+        ),
+    );
+    let cancel = CancelToken::new();
+    let stopper = {
+        let cancel = cancel.clone();
+        let pids = pids.clone();
+        std::thread::spawn(move || {
+            // Stop once the hook has started its child, as a user would.
+            let started = Instant::now() + Duration::from_secs(20);
+            while !fs::read_to_string(&pids).is_ok_and(|text| text.split_whitespace().count() == 2)
+                && Instant::now() < started
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            cancel.cancel();
+        })
+    };
+    let run = cancel.scope(|| {
+        run(
+            &hook,
+            &runner_envelope(&root, json!({})),
+            &root,
+            &data_dir,
+            Duration::from_secs(60),
+        )
+    });
+    stopper.join().unwrap();
+    assert_eq!(run.failure, Some(HookFailureKind::Cancelled));
+    assert!(
+        run.duration < Duration::from_secs(25),
+        "the stop did not end the hook: {:?}",
+        run.duration
+    );
+    assert_eq!(registry_entries(&data_dir), 0);
+    let written: Vec<i32> = fs::read_to_string(&pids)
+        .unwrap()
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    assert!(!is_alive(written[0]), "the hook was reaped");
+    let settle = Instant::now() + Duration::from_secs(1);
+    while is_alive(written[1]) && Instant::now() < settle {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!is_alive(written[1]), "the hook's child outlived the stop");
     let _ = fs::remove_dir_all(&root);
 }
 

@@ -6217,6 +6217,11 @@ impl ChatOrchestrator {
                                 (text, ActionOutcome::Ok)
                             }
                         }
+                        // Spec 109 D8: stopped part-way, not failed.
+                        Err(ClientError::Cancelled) => (
+                            "The user stopped this MCP call; its outcome is unknown.".to_string(),
+                            ActionOutcome::Cancelled,
+                        ),
                         Err(error) => (
                             format!("MCP tool call failed: {error}"),
                             ActionOutcome::Failed,
@@ -6307,14 +6312,41 @@ impl ChatOrchestrator {
                         pending.turn_notes.chars().count(),
                     )));
                 };
-                let record = self.validation_orchestrator.run_proposal(
+                // Spec 109 D8: the approved run gets its own marker (the one
+                // before the pause finished `awaiting_approval`), so a Stop
+                // part-way — or a crash — leaves its outcome `unknown`, and
+                // the stopped turn can name it.
+                let (marker_action, marker_ref, marker_side_effecting) =
+                    tool_action_marker(&ToolAction::Command(command_request.clone()));
+                let run_marker = self.session_store.start_action(
+                    &pending.task,
+                    marker_action,
+                    &marker_ref,
+                    marker_side_effecting,
+                )?;
+                let record = match self.validation_orchestrator.run_proposal(
                     proposal_id,
                     true,
                     approved_by,
                     Some(&pending.task.id),
                     cancel,
                     &mut on_output,
-                )?;
+                ) {
+                    Ok(record) if record.execution.termination == CommandTermination::Cancelled => {
+                        self.session_store
+                            .finish_action_stopped_by_user(run_marker)?;
+                        record
+                    }
+                    Ok(record) => {
+                        self.session_store
+                            .finish_command_action(run_marker, record.execution.exit_code)?;
+                        record
+                    }
+                    Err(error) => {
+                        self.session_store.finish_action(run_marker, "failed")?;
+                        return Err(error);
+                    }
+                };
                 // Recorded, but no evidence: this path attaches no
                 // `CommandExit` either (spec 22 `context.md` §14).
                 self.record_command_findings(
@@ -6345,9 +6377,9 @@ impl ChatOrchestrator {
                     Some(&command_request.command),
                 )?;
                 // The command the user approved is evidence for the step it
-                // served. The resumed execution is not bracketed by a new
-                // action marker, so the execution's own id is the breadcrumb —
-                // it is the `commandId` on the `stored_command_executed`
+                // served. The execution's own id is the breadcrumb, as it was
+                // before the run had a marker of its own — it is the
+                // `commandId` on the `stored_command_executed`
                 // record that carries the exit (spec 66 `context.md` D14).
                 // The directory comes from the execution, not the proposal,
                 // because that is where the runner actually ran it.
@@ -13293,6 +13325,13 @@ impl ChatOrchestrator {
                                             (text, ActionOutcome::Ok)
                                         }
                                     }
+                                    // Spec 109 D8: stopped part-way, not failed.
+                                    Err(ClientError::Cancelled) => (
+                                        "The user stopped this MCP call; its outcome is \
+                                         unknown."
+                                            .to_string(),
+                                        ActionOutcome::Cancelled,
+                                    ),
                                     Err(error) => (
                                         format!("MCP tool call failed: {error}"),
                                         ActionOutcome::Failed,
@@ -13570,14 +13609,13 @@ impl ChatOrchestrator {
                         }
                     }
                 };
-                // Defensive: the top-of-loop check normally catches a stop
-                // before the marker is even started, so a cancelled batch result
-                // is rare. If one arrives, close the marker cleanly and let the
-                // turn end cancelled rather than record a result for a call that
-                // did nothing.
+                // A stop that reached the action itself (spec 109 D8): an MCP
+                // call or a hook ended part-way. What it did is unknown, so the
+                // marker says `unknown` (spec 17), nothing is retried, and the
+                // turn ends cancelled.
                 if action_outcome == ActionOutcome::Cancelled {
                     self.session_store
-                        .finish_action(action_marker, "cancelled")?;
+                        .finish_action_stopped_by_user(action_marker)?;
                     break;
                 }
                 // §5.3: a dispatched read joins the turn's seen-call set, so an
@@ -13626,6 +13664,14 @@ impl ChatOrchestrator {
                 // the exit code rather than passed beside it — the two cannot then
                 // disagree in the log.
                 match action_outcome {
+                    // Spec 109 D8: a command the Stop killed part-way is named
+                    // in the stopped turn's report; one that timed out is not.
+                    ActionOutcome::CommandExit(_, _)
+                        if command_termination == Some(CommandTermination::Cancelled) =>
+                    {
+                        self.session_store
+                            .finish_action_stopped_by_user(action_marker)?
+                    }
                     ActionOutcome::CommandExit(exit_code, _) => self
                         .session_store
                         .finish_command_action(action_marker, exit_code)?,
@@ -14483,7 +14529,7 @@ impl ChatOrchestrator {
     ) -> Result<ChatTurnResult> {
         // Through the same scanner as a completed turn: stopping does not
         // suspend the redaction guarantee.
-        let response = self.scanner.redact(partial).text;
+        let mut response = self.scanner.redact(partial).text;
         if !response.is_empty() {
             self.session_store.append_message(
                 &session.id,
@@ -14491,6 +14537,20 @@ impl ChatOrchestrator {
                 "assistant",
                 &response,
             )?;
+        }
+        // Spec 109 D8: the turn's report names what the stop cut short.
+        if let Some(note) = self
+            .session_store
+            .action_stopped_by_user(&session.id, &task.id)?
+            .map(|(action, reference)| stopped_action_note(&action, &reference))
+        {
+            let note = self.scanner.redact(&note).text;
+            self.session_store
+                .append_message(&session.id, Some(&task.id), "assistant", &note)?;
+            if !response.is_empty() {
+                response.push_str("\n\n");
+            }
+            response.push_str(&note);
         }
         // A stop is a true end: the step stays open, with what it ran attached
         // (spec 66 §5.3). It never changes the step's status.
@@ -18543,6 +18603,22 @@ fn tool_event_payload(
     payload
 }
 
+/// What a stopped turn says about the action the stop ended part-way (spec
+/// 109 D8). Its outcome is unknown and nothing retries it, so the user is
+/// told to check rather than assume either way.
+fn stopped_action_note(action: &str, reference: &str) -> String {
+    let what = match action {
+        "run_command" => format!("the command `{reference}`"),
+        "mcp_call" => format!("the MCP call `{reference}`"),
+        _ if reference.is_empty() => format!("`{action}`"),
+        _ => format!("`{action}` (`{reference}`)"),
+    };
+    format!(
+        "Stopped by you while running {what}. It was ended part-way, so its outcome is \
+         unknown; Damaian did not retry it. Check its effect before running it again."
+    )
+}
+
 /// The action marker parameters for a dispatched tool: a stable name, a
 /// reference identifying *which* invocation, and whether a crash mid-flight
 /// could have left a side effect.
@@ -22324,6 +22400,21 @@ mod clarification_tests {
                 .contains("authorises nothing on its own"),
             "the check's own schema description says it authorises nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod stopped_action_note_tests {
+    use super::stopped_action_note;
+
+    #[test]
+    fn the_note_names_the_stopped_action_and_says_its_outcome_is_unknown() {
+        let note = stopped_action_note("run_command", "cargo test");
+        assert!(note.contains("the command `cargo test`"), "{note}");
+        assert!(note.contains("outcome is unknown"), "{note}");
+        assert!(note.contains("did not retry"), "{note}");
+        let hook = stopped_action_note("hook", "");
+        assert!(hook.contains("`hook`"), "{hook}");
     }
 }
 

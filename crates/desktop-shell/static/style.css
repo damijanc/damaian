@@ -1497,6 +1497,32 @@ button:disabled {
   font-weight: 500;
 }
 
+/* Spec 109 D7: what this session is running, with its Stop. */
+.composer-running {
+  border-color: var(--line);
+  background: var(--surface-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A card's running state in place of its buttons (spec 109 D7). */
+.running-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.running-row-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* The pending card, last in the conversation. It keeps the card's own look;
    the accent edge marks it as the one waiting, and goes once it is decided. */
 .pending-decision {

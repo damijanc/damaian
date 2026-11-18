@@ -9,6 +9,8 @@
 //! server can never hang a chat turn.
 
 use crate::audit::AuditLog;
+use crate::cancel::CancelToken;
+use crate::command_runner::kill_process_group;
 use crate::config::{McpServerConfig, McpTransport};
 use crate::error::{ClientError, Result};
 use crate::model::{ToolDefinition, escape_curl_config_value};
@@ -330,6 +332,9 @@ fn flatten_tool_result(result: &Value) -> McpToolResult {
 // Transports
 // ---------------------------------------------------------------------------
 
+/// How often a waiting call looks at the turn's Stop.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// A JSON-RPC transport. `call` sends a request and returns the parsed
 /// response message whose `id` matches; `notify` fires a request-less
 /// notification.
@@ -443,15 +448,29 @@ impl RpcTransport for StdioTransport {
     fn call(&mut self, payload: &str, id: u64, timeout: Duration) -> Result<Value> {
         self.write_line(payload)?;
         let deadline = Instant::now() + timeout;
+        // The turn's Stop (spec 109 D8). The server may be part-way through
+        // the call, so stopping it ends the server's process group: what the
+        // call did is unknown, and nothing re-sends it.
+        let cancel = CancelToken::current();
         loop {
+            if cancel.is_cancelled() {
+                kill_process_group(self.child.id());
+                return Err(ClientError::Cancelled);
+            }
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or_else(|| {
                     ClientError::McpTimeout("Timed out waiting for MCP server response".to_string())
                 })?;
-            let line = self.lines.recv_timeout(remaining).map_err(|_| {
-                ClientError::McpTimeout("Timed out waiting for MCP server response".to_string())
-            })?;
+            let line = match self.lines.recv_timeout(remaining.min(CANCEL_POLL_INTERVAL)) {
+                Ok(line) => line,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ClientError::McpTimeout(
+                        "Timed out waiting for MCP server response".to_string(),
+                    ));
+                }
+            };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -545,10 +564,31 @@ impl HttpTransport {
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(self.curl_config(payload, timeout).as_bytes())?;
         }
-        let mut raw = String::new();
-        if let Some(mut stdout) = child.stdout.take() {
-            stdout.read_to_string(&mut raw)?;
-        }
+        // Read on its own thread so the turn's Stop (spec 109 D8) can end
+        // the request while the server is still answering.
+        let stdout = child.stdout.take();
+        let (sender, read) = mpsc::channel();
+        thread::spawn(move || {
+            let mut raw = String::new();
+            if let Some(mut stdout) = stdout {
+                let _ = stdout.read_to_string(&mut raw);
+            }
+            let _ = sender.send(raw);
+        });
+        let cancel = CancelToken::current();
+        let raw = loop {
+            if cancel.is_cancelled() {
+                // curl is the only process; ending it closes the reader's pipe.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ClientError::Cancelled);
+            }
+            match read.recv_timeout(CANCEL_POLL_INTERVAL) {
+                Ok(raw) => break raw,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break String::new(),
+            }
+        };
         let status = child.wait()?;
         let mut stderr = String::new();
         if let Some(mut pipe) = child.stderr.take() {

@@ -35,6 +35,42 @@ impl CancelToken {
         }
         Ok(())
     }
+
+    /// Runs `work` with `self` as the token of the turn running on this
+    /// thread, restoring whatever was there before (spec 109 D8).
+    ///
+    /// The runners a turn reaches without a [`TurnSink`](crate::TurnSink) in
+    /// hand — hooks, the commands a hook asks for, MCP calls and the browser
+    /// diagnostics built on them — read it through [`Self::current`], so the
+    /// user's Stop ends them as it ends a command, without every dispatch
+    /// signature carrying the token. They all run on the turn's own thread.
+    pub fn scope<T>(&self, work: impl FnOnce() -> T) -> T {
+        struct Restore(Option<CancelToken>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let previous = self.0.take();
+                TURN_CANCEL.with(|current| *current.borrow_mut() = previous);
+            }
+        }
+        let previous = TURN_CANCEL.with(|current| current.borrow_mut().replace(self.clone()));
+        // Restored on unwind too, so a panicking turn cannot leave its token
+        // to the next piece of work on a reused thread.
+        let _restore = Restore(previous);
+        work()
+    }
+
+    /// The token of the turn running on this thread, or a fresh one nothing
+    /// can cancel when no turn set one (the CLI, a settings test run).
+    pub fn current() -> CancelToken {
+        TURN_CANCEL
+            .with(|current| current.borrow().clone())
+            .unwrap_or_default()
+    }
+}
+
+thread_local! {
+    static TURN_CANCEL: std::cell::RefCell<Option<CancelToken>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -66,6 +102,33 @@ mod tests {
         let worker_handle = token.clone();
         token.cancel();
         assert!(worker_handle.is_cancelled());
+    }
+
+    #[test]
+    fn a_scoped_token_is_current_only_inside_its_scope_and_nests() {
+        assert!(!CancelToken::current().is_cancelled());
+        let outer = CancelToken::new();
+        let inner = CancelToken::new();
+        outer.scope(|| {
+            inner.scope(|| {
+                inner.cancel();
+                assert!(CancelToken::current().is_cancelled());
+            });
+            // The outer turn's token is back, and it was never cancelled.
+            assert!(!CancelToken::current().is_cancelled());
+            outer.cancel();
+            assert!(CancelToken::current().is_cancelled());
+        });
+        assert!(!CancelToken::current().is_cancelled());
+    }
+
+    #[test]
+    fn a_scope_is_restored_when_its_work_panics() {
+        let token = CancelToken::new();
+        token.cancel();
+        let unwound = std::panic::catch_unwind(|| token.scope(|| panic!("turn failed")));
+        assert!(unwound.is_err());
+        assert!(!CancelToken::current().is_cancelled());
     }
 
     #[test]

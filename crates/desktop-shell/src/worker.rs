@@ -1275,7 +1275,9 @@ impl TurnDriver {
             ProgressKind::Status,
             json!({"state": WorkerState::Running.as_str()}),
         );
-        match self.take_turn(host, job, &cancel, &steering) {
+        // Spec 109 D8: hooks, MCP calls and browser diagnostics in a worker's
+        // turn stop with it too.
+        match cancel.scope(|| self.take_turn(host, job, &cancel, &steering)) {
             Ok(result) => {
                 let pending = pending_decision(&result);
                 if let Some(approval) = approval_payload(&result) {
