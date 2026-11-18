@@ -468,6 +468,7 @@ fn a_legacy_fingerprint_value_still_loads_from_a_baseline_event() {
     let found = evidence("mismatched types", Some("src/a.rs"), Some(8));
     let event = VerificationEvent::Baseline {
         task_id: "task".to_string(),
+        tests: Vec::new(),
         check: check(),
         baseline: CheckBaseline::Failed {
             termination: exited(1),
@@ -501,6 +502,7 @@ fn new_verification_events_round_trip_through_a_fresh_store() {
     let events = vec![
         VerificationEvent::Baseline {
             task_id: "task".to_string(),
+            tests: Vec::new(),
             check: check(),
             baseline: CheckBaseline::Failed {
                 termination: exited(1),

@@ -1385,14 +1385,19 @@ pub enum VerificationEvent {
         task_id: String,
         outcome: VerificationOutcome,
     },
-    /// A check's task-local baseline, recorded before the patch that first
-    /// selected it was applied (spec 102 Task 2). Absent from every historical
-    /// log, so replay must not invent one.
+    /// A check's task-local baseline (spec 102 Task 2), taken when the check
+    /// first failed (spec 109 D1). Absent from every historical log, so
+    /// replay must not invent one.
     #[serde(rename = "verification_baseline", rename_all = "camelCase")]
     Baseline {
         task_id: String,
         check: CheckId,
         baseline: CheckBaseline,
+        /// The failing tests the baseline reran by name (spec 109 D3); empty
+        /// when it ran the whole check, as every baseline before Task 4 did.
+        /// A later failure of a test outside this set is not covered by it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tests: Vec<String>,
     },
     /// One post-patch provenance classification (spec 102 Task 3).
     #[serde(rename = "verification_provenance", rename_all = "camelCase")]

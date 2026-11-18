@@ -203,14 +203,20 @@ fn card_decisions(
 /// A headless harness has no user to answer a baseline card, so the scenario's
 /// own check decisions are the only approval it declares: a baseline for a
 /// check the scenario approves runs, and every other baseline stays declined.
+/// A Rust test baseline reruns only the failing tests (spec 109 D3), so its
+/// card shows the check's command narrowed with `-- --exact <names>` (nextest
+/// also gets `--no-tests=pass`); that is still the approved check's baseline.
 fn baseline_approved(scenario: &Scenario, command: &str) -> bool {
     if scenario.decline_baseline {
         return false;
     }
-    scenario
-        .check_decisions
-        .iter()
-        .any(|decision| decision.command == command && decision.approved)
+    scenario.check_decisions.iter().any(|decision| {
+        decision.approved
+            && (decision.command == command
+                || command.starts_with(&format!("{} -- --exact ", decision.command))
+                || command
+                    .starts_with(&format!("{} --no-tests=pass -- --exact ", decision.command)))
+    })
 }
 
 /// The durable baseline state per check, read from the run's session log.

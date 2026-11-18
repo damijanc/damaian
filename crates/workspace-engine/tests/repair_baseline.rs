@@ -73,7 +73,14 @@ fn git_fixture(name: &str, committed: &str, uncommitted: Option<&str>) -> PathBu
 
 /// A shell whose every command is a test suite: it fails each test named on a
 /// `// fail <name>` line of `src/lib.rs` in the directory it runs in, and
-/// appends that directory to `runs.log` so a test can tell where it ran.
+/// appends that directory to `runs.log` so a test can tell where it ran. Like
+/// libtest, a command ending in `-- --exact <names>` runs only those tests
+/// (spec 109 D3); every command is appended to `commands.log`. A test exists
+/// in a tree when a `// test <name>` or `// fail <name>` line names it. A
+/// narrowed `cargo nextest run` that matches no existing test fails as nextest
+/// 0.9.144 does (`error: no tests to run`, exit 4) unless it passes
+/// `--no-tests=pass`; a failing nextest run reports on stderr in nextest's
+/// shape, exit 100.
 fn fake_shell(data_dir: &Path) -> PathBuf {
     let script = data_dir.join("fake-shell.sh");
     let log = data_dir.join("runs.log");
@@ -82,8 +89,34 @@ fn fake_shell(data_dir: &Path) -> PathBuf {
         format!(
             "#!/bin/sh\n\
              echo \"$PWD\" >> '{}'\n\
+             for cmd; do :; done\n\
+             echo \"$cmd\" >> '{}'\n\
              if [ -f '{}' ]; then sleep 30; fi\n\
              names=$(sed -n 's|^// fail ||p' src/lib.rs 2>/dev/null)\n\
+             case \"$cmd\" in *' -- --exact '*)\n\
+             only=${{cmd#*' -- --exact '}}; kept=''; matched=''\n\
+             existing=$(sed -n 's|^// \\(test\\|fail\\) ||p' src/lib.rs 2>/dev/null)\n\
+             for name in $existing; do for one in $only; do\n\
+             if [ \"$name\" = \"$one\" ]; then matched=yes; fi\n\
+             done; done\n\
+             for name in $names; do for one in $only; do\n\
+             if [ \"$name\" = \"$one\" ]; then kept=\"$kept $name\"; fi\n\
+             done; done\n\
+             names=$kept\n\
+             case \"$cmd\" in *'nextest run'*)\n\
+             case \"$cmd\" in *--no-tests=pass*) ;; *)\n\
+             if [ -z \"$matched\" ]; then echo 'error: no tests to run' >&2; exit 4; fi;;\n\
+             esac;;\n\
+             esac;;\n\
+             esac\n\
+             case \"$cmd\" in *'nextest run'*)\n\
+             if [ -n \"$names\" ]; then\n\
+             for name in $names; do echo \"        FAIL [   0.001s] fixture $name\" >&2; done\n\
+             echo 'error: test run failed' >&2\n\
+             exit 100\n\
+             fi\n\
+             exit 0;;\n\
+             esac\n\
              if [ -n \"$names\" ]; then\n\
              echo 'failures:'\n\
              for name in $names; do echo \"    $name\"; done\n\
@@ -94,6 +127,7 @@ fn fake_shell(data_dir: &Path) -> PathBuf {
              echo 'test result: ok. 1 passed; 0 failed'\n\
              exit 0\n",
             log.display(),
+            data_dir.join("commands.log").display(),
             slow_marker(data_dir).display()
         ),
     )
@@ -109,6 +143,15 @@ fn fake_shell(data_dir: &Path) -> PathBuf {
 /// already finished.
 fn slow_marker(data_dir: &Path) -> PathBuf {
     data_dir.join("slow-runs")
+}
+
+/// Every command the fake shell ran, in order.
+fn commands(data_dir: &Path) -> Vec<String> {
+    fs::read_to_string(data_dir.join("commands.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 fn runs(data_dir: &Path) -> Vec<String> {
@@ -341,15 +384,23 @@ fn a_new_failure_beside_a_pre_existing_one_is_worsened_with_only_the_new_one_int
     );
 }
 
+/// Spec 102's "unchanged" fixture. A whole-check baseline saw both tests fail
+/// and read the smaller failure as `unchanged_failure`. Since spec 109 D3 the
+/// baseline reruns only the test still failing, which failed at task start
+/// too, so it reads `pre_existing`: the dropped test is not rerun. Both
+/// classes are the user's to review, never a repair target, and the
+/// completion gate treats them alike; `provenance::classify` still gives
+/// `unchanged_failure` for a whole-check baseline
+/// (`repair_targets::a_failed_baseline_with_no_new_evidence_is_unchanged_failure`).
 #[test]
-fn fewer_failures_than_at_task_start_is_unchanged() {
+fn fewer_failures_than_at_task_start_is_not_the_tasks() {
     let (class, record) = classify_fixture(
         "unchanged",
         "pub fn a() {}\n// fail tests::a\n// fail tests::b\n",
         None,
         "pub fn a() {}\n// fail tests::a\n",
     );
-    assert_eq!(class, FailureProvenance::UnchangedFailure);
+    assert_eq!(class, FailureProvenance::PreExisting);
     assert!(record.introduced.is_empty());
 }
 
@@ -475,7 +526,8 @@ fn a_baseline_that_needs_approval_asks_once_with_why_and_then_classifies() {
         .check_batch
         .expect("the failure's baseline needs approval");
     assert_eq!(card.checks.len(), 1);
-    assert_eq!(card.checks[0].command, "cargo test");
+    // The card shows what runs: only the failing test (spec 109 D3).
+    assert_eq!(card.checks[0].command, "cargo test -- --exact tests::a");
     assert!(
         card.note
             .as_deref()
@@ -611,5 +663,263 @@ fn a_baseline_cancelled_while_it_runs_is_declined_and_its_tree_is_removed() {
         matches!(recorded.as_slice(), [(_, CheckBaseline::Declined)]),
         "{recorded:?}"
     );
+    cleanup(&root, &data_dir);
+}
+
+// --- Spec 109 Task 4 (D3): a Rust test failure reruns only its failing
+// tests by name. ---
+
+/// The tests each recorded baseline reran by name (empty: the whole check).
+fn baseline_scopes(engine: &WorkspaceEngine, session_id: &str) -> Vec<Vec<String>> {
+    engine
+        .session_store
+        .read_verification_events(session_id, &[])
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            VerificationEvent::Baseline { tests, .. } => Some(tests),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn two_failing_tests_rerun_alone_by_name() {
+    // At task start `tests::c` already failed. The patch fixes it and breaks
+    // `tests::a` and `tests::b`. A whole-check baseline would see `tests::c`
+    // fail; the targeted one runs only `a` and `b`, which passed then.
+    let root = git_fixture("targeted", "pub fn a() {}\n// fail tests::c\n", None);
+    let data_dir = temp_dir("targeted-data");
+    let shell = fake_shell(&data_dir);
+    let engine = engine(&data_dir, &shell, false);
+    let proposal = propose_and_apply(
+        &engine,
+        &root,
+        "pub fn a() {}\n// fail tests::b\n// fail tests::a\n",
+    );
+    verify(&engine, &root, &proposal.session.id);
+
+    assert_eq!(
+        commands(&data_dir),
+        ["cargo test", "cargo test -- --exact tests::a tests::b"],
+        "the live check, then only its two failing tests in the task-start tree"
+    );
+    let recorded = baselines(&engine, &proposal.session.id);
+    assert!(
+        matches!(recorded.as_slice(), [(check, CheckBaseline::Passed)] if *check == cargo_test()),
+        "the baseline belongs to the whole check: {recorded:?}"
+    );
+    assert_eq!(
+        baseline_scopes(&engine, &proposal.session.id),
+        [vec!["tests::a".to_string(), "tests::b".to_string()]]
+    );
+    let record = provenance(&engine, &proposal)
+        .remove(&cargo_test())
+        .expect("the failure is classified");
+    assert_eq!(record.provenance, FailureProvenance::NewRegression);
+    assert_eq!(record.introduced.len(), 2, "{record:?}");
+    cleanup(&root, &data_dir);
+}
+
+#[test]
+fn a_mixed_targeted_failure_is_worsened_with_only_the_introduced_test() {
+    // `tests::a` failed at task start; the patch adds `tests::b`. Rerun by
+    // name, `a` still fails and `b` passes, so only `b` is the task's.
+    let root = git_fixture("mixed", "pub fn a() {}\n// fail tests::a\n", None);
+    let data_dir = temp_dir("mixed-data");
+    let shell = fake_shell(&data_dir);
+    let engine = engine(&data_dir, &shell, false);
+    let proposal = propose_and_apply(
+        &engine,
+        &root,
+        "pub fn a() {}\n// fail tests::a\n// fail tests::b\n",
+    );
+    verify(&engine, &root, &proposal.session.id);
+
+    assert_eq!(
+        commands(&data_dir).last().map(String::as_str),
+        Some("cargo test -- --exact tests::a tests::b")
+    );
+    let recorded = baselines(&engine, &proposal.session.id);
+    assert!(
+        matches!(recorded.as_slice(), [(_, CheckBaseline::Failed { .. })]),
+        "{recorded:?}"
+    );
+    let record = provenance(&engine, &proposal)
+        .remove(&cargo_test())
+        .expect("the failure is classified");
+    assert_eq!(record.provenance, FailureProvenance::Worsened);
+    assert_eq!(record.introduced.len(), 1, "{record:?}");
+    assert!(
+        record.introduced[0].summary().starts_with("tests::b"),
+        "{record:?}"
+    );
+    cleanup(&root, &data_dir);
+}
+
+#[test]
+fn the_whole_check_reruns_when_only_the_narrowed_command_would_need_a_card() {
+    // The user allowed `cargo test` itself; the narrowed command is a
+    // different command the policy would ask about. Narrowing must never add
+    // a card, so the whole check reruns, as it did before spec 109 Task 4.
+    let root = git_fixture("allowed", "pub fn a() {}\n", None);
+    let data_dir = temp_dir("allowed-data");
+    let shell = fake_shell(&data_dir);
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: data_dir.to_path_buf(),
+        enable_index_watcher: false,
+        shell: shell.to_string_lossy().to_string(),
+        require_approval_for_risky_commands: true,
+        command_allowlist: vec!["cargo test".to_string()],
+        agent_tool_retry_limit: 0,
+        ..Config::default()
+    });
+    let proposal = propose_and_apply(&engine, &root, "pub fn a() {}\n// fail tests::a\n");
+    let result = verify(&engine, &root, &proposal.session.id);
+
+    assert!(
+        result.check_batch.is_none(),
+        "no card: {:?}",
+        result.check_batch
+    );
+    assert_eq!(commands(&data_dir), ["cargo test", "cargo test"]);
+    assert_eq!(
+        baseline_scopes(&engine, &proposal.session.id),
+        [Vec::<String>::new()]
+    );
+    let record = provenance(&engine, &proposal)
+        .remove(&cargo_test())
+        .expect("the failure is classified");
+    assert_eq!(record.provenance, FailureProvenance::NewRegression);
+    cleanup(&root, &data_dir);
+}
+
+// --- Task 4 review fix: a baseline whose failing tests were all added by the
+// patch. They do not exist in the task-start tree, so the narrowed run
+// matches nothing; that must read as a pass, never as a failure. ---
+
+#[test]
+fn a_new_failing_test_is_a_new_regression_under_cargo_test() {
+    let root = git_fixture("added-cargo", "pub fn a() {}\n// test tests::old\n", None);
+    let data_dir = temp_dir("added-cargo-data");
+    let shell = fake_shell(&data_dir);
+    let engine = engine(&data_dir, &shell, false);
+    let proposal = propose_and_apply(
+        &engine,
+        &root,
+        "pub fn a() {}\n// test tests::old\n// fail tests::added\n",
+    );
+    verify(&engine, &root, &proposal.session.id);
+
+    assert_eq!(
+        commands(&data_dir),
+        ["cargo test", "cargo test -- --exact tests::added"]
+    );
+    let recorded = baselines(&engine, &proposal.session.id);
+    assert!(
+        matches!(recorded.as_slice(), [(_, CheckBaseline::Passed)]),
+        "an empty libtest run passes: {recorded:?}"
+    );
+    let record = provenance(&engine, &proposal)
+        .remove(&cargo_test())
+        .expect("the failure is classified");
+    assert_eq!(record.provenance, FailureProvenance::NewRegression);
+    assert_eq!(record.introduced.len(), 1, "{record:?}");
+    assert!(record.introduced[0].summary().starts_with("tests::added"));
+    cleanup(&root, &data_dir);
+}
+
+#[test]
+fn a_new_failing_test_is_a_new_regression_under_nextest() {
+    use workspace_engine::baseline::FailedCheck;
+    use workspace_engine::finding::{Finding, FindingDraft, FindingSource, Severity};
+    use workspace_engine::{
+        BaselineCoordinator, BaselinePreparation, CheckTermination, FindingEvidence,
+        PostPatchResult, SecretScanner, classify,
+    };
+
+    let root = git_fixture("added-nextest", "pub fn a() {}\n// test tests::old\n", None);
+    let data_dir = temp_dir("added-nextest-data");
+    let shell = fake_shell(&data_dir);
+    let engine = engine(&data_dir, &shell, false);
+    let proposal = propose_and_apply(
+        &engine,
+        &root,
+        "pub fn a() {}\n// test tests::old\n// fail tests::added\n",
+    );
+    // The plan's nextest check failed after the patch on the one test the
+    // patch added (the fixture's detected check is `cargo test`, so the
+    // failure is handed to the coordinator directly).
+    let check = CheckId::new("", "cargo nextest run");
+    let evidence = vec![FindingEvidence::from_finding(&Finding::new(
+        FindingDraft {
+            source: FindingSource::Test,
+            severity: Severity::Error,
+            summary: "tests::added failed".to_string(),
+            details: None,
+            range: None,
+            code: None,
+        },
+        &SecretScanner::default(),
+    ))];
+    let coordinator = BaselineCoordinator::new(
+        engine.config.clone(),
+        engine.scanner.clone(),
+        engine.audit_log.clone(),
+        engine.session_store.clone(),
+        engine.validation_orchestrator.clone(),
+        engine.checkpoint_store.clone(),
+    );
+    let preparation = coordinator
+        .prepare_for_failures(
+            &root,
+            &proposal.session.id,
+            &proposal.task.id,
+            &[FailedCheck {
+                check: check.clone(),
+                findings: evidence.clone(),
+            }],
+            &CancelToken::new(),
+            &mut |_| {},
+        )
+        .expect("the baseline is prepared");
+    // Damaian does not know `cargo nextest`, so the baseline asks first; the
+    // card shows exactly what will run.
+    let BaselinePreparation::Awaiting(batch) = preparation else {
+        panic!("the nextest baseline asks first: {preparation:?}");
+    };
+    assert_eq!(
+        batch.checks[0].command,
+        "cargo nextest run --no-tests=pass -- --exact tests::added"
+    );
+    coordinator
+        .resume_streamed(
+            &root,
+            &batch.id,
+            &[(batch.checks[0].proposal_id.clone(), true)],
+            &[],
+            "tester",
+            &CancelToken::new(),
+            &mut |_| {},
+        )
+        .expect("the approved baseline runs");
+
+    assert_eq!(
+        commands(&data_dir),
+        ["cargo nextest run --no-tests=pass -- --exact tests::added"],
+        "only the added test, with an empty run allowed to pass"
+    );
+    let recorded = baselines(&engine, &proposal.session.id);
+    assert!(
+        matches!(recorded.as_slice(), [(id, CheckBaseline::Passed)] if *id == check),
+        "nothing to run at task start is a pass, not a failure: {recorded:?}"
+    );
+    let classification = classify(
+        &PostPatchResult::new(check, CheckTermination::Exited { exit_code: 100 }, evidence),
+        recorded.first().map(|(_, baseline)| baseline),
+        None,
+    );
+    assert_eq!(classification.provenance, FailureProvenance::NewRegression);
+    assert_eq!(classification.introduced.len(), 1, "{classification:?}");
     cleanup(&root, &data_dir);
 }

@@ -43,7 +43,9 @@ partly fixed by spec 107 D3), 86 (main-checkout test-process overhead) and 89
   mutation `generation`; `is_stale` compares them with the current tree
   (`verification.rs` ≈715).
 - **Findings:** `finding/rust_test.rs` parses failing test names and locations
-  from `cargo test` output; nextest output is parsed too.
+  from `cargo test` output. *Correction (Task 4):* nextest output was not
+  parsed — a failed `cargo nextest run` was one generic finding; Task 4 added
+  `finding/nextest.rs`.
 
 ## Decisions
 
@@ -149,6 +151,49 @@ partly fixed by spec 107 D3), 86 (main-checkout test-process overhead) and 89
   failing tests by name (`cargo test -- --exact <names>` / nextest `-E`
   filter) in the pre-patch tree; compare the same set. Anything else reruns the
   whole check.
+  *Built in Task 4 (2026-11-18).* What Task 4 decided while building it:
+  - **One filter form for both runners:** the check's own command plus `--
+    --exact <names>` (names sorted, deduplicated). nextest accepts libtest's
+    `--exact` and name filters after `--` (checked against nextest 0.9.144),
+    so no `-E` expression is built; `--exact` keeps `tests::a` from also
+    running `tests::a_longer`. It only narrows what the original command runs.
+    nextest also gets `--no-tests=pass` before `--`: a test the task added
+    does not exist in the task-start tree, and an empty nextest run otherwise
+    exits 4 (`error: no tests to run`), which would record a failed baseline
+    and read a new regression as `worsened`. libtest passes an empty run.
+  - **When it narrows:** the check is `cargo test`/`cargo t` or `cargo nextest
+    run`/`r`; the command has no `--` already and no shell control
+    characters; every error finding of the failed run is a parsed `Test`
+    finding whose name is a plain `::` path of identifiers (a doctest's name
+    is not); at least one. Warnings are ignored (the narrowed run builds the
+    same targets). A compile error, a generic (unparsed) failure, or anything
+    else reruns the whole check. The names come back out of the finding
+    summaries (`finding::failed_test_name`, next to the parser that writes
+    them).
+  - **nextest findings are parsed now** (`finding/nextest.rs`, from real
+    output in `finding/fixtures/nextest_failures_stderr.txt`): each failing
+    status line (`FAIL`, `TIMEOUT`, `ABORT`, `SIG…`) is one `Test` finding
+    shaped exactly like a `cargo test` one, with the panic message and
+    location from its indented captured output; the closing `error: test run
+    failed` is a cargo summary, not a compiler error. A failed nextest check's
+    repair evidence therefore names its tests instead of one generic finding.
+  - **The baseline records what it covered.** `verification_baseline` gains
+    `tests` (empty: the whole check). A later failure of the same check is
+    covered by an earlier baseline only if that baseline ran the whole check,
+    or ran every test now failing (a declined, unavailable or uncertain one
+    covers everything, as before); otherwise a new baseline runs for the
+    union of both sets and replaces it (last record wins, as before).
+  - **Policy:** the narrowed command is its own command to the policy and is
+    what a baseline card shows. When it would need a card or is blocked but
+    the whole check would run without one (the user allowed `cargo test`
+    itself), the whole check runs instead, so narrowing never adds a card.
+  - **Classification consequence:** spec 102's "fewer failures than at task
+    start" fixture now reads `pre_existing`, not `unchanged_failure` — the
+    narrowed baseline reruns only the test still failing, which failed then
+    too, and never sees the one the patch fixed. Both classes are non-repair
+    and the completion gate treats them alike (`completion.rs`); the other
+    three fixture classes (new regression, pre-existing, worsened with only
+    the new test introduced) are unchanged.
 - **D4 — per-change check choice (recommended).** If the plan has a required
   check whose working directory is the patch's owning root (or an enclosing
   root), run that per change instead of the detected `cargo test` for that root.

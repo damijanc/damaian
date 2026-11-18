@@ -1,0 +1,92 @@
+   Compiling demo v0.1.0 (/repo/crates/demo)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.40s
+────────────
+  Nextest run ID 00000000-0000-0000-0000-000000000000 with nextest profile: default
+    Starting 6 tests across 2 binaries
+        PASS [   0.012s] (1/6) demo::integration integration_ok
+        PASS [   0.013s] (2/6) demo tests::passes
+        FAIL [   0.012s] (3/6) demo tests::fails_one
+  stdout ───
+
+    running 1 test
+    test tests::fails_one ... FAILED
+
+    failures:
+
+    failures:
+        tests::fails_one
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'tests::fails_one' (70979291) panicked at src/lib.rs:5:30:
+    assertion `left == right` failed: one
+      left: 2
+     right: 3
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   0.013s] (4/6) demo tests::fails_one_more
+  stdout ───
+
+    running 1 test
+    test tests::fails_one_more ... FAILED
+
+    failures:
+
+    failures:
+        tests::fails_one_more
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'tests::fails_one_more' (70979293) panicked at src/lib.rs:7:35:
+    prefix sibling
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   0.013s] (5/6) demo tests::fails_two
+  stdout ───
+
+    running 1 test
+    test tests::fails_two ... FAILED
+
+    failures:
+
+    failures:
+        tests::fails_two
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'tests::fails_two' (70979294) panicked at src/lib.rs:6:30:
+    two broke
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   0.012s] (6/6) demo::integration integration_fails
+  stdout ───
+
+    running 1 test
+    test integration_fails ... FAILED
+
+    failures:
+
+    failures:
+        integration_fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'integration_fails' (70979292) panicked at tests/integration.rs:1:34:
+    sum too small
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [   0.013s] 6 tests run: 2 passed, 4 failed, 0 skipped
+        FAIL [   0.012s] (3/6) demo tests::fails_one
+        FAIL [   0.013s] (4/6) demo tests::fails_one_more
+        FAIL [   0.013s] (5/6) demo tests::fails_two
+        FAIL [   0.012s] (6/6) demo::integration integration_fails
+error: test run failed

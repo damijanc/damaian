@@ -4277,6 +4277,24 @@ impl SessionStore {
         session_id: &str,
         task_id: &str,
     ) -> Result<BTreeMap<crate::verification::CheckId, crate::verification::CheckBaseline>> {
+        Ok(self
+            .task_verification_baseline_scopes(session_id, task_id)?
+            .into_iter()
+            .map(|(check, (baseline, _))| (check, baseline))
+            .collect())
+    }
+
+    /// [`Self::task_verification_baselines`] with the failing tests each
+    /// baseline reran by name (empty: the whole check ran), so a later failure
+    /// of other tests is known not to be covered by it (spec 109 D3).
+    #[allow(clippy::type_complexity)]
+    pub fn task_verification_baseline_scopes(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<
+        BTreeMap<crate::verification::CheckId, (crate::verification::CheckBaseline, Vec<String>)>,
+    > {
         use crate::verification::VerificationEvent;
         let chain = self.task_continuation_chain(session_id, task_id)?;
         let ids = chain.iter().map(String::as_str).collect::<Vec<_>>();
@@ -4284,10 +4302,13 @@ impl SessionStore {
         let mut baselines = BTreeMap::new();
         for event in events {
             if let VerificationEvent::Baseline {
-                check, baseline, ..
+                check,
+                baseline,
+                tests,
+                ..
             } = event
             {
-                baselines.insert(check, baseline);
+                baselines.insert(check, (baseline, tests));
             }
         }
         Ok(baselines)

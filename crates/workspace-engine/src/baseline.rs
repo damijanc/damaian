@@ -11,6 +11,13 @@
 //! approval goes on one card that says why. A tree that cannot be rebuilt
 //! exactly is an unavailable baseline.
 //!
+//! A Rust test failure (`cargo test`, `cargo nextest run`) whose findings
+//! name the failing tests reruns only those tests (spec 109 D3): the same
+//! command with `-- --exact <names>`, which narrows what runs and nothing
+//! else. The baseline records the names it covered, so a later failure of
+//! another test takes a new baseline rather than reading this one. Any other
+//! failure reruns the whole check.
+//!
 //! It deliberately does not classify a result. It records [`CheckBaseline`]
 //! facts; spec 102 Task 3's `provenance::classify` compares them with the
 //! failed result, with the meaning it always had.
@@ -28,7 +35,10 @@ use crate::checkpoint::CheckpointStore;
 use crate::command_policy::allow_always_eligible;
 use crate::config::Config;
 use crate::error::{ClientError, Result};
-use crate::finding::{default_parsers, findings_from_execution};
+use crate::finding::{
+    FindingSource, Severity, default_parsers, failed_test_name, findings_from_execution,
+    is_nextest_command, is_rust_test_command,
+};
 use crate::pre_task_tree::{PreTaskSources, TreeBuild, build_pre_task_tree};
 use crate::secret_scanner::SecretScanner;
 use crate::session::SessionStore;
@@ -76,6 +86,29 @@ pub struct BaselineCheck {
     pub requires_approval: bool,
     /// Whether the ordinary command-approval path may offer *Allow Always*.
     pub allow_always: bool,
+    /// The failing tests `command` reruns by name (spec 109 D3); empty when
+    /// it reruns the whole check. Defaulted so a card persisted before the
+    /// field existed still loads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<String>,
+}
+
+/// A check whose latest run failed with a code result, with that run's
+/// findings: what a failure-time baseline is taken for (spec 109 D1). The
+/// findings decide whether only the failing tests rerun (D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedCheck {
+    pub check: CheckId,
+    pub findings: Vec<FindingEvidence>,
+}
+
+/// One baseline to run: the check it is for, its stored proposal, and the
+/// failing tests that proposal reruns by name (empty: the whole check).
+#[derive(Debug, Clone)]
+struct BaselineJob {
+    check: CheckId,
+    proposal_id: String,
+    tests: Vec<String>,
 }
 
 /// The engine-owned card for baselines that need separate approval.
@@ -211,7 +244,7 @@ impl BaselineCoordinator {
         repository_root: &Path,
         session_id: &str,
         task_id: &str,
-        failed: &[CheckId],
+        failed: &[FailedCheck],
         cancel: &CancelToken,
         on_progress: &mut dyn FnMut(BaselineProgress),
     ) -> Result<BaselinePreparation> {
@@ -224,24 +257,46 @@ impl BaselineCoordinator {
         // reuses the one its source task took.
         let current = self
             .session_store
-            .task_verification_baselines(session_id, task_id)?;
+            .task_verification_baseline_scopes(session_id, task_id)?;
         let mut recorded = Vec::new();
         let mut awaiting = Vec::new();
         let mut runnable = Vec::new();
         let mut seen = BTreeSet::new();
-        for check in failed {
-            if current.contains_key(check) || !seen.insert(check.clone()) {
+        for failed in failed {
+            let check = &failed.check;
+            if !seen.insert(check.clone()) {
                 continue;
             }
+            let wanted = failing_tests(check, &failed.findings);
+            let earlier = current.get(check);
+            if earlier.is_some_and(|(baseline, covered)| {
+                baseline_covers(baseline, covered, wanted.as_deref())
+            }) {
+                continue;
+            }
+            // A targeted baseline that missed a test now failing is
+            // replaced by one covering both sets, so the earlier failure
+            // stays covered too.
+            let tests = match (wanted, earlier) {
+                (Some(mut names), Some((_, covered))) => {
+                    names.extend(covered.iter().cloned());
+                    names.sort();
+                    names.dedup();
+                    names
+                }
+                (Some(names), None) => names,
+                (None, _) => Vec::new(),
+            };
             let directory = if check.working_directory.is_empty() {
                 repository_root.to_path_buf()
             } else {
                 repository_root.join(&check.working_directory)
             };
+            let (command, tests) = self.baseline_command(repository_root, &directory, check, tests);
             let proposal = self.validation.propose_command_at(
                 repository_root,
                 &directory,
-                &check.command,
+                &command,
                 FAILURE_BASELINE_REASON,
             )?;
             if proposal.blocked {
@@ -250,12 +305,17 @@ impl BaselineCoordinator {
                     task_id,
                     check,
                     unavailable(check, CheckTermination::PolicyRefused),
+                    tests,
                 )?;
                 recorded.push(check.clone());
             } else if proposal.requires_approval {
-                awaiting.push(self.batch_check(&proposal, check));
+                awaiting.push(self.batch_check(&proposal, check, tests));
             } else {
-                runnable.push((check.clone(), proposal.id));
+                runnable.push(BaselineJob {
+                    check: check.clone(),
+                    proposal_id: proposal.id,
+                    tests,
+                });
             }
         }
         if !runnable.is_empty() {
@@ -360,7 +420,11 @@ impl BaselineCoordinator {
         let mut approved = Vec::new();
         for check in &pending.batch.checks {
             if approved_of(check) {
-                approved.push((check.check.clone(), check.proposal_id.clone()));
+                approved.push(BaselineJob {
+                    check: check.check.clone(),
+                    proposal_id: check.proposal_id.clone(),
+                    tests: check.tests.clone(),
+                });
                 continue;
             }
             // Through the store as well as the log, so declining a baseline
@@ -374,6 +438,7 @@ impl BaselineCoordinator {
                 &pending.task_id,
                 &check.check,
                 CheckBaseline::Declined,
+                check.tests.clone(),
             )?;
             recorded.push(check.check.clone());
         }
@@ -522,7 +587,7 @@ impl BaselineCoordinator {
         repository_root: &Path,
         session_id: &str,
         task_id: &str,
-        checks: &[(CheckId, String)],
+        checks: &[BaselineJob],
         approved: bool,
         approved_by: &str,
         cancel: &CancelToken,
@@ -554,7 +619,8 @@ impl BaselineCoordinator {
             Some(TreeBuild::Unavailable(reason)) => {
                 // D2: a task-start tree that cannot be rebuilt exactly is no
                 // baseline at all, never a guess. Unknown provenance follows.
-                for (check, _) in checks {
+                for job in checks {
+                    let check = &job.check;
                     self.audit_log.record(
                         "verification_baseline_unavailable",
                         &[
@@ -571,6 +637,7 @@ impl BaselineCoordinator {
                         task_id,
                         check,
                         unavailable(check, CheckTermination::UnavailableInfrastructure),
+                        job.tests.clone(),
                     )?;
                     let name = check.label();
                     on_progress(BaselineProgress::Finished {
@@ -590,13 +657,14 @@ impl BaselineCoordinator {
         let env = vec![("CARGO_TARGET_DIR", self.cargo_target_dir(repository_root))];
         let total = checks.len();
         let mut cancelled = false;
-        for (index, (check, proposal_id)) in checks.iter().enumerate() {
+        for (index, job) in checks.iter().enumerate() {
+            let (check, proposal_id) = (&job.check, &job.proposal_id);
             let name = check.label();
             let result = match (&tree, cancel.is_cancelled()) {
                 (Some(tree), false) => {
                     on_progress(BaselineProgress::Started {
                         check: name.clone(),
-                        label: format!("Running baseline: {name}"),
+                        label: running_label(&name, &job.tests),
                         index: index + 1,
                         total,
                     });
@@ -640,7 +708,7 @@ impl BaselineCoordinator {
                     (CheckBaseline::Declined, "declined")
                 }
             };
-            self.record(session_id, task_id, check, baseline)?;
+            self.record(session_id, task_id, check, baseline, job.tests.clone())?;
             on_progress(BaselineProgress::Finished {
                 label: finished_label(word, &name),
                 check: name,
@@ -674,7 +742,44 @@ impl BaselineCoordinator {
             .to_string()
     }
 
-    fn batch_check(&self, proposal: &CommandProposal, check: &CheckId) -> BaselineCheck {
+    /// The command a failure-time baseline runs, and the tests it reruns by
+    /// name (spec 109 D3). With `tests`, the check's own command narrowed to
+    /// them, as long as the policy treats that no worse than the whole check:
+    /// when the narrowed command would need a card or is blocked but the
+    /// whole check runs without one (the user allowed it always, say), the
+    /// whole check runs instead, so narrowing never adds a card.
+    fn baseline_command(
+        &self,
+        repository_root: &Path,
+        directory: &Path,
+        check: &CheckId,
+        tests: Vec<String>,
+    ) -> (String, Vec<String>) {
+        if tests.is_empty() {
+            return (check.command.clone(), tests);
+        }
+        let targeted = targeted_command(&check.command, &tests);
+        let narrowed = self
+            .validation
+            .classify_command_at(repository_root, directory, &targeted);
+        if !narrowed.blocked && !narrowed.requires_approval {
+            return (targeted, tests);
+        }
+        let whole = self
+            .validation
+            .classify_command_at(repository_root, directory, &check.command);
+        if narrowed.blocked || !(whole.blocked || whole.requires_approval) {
+            return (check.command.clone(), Vec::new());
+        }
+        (targeted, tests)
+    }
+
+    fn batch_check(
+        &self,
+        proposal: &CommandProposal,
+        check: &CheckId,
+        tests: Vec<String>,
+    ) -> BaselineCheck {
         let location_label = if check.working_directory.is_empty() {
             "repository root".to_string()
         } else {
@@ -684,7 +789,9 @@ impl BaselineCoordinator {
             proposal_id: proposal.id.clone(),
             check: check.clone(),
             label: check.label(),
-            command: check.command.clone(),
+            // What runs, which is narrower than the check when it reruns
+            // only the failing tests.
+            command: proposal.command.clone(),
             directory: check.working_directory.clone(),
             location_label,
             risk: proposal.risk.as_str().to_string(),
@@ -699,6 +806,7 @@ impl BaselineCoordinator {
             blocked: proposal.blocked,
             requires_approval: proposal.requires_approval,
             allow_always: allow_always_eligible(&self.config, &proposal.command, proposal.blocked),
+            tests,
         }
     }
 
@@ -816,6 +924,7 @@ impl BaselineCoordinator {
         task_id: &str,
         check: &CheckId,
         baseline: CheckBaseline,
+        tests: Vec<String>,
     ) -> Result<()> {
         self.session_store.append_verification_event(
             session_id,
@@ -823,6 +932,7 @@ impl BaselineCoordinator {
                 task_id: task_id.to_string(),
                 check: check.clone(),
                 baseline,
+                tests,
             },
         )
     }
@@ -977,6 +1087,99 @@ fn baseline_result_word(baseline: &CheckBaseline) -> &'static str {
     }
 }
 
+/// The engine's line for a baseline that starts running.
+fn running_label(check: &str, tests: &[String]) -> String {
+    match tests.len() {
+        0 => format!("Running baseline: {check}"),
+        1 => format!("Running baseline: {check}, only the failing test"),
+        count => format!("Running baseline: {check}, only the {count} failing tests"),
+    }
+}
+
+/// The failing tests a baseline of `check` can rerun by name, from the
+/// findings of its failed run (spec 109 D3): `None` when the whole check must
+/// rerun. Only a Rust test runner whose every error is a parsed test failure
+/// with a plain path name qualifies. A compile error, an unparsed (generic)
+/// failure, a doctest (its name is not an identifier path) or a command that
+/// already passes arguments to the test binaries, or is more than one
+/// command, reruns whole. Warnings are ignored: the narrowed run builds the
+/// same targets and prints them again.
+fn failing_tests(check: &CheckId, findings: &[FindingEvidence]) -> Option<Vec<String>> {
+    let command = check.command.as_str();
+    if !is_rust_test_command(command)
+        || command
+            .split_whitespace()
+            .any(|token| token == "--" || token.starts_with("--no-tests"))
+        || command.contains(['&', '|', ';', '<', '>', '$', '`', '(', ')', '\n', '\\'])
+    {
+        return None;
+    }
+    let mut names = BTreeSet::new();
+    for finding in findings {
+        if finding.severity() != Severity::Error {
+            continue;
+        }
+        if finding.source() != FindingSource::Test {
+            return None;
+        }
+        let name = failed_test_name(finding.summary()).filter(|name| is_plain_test_name(name))?;
+        names.insert(name.to_string());
+    }
+    (!names.is_empty()).then(|| names.into_iter().collect())
+}
+
+/// A test path such as `tests::parses_a_header`: `::`-separated Rust
+/// identifiers, so it is passed to the test binary as one plain argument.
+fn is_plain_test_name(name: &str) -> bool {
+    name.split("::").all(|segment| {
+        segment
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && segment
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    })
+}
+
+/// `command` narrowed to the named tests. `--exact` makes each name match
+/// only that test, never a test whose name merely contains it; libtest and
+/// nextest both accept it after `--`.
+///
+/// A test the task added does not exist in the task-start tree, so the
+/// narrowed run may match nothing. libtest then passes (exit 0), but nextest
+/// fails with `error: no tests to run` (exit 4, nextest 0.9.144), which would
+/// record the baseline as failed and turn a new regression into `worsened`.
+/// `--no-tests=pass` makes nextest pass an empty run as libtest does.
+fn targeted_command(command: &str, tests: &[String]) -> String {
+    let command = command.trim_end();
+    let no_tests = if is_nextest_command(command) {
+        " --no-tests=pass"
+    } else {
+        ""
+    };
+    format!("{command}{no_tests} -- --exact {}", tests.join(" "))
+}
+
+/// Whether an earlier baseline already answers for a failure that needs
+/// `wanted` (the failing tests, or `None` for the whole check). A declined,
+/// unavailable or uncertain baseline answers the same way whatever fails; one
+/// that ran answers only for the tests it ran.
+fn baseline_covers(
+    baseline: &CheckBaseline,
+    covered: &[String],
+    wanted: Option<&[String]>,
+) -> bool {
+    if !matches!(
+        baseline,
+        CheckBaseline::Passed | CheckBaseline::Failed { .. }
+    ) || covered.is_empty()
+    {
+        return true;
+    }
+    wanted.is_some_and(|wanted| wanted.iter().all(|name| covered.contains(name)))
+}
+
 /// The engine's line for a finished baseline.
 fn finished_label(result: &str, check: &str) -> String {
     match result {
@@ -1000,3 +1203,136 @@ fn unavailable(check: &CheckId, termination: CheckTermination) -> CheckBaseline 
 /// Exposed as a value rather than a second lookup rule so spec 102 Task 3
 /// classifies against exactly the state that was recorded.
 pub type TaskBaselines = BTreeMap<CheckId, CheckBaseline>;
+
+#[cfg(test)]
+mod targeted_rerun_tests {
+    use super::*;
+    use crate::finding::{Finding, FindingDraft};
+
+    fn evidence(source: FindingSource, severity: Severity, summary: &str) -> FindingEvidence {
+        FindingEvidence::from_finding(&Finding::new(
+            FindingDraft {
+                source,
+                severity,
+                summary: summary.to_string(),
+                details: None,
+                range: None,
+                code: None,
+            },
+            &SecretScanner::default(),
+        ))
+    }
+
+    fn test_failure(summary: &str) -> FindingEvidence {
+        evidence(FindingSource::Test, Severity::Error, summary)
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn rust_test_failures_rerun_by_name_for_both_runners() {
+        let findings = [
+            test_failure("tests::b failed"),
+            test_failure("tests::a: assertion `left == right` failed"),
+            // A warning is printed again by the narrowed run; it does not
+            // stop narrowing.
+            evidence(
+                FindingSource::Compiler,
+                Severity::Warning,
+                "unused variable",
+            ),
+        ];
+        for command in [
+            "cargo test",
+            "cargo test -p demo --no-fail-fast",
+            "cargo nextest run -p demo --test a",
+        ] {
+            assert_eq!(
+                failing_tests(&CheckId::new("", command), &findings),
+                Some(names(&["tests::a", "tests::b"])),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            targeted_command(
+                "cargo nextest run -p demo",
+                &names(&["tests::a", "tests::b"])
+            ),
+            "cargo nextest run -p demo --no-tests=pass -- --exact tests::a tests::b"
+        );
+        assert_eq!(
+            targeted_command("cargo test -p demo", &names(&["tests::a"])),
+            "cargo test -p demo -- --exact tests::a",
+            "libtest already passes an empty run"
+        );
+    }
+
+    #[test]
+    fn anything_else_reruns_the_whole_check() {
+        let a = test_failure("tests::a failed");
+        let cases: [(&str, Vec<FindingEvidence>); 8] = [
+            // Not a Rust test runner.
+            ("npm test", vec![a.clone()]),
+            // Already passes arguments to the test binaries.
+            ("cargo test -- --nocapture", vec![a.clone()]),
+            // Sets its own empty-run rule, which a narrowed run must not
+            // inherit.
+            ("cargo nextest run --no-tests=fail", vec![a.clone()]),
+            // More than one command.
+            ("cargo test && echo done", vec![a.clone()]),
+            // A compile error is not a test failure.
+            (
+                "cargo test",
+                vec![
+                    a.clone(),
+                    evidence(FindingSource::Compiler, Severity::Error, "mismatched types"),
+                ],
+            ),
+            // An unparsed failure names no test.
+            (
+                "cargo test",
+                vec![evidence(
+                    FindingSource::Command,
+                    Severity::Error,
+                    "cargo test: Killed: 9",
+                )],
+            ),
+            // A doctest's name is not a plain test path.
+            (
+                "cargo test",
+                vec![test_failure("src/lib.rs - add (line 3) failed")],
+            ),
+            // Nothing failed by name.
+            ("cargo test", Vec::new()),
+        ];
+        for (command, findings) in cases {
+            assert_eq!(
+                failing_tests(&CheckId::new("", command), &findings),
+                None,
+                "{command}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_baseline_covers_only_the_tests_it_ran() {
+        let ran = names(&["tests::a", "tests::b"]);
+        let passed = CheckBaseline::Passed;
+        assert!(baseline_covers(&passed, &ran, Some(&names(&["tests::a"]))));
+        assert!(!baseline_covers(
+            &passed,
+            &ran,
+            Some(&names(&["tests::a", "tests::c"]))
+        ));
+        assert!(!baseline_covers(&passed, &ran, None), "a whole-check need");
+        assert!(
+            baseline_covers(&passed, &[], None),
+            "a whole-check baseline"
+        );
+        assert!(baseline_covers(&passed, &[], Some(&names(&["tests::c"]))));
+        // A declined or unavailable baseline answers the same whatever fails.
+        assert!(baseline_covers(&CheckBaseline::Declined, &ran, None));
+    }
+}

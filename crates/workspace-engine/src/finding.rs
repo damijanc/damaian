@@ -14,12 +14,26 @@ use std::path::Path;
 
 mod biome;
 mod browser;
+mod nextest;
 mod repair;
 mod rust_diagnostics;
 mod rust_test;
 
 pub use browser::findings_from_web_record;
 pub use repair::{Exclusion, ExclusionReason, RepairRequest};
+pub use rust_test::failed_test_name;
+
+/// Whether `command` runs Rust tests through a runner whose failures are
+/// parsed per test (`cargo test` or `cargo nextest run`), so a failure's test
+/// findings name the tests that failed (spec 109 D3).
+pub fn is_rust_test_command(command: &str) -> bool {
+    rust_test::RustTestParser.matches(command) || nextest::is_nextest_run(command)
+}
+
+/// Whether `command` is `cargo nextest run` (or its `r` alias).
+pub fn is_nextest_command(command: &str) -> bool {
+    nextest::is_nextest_run(command)
+}
 
 pub const MAX_SUMMARY_CHARS: usize = 240;
 pub const MAX_DETAILS_BYTES: usize = 4096;
@@ -322,6 +336,7 @@ pub fn default_parsers() -> Vec<Box<dyn FindingParser>> {
     vec![
         Box::new(rust_diagnostics::RustDiagnosticsParser),
         Box::new(rust_test::RustTestParser),
+        Box::new(nextest::NextestParser),
         Box::new(biome::BiomeParser),
     ]
 }

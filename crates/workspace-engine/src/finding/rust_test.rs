@@ -81,6 +81,17 @@ pub(super) fn parse_test_failures(stdout: &str) -> Vec<FindingDraft> {
 
 fn test_draft(name: &str, section: Option<&[&str]>) -> FindingDraft {
     let body = section.map_or(&[][..], |lines| &lines[1..]);
+    named_test_draft(
+        name,
+        body,
+        section.map(|lines| lines.join("\n").trim_end().to_string()),
+    )
+}
+
+/// One failed test as a finding. The summary is `name: message`, or `name
+/// failed` without one; [`failed_test_name`] reads the name back, so the two
+/// change together.
+pub(super) fn named_test_draft(name: &str, body: &[&str], details: Option<String>) -> FindingDraft {
     FindingDraft {
         source: FindingSource::Test,
         severity: Severity::Error,
@@ -88,10 +99,20 @@ fn test_draft(name: &str, section: Option<&[&str]>) -> FindingDraft {
             Some(message) => format!("{name}: {message}"),
             None => format!("{name} failed"),
         },
-        details: section.map(|lines| lines.join("\n").trim_end().to_string()),
+        details,
         range: failure_location(body).or_else(|| doctest_location(name)),
         code: None,
     }
+}
+
+/// The test a failed-test finding's summary names, as [`named_test_draft`]
+/// wrote it. A test name never contains `": "`; a doctest's does not either.
+pub fn failed_test_name(summary: &str) -> Option<&str> {
+    let name = match summary.split_once(": ") {
+        Some((name, _)) => name,
+        None => summary.strip_suffix(" failed")?,
+    };
+    (!name.is_empty()).then_some(name)
 }
 
 /// libtest's `#[should_panic]` notes say why the test failed better than the
@@ -482,8 +503,8 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         }
     }
 
-    /// `cargo nextest run` is out of scope (`context.md` §10): no parser
-    /// matches it, so a failure reaches the generic fallback.
+    /// `cargo nextest run` has its own parser (`nextest.rs`, spec 109 Task
+    /// 4); this one does not claim it.
     #[test]
     fn does_not_match_nextest_or_other_commands() {
         for command in [
@@ -506,6 +527,24 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             &SecretScanner::default(),
         );
         assert_eq!(findings.len(), 1, "{findings:#?}");
-        assert_eq!(findings[0].source(), FindingSource::Command);
+        assert_eq!(findings[0].source(), FindingSource::Test);
+        assert_eq!(findings[0].summary(), "tests::panics_with_message failed");
+    }
+
+    /// The name a failed-test summary carries, in every shape
+    /// `named_test_draft` writes, and nothing from any other summary shape.
+    #[test]
+    fn a_failed_test_summary_names_its_test() {
+        for draft in parse_test_failures(FAILURES_STDOUT) {
+            let name = failed_test_name(&draft.summary).expect("a name");
+            assert!(
+                draft.summary == format!("{name} failed")
+                    || draft.summary.starts_with(&format!("{name}: ")),
+                "{}",
+                draft.summary
+            );
+        }
+        assert_eq!(failed_test_name("tests::lost failed"), Some("tests::lost"));
+        assert_eq!(failed_test_name("cargo test exited with code 101"), None);
     }
 }

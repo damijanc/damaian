@@ -2080,6 +2080,7 @@ fn mark_baselines_passed(
                 session_id,
                 &VerificationEvent::Baseline {
                     task_id: task_id.to_string(),
+                    tests: Vec::new(),
                     check,
                     baseline: workspace_engine::CheckBaseline::Passed,
                 },
@@ -2104,6 +2105,7 @@ fn mark_baselines_declined(
                 session_id,
                 &VerificationEvent::Baseline {
                     task_id: task_id.to_string(),
+                    tests: Vec::new(),
                     check,
                     baseline: workspace_engine::CheckBaseline::Declined,
                 },
@@ -5480,6 +5482,7 @@ fn a_matching_failed_baseline_is_pre_existing_and_starts_no_repair() {
             &session,
             &VerificationEvent::Baseline {
                 task_id: patch_task.clone(),
+                tests: Vec::new(),
                 check: record.check.clone(),
                 baseline: CheckBaseline::Failed {
                     termination: record.termination.clone(),

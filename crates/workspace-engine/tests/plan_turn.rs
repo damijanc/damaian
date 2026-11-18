@@ -3915,6 +3915,7 @@ fn uncertain_repair_fixture(
             &proposed.session.id,
             &VerificationEvent::Baseline {
                 task_id: proposed.task.id.clone(),
+                tests: Vec::new(),
                 check: CheckId::new("crates/foo", "cargo test"),
                 baseline: CheckBaseline::Uncertain,
             },

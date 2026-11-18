@@ -115,6 +115,8 @@ fn is_cargo_summary(message: &str) -> bool {
         || message.starts_with("build failed")
         || message.starts_with("test failed, to rerun pass ")
         || message.starts_with("doctest failed, to rerun pass ")
+        // nextest's closing line after its own summary of the failed tests.
+        || message == "test run failed"
         || TARGETS_FAILED.is_match(message)
         || GENERATED.is_match(message)
         || EMITTED.is_match(message)

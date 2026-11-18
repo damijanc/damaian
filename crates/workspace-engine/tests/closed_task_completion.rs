@@ -1021,6 +1021,7 @@ mod pre_existing {
     fn baseline_event(baseline: CheckBaseline) -> VerificationEvent {
         VerificationEvent::Baseline {
             task_id: TASK.to_string(),
+            tests: Vec::new(),
             check: root(),
             baseline,
         }

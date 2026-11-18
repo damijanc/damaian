@@ -4409,17 +4409,7 @@ impl ChatOrchestrator {
                 // failure with a provenance.
                 continue;
             };
-            let evidence = match &run.outcome {
-                CheckOutcome::Ran { marker_id, .. } => findings
-                    .iter()
-                    .filter(|finding| {
-                        finding.origin_ref() == Some(marker_id.as_str())
-                            && finding.status() == FindingStatus::Open
-                    })
-                    .map(FindingEvidence::from_finding)
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
-            };
+            let evidence = run_evidence(&findings, &run.outcome);
             let result = PostPatchResult::new(check.clone(), termination, evidence);
             let classification = if !baselines.contains_key(check) && required.contains(check) {
                 let marker = crate::verification::CheckBaseline::Uncertain;
@@ -4466,7 +4456,12 @@ impl ChatOrchestrator {
         // chain takes one now, on the task-start tree, before anything
         // classifies it. A passing check never does. One that needs approval
         // parks the verification on the baseline card.
-        let failed = checks_needing_failure_baseline(&state);
+        let failed = checks_needing_failure_baseline(
+            &state,
+            &self
+                .session_store
+                .read_findings(&session.id, repository_root)?,
+        );
         if !failed.is_empty() {
             let cancel = sink.cancel;
             let on_progress = &mut *sink.on_progress;
@@ -17073,23 +17068,49 @@ const BUILD_CHECK_CARD_NOTE: &str = "Damaian compiles each change before anythin
 /// result: what a failure-time baseline is for (spec 109 D1). A passed,
 /// skipped or declined check, an environment failure, a run the user
 /// cancelled and a browser check (which has no command to rerun) take none.
-fn checks_needing_failure_baseline(state: &crate::verification::VerificationState) -> Vec<CheckId> {
+/// Each comes with its run's open findings, which decide whether only the
+/// failing tests rerun (spec 109 D3).
+fn checks_needing_failure_baseline(
+    state: &crate::verification::VerificationState,
+    findings: &[crate::finding::Finding],
+) -> Vec<crate::baseline::FailedCheck> {
     state
         .selected
         .iter()
         .filter(|check| !check.is_browser())
-        .filter(|check| {
-            state.checks.get(*check).is_some_and(|run| {
+        .filter_map(|check| {
+            let run = state.checks.get(check).filter(|run| {
                 matches!(run.outcome, CheckOutcome::Ran { .. })
                     && !run.outcome.is_passed()
                     && run.outcome.termination().is_some_and(|termination| {
                         !termination.is_environment_failure()
                             && termination != CheckTermination::Cancelled
                     })
+            })?;
+            Some(crate::baseline::FailedCheck {
+                check: check.clone(),
+                findings: run_evidence(findings, &run.outcome),
             })
         })
-        .cloned()
         .collect()
+}
+
+/// The open findings a check run produced, as provenance compares them.
+fn run_evidence(
+    findings: &[crate::finding::Finding],
+    outcome: &CheckOutcome,
+) -> Vec<FindingEvidence> {
+    match outcome {
+        CheckOutcome::Ran { marker_id, .. } => findings
+            .iter()
+            .filter(|finding| {
+                finding.origin_ref() == Some(marker_id.as_str())
+                    && finding.status() == FindingStatus::Open
+            })
+            .map(FindingEvidence::from_finding)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// A baseline's progress as the turn's status line shows it: the running
