@@ -6521,9 +6521,7 @@ function clearWaitingIndicator() {
 function showWaitingIndicator(row, label) {
   clearWaitingIndicator();
   row.dataset.state = "waiting";
-  for (const part of row.querySelectorAll(
-    ".turn-indicator-output, .turn-indicator-total, .turn-indicator-stop",
-  )) {
+  for (const part of row.querySelectorAll(".turn-indicator-output, .turn-indicator-total")) {
     part.remove();
   }
   const text = row.querySelector(".turn-indicator-label");
@@ -6558,11 +6556,12 @@ function restoreWaitingIndicator(body, label) {
 }
 
 // A live "something is happening" row inside an assistant bubble: the current
-// activity with its own clock, the turn's total beside it, and a Stop button.
-// Every turn has one (spec 109 D8): `onStop` is the main composer turn's own
-// abort; any other stream stops through the shell's session-work cancel,
-// which every streamed turn's lane carries. Its state is a running action
-// (D7), so the composer line and a card's running row say the same thing.
+// activity with its own clock and the turn's total beside it. Every turn is
+// stoppable (spec 109 D8) through the composer's one Stop (spec 112
+// requirement 3): `onStop` is the main composer turn's own abort; any other
+// stream stops through the shell's session-work cancel, which every streamed
+// turn's lane carries. Its state is a running action (D7), so the composer
+// line and a card's running row say the same thing.
 // `false` is only the legacy one-shot patch request, which has no lane to
 // cancel (see `proposePatchFromChat`).
 //
@@ -6606,21 +6605,12 @@ function startTurnIndicator(target, onStop = null) {
   total.setAttribute("aria-hidden", "true");
 
   row.append(dot, label, elapsed, total, output);
+  // Spec 112 requirement 3: the row has no Stop of its own. The composer's
+  // button stops this action (`composerStopTarget`), so there is one Stop.
   const running = beginRunningAction({ stop: onStop || null });
-  let stop = null;
-  if (onStop !== false) {
-    stop = document.createElement("button");
-    stop.type = "button";
-    stop.className = "turn-indicator-stop";
-    stop.textContent = "Stop";
-    stop.addEventListener("click", () => {
-      stop.disabled = true;
-      label.textContent = "Stopping";
-      running.stop();
-    });
-    row.append(stop);
-  } else {
+  if (onStop === false) {
     running.unstoppable = true;
+    running.unstoppableReason = "This request cannot be stopped; it ends on its own";
   }
   target.body.after(row);
 
@@ -6649,11 +6639,19 @@ function startTurnIndicator(target, onStop = null) {
 
   let done = false;
   let streaming = false;
+  // Stop arrives from the composer, not from this row, so the row learns of
+  // it through the running state.
+  const showStopping = () => {
+    if (!done && running.stopRequested) label.textContent = "Stopping";
+  };
+  runningListeners.add(showStopping);
 
   return {
     // Read by the usage row, so the turn's duration is the clock the user
     // watched rather than a second timing that could disagree with it.
     startedAt,
+    // The composer's Stop for a turn this window streams (`currentTurn`).
+    action: running,
     phase(payload) {
       if (done) return;
       if (payload.phase === "output") {
@@ -6711,6 +6709,7 @@ function startTurnIndicator(target, onStop = null) {
       if (done) return;
       done = true;
       clearInterval(timer);
+      runningListeners.delete(showStopping);
       running.end();
       // A turn the user stopped ends however the route reports it; the line
       // says it was stopped (spec 109 D8). A pause still says what it waits on.
@@ -6720,7 +6719,6 @@ function startTurnIndicator(target, onStop = null) {
         label.textContent = "Stopped by you";
         elapsed.remove();
         total.remove();
-        stop?.remove();
         return;
       }
       // Spec 107 requirement 3: a turn paused on the user is still alive, so
@@ -12751,7 +12749,7 @@ function createQuestionCard(question, questionRepo, { answered = null, onAnswer 
     let assistantText = "";
     let streamError = null;
     chatSubmitting = true;
-    setComposerBusy(true);
+    setComposerBusy();
     try {
       await streamResumeAnswerRequest(
         {
@@ -12802,7 +12800,7 @@ function createQuestionCard(question, questionRepo, { answered = null, onAnswer 
     } finally {
       indicator.finish("failed");
       chatSubmitting = false;
-      setComposerBusy(false);
+      setComposerBusy();
     }
     if (streamError) {
       // The card stays open: the engine puts the pause back on a refusal, so a
@@ -12941,7 +12939,7 @@ function createFetchApproval(proposal, proposalRepo) {
     let assistantText = "";
     let streamError = null;
     chatSubmitting = true;
-    setComposerBusy(true);
+    setComposerBusy();
     try {
       await streamResumeFetchRequest(
         {
@@ -12993,7 +12991,7 @@ function createFetchApproval(proposal, proposalRepo) {
     } finally {
       indicator.finish("failed");
       chatSubmitting = false;
-      setComposerBusy(false);
+      setComposerBusy();
     }
     if (streamError) {
       // The engine puts the pause back on a refusal, so a second attempt is
@@ -13903,12 +13901,13 @@ function syncComposerDecision() {
     if (composerQuestionLock === null) composerQuestionLock = field.placeholder;
     field.disabled = true;
     field.placeholder = "Answer the question above";
-    button.disabled = true;
+    // A Stop for work elsewhere in the session stays usable (spec 112).
+    if (!composerStopShown) button.disabled = true;
   } else if (composerQuestionLock !== null) {
     field.disabled = false;
     field.placeholder = composerQuestionLock;
     composerQuestionLock = null;
-    button.disabled = false;
+    if (!composerStopShown) button.disabled = false;
   }
 }
 
@@ -15929,12 +15928,12 @@ function syncInvisibleWork() {
   const visible =
     Boolean(info) && !runningTurnStream(currentSessionId) && !runningActionFor(currentSessionId);
   line.hidden = !visible;
-  const stopButton = $("composer-invisible-work-stop-btn");
+  // Its Stop is the composer's button (spec 112 requirement 3).
+  syncComposerStop();
   if (visible) {
     const seconds = Math.round((info.elapsedMs || 0) / 1000);
     $("composer-invisible-work-label").textContent =
       `Working: ${info.label} · ${seconds}s — not visible here, but it blocks your next message`;
-    stopButton.hidden = !info.cancellable;
   }
   if (invisibleWorkWasVisible && !visible) {
     // The server stopped reporting it; this window never saw a `done` for
@@ -16703,24 +16702,21 @@ function syncRunningState() {
   }
   for (const listener of runningListeners) listener();
   syncComposerRunning();
+  syncComposerStop();
 }
 
 // The composer line (observation 89): while this session runs something, it
-// says what, not the decision that started it.
+// says what, not the decision that started it. Its Stop is the composer's
+// button (spec 112 requirement 3).
 function syncComposerRunning() {
   const line = $("composer-running");
   if (!line) return;
   const action = workerView ? null : runningActionFor(currentSessionId);
-  // The main composer turn has its own Stop in the send button.
+  // The main composer turn's line is its status row in the turn.
   const visible = Boolean(action) && !chatSubmitting;
   const wasVisible = !line.hidden;
   line.hidden = !visible;
-  if (visible) {
-    $("composer-running-label").textContent = runningActionText(action);
-    const stop = $("composer-running-stop-btn");
-    stop.hidden = Boolean(action.unstoppable);
-    stop.disabled = action.stopRequested;
-  }
+  if (visible) $("composer-running-label").textContent = runningActionText(action);
   if (visible !== wasVisible) {
     syncComposerDecision();
     syncInvisibleWork();
@@ -16757,15 +16753,101 @@ function createRunningRow(action, { stopLabel = "Cancel" } = {}) {
   return row;
 }
 
-function setComposerBusy(busy) {
+// Spec 112 requirement 3: the composer's Send is the one Stop. What it stops
+// in the current session, through the path that work needs: the abort of a
+// turn this window streams, else the running action's own stop (a resumed
+// stream, an answered question or fetch decision, a recovered command), else
+// the shell's session-work cancel for work this window never streamed. Null
+// when nothing runs: the button is Send. `stop` is absent for work that cannot
+// be stopped; `reason` then says why, as the disabled button's title.
+function composerStopTarget() {
+  if (workerView) return null;
+  if (currentTurn) {
+    const action = currentTurn.action;
+    if (action?.stopRequested) return { reason: "Stopping…" };
+    return { stop: () => (action ? action.stop() : stopCurrentTurn()) };
+  }
+  const action = runningActionFor(currentSessionId);
+  if (action) {
+    if (action.unstoppable) {
+      return { reason: action.unstoppableReason || "This work cannot be stopped" };
+    }
+    if (action.stopRequested) return { reason: "Stopping…" };
+    return { stop: () => action.stop() };
+  }
+  const work = currentSessionId ? workingSessionsById.get(currentSessionId) : null;
+  if (work) {
+    if (!work.cancellable) return { reason: "This work cannot be stopped; it ends on its own" };
+    if (stoppingWorkFor === currentSessionId) return { reason: "Stopping…" };
+    const sessionId = currentSessionId;
+    return { stop: () => void stopWorkFromComposer(sessionId) };
+  }
+  // Sent, but the stream has not begun: nothing exists to stop yet.
+  if (chatSubmitting) return { reason: "Starting — nothing to stop yet" };
+  return null;
+}
+
+// The session whose work-cancel the composer has in flight, so a second click
+// or Escape does not post it again.
+let stoppingWorkFor = null;
+
+async function stopWorkFromComposer(sessionId) {
+  stoppingWorkFor = sessionId;
+  syncComposerStop();
+  try {
+    await stopSessionWork(sessionId);
+    await pollWorkingSessions();
+  } finally {
+    stoppingWorkFor = null;
+    syncComposerStop();
+  }
+}
+
+// Click and Escape both come here. True when the button is a Stop, whether or
+// not it could stop anything, so neither falls through to sending.
+function stopFromComposer() {
+  const target = composerStopTarget();
+  if (!target) return false;
+  target.stop?.();
+  return true;
+}
+
+// Whether the button shows Stop, so going back to Send happens once rather
+// than on every running-state tick (it would undo the question lock).
+let composerStopShown = false;
+
+function syncComposerStop() {
   const button = $("ask-btn");
-  button.classList.toggle("is-stopping", busy);
-  button.setAttribute("aria-label", busy ? "Stop generating" : "Send message");
-  // Deliberately left enabled while busy: it is the Stop control now.
+  if (workerView) {
+    // The worker's own composer owns the button (`renderWorkerComposer`).
+    if (composerStopShown) button.classList.remove("is-stopping");
+    composerStopShown = false;
+    return;
+  }
+  const target = composerStopTarget();
+  if (target) {
+    button.classList.add("is-stopping");
+    button.setAttribute("aria-label", "Stop");
+    button.title = target.reason || "Stop (Esc)";
+    button.disabled = !target.stop;
+    composerStopShown = true;
+    return;
+  }
+  if (!composerStopShown) return;
+  composerStopShown = false;
+  button.classList.remove("is-stopping");
+  button.setAttribute("aria-label", "Send message");
+  button.title = "";
   button.disabled = false;
+  // A pending question takes the button back once nothing runs.
+  syncComposerDecision();
+}
+
+function setComposerBusy() {
   // "Fix selected" and the repo bar's action follow `chatSubmitting`, which
   // callers set before this.
   renderFindingsPanel();
+  syncComposerStop();
   // Last: a pending question takes the button back once nothing runs.
   syncComposerDecision();
 }
@@ -16822,7 +16904,7 @@ async function sendChatPrompt(options = {}) {
     prompt = promptOverride || $("chat-prompt").value.trim();
     if (!prompt) throw new Error("Prompt is required");
     chatSubmitting = true;
-    setComposerBusy(true);
+    setComposerBusy();
     await ensureDesktopApiReady();
     const chatRepo = requireRepo();
     const userMessage = appendChatMessage("user", prompt);
@@ -16845,6 +16927,7 @@ async function sendChatPrompt(options = {}) {
     const controller = new AbortController();
     currentTurn = { controller, stopped: false };
     indicator = startTurnIndicator(assistantMessage, stopCurrentTurn);
+    currentTurn.action = indicator.action;
 
     let assistantText = "";
 
@@ -16940,7 +17023,7 @@ async function sendChatPrompt(options = {}) {
   } finally {
     chatSubmitting = false;
     currentTurn = null;
-    setComposerBusy(false);
+    setComposerBusy();
     // Whatever the outcome, an agentic turn may have changed files.
     void refreshRepoBar();
   }
@@ -16954,13 +17037,13 @@ async function askAgainFromExhausted(sessionId, taskId) {
     await loadSession(sessionId);
   }
   chatSubmitting = true;
-  setComposerBusy(true);
+  setComposerBusy();
   await ensureDesktopApiReady();
   const chatRepo = requireRepo();
   const assistantMessage = appendChatMessage("assistant", "");
   const indicator = startTurnIndicator(assistantMessage, stopCurrentTurn);
   const controller = new AbortController();
-  currentTurn = { controller, stopped: false };
+  currentTurn = { controller, stopped: false, action: indicator.action };
   let assistantText = "";
   let streamError = null;
   try {
@@ -17035,43 +17118,25 @@ async function askAgainFromExhausted(sessionId, taskId) {
   } finally {
     chatSubmitting = false;
     currentTurn = null;
-    setComposerBusy(false);
+    setComposerBusy();
     void refreshRepoBar();
   }
 }
 
 $("composer-decision-btn").addEventListener("click", focusPendingDecision);
 
-$("composer-running-stop-btn").addEventListener("click", () => {
-  runningActionFor(currentSessionId)?.stop();
-});
-
-$("composer-invisible-work-stop-btn").addEventListener("click", async () => {
-  const button = $("composer-invisible-work-stop-btn");
-  button.disabled = true;
-  try {
-    await api("/api/session-work-cancel", form({ session_id: currentSessionId }));
-    await pollWorkingSessions();
-  } catch (error) {
-    toast(error.message);
-  } finally {
-    button.disabled = false;
-  }
-});
-
+// Spec 112 requirement 3: the button is Send, or the one Stop while anything
+// in this session runs (`composerStopTarget`). Steering stays on Enter.
 $("ask-btn").addEventListener("click", () => {
-  if (chatSubmitting) {
-    stopCurrentTurn();
-    return;
-  }
+  if (stopFromComposer()) return;
   void sendChatPrompt();
 });
 
 document.addEventListener("keydown", (event) => {
-  if (event.key !== "Escape" || !chatSubmitting) return;
+  if (event.key !== "Escape" || !composerStopTarget()) return;
   // Escape already closes dialogs and popovers; those keep priority.
   if (document.querySelector(".app-dialog-backdrop, .model-popover:not([hidden])")) return;
-  stopCurrentTurn();
+  stopFromComposer();
 });
 
 $("chat-prompt").addEventListener("input", autoGrowPrompt);

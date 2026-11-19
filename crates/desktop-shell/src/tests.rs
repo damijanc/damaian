@@ -2054,15 +2054,19 @@ fn app_js_shows_work_this_window_never_streamed() {
         "Send must refuse rather than repeat a 409 the shell already gave: {send}"
     );
 
+    let target = app_js_function("composerStopTarget");
     assert!(
-        super::APP_JS.contains(
-            r#"api("/api/session-work-cancel", form({ session_id: currentSessionId }));"#
-        ),
-        "the Stop button must cancel the session the banner names"
+        target.contains("workingSessionsById.get(currentSessionId)")
+            && target.contains("stopWorkFromComposer(sessionId)"),
+        "the composer's Stop must cancel the session the banner names: {target}"
+    );
+    assert!(
+        app_js_function("stopWorkFromComposer").contains("await stopSessionWork(sessionId);"),
+        "it cancels through the session-work route"
     );
 }
 
-/// Spec 109 D7/D8: every turn's status line has Stop, the composer line
+/// Spec 109 D7/D8: every turn is stoppable, the composer line
 /// and a check card's running row read the same running state, and the
 /// composer stops claiming a decision once it has been answered
 /// (observation 89).
@@ -2074,8 +2078,9 @@ fn app_js_gives_every_running_action_one_state_and_a_stop() {
         "a turn's line is a running action: {indicator}"
     );
     assert!(
-        indicator.contains("if (onStop !== false)"),
-        "only an explicit `false` leaves a line without Stop: {indicator}"
+        indicator.contains("if (onStop === false)")
+            && indicator.contains("running.unstoppable = true;"),
+        "only an explicit `false` makes a turn unstoppable: {indicator}"
     );
     // The one turn line without Stop is the legacy one-shot patch request.
     assert_eq!(
@@ -2113,6 +2118,86 @@ fn app_js_gives_every_running_action_one_state_and_a_stop() {
     assert!(
         invisible.contains("!runningActionFor(currentSessionId)"),
         "{invisible}"
+    );
+}
+
+/// Spec 112 requirement 3: the composer's Send is the one Stop. One function
+/// decides what it stops — this window's stream (abort), else the running
+/// action (a resumed stream, an answered question, a fetch decision), else
+/// work only the shell knows about (session-work cancel) — and click and
+/// Escape both go through it. The turn row and the composer lines build no
+/// Stop; unstoppable work leaves a disabled Stop that says why.
+#[test]
+fn app_js_has_one_stop_in_the_composer() {
+    let target = app_js_function("composerStopTarget");
+    let stream = target.find("if (currentTurn)").expect("stream first");
+    let action = target
+        .find("runningActionFor(currentSessionId)")
+        .expect("then the running action");
+    let work = target
+        .find("workingSessionsById.get(currentSessionId)")
+        .expect("then work this window never streamed");
+    assert!(stream < action && action < work, "{target}");
+    assert!(target.contains("action.stop()"), "{target}");
+    assert!(target.contains("action.unstoppableReason"), "{target}");
+    assert!(target.contains("if (!work.cancellable)"), "{target}");
+
+    let sync = app_js_function("syncComposerStop");
+    assert!(sync.contains("button.disabled = !target.stop;"), "{sync}");
+    assert!(sync.contains("button.title = target.reason"), "{sync}");
+    for caller in ["syncRunningState", "syncInvisibleWork", "setComposerBusy"] {
+        assert!(
+            app_js_function(caller).contains("syncComposerStop();"),
+            "{caller} must keep the button in step"
+        );
+    }
+
+    // One Stop site: click and Escape share `stopFromComposer`, and nothing
+    // else calls the stream's abort directly.
+    let app = super::APP_JS;
+    assert_eq!(app.matches("stopFromComposer();").count(), 1, "Escape");
+    assert!(app.contains("if (stopFromComposer()) return;"), "click");
+    assert_eq!(
+        app.matches("stopCurrentTurn();").count(),
+        0,
+        "nothing calls the stream's abort directly"
+    );
+    assert!(
+        target.contains("action ? action.stop() : stopCurrentTurn()"),
+        "{target}"
+    );
+    // The question answer and fetch decision streams have running actions
+    // with the default (cancel-route) stop, so the composer reaches them.
+    for flow in ["createQuestionCard", "createFetchApproval"] {
+        assert!(
+            app_js_function(flow).contains("startTurnIndicator(assistantMessage);"),
+            "{flow}"
+        );
+    }
+
+    let indicator = app_js_function("startTurnIndicator");
+    assert!(
+        !indicator.contains("createElement(\"button\")"),
+        "the turn row builds no button: {indicator}"
+    );
+    assert!(
+        indicator.contains("runningListeners.add(showStopping)"),
+        "{indicator}"
+    );
+    for gone in [
+        "turn-indicator-stop",
+        "composer-running-stop-btn",
+        "composer-invisible-work-stop-btn",
+    ] {
+        assert!(!app.contains(gone), "app.js names {gone}");
+        assert!(!super::INDEX_HTML.contains(gone), "index.html names {gone}");
+        assert!(!super::STYLE_CSS.contains(gone), "style.css names {gone}");
+    }
+
+    // Steering is unchanged: Enter goes to `sendChatPrompt`, which delivers a
+    // note into a running turn.
+    assert!(
+        app_js_function("sendChatPrompt").contains("return sendSteeringNote(working.sessionId);")
     );
 }
 
@@ -2339,7 +2424,6 @@ fn app_js_status_line_waits_with_the_engine_label_until_the_turn_ends() {
     assert!(finish.contains("showWaitingIndicator(row, pendingDecision.decision.statusLabel"));
     let show = app_js_function("showWaitingIndicator");
     assert!(show.contains("row.dataset.state = \"waiting\""));
-    assert!(show.contains(".turn-indicator-stop"));
     assert!(show.contains("formatClock(Date.now() - entry.since)"));
     for settled in ["settlePendingDecision", "resetPendingDecision"] {
         assert!(

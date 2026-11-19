@@ -1478,7 +1478,7 @@ button:disabled {
   font-weight: 500;
 }
 
-/* Spec 109 D7: what this session is running, with its Stop. */
+/* Spec 109 D7: what this session is running. */
 .composer-running {
   border-color: var(--line);
   background: var(--surface-soft);
@@ -5236,13 +5236,6 @@ body.worker-view #chat-model-menu {
   color: var(--muted);
 }
 
-.turn-indicator-stop {
-  margin-left: auto;
-  min-width: 0;
-  padding: 2px 10px;
-  font-size: 12px;
-}
-
 .turn-indicator-action {
   margin-left: auto;
   min-width: 0;
@@ -5856,8 +5849,9 @@ body.worker-view #chat-model-menu {
   }
 }
 
-/* While a turn is in flight the send button is the Stop control: a square
-   replaces the arrow, and it stays enabled. */
+/* While anything in the session runs the send button is the one Stop (spec
+   112): a square replaces the arrow. It is disabled only for work that cannot
+   be stopped, with the reason in its title. */
 .send-button.is-stopping {
   background: var(--warn, #b8791f);
 }
