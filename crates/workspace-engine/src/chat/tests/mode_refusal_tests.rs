@@ -1153,6 +1153,27 @@ fn a_web_diagnostic_approved_after_switching_to_plan_is_refused_at_resume() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// An MCP call waiting for approval is a decision, not a crash: like every
+/// other approval pause, its marker is finished `awaiting_approval`, so
+/// recovery never reports a call that was never sent as an unknown outcome.
+#[test]
+fn an_mcp_call_waiting_for_approval_leaves_no_dangling_marker() {
+    let repo = temp_repo("mcp-pause-marker");
+    let (engine, marker) = engine_with_mcp(&repo, true);
+    let session = session_in(&engine, &repo, SessionMode::Code);
+
+    let mut adapter = calls_then_answer(vec![call("call_1", "mcp__fake__echo", "{}")]);
+    turn(&engine, &repo, &session, &mut adapter)
+        .command_proposal
+        .expect("the server requires approval");
+
+    assert!(!marker.exists(), "the MCP call reached the server");
+    let dangling = engine.session_store.dangling_actions(&session).unwrap();
+    assert!(dangling.is_empty(), "{dangling:?}");
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 // Point 9.
 #[test]
 fn an_mcp_call_approved_after_switching_to_ask_is_refused_at_resume() {

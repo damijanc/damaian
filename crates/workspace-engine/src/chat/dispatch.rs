@@ -940,6 +940,11 @@ impl ChatOrchestrator {
                         proposal_id: proposal.id.clone(),
                     }],
                 );
+                // A clean stop for a human decision, not a crash: nothing was
+                // sent to the server, so the marker is finished rather than
+                // left for recovery to read as a remote call of unknown outcome.
+                self.session_store
+                    .finish_action(action_marker, "awaiting_approval")?;
                 return Ok(ControlFlow::Break(RoundStop {
                     response,
                     proposals: TurnProposals {
