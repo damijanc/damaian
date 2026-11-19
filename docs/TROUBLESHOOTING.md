@@ -1695,10 +1695,10 @@ turn has ended.
   while is still running. **Stop** ends the turn if you do not want to wait.
 - **It reads "Waiting for your answer / review / approval / decision".** The
   turn is paused on a card you have to answer. The card is the last thing in the
-  conversation, directly above the prompt box, and the line above the prompt box
+  conversation, directly above the prompt box, and, while the card is scrolled out of view, the line above the prompt box
   names it ("Review the patch", "Approve 2 checks", …); **Show** (or **Answer**
   for a question) scrolls to it. While a question is pending the prompt box is
-  disabled and reads "Answer the question above" — that is deliberate, not a
+  disabled and reads "Answer the question" — that is deliberate, not a
   frozen app. The plan step reads **waiting for you**. Nothing times out; the
   task waits, across reloads and restarts, until you decide.
 - **It reads "Running baseline: …".** A pre-apply baseline you approved is

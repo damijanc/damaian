@@ -1,6 +1,6 @@
 # Feature Spec: Status in One Place
 
-Status: In progress (specified 2026-11-19; started 2026-11-19, Tasks 1–2 done; six tasks in [tasks.md](tasks.md))
+Status: In progress (specified 2026-11-19; started 2026-11-19, Tasks 1–3 done; six tasks in [tasks.md](tasks.md))
 Order: 112 of 112
 Plan: none. Written from a UX investigation of the desktop shell on
 2026-11-19, checked against the running app the same day. The evidence, the

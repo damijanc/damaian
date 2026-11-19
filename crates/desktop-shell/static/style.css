@@ -1445,43 +1445,43 @@ button:disabled {
   display: none;
 }
 
-/* Spec 107: names the decision a paused turn waits on, right above the box the
-   user would otherwise type into. */
-.composer-decision {
+/* Spec 112 requirement 2: the one composer status slot. Working and Busy
+   elsewhere are informational (muted); Needs you takes the accent edge, since
+   something waits on the user. */
+.composer-status {
   display: flex;
   align-items: center;
   gap: 10px;
   margin-bottom: 8px;
-  border: 1px solid var(--accent);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--accent-soft);
+  background: var(--surface-soft);
   padding: 6px 8px 6px 12px;
   color: var(--ink);
   font-size: 13px;
-  font-weight: 600;
-}
-
-.composer-decision[hidden] {
-  display: none;
-}
-
-.composer-decision-label {
-  flex: 1;
-  min-width: 0;
-}
-
-/* Informational, not a decision: muted rather than the accent edge
-   `.composer-decision` uses for something waiting on the user. */
-.composer-invisible-work {
-  border-color: var(--line);
-  background: var(--surface-soft);
   font-weight: 500;
 }
 
-/* Spec 109 D7: what this session is running. */
-.composer-running {
-  border-color: var(--line);
-  background: var(--surface-soft);
+.composer-status[hidden] {
+  display: none;
+}
+
+.composer-status[data-kind="needs-you"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+
+.composer-status-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-status-clock {
+  color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
 
@@ -1526,20 +1526,6 @@ button:disabled {
 
 .pending-decision > .question-card:first-child {
   margin-top: 0;
-}
-
-.pending-decision-pointer {
-  display: block;
-  margin-top: 10px;
-  border: 0;
-  background: none;
-  padding: 0;
-  color: var(--accent);
-  font: inherit;
-  font-size: 12px;
-  font-weight: 600;
-  text-align: left;
-  cursor: pointer;
 }
 
 .pinned-context-files {

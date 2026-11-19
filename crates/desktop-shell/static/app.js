@@ -6561,7 +6561,7 @@ function restoreWaitingIndicator(body, label) {
 // requirement 3): `onStop` is the main composer turn's own abort; any other
 // stream stops through the shell's session-work cancel, which every streamed
 // turn's lane carries. Its state is a running action (D7), so the composer
-// line and a card's running row say the same thing.
+// slot and a card's running row say the same thing.
 // `false` is only the legacy one-shot patch request, which has no lane to
 // cancel (see `proposePatchFromChat`).
 //
@@ -6613,6 +6613,8 @@ function startTurnIndicator(target, onStop = null) {
     running.unstoppableReason = "This request cannot be stopped; it ends on its own";
   }
   target.body.after(row);
+  running.homes.add(row);
+  observeStatusHome(row);
 
   const startedAt = Date.now();
   // When the current activity began, and what it is. A repeated phase with the
@@ -13748,7 +13750,7 @@ function appendProposals(message, payload, repo) {
 
 // Spec 107: the decision a paused turn waits on, and the card that answers it.
 // The card is the last element of `#chat-log`, directly above the composer
-// (spec 93's rule for recovery cards), and the composer line names it. A
+// (spec 93's rule for recovery cards), and the composer slot names it. A
 // decided card stays where it is in the history (context D5).
 // `{ decision, card, frame }`.
 let pendingDecision = null;
@@ -13769,9 +13771,11 @@ const PENDING_DECISION_FIELDS = {
   fetch: "fetchProposal",
 };
 
-// `message` is the bubble that raised the decision; it keeps a one-line
-// pointer. `card` may be null (a reload that has no card for it): the composer
-// still names the decision, with nothing to focus.
+// `message` is the bubble that raised the decision (a plan bubble marks its
+// open step waiting). `card` may be null (a reload that has no card for it):
+// the composer slot still names the decision, with nothing to focus. The
+// bubble keeps no pointer to the card (spec 112 requirement 5): the slot is
+// the pointer, and only while the card is out of view.
 function setPendingDecision(message, card, decision, mount = card) {
   settlePendingDecision();
   if (!decision) return;
@@ -13789,27 +13793,16 @@ function setPendingDecision(message, card, decision, mount = card) {
     const shown = mount || card;
     frame.append(shown.closest(".message.question") || shown);
     $("chat-log").append(frame);
-    if (message?.body) appendPendingPointer(message.body, decision, frame);
   }
   const planMessage = message?.body ? message : null;
-  pendingDecision = { decision, card, frame, planMessage };
+  pendingDecision = { decision, card, frame, planMessage, since: Date.now() };
   // A live `plan` event is streamed before the pause is written, so it always
   // says `waiting: false`; the decision is what makes the open step wait.
   if (planMessage) markPlanWaiting(planMessage, true);
-  syncComposerDecision();
   frame?.scrollIntoView({ block: "nearest" });
-}
-
-function appendPendingPointer(body, decision, frame) {
-  const pointer = document.createElement("button");
-  pointer.type = "button";
-  pointer.className = "pending-decision-pointer";
-  pointer.textContent = `${decision.label} — the card is below.`;
-  pointer.addEventListener("click", () => {
-    frame.scrollIntoView({ block: "nearest" });
-    frame.focus({ preventScroll: true });
-  });
-  body.append(pointer);
+  // After the scroll, so the slot starts from where the card now is.
+  if (frame) observeStatusHome(frame);
+  syncComposerStatus();
 }
 
 // `card` limits this to one card: a patch reports its own settlement, and must
@@ -13819,16 +13812,18 @@ function settlePendingDecision(card = null) {
   if (card && pendingDecision.card !== card) return;
   if (pendingDecision.frame) pendingDecision.frame.dataset.waiting = "false";
   if (pendingDecision.planMessage) markPlanWaiting(pendingDecision.planMessage, false);
+  if (pendingDecision.frame) unobserveStatusHome(pendingDecision.frame);
   pendingDecision = null;
   clearWaitingIndicator();
-  syncComposerDecision();
+  syncComposerStatus();
 }
 
 // The DOM the state pointed into is gone (a session render or a cleared chat).
 function resetPendingDecision() {
+  if (pendingDecision?.frame) unobserveStatusHome(pendingDecision.frame);
   pendingDecision = null;
   clearWaitingIndicator();
-  syncComposerDecision();
+  syncComposerStatus();
 }
 
 // Reload: the engine reports the decision in `/api/session`; the card is the
@@ -13875,32 +13870,175 @@ function focusPendingDecision() {
   (target || frame).focus({ preventScroll: true });
 }
 
-// The composer line, and D2's lock: while a question is pending the main
-// composer does not compete with the card's answer field, because a typed
-// message is not an answer. Hidden while a turn runs, and in a worker's view,
-// whose composer belongs to the worker (spec 57).
-function syncComposerDecision() {
-  const current = pendingDecision;
+// The decision the session waits on, while it is the user's move: not while a
+// turn is being sent, not once answered (observation 89: the work it started
+// is what the slot shows then), and not in a worker's view, whose composer
+// belongs to the worker (spec 57).
+function pendingDecisionApplies() {
+  if (!pendingDecision) return null;
   const inWorker = Boolean(workerView) || isWorkerSession(currentSessionId);
-  // Observation 89: once answered, the work it started is what the composer
-  // shows (`syncComposerRunning`), not the decision any more.
   const running = Boolean(runningActionFor(currentSessionId));
-  const visible = Boolean(current) && !chatSubmitting && !inWorker && !running;
-  const line = $("composer-decision");
-  line.hidden = !visible;
-  if (visible) {
-    $("composer-decision-label").textContent = current.decision.label;
-    const go = $("composer-decision-btn");
-    go.hidden = !current.frame;
-    go.textContent = current.decision.kind === "question" ? "Answer" : "Show";
+  return !chatSubmitting && !inWorker && !running ? pendingDecision : null;
+}
+
+// Spec 112 requirement 1: the elements whose state the composer slot would
+// repeat — a pending card's frame, a running action's status rows — that are
+// in view in `#chat-log`. While a home is in view the slot leaves its state
+// to it.
+//
+// The observer's root is the viewport, not `#chat-log`: the viewport root is
+// still clipped by the log's own scrolling, and below 1100px the log grows to
+// its content and the page scrolls instead, where a `#chat-log` root would
+// report every home in view and the slot would never show.
+const statusHomesInView = new Set();
+let statusHomeObserver = null;
+
+function observeStatusHome(element) {
+  if (!statusHomeObserver) {
+    statusHomeObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) statusHomesInView.add(entry.target);
+        else statusHomesInView.delete(entry.target);
+      }
+      syncComposerStatus();
+    });
   }
+  // The observer reports a frame later; seeding from geometry now keeps the
+  // slot from flashing an entry for a home that is already in view.
+  if (homeIsInView(element)) statusHomesInView.add(element);
+  statusHomeObserver.observe(element);
+}
+
+function unobserveStatusHome(element) {
+  statusHomeObserver?.unobserve(element);
+  statusHomesInView.delete(element);
+}
+
+function homeIsInView(element) {
+  if (!element.isConnected) return false;
+  const box = element.getBoundingClientRect();
+  if (!box.width && !box.height) return false;
+  // The part of the log that is on screen, in either layout.
+  const log = $("chat-log").getBoundingClientRect();
+  const top = Math.max(log.top, 0);
+  const bottom = Math.min(log.bottom, window.innerHeight);
+  return box.bottom >= top && box.top <= bottom;
+}
+
+function statusHomeShown(element) {
+  return Boolean(element?.isConnected) && statusHomesInView.has(element);
+}
+
+// "…" past `max` characters: the slot is one line, the full text is its title.
+function clipStatusText(text, max = 60) {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+// Spec 112 requirement 2: the first entry that applies, or null. Needs you and
+// Working apply only while their home is out of view; Busy elsewhere has no
+// home in this window.
+function composerStatusEntry() {
+  const now = Date.now();
+  const decision = pendingDecisionApplies();
+  if (decision && !statusHomeShown(decision.frame)) {
+    const question = decision.decision.kind === "question";
+    return {
+      kind: "needs-you",
+      text: question ? "Needs your answer" : decision.decision.label,
+      title: `${decision.decision.label}. The card is at the end of the conversation.`,
+      elapsedMs: now - decision.since,
+      button: decision.frame ? (question ? "Answer" : "Show") : null,
+    };
+  }
+  const action = workerView ? null : runningActionFor(currentSessionId);
+  if (action) {
+    if ([...action.homes].some(statusHomeShown)) return null;
+    const text = action.stopRequested ? `Stopping: ${action.label}` : action.label;
+    return {
+      kind: "working",
+      text,
+      title: `${text}. Its status row is in the conversation above.`,
+      elapsedMs: now - action.stepStartedAt,
+      button: null,
+    };
+  }
+  const work = busyElsewhereWork();
+  if (work) {
+    return {
+      kind: "busy",
+      text: `Busy elsewhere: ${work.label}`,
+      title:
+        `Working: ${work.label}. Started outside this window, so it is not shown ` +
+        "here, but it blocks your next message until it ends.",
+      elapsedMs: (work.elapsedMs || 0) + (now - workingSessionsPolledAt),
+      button: null,
+    };
+  }
+  return null;
+}
+
+// Server-reported work for the open session that no stream or running action
+// of this window already shows (spec 110 D3).
+function busyElsewhereWork() {
+  const info = currentSessionId && !workerView ? workingSessionsById.get(currentSessionId) : null;
+  if (!info || runningTurnStream(currentSessionId) || runningActionFor(currentSessionId)) {
+    return null;
+  }
+  return info;
+}
+
+let composerStatusTicker = null;
+
+// The one composer status slot (spec 112 requirement 2). It never holds a
+// Stop: the composer's button is the one Stop, kept in step from here.
+function syncComposerStatus() {
+  const slot = $("composer-status");
+  if (!slot) return;
+  const entry = composerStatusEntry();
+  slot.hidden = !entry;
+  if (entry) {
+    slot.dataset.kind = entry.kind;
+    slot.title = entry.title;
+    $("composer-status-label").textContent = clipStatusText(entry.text);
+    $("composer-status-clock").textContent = formatClock(entry.elapsedMs);
+    const go = $("composer-status-btn");
+    go.hidden = !entry.button;
+    if (entry.button) go.textContent = entry.button;
+  }
+  // A running action's clock ticks with the running state; the other two
+  // entries need their own second.
+  const tick = Boolean(entry) && entry.kind !== "working";
+  if (tick && !composerStatusTicker) {
+    composerStatusTicker = setInterval(syncComposerStatus, 1000);
+  } else if (!tick && composerStatusTicker) {
+    clearInterval(composerStatusTicker);
+    composerStatusTicker = null;
+  }
+  syncComposerStop();
+  syncComposerQuestionLock();
+  const busy = Boolean(busyElsewhereWork());
+  const wasBusy = busyElsewhereApplied;
+  busyElsewhereApplied = busy;
+  if (wasBusy && !busy) {
+    // The server stopped reporting it; this window never saw a `done` for
+    // it, so reloading is the only way to pick up what it left behind (a
+    // patch proposal, a new assistant message, a failure).
+    void loadSession(currentSessionId);
+  }
+}
+
+// D2's lock: while a question is pending the main composer does not compete
+// with the card's answer field, because a typed message is not an answer. It
+// holds whether or not the card is in view.
+function syncComposerQuestionLock() {
+  const current = pendingDecisionApplies();
   const field = $("chat-prompt");
   const button = $("ask-btn");
-  const lock = visible && current.decision.kind === "question" && Boolean(current.frame);
+  const lock = Boolean(current) && current.decision.kind === "question" && Boolean(current.frame);
   if (lock) {
     if (composerQuestionLock === null) composerQuestionLock = field.placeholder;
     field.disabled = true;
-    field.placeholder = "Answer the question above";
+    field.placeholder = "Answer the question";
     // A Stop for work elsewhere in the session stays usable (spec 112).
     if (!composerStopShown) button.disabled = true;
   } else if (composerQuestionLock !== null) {
@@ -15694,8 +15832,8 @@ async function loadSession(sessionId) {
     void refreshRepoBar();
     // A fresh session to track, not a transition within one: no reload-on-
     // cleared belongs to whatever session was open before this.
-    invisibleWorkWasVisible = false;
-    syncInvisibleWork();
+    busyElsewhereApplied = false;
+    syncComposerStatus();
     return;
   }
   // A rewind reloads the session through here, so it refreshes the bar too.
@@ -15711,8 +15849,8 @@ async function loadSession(sessionId) {
   // A fresh session to track, not a transition within one: show what the
   // poller already knows at once, without reloading on behalf of whatever
   // session was open before this.
-  invisibleWorkWasVisible = false;
-  syncInvisibleWork();
+  busyElsewhereApplied = false;
+  syncComposerStatus();
   loadPinnedContextFiles(currentSessionId);
   await loadSessionCheckpoints(currentSessionId);
   // Before rendering: the messages' *Start worker* actions depend on it.
@@ -15778,7 +15916,7 @@ function withChatModel(data) {
 }
 
 // Answering a decision resumes the paused turn, which no longer waits on the
-// user: the card and the composer line stop asking now, not when the resumed
+// user: the card and the composer slot stop asking now, not when the resumed
 // turn ends (a command can run for minutes).
 async function resumeDecision(path, fallbackPath, data, handlers) {
   settlePendingDecision();
@@ -15884,9 +16022,12 @@ const waitingNotes = [];
 // by session id; a session absent here is not reported as working.
 let workingSessionsById = new Map();
 let workingSessionsPollTimer = null;
-// Whether `currentSessionId` was shown as invisibly working on the last sync,
-// so the transition to "not working any more" can be told from "never was".
-let invisibleWorkWasVisible = false;
+// When the last poll answered, so Busy elsewhere's clock runs between polls.
+let workingSessionsPolledAt = 0;
+// Whether `currentSessionId` was busy elsewhere on the last sync, so the
+// transition to "not working any more" can be told from "never was": the slot
+// reloads the session on it (`syncComposerStatus`), whichever entry it showed.
+let busyElsewhereApplied = false;
 
 function startWorkingSessionsPoll() {
   clearInterval(workingSessionsPollTimer);
@@ -15904,6 +16045,7 @@ async function pollWorkingSessions() {
     return;
   }
   workingSessionsById = new Map((payload.sessions || []).map((row) => [row.sessionId, row]));
+  workingSessionsPolledAt = Date.now();
   // A plain request's running action has no stream to say what it is doing;
   // the shell's lane label does (spec 109 D7).
   for (const action of runningActions) {
@@ -15912,36 +16054,7 @@ async function pollWorkingSessions() {
       action.setLabel(row.label, true);
     }
   }
-  syncInvisibleWork();
-}
-
-// Shows a session's server-reported work when this window has no stream of
-// its own that already says so (`runningTurnStream`), so "something is
-// running and blocks you" is never silent just because of which code path is
-// driving it. Clears itself, and reloads the session once, the first poll
-// after the work it was showing is gone — that reload is the only way this
-// window learns what the invisible work actually did.
-function syncInvisibleWork() {
-  const line = $("composer-invisible-work");
-  if (!line) return;
-  const info = currentSessionId && !workerView ? workingSessionsById.get(currentSessionId) : null;
-  const visible =
-    Boolean(info) && !runningTurnStream(currentSessionId) && !runningActionFor(currentSessionId);
-  line.hidden = !visible;
-  // Its Stop is the composer's button (spec 112 requirement 3).
-  syncComposerStop();
-  if (visible) {
-    const seconds = Math.round((info.elapsedMs || 0) / 1000);
-    $("composer-invisible-work-label").textContent =
-      `Working: ${info.label} · ${seconds}s — not visible here, but it blocks your next message`;
-  }
-  if (invisibleWorkWasVisible && !visible) {
-    // The server stopped reporting it; this window never saw a `done` for
-    // it, so reloading is the only way to pick up what it left behind (a
-    // patch proposal, a new assistant message, a failure).
-    void loadSession(currentSessionId);
-  }
-  invisibleWorkWasVisible = visible;
+  syncComposerStatus();
 }
 
 function runningTurnStream(sessionId) {
@@ -16624,7 +16737,7 @@ function stopCurrentTurn() {
 // Spec 109 D7: one running state for every action this window runs — a turn
 // stream (model call, command, check, baseline, hook, MCP call, browser
 // diagnostic) or a plain request that runs one (a recovered command). The
-// turn's status line, a card's running row and the composer line all read it,
+// turn's status line, a card's running row and the composer slot all read it,
 // so they cannot disagree, and each offers the same Stop (D8).
 //
 // `stop` defaults to cancelling the session's work on the shell (spec 110
@@ -16647,6 +16760,9 @@ function beginRunningAction({ label = "Starting", stop = null } = {}) {
     startedAt: now,
     stepStartedAt: now,
     stopRequested: false,
+    // Its status rows (the turn's row, a card's running row): while one is in
+    // view the composer slot does not repeat it (spec 112 requirement 1).
+    homes: new Set(),
     stop() {
       if (action.stopRequested) return;
       action.stopRequested = true;
@@ -16661,6 +16777,8 @@ function beginRunningAction({ label = "Starting", stop = null } = {}) {
     },
     end() {
       runningActions.delete(action);
+      for (const home of action.homes) unobserveStatusHome(home);
+      action.homes.clear();
       syncRunningState();
     },
   };
@@ -16701,26 +16819,9 @@ function syncRunningState() {
     runningTicker = null;
   }
   for (const listener of runningListeners) listener();
-  syncComposerRunning();
-  syncComposerStop();
-}
-
-// The composer line (observation 89): while this session runs something, it
-// says what, not the decision that started it. Its Stop is the composer's
-// button (spec 112 requirement 3).
-function syncComposerRunning() {
-  const line = $("composer-running");
-  if (!line) return;
-  const action = workerView ? null : runningActionFor(currentSessionId);
-  // The main composer turn's line is its status row in the turn.
-  const visible = Boolean(action) && !chatSubmitting;
-  const wasVisible = !line.hidden;
-  line.hidden = !visible;
-  if (visible) $("composer-running-label").textContent = runningActionText(action);
-  if (visible !== wasVisible) {
-    syncComposerDecision();
-    syncInvisibleWork();
-  }
+  // The slot's Working entry (observation 89: what runs, not the decision
+  // that started it) and the composer's Stop follow the same state.
+  syncComposerStatus();
 }
 
 // A card's running row (spec 109 D7): the action's state in place of the
@@ -16742,6 +16843,7 @@ function createRunningRow(action, { stopLabel = "Cancel" } = {}) {
   const render = () => {
     if (!runningActions.has(action)) {
       runningListeners.delete(render);
+      unobserveStatusHome(row);
       row.remove();
       return;
     }
@@ -16750,6 +16852,12 @@ function createRunningRow(action, { stopLabel = "Cancel" } = {}) {
   };
   runningListeners.add(render);
   render();
+  // The caller places the row right after this returns; observed once it is
+  // in the log, so the slot starts from where it really is.
+  action.homes.add(row);
+  queueMicrotask(() => {
+    if (runningActions.has(action)) observeStatusHome(row);
+  });
   return row;
 }
 
@@ -16840,16 +16948,15 @@ function syncComposerStop() {
   button.title = "";
   button.disabled = false;
   // A pending question takes the button back once nothing runs.
-  syncComposerDecision();
+  syncComposerQuestionLock();
 }
 
 function setComposerBusy() {
   // "Fix selected" and the repo bar's action follow `chatSubmitting`, which
-  // callers set before this.
+  // callers set before this. The slot keeps the composer's Stop and the
+  // question lock in step.
   renderFindingsPanel();
-  syncComposerStop();
-  // Last: a pending question takes the button back once nothing runs.
-  syncComposerDecision();
+  syncComposerStatus();
 }
 
 // Sizes the composer to its content. The floor and the cap both live in CSS
@@ -17123,7 +17230,7 @@ async function askAgainFromExhausted(sessionId, taskId) {
   }
 }
 
-$("composer-decision-btn").addEventListener("click", focusPendingDecision);
+$("composer-status-btn").addEventListener("click", focusPendingDecision);
 
 // Spec 112 requirement 3: the button is Send, or the one Stop while anything
 // in this session runs (`composerStopTarget`). Steering stays on Enter.

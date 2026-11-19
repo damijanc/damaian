@@ -314,27 +314,15 @@
               </div>
             </section>
           </div>
-          <!-- Spec 109 D7: what this window is running for the session, from
-               the same state as the turn's status line and a card's running
-               row. Its Stop is the composer's button (spec 112). -->
-          <div id="composer-running" class="composer-decision composer-running" role="status" hidden>
-            <span id="composer-running-label" class="composer-decision-label"></span>
-          </div>
-          <div id="composer-decision" class="composer-decision" role="status" hidden>
-            <span id="composer-decision-label" class="composer-decision-label"></span>
-            <button id="composer-decision-btn" class="btn-sm" type="button">Show</button>
-          </div>
-          <!-- A session can be busy on a request this window never streamed
-               (a crash-recovered command's own resumed turn, say): polled
-               from /api/working-sessions rather than a local stream, so the
-               user is never left thinking nothing is happening (2026-11-14). -->
-          <div
-            id="composer-invisible-work"
-            class="composer-decision composer-invisible-work"
-            role="status"
-            hidden
-          >
-            <span id="composer-invisible-work-label" class="composer-decision-label"></span>
+          <!-- Spec 112 requirement 2: one status slot, derived by
+               syncComposerStatus(). It shows Needs you, Working or Busy
+               elsewhere only while that state's home (the card, the status
+               row) is out of view, and never holds a Stop: the composer's
+               button is the one Stop. -->
+          <div id="composer-status" class="composer-status" role="status" hidden>
+            <span id="composer-status-label" class="composer-status-label"></span>
+            <span id="composer-status-clock" class="composer-status-clock"></span>
+            <button id="composer-status-btn" class="btn-sm" type="button" hidden>Show</button>
           </div>
           <div class="prompt-box">
             <div id="composer-context" class="composer-context" hidden>

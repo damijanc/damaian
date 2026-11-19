@@ -2036,13 +2036,14 @@ fn app_js_shows_the_commit_review_as_a_full_panel_with_expanded_diffs() {
 fn app_js_shows_work_this_window_never_streamed() {
     let poll = app_js_function("pollWorkingSessions");
     assert!(poll.contains(r#"api("/api/working-sessions")"#), "{poll}");
-    assert!(poll.contains("syncInvisibleWork();"), "{poll}");
+    assert!(poll.contains("syncComposerStatus();"), "{poll}");
 
-    let sync = app_js_function("syncInvisibleWork");
+    let busy = app_js_function("busyElsewhereWork");
     assert!(
-        sync.contains("!runningTurnStream(currentSessionId)"),
-        "a stream this window already knows about must not double up with the banner: {sync}"
+        busy.contains("runningTurnStream(currentSessionId)"),
+        "a stream this window already knows about must not double up with the slot: {busy}"
     );
+    let sync = app_js_function("syncComposerStatus");
     assert!(
         sync.contains("void loadSession(currentSessionId);"),
         "the only way to learn what invisible work left behind is a reload: {sync}"
@@ -2097,13 +2098,12 @@ fn app_js_gives_every_running_action_one_state_and_a_stop() {
     let stop = app_js_function("stopSessionWork");
     assert!(stop.contains(r#"api("/api/session-work-cancel""#), "{stop}");
 
-    let composer = app_js_function("syncComposerRunning");
+    let entry = app_js_function("composerStatusEntry");
     assert!(
-        composer.contains("runningActionFor(currentSessionId)"),
-        "{composer}"
+        entry.contains("runningActionFor(currentSessionId)"),
+        "{entry}"
     );
-    assert!(super::INDEX_HTML.contains(r#"id="composer-running""#));
-    let decision = app_js_function("syncComposerDecision");
+    let decision = app_js_function("pendingDecisionApplies");
     assert!(
         decision.contains("&& !running"),
         "an answered decision gives way to what it started: {decision}"
@@ -2114,10 +2114,10 @@ fn app_js_gives_every_running_action_one_state_and_a_stop() {
         card.contains("card.append(createRunningRow(action));"),
         "checks that run show Cancel in place of the card's buttons: {card}"
     );
-    let invisible = app_js_function("syncInvisibleWork");
+    let busy = app_js_function("busyElsewhereWork");
     assert!(
-        invisible.contains("!runningActionFor(currentSessionId)"),
-        "{invisible}"
+        busy.contains("runningActionFor(currentSessionId)"),
+        "{busy}"
     );
 }
 
@@ -2145,9 +2145,12 @@ fn app_js_has_one_stop_in_the_composer() {
     let sync = app_js_function("syncComposerStop");
     assert!(sync.contains("button.disabled = !target.stop;"), "{sync}");
     assert!(sync.contains("button.title = target.reason"), "{sync}");
-    for caller in ["syncRunningState", "syncInvisibleWork", "setComposerBusy"] {
+    // The slot keeps the button in step; the running-state tick, the poll
+    // and `setComposerBusy` all reach it.
+    assert!(app_js_function("syncComposerStatus").contains("syncComposerStop();"));
+    for caller in ["syncRunningState", "pollWorkingSessions", "setComposerBusy"] {
         assert!(
-            app_js_function(caller).contains("syncComposerStop();"),
+            app_js_function(caller).contains("syncComposerStatus();"),
             "{caller} must keep the button in step"
         );
     }
@@ -2330,9 +2333,10 @@ fn app_js_places_every_pending_decision_kind_above_the_composer() {
 
     let set = app_js_function("setPendingDecision");
     assert!(set.contains("$(\"chat-log\").append(frame)"));
-    assert!(set.contains("appendPendingPointer(message.body, decision, frame)"));
     assert!(set.contains("scrollIntoView({ block: \"nearest\" })"));
-    assert!(app_js_function("appendPendingPointer").contains("the card is below."));
+    // Spec 112 requirement 5: no pointer in the bubble; the slot is the
+    // pointer while the card is out of view.
+    assert!(set.contains("observeStatusHome(frame)"), "{set}");
     // The one-shot patch route has no turn, but its card follows the rule.
     let one_shot = app_js_function("proposePatchFromChat");
     assert!(one_shot.contains("setPendingDecision("));
@@ -2362,32 +2366,120 @@ fn app_js_restores_the_pending_decision_last_on_reload() {
     assert!(app_js_function("renderMemoryProposals").contains("log.insertBefore(stack, pending)"));
 }
 
-/// Spec 107 Task 2, requirement 2 and D2: the composer names the decision
-/// from the engine's label, its control focuses the card, and a pending
-/// question disables the main composer instead of competing with the
-/// card's answer field.
+/// Spec 107 Task 2, requirement 2 and D2, as spec 112 requirements 2 and 5
+/// keep them: the slot names the decision from the engine's label, its
+/// control focuses the card, and a pending question disables the main
+/// composer instead of competing with the card's answer field — whether or
+/// not the card is in view.
 #[test]
 fn app_js_composer_names_the_pending_decision_and_yields_to_a_question() {
-    for id in [
-        "id=\"composer-decision\"",
-        "id=\"composer-decision-label\"",
-        "id=\"composer-decision-btn\"",
-    ] {
-        assert!(super::INDEX_HTML.contains(id), "{id}");
-    }
-    let sync = app_js_function("syncComposerDecision");
-    assert!(sync.contains("current.decision.label"));
-    assert!(sync.contains("!chatSubmitting"));
-    assert!(sync.contains("current.decision.kind === \"question\""));
-    assert!(sync.contains("field.disabled = true"));
-    assert!(sync.contains("\"Answer the question above\""));
-    assert!(sync.contains("button.disabled = true"));
-    assert!(app_js_function("setComposerBusy").contains("syncComposerDecision()"));
+    let entry = app_js_function("composerStatusEntry");
+    assert!(entry.contains("decision.decision.label"), "{entry}");
+    assert!(entry.contains("\"Needs your answer\""), "{entry}");
+    assert!(
+        entry.contains("question ? \"Answer\" : \"Show\""),
+        "{entry}"
+    );
+    assert!(app_js_function("pendingDecisionApplies").contains("!chatSubmitting"));
+    let lock = app_js_function("syncComposerQuestionLock");
+    assert!(lock.contains("pendingDecisionApplies()"), "{lock}");
+    assert!(
+        !lock.contains("statusHome"),
+        "the lock does not follow the card's visibility: {lock}"
+    );
+    assert!(lock.contains("current.decision.kind === \"question\""));
+    assert!(lock.contains("field.disabled = true"));
+    assert!(lock.contains("field.placeholder = \"Answer the question\";"));
+    assert!(lock.contains("button.disabled = true"));
+    assert!(!super::APP_JS.contains("Answer the question above"));
+    assert!(app_js_function("syncComposerStatus").contains("syncComposerQuestionLock();"));
     let focus = app_js_function("focusPendingDecision");
     assert!(focus.contains(".question-card-free-text input:not(:disabled)"));
-    assert!(super::APP_JS.contains(
-        "$(\"composer-decision-btn\").addEventListener(\"click\", focusPendingDecision)"
-    ));
+    assert!(
+        super::APP_JS.contains(
+            "$(\"composer-status-btn\").addEventListener(\"click\", focusPendingDecision)"
+        )
+    );
+}
+
+/// Spec 112 requirements 1, 2 and 5: the three composer boxes are one slot,
+/// `#composer-status`, derived by one function in the order Needs you →
+/// Working → Busy elsewhere. An `IntersectionObserver` (viewport root,
+/// clipped by `#chat-log`) hides Needs you while the pending frame is in view and Working while the
+/// running action's status row is; the slot never holds a Stop, its text is
+/// clipped to one line with the rest in `title`, and the in-message pointer
+/// is gone.
+#[test]
+fn app_js_has_one_composer_status_slot() {
+    let html = super::INDEX_HTML;
+    let slot = &html[html.find(r#"id="composer-status""#).expect("the slot")..];
+    let slot = &slot[..slot.find("</div>").unwrap()];
+    for id in [
+        "composer-status-label",
+        "composer-status-clock",
+        "composer-status-btn",
+    ] {
+        assert!(slot.contains(id), "{id}: {slot}");
+    }
+    assert_eq!(
+        slot.matches("<button").count(),
+        1,
+        "one optional button: {slot}"
+    );
+    assert!(
+        !slot.contains("Stop"),
+        "the slot never holds a Stop: {slot}"
+    );
+
+    let entry = app_js_function("composerStatusEntry");
+    let needs = entry.find("kind: \"needs-you\"").expect("Needs you");
+    let working = entry.find("kind: \"working\"").expect("Working");
+    let busy = entry.find("kind: \"busy\"").expect("Busy elsewhere");
+    assert!(needs < working && working < busy, "priority: {entry}");
+    assert!(
+        entry.contains("!statusHomeShown(decision.frame)"),
+        "{entry}"
+    );
+    assert!(
+        entry.contains("[...action.homes].some(statusHomeShown)"),
+        "{entry}"
+    );
+    assert!(entry.contains("title:"), "{entry}");
+
+    let observe = app_js_function("observeStatusHome");
+    assert!(observe.contains("new IntersectionObserver("), "{observe}");
+    // The viewport root, clipped by `#chat-log`'s scrolling, holds in both
+    // layouts; a `#chat-log` root would see every home in view below 1100px.
+    assert!(!observe.contains("root:"), "{observe}");
+    assert!(app_js_function("homeIsInView").contains("$(\"chat-log\")"));
+    assert!(app_js_function("startTurnIndicator").contains("observeStatusHome(row);"));
+    assert!(app_js_function("createRunningRow").contains("observeStatusHome(row)"));
+    assert!(app_js_function("clipStatusText").contains("max = 60"));
+
+    let sync = app_js_function("syncComposerStatus");
+    assert!(sync.contains("clipStatusText(entry.text)"), "{sync}");
+    assert!(sync.contains("slot.title = entry.title;"), "{sync}");
+    assert!(
+        !sync.contains("createElement(\"button\")") && !sync.contains("stop()"),
+        "{sync}"
+    );
+
+    let app = super::APP_JS;
+    for gone in [
+        "composer-running",
+        "composer-decision",
+        "composer-invisible-work",
+        "syncComposerRunning",
+        "syncComposerDecision",
+        "syncInvisibleWork",
+        "appendPendingPointer",
+        "pending-decision-pointer",
+        "the card is below",
+    ] {
+        assert!(!app.contains(gone), "app.js names {gone}");
+        assert!(!html.contains(gone), "index.html names {gone}");
+        assert!(!super::STYLE_CSS.contains(gone), "style.css names {gone}");
+    }
 }
 
 /// Spec 109 Task 3: a failed check's baseline asks on the ordinary check
