@@ -1778,6 +1778,32 @@ fn the_plan_card_asks_one_decision_at_a_time() {
     assert!(css.contains(".worker-suggestion-steps > [hidden]"), "{css}");
 }
 
+/// Spec 112 requirement 8: one button scale and one icon-button class. A
+/// class with no rule (`btn-secondary`) rendered as an unstyled browser
+/// button, and an emoji drifted from the drawn icon set.
+#[test]
+fn static_assets_use_one_button_scale_and_drawn_icons() {
+    for (name, text) in [
+        ("app.js", super::APP_JS),
+        ("index.html", super::INDEX_HTML),
+        ("style.css", super::STYLE_CSS),
+    ] {
+        assert!(
+            !text.contains("btn-secondary"),
+            "{name} names btn-secondary"
+        );
+        assert!(!text.contains("icon-button"), "{name} names icon-button");
+        assert!(
+            !text.contains('📌'),
+            "{name} labels a control with an emoji"
+        );
+    }
+    assert!(
+        !super::STYLE_CSS.contains("var(--accent-soft,"),
+        "--accent-soft is defined, so a fallback can only drift off-theme"
+    );
+}
+
 /// Spec 108 D3, the UI half: Archive in both session menus and the
 /// worker's, archived sessions out of the sidebar list and into a
 /// collapsed Archived (N) entry with Open and Unarchive, search labelling

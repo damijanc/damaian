@@ -225,6 +225,7 @@ const ICON_PATHS = {
   ],
   folderPlus: ["M3 7h6l2 2h10v10H3z", "M12 12v5M9.5 14.5h5"],
   compose: ["M12 20h8", "M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"],
+  pin: ["M9 4h6", "M10 4v5l-3 4h10l-3-4V4", "M12 13v7"],
 };
 
 function icon(name) {
@@ -3362,7 +3363,7 @@ function contextCategoryRow(manifest, category) {
       pin.className = "btn-icon context-item-action";
       pin.title = "Pin for later turns";
       pin.setAttribute("aria-label", `Pin ${item.path} for later turns`);
-      pin.textContent = "📌";
+      pin.append(icon("pin"));
       pin.addEventListener("click", () =>
         addContextPin(item.path, item.lineRange).catch((error) => toast(error.message)),
       );
@@ -3539,7 +3540,7 @@ function renderContextPanel() {
       pin.className = "btn-icon context-item-action";
       pin.title = "Pin for later turns";
       pin.setAttribute("aria-label", `Pin ${record.path} for later turns`);
-      pin.textContent = "📌";
+      pin.append(icon("pin"));
       pin.addEventListener("click", () =>
         addContextPin(record.path, record.lineRange).catch((error) => toast(error.message)),
       );
@@ -7410,7 +7411,7 @@ function conversationBoundaryMarker(compactions, conversation) {
   if (conversation.canCompact) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "btn-quiet compaction-now";
+    button.className = "btn-sm btn-quiet compaction-now";
     button.textContent = "Compact now";
     button.addEventListener("click", () => void compactConversationNow());
     body.append(button);
@@ -7690,7 +7691,7 @@ function createMemoryProposalCard(proposal) {
 
   const confirm = document.createElement("button");
   confirm.type = "button";
-  confirm.className = "btn-primary";
+  confirm.className = "btn-sm btn-primary";
   confirm.textContent = "Remember";
   confirm.addEventListener("click", () => {
     // One decision per proposal. Disabling only this button let a quick second
@@ -7709,7 +7710,7 @@ function createMemoryProposalCard(proposal) {
 
   const dismiss = document.createElement("button");
   dismiss.type = "button";
-  dismiss.className = "btn-secondary";
+  dismiss.className = "btn-sm btn-quiet";
   dismiss.textContent = "Dismiss";
   dismiss.addEventListener("click", () => {
     setCardDeciding(controls, true);

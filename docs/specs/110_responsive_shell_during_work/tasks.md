@@ -116,9 +116,12 @@ deterministic eval tier.
 ## Task 3 · The UI with several working sessions
 
 - [ ] `app.js`: a 409 shows its message; sidebar actions during a turn update
-      the sidebar at once; working sessions are marked in the sidebar (from
-      D3); switching to another session while one works leaves the first
-      running and shows its progress again on return.
+      the sidebar at once; switching to another session while one works leaves
+      the first running and shows its progress again on return.
+      *(2026-11-19: "working sessions are marked in the sidebar" moved to
+      [spec 112](../112_status_in_one_place/proposal.md) requirement 7, which
+      draws Working, Needs you and Failed from this spec's D3 routes. Build
+      spec 112 before this task: both edit `app.js` and `style.css`.)*
 - [ ] Manual check in the running app (`serves_the_ui_for_manual_inspection`,
       port 4899, its own data dir): archive during a turn; two sessions working.
 

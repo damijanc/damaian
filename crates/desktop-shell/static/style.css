@@ -14,6 +14,19 @@
   --warn: #a15c18;
   --danger: #a33737;
   --code: #101820;
+  /* Spec 112 Task 1: literals that recurred in three or more rules. */
+  --on-accent: #ffffff;
+  --ink-strong: #181a1c;
+  --faint: #9a9da0;
+  --hover: #f4f4f1;
+  --line-soft: #eeeeeb;
+  --code-soft: #f6f7f7;
+  --ok-line: #8dbda5;
+  --warn-soft: #fdf3e3;
+  --warn-line: #e3cba8;
+  --warn-ink: #7a4b12;
+  --danger-soft: #fbe9e7;
+  --danger-line: #d89999;
 }
 
 * {
@@ -237,7 +250,7 @@ button:disabled {
 .btn-primary {
   border-color: var(--accent);
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
 }
 
 /* `button:hover` sets `color: var(--accent)`, which on the accent fill would
@@ -246,7 +259,7 @@ button:disabled {
 .btn-primary:hover {
   border-color: #12564a;
   background: #12564a;
-  color: #ffffff;
+  color: var(--on-accent);
 }
 
 .btn-quiet {
@@ -272,7 +285,7 @@ button:disabled {
 
 .btn-danger:hover {
   border-color: transparent;
-  background: #fbe9e7;
+  background: var(--danger-soft);
   color: var(--danger);
 }
 
@@ -720,7 +733,7 @@ button:disabled {
 .update-button {
   width: 100%;
   min-height: 34px;
-  border-color: #8dbda5;
+  border-color: var(--ok-line);
   background: #eef8f2;
   color: var(--ok);
   font-size: 12px;
@@ -734,38 +747,6 @@ button:disabled {
   color: var(--muted);
   font-size: 12px;
   text-align: center;
-}
-
-.icon-button {
-  width: 30px;
-  height: 30px;
-  display: inline-grid;
-  place-items: center;
-  padding: 0;
-}
-
-.panel-icon {
-  position: relative;
-  width: 16px;
-  height: 13px;
-  display: block;
-  border: 1.5px solid currentColor;
-  border-radius: 3px;
-}
-
-.panel-icon::after {
-  position: absolute;
-  top: 0;
-  right: 4px;
-  width: 1.5px;
-  height: 100%;
-  background: currentColor;
-  content: "";
-}
-
-.icon-button.is-collapsed .panel-icon::after {
-  right: auto;
-  left: 4px;
 }
 
 /* One icon set (style guide §3): a 28px glyph button whose 16px stroke icon
@@ -805,7 +786,7 @@ button:disabled {
 .app-error-banner {
   margin: 0;
   border-bottom: 1px solid var(--line);
-  background: #fbe9e7;
+  background: var(--danger-soft);
   color: var(--danger);
   font-size: 13px;
   font-weight: 600;
@@ -914,7 +895,7 @@ button:disabled {
 }
 
 .session-search-hit:hover {
-  background: var(--accent-soft, #f0f5ff);
+  background: var(--accent-soft);
 }
 
 .session-search-hit-title {
@@ -1120,7 +1101,7 @@ button:disabled {
   width: 100%;
   aspect-ratio: 16 / 9;
   object-fit: contain;
-  background: #fff;
+  background: var(--surface);
 }
 
 .web-diagnostic-artifact figcaption {
@@ -1757,7 +1738,7 @@ button:disabled {
 }
 
 .repo-action[data-tone="danger"] button:hover:not(:disabled) {
-  background: #fbe9e7;
+  background: var(--danger-soft);
 }
 
 .repo-action[data-tone="warning"] button {
@@ -1951,7 +1932,7 @@ button:disabled {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   border-top: 1px solid var(--line);
-  background: #ffffff;
+  background: var(--surface);
   color: var(--ink);
   box-shadow: 0 -1px 0 rgba(31, 36, 40, 0.03);
 }
@@ -1960,9 +1941,9 @@ button:disabled {
   display: none;
 }
 
-/* The two glyph controls default to 30px squares, which alone keep the bar
-   above its 36px budget. 26px still clears the 24px hit-target floor. */
-.terminal-tabbar .icon-button {
+/* The close control would be a 28px square, which alone keeps the bar above
+   its 36px budget. 26px still clears the 24px hit-target floor. */
+.terminal-tabbar .icon-btn {
   width: 26px;
   height: 26px;
 }
@@ -1973,7 +1954,7 @@ button:disabled {
   align-items: center;
   gap: 8px;
   border-bottom: 1px solid var(--line);
-  background: #ffffff;
+  background: var(--surface);
   padding: 3px 10px;
 }
 
@@ -2022,7 +2003,7 @@ button:disabled {
 .terminal-body {
   position: relative;
   min-height: 0;
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .terminal-xterm {
@@ -2119,7 +2100,7 @@ button:disabled {
   place-items: center;
   border: 1px solid #d8d8d5;
   border-radius: 50%;
-  background: #f4f4f1;
+  background: var(--hover);
   color: #4d5154;
   padding: 0;
 }
@@ -2127,7 +2108,7 @@ button:disabled {
 .attach-menu-button:hover,
 .attach-menu-button[aria-expanded="true"] {
   border-color: #c9c9c5;
-  background: #eeeeea;
+  background: var(--line-soft);
 }
 
 .attach-popover {
@@ -2157,7 +2138,7 @@ button:disabled {
 }
 
 .attach-menu-row:hover:not(:disabled) {
-  background: #f4f4f1;
+  background: var(--hover);
 }
 
 .attach-menu-row:disabled {
@@ -2167,8 +2148,8 @@ button:disabled {
 
 .attach-menu-soon {
   border-radius: 999px;
-  background: #eeeeea;
-  color: #9a9da0;
+  background: var(--line-soft);
+  color: var(--faint);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.02em;
@@ -2215,7 +2196,7 @@ button:disabled {
 
 .btn-trigger:hover,
 .btn-trigger[aria-expanded="true"] {
-  background: #f0f0ed;
+  background: var(--sidebar);
   color: var(--ink);
 }
 
@@ -2332,13 +2313,13 @@ button:disabled {
    current one, the way hover does. */
 .context-menu-row:focus-visible,
 .context-menu-back:focus-visible {
-  background: #f4f4f1;
+  background: var(--hover);
 }
 
 .context-menu-divider {
   height: 1px;
   margin: 4px 2px;
-  background: #eeeeeb;
+  background: var(--line-soft);
 }
 
 /* Wide enough for "Open repository on GitHub" on one line. */
@@ -2385,7 +2366,7 @@ button:disabled {
 
 .model-reset-row {
   color: #8a8d90;
-  border-bottom: 1px solid #eeeeeb;
+  border-bottom: 1px solid var(--line-soft);
   border-radius: 0;
   margin: -1px -1px 5px;
   padding: 9px 10px 10px;
@@ -2394,7 +2375,7 @@ button:disabled {
 .model-menu-row strong {
   max-width: 126px;
   overflow: hidden;
-  color: #9a9da0;
+  color: var(--faint);
   font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2406,13 +2387,13 @@ button:disabled {
 .model-option:hover,
 .context-menu-row:hover,
 .context-menu-back:hover {
-  background: #f4f4f1;
+  background: var(--hover);
 }
 
 .reset-icon {
   width: 14px;
   height: 14px;
-  border: 1.5px solid #9a9da0;
+  border: 1.5px solid var(--faint);
   border-left-color: transparent;
   border-radius: 50%;
 }
@@ -2421,8 +2402,8 @@ button:disabled {
   width: 5px;
   height: 5px;
   display: block;
-  border-top: 1.5px solid #9a9da0;
-  border-left: 1.5px solid #9a9da0;
+  border-top: 1.5px solid var(--faint);
+  border-left: 1.5px solid var(--faint);
   content: "";
   transform: translate(0, -2px) rotate(-35deg);
 }
@@ -2430,8 +2411,8 @@ button:disabled {
 .row-chevron {
   width: 8px;
   height: 8px;
-  border-right: 1.5px solid #9a9da0;
-  border-bottom: 1.5px solid #9a9da0;
+  border-right: 1.5px solid var(--faint);
+  border-bottom: 1.5px solid var(--faint);
   transform: rotate(-45deg);
 }
 
@@ -2439,7 +2420,7 @@ button:disabled {
 .context-menu-back {
   grid-template-columns: auto minmax(0, 1fr);
   color: #7b7f82;
-  border-bottom: 1px solid #eeeeeb;
+  border-bottom: 1px solid var(--line-soft);
   border-radius: 0;
   margin: -1px -1px 5px;
 }
@@ -2486,7 +2467,7 @@ button:disabled {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 6px;
-  border-top: 1px solid #eeeeeb;
+  border-top: 1px solid var(--line-soft);
   margin-top: 6px;
   padding-top: 8px;
 }
@@ -2808,7 +2789,7 @@ button:disabled {
 }
 
 .settings-page-title {
-  color: #181a1c;
+  color: var(--ink-strong);
   font-size: 18px;
   font-weight: 750;
 }
@@ -2819,7 +2800,7 @@ button:disabled {
 }
 
 .settings-section h3 {
-  color: #181a1c;
+  color: var(--ink-strong);
   font-size: 15px;
   font-weight: 750;
 }
@@ -2829,13 +2810,13 @@ button:disabled {
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fbfbfb;
+  background: var(--surface-soft);
 }
 
 .settings-empty-card {
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fbfbfb;
+  background: var(--surface-soft);
   color: var(--muted);
   padding: 14px;
 }
@@ -2889,7 +2870,7 @@ button:disabled {
 .settings-row strong {
   min-width: 0;
   overflow: hidden;
-  color: #181a1c;
+  color: var(--ink-strong);
   font-size: 14px;
   font-weight: 760;
   text-overflow: ellipsis;
@@ -2899,7 +2880,7 @@ button:disabled {
 .provider-title + p,
 .settings-row p {
   margin-top: 2px;
-  color: #626568;
+  color: var(--muted);
   font-size: 12px;
 }
 
@@ -2908,7 +2889,7 @@ button:disabled {
   border: 1px solid #d4d4d1;
   border-radius: 4px;
   background: #f0f0ee;
-  color: #626568;
+  color: var(--muted);
   font-size: 11px;
   font-weight: 700;
   line-height: 1.1;
@@ -3254,7 +3235,7 @@ button:disabled {
 }
 
 .key-status[data-state="ok"] {
-  border-color: #8dbda5;
+  border-color: var(--ok-line);
   color: var(--ok);
 }
 
@@ -3264,7 +3245,7 @@ button:disabled {
 }
 
 .key-status[data-state="error"] {
-  border-color: #d89999;
+  border-color: var(--danger-line);
   color: var(--danger);
 }
 
@@ -3351,11 +3332,11 @@ button:disabled {
 }
 
 .diff-card.applied {
-  border-color: #8dbda5;
+  border-color: var(--ok-line);
 }
 
 .diff-card.rejected {
-  border-color: #d89999;
+  border-color: var(--danger-line);
   opacity: 0.82;
 }
 
@@ -3387,9 +3368,9 @@ button:disabled {
 
 .command-approval-risk {
   flex: 0 0 auto;
-  border: 1px solid #e3cba8;
+  border: 1px solid var(--warn-line);
   border-radius: 999px;
-  background: #fdf3e3;
+  background: var(--warn-soft);
   color: var(--warn);
   font-size: 10px;
   font-weight: 800;
@@ -3399,8 +3380,8 @@ button:disabled {
 }
 
 .command-approval-risk[data-blocked="true"] {
-  border-color: #d89999;
-  background: #fbe9e7;
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
   color: var(--danger);
 }
 
@@ -3440,7 +3421,7 @@ code.command-approval-command {
   display: block;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #f6f7f7;
+  background: var(--code-soft);
   color: var(--ink);
   font-size: 11px;
   line-height: 1.5;
@@ -3500,7 +3481,7 @@ code.command-approval-command {
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #f6f7f7;
+  background: var(--code-soft);
   color: var(--ink);
   font-size: 12px;
   margin: 0;
@@ -3828,12 +3809,12 @@ code.fetch-approval-flag-value {
 }
 
 .diff-card.applied .diff-state {
-  border-color: #8dbda5;
+  border-color: var(--ok-line);
   color: var(--ok);
 }
 
 .diff-card.rejected .diff-state {
-  border-color: #d89999;
+  border-color: var(--danger-line);
   color: var(--danger);
 }
 
@@ -3905,7 +3886,7 @@ code.fetch-approval-flag-value {
 }
 
 .diff-line.context {
-  background: #ffffff;
+  background: var(--surface);
   color: #3f4945;
 }
 
@@ -3970,7 +3951,7 @@ code.fetch-approval-flag-value {
   margin: 0;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #f6f7f7;
+  background: var(--code-soft);
   color: var(--ink);
   font-size: 11px;
   padding: 9px 10px;
@@ -5034,12 +5015,12 @@ body.worker-view #chat-model-menu {
 }
 
 .app-dialog-btn:hover {
-  background: #eeeeea;
+  background: var(--line-soft);
 }
 
 .app-dialog-confirm {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .app-dialog-confirm:hover {
@@ -5049,7 +5030,7 @@ body.worker-view #chat-model-menu {
 
 .app-dialog-confirm.app-dialog-btn-danger {
   background: var(--danger);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 #toast {
@@ -5443,7 +5424,7 @@ body.worker-view #chat-model-menu {
 .activity-step-title code {
   border: 1px solid var(--line);
   border-radius: 4px;
-  background: #f6f7f7;
+  background: var(--code-soft);
   font-size: 11px;
   padding: 0 4px;
 }
@@ -5454,7 +5435,7 @@ body.worker-view #chat-model-menu {
   margin: 0;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #f6f7f7;
+  background: var(--code-soft);
   color: var(--ink);
   font-size: 11px;
   padding: 8px 10px;
@@ -5900,7 +5881,7 @@ body.worker-view #chat-model-menu {
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #fbfbfb;
+  background: var(--surface-soft);
 }
 
 .repository-root-row {
@@ -5968,7 +5949,7 @@ body.worker-view #chat-model-menu {
 }
 
 .repository-root-evidence {
-  color: #626568;
+  color: var(--muted);
   font-size: 13px;
 }
 
@@ -6165,11 +6146,11 @@ body.worker-view #chat-model-menu {
 }
 
 .check-batch-risk {
-  border: 1px solid #e3cba8;
+  border: 1px solid var(--warn-line);
   border-radius: 999px;
-  background: #fdf3e3;
+  background: var(--warn-soft);
   padding: 1px 7px;
-  color: #7a4b12;
+  color: var(--warn-ink);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
@@ -6253,9 +6234,9 @@ body.worker-view #chat-model-menu {
 
 .verification-report-outcome[data-outcome="due"],
 .verification-report-outcome[data-outcome="nothing_verified"] {
-  border-color: #e3cba8;
-  background: #fdf3e3;
-  color: #7a4b12;
+  border-color: var(--warn-line);
+  background: var(--warn-soft);
+  color: var(--warn-ink);
 }
 
 .verification-report-row {
@@ -6276,7 +6257,7 @@ body.worker-view #chat-model-menu {
 }
 
 .verification-report-value.has-stale {
-  color: #7a4b12;
+  color: var(--warn-ink);
 }
 
 /* Spec 109 D10: a change that does not build. */
@@ -6288,7 +6269,7 @@ body.worker-view #chat-model-menu {
   border: 1px dashed #d8b985;
   border-radius: 4px;
   padding: 0 4px;
-  color: #7a4b12;
+  color: var(--warn-ink);
 }
 
 .verification-offer,

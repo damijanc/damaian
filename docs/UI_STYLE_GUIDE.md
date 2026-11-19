@@ -62,6 +62,19 @@ Defined on `:root` in `style.css`. Use the token, never the literal.
 | `--accent-soft` | `#e7f1ee` | Focus ring, accent backgrounds |
 | `--ok` / `--warn` / `--danger` | `#26734d` / `#a15c18` / `#a33737` | State only, never decoration |
 | `--code` | `#101820` | Code block background |
+| `--on-accent` | `#ffffff` | Text on a filled `--accent` or `--danger` control |
+| `--ink-strong` | `#181a1c` | Settings page and section headings |
+| `--faint` | `#9a9da0` | Drawn glyph strokes (chevrons, reset), "Soon" labels. Not for text that must be read: below the `--muted` floor |
+| `--hover` | `#f4f4f1` | Hover background of menu rows and the attach button |
+| `--line-soft` | `#eeeeeb` | Dividers inside a popover; pressed attach button |
+| `--code-soft` | `#f6f7f7` | Inline command and output backgrounds on cards and dialogs |
+| `--ok-line` | `#8dbda5` | Border of an applied or OK state |
+| `--warn-soft` / `--warn-line` / `--warn-ink` | `#fdf3e3` / `#e3cba8` / `#7a4b12` | Warning chip: fill, border, text |
+| `--danger-soft` / `--danger-line` | `#fbe9e7` / `#d89999` | Danger hover and blocked fill; border of a rejected or error state |
+
+A literal that appears in three or more rules becomes a token (spec 112). The
+syntax-highlighting colours stay literals, grouped under their own comment in
+`style.css`.
 
 The app is light-only (`color-scheme: light`). Do not add
 `prefers-color-scheme` branches piecemeal; a dark theme is a whole-app change.
