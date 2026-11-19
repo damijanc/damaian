@@ -2265,6 +2265,142 @@ fn app_js_has_a_semantic_search_settings_toggle() {
     );
 }
 
+/// Spec 112 requirement 4 (D7): after a restart the sweep's recovery card is
+/// the one answerable copy of a question, and `restorePendingDecision` frames
+/// it; the transcript's copy keeps the question's text with no answer
+/// controls. A worker's transcript copy is left alone, because it answers
+/// through the worker's socket rather than the shell's route.
+#[test]
+fn app_js_draws_a_reattached_question_answerable_once() {
+    let recovery = app_js_function("renderRecoveryPrompts");
+    assert!(recovery.contains("if (resumable) {"), "{recovery}");
+    assert!(
+        recovery.contains(r#"approval.kind === "question""#),
+        "{recovery}"
+    );
+    assert!(
+        recovery.contains(r#"querySelectorAll(".message.question > .question-card")"#),
+        "only the transcript's copy, never the recovery card's: {recovery}"
+    );
+    assert!(
+        recovery.contains("card.dataset.questionId === questionId"),
+        "{recovery}"
+    );
+    assert!(
+        recovery.contains("makeQuestionCardReadOnly(card)"),
+        "{recovery}"
+    );
+
+    let read_only = app_js_function("makeQuestionCardReadOnly");
+    for control in [
+        ".question-card-options",
+        ".question-card-free-text",
+        ".question-card-status",
+    ] {
+        assert!(read_only.contains(control), "{control}: {read_only}");
+    }
+    assert!(
+        read_only.contains(r#"card.dataset.readonly = "true";"#),
+        "{read_only}"
+    );
+    // An answered card keeps its record.
+    assert!(
+        read_only.contains(r#"if (card.dataset.answered === "true") return;"#),
+        "{read_only}"
+    );
+
+    // The framed copy is the recovery card whenever there is one, and the
+    // recovery cards are drawn before the decision is restored.
+    let restore = app_js_function("restorePendingDecision");
+    let recovered = restore.find("recovered ||").expect("recovery card first");
+    let transcript = restore
+        .find(r#"querySelectorAll(".question-card")"#)
+        .expect("transcript card as the fallback");
+    assert!(recovered < transcript, "{restore}");
+    let load = app_js_function("loadSession");
+    let sweep = load
+        .find("await renderRecoveryPrompts(currentSessionId, generation);")
+        .unwrap();
+    let pending = load
+        .find("restorePendingDecision(payload.tasks || []);")
+        .unwrap();
+    assert!(sweep < pending, "{load}");
+
+    // Overlapping loads of one session drew the recovery card twice: a load a
+    // later one has overtaken stops drawing, inside the sweep's await too.
+    assert!(
+        load.contains("const generation = ++sessionLoadGeneration;"),
+        "{load}"
+    );
+    assert!(
+        load.contains("await renderRecoveryPrompts(currentSessionId, generation);"),
+        "{load}"
+    );
+    assert!(
+        load.matches("if (!current()) return;").count() >= 4,
+        "{load}"
+    );
+    assert!(
+        recovery.contains("if (generation !== sessionLoadGeneration) return;"),
+        "{recovery}"
+    );
+
+    assert!(
+        super::STYLE_CSS.contains(".question-card[data-readonly=\"true\"]"),
+        "a read-only copy looks settled, not clickable"
+    );
+}
+
+/// Spec 112 requirement 6: an assistant message draws no bordered body until
+/// it has content, so a starting turn is its status row alone.
+#[test]
+fn style_css_hides_an_empty_assistant_body() {
+    let css = super::STYLE_CSS;
+    let rule = &css[css
+        .find(".message.assistant .message-body:empty {")
+        .expect("the empty-body rule")..];
+    let rule = &rule[..rule.find('}').unwrap()];
+    assert!(rule.contains("display: none;"), "{rule}");
+    // The live turns still open with an empty body and fill it on the first
+    // token, which is what makes the rule apply until then.
+    assert!(
+        app_js_function("sendChatPrompt")
+            .contains(r#"assistantMessage = appendChatMessage("assistant", "");"#)
+    );
+    assert!(app_js_function("updateChatMessage").contains("target.body.innerHTML ="));
+}
+
+/// Spec 112 requirement 6: Rewind is offered only for a checkpoint that
+/// covers a file, and a live turn marks its own checkpoint — found by its
+/// task id — not the session's newest unrestored one.
+#[test]
+fn app_js_offers_rewind_only_for_the_turns_own_files() {
+    let mark = app_js_function("markMessageRewindable");
+    let guard = mark
+        .find("if (!checkpoint.fileCount) return;")
+        .expect("no row for a checkpoint that covers no file");
+    assert!(guard < mark.find("createElement").unwrap(), "{mark}");
+
+    let send = app_js_function("sendChatPrompt");
+    assert!(
+        send.contains("sessionCheckpoints.find((entry) => entry.taskId === turnTaskId)"),
+        "{send}"
+    );
+    assert!(
+        send.contains("const turnTaskId = assistantMessage?.message.dataset.taskId;"),
+        "{send}"
+    );
+    assert!(
+        !send.contains("!entry.restoredAtMs"),
+        "the newest unrestored checkpoint is not this turn's: {send}"
+    );
+    // The reload path matches the user message itself.
+    assert!(
+        app_js_function("renderMessages")
+            .contains("sessionCheckpoints.find((entry) => entry.userMessageId === message.id)")
+    );
+}
+
 fn app_js_function(name: &str) -> &'static str {
     let app = super::APP_JS;
     let start = app
@@ -7016,6 +7152,9 @@ fn checkpoint_list_json_reports_what_the_list_view_shows() {
     assert!(json.contains("\"commandEffectsCovered\":true"));
     assert!(json.contains("\"restoredAtMs\":null"));
     assert!(json.contains("\"userMessageId\":\"msg_1\""));
+    // A live turn knows its task id, not its user message's id, so this is
+    // how it finds its own checkpoint (spec 112 requirement 6).
+    assert!(json.contains("\"taskId\":\"task_1\""));
     // The per-file list is what lets the UI offer "restore only this file".
     // Paths and origins only: the manifest has no content and this must not
     // become the place that acquires it.

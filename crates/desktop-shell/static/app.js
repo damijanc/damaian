@@ -7555,10 +7555,14 @@ function loadRecoverySweep() {
   return recoverySweepRequest;
 }
 
-async function renderRecoveryPrompts(sessionId) {
+async function renderRecoveryPrompts(sessionId, generation = sessionLoadGeneration) {
   if (!sessionId) return;
   await loadRecoverySweep();
   if (sessionId !== currentSessionId) return;
+  // A later load of the same session draws its own cards; two overlapping
+  // loads appending after the same await drew the cards twice (spec 112
+  // requirement 4).
+  if (generation !== sessionLoadGeneration) return;
   // C5: a worker's turn is never resumed in the shell, whose sweep cannot tell
   // a worker's live turn from a crashed one. Its strip offers *Restart worker*.
   const resumable = !(workersEnabled && isWorkerSession(sessionId));
@@ -7579,6 +7583,25 @@ async function renderRecoveryPrompts(sessionId) {
   cards.forEach((card) => {
     $("chat-log").append(card);
   });
+  // Spec 112 requirement 4 (D7): a question the sweep reattached is one
+  // decision with its transcript copy. The recovery card carries the route
+  // that resumes the turn, so it is the answerable one and
+  // `restorePendingDecision` frames it; the transcript keeps the question as
+  // text. A worker's transcript question answers through the worker's own
+  // socket, so its copy is left as it is rather than routed through the shell.
+  if (resumable) {
+    reattachedApprovals
+      .filter((approval) => approval.sessionId === sessionId && approval.kind === "question")
+      .forEach((approval) => {
+        const questionId = approval.payload?.questionId;
+        if (!questionId) return;
+        $("chat-log")
+          .querySelectorAll(".message.question > .question-card")
+          .forEach((card) => {
+            if (card.dataset.questionId === questionId) makeQuestionCardReadOnly(card);
+          });
+      });
+  }
   cards[0]?.scrollIntoView({ block: "nearest" });
 }
 
@@ -8300,7 +8323,11 @@ function emptyCheckpointNotice(message) {
   return notice;
 }
 
+// Spec 112 requirement 6: every turn takes a checkpoint before it knows what
+// it will change (`take_turn_checkpoint`), so one that changed nothing covers
+// no file and has nothing to rewind; it gets no row.
 function markMessageRewindable(target, checkpoint) {
+  if (!checkpoint.fileCount) return;
   const row = document.createElement("div");
   row.className = "turn-indicator";
   row.dataset.state = "rewindable";
@@ -12628,6 +12655,19 @@ async function appendGitStatusAfterChange(repoPath) {
 //
 // `answered` is the recorded answer when the card is rebuilt from the
 // transcript or a recovered turn; `null` means it is still open.
+// A copy of a question that is answered elsewhere (spec 112 requirement 4):
+// the question's text stays, and nothing on it can answer. An answered card
+// is already settled and keeps its "You answered" line.
+function makeQuestionCardReadOnly(card) {
+  if (card.dataset.answered === "true") return;
+  for (const control of card.querySelectorAll(
+    ".question-card-options, .question-card-free-text, .question-card-status",
+  )) {
+    control.remove();
+  }
+  card.dataset.readonly = "true";
+}
+
 function createQuestionCard(question, questionRepo, { answered = null, onAnswer = null } = {}) {
   const wrapper = document.createElement("section");
   wrapper.className = "question-card";
@@ -13835,8 +13875,9 @@ function restorePendingDecision(tasks) {
   const decision = task.turnPresentation.pendingDecision;
   const log = $("chat-log");
   // After a restart the sweep reattaches the decision as a recovery card,
-  // already below the conversation; that card is the pending one, and a
-  // transcript question stays where it was asked rather than joining it.
+  // already below the conversation; that card is the pending one (spec 112
+  // D7), and a transcript question stays where it was asked, read-only
+  // (`renderRecoveryPrompts`), rather than joining it.
   const recovered = [...log.querySelectorAll(".recovery-card")].find(
     (entry) => entry.dataset.taskId === task.id,
   );
@@ -15820,7 +15861,15 @@ async function loadSessions(preferredSessionId = "", reloadSelected = false) {
   }
 }
 
+// Bumped by every `loadSession`. Loads overlap (a poll's reload, a project
+// switch, a rewind), and a load that a later one has overtaken stops drawing:
+// the later one renders the whole session again, so anything the earlier one
+// appended after its awaits would be a second copy (spec 112 requirement 4).
+let sessionLoadGeneration = 0;
+
 async function loadSession(sessionId) {
+  const generation = ++sessionLoadGeneration;
+  const current = () => generation === sessionLoadGeneration;
   // Opening a conversation leaves the Workers board.
   hideWorkersBoard();
   if (!sessionId) {
@@ -15841,6 +15890,7 @@ async function loadSession(sessionId) {
   const payload = await api(
     `/api/session?repo=${encodeURIComponent(repo())}&session_id=${encodeURIComponent(sessionId)}`,
   );
+  if (!current()) return;
   currentSessionId = payload.session.id;
   currentSessionMode = { sessionId: payload.session.id, mode: payload.session.mode || "code" };
   localStorage.setItem(lastSessionStorageKey(), currentSessionId);
@@ -15855,6 +15905,7 @@ async function loadSession(sessionId) {
   await loadSessionCheckpoints(currentSessionId);
   // Before rendering: the messages' *Start worker* actions depend on it.
   await refreshWorkerIndex();
+  if (!current()) return;
   renderThreadHeader();
   // A worker runs one continuous turn in its own process (spec 57); the
   // "earlier messages… Compact now" boundary is a multi-turn chat concept
@@ -15894,12 +15945,15 @@ async function loadSession(sessionId) {
   renderContextButton();
   if (!$("context-panel").hidden) renderContextPanel();
   await refreshFindings();
+  if (!current()) return;
   // After the conversation, because `renderMessages` clears the log and the
   // cards follow what it renders.
-  await renderRecoveryPrompts(currentSessionId);
+  await renderRecoveryPrompts(currentSessionId, generation);
+  if (!current()) return;
   // The memory stack sits below the conversation and above nothing else, so it
   // is drawn after the messages it follows.
   await refreshMemoryProposals(currentSessionId);
+  if (!current()) return;
   // Spec 107: after everything else, so the decision the session waits on is
   // the last card above the composer.
   restorePendingDecision(payload.tasks || []);
@@ -17103,11 +17157,16 @@ async function sendChatPrompt(options = {}) {
     if (streamError) throw streamError;
     dismissContextChips();
     // The checkpoint for this turn exists now, so the turn just sent becomes
-    // rewindable without waiting for a session reload.
+    // rewindable without waiting for a session reload. This turn's own: the
+    // newest unrestored one of the session may be another turn's (spec 112
+    // requirement 6). The live bubble has no user message id, but the turn's
+    // task id names the same checkpoint, which is taken once per task with
+    // that user message.
     await loadSessionCheckpoints(currentSessionId);
-    const checkpoint = sessionCheckpoints.find(
-      (entry) => entry.sessionId === currentSessionId && !entry.restoredAtMs,
-    );
+    const turnTaskId = assistantMessage?.message.dataset.taskId;
+    const checkpoint = turnTaskId
+      ? sessionCheckpoints.find((entry) => entry.taskId === turnTaskId)
+      : null;
     if (checkpoint) markMessageRewindable(userMessage, checkpoint);
     await loadSessions(currentSessionId, false);
     await refreshFindings();

@@ -1071,6 +1071,12 @@ button:disabled {
   background: var(--surface);
 }
 
+/* Spec 112 requirement 6: a turn that has not produced a token yet is its
+   status row alone, not an empty bordered box above it. */
+.message.assistant .message-body:empty {
+  display: none;
+}
+
 .message.system .message-body {
   background: #f3f4f4;
 }
@@ -3552,7 +3558,8 @@ code.command-approval-command {
 
 /* A settled card is a record, not a control: it stays readable and stops
    looking clickable without borrowing the approval card's muted outcome. */
-.question-card[data-answered="true"] {
+.question-card[data-answered="true"],
+.question-card[data-readonly="true"] {
   background: var(--surface);
 }
 

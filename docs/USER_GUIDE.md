@@ -1275,7 +1275,7 @@ conflicted paths.
 
 ## Rewind
 
-Damaian takes a checkpoint before every turn, so a turn that went the wrong way can be undone in one action. Each of your messages in the conversation carries a **Rewind** control, which offers three choices:
+Damaian takes a checkpoint before every turn, so a turn that went the wrong way can be undone in one action. Each of your messages whose turn changed at least one file carries a **Rewind** control under it ("1 file covered · Rewind"); a turn that changed nothing has no row, and its checkpoint is still listed under **Settings › Checkpoints** if you want to rewind the conversation to it. **Rewind** offers three choices:
 
 - **Files and conversation** — puts back the files Damaian changed in that turn and moves the conversation to just before your message.
 - **Files only** — restores the files and leaves the conversation as it is.

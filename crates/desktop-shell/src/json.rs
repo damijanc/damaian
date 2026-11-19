@@ -939,9 +939,14 @@ pub(crate) fn checkpoint_list_json(manifests: &[workspace_engine::CheckpointMani
         .iter()
         .map(|manifest| {
             format!(
-                "{{\"checkpointId\":\"{}\",\"sessionId\":\"{}\",\"createdAtMs\":{},\"summary\":\"{}\",\"userMessageId\":{},\"fileCount\":{},\"excludedCount\":{},\"commandEffectsCovered\":{},\"restoredAtMs\":{},\"files\":[{}],\"pendingApprovals\":[{}]}}",
+                "{{\"checkpointId\":\"{}\",\"sessionId\":\"{}\",\"taskId\":{},\"createdAtMs\":{},\"summary\":\"{}\",\"userMessageId\":{},\"fileCount\":{},\"excludedCount\":{},\"commandEffectsCovered\":{},\"restoredAtMs\":{},\"files\":[{}],\"pendingApprovals\":[{}]}}",
                 escape_json(&manifest.checkpoint_id),
                 escape_json(&manifest.session_id),
+                manifest
+                    .task_id
+                    .as_ref()
+                    .map(|id| format!("\"{}\"", escape_json(id)))
+                    .unwrap_or_else(|| "null".to_string()),
                 manifest.created_at_ms,
                 escape_json(&manifest.summary),
                 manifest
