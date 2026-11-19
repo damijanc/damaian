@@ -121,7 +121,8 @@ deterministic eval tier.
       *(2026-11-19: "working sessions are marked in the sidebar" moved to
       [spec 112](../112_status_in_one_place/proposal.md) requirement 7, which
       draws Working, Needs you and Failed from this spec's D3 routes. Build
-      spec 112 before this task: both edit `app.js` and `style.css`.)*
+      spec 112 before this task: both edit `app.js` and `style.css`. Spec 112
+      is Done 2026-11-19, so this task no longer waits on it.)*
 - [ ] Manual check in the running app (`serves_the_ui_for_manual_inspection`,
       port 4899, its own data dir): archive during a turn; two sessions working.
 

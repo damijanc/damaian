@@ -1,6 +1,6 @@
 # Feature Spec: Status in One Place
 
-Status: In progress (specified 2026-11-19; started 2026-11-19, Tasks 1–5 done; six tasks in [tasks.md](tasks.md))
+Status: Done 2026-11-19 (specified and started 2026-11-19; six tasks in [tasks.md](tasks.md))
 Order: 112 of 112
 Plan: none. Written from a UX investigation of the desktop shell on
 2026-11-19, checked against the running app the same day. The evidence, the
@@ -10,9 +10,9 @@ decisions above the composer, the status line) and
 [#109](../109_fast_verification/proposal.md) Task 6 (one running-action model
 with a Stop) — both built. Spec
 [#110](../110_responsive_shell_during_work/proposal.md) supplies the
-working-sessions route this spec reads; its Task 1 is built. **Nothing here is
-unbuilt, so this spec is ready to start.** Build it before spec 110 Task 3:
-both edit `app.js` and `style.css` (owner's decision, 2026-11-19).
+working-sessions route this spec reads; its Task 1 is built. Nothing here was
+unbuilt. It was built before spec 110 Task 3, because both edit `app.js` and
+`style.css` (owner's decision, 2026-11-19).
 
 ## 1. Motivation
 

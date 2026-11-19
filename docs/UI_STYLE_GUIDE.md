@@ -41,6 +41,17 @@ restart to be visible — there is no live reload.
    approving something, the thing being approved is shown in full.
 4. **Containers size to content.** No element reserves space it is not using.
 5. **One primary action per surface.** If everything is emphasised, nothing is.
+6. **Every state has one home.** A pending decision lives in its card at the
+   end of the conversation; a running action lives in its status row in the
+   turn. Nothing else repeats the state while that home is in view. A pointer
+   elsewhere — the composer status slot (§4) — appears only while the home is
+   scrolled out of view, and goes away when it comes back
+   ([spec 112](specs/112_status_in_one_place/proposal.md)).
+7. **One vocabulary of states.** The same state has the same name and the same
+   mark on every surface: *Working*, *Needs you*, *Failed*, drawn with the one
+   `.worker-dot` (§4) in the sidebar, on the Workers board and in the worker
+   strip, and named the same in the composer status slot. Do not invent a
+   second word or a second colour for a state that already has one.
 
 ---
 
@@ -290,6 +301,53 @@ group. Two rules matter:
   leftward as their values lengthen, so the button the user aims at is always
   in the same place — including when it changes into Stop mid-turn.
 
+### The composer status slot and the one Stop
+
+Spec 112 replaced the composer's three stacked status boxes (running,
+decision, work this window never streamed) and the in-message pointer ("… the
+card is below") with one slot and one Stop.
+
+**The slot.** `#composer-status` (`.composer-status`) sits directly above the
+prompt box. Like the repo bar's action it is **one slot with a priority
+list**: the first entry that applies is shown, and the slot is hidden when
+none does.
+
+| Priority | `data-kind` | Shown when | Text | Button |
+|---|---|---|---|---|
+| 1 | `needs-you` | A pending decision whose card is out of view | "Needs your answer" for a question, else the decision's label | **Answer** (question) or **Show**: scrolls to and focuses the card |
+| 2 | `working` | A running action of this session whose status row (or card's running row) is out of view | The action's label, or "Stopping: …" | None |
+| 3 | `busy` | The session works on something this window never streamed (working-sessions poll) | "Busy elsewhere: {label}" | None |
+
+- **Shown only while the home is out of view.** An `IntersectionObserver`
+  watches the pending frame and the running action's status rows; while one is
+  visible its entry is skipped (§1, "every state has one home"). The observer's
+  root is the viewport, because below 1100px the page scrolls rather than the
+  log.
+- **One line.** `.composer-status-label` is clipped to about 60 characters,
+  then a `.composer-status-clock` (muted, tabular numerals). The full text goes
+  in the slot's `title`.
+- **Only Needs you is tinted** — `--accent` edge on `--accent-soft`. Working
+  and Busy elsewhere sit on `--surface-soft` with a `--line` border: they are
+  information, not a request.
+- **The slot never holds a Stop.** Its one optional button is a `.btn-sm`.
+
+**The one Stop.** While anything in the current session runs — a turn this
+window streams, a resumed stream, a running action, or work another window
+started — the composer's send button is the Stop (`.send-button.is-stopping`,
+`aria-label` "Stop", `title` "Stop (Esc)"), and Escape does the same. It stops
+the work through the path that work needs: the stream's abort, the running
+action's `stop()`, or `/api/session-work-cancel` for work this window does not
+own.
+
+- **The turn's status row has no Stop**, and neither does the slot.
+- **Work that cannot be stopped** leaves a disabled Stop with the reason in its
+  `title`, rather than an enabled control that does nothing.
+- **A card's own Cancel row stays** (`.running-row` on a check batch or a
+  reattached command): it is that card's action, not a second Stop for the
+  session.
+- Enter with text in the prompt during a turn still sends a steering note
+  (spec 110).
+
 ### Worker sessions
 
 Worker sessions ([spec 57](specs/57_worker_sessions/proposal.md) §5.7) appear
@@ -319,6 +377,28 @@ look. State colours only (§2):
 opens the one board for every project. A worker's session is listed under the
 session that started it as `.project-worker-item.nested`, indented one 14px
 step, with its dot where a child's bullet would be.
+
+**Session dots.** An ordinary session row uses the same dot for three states
+only (spec 112), from `/api/sessions`' `state` field:
+
+| `state` | `data-state` | Label | Means |
+|---|---|---|---|
+| `working` | `running` | Working | The session is in the working-sessions list |
+| `needs_you` | `needs-you` | Needs you | Its latest task waits on a decision |
+| `failed` | `failed` | Failed | Its latest task ended failed |
+
+- **Idle draws nothing.** Idle, complete, stopped and cancelled sessions keep
+  their relative time (`.session-when`); there is no finished dot on a session
+  row, because a column of grey dots would say nothing.
+- **The dot replaces the time** in the same column (`.session-state-dot`,
+  centred there): while a session needs you, that is the news, not when it last
+  changed.
+- Like every sidebar dot it is `role="img"` with an `aria-label` and `title`
+  naming the state. Worker rows keep their own engine-computed dot.
+- **A collapsed project names its count**: `.project-need-you`, "2 need you" in
+  `--warn-ink` at 11px, after the project name. Text, not a dot: the count is
+  the information. An expanded project shows no count, because its rows carry
+  the dots.
 
 **The Workers board.** `.workers-board` takes the conversation's place: while
 `body.workers-board-open` is set, the log, the composer and the worker strip
@@ -511,6 +591,8 @@ Each of these existed in the shell and was removed. Do not reintroduce them.
 | Turn state in a header badge | Nobody looks at the header during a turn; they look at the reply. `#chat-status` was the only progress signal for four turn paths. Running state is the in-bubble turn indicator; an end state is a mark on that turn's message (spec 58 §3.2) |
 | Horizontal `⋯` or a text-glyph overflow trigger | Vertical ⋮ was asked for and applied to one control while this guide still said `⋯`; the approval and recovery overflows were then built from the guide and came out horizontal. The trigger is `.dots-icon` (§3), and the guide is what gets fixed first |
 | Chrome with nothing to say | An empty *Workers* entry and a permanent *Check Updates* button cost space on every screen to report nothing. Draw an entry only when it has state to show, and keep the way back to it in a menu or in Settings |
+| The same state in several places | One pending question was announced six times: a pointer in the assistant's message ("the card is below"), the waiting row, the card, a second answerable copy inside a recovery card, a composer line and a placeholder saying "above". The pointer said *below* and the placeholder *above*, both true of different copies. A state has one home; the composer slot points at it only while it is out of view, and a reattached card is answerable once (spec 112) |
+| A Stop on every surface | A running turn had a Stop on its status row and a Stop in the composer, sometimes a third in a status line, and answering a question turned Send into a Stop that did nothing. The user cannot tell which one stops what. The composer's send button is the one Stop for a session's running work; a card keeps only its own Cancel (spec 112) |
 | Two values sharing one truncating label | Whichever is last is the one that disappears. `model + effort` in one 220px pill rendered `claude-3-5-sonnet-202…` — the effort still in force and readable nowhere but the popover. One trigger per value |
 
 ---

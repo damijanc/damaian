@@ -388,7 +388,8 @@
       </div>
       <p class="sg-note">
         Mid-turn the same button becomes Stop in place — same size, same position, so the control
-        never moves under the pointer:
+        never moves under the pointer. It is the one Stop for anything the session runs; the turn's
+        status row and the status slot have none (guide §4):
       </p>
       <div class="composer-actions">
         <div class="attach-menu">
@@ -411,9 +412,39 @@
             <span class="menu-caret" aria-hidden="true"></span>
           </button>
         </div>
-        <button type="button" class="send-button is-stopping" aria-label="Stop generating">
+        <button type="button" class="send-button is-stopping" aria-label="Stop" title="Stop (Esc)">
           <span class="send-icon" aria-hidden="true"></span>
         </button>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Composer status slot</h2>
+      <p class="sg-hint">
+        Spec 112 (guide §4). One slot above the prompt box, showing the first entry that applies —
+        Needs you, then Working, then Busy elsewhere — and only while that state's home (the card,
+        the turn's status row) is scrolled out of view. One line, a clock, at most one
+        <code>.btn-sm</code>; never a Stop. Each specimen is one state; the app shows one at a time.
+      </p>
+      <div class="sg-grid">
+        <span class="sg-rowlabel">Needs you</span>
+        <div class="composer-status" data-kind="needs-you" role="status" title="Needs your answer">
+          <span class="composer-status-label">Needs your answer</span>
+          <span class="composer-status-clock">18s</span>
+          <button class="btn-sm" type="button">Answer</button>
+        </div>
+
+        <span class="sg-rowlabel">Working</span>
+        <div class="composer-status" data-kind="working" role="status" title="Running cargo nextest run -p desktop-shell">
+          <span class="composer-status-label">Running cargo nextest run -p desktop-shell</span>
+          <span class="composer-status-clock">42s</span>
+        </div>
+
+        <span class="sg-rowlabel">Busy elsewhere</span>
+        <div class="composer-status" data-kind="busy" role="status" title="Busy elsewhere: Running cargo nextest run --workspace --locked">
+          <span class="composer-status-label">Busy elsewhere: Running cargo nextest run --workspace --loc…</span>
+          <span class="composer-status-clock">12s</span>
+        </div>
       </div>
     </section>
 
@@ -1342,6 +1373,23 @@ The cause enum is fed by the classifier in validation.rs.</pre>
           <span class="worker-dot" data-state="paused" role="img" aria-label="Paused" title="Paused"></span>Paused
           <span class="worker-dot" data-state="finished" role="img" aria-label="Finished" title="Finished"></span>Finished
           <span class="worker-dot" data-state="failed" role="img" aria-label="Failed" title="Failed"></span>Failed
+        </div>
+
+        <span class="sg-rowlabel">Session dots</span>
+        <div style="width: 280px; padding: 8px; background: var(--sidebar); border-radius: 8px">
+          <div class="session-item project-session-item"><button type="button" class="project-session-open">Fix the flaky retry test</button><span class="worker-dot session-state-dot" data-state="running" role="img" aria-label="Working" title="Working"></span><span></span></div>
+          <div class="session-item project-session-item"><button type="button" class="project-session-open">Exponential or fixed backoff?</button><span class="worker-dot session-state-dot" data-state="needs-you" role="img" aria-label="Needs you" title="Needs you"></span><span></span></div>
+          <div class="session-item project-session-item"><button type="button" class="project-session-open">Bump the toolchain</button><span class="worker-dot session-state-dot" data-state="failed" role="img" aria-label="Failed" title="Failed"></span><span></span></div>
+          <div class="session-item project-session-item"><button type="button" class="project-session-open">check what specs are left</button><span class="session-when">2m</span><span></span></div>
+        </div>
+
+        <span class="sg-rowlabel">Collapsed project</span>
+        <div style="width: 280px; padding: 8px; background: var(--sidebar); border-radius: 8px">
+          <div class="project-row">
+            <button type="button" class="project-select-btn"><span class="project-chevron" aria-hidden="true"></span><span class="project-name">damaian-client</span><span class="project-need-you">2 need you</span></button>
+            <button type="button" class="project-session-add-btn" aria-label="New session" style="opacity: 1"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h8"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></button>
+            <button type="button" class="project-menu-btn" aria-label="More options" style="opacity: 1"><span class="dots-icon" aria-hidden="true"></span></button>
+          </div>
         </div>
 
         <span class="sg-rowlabel">Sidebar</span>

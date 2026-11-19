@@ -49,6 +49,14 @@ not matter.
    "Approve 2 checks", …), with a control that scrolls to and focuses the card.
    While a question is pending, the main composer does not compete with the
    card's own answer field (context D2).
+
+   *Note 2026-11-19 ([spec 112](../112_status_in_one_place/proposal.md)):*
+   requirement 1's one-line pointer in the assistant's message is removed, and
+   requirement 2's composer line is now the **Needs you** entry of the one
+   composer status slot (`#composer-status`), shown only while the card is
+   scrolled out of view; a question reads "Needs your answer". The question
+   lock (D2) is unchanged, with the placeholder "Answer the question" (no
+   direction).
 3. **The status line never goes blank while a turn is alive.** It shows the
    waiting state ("Waiting for your answer", "Waiting for your review",
    "Running baseline: cargo test (repository root) · 1m 12s") instead of being

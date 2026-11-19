@@ -1692,7 +1692,10 @@ turn has ended.
   first clock is the current activity alone and the "turn" clock is the whole
   turn, so a long turn total does not mean one long call. A running command's
   latest output line is shown under it; a `cargo test` that prints nothing for a
-  while is still running. **Stop** ends the turn if you do not want to wait.
+  while is still running. **Stop** — the prompt box's send button, the one
+  Stop for the session — ends the turn if you do not want to wait. With the
+  status line scrolled out of view, the slot above the prompt box shows the
+  same activity and clock.
 - **It reads "Waiting for your answer / review / approval / decision".** The
   turn is paused on a card you have to answer. The card is the last thing in the
   conversation, directly above the prompt box, and, while the card is scrolled out of view, the line above the prompt box
@@ -1713,6 +1716,21 @@ turn has ended.
   ended. Its message carries the mark that says how ([A turn stopped
   early](#a-turn-stopped-early-which-budget-ran-out)), or a **Task incomplete**
   card ([A task ended incomplete](#a-task-ended-incomplete-what-the-completion-gate-saw)).
+- **The slot above the prompt box reads "Busy elsewhere: …" and Send is a
+  Stop.** The session is working on something this window did not start or
+  stream — a turn from another window, say. Your next message waits for it;
+  **Stop** cancels it. When it ends, the conversation reloads.
+
+**A session shows Needs you in the sidebar, after a restart too.** The
+orange dot means the session's latest task is waiting on a decision
+(`/api/sessions` reports that row's `state` as `needs_you`). Decisions are
+durable, so a task that was waiting when Damaian quit is still waiting when it
+starts again, and the dot comes back with it. Open the session and answer the
+card at the end of the conversation; if the question also appears earlier in
+the transcript, that copy is read-only and the card at the end is the one that
+answers it. A red **Failed** dot means the latest task failed; a new turn that
+completes clears it. A green **Working** dot follows the working-sessions poll,
+so it appears and clears within about two seconds.
 
 To confirm from the logs which decision a task is waiting on, read the newest
 `task_status_updated` for that task: it is `waiting_for_approval` with a
@@ -2413,7 +2431,7 @@ Workers keep running meanwhile, and only the view lags. When the other turn
 ends, polling resumes within a second. Only a request that **fails** shows
 "Could not refresh". This is accepted behaviour (correction C10 in
 [`tasks.md`](specs/57_worker_sessions/tasks.md)). Answering the worker routes
-while a turn streams is a follow-up, proposal §7. The sidebar's dots and badge
+while a turn streams is a follow-up, proposal §7. The sidebar's worker dots and badge
 have no timer of their own, so with the board closed they can be stale until a
 project is drawn, a session loads or the window regains focus.
 
